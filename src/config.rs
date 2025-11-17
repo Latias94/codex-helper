@@ -632,9 +632,11 @@ mod tests {
         let suffix = format!("codex-helper-test-{}", uuid::Uuid::new_v4().to_string());
         dir.push(suffix);
         std::fs::create_dir_all(&dir).expect("create temp codex home");
-        std::env::set_var("CODEX_HOME", &dir);
-        // 将 HOME 也指向该目录，确保 proxy_home_dir()/config.json 也被隔离在测试目录中。
-        std::env::set_var("HOME", &dir);
+        unsafe {
+            std::env::set_var("CODEX_HOME", &dir);
+            // 将 HOME 也指向该目录，确保 proxy_home_dir()/config.json 也被隔离在测试目录中。
+            std::env::set_var("HOME", &dir);
+        }
         dir
     }
 
