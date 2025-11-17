@@ -342,15 +342,4 @@ codex-helper config set-active openai-main
 
 ## 与 cli_proxy / cc-switch 的关系
 
-- [cli_proxy](https://github.com/guojinpeng/cli_proxy)：多服务本地代理，提供 Web UI、模型路由、过滤、号池等高级能力。
-- [cc-switch](https://github.com/farion1231/cc-switch)：桌面级配置管理与切换工具，负责 Codex 等 CLI 配置的安全读写与同步。
-
-codex-helper 的定位：
-
-- 更专注于 **Codex CLI responses wire_api 的本地代理** 和 **命令行 / 配置驱动的多上游管理**；
-- 默认无 UI，适合在本地或服务器以轻量方式部署。
-
-如果你已经熟悉 `cli_proxy` 和 `cc-switch`，可以把 codex-helper 看作一个更轻量、更 Rust 化、专门为 Codex CLI 优化的“本地代理 + 配置/用量中枢”。在实际使用中也可以与它们配合：  
-- 用 cc-switch 管理系统级 Codex 配置；  
-- 用 codex-helper 管理本地代理与上游池；  
-- 用 cli_proxy 作为更重型的带 UI 管控层。 
+codex-helper 借鉴了 [cli_proxy](https://github.com/guojinpeng/cli_proxy) 和 [cc-switch](https://github.com/farion1231/cc-switch) 的设计思路，在此基础上提供了一个更轻量、面向 Codex CLI 的 Rust 本地代理与配置管理工具。

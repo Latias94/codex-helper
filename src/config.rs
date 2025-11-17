@@ -203,6 +203,32 @@ fn resolve_auth_token(env_key: &str, auth_json: &Option<JsonValue>) -> Option<St
     None
 }
 
+/// Try to infer a unique API key from ~/.codex/auth.json when the provider
+/// does not declare an explicit `env_key`.
+///
+/// This mirrors the common Codex CLI layout where `auth.json` contains a
+/// single `*_API_KEY` field (e.g. `OPENAI_API_KEY`) plus metadata fields
+/// like `tokens` / `last_refresh`. We only consider string values whose
+/// key ends with `_API_KEY`, and only succeed when there is exactly one
+/// such candidate; otherwise we return None and let the caller error out.
+fn infer_env_key_from_auth_json(auth_json: &Option<JsonValue>) -> Option<(String, String)> {
+    let json = auth_json.as_ref()?;
+    let obj = json.as_object()?;
+
+    let mut candidates: Vec<(String, String)> = obj
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k, s)))
+        .filter(|(k, v)| k.ends_with("_API_KEY") && !v.trim().is_empty())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
+    }
+}
+
 fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
     if !cfg.codex.configs.is_empty() {
         return Ok(());
@@ -283,13 +309,26 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         _ => None,
     };
 
-    // 仅按 Codex 官方语义解析 token：必须有 env_key 才会尝试从环境变量或 auth.json 读取。
-    let auth_token = env_key
+    // 按 Codex 官方语义优先使用 env_key；若当前 provider 未声明 env_key，
+    // 则在 ~/.codex/auth.json 中尝试推断唯一的 `*_API_KEY` 字段作为后备。
+    let mut effective_env_key = env_key.clone();
+    let mut auth_token = effective_env_key
         .as_deref()
         .and_then(|key| resolve_auth_token(key, &auth_json));
 
+    if auth_token.is_none() && effective_env_key.is_none() {
+        if let Some((inferred_key, inferred_token)) = infer_env_key_from_auth_json(&auth_json) {
+            info!(
+                "当前 model_provider 未声明 env_key，已从 ~/.codex/auth.json 自动推断为 `{}`",
+                inferred_key
+            );
+            effective_env_key = Some(inferred_key);
+            auth_token = Some(inferred_token);
+        }
+    }
+
     if auth_token.is_none() {
-        if let Some(key) = env_key.as_deref() {
+        if let Some(key) = effective_env_key.as_deref() {
             anyhow::bail!(
                 "未在环境变量或 ~/.codex/auth.json 中找到 `{}`，无法为 Codex 上游构建有效的 Authorization 头；请先在 Codex CLI 中完成登录或配置对应环境变量，然后重试",
                 key
@@ -423,7 +462,9 @@ pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
         match bootstrap_from_codex(&mut cfg) {
             Ok(()) => {
                 let _ = save_config(&cfg).await;
-                info!("已根据 ~/.codex/config.toml 自动创建默认 Codex 上游配置");
+                info!(
+                    "已根据 ~/.codex/config.toml 与 ~/.codex/auth.json 自动创建默认 Codex 上游配置"
+                );
             }
             Err(err) => {
                 warn!(

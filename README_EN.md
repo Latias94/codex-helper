@@ -315,20 +315,4 @@ You can use tools like `jq` to aggregate usage by config, upstream, or time wind
 
 ## Relationship to cli_proxy and cc-switch
 
-This project is heavily inspired by, and intended to complement, the following tools:
-
-- [cli_proxy](https://github.com/guojinpeng/cli_proxy)
-  - A local multi-service proxy for Codex (and other tools) with a Web UI, model routing, filters, and “number pools”.
-- [cc-switch](https://github.com/farion1231/cc-switch)
-  - A desktop app for managing providers and live Codex configs safely (with atomic writes and rollback).
-
-codex-helper positions itself as:
-
-- A **Rust-native**, CLI-first local proxy focused on traffic from the Codex CLI.
-- Lightweight and headless by default (no UI), suitable for local machines and servers.
-- Providing:
-  - Safe integration with Codex config (`switch-on/off` + auto bootstrap).
-  - Structured upstream management (`config.json` + CLI).
-  - Unified LB state (failures + cooldown + usage exhaustion) with pluggable usage providers.
-
-If you're already using `cli_proxy` or `cc-switch`, you can adopt codex-helper as a focused Codex-specific proxy layer, while still reusing your existing knowledge and patterns from those tools. 
+codex-helper is inspired by, and designed to work well alongside, both [cli_proxy](https://github.com/guojinpeng/cli_proxy) and [cc-switch](https://github.com/farion1231/cc-switch), but focuses on being a lightweight, Rust-based local proxy and config manager specifically for Codex CLI traffic.
