@@ -181,7 +181,7 @@ enum SwitchCommand {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
-    /// List configs in ~/.codex-proxy/config.json
+    /// List configs in ~/.codex-helper/config.json
     List {
         /// Target Codex configs (default if neither flag is set)
         #[arg(long)]
@@ -217,9 +217,9 @@ enum ConfigCommand {
         #[arg(long)]
         claude: bool,
     },
-    /// Import Codex upstream config from ~/.codex/config.toml + auth.json into ~/.codex-proxy/config.json
+    /// Import Codex upstream config from ~/.codex/config.toml + auth.json into ~/.codex-helper/config.json
     ImportFromCodex {
-        /// Overwrite existing Codex configs in ~/.codex-proxy/config.json
+        /// Overwrite existing Codex configs in ~/.codex-helper/config.json
         #[arg(long)]
         force: bool,
     },
@@ -236,6 +236,28 @@ enum SessionCommand {
         #[arg(long)]
         path: Option<String>,
     },
+    /// Search Codex sessions by user message content
+    Search {
+        /// Substring to search in user messages
+        query: String,
+        /// Maximum number of sessions to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Optional directory to search sessions for; defaults to current dir
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Export a Codex session to a file
+    Export {
+        /// Session id to export
+        id: String,
+        /// Output format: markdown or json
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        /// Optional output path; defaults to stdout
+        #[arg(long)]
+        output: Option<String>,
+    },
     /// Show the last Codex session for the current project
     Last {
         /// Optional directory to search sessions for; defaults to current dir
@@ -246,7 +268,7 @@ enum SessionCommand {
 
 #[derive(Subcommand, Debug)]
 enum UsageCommand {
-    /// Show recent requests with basic usage info from ~/.codex-proxy/logs/requests.jsonl
+    /// Show recent requests with basic usage info from ~/.codex-helper/logs/requests.jsonl
     Tail {
         /// Maximum number of recent entries to print
         #[arg(long, default_value_t = 20)]
@@ -255,7 +277,7 @@ enum UsageCommand {
         #[arg(long)]
         raw: bool,
     },
-    /// Summarize total token usage per config from ~/.codex-proxy/logs/requests.jsonl
+    /// Summarize total token usage per config from ~/.codex-helper/logs/requests.jsonl
     Summary {
         /// Maximum number of configs to show (sorted by total_tokens desc)
         #[arg(long, default_value_t = 20)]
@@ -423,7 +445,7 @@ async fn run_server(service_name: &'static str, port: u16) -> anyhow::Result<()>
     if service_name == "codex" {
         if cfg.codex.configs.is_empty() || cfg.codex.active_config().is_none() {
             anyhow::bail!(
-                "未找到任何可用的 Codex 上游配置，请先确保 ~/.codex/config.toml 与 ~/.codex/auth.json 配置完整，或手动编辑 ~/.codex-proxy/config.json 添加配置"
+                "未找到任何可用的 Codex 上游配置，请先确保 ~/.codex/config.toml 与 ~/.codex/auth.json 配置完整，或手动编辑 ~/.codex-helper/config.json 添加配置"
             );
         }
     } else if service_name == "claude"
@@ -431,7 +453,7 @@ async fn run_server(service_name: &'static str, port: u16) -> anyhow::Result<()>
     {
         anyhow::bail!(
             "未找到任何可用的 Claude 上游配置，请先确保 ~/.claude/settings.json 配置完整，\
-或在 ~/.codex-proxy/config.json 的 `claude` 段下手动添加上游配置"
+或在 ~/.codex-helper/config.json 的 `claude` 段下手动添加上游配置"
         );
     }
     let client = Client::builder().build()?;

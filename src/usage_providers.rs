@@ -301,7 +301,7 @@ pub async fn poll_for_codex_upstream(
         } else {
             warn!(
                 "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
-跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-proxy/config.json",
+跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.json",
                 provider.id
             );
         }

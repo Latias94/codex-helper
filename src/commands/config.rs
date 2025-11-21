@@ -41,7 +41,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             };
 
             if mgr.configs.is_empty() {
-                println!("No {} configs in ~/.codex-proxy/config.json", label);
+                println!("No {} configs in ~/.codex-helper/config.json", label);
             } else {
                 let active = mgr.active.clone();
                 println!("{} configs:", label);

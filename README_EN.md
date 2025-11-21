@@ -55,7 +55,7 @@ This will:
 
 - Start a Codex proxy on `127.0.0.1:3211`;
 - Guard and, if needed, rewrite `~/.codex/config.toml` to point Codex at the local proxy (backing up the original config on first run);
-- If `~/.codex-proxy/config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
+- If `~/.codex-helper/config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
 - On Ctrl+C, attempt to restore the original Codex config from the backup.
 
 After that, you keep using your usual `codex ...` commands; codex-helper just sits in the middle.
@@ -88,7 +88,7 @@ codex-helper default
   - The original config is backed up and can be restored via `codex-helper switch off`.
 
 - **Centralize multiple keys / providers / relays**  
-  - All upstream definitions live in `~/.codex-proxy/config.json`;
+  - All upstream definitions live in `~/.codex-helper/config.json`;
   - You can define multiple Codex / Claude configs, each with its own upstream pool;
   - Switch the active config with `codex-helper config set-active`, then restart or re-run `codex-helper`.
 
@@ -102,8 +102,8 @@ codex-helper default
   - `codex-helper session last` prints the last session for the current project plus a ready-to-copy `codex resume <ID>` command.
 
 - **Request filtering and structured request logging**  
-  - Redaction/removal rules from `~/.codex-proxy/filter.json` are applied to request bodies before sending upstream;
-  - Every request is logged to `~/.codex-proxy/logs/requests.jsonl` with method, path, status, duration, and usage metrics.
+  - Redaction/removal rules from `~/.codex-helper/filter.json` are applied to request bodies before sending upstream;
+  - Every request is logged to `~/.codex-helper/logs/requests.jsonl` with method, path, status, duration, and usage metrics.
 
 - **(Experimental) Claude Code support**  
   - Can bootstrap Claude upstreams from `~/.claude/settings.json` (or `claude.json`) by reading `env.ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`;
@@ -262,10 +262,10 @@ This is especially handy when juggling multiple side projects: you don’t need 
 
 Most users do not need to touch these. If you want deeper customization, these files are relevant:
 
-- Main config: `~/.codex-proxy/config.json`
-- Filter rules: `~/.codex-proxy/filter.json`
-- Usage providers: `~/.codex-proxy/usage_providers.json`
-- Request logs: `~/.codex-proxy/logs/requests.jsonl`
+- Main config: `~/.codex-helper/config.json`
+- Filter rules: `~/.codex-helper/filter.json`
+- Usage providers: `~/.codex-helper/usage_providers.json`
+- Request logs: `~/.codex-helper/logs/requests.jsonl`
 
 Codex official files:
 
@@ -309,7 +309,7 @@ Key ideas:
 
 ### `usage_providers.json`
 
-Path: `~/.codex-proxy/usage_providers.json`. If it does not exist, codex-helper will write a default file similar to:
+Path: `~/.codex-helper/usage_providers.json`. If it does not exist, codex-helper will write a default file similar to:
 
 ```jsonc
 {
@@ -334,7 +334,7 @@ For `budget_http_json`:
 
 ### Filtering & logging
 
-- Filter rules: `~/.codex-proxy/filter.json`, e.g.:
+- Filter rules: `~/.codex-helper/filter.json`, e.g.:
 
   ```jsonc
   [
@@ -345,7 +345,7 @@ For `budget_http_json`:
 
   Filters are applied to the request body before sending it upstream; rules are reloaded based on file mtime.
 
-- Logs: `~/.codex-proxy/logs/requests.jsonl`, each line is a JSON object like:
+- Logs: `~/.codex-helper/logs/requests.jsonl`, each line is a JSON object like:
 
   ```jsonc
   {

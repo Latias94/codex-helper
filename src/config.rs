@@ -147,11 +147,11 @@ pub fn codex_set_active(cfg: &mut ProxyConfig, name: &str) -> bool {
     }
 }
 
-/// 获取 codex-proxy 的主目录（用于配置、日志等）
+/// 获取 codex-helper 的主目录（用于配置、日志等）
 pub fn proxy_home_dir() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".codex-proxy")
+        .join(".codex-helper")
 }
 
 fn codex_home() -> PathBuf {
@@ -168,7 +168,7 @@ pub fn codex_config_path() -> PathBuf {
 }
 
 pub fn codex_backup_config_path() -> PathBuf {
-    codex_home().join("config.toml.codex-proxy-backup")
+    codex_home().join("config.toml.codex-helper-backup")
 }
 
 pub fn codex_auth_path() -> PathBuf {
@@ -322,7 +322,7 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         if is_local_helper {
             anyhow::bail!(
                 "检测到 ~/.codex/config.toml 的当前 model_provider 指向本地代理 codex-helper，且未找到备份配置；\
-无法自动推导原始 Codex 上游。请先恢复 ~/.codex/config.toml 后重试，或在 ~/.codex-proxy/config.json 中手动添加 codex 上游配置。"
+无法自动推导原始 Codex 上游。请先恢复 ~/.codex/config.toml 后重试，或在 ~/.codex-helper/config.json 中手动添加 codex 上游配置。"
             );
         }
     }
@@ -426,7 +426,7 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
         Some(s) if !s.trim().is_empty() => s,
         _ => {
             anyhow::bail!(
-                "未找到 Claude Code 配置文件 {:?}（或文件为空），无法自动推导 Claude 上游；请先在 Claude Code 中完成配置，或手动在 ~/.codex-proxy/config.json 中添加 claude 配置",
+                "未找到 Claude Code 配置文件 {:?}（或文件为空），无法自动推导 Claude 上游；请先在 Claude Code 中完成配置，或手动在 ~/.codex-helper/config.json 中添加 claude 配置",
                 settings_path
             );
         }
@@ -465,7 +465,7 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
     if !backup_path.exists() && (base_url.contains("127.0.0.1") || base_url.contains("localhost")) {
         anyhow::bail!(
             "检测到 Claude settings {:?} 的 ANTHROPIC_BASE_URL 指向本地地址 ({base_url})，且未找到备份配置；\
-无法自动推导原始 Claude 上游。请先恢复 Claude 配置后重试，或在 ~/.codex-proxy/config.json 中手动添加 claude 上游配置。",
+无法自动推导原始 Claude 上游。请先恢复 Claude 配置后重试，或在 ~/.codex-helper/config.json 中手动添加 claude 上游配置。",
             settings_path
         );
     }
@@ -509,7 +509,7 @@ pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
             Err(err) => {
                 warn!(
                     "无法从 ~/.codex 引导 Codex 配置: {err}; \
-                     如果尚未安装或配置 Codex CLI 可以忽略，否则请检查 ~/.codex/config.toml 和 ~/.codex/auth.json，或使用 `codex-proxy config add` 手动添加上游"
+                     如果尚未安装或配置 Codex CLI 可以忽略，否则请检查 ~/.codex/config.toml 和 ~/.codex/auth.json，或使用 `codex-helper config add` 手动添加上游"
                 );
             }
         }
@@ -517,7 +517,7 @@ pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
         // 已存在配置但没有 active，提示用户检查
         if cfg.codex.active.is_none() && !cfg.codex.configs.is_empty() {
             warn!(
-                "检测到 Codex 配置但没有激活项，将使用任意一条配置作为默认；如需指定，请使用 `codex-proxy config set-active <name>`"
+                "检测到 Codex 配置但没有激活项，将使用任意一条配置作为默认；如需指定，请使用 `codex-helper config set-active <name>`"
             );
         }
     }
@@ -531,7 +531,7 @@ pub async fn import_codex_config_from_codex_cli(force: bool) -> Result<ProxyConf
     let mut cfg = load_config().await?;
     if !cfg.codex.configs.is_empty() && !force {
         anyhow::bail!(
-            "检测到 ~/.codex-proxy/config.json 中已存在 Codex 配置；如需根据 ~/.codex/config.toml 重新导入，请使用 --force 覆盖"
+            "检测到 ~/.codex-helper/config.json 中已存在 Codex 配置；如需根据 ~/.codex/config.toml 重新导入，请使用 --force 覆盖"
         );
     }
 
@@ -557,7 +557,7 @@ pub async fn load_or_bootstrap_from_claude() -> Result<ProxyConfig> {
             Err(err) => {
                 warn!(
                     "无法从 ~/.claude 引导 Claude 配置: {err}; \
-                     如果尚未安装或配置 Claude Code 可以忽略，否则请检查 ~/.claude/settings.json，或在 ~/.codex-proxy/config.json 中手动添加 claude 配置"
+                     如果尚未安装或配置 Claude Code 可以忽略，否则请检查 ~/.claude/settings.json，或在 ~/.codex-helper/config.json 中手动添加 claude 配置"
                 );
             }
         }

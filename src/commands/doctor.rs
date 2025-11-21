@@ -46,12 +46,12 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
     // Codex section
     if cfg.codex.configs.is_empty() {
         println!(
-            "{} none in ~/.codex-proxy/config.json",
+            "{} none in ~/.codex-helper/config.json",
             "Codex configs:".bold()
         );
     } else {
         let active = cfg.codex.active.as_deref();
-        println!("{}", "Codex configs in ~/.codex-proxy/config.json:".bold());
+        println!("{}", "Codex configs in ~/.codex-helper/config.json:".bold());
         for (name, svc) in &cfg.codex.configs {
             let marker = if Some(name.as_str()) == active {
                 "*"
@@ -82,12 +82,12 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
     // Claude section
     if cfg.claude.configs.is_empty() {
         println!(
-            "{} none in ~/.codex-proxy/config.json",
+            "{} none in ~/.codex-helper/config.json",
             "Claude configs:".bold()
         );
     } else {
         let active = cfg.claude.active.as_deref();
-        println!("{}", "Claude configs in ~/.codex-proxy/config.json:".bold());
+        println!("{}", "Claude configs in ~/.codex-helper/config.json:".bold());
         for (name, svc) in &cfg.claude.configs {
             let marker = if Some(name.as_str()) == active {
                 "*"
@@ -130,7 +130,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         Ok(cfg) => {
             let codex_count = cfg.codex.configs.len();
             if codex_count == 0 {
-                let msg = "检测到 ~/.codex-proxy/config.json 中尚无 Codex upstream 配置；建议使用 `codex-helper config add` 手动添加，或运行 `codex-helper config import-from-codex` 从 Codex CLI 配置导入。".to_string();
+                let msg = "检测到 ~/.codex-helper/config.json 中尚无 Codex upstream 配置；建议使用 `codex-helper config add` 手动添加，或运行 `codex-helper config import-from-codex` 从 Codex CLI 配置导入。".to_string();
                 if !json {
                     println!("{} {}", "[WARN]".yellow(), msg);
                 }
@@ -141,7 +141,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                 });
             } else {
                 let msg = format!(
-                    "已从 ~/.codex-proxy/config.json 读取到 {} 条 Codex 配置（active = {:?}）",
+                    "已从 ~/.codex-helper/config.json 读取到 {} 条 Codex 配置（active = {:?}）",
                     codex_count, cfg.codex.active
                 );
                 if !json {
@@ -156,7 +156,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         }
         Err(err) => {
             let msg = format!(
-                "无法读取 ~/.codex-proxy/config.json：{}；请检查该文件是否为有效 JSON，或尝试备份后删除以重新初始化。",
+                "无法读取 ~/.codex-helper/config.json：{}；请检查该文件是否为有效 JSON，或尝试备份后删除以重新初始化。",
                 err
             );
             if !json {
@@ -355,7 +355,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         }
         Err(err) => {
             let msg = format!(
-                "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-proxy/config.json 中配置上游，但自动导入功能将不可用。",
+                "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-helper/config.json 中配置上游，但自动导入功能将不可用。",
                 err
             );
             if !json {

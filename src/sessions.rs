@@ -56,6 +56,11 @@ pub async fn find_codex_sessions_for_dir(
                         continue;
                     };
 
+                    // Skip sessions with no user messages (e.g. Codex started but no prompt was sent).
+                    if summary.first_user_message.is_none() {
+                        continue;
+                    }
+
                     if summary.is_cwd_match {
                         matched.push(summary);
                     } else {
@@ -84,10 +89,41 @@ pub async fn find_codex_sessions_for_dir(
     }
 }
 
+/// Search Codex sessions for user messages containing the given substring.
+/// Matching is case-insensitive and only considers the first user message per session.
+pub async fn search_codex_sessions_for_dir(
+    root_dir: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SessionSummary>> {
+    let mut sessions = find_codex_sessions_for_dir(root_dir, usize::MAX).await?;
+    let needle = query.to_lowercase();
+    sessions.retain(|s| {
+        s.first_user_message
+            .as_deref()
+            .map(|m| m.to_lowercase().contains(&needle))
+            .unwrap_or(false)
+    });
+    sort_by_updated_desc(&mut sessions);
+    if sessions.len() > limit {
+        sessions.truncate(limit);
+    }
+    Ok(sessions)
+}
+
 /// Convenience wrapper that uses the current working directory as the root for session matching.
 pub async fn find_codex_sessions_for_current_dir(limit: usize) -> Result<Vec<SessionSummary>> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     find_codex_sessions_for_dir(&cwd, limit).await
+}
+
+/// Convenience wrapper to search sessions under the current working directory.
+pub async fn search_codex_sessions_for_current_dir(
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SessionSummary>> {
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    search_codex_sessions_for_dir(&cwd, query, limit).await
 }
 
 async fn summarize_session_for_current_dir(

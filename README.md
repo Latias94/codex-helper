@@ -55,7 +55,7 @@ ch
 - 启动 Codex 本地代理，监听 `127.0.0.1:3211`；
 - 在修改前检查 `~/.codex/config.toml`，如已指向本地代理且存在备份，会询问是否先恢复原始配置；
 - 必要时修改 `model_provider` 与 `model_providers.codex_proxy`，让 Codex 走本地代理，并只在首次写入备份；
-- 如果 `~/.codex-proxy/config.json` 还没初始化，会尝试根据 `~/.codex/config.toml` + `auth.json` 推导一个默认上游；
+- 如果 `~/.codex-helper/config.json` 还没初始化，会尝试根据 `~/.codex/config.toml` + `auth.json` 推导一个默认上游；
 - 用 Ctrl+C 优雅退出时，尝试从备份恢复原始 Codex 配置。
 
 从此之后，你继续用原来的 `codex` 命令即可，所有请求会自动经过 codex-helper。
@@ -84,7 +84,7 @@ codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
   - 自动备份 `~/.codex/config.toml`，用 `codex-helper switch off` 随时恢复。
 
 - **多供应商 / 多 key 集中管理**  
-  - 所有上游配置集中在 `~/.codex-proxy/config.json`；
+  - 所有上游配置集中在 `~/.codex-helper/config.json`；
   - 支持多套 Codex / Claude 配置，每套配置可以挂多个 upstream（号池）；
   - `codex-helper config set-active` 一条命令切换当前在用的那套配置。
 
@@ -99,7 +99,7 @@ codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
 
 - **统一的请求过滤与结构化日志**  
   - 在 `filter.json` 中配置脱敏规则，请求 body 在发出前统一过滤；
-  - 所有请求写入 `~/.codex-proxy/logs/requests.jsonl`，方便用 `jq` 等工具做分析。
+  - 所有请求写入 `~/.codex-helper/logs/requests.jsonl`，方便用 `jq` 等工具做分析。
 
 - **（实验性）Claude Code 支持**  
   - 基于 `~/.claude/settings.json` 自动引导 Claude 上游配置；
@@ -258,10 +258,10 @@ codex-helper session last --path ~/code/my-app
 
 大部分用户只需要前面的命令即可。如果你想做更细粒度的定制，可以关注这几个文件：
 
-- 主配置：`~/.codex-proxy/config.json`
-- 请求过滤：`~/.codex-proxy/filter.json`
-- 用量提供商：`~/.codex-proxy/usage_providers.json`
-- 请求日志：`~/.codex-proxy/logs/requests.jsonl`
+- 主配置：`~/.codex-helper/config.json`
+- 请求过滤：`~/.codex-helper/filter.json`
+- 用量提供商：`~/.codex-helper/usage_providers.json`
+- 请求日志：`~/.codex-helper/logs/requests.jsonl`
 
 Codex 官方文件：
 
@@ -305,7 +305,7 @@ Codex 官方文件：
 
 ### 用量提供商（Usage Providers）
 
-路径：`~/.codex-proxy/usage_providers.json`，示例：
+路径：`~/.codex-helper/usage_providers.json`，示例：
 
 ```jsonc
 {
@@ -330,7 +330,7 @@ Codex 官方文件：
 
 ### 请求过滤与日志
 
-- 过滤规则：`~/.codex-proxy/filter.json`，例如：
+- 过滤规则：`~/.codex-helper/filter.json`，例如：
 
   ```jsonc
   [
@@ -341,7 +341,7 @@ Codex 官方文件：
 
   请求 body 在发出前会按规则进行字节级替换 / 删除，规则根据文件 mtime 约 1 秒内自动刷新。
 
-- 请求日志：`~/.codex-proxy/logs/requests.jsonl`，每行一个 JSON，字段包括：
+- 请求日志：`~/.codex-helper/logs/requests.jsonl`，每行一个 JSON，字段包括：
   - `service`（codex/claude）、`method`、`path`、`status_code`、`duration_ms`；
   - `config_name`、`upstream_base_url`；
   - `usage`（input/output/total_tokens 等）。

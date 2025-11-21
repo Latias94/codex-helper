@@ -21,7 +21,7 @@ fn codex_config_path() -> PathBuf {
 }
 
 fn codex_config_backup_path() -> PathBuf {
-    codex_home().join("config.toml.codex-proxy-backup")
+    codex_home().join("config.toml.codex-helper-backup")
 }
 
 fn read_config_text(path: &PathBuf) -> Result<String> {
@@ -39,7 +39,7 @@ fn atomic_write(path: &PathBuf, data: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create_dir_all {:?}", parent))?;
     }
-    let tmp = path.with_extension("tmp.codex-proxy");
+    let tmp = path.with_extension("tmp.codex-helper");
     {
         let mut f = fs::File::create(&tmp).with_context(|| format!("create {:?}", tmp))?;
         f.write_all(data.as_bytes())
@@ -50,7 +50,7 @@ fn atomic_write(path: &PathBuf, data: &str) -> Result<()> {
     Ok(())
 }
 
-/// Switch Codex to use the local codex-proxy model provider.
+/// Switch Codex to use the local codex-helper model provider.
 pub fn switch_on(port: u16) -> Result<()> {
     let cfg_path = codex_config_path();
     let backup_path = codex_config_backup_path();
@@ -162,7 +162,7 @@ pub fn guard_codex_config_before_switch_on_interactive() -> Result<()> {
 
     // 仅当当前 provider 看起来是“本地 codex-helper 代理”时才触发守护逻辑。
     let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
-    let is_helper_name = name == "codex-helper" || name == "codex-proxy";
+    let is_helper_name = name == "codex-helper" || name == "codex-helper";
     if !is_local && !is_helper_name {
         return Ok(());
     }
