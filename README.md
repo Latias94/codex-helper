@@ -77,34 +77,55 @@ codex-helper default --claude   # 将默认目标服务改为 Claude（实验）
 
 ---
 
-## 核心功能一览
+## 常见配置：多上游自动切换
 
-- **一键让 Codex 走本地代理**  
-  - `codex-helper switch on` 一次切换，Codex CLI 所有流量走本地代理；
-  - 自动备份 `~/.codex/config.toml`，用 `codex-helper switch off` 随时恢复。
+最常见、也是最“物有所值”的用法，是让 codex-helper 在多个上游之间自动切换：
 
-- **多供应商 / 多 key 集中管理**  
-  - 所有上游配置集中在 `~/.codex-helper/config.json`；
-  - 支持多套 Codex / Claude 配置，每套配置可以挂多个 upstream（号池）；
-  - `codex-helper config set-active` 一条命令切换当前在用的那套配置。
+- 某条线路频繁失败（例如 5xx / 连接失败）；
+- 或被用量提供商标记为“额度用尽”（`usage_exhausted = true`）；
+- 在这种情况下，LB 会优先选择同一配置下的其他 upstream 作为备份。
 
-- **用量感知 + 自动切换（默认适配 Packy）**  
-  - 内置 usage provider 机制；
-  - 在某个 upstream 额度用尽时自动标记为“用尽”，优先走其他线路；
-  - 所有线路都被标记用尽时仍然兜底选一个，避免完全断流。
+**关键点：主线路 + 备份线路要放在同一个配置的 `upstreams` 里，而不是拆成两个平级配置。**
 
-- **命令行里快速找回 Codex 会话**  
-  - `codex-helper session list`：按“当前项目（cwd/父目录/子目录）”优先列出最近会话；
-  - `codex-helper session last`：直接给出最近一次会话以及 `codex resume <ID>` 命令。
+示例（`~/.codex-helper/config.json`）：
 
-- **统一的请求过滤与结构化日志**  
-  - 在 `filter.json` 中配置脱敏规则，请求 body 在发出前统一过滤；
-  - 所有请求写入 `~/.codex-helper/logs/requests.jsonl`，方便用 `jq` 等工具做分析。
+```jsonc
+{
+  "version": 1,
+  "codex": {
+    "active": "codex-main",
+    "configs": {
+      "codex-main": {
+        "name": "codex-main",
+        "alias": null,
+        "upstreams": [
+          {
+            "base_url": "https://codex-api.packycode.com/v1",
+            "auth": { "auth_token": "sk-packy-..." },
+            "tags": { "provider_id": "packycode", "source": "codex-config" }
+          },
+          {
+            "base_url": "https://co.yes.vg/v1",
+            "auth": { "auth_token": "cr-..." },
+            "tags": { "provider_id": "yes", "source": "codex-config" }
+          }
+        ]
+      }
+    }
+  },
+  "claude": { "active": null, "configs": {} },
+  "default_service": null
+}
+```
 
-- **（实验性）Claude Code 支持**  
-  - 基于 `~/.claude/settings.json` 自动引导 Claude 上游配置；
-  - `codex-helper switch on --claude` / `serve --claude` 将 Claude Code 指向本地代理（默认 3210），并带备份与守护逻辑；
-  - 由于 Claude 自身更新较快，此部分暂视为实验特性。
+在这份配置下：
+
+- `active = "codex-main"` → 负载均衡器会在 `upstreams[0]`（Packy）和 `upstreams[1]`（Yes）之间选择；
+- 当某个 upstream：
+  - 连续失败达到阈值（`FAILURE_THRESHOLD`，见 `src/lb.rs`），或
+  - 被 `usage_providers` 标记为 `usage_exhausted = true`  
+  时，LB 会优先避开它，尽量选择列表中的其他 upstream；
+- 所有 upstream 都被视为“不可用”时，仍会兜底返回第一个，避免完全断流。
 
 ---
 
@@ -360,4 +381,3 @@ codex-helper 借鉴了它们的设计思路，但定位更轻量：
 - 专注 Codex CLI（附带实验性的 Claude 支持）；
 - 单一二进制，无守护进程、无 Web UI；
 - 更适合作为你日常使用的“命令行小助手”，或者集成进你自己的脚本 / 工具链中。
-

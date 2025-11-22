@@ -81,34 +81,50 @@ codex-helper default
 
 ---
 
-## Key capabilities
+## Common configuration: multi-upstream failover
 
-- **Seamlessly put Codex behind a local proxy**  
-  - `codex-helper switch on` rewrites `~/.codex/config.toml` once so that all Codex traffic goes through the local proxy;
-  - The original config is backed up and can be restored via `codex-helper switch off`.
+The most common and powerful way to use codex-helper is to let it **fail over between multiple upstreams automatically** when one is failing or out of quota.
 
-- **Centralize multiple keys / providers / relays**  
-  - All upstream definitions live in `~/.codex-helper/config.json`;
-  - You can define multiple Codex / Claude configs, each with its own upstream pool;
-  - Switch the active config with `codex-helper config set-active`, then restart or re-run `codex-helper`.
+The key idea: put your primary and backup upstreams **in the same config’s `upstreams` array**, instead of as separate configs.
 
-- **Usage-aware routing (“auto-switch when quota is exhausted”)**  
-  - A pluggable usage provider layer can mark upstreams as “exhausted” when quotas are out;
-  - Ships with a default provider for **Packy** (configured via domains, not hardcoded);
-  - LB prefers non-exhausted, non-cooled-down upstreams, with a fallback mode that always keeps at least one upstream usable.
+Example `~/.codex-helper/config.json`:
 
-- **Session helpers for Codex**  
-  - `codex-helper session list` scans `~/.codex/sessions` and prefers sessions whose `cwd` matches the current project (cwd / parents / children);
-  - `codex-helper session last` prints the last session for the current project plus a ready-to-copy `codex resume <ID>` command.
+```jsonc
+{
+  "version": 1,
+  "codex": {
+    "active": "codex-main",
+    "configs": {
+      "codex-main": {
+        "name": "codex-main",
+        "alias": null,
+        "upstreams": [
+          {
+            "base_url": "https://codex-api.packycode.com/v1",
+            "auth": { "auth_token": "sk-packy-..." },
+            "tags": { "provider_id": "packycode", "source": "codex-config" }
+          },
+          {
+            "base_url": "https://co.yes.vg/v1",
+            "auth": { "auth_token": "cr-..." },
+            "tags": { "provider_id": "yes", "source": "codex-config" }
+          }
+        ]
+      }
+    }
+  },
+  "claude": { "active": null, "configs": {} },
+  "default_service": null
+}
+```
 
-- **Request filtering and structured request logging**  
-  - Redaction/removal rules from `~/.codex-helper/filter.json` are applied to request bodies before sending upstream;
-  - Every request is logged to `~/.codex-helper/logs/requests.jsonl` with method, path, status, duration, and usage metrics.
+With this layout:
 
-- **(Experimental) Claude Code support**  
-  - Can bootstrap Claude upstreams from `~/.claude/settings.json` (or `claude.json`) by reading `env.ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`;
-  - Supports `codex-helper switch on --claude` / `serve --claude` to point Claude Code at the local proxy, with backups and guards around `settings.json`;
-  - Behavior may evolve as Claude’s config format changes.
+- `active = "codex-main"` → the load balancer chooses between `upstreams[0]` (Packy) and `upstreams[1]` (Yes);
+- when an upstream either:
+  - exceeds the failure threshold (`FAILURE_THRESHOLD` in `src/lb.rs:6`), or
+  - is marked `usage_exhausted = true` by `usage_providers`,
+  the LB will prefer the other upstream whenever possible.
 
 ---
 
@@ -380,4 +396,3 @@ codex-helper takes inspiration from both, but stays deliberately lightweight:
 - focused on Codex CLI (with experimental Claude support);
 - single binary, no daemon, no Web UI;
 - designed to be a small CLI companion you can run ad hoc, or embed into your own scripts and tooling.
-
