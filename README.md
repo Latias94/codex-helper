@@ -57,6 +57,7 @@ ch
 - 对 429/5xx/网络抖动等瞬态错误在**未开始向客户端输出响应**前进行有限次数的自动重试（可配置）；
 - 在修改前检查 `~/.codex/config.toml`，如已指向本地代理且存在备份，会询问是否先恢复原始配置；
 - 必要时修改 `model_provider` 与 `model_providers.codex_proxy`，让 Codex 走本地代理，并只在首次写入备份；
+- 写入 `model_providers.codex_proxy` 时，默认设置 `request_max_retries = 0` 以避免“Codex 重试 + codex-helper 重试”叠加（你也可以在 `~/.codex/config.toml` 中手动覆盖）；
 - 如果 `~/.codex-helper/config.json` 还没初始化，会尝试根据 `~/.codex/config.toml` + `auth.json` 推导一个默认上游；
 - 用 Ctrl+C 或在 TUI 中按 `q` 退出时，尝试从备份恢复原始 Codex 配置。
 

@@ -892,15 +892,22 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("create cwd dir");
         let cwd_str = cwd.to_str().expect("cwd utf8");
 
-        let meta_line = format!(
-            r#"{{"timestamp":"2025-12-22T00:00:00.000Z","type":"session_meta","payload":{{"id":"sid-1","cwd":"{cwd_str}","timestamp":"2025-12-22T00:00:00.000Z"}}}}"#
-        );
-        let lines = [
-            meta_line.as_str(),
-            r#"{"timestamp":"2025-12-22T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
-            r#"{"timestamp":"2025-12-22T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#,
-            r#"{"timestamp":"2025-12-22T00:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"next"}}"#,
-            r#"{"timestamp":"2025-12-22T00:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+        let meta_line = serde_json::json!({
+            "timestamp": "2025-12-22T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "sid-1",
+                "cwd": cwd_str,
+                "timestamp": "2025-12-22T00:00:00.000Z"
+            }
+        })
+        .to_string();
+        let lines = vec![
+            meta_line,
+            r#"{"timestamp":"2025-12-22T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#.to_string(),
+            r#"{"timestamp":"2025-12-22T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#.to_string(),
+            r#"{"timestamp":"2025-12-22T00:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"next"}}"#.to_string(),
+            r#"{"timestamp":"2025-12-22T00:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#.to_string(),
         ]
         .join("\n");
         std::fs::write(&path, lines).expect("write session file");

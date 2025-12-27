@@ -55,6 +55,7 @@ This will:
 
 - Start a Codex proxy on `127.0.0.1:3211`;
 - Guard and, if needed, rewrite `~/.codex/config.toml` to point Codex at the local proxy (backing up the original config on first run);
+- When writing `model_providers.codex_proxy`, set `request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries); you can override it in `~/.codex/config.toml`;
 - Automatically retry a small number of times for transient failures (429/5xx/network hiccups) **before any response bytes are streamed to the client** (configurable);
 - If `~/.codex-helper/config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
 - If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit);
@@ -103,7 +104,7 @@ With this layout:
 
 - `active = "codex-main"` → the load balancer chooses between `upstreams[0]` (Packy) and `upstreams[1]` (Yes);
 - when an upstream either:
-  - exceeds the failure threshold (`FAILURE_THRESHOLD` in `src/lb.rs:6`), or
+  - exceeds the failure threshold (`FAILURE_THRESHOLD` in `src/lb.rs`), or
   - is marked `usage_exhausted = true` by `usage_providers`,
   the LB will prefer the other upstream whenever possible.
 

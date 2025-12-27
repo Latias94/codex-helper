@@ -87,10 +87,18 @@ pub fn switch_on(port: u16) -> Result<()> {
         .ok_or_else(|| anyhow!("model_providers must be a table"))?;
 
     let base_url = format!("http://127.0.0.1:{}", port);
-    let mut proxy_table = toml::Table::new();
+    let mut proxy_table = providers_table
+        .get("codex_proxy")
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_else(toml::Table::new);
     proxy_table.insert("name".into(), Value::String("codex-helper".into()));
     proxy_table.insert("base_url".into(), Value::String(base_url));
     proxy_table.insert("wire_api".into(), Value::String("responses".into()));
+    // Avoid double-retry (Codex retries + codex-helper retries) by default.
+    proxy_table
+        .entry("request_max_retries")
+        .or_insert(Value::Integer(0));
 
     providers_table.insert("codex_proxy".into(), Value::Table(proxy_table));
     table.insert("model_provider".into(), Value::String("codex_proxy".into()));

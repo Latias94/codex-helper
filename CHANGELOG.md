@@ -1,6 +1,15 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2025-12-27
+### Changed
+- `switch on` now sets `model_providers.codex_proxy.request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries), while preserving any user-defined value.
+- Proxy module refactor: split `proxy.rs` into `src/proxy/*` to make retry/streaming logic easier to reason about and test.
+
+### Fixed
+- Streaming (SSE) upstream disconnects now count as upstream failures and apply a cooldown penalty, improving failover when Codex retries the stream.
+- `retry.attempts` no longer counts `all_upstreams_avoided` marker entries.
+
 ## [0.4.0] - 2025-12-23
 ### Added
 - `session list/search` now shows rounds/turn counts and `last_response_at` (and includes these fields in `session export`).
