@@ -41,7 +41,7 @@ pub type CliResult<T> = Result<T, CliError>;
 
 #[derive(Debug)]
 pub enum CliError {
-    /// Errors related to codex-helper's own config.json
+    /// Errors related to codex-helper's config (config.json/config.toml)
     ProxyConfig(String),
     /// Errors while reading or interpreting Codex CLI config/auth files
     CodexConfig(String),
@@ -212,7 +212,13 @@ enum SwitchCommand {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
-    /// List configs in ~/.codex-helper/config.json
+    /// Initialize a commented config template (TOML)
+    Init {
+        /// Overwrite existing config.toml (backing up to config.toml.bak)
+        #[arg(long)]
+        force: bool,
+    },
+    /// List configs in ~/.codex-helper/config.toml (or config.json)
     List {
         /// Target Codex configs (default if neither flag is set)
         #[arg(long)]
@@ -257,9 +263,9 @@ enum ConfigCommand {
         #[arg(long)]
         claude: bool,
     },
-    /// Import Codex upstream config from ~/.codex/config.toml + auth.json into ~/.codex-helper/config.json
+    /// Import Codex upstream config from ~/.codex/config.toml + auth.json into ~/.codex-helper/config (toml/json)
     ImportFromCodex {
-        /// Overwrite existing Codex configs in ~/.codex-helper/config.json
+        /// Overwrite existing Codex configs in ~/.codex-helper/config (toml/json)
         #[arg(long)]
         force: bool,
     },
@@ -619,7 +625,7 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
     if service_name == "codex" {
         if cfg.codex.configs.is_empty() || cfg.codex.active_config().is_none() {
             anyhow::bail!(
-                "未找到任何可用的 Codex 上游配置，请先确保 ~/.codex/config.toml 与 ~/.codex/auth.json 配置完整，或手动编辑 ~/.codex-helper/config.json 添加配置"
+                "未找到任何可用的 Codex 上游配置，请先确保 ~/.codex/config.toml 与 ~/.codex/auth.json 配置完整，或手动编辑 ~/.codex-helper/config.toml（或 config.json）添加配置"
             );
         }
     } else if service_name == "claude"
@@ -627,7 +633,7 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
     {
         anyhow::bail!(
             "未找到任何可用的 Claude 上游配置，请先确保 ~/.claude/settings.json 配置完整，\
-或在 ~/.codex-helper/config.json 的 `claude` 段下手动添加上游配置"
+或在 ~/.codex-helper/config.toml（或 config.json）的 `claude` 段下手动添加上游配置"
         );
     }
     let client = Client::builder().build()?;

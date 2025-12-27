@@ -57,7 +57,7 @@ This will:
 - Guard and, if needed, rewrite `~/.codex/config.toml` to point Codex at the local proxy (backing up the original config on first run);
 - When writing `model_providers.codex_proxy`, set `request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries); you can override it in `~/.codex/config.toml`;
 - Automatically retry a small number of times for transient failures (429/5xx/network hiccups) **before any response bytes are streamed to the client** (configurable);
-- If `~/.codex-helper/config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
+- If `~/.codex-helper/config.toml` / `config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
 - If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit);
 - On Ctrl+C, attempt to restore the original Codex config from the backup.
 
@@ -82,23 +82,22 @@ notify = ["codex-helper", "notify", "codex"]
 
 > This is independent from `tui.notifications`. You can use both.
 
-### 2) Enable notifications in `~/.codex-helper/config.json` (default: off)
+### 2) Enable notifications in `~/.codex-helper/config.toml` (or `config.json`) (default: off)
 
 Add (or edit) the `notify` section:
 
-```jsonc
-{
-  "notify": {
-    "enabled": true,
-    "system": { "enabled": true },
-    "policy": {
-      "min_duration_ms": 60000,
-      "global_cooldown_ms": 60000,
-      "merge_window_ms": 10000,
-      "per_thread_cooldown_ms": 180000
-    }
-  }
-}
+```toml
+[notify]
+enabled = true
+
+[notify.system]
+enabled = true
+
+[notify.policy]
+min_duration_ms = 60000
+global_cooldown_ms = 60000
+merge_window_ms = 10000
+per_thread_cooldown_ms = 180000
 ```
 
 Notes:
@@ -291,7 +290,7 @@ This is especially handy when juggling multiple side projects: you don’t need 
 
 Most users do not need to touch these. If you want deeper customization, these files are relevant:
 
-- Main config: `~/.codex-helper/config.json`
+- Main config: `~/.codex-helper/config.toml` (preferred) or `~/.codex-helper/config.json` (legacy). If both exist, `config.toml` wins.
 - Filter rules: `~/.codex-helper/filter.json`
 - Usage providers: `~/.codex-helper/usage_providers.json`
 - Request logs: `~/.codex-helper/logs/requests.jsonl`
@@ -303,7 +302,7 @@ Codex official files:
 - `~/.codex/auth.json`: managed by `codex login`; codex-helper only reads it.
 - `~/.codex/config.toml`: managed by Codex CLI; codex-helper touches it only via `switch on/off`.
 
-### `config.json` structure (brief)
+### Config structure (brief)
 
 ```jsonc
 {

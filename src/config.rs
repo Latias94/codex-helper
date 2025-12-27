@@ -225,6 +225,24 @@ fn config_backup_path() -> PathBuf {
     config_dir().join("config.json.bak")
 }
 
+fn config_toml_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+fn config_toml_backup_path() -> PathBuf {
+    config_dir().join("config.toml.bak")
+}
+
+/// Return the primary config file path that will be used by `load_config()`.
+pub fn config_file_path() -> PathBuf {
+    let toml_path = config_toml_path();
+    if toml_path.exists() {
+        toml_path
+    } else {
+        config_path()
+    }
+}
+
 const CONFIG_VERSION: u32 = 1;
 
 fn ensure_config_version(cfg: &mut ProxyConfig) {
@@ -233,15 +251,139 @@ fn ensure_config_version(cfg: &mut ProxyConfig) {
     }
 }
 
+const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
+#
+# This file is optional. If present, codex-helper will prefer it over config.json.
+# - To generate a commented template: `codex-helper config init`
+# - To keep config secrets off disk, prefer *_env fields (e.g. auth_token_env/api_key_env).
+#
+# Note: some commands may rewrite this file; the header is preserved to keep the docs close to the config.
+"#;
+
+const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
+#
+# codex-helper supports both config.json and config.toml:
+# - If `config.toml` exists, it takes precedence over `config.json`.
+# - Otherwise `config.json` is used (backward-compatible default).
+#
+# This template focuses on discoverability: it includes commented examples.
+#
+# Paths:
+# - Linux/macOS: ~/.codex-helper/config.toml
+# - Windows:     %USERPROFILE%\.codex-helper\config.toml
+
+version = 1
+
+# Which service to use by default when you omit --codex/--claude.
+# default_service = "codex"
+# default_service = "claude"
+
+# --- Notify integration (Codex `notify` hook) ---
+#
+# To enable:
+# 1) In ~/.codex/config.toml:
+#      notify = ["codex-helper", "notify", "codex"]
+# 2) Here:
+#      notify.enabled = true
+#      notify.system.enabled = true
+#
+[notify]
+enabled = false
+
+[notify.system]
+# System notifications are supported on:
+# - Windows: toast via powershell.exe
+# - macOS: `osascript`
+enabled = false
+
+[notify.policy]
+# D: duration-based filter (milliseconds)
+min_duration_ms = 60000
+
+# A: merge + rate-limit (milliseconds)
+merge_window_ms = 10000
+global_cooldown_ms = 60000
+per_thread_cooldown_ms = 180000
+
+# How far back to look in proxy /__codex_helper/status/recent (milliseconds)
+recent_search_window_ms = 300000
+# HTTP timeout for the proxy recent endpoint (milliseconds)
+recent_endpoint_timeout_ms = 500
+
+[notify.exec]
+# Optional callback sink: run a command and write aggregated JSON to stdin.
+enabled = false
+# command = ["python", "my_hook.py"]
+
+# --- Upstream configs ---
+#
+# You can configure multiple upstreams per config for failover.
+#
+# [codex]
+# active = "codex-main"
+#
+# [codex.configs.codex-main]
+# name = "codex-main"
+# alias = "primary+backup"
+#
+# [[codex.configs.codex-main.upstreams]]
+# base_url = "https://api.openai.com/v1"
+# [codex.configs.codex-main.upstreams.auth]
+# auth_token_env = "OPENAI_API_KEY"
+# [codex.configs.codex-main.upstreams.tags]
+# provider_id = "openai"
+#
+# [[codex.configs.codex-main.upstreams]]
+# base_url = "https://your-backup-provider.example/v1"
+# [codex.configs.codex-main.upstreams.auth]
+# api_key_env = "BACKUP_API_KEY"
+# [codex.configs.codex-main.upstreams.tags]
+# provider_id = "backup"
+"#;
+
+pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
+    let dir = config_dir();
+    fs::create_dir_all(&dir).await?;
+    let path = config_toml_path();
+    let backup_path = config_toml_backup_path();
+
+    if path.exists() && !force {
+        anyhow::bail!(
+            "config.toml already exists at {:?}; use --force to overwrite",
+            path
+        );
+    }
+
+    if path.exists()
+        && let Err(err) = fs::copy(&path, &backup_path).await
+    {
+        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+    }
+
+    let tmp_path = dir.join("config.toml.tmp");
+    fs::write(&tmp_path, CONFIG_TOML_TEMPLATE.as_bytes()).await?;
+    fs::rename(&tmp_path, &path).await?;
+    Ok(path)
+}
+
 pub async fn load_config() -> Result<ProxyConfig> {
-    let path = config_path();
-    if !path.exists() {
-        let mut cfg = ProxyConfig::default();
+    let toml_path = config_toml_path();
+    if toml_path.exists() {
+        let text = fs::read_to_string(&toml_path).await?;
+        let mut cfg = toml::from_str::<ProxyConfig>(&text)?;
         ensure_config_version(&mut cfg);
         return Ok(cfg);
     }
-    let bytes = fs::read(path).await?;
-    let mut cfg = serde_json::from_slice::<ProxyConfig>(&bytes)?;
+
+    let json_path = config_path();
+    if json_path.exists() {
+        let bytes = fs::read(json_path).await?;
+        let mut cfg = serde_json::from_slice::<ProxyConfig>(&bytes)?;
+        ensure_config_version(&mut cfg);
+        return Ok(cfg);
+    }
+
+    let mut cfg = ProxyConfig::default();
     ensure_config_version(&mut cfg);
     Ok(cfg)
 }
@@ -252,9 +394,18 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
 
     let dir = config_dir();
     fs::create_dir_all(&dir).await?;
-    let path = config_path();
-    let backup_path = config_backup_path();
-    let data = serde_json::to_vec_pretty(&cfg)?;
+    let toml_path = config_toml_path();
+    let (path, backup_path, data) = if toml_path.exists() {
+        let body = toml::to_string_pretty(&cfg)?;
+        let text = format!("{CONFIG_TOML_DOC_HEADER}\n{body}");
+        (toml_path, config_toml_backup_path(), text.into_bytes())
+    } else {
+        (
+            config_path(),
+            config_backup_path(),
+            serde_json::to_vec_pretty(&cfg)?,
+        )
+    };
 
     // 先备份旧文件（若存在），再采用临时文件 + rename 方式原子写入，尽量避免配置损坏。
     if path.exists()
@@ -263,7 +414,7 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
         warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
     }
 
-    let tmp_path = dir.join("config.json.tmp");
+    let tmp_path = dir.join("config.tmp");
     fs::write(&tmp_path, &data).await?;
     fs::rename(&tmp_path, &path).await?;
     Ok(())
@@ -906,6 +1057,8 @@ mod tests {
             scoped.set("CODEX_HOME", &dir);
             // 将 HOME 也指向该目录，确保 proxy_home_dir()/config.json 也被隔离在测试目录中。
             scoped.set("HOME", &dir);
+            // Windows: dirs::home_dir() prefers USERPROFILE.
+            scoped.set("USERPROFILE", &dir);
             // 避免本机真实环境变量（例如 OPENAI_API_KEY）影响测试断言。
             scoped.set_str("OPENAI_API_KEY", "");
             scoped.set_str("MISTRAL_API_KEY", "");
@@ -924,6 +1077,42 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create parent dirs");
         }
         std::fs::write(path, content).expect("write test file");
+    }
+
+    #[test]
+    fn load_config_prefers_toml_over_json() {
+        let env = setup_temp_codex_home();
+        let home = env.home.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let json_path = dir.join("config.json");
+            let toml_path = dir.join("config.toml");
+
+            // JSON sets notify.enabled=false
+            write_file(&json_path, r#"{"version":1,"notify":{"enabled":false}}"#);
+
+            // TOML overrides notify.enabled=true
+            write_file(
+                &toml_path,
+                r#"
+version = 1
+
+[notify]
+enabled = true
+"#,
+            );
+
+            let cfg = super::load_config().await.expect("load_config");
+            assert!(
+                cfg.notify.enabled,
+                "expected config.toml to take precedence over config.json (home={:?})",
+                home
+            );
+        });
     }
 
     #[test]
@@ -1052,7 +1241,9 @@ env_key = "RIGHTCODE_API_KEY"
 
             // 确保 proxy 配置文件起始不存在
             let proxy_cfg_path = super::proxy_home_dir().join("config.json");
+            let proxy_cfg_toml_path = super::proxy_home_dir().join("config.toml");
             let _ = std::fs::remove_file(&proxy_cfg_path);
+            let _ = std::fs::remove_file(&proxy_cfg_toml_path);
 
             let cfg = super::load_or_bootstrap_for_service(ServiceKind::Codex)
                 .await

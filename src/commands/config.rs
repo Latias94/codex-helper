@@ -1,6 +1,6 @@
 use crate::config::{
-    ServiceConfig, ServiceKind, UpstreamAuth, UpstreamConfig, import_codex_config_from_codex_cli,
-    load_config, save_config,
+    ServiceConfig, ServiceKind, UpstreamAuth, UpstreamConfig, config_file_path,
+    import_codex_config_from_codex_cli, init_config_toml, load_config, save_config,
 };
 use crate::{CliError, CliResult, ConfigCommand};
 
@@ -27,6 +27,12 @@ async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result<&'static s
 
 pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
     match cmd {
+        ConfigCommand::Init { force } => {
+            let path = init_config_toml(force)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            println!("Wrote TOML config template to {:?}", path);
+        }
         ConfigCommand::List { codex, claude } => {
             let service = resolve_service(codex, claude)
                 .await
@@ -39,12 +45,13 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             } else {
                 (&cfg.codex, "Codex")
             };
+            let cfg_path = config_file_path();
 
             if mgr.configs.is_empty() {
-                println!("No {} configs in ~/.codex-helper/config.json", label);
+                println!("No {} configs in {:?}", label, cfg_path);
             } else {
                 let active = mgr.active.clone();
-                println!("{} configs:", label);
+                println!("{} configs (from {:?}):", label, cfg_path);
                 for (name, service_cfg) in &mgr.configs {
                     let marker = if Some(name) == active.as_ref() {
                         "*"
