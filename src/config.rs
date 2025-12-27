@@ -238,8 +238,10 @@ pub fn config_file_path() -> PathBuf {
     let toml_path = config_toml_path();
     if toml_path.exists() {
         toml_path
-    } else {
+    } else if config_path().exists() {
         config_path()
+    } else {
+        toml_path
     }
 }
 
@@ -395,13 +397,14 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
     let dir = config_dir();
     fs::create_dir_all(&dir).await?;
     let toml_path = config_toml_path();
-    let (path, backup_path, data) = if toml_path.exists() {
+    let json_path = config_path();
+    let (path, backup_path, data) = if toml_path.exists() || !json_path.exists() {
         let body = toml::to_string_pretty(&cfg)?;
         let text = format!("{CONFIG_TOML_DOC_HEADER}\n{body}");
         (toml_path, config_toml_backup_path(), text.into_bytes())
     } else {
         (
-            config_path(),
+            json_path,
             config_backup_path(),
             serde_json::to_vec_pretty(&cfg)?,
         )
@@ -1259,11 +1262,16 @@ env_key = "RIGHTCODE_API_KEY"
                 Some("RIGHTCODE_API_KEY")
             );
 
-            // 并且应已将配置写入到 proxy_home_dir()/config.json
-            let text = std::fs::read_to_string(&proxy_cfg_path)
-                .expect("config.json should be written by load_or_bootstrap");
+            // 并且应已将配置写入到 proxy_home_dir()/config.toml（fresh install defaults to TOML）
+            let text = std::fs::read_to_string(&proxy_cfg_toml_path)
+                .expect("config.toml should be written by load_or_bootstrap");
+            let text = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
             let loaded: ProxyConfig =
-                serde_json::from_str(&text).expect("config.json should be valid ProxyConfig");
+                toml::from_str(&text).expect("config.toml should be valid ProxyConfig");
             let svc2 = loaded.codex.active_config().expect("active codex config");
             assert_eq!(svc2.name, "right");
             assert!(svc2.upstreams[0].auth.auth_token.is_none());
