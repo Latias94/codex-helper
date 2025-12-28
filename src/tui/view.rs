@@ -1,0 +1,806 @@
+use std::time::Duration;
+
+use ratatui::Frame;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
+use ratatui::prelude::{Buffer, Color, Line, Modifier, Span, Style, Text};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table, Wrap,
+};
+
+use super::model::{
+    Palette, ProviderOption, Snapshot, basename, format_age, now_ms, short_sid, shorten,
+    status_style, tokens_short, usage_line,
+};
+use super::state::UiState;
+use super::types::{EffortChoice, Focus, Overlay, Page, page_index, page_titles};
+
+pub(in crate::tui) fn render_app(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    service_name: &'static str,
+    port: u16,
+    providers: &[ProviderOption],
+) {
+    f.render_widget(BackgroundWidget { p }, f.area());
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    render_header(f, p, ui, snapshot, service_name, port, outer[0]);
+    render_body(f, p, ui, snapshot, providers, outer[1]);
+    render_footer(f, p, ui, outer[2]);
+
+    match ui.overlay {
+        Overlay::None => {}
+        Overlay::Help => render_help_modal(f, p),
+        Overlay::EffortMenu => render_effort_modal(f, p, ui),
+        Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
+            let title = match ui.overlay {
+                Overlay::ProviderMenuSession => "Session provider override",
+                Overlay::ProviderMenuGlobal => "Global provider override",
+                _ => unreachable!(),
+            };
+            render_provider_modal(f, p, ui, providers, title);
+        }
+    }
+}
+
+fn render_header(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &UiState,
+    snapshot: &Snapshot,
+    service_name: &'static str,
+    port: u16,
+    area: Rect,
+) {
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let active_total = snapshot.rows.iter().map(|r| r.active_count).sum::<usize>();
+    let recent_err = snapshot
+        .recent
+        .iter()
+        .take(80)
+        .filter(|r| r.status_code >= 400)
+        .count();
+    let updated = snapshot.refreshed_at.elapsed().as_millis();
+    let overrides_effort = snapshot.overrides.len();
+    let overrides_cfg = snapshot.config_overrides.len();
+
+    let global_cfg = snapshot
+        .global_override
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("-");
+    let focus = match ui.focus {
+        Focus::Sessions => "Sessions",
+        Focus::Requests => "Requests",
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            "codex-helper",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{service_name}:{port}"),
+            Style::default().fg(p.muted),
+        ),
+        Span::raw("  "),
+        Span::styled(format!("focus: {focus}"), Style::default().fg(p.muted)),
+    ]);
+
+    let subtitle = Line::from(vec![
+        Span::styled("active ", Style::default().fg(p.muted)),
+        Span::styled(active_total.to_string(), Style::default().fg(p.good)),
+        Span::raw("   "),
+        Span::styled("errors(80) ", Style::default().fg(p.muted)),
+        Span::styled(
+            recent_err.to_string(),
+            Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
+        ),
+        Span::raw("   "),
+        Span::styled("overrides ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{overrides_effort}/{overrides_cfg}"),
+            Style::default().fg(p.muted),
+        ),
+        Span::raw("   "),
+        Span::styled("cfg(global) ", Style::default().fg(p.muted)),
+        Span::styled(global_cfg.to_string(), Style::default().fg(p.accent)),
+        Span::raw("   "),
+        Span::styled("updated ", Style::default().fg(p.muted)),
+        Span::styled(format!("{updated}ms"), Style::default().fg(p.muted)),
+    ]);
+
+    let tabs = ratatui::widgets::Tabs::new(
+        page_titles()
+            .iter()
+            .map(|t| Line::from(*t))
+            .collect::<Vec<_>>(),
+    )
+    .select(page_index(ui.page))
+    .style(Style::default().fg(p.muted))
+    .highlight_style(Style::default().fg(p.text).add_modifier(Modifier::BOLD))
+    .divider(Span::raw("  "));
+
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(p.border));
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(Text::from(title)), chunks[0]);
+    f.render_widget(Paragraph::new(Text::from(subtitle)), chunks[1]);
+    f.render_widget(tabs, chunks[2]);
+}
+
+fn render_body(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    providers: &[ProviderOption],
+    area: Rect,
+) {
+    let area = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+
+    match ui.page {
+        Page::Dashboard => render_dashboard(f, p, ui, snapshot, providers, area),
+        Page::Sessions => render_placeholder(f, p, "Sessions view (coming soon)", area),
+        Page::Requests => render_placeholder(f, p, "Requests view (coming soon)", area),
+        Page::Settings => render_placeholder(f, p, "Settings view (coming soon)", area),
+    }
+}
+
+fn render_placeholder(f: &mut Frame<'_>, p: Palette, title: &str, area: Rect) {
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border))
+        .style(Style::default().bg(p.panel));
+    f.render_widget(block, area);
+    let content = Paragraph::new("This page is reserved for future operations and workflows.")
+        .style(Style::default().fg(p.muted))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    f.render_widget(content, area);
+}
+
+fn render_dashboard(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    providers: &[ProviderOption],
+    area: Rect,
+) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    render_sessions_panel(f, p, ui, snapshot, columns[0]);
+    render_details_and_requests(f, p, ui, snapshot, providers, columns[1]);
+}
+
+fn render_sessions_panel(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    area: Rect,
+) {
+    let title = Span::styled(
+        "Sessions",
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    );
+    let focused = ui.focus == Focus::Sessions && ui.overlay == Overlay::None;
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { p.focus } else { p.border }))
+        .style(Style::default().bg(p.panel));
+
+    let now = now_ms();
+
+    let header = Row::new(vec![
+        Cell::from(Span::styled("Session", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("CWD", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("A", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("Last", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("Age", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("ΣTok", Style::default().fg(p.muted))),
+    ])
+    .height(1)
+    .style(Style::default().bg(p.panel));
+
+    let rows = snapshot
+        .rows
+        .iter()
+        .map(|r| {
+            let sid = r
+                .session_id
+                .as_deref()
+                .map(|s| short_sid(s, 12))
+                .unwrap_or_else(|| "-".to_string());
+
+            let cwd = r
+                .cwd
+                .as_deref()
+                .map(basename)
+                .map(|s| shorten(s, 18))
+                .unwrap_or_else(|| "-".to_string());
+
+            let active = if r.active_count > 0 {
+                Span::styled(r.active_count.to_string(), Style::default().fg(p.good))
+            } else {
+                Span::styled("-", Style::default().fg(p.muted))
+            };
+
+            let last = match r.last_status {
+                Some(s) => Span::styled(s.to_string(), status_style(p, Some(s))),
+                None => Span::styled("-", Style::default().fg(p.muted)),
+            };
+
+            let age = if r.active_count > 0 {
+                format_age(now, r.active_started_at_ms_min)
+            } else {
+                format_age(now, r.last_ended_at_ms)
+            };
+
+            let total_tokens = r.total_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+            let tok = if total_tokens > 0 {
+                Span::styled(tokens_short(total_tokens), Style::default().fg(p.accent))
+            } else {
+                Span::styled("-", Style::default().fg(p.muted))
+            };
+
+            let mut badges = Vec::new();
+            if r.active_count > 0 {
+                badges.push(Span::styled(
+                    "RUN",
+                    Style::default().fg(p.good).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if r.override_effort.is_some() {
+                badges.push(Span::styled("E", Style::default().fg(p.accent)));
+            }
+            if r.override_config_name.is_some() {
+                badges.push(Span::styled("C", Style::default().fg(p.accent)));
+            }
+
+            let mut session_spans = vec![Span::styled(sid, Style::default().fg(p.text))];
+            for b in badges {
+                session_spans.push(Span::raw(" "));
+                session_spans.push(Span::raw("["));
+                session_spans.push(b);
+                session_spans.push(Span::raw("]"));
+            }
+
+            let mut row_style = Style::default().fg(p.text).bg(p.panel);
+            if r.override_effort.is_some() || r.override_config_name.is_some() {
+                row_style = row_style.add_modifier(Modifier::ITALIC);
+            }
+
+            Row::new(vec![
+                Cell::from(Line::from(session_spans)),
+                Cell::from(cwd),
+                Cell::from(Line::from(vec![active])),
+                Cell::from(Line::from(vec![last])),
+                Cell::from(Span::styled(age, Style::default().fg(p.muted))),
+                Cell::from(Line::from(vec![tok])),
+            ])
+            .style(row_style)
+        })
+        .collect::<Vec<_>>();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(18),
+            Constraint::Min(10),
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Length(6),
+            Constraint::Length(6),
+        ],
+    )
+    .header(header)
+    .block(block)
+    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+    .highlight_spacing(HighlightSpacing::Always);
+
+    f.render_stateful_widget(table, area, &mut ui.sessions_table);
+
+    if snapshot.rows.len() > 8 {
+        let mut scrollbar =
+            ScrollbarState::new(snapshot.rows.len()).position(ui.sessions_table.offset());
+        let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(p.border));
+        f.render_stateful_widget(sb, area, &mut scrollbar);
+    }
+}
+
+fn render_details_and_requests(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    providers: &[ProviderOption],
+    area: Rect,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .split(area);
+
+    render_session_details(f, p, ui, snapshot, chunks[0]);
+    render_requests_panel(f, p, ui, snapshot, providers, chunks[1]);
+}
+
+fn kv_line<'a>(p: Palette, k: &'a str, v: String, v_style: Style) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(format!("{k}: "), Style::default().fg(p.muted)),
+        Span::styled(v, v_style),
+    ])
+}
+
+fn render_session_details(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &UiState,
+    snapshot: &Snapshot,
+    area: Rect,
+) {
+    let selected = snapshot.rows.get(ui.selected_session_idx);
+    let sid = selected
+        .and_then(|r| r.session_id.as_deref())
+        .unwrap_or("-");
+    let cwd = selected
+        .and_then(|r| r.cwd.as_deref())
+        .map(|s| shorten(s, 64))
+        .unwrap_or_else(|| "-".to_string());
+
+    let override_effort = selected
+        .and_then(|r| r.override_effort.as_deref())
+        .unwrap_or("-");
+    let override_cfg = selected
+        .and_then(|r| r.override_config_name.as_deref())
+        .unwrap_or("-");
+    let model = selected
+        .and_then(|r| r.last_model.as_deref())
+        .unwrap_or("-");
+    let provider = selected
+        .and_then(|r| r.last_provider_id.as_deref())
+        .unwrap_or("-");
+    let cfg = selected
+        .and_then(|r| r.last_config_name.as_deref())
+        .unwrap_or("-");
+    let effort = selected
+        .and_then(|r| r.override_effort.as_deref())
+        .or_else(|| selected.and_then(|r| r.last_reasoning_effort.as_deref()))
+        .unwrap_or("-");
+
+    let now = now_ms();
+    let active_age = if selected.map(|r| r.active_count).unwrap_or(0) > 0 {
+        format_age(now, selected.and_then(|r| r.active_started_at_ms_min))
+    } else {
+        "-".to_string()
+    };
+    let last_age = format_age(now, selected.and_then(|r| r.last_ended_at_ms));
+    let last_status = selected.and_then(|r| r.last_status);
+    let last_dur = selected
+        .and_then(|r| r.last_duration_ms)
+        .map(|d| format!("{d}ms"))
+        .unwrap_or_else(|| "-".to_string());
+
+    let turns_total = selected.and_then(|r| r.turns_total).unwrap_or(0);
+    let turns_with_usage = selected.and_then(|r| r.turns_with_usage).unwrap_or(0);
+
+    let last_usage = selected
+        .and_then(|r| r.last_usage.as_ref())
+        .map(usage_line)
+        .unwrap_or_else(|| "tok in/out/rsn/ttl: -".to_string());
+
+    let total_usage = selected
+        .and_then(|r| r.total_usage.as_ref())
+        .filter(|u| u.total_tokens > 0)
+        .map(usage_line)
+        .unwrap_or_else(|| "tok in/out/rsn/ttl: -".to_string());
+
+    let lines = vec![
+        kv_line(
+            p,
+            "session",
+            short_sid(sid, 24),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ),
+        kv_line(p, "cwd", cwd, Style::default().fg(p.text)),
+        kv_line(p, "model", model.to_string(), Style::default().fg(p.text)),
+        kv_line(
+            p,
+            "provider",
+            provider.to_string(),
+            Style::default().fg(p.text),
+        ),
+        kv_line(p, "config", cfg.to_string(), Style::default().fg(p.text)),
+        kv_line(
+            p,
+            "effort",
+            effort.to_string(),
+            Style::default().fg(if override_effort != "-" {
+                p.accent
+            } else {
+                p.text
+            }),
+        ),
+        kv_line(
+            p,
+            "override",
+            format!("effort={override_effort}, cfg={override_cfg}"),
+            Style::default().fg(if override_effort != "-" || override_cfg != "-" {
+                p.accent
+            } else {
+                p.muted
+            }),
+        ),
+        kv_line(
+            p,
+            "activity",
+            format!(
+                "active_age={active_age}, last_age={last_age}, last_status={}, last_dur={last_dur}",
+                last_status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            ),
+            status_style(p, last_status),
+        ),
+        kv_line(
+            p,
+            "usage",
+            format!("{last_usage} | sum {total_usage} | turns {turns_total}/{turns_with_usage}"),
+            Style::default().fg(p.muted),
+        ),
+    ];
+
+    let title = Span::styled(
+        "Details",
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border))
+        .style(Style::default().bg(p.panel));
+    let content = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(p.text))
+        .wrap(Wrap { trim: true });
+    f.render_widget(content, area);
+}
+
+fn render_requests_panel(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    _providers: &[ProviderOption],
+    area: Rect,
+) {
+    let focused = ui.focus == Focus::Requests && ui.overlay == Overlay::None;
+    let title = Span::styled(
+        "Requests",
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { p.focus } else { p.border }))
+        .style(Style::default().bg(p.panel));
+
+    let selected_sid = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .and_then(|r| r.session_id.as_deref())
+        .map(|s| s.to_string());
+
+    let filtered = snapshot
+        .recent
+        .iter()
+        .filter(|r| match (&selected_sid, &r.session_id) {
+            (Some(sid), Some(rid)) => sid == rid,
+            (Some(_), None) => false,
+            (None, _) => true,
+        })
+        .take(60)
+        .collect::<Vec<_>>();
+
+    let header = Row::new(vec![
+        Cell::from(Span::styled("Age", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("St", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("Method", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("Path", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("Dur", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("Tok", Style::default().fg(p.muted))),
+    ]);
+
+    let now = now_ms();
+    let rows = filtered
+        .iter()
+        .map(|r| {
+            let age = format_age(now, Some(r.ended_at_ms));
+            let status = Span::styled(
+                r.status_code.to_string(),
+                status_style(p, Some(r.status_code)),
+            );
+            let method = Span::styled(r.method.clone(), Style::default().fg(p.muted));
+            let path = shorten(&r.path, 48);
+            let dur = format!("{}ms", r.duration_ms);
+            let tok = r
+                .usage
+                .as_ref()
+                .map(|u| tokens_short(u.total_tokens))
+                .unwrap_or_else(|| "-".to_string());
+
+            Row::new(vec![
+                Cell::from(Span::styled(age, Style::default().fg(p.muted))),
+                Cell::from(Line::from(vec![status])),
+                Cell::from(Line::from(vec![method])),
+                Cell::from(path),
+                Cell::from(Span::styled(dur, Style::default().fg(p.muted))),
+                Cell::from(Span::styled(tok, Style::default().fg(p.muted))),
+            ])
+            .style(Style::default().bg(p.panel).fg(p.text))
+        })
+        .collect::<Vec<_>>();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(4),
+            Constraint::Length(8),
+            Constraint::Min(20),
+            Constraint::Length(8),
+            Constraint::Length(6),
+        ],
+    )
+    .header(header)
+    .block(block)
+    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+    .highlight_spacing(HighlightSpacing::Always);
+
+    f.render_stateful_widget(table, area, &mut ui.requests_table);
+
+    if filtered.len() > 8 {
+        let mut scrollbar =
+            ScrollbarState::new(filtered.len()).position(ui.requests_table.offset());
+        let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(p.border));
+        f.render_stateful_widget(sb, area, &mut scrollbar);
+    }
+}
+
+fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
+    let now = std::time::Instant::now();
+    if let Some((_, ts)) = ui.toast.as_ref()
+        && now.duration_since(*ts) > Duration::from_secs(3)
+    {
+        ui.toast = None;
+    }
+
+    let left = match ui.overlay {
+        Overlay::None => {
+            "q quit  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set effort  x clear  p session cfg  P global cfg  ? help"
+        }
+        Overlay::Help => "Esc close help",
+        Overlay::EffortMenu => "↑/↓ select  Enter apply  Esc cancel",
+        Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
+            "↑/↓ select  Enter apply  Esc cancel"
+        }
+    };
+    let right = ui.toast.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
+
+    let line = Line::from(vec![
+        Span::styled(left, Style::default().fg(p.muted)),
+        Span::raw(" "),
+        Span::styled(right, Style::default().fg(p.accent)),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(p.border));
+    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(Text::from(line)).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_help_modal(f: &mut Frame<'_>, p: Palette) {
+    let area = centered_rect(70, 70, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            "Help",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            "Navigation",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("  Tab        switch focus (Sessions/Requests)"),
+        Line::from("  ↑/↓, j/k   move selection"),
+        Line::from("  1-4        switch page (reserved)"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Effort",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("  Enter      open effort menu (on Sessions)"),
+        Line::from("  l/m/h/X    set low/medium/high/xhigh"),
+        Line::from("  x          clear effort override"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Provider override",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("  p          session provider override"),
+        Line::from("  P          global provider override"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Quit",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("  q          quit and request shutdown"),
+        Line::from("  Esc/?      close this modal"),
+    ];
+
+    let content = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(p.muted))
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, area);
+}
+
+fn render_effort_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
+    let area = centered_rect(50, 55, f.area());
+    f.render_widget(Clear, area);
+    let focused = ui.overlay == Overlay::EffortMenu;
+    let block = Block::default()
+        .title(Span::styled(
+            "Set reasoning effort",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { p.focus } else { p.border }))
+        .style(Style::default().bg(p.panel));
+
+    let choices = [
+        EffortChoice::Clear,
+        EffortChoice::Low,
+        EffortChoice::Medium,
+        EffortChoice::High,
+        EffortChoice::XHigh,
+    ];
+    let items = choices
+        .iter()
+        .map(|c| ListItem::new(Line::from(c.label())))
+        .collect::<Vec<_>>();
+
+    ui.menu_list.select(Some(
+        ui.effort_menu_idx.min(choices.len().saturating_sub(1)),
+    ));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
+        .highlight_symbol("  ");
+    f.render_stateful_widget(list, area, &mut ui.menu_list);
+}
+
+fn render_provider_modal(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    providers: &[ProviderOption],
+    title: &str,
+) {
+    let area = centered_rect(60, 70, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let mut items = Vec::with_capacity(providers.len() + 1);
+    items.push(ListItem::new(Line::from("(Clear override)")));
+    for pvd in providers {
+        let label = match pvd.alias.as_deref() {
+            Some(alias) if !alias.trim().is_empty() && alias != pvd.name => {
+                format!("{} ({})", pvd.name, alias)
+            }
+            _ => pvd.name.clone(),
+        };
+        items.push(ListItem::new(Line::from(label)));
+    }
+
+    let max = items.len().saturating_sub(1);
+    ui.menu_list.select(Some(ui.provider_menu_idx.min(max)));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
+        .highlight_symbol("  ");
+    f.render_stateful_widget(list, area, &mut ui.menu_list);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn render_background(area: Rect, buf: &mut Buffer, p: Palette) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buf[(x, y)].set_style(Style::default().bg(p.bg));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackgroundWidget {
+    p: Palette,
+}
+
+impl ratatui::widgets::Widget for BackgroundWidget {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        render_background(area, buf, self.p);
+    }
+}
