@@ -6,6 +6,12 @@ pub(in crate::tui) enum Focus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum StatsFocus {
+    Configs,
+    Providers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum Page {
     Dashboard,
     Configs,

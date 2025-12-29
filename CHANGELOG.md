@@ -31,6 +31,8 @@ All notable changes to this project will be documented in this file.
   TUI Requests page: inspect recent requests with error filter and scope switch, and show the per-retry upstream chain.
 - TUI Stats 页：展示按天聚合的 token 趋势、按 config/provider 的 Top 用量表；可通过 `CODEX_HELPER_PRICE_INPUT_PER_1K_USD` / `CODEX_HELPER_PRICE_OUTPUT_PER_1K_USD` 启用粗略成本估算。  
   TUI Stats page: show daily token rollups and top usage tables by config/provider; enable coarse cost estimates via `CODEX_HELPER_PRICE_INPUT_PER_1K_USD` / `CODEX_HELPER_PRICE_OUTPUT_PER_1K_USD`.
+- TUI Stats 交互：支持在 config/provider 之间切换焦点并查看明细；支持切换时间窗口（7/21/60 天）。  
+  TUI Stats interactions: switch focus between config/provider with a detail panel, and cycle time windows (7/21/60 days).
 - TUI Configs 健康检查：`h` 检测选中 config，`H` 批量检测所有 config；结果会展示每个 upstream 的延迟与状态码。  
   TUI Configs health checks: `h` checks selected config, `H` checks all configs; results show per-upstream latency and status code.
 

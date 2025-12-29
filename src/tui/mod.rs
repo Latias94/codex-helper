@@ -55,7 +55,7 @@ pub async fn run_dashboard(
     let mut ticker = tokio::time::interval(Duration::from_millis(refresh_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut snapshot = refresh_snapshot(&state, service_name).await;
+    let mut snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
     ui.clamp_selection(&snapshot, providers.len());
 
     let mut should_redraw = true;
@@ -82,7 +82,7 @@ pub async fn run_dashboard(
 
         tokio::select! {
             _ = ticker.tick() => {
-                snapshot = refresh_snapshot(&state, service_name).await;
+                snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
                 ui.clamp_selection(&snapshot, providers.len());
                 should_redraw = true;
             }
@@ -96,6 +96,11 @@ pub async fn run_dashboard(
                 match event {
                     Event::Key(key) if input::should_accept_key_event(&key) => {
                         if input::handle_key_event(state.clone(), &providers, &mut ui, &snapshot, key).await {
+                            if ui.needs_snapshot_refresh {
+                                snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
+                                ui.clamp_selection(&snapshot, providers.len());
+                                ui.needs_snapshot_refresh = false;
+                            }
                             should_redraw = true;
                         }
                     }

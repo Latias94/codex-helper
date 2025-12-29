@@ -1,7 +1,7 @@
 use ratatui::widgets::{ListState, TableState};
 
 use super::model::{Snapshot, filtered_requests_len};
-use super::types::{Focus, Overlay, Page};
+use super::types::{Focus, Overlay, Page, StatsFocus};
 
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
@@ -22,6 +22,11 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) sessions_page_overrides_only: bool,
     pub(in crate::tui) effort_menu_idx: usize,
     pub(in crate::tui) provider_menu_idx: usize,
+    pub(in crate::tui) stats_focus: StatsFocus,
+    pub(in crate::tui) stats_days: usize,
+    pub(in crate::tui) selected_stats_config_idx: usize,
+    pub(in crate::tui) selected_stats_provider_idx: usize,
+    pub(in crate::tui) needs_snapshot_refresh: bool,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
     pub(in crate::tui) should_exit: bool,
     pub(in crate::tui) configs_table: TableState,
@@ -29,6 +34,8 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) requests_table: TableState,
     pub(in crate::tui) request_page_table: TableState,
     pub(in crate::tui) sessions_page_table: TableState,
+    pub(in crate::tui) stats_configs_table: TableState,
+    pub(in crate::tui) stats_providers_table: TableState,
     pub(in crate::tui) menu_list: ListState,
 }
 
@@ -52,6 +59,11 @@ impl Default for UiState {
             sessions_page_overrides_only: false,
             effort_menu_idx: 0,
             provider_menu_idx: 0,
+            stats_focus: StatsFocus::Configs,
+            stats_days: 21,
+            selected_stats_config_idx: 0,
+            selected_stats_provider_idx: 0,
+            needs_snapshot_refresh: false,
             toast: None,
             should_exit: false,
             configs_table: TableState::default(),
@@ -59,6 +71,8 @@ impl Default for UiState {
             requests_table: TableState::default(),
             request_page_table: TableState::default(),
             sessions_page_table: TableState::default(),
+            stats_configs_table: TableState::default(),
+            stats_providers_table: TableState::default(),
             menu_list: ListState::default(),
         }
     }
@@ -104,6 +118,29 @@ impl UiState {
         } else {
             self.selected_request_idx = self.selected_request_idx.min(req_len - 1);
             self.requests_table.select(Some(self.selected_request_idx));
+        }
+
+        let stats_configs_len = snapshot.usage_rollup.by_config.len();
+        if stats_configs_len == 0 {
+            self.selected_stats_config_idx = 0;
+            self.stats_configs_table.select(None);
+        } else {
+            self.selected_stats_config_idx =
+                self.selected_stats_config_idx.min(stats_configs_len - 1);
+            self.stats_configs_table
+                .select(Some(self.selected_stats_config_idx));
+        }
+
+        let stats_providers_len = snapshot.usage_rollup.by_provider.len();
+        if stats_providers_len == 0 {
+            self.selected_stats_provider_idx = 0;
+            self.stats_providers_table.select(None);
+        } else {
+            self.selected_stats_provider_idx = self
+                .selected_stats_provider_idx
+                .min(stats_providers_len - 1);
+            self.stats_providers_table
+                .select(Some(self.selected_stats_provider_idx));
         }
     }
 }

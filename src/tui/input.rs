@@ -9,7 +9,7 @@ use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
 
 use super::model::{ProviderOption, Snapshot, filtered_requests_len, now_ms};
 use super::state::{UiState, adjust_table_selection};
-use super::types::{EffortChoice, Focus, Overlay, Page};
+use super::types::{EffortChoice, Focus, Overlay, Page, StatsFocus};
 
 pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
     matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -263,6 +263,21 @@ async fn handle_key_normal(
                 };
             } else if ui.page == Page::Configs {
                 ui.focus = Focus::Configs;
+            } else if ui.page == Page::Stats {
+                ui.stats_focus = match ui.stats_focus {
+                    StatsFocus::Configs => StatsFocus::Providers,
+                    StatsFocus::Providers => StatsFocus::Configs,
+                };
+                ui.toast = Some((
+                    format!(
+                        "stats focus: {}",
+                        match ui.stats_focus {
+                            StatsFocus::Configs => "configs",
+                            StatsFocus::Providers => "providers",
+                        }
+                    ),
+                    Instant::now(),
+                ));
             }
             true
         }
@@ -279,6 +294,58 @@ async fn handle_key_normal(
                 return true;
             }
             false
+        }
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stats => {
+            let (table, len) = match ui.stats_focus {
+                StatsFocus::Configs => (
+                    &mut ui.stats_configs_table,
+                    snapshot.usage_rollup.by_config.len(),
+                ),
+                StatsFocus::Providers => (
+                    &mut ui.stats_providers_table,
+                    snapshot.usage_rollup.by_provider.len(),
+                ),
+            };
+            if let Some(next) = adjust_table_selection(table, -1, len) {
+                match ui.stats_focus {
+                    StatsFocus::Configs => ui.selected_stats_config_idx = next,
+                    StatsFocus::Providers => ui.selected_stats_provider_idx = next,
+                }
+                return true;
+            }
+            false
+        }
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stats => {
+            let (table, len) = match ui.stats_focus {
+                StatsFocus::Configs => (
+                    &mut ui.stats_configs_table,
+                    snapshot.usage_rollup.by_config.len(),
+                ),
+                StatsFocus::Providers => (
+                    &mut ui.stats_providers_table,
+                    snapshot.usage_rollup.by_provider.len(),
+                ),
+            };
+            if let Some(next) = adjust_table_selection(table, 1, len) {
+                match ui.stats_focus {
+                    StatsFocus::Configs => ui.selected_stats_config_idx = next,
+                    StatsFocus::Providers => ui.selected_stats_provider_idx = next,
+                }
+                return true;
+            }
+            false
+        }
+        KeyCode::Char('d') if ui.page == Page::Stats => {
+            let options = [7usize, 21usize, 60usize];
+            let idx = options
+                .iter()
+                .position(|&n| n == ui.stats_days)
+                .unwrap_or(1);
+            let next = options[(idx + 1) % options.len()];
+            ui.stats_days = next;
+            ui.needs_snapshot_refresh = true;
+            ui.toast = Some((format!("stats days: {next}"), Instant::now()));
+            true
         }
         KeyCode::Enter if ui.page == Page::Configs => {
             let Some(pvd) = providers.get(ui.selected_config_idx) else {

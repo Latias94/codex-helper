@@ -1512,7 +1512,9 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
             Page::Sessions => {
                 "q quit  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help"
             }
-            Page::Stats => "q quit  ? help",
+            Page::Stats => {
+                "q quit  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  ? help"
+            }
             Page::Settings => "q quit  ? help",
         },
         Overlay::Help => "Esc close help",

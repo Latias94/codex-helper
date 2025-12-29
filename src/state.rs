@@ -36,7 +36,9 @@ pub struct UsageRollupView {
     pub since_start: UsageBucket,
     pub by_day: Vec<(i32, UsageBucket)>,
     pub by_config: Vec<(String, UsageBucket)>,
+    pub by_config_day: HashMap<String, Vec<(i32, UsageBucket)>>,
     pub by_provider: Vec<(String, UsageBucket)>,
+    pub by_provider_day: HashMap<String, Vec<(i32, UsageBucket)>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,7 +46,9 @@ struct UsageRollup {
     since_start: UsageBucket,
     by_day: HashMap<i32, UsageBucket>,
     by_config: HashMap<String, UsageBucket>,
+    by_config_day: HashMap<String, HashMap<i32, UsageBucket>>,
     by_provider: HashMap<String, UsageBucket>,
+    by_provider_day: HashMap<String, HashMap<i32, UsageBucket>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
@@ -400,6 +404,15 @@ impl ProxyState {
             return UsageRollupView::default();
         };
 
+        fn day_series(map: &HashMap<i32, UsageBucket>, days: usize) -> Vec<(i32, UsageBucket)> {
+            let mut out = map.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>();
+            out.sort_by_key(|(k, _)| *k);
+            if out.len() > days {
+                out = out[out.len().saturating_sub(days)..].to_vec();
+            }
+            out
+        }
+
         let mut by_day = rollup
             .by_day
             .iter()
@@ -426,11 +439,31 @@ impl ProxyState {
         by_provider.sort_by_key(|(_, v)| std::cmp::Reverse(v.usage.total_tokens));
         by_provider.truncate(top_n);
 
+        let mut by_config_day = HashMap::new();
+        for (name, _) in &by_config {
+            if let Some(m) = rollup.by_config_day.get(name) {
+                by_config_day.insert(name.clone(), day_series(m, days));
+            } else {
+                by_config_day.insert(name.clone(), Vec::new());
+            }
+        }
+
+        let mut by_provider_day = HashMap::new();
+        for (name, _) in &by_provider {
+            if let Some(m) = rollup.by_provider_day.get(name) {
+                by_provider_day.insert(name.clone(), day_series(m, days));
+            } else {
+                by_provider_day.insert(name.clone(), Vec::new());
+            }
+        }
+
         UsageRollupView {
             since_start: rollup.since_start.clone(),
             by_day,
             by_config,
+            by_config_day,
             by_provider,
+            by_provider_day,
         }
     }
 
@@ -580,16 +613,31 @@ impl ProxyState {
                 .entry(day)
                 .or_default()
                 .record(status_code, duration_ms, usage.as_ref());
-            rollup.by_config.entry(cfg_key).or_default().record(
+            rollup.by_config.entry(cfg_key.clone()).or_default().record(
                 status_code,
                 duration_ms,
                 usage.as_ref(),
             );
-            rollup.by_provider.entry(provider_key).or_default().record(
-                status_code,
-                duration_ms,
-                usage.as_ref(),
-            );
+            rollup
+                .by_config_day
+                .entry(cfg_key)
+                .or_default()
+                .entry(day)
+                .or_default()
+                .record(status_code, duration_ms, usage.as_ref());
+
+            rollup
+                .by_provider
+                .entry(provider_key.clone())
+                .or_default()
+                .record(status_code, duration_ms, usage.as_ref());
+            rollup
+                .by_provider_day
+                .entry(provider_key)
+                .or_default()
+                .entry(day)
+                .or_default()
+                .record(status_code, duration_ms, usage.as_ref());
         }
 
         if let Some(sid) = finished.session_id.as_deref() {
@@ -703,6 +751,14 @@ impl ProxyState {
         let mut rollups = self.usage_rollups.write().await;
         for rollup in rollups.values_mut() {
             rollup.by_day.retain(|day, _| *day >= cutoff_day);
+            rollup.by_config_day.retain(|_, m| {
+                m.retain(|day, _| *day >= cutoff_day);
+                !m.is_empty()
+            });
+            rollup.by_provider_day.retain(|_, m| {
+                m.retain(|day, _| *day >= cutoff_day);
+                !m.is_empty()
+            });
         }
 
         let cutoff_cwd =

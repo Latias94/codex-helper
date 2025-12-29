@@ -7,6 +7,7 @@ use crate::state::UsageBucket;
 use crate::tui::ProviderOption;
 use crate::tui::model::{Palette, Snapshot, tokens_short};
 use crate::tui::state::UiState;
+use crate::tui::types::StatsFocus;
 
 fn pricing_per_1k_usd() -> Option<(f64, f64)> {
     let input = std::env::var("CODEX_HELPER_PRICE_INPUT_PER_1K_USD")
@@ -46,7 +47,7 @@ fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
 pub(super) fn render_stats_page(
     f: &mut Frame<'_>,
     p: Palette,
-    _ui: &mut UiState,
+    ui: &mut UiState,
     snapshot: &Snapshot,
     _providers: &[ProviderOption],
     area: Rect,
@@ -62,7 +63,7 @@ pub(super) fn render_stats_page(
 
     render_kpis(f, p, snapshot, rows[0]);
     render_sparkline(f, p, snapshot, rows[1]);
-    render_tables(f, p, snapshot, rows[2]);
+    render_tables(f, p, ui, snapshot, rows[2]);
 }
 
 fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, area: Rect) {
@@ -193,34 +194,47 @@ fn render_sparkline(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, area: Re
     f.render_widget(widget, area);
 }
 
-fn render_tables(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, area: Rect) {
+fn render_tables(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, snapshot: &Snapshot, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    render_bucket_table(
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(cols[0]);
+
+    render_bucket_table_stateful(
         f,
         p,
+        ui.stats_focus == StatsFocus::Configs,
         "Top configs (by total tokens)",
         &snapshot.usage_rollup.by_config,
-        cols[0],
+        left[0],
+        &mut ui.stats_configs_table,
     );
-    render_bucket_table(
+    render_bucket_table_stateful(
         f,
         p,
+        ui.stats_focus == StatsFocus::Providers,
         "Top providers (by total tokens)",
         &snapshot.usage_rollup.by_provider,
-        cols[1],
+        left[1],
+        &mut ui.stats_providers_table,
     );
+
+    render_detail_panel(f, p, ui, snapshot, cols[1]);
 }
 
-fn render_bucket_table(
+fn render_bucket_table_stateful(
     f: &mut Frame<'_>,
     p: Palette,
+    focused: bool,
     title: &str,
     items: &[(String, UsageBucket)],
     area: Rect,
+    state: &mut ratatui::widgets::TableState,
 ) {
     let header = Row::new(vec![
         Cell::from(Span::styled("name", Style::default().fg(p.muted))),
@@ -265,9 +279,191 @@ fn render_bucket_table(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(p.border)),
+            .border_style(Style::default().fg(if focused { p.focus } else { p.border })),
     )
-    .row_highlight_style(Style::default().fg(p.text));
+    .row_highlight_style(Style::default().bg(p.panel).fg(p.text))
+    .highlight_symbol("  ");
 
-    f.render_widget(table, area);
+    f.render_stateful_widget(table, area, state);
+}
+
+fn render_detail_panel(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &UiState,
+    snapshot: &Snapshot,
+    area: Rect,
+) {
+    let selected = match ui.stats_focus {
+        StatsFocus::Configs => snapshot
+            .usage_rollup
+            .by_config
+            .get(ui.selected_stats_config_idx)
+            .map(|(k, v)| ("config", k.as_str(), v)),
+        StatsFocus::Providers => snapshot
+            .usage_rollup
+            .by_provider
+            .get(ui.selected_stats_provider_idx)
+            .map(|(k, v)| ("provider", k.as_str(), v)),
+    };
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!("Detail  window: {}d", ui.stats_days),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border));
+
+    let Some((kind, name, bucket)) = selected else {
+        f.render_widget(
+            Paragraph::new(Text::from(Line::from(Span::styled(
+                "No data yet.",
+                Style::default().fg(p.muted),
+            ))))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let series = match kind {
+        "config" => snapshot
+            .usage_rollup
+            .by_config_day
+            .get(name)
+            .map(|v| {
+                v.iter()
+                    .map(|(_, b)| b.usage.total_tokens.max(0) as u64)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        _ => snapshot
+            .usage_rollup
+            .by_provider_day
+            .get(name)
+            .map(|v| {
+                v.iter()
+                    .map(|(_, b)| b.usage.total_tokens.max(0) as u64)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    };
+
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Length(5),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let err_pct = fmt_pct(bucket.requests_error, bucket.requests_total);
+    let avg_ms = fmt_avg_ms(bucket.duration_ms_total, bucket.requests_total);
+    let cost = estimate_cost_usd(bucket)
+        .map(|v| format!("${v:.2}"))
+        .unwrap_or_else(|| "-".to_string());
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{kind}: "), Style::default().fg(p.muted)),
+            Span::styled(name.to_string(), Style::default().fg(p.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("requests  ", Style::default().fg(p.muted)),
+            Span::styled(
+                bucket.requests_total.to_string(),
+                Style::default().fg(p.text),
+            ),
+            Span::raw("   "),
+            Span::styled("errors  ", Style::default().fg(p.muted)),
+            Span::styled(
+                bucket.requests_error.to_string(),
+                Style::default().fg(p.warn),
+            ),
+            Span::raw("   "),
+            Span::styled("err%  ", Style::default().fg(p.muted)),
+            Span::styled(err_pct, Style::default().fg(p.warn)),
+        ]),
+        Line::from(vec![
+            Span::styled("tokens  ", Style::default().fg(p.muted)),
+            Span::styled(
+                tokens_short(bucket.usage.total_tokens),
+                Style::default().fg(p.accent),
+            ),
+            Span::raw("   "),
+            Span::styled("avg  ", Style::default().fg(p.muted)),
+            Span::styled(avg_ms, Style::default().fg(p.text)),
+            Span::raw("   "),
+            Span::styled("usd  ", Style::default().fg(p.muted)),
+            Span::styled(cost, Style::default().fg(p.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled("tok(in/out/rsn)  ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!(
+                    "{}/{}/{}",
+                    tokens_short(bucket.usage.input_tokens),
+                    tokens_short(bucket.usage.output_tokens),
+                    tokens_short(bucket.usage.reasoning_tokens),
+                ),
+                Style::default().fg(p.muted),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            "pricing: set CODEX_HELPER_PRICE_* env for usd",
+            Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+        )]),
+    ];
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        inner[0],
+    );
+
+    let sl_block = Block::default()
+        .title(Span::styled(
+            "Tokens / day",
+            Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border));
+    let sl = Sparkline::default()
+        .block(sl_block)
+        .style(Style::default().fg(p.accent))
+        .data(&series);
+    f.render_widget(sl, inner[1]);
+
+    let tips = Text::from(vec![
+        Line::from(vec![
+            Span::styled("Tab", Style::default().fg(p.text)),
+            Span::styled(" switch focus  ", Style::default().fg(p.muted)),
+            Span::styled("d", Style::default().fg(p.text)),
+            Span::styled(" cycle window  ", Style::default().fg(p.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled("↑/↓", Style::default().fg(p.text)),
+            Span::styled(" select  ", Style::default().fg(p.muted)),
+            Span::styled("1-6", Style::default().fg(p.text)),
+            Span::styled(" switch pages", Style::default().fg(p.muted)),
+        ]),
+    ]);
+    f.render_widget(
+        Paragraph::new(tips)
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        "Tips",
+                        Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(p.border)),
+            )
+            .wrap(Wrap { trim: true }),
+        inner[2],
+    );
 }

@@ -402,7 +402,11 @@ fn build_session_rows(
     rows
 }
 
-pub(in crate::tui) async fn refresh_snapshot(state: &ProxyState, service_name: &str) -> Snapshot {
+pub(in crate::tui) async fn refresh_snapshot(
+    state: &ProxyState,
+    service_name: &str,
+    stats_days: usize,
+) -> Snapshot {
     let (
         active,
         recent,
@@ -421,7 +425,7 @@ pub(in crate::tui) async fn refresh_snapshot(state: &ProxyState, service_name: &
         state.get_global_config_override(),
         state.list_session_stats(),
         state.get_config_meta_overrides(service_name),
-        state.get_usage_rollup_view(service_name, 12, 21),
+        state.get_usage_rollup_view(service_name, 12, stats_days),
         state.get_config_health(service_name),
     );
 
