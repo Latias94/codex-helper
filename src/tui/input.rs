@@ -6,10 +6,11 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Url;
 use tokio::sync::{OnceCell, Semaphore};
 
-use crate::config::{UpstreamConfig, load_config, save_config};
+use crate::config::{UpstreamConfig, load_config, proxy_home_dir, save_config};
 use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
 
 use super::model::{ProviderOption, Snapshot, filtered_requests_len, now_ms};
+use super::report::build_stats_report;
 use super::state::{UiState, adjust_table_selection};
 use super::types::{EffortChoice, Focus, Overlay, Page, StatsFocus};
 
@@ -314,6 +315,64 @@ async fn run_health_check_for_config(
         .await;
 }
 
+fn reports_dir() -> std::path::PathBuf {
+    proxy_home_dir().join("reports")
+}
+
+fn write_report(report: &str, now_ms: u64) -> anyhow::Result<std::path::PathBuf> {
+    let dir = reports_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("tui_stats_report.{now_ms}.txt"));
+    std::fs::write(&path, report.as_bytes())?;
+    Ok(path)
+}
+
+fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn run(mut cmd: Command, report: &str) -> anyhow::Result<()> {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        {
+            let Some(mut stdin) = child.stdin.take() else {
+                anyhow::bail!("no stdin");
+            };
+            stdin.write_all(report.as_bytes())?;
+        }
+        let status = child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("clipboard command failed")
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return run(Command::new("pbcopy"), report);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return run(Command::new("cmd").args(["/C", "clip"]), report);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Ok(()) = run(Command::new("wl-copy"), report) {
+            return Ok(());
+        }
+        run(
+            Command::new("xclip").args(["-selection", "clipboard"]),
+            report,
+        )
+    }
+}
+
 async fn handle_key_normal(
     state: &Arc<ProxyState>,
     providers: &[ProviderOption],
@@ -434,6 +493,46 @@ async fn handle_key_normal(
                 format!("stats: errors_only={}", ui.stats_errors_only),
                 Instant::now(),
             ));
+            true
+        }
+        KeyCode::Char('y') if ui.page == Page::Stats => {
+            let now = now_ms();
+            let Some(report) = build_stats_report(ui, snapshot, now) else {
+                ui.toast = Some(("stats report: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            let saved = write_report(&report, now);
+            let copied = try_copy_to_clipboard(&report);
+
+            match (saved, copied) {
+                (Ok(path), Ok(())) => {
+                    ui.toast = Some((
+                        format!("stats report: copied + saved {}", path.display()),
+                        Instant::now(),
+                    ));
+                }
+                (Ok(path), Err(err)) => {
+                    ui.toast = Some((
+                        format!(
+                            "stats report: saved {} (copy failed: {err})",
+                            path.display()
+                        ),
+                        Instant::now(),
+                    ));
+                }
+                (Err(err), Ok(())) => {
+                    ui.toast = Some((
+                        format!("stats report: copied (save failed: {err})"),
+                        Instant::now(),
+                    ));
+                }
+                (Err(err1), Err(err2)) => {
+                    ui.toast = Some((
+                        format!("stats report: copy failed: {err2} (save failed: {err1})"),
+                        Instant::now(),
+                    ));
+                }
+            }
             true
         }
         KeyCode::Enter if ui.page == Page::Configs => {

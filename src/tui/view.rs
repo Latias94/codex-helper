@@ -88,6 +88,19 @@ fn render_header(
     let updated = snapshot.refreshed_at.elapsed().as_millis();
     let overrides_effort = snapshot.overrides.len();
     let overrides_cfg = snapshot.config_overrides.len();
+    let (hc_running, hc_canceling) = {
+        let mut running = 0usize;
+        let mut canceling = 0usize;
+        for st in snapshot.health_checks.values() {
+            if !st.done {
+                running += 1;
+                if st.cancel_requested {
+                    canceling += 1;
+                }
+            }
+        }
+        (running, canceling)
+    };
 
     let global_cfg = snapshot
         .global_override
@@ -121,6 +134,16 @@ fn render_header(
         Span::styled(
             recent_err.to_string(),
             Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
+        ),
+        Span::raw("   "),
+        Span::styled("hc ", Style::default().fg(p.muted)),
+        Span::styled(
+            if hc_running > 0 {
+                format!("run:{hc_running} cancel:{hc_canceling}")
+            } else {
+                "-".to_string()
+            },
+            Style::default().fg(if hc_running > 0 { p.accent } else { p.muted }),
         ),
         Span::raw("   "),
         Span::styled("overrides ", Style::default().fg(p.muted)),
@@ -1563,7 +1586,7 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
                 "q quit  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help"
             }
             Page::Stats => {
-                "1-6 pages  q quit  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  ? help"
+                "1-6 pages  q quit  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  y copy+export report  ? help"
             }
             Page::Settings => "q quit  ? help",
         },
@@ -1666,6 +1689,7 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette) {
         Line::from("  Tab        switch focus (config vs provider)"),
         Line::from("  d          cycle time window (7/21/60 days)"),
         Line::from("  e          toggle errors-only (recent breakdown)"),
+        Line::from("  y          copy + export report (selected item)"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Quit",

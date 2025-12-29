@@ -1,5 +1,6 @@
 mod input;
 mod model;
+mod report;
 mod state;
 mod terminal;
 mod types;
