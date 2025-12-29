@@ -7,9 +7,19 @@ use crate::state::{ActiveRequest, FinishedRequest, ProxyState, SessionStats};
 use crate::usage::UsageMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpstreamSummary {
+    pub base_url: String,
+    pub provider_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProviderOption {
     pub name: String,
     pub alias: Option<String>,
+    pub enabled: bool,
+    pub level: u8,
+    pub active: bool,
+    pub upstreams: Vec<UpstreamSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

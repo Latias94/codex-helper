@@ -42,13 +42,19 @@ pub(in crate::tui) async fn handle_key_event(
 fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
     let page = match code {
         KeyCode::Char('1') => Some(Page::Dashboard),
-        KeyCode::Char('2') => Some(Page::Sessions),
-        KeyCode::Char('3') => Some(Page::Requests),
-        KeyCode::Char('4') => Some(Page::Settings),
+        KeyCode::Char('2') => Some(Page::Configs),
+        KeyCode::Char('3') => Some(Page::Sessions),
+        KeyCode::Char('4') => Some(Page::Requests),
+        KeyCode::Char('5') => Some(Page::Settings),
         _ => None,
     };
     if let Some(p) = page {
         ui.page = p;
+        if ui.page == Page::Configs {
+            ui.focus = Focus::Configs;
+        } else if ui.page == Page::Dashboard && ui.focus == Focus::Configs {
+            ui.focus = Focus::Sessions;
+        }
         return true;
     }
     false
@@ -102,10 +108,80 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Tab => {
-            ui.focus = match ui.focus {
-                Focus::Sessions => Focus::Requests,
-                Focus::Requests => Focus::Sessions,
+            if ui.page == Page::Dashboard {
+                ui.focus = match ui.focus {
+                    Focus::Sessions => Focus::Requests,
+                    Focus::Requests => Focus::Sessions,
+                    Focus::Configs => Focus::Sessions,
+                };
+            } else if ui.page == Page::Configs {
+                ui.focus = Focus::Configs;
+            }
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Configs => {
+            if let Some(next) = adjust_table_selection(&mut ui.configs_table, -1, providers.len()) {
+                ui.selected_config_idx = next;
+                return true;
+            }
+            false
+        }
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Configs => {
+            if let Some(next) = adjust_table_selection(&mut ui.configs_table, 1, providers.len()) {
+                ui.selected_config_idx = next;
+                return true;
+            }
+            false
+        }
+        KeyCode::Enter if ui.page == Page::Configs => {
+            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+                return true;
             };
+            apply_global_provider_override(state, Some(pvd.name.clone())).await;
+            ui.toast = Some((format!("global cfg override: {}", pvd.name), Instant::now()));
+            true
+        }
+        KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Configs => {
+            apply_global_provider_override(state, None).await;
+            ui.toast = Some(("global cfg override: <clear>".to_string(), Instant::now()));
+            true
+        }
+        KeyCode::Char('o') if ui.page == Page::Configs => {
+            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+                return true;
+            };
+            let Some(sid) = snapshot
+                .rows
+                .get(ui.selected_session_idx)
+                .and_then(|r| r.session_id.clone())
+            else {
+                ui.toast = Some((
+                    "session cfg override: <no session>".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            apply_session_provider_override(state, sid, Some(pvd.name.clone())).await;
+            ui.toast = Some((
+                format!("session cfg override: {}", pvd.name),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('O') if ui.page == Page::Configs => {
+            let Some(sid) = snapshot
+                .rows
+                .get(ui.selected_session_idx)
+                .and_then(|r| r.session_id.clone())
+            else {
+                ui.toast = Some((
+                    "session cfg override: <no session>".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            apply_session_provider_override(state, sid, None).await;
+            ui.toast = Some(("session cfg override: <clear>".to_string(), Instant::now()));
             true
         }
         KeyCode::Up | KeyCode::Char('k') => match ui.focus {
@@ -133,6 +209,7 @@ async fn handle_key_normal(
                 }
                 false
             }
+            Focus::Configs => false,
         },
         KeyCode::Down | KeyCode::Char('j') => match ui.focus {
             Focus::Sessions => {
@@ -159,6 +236,7 @@ async fn handle_key_normal(
                 }
                 false
             }
+            Focus::Configs => false,
         },
         KeyCode::Enter => {
             if ui.focus != Focus::Sessions {

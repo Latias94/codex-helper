@@ -95,6 +95,7 @@ fn render_header(
     let focus = match ui.focus {
         Focus::Sessions => "Sessions",
         Focus::Requests => "Requests",
+        Focus::Configs => "Configs",
     };
     let title = Line::from(vec![
         Span::styled(
@@ -168,10 +169,193 @@ fn render_body(
 
     match ui.page {
         Page::Dashboard => render_dashboard(f, p, ui, snapshot, providers, area),
+        Page::Configs => render_configs_page(f, p, ui, snapshot, providers, area),
         Page::Sessions => render_placeholder(f, p, "Sessions view (coming soon)", area),
         Page::Requests => render_placeholder(f, p, "Requests view (coming soon)", area),
         Page::Settings => render_placeholder(f, p, "Settings view (coming soon)", area),
     }
+}
+
+fn render_configs_page(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    providers: &[ProviderOption],
+    area: Rect,
+) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    let selected_session = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .and_then(|r| r.session_id.as_deref())
+        .unwrap_or("-");
+    let session_override = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .and_then(|r| r.override_config_name.as_deref());
+    let global_override = snapshot.global_override.as_deref();
+
+    let left_block = Block::default()
+        .title(Span::styled(
+            format!("Configs  (session: {})", short_sid(selected_session, 20)),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border))
+        .style(Style::default().bg(p.panel));
+
+    let header = Row::new(["Lvl", "Name", "Alias", "On", "Up"])
+        .style(Style::default().fg(p.muted))
+        .height(1);
+
+    let rows = providers
+        .iter()
+        .map(|cfg| {
+            let mut name = cfg.name.clone();
+            if cfg.active {
+                name = format!("* {name}");
+            }
+
+            let alias = cfg
+                .alias
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("-");
+            let on = if cfg.enabled { "on" } else { "off" };
+            let up = cfg.upstreams.len().to_string();
+
+            let mut style = Style::default().fg(if cfg.enabled { p.text } else { p.muted });
+            if global_override == Some(cfg.name.as_str()) {
+                style = style.fg(p.accent).add_modifier(Modifier::BOLD);
+            }
+            if session_override == Some(cfg.name.as_str()) {
+                style = style.fg(p.focus).add_modifier(Modifier::BOLD);
+            }
+
+            Row::new([
+                format!("L{}", cfg.level.clamp(1, 10)),
+                name,
+                alias.to_string(),
+                on.to_string(),
+                up,
+            ])
+            .style(style)
+            .height(1)
+        })
+        .collect::<Vec<_>>();
+
+    ui.configs_table.select(if providers.is_empty() {
+        None
+    } else {
+        Some(ui.selected_config_idx)
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),
+            Constraint::Length(18),
+            Constraint::Min(12),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ],
+    )
+    .header(header)
+    .block(left_block)
+    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
+    .highlight_symbol("  ");
+    f.render_stateful_widget(table, columns[0], &mut ui.configs_table);
+
+    let selected = providers.get(ui.selected_config_idx);
+    let right_title = selected
+        .map(|c| format!("Config details: {} (L{})", c.name, c.level.clamp(1, 10)))
+        .unwrap_or_else(|| "Config details".to_string());
+
+    let mut lines = Vec::new();
+    if let Some(cfg) = selected {
+        if let Some(alias) = cfg.alias.as_deref()
+            && !alias.trim().is_empty()
+        {
+            lines.push(Line::from(vec![
+                Span::styled("alias: ", Style::default().fg(p.muted)),
+                Span::styled(alias.to_string(), Style::default().fg(p.text)),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("enabled: ", Style::default().fg(p.muted)),
+            Span::styled(
+                if cfg.enabled { "true" } else { "false" },
+                Style::default().fg(if cfg.enabled { p.good } else { p.warn }),
+            ),
+            Span::raw("   "),
+            Span::styled("active: ", Style::default().fg(p.muted)),
+            Span::styled(
+                if cfg.active { "true" } else { "false" },
+                Style::default().fg(if cfg.active { p.accent } else { p.muted }),
+            ),
+        ]));
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Upstreams",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+        if cfg.upstreams.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "(none)",
+                Style::default().fg(p.muted),
+            )));
+        } else {
+            for (idx, u) in cfg.upstreams.iter().enumerate() {
+                let pid = u.provider_id.as_deref().unwrap_or("-");
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
+                    Span::styled(pid.to_string(), Style::default().fg(p.muted)),
+                    Span::raw("  "),
+                    Span::styled(u.base_url.clone(), Style::default().fg(p.text)),
+                ]));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Actions",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(
+            "  Enter        set global override to selected config",
+        ));
+        lines.push(Line::from("  Backspace    clear global override"));
+        lines.push(Line::from(
+            "  o            set session override to selected config",
+        ));
+        lines.push(Line::from("  O            clear session override"));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No configs available.",
+            Style::default().fg(p.muted),
+        )));
+    }
+
+    let right_block = Block::default()
+        .title(Span::styled(
+            right_title,
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border))
+        .style(Style::default().bg(p.panel));
+
+    let content = Paragraph::new(Text::from(lines))
+        .block(right_block)
+        .style(Style::default().fg(p.muted))
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, columns[1]);
 }
 
 fn render_placeholder(f: &mut Frame<'_>, p: Palette, title: &str, area: Rect) {
@@ -659,9 +843,9 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette) {
             "Navigation",
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]),
-        Line::from("  Tab        switch focus (Sessions/Requests)"),
+        Line::from("  Tab        switch focus (Dashboard)"),
         Line::from("  ↑/↓, j/k   move selection"),
-        Line::from("  1-4        switch page (reserved)"),
+        Line::from("  1-5        switch page"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Effort",
@@ -677,6 +861,15 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette) {
         )]),
         Line::from("  p          session provider override"),
         Line::from("  P          global provider override"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Configs page",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("  Enter      set global override to selected config"),
+        Line::from("  Backspace  clear global override"),
+        Line::from("  o          set session override to selected config"),
+        Line::from("  O          clear session override"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Quit",
@@ -749,13 +942,21 @@ fn render_provider_modal(
     let mut items = Vec::with_capacity(providers.len() + 1);
     items.push(ListItem::new(Line::from("(Clear override)")));
     for pvd in providers {
-        let label = match pvd.alias.as_deref() {
-            Some(alias) if !alias.trim().is_empty() && alias != pvd.name => {
-                format!("{} ({})", pvd.name, alias)
-            }
-            _ => pvd.name.clone(),
-        };
-        items.push(ListItem::new(Line::from(label)));
+        let mut label = format!("L{} {}", pvd.level.clamp(1, 10), pvd.name);
+        if pvd.active {
+            label.push_str(" *");
+        }
+        if !pvd.enabled {
+            label.push_str(" [off]");
+        }
+        if let Some(alias) = pvd.alias.as_deref()
+            && !alias.trim().is_empty()
+            && alias != pvd.name
+        {
+            label.push_str(&format!(" ({alias})"));
+        }
+        let style = Style::default().fg(if pvd.enabled { p.text } else { p.muted });
+        items.push(ListItem::new(Line::from(label)).style(style));
     }
 
     let max = items.len().saturating_sub(1);

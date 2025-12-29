@@ -2,11 +2,13 @@
 pub(in crate::tui) enum Focus {
     Sessions,
     Requests,
+    Configs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum Page {
     Dashboard,
+    Configs,
     Sessions,
     Requests,
     Settings,
@@ -52,15 +54,16 @@ impl EffortChoice {
     }
 }
 
-pub(in crate::tui) fn page_titles() -> [&'static str; 4] {
-    ["Dashboard", "Sessions", "Requests", "Settings"]
+pub(in crate::tui) fn page_titles() -> [&'static str; 5] {
+    ["Dashboard", "Configs", "Sessions", "Requests", "Settings"]
 }
 
 pub(in crate::tui) fn page_index(page: Page) -> usize {
     match page {
         Page::Dashboard => 0,
-        Page::Sessions => 1,
-        Page::Requests => 2,
-        Page::Settings => 3,
+        Page::Configs => 1,
+        Page::Sessions => 2,
+        Page::Requests => 3,
+        Page::Settings => 4,
     }
 }

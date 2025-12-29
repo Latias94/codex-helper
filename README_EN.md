@@ -58,7 +58,7 @@ This will:
 - When writing `model_providers.codex_proxy`, set `request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries); you can override it in `~/.codex/config.toml`;
 - Automatically retry a small number of times for transient failures (429/5xx/network hiccups) **before any response bytes are streamed to the client** (configurable);
 - If `~/.codex-helper/config.toml` / `config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
-- If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit);
+- If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit; use `1-5` to switch pages, with `2` for Configs/level routing);
 - On Ctrl+C, attempt to restore the original Codex config from the backup.
 
 After that, you keep using your usual `codex ...` commands; codex-helper just sits in the middle.
@@ -215,6 +215,14 @@ If you prefer to keep upstreams in separate configs, codex-helper also supports 
 
   ```bash
   codex-helper config set-active openai-main
+  ```
+
+- Level-based routing controls (multi-config failover):
+  
+  ```bash
+  codex-helper config set-level openai-main 1
+  codex-helper config disable packy-main
+  codex-helper config enable packy-main
   ```
 
 ### Sessions, usage, diagnostics

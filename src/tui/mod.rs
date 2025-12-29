@@ -5,7 +5,7 @@ mod terminal;
 mod types;
 mod view;
 
-pub use model::ProviderOption;
+pub use model::{ProviderOption, UpstreamSummary};
 
 use std::io;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ pub async fn run_dashboard(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut snapshot = refresh_snapshot(&state).await;
-    ui.clamp_selection(&snapshot);
+    ui.clamp_selection(&snapshot, providers.len());
 
     let mut should_redraw = true;
     loop {
@@ -82,7 +82,7 @@ pub async fn run_dashboard(
         tokio::select! {
             _ = ticker.tick() => {
                 snapshot = refresh_snapshot(&state).await;
-                ui.clamp_selection(&snapshot);
+                ui.clamp_selection(&snapshot, providers.len());
                 should_redraw = true;
             }
             changed = shutdown_rx.changed() => {

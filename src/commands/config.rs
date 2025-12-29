@@ -52,24 +52,41 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             } else {
                 let active = mgr.active.clone();
                 println!("{} configs (from {:?}):", label, cfg_path);
-                for (name, service_cfg) in &mgr.configs {
-                    let marker = if Some(name) == active.as_ref() {
+                let mut items = mgr
+                    .configs
+                    .iter()
+                    .map(|(name, svc)| (name.as_str(), svc))
+                    .collect::<Vec<_>>();
+                items.sort_by(|(a_name, a), (b_name, b)| {
+                    let a_level = a.level.clamp(1, 10);
+                    let b_level = b.level.clamp(1, 10);
+                    a_level.cmp(&b_level).then_with(|| a_name.cmp(b_name))
+                });
+
+                for (name, service_cfg) in items {
+                    let marker = if active.as_deref() == Some(name) {
                         "*"
                     } else {
                         " "
                     };
+                    let enabled = if service_cfg.enabled { "on" } else { "off" };
+                    let level = service_cfg.level.clamp(1, 10);
                     if let Some(alias) = &service_cfg.alias {
                         println!(
-                            "  {} {} [{}] ({} upstreams)",
+                            "  {} L{} {} {} [{}] ({} upstreams)",
                             marker,
+                            level,
+                            enabled,
                             name,
                             alias,
                             service_cfg.upstreams.len()
                         );
                     } else {
                         println!(
-                            "  {} {} ({} upstreams)",
+                            "  {} L{} {} {} ({} upstreams)",
                             marker,
+                            level,
+                            enabled,
                             name,
                             service_cfg.upstreams.len()
                         );
@@ -85,6 +102,8 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             api_key,
             api_key_env,
             alias,
+            level,
+            disabled,
             codex,
             claude,
         } => {
@@ -110,8 +129,8 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             let service_cfg = ServiceConfig {
                 name: name.clone(),
                 alias,
-                enabled: true,
-                level: 1,
+                enabled: !disabled,
+                level: level.clamp(1, 10),
                 upstreams: vec![upstream],
             };
 
@@ -165,6 +184,160 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                     .await
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 println!("Active Codex config set to '{}'", name);
+            }
+        }
+        ConfigCommand::SetLevel {
+            name,
+            level,
+            codex,
+            claude,
+        } => {
+            let service = resolve_service(codex, claude)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            if !(1..=10).contains(&level) {
+                return Err(CliError::ProxyConfig(
+                    "level must be in range 1..=10".to_string(),
+                ));
+            }
+
+            let mut cfg = load_config()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let mgr = if service == "claude" {
+                &mut cfg.claude
+            } else {
+                &mut cfg.codex
+            };
+
+            let Some(svc) = mgr.configs.get_mut(&name) else {
+                println!(
+                    "{} config '{}' not found",
+                    if service == "claude" {
+                        "Claude"
+                    } else {
+                        "Codex"
+                    },
+                    name
+                );
+                return Ok(());
+            };
+            svc.level = level;
+            save_config(&cfg)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            println!(
+                "Set {} config '{}' level to {}",
+                if service == "claude" {
+                    "Claude"
+                } else {
+                    "Codex"
+                },
+                name,
+                level
+            );
+        }
+        ConfigCommand::Enable {
+            name,
+            codex,
+            claude,
+        } => {
+            let service = resolve_service(codex, claude)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let mut cfg = load_config()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let mgr = if service == "claude" {
+                &mut cfg.claude
+            } else {
+                &mut cfg.codex
+            };
+
+            let Some(svc) = mgr.configs.get_mut(&name) else {
+                println!(
+                    "{} config '{}' not found",
+                    if service == "claude" {
+                        "Claude"
+                    } else {
+                        "Codex"
+                    },
+                    name
+                );
+                return Ok(());
+            };
+            svc.enabled = true;
+            save_config(&cfg)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            println!(
+                "Enabled {} config '{}'",
+                if service == "claude" {
+                    "Claude"
+                } else {
+                    "Codex"
+                },
+                name
+            );
+        }
+        ConfigCommand::Disable {
+            name,
+            codex,
+            claude,
+        } => {
+            let service = resolve_service(codex, claude)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let mut cfg = load_config()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let is_active = {
+                let mgr = if service == "claude" {
+                    &mut cfg.claude
+                } else {
+                    &mut cfg.codex
+                };
+
+                let Some(svc) = mgr.configs.get_mut(&name) else {
+                    println!(
+                        "{} config '{}' not found",
+                        if service == "claude" {
+                            "Claude"
+                        } else {
+                            "Codex"
+                        },
+                        name
+                    );
+                    return Ok(());
+                };
+                svc.enabled = false;
+                mgr.active.as_deref() == Some(name.as_str())
+            };
+
+            save_config(&cfg)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+
+            if is_active {
+                println!(
+                    "Disabled {} config '{}' (note: active config is still eligible for routing)",
+                    if service == "claude" {
+                        "Claude"
+                    } else {
+                        "Codex"
+                    },
+                    name
+                );
+            } else {
+                println!(
+                    "Disabled {} config '{}'",
+                    if service == "claude" {
+                        "Claude"
+                    } else {
+                        "Codex"
+                    },
+                    name
+                );
             }
         }
         ConfigCommand::ImportFromCodex { force } => {

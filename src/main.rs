@@ -247,6 +247,12 @@ enum ConfigCommand {
         /// Optional alias for this config
         #[arg(long)]
         alias: Option<String>,
+        /// Priority group for level-based config routing (1..=10, lower is higher priority)
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=10))]
+        level: u8,
+        /// Exclude this config from automatic routing (unless it is active)
+        #[arg(long)]
+        disabled: bool,
         /// Target Codex configs (default if neither flag is set)
         #[arg(long)]
         codex: bool,
@@ -256,6 +262,38 @@ enum ConfigCommand {
     },
     /// Set active config
     SetActive {
+        name: String,
+        /// Target Codex configs (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude configs
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Set a config's level (1..=10, lower is higher priority)
+    SetLevel {
+        name: String,
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=10))]
+        level: u8,
+        /// Target Codex configs (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude configs
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Enable a config for automatic routing
+    Enable {
+        name: String,
+        /// Target Codex configs (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude configs
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Disable a config for automatic routing (unless it is active)
+    Disable {
         name: String,
         /// Target Codex configs (default if neither flag is set)
         #[arg(long)]
@@ -695,6 +733,17 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
                 .map(|(name, svc)| tui::ProviderOption {
                     name: name.clone(),
                     alias: svc.alias.clone(),
+                    enabled: svc.enabled,
+                    level: svc.level.clamp(1, 10),
+                    active: cfg.claude.active.as_deref() == Some(name.as_str()),
+                    upstreams: svc
+                        .upstreams
+                        .iter()
+                        .map(|u| tui::UpstreamSummary {
+                            base_url: u.base_url.clone(),
+                            provider_id: u.tags.get("provider_id").cloned(),
+                        })
+                        .collect(),
                 })
                 .collect(),
             _ => cfg
@@ -704,10 +753,21 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
                 .map(|(name, svc)| tui::ProviderOption {
                     name: name.clone(),
                     alias: svc.alias.clone(),
+                    enabled: svc.enabled,
+                    level: svc.level.clamp(1, 10),
+                    active: cfg.codex.active.as_deref() == Some(name.as_str()),
+                    upstreams: svc
+                        .upstreams
+                        .iter()
+                        .map(|u| tui::UpstreamSummary {
+                            base_url: u.base_url.clone(),
+                            provider_id: u.tags.get("provider_id").cloned(),
+                        })
+                        .collect(),
                 })
                 .collect(),
         };
-        providers.sort_by(|a, b| a.name.cmp(&b.name));
+        providers.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
 
         let mut tui_handle = tokio::spawn(tui::run_dashboard(
             state,

@@ -7,6 +7,8 @@ All notable changes to this project will be documented in this file.
 ### 亮点 / Highlights
 - TUI 全面升级：用 `ratatui v0.30` 重写内置面板，信息层级更清晰、布局更有“呼吸感”，并为后续功能页扩展预留了结构化模块。  
   TUI upgrade: rewrite the built-in dashboard with `ratatui v0.30`, with clearer information hierarchy, more breathable layout, and a modular structure for future features.
+- TUI Configs 页：新增 Configs 视图用于查看 level 分组/启用状态，并可快速设置全局/会话级配置覆盖（pin 到单一 config）。  
+  TUI Configs page: add a Configs view for level grouping/enabled status, with quick global/session overrides (pin to a single config).
 - 模型白名单与映射（支持通配符）：为每个上游增加 `supported_models` / `model_mapping`（兼容 JSON `supportedModels` / `modelMapping`），代理会自动过滤不支持的上游并在转发前重写 `model` 字段。  
   Model allowlist + mapping (wildcards supported): add per-upstream `supported_models` / `model_mapping` (JSON compatible via `supportedModels` / `modelMapping`); the proxy skips incompatible upstreams and rewrites `model` before forwarding.
 - Level 分组（跨配置降级）：为每个配置增加 `level` / `enabled`，当存在多个 level 时，会按 level 从低到高（1→10）进行自动路由与故障降级。  
@@ -15,6 +17,8 @@ All notable changes to this project will be documented in this file.
 ### 新增 / Added
 - 启动时模型路由配置告警：提示未配置白名单/映射、仅配置映射未配置白名单、以及“映射目标不在白名单”等高风险配置。  
   Startup warnings for model routing config: warns about missing allowlist/mapping, mapping without allowlist, and invalid mapping targets.
+- `config` 子命令增强：支持 `config set-level` / `config enable` / `config disable`，并在 `config list` 中显示 `level/enabled`。  
+  Better `config` subcommands: add `config set-level` / `config enable` / `config disable`, and show `level/enabled` in `config list`.
 
 ### 测试 / Tests
 - 新增用例覆盖：按模型过滤上游、以及请求体 `model` 自动映射。  

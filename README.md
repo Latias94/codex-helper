@@ -53,7 +53,7 @@ ch
 它会自动帮你：
 
 - 启动 Codex 本地代理，监听 `127.0.0.1:3211`；
-- 如果在交互终端运行，会默认显示一个内置 TUI 面板（可用 `--no-tui` 关闭；按 `q` 退出）；
+- 如果在交互终端运行，会默认显示一个内置 TUI 面板（可用 `--no-tui` 关闭；按 `q` 退出；`1-5` 切页，`2` 为 Configs/Level 分组视图）；
 - 对 429/5xx/网络抖动等瞬态错误在**未开始向客户端输出响应**前进行有限次数的自动重试（可配置）；
 - 在修改前检查 `~/.codex/config.toml`，如已指向本地代理且存在备份，会询问是否先恢复原始配置；
 - 必要时修改 `model_provider` 与 `model_providers.codex_proxy`，让 Codex 走本地代理，并只在首次写入备份；
@@ -177,6 +177,14 @@ ch
 
   ```bash
   codex-helper config set-active openai-main
+  ```
+
+- 调整 Level 分组 / 启用禁用（用于跨配置降级）：
+  
+  ```bash
+  codex-helper config set-level openai-main 1
+  codex-helper config disable packy-main
+  codex-helper config enable packy-main
   ```
 
 ### 会话、用量与诊断

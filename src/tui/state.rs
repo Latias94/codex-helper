@@ -8,6 +8,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) page: Page,
     pub(in crate::tui) focus: Focus,
     pub(in crate::tui) overlay: Overlay,
+    pub(in crate::tui) selected_config_idx: usize,
     pub(in crate::tui) selected_session_idx: usize,
     pub(in crate::tui) selected_session_id: Option<String>,
     pub(in crate::tui) selected_request_idx: usize,
@@ -15,6 +16,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) provider_menu_idx: usize,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
     pub(in crate::tui) should_exit: bool,
+    pub(in crate::tui) configs_table: TableState,
     pub(in crate::tui) sessions_table: TableState,
     pub(in crate::tui) requests_table: TableState,
     pub(in crate::tui) menu_list: ListState,
@@ -26,6 +28,7 @@ impl Default for UiState {
             page: Page::Dashboard,
             focus: Focus::Sessions,
             overlay: Overlay::None,
+            selected_config_idx: 0,
             selected_session_idx: 0,
             selected_session_id: None,
             selected_request_idx: 0,
@@ -33,6 +36,7 @@ impl Default for UiState {
             provider_menu_idx: 0,
             toast: None,
             should_exit: false,
+            configs_table: TableState::default(),
             sessions_table: TableState::default(),
             requests_table: TableState::default(),
             menu_list: ListState::default(),
@@ -41,7 +45,15 @@ impl Default for UiState {
 }
 
 impl UiState {
-    pub(in crate::tui) fn clamp_selection(&mut self, snapshot: &Snapshot) {
+    pub(in crate::tui) fn clamp_selection(&mut self, snapshot: &Snapshot, providers_len: usize) {
+        if providers_len == 0 {
+            self.selected_config_idx = 0;
+            self.configs_table.select(None);
+        } else {
+            self.selected_config_idx = self.selected_config_idx.min(providers_len - 1);
+            self.configs_table.select(Some(self.selected_config_idx));
+        }
+
         if snapshot.rows.is_empty() {
             self.selected_session_idx = 0;
             self.selected_session_id = None;
