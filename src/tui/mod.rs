@@ -55,6 +55,7 @@ pub async fn run_dashboard(
     let mut ui = UiState {
         service_name,
         language,
+        refresh_ms,
         ..Default::default()
     };
     let palette = Palette::default();

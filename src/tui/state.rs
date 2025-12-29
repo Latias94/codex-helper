@@ -8,6 +8,7 @@ use super::types::{Focus, Overlay, Page, StatsFocus};
 pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
     pub(in crate::tui) language: Language,
+    pub(in crate::tui) refresh_ms: u64,
     pub(in crate::tui) page: Page,
     pub(in crate::tui) focus: Focus,
     pub(in crate::tui) overlay: Overlay,
@@ -48,6 +49,7 @@ impl Default for UiState {
         Self {
             service_name: "codex",
             language: Language::En,
+            refresh_ms: 500,
             page: Page::Dashboard,
             focus: Focus::Sessions,
             overlay: Overlay::None,

@@ -320,13 +320,7 @@ fn render_body(
         Page::Sessions => render_sessions_page(f, p, ui, snapshot, area),
         Page::Requests => render_requests_page(f, p, ui, snapshot, area),
         Page::Stats => stats::render_stats_page(f, p, ui, snapshot, providers, area),
-        Page::Settings => render_placeholder(
-            f,
-            p,
-            ui.language,
-            crate::tui::i18n::pick(ui.language, "设置（开发中）", "Settings (coming soon)"),
-            area,
-        ),
+        Page::Settings => render_settings_page(f, p, ui, snapshot, area),
     }
 }
 
@@ -1266,6 +1260,7 @@ fn render_requests_page(
     f.render_widget(content, columns[1]);
 }
 
+#[allow(dead_code)]
 fn render_placeholder(
     f: &mut Frame<'_>,
     p: Palette,
@@ -1290,6 +1285,237 @@ fn render_placeholder(
     .style(Style::default().fg(p.muted))
     .alignment(Alignment::Center)
     .wrap(Wrap { trim: true });
+    f.render_widget(content, area);
+}
+
+fn render_settings_page(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    area: Rect,
+) {
+    let now_epoch_ms = now_ms();
+    let block = Block::default()
+        .title(Span::styled(
+            crate::tui::i18n::pick(ui.language, "设置", "Settings"),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border))
+        .style(Style::default().bg(p.panel));
+
+    let mut lines = Vec::new();
+
+    let lang_name = match ui.language {
+        crate::tui::Language::Zh => "中文",
+        crate::tui::Language::En => "English",
+    };
+    let refresh_env = std::env::var("CODEX_HELPER_TUI_REFRESH_MS").ok();
+    let recent_max_env = std::env::var("CODEX_HELPER_RECENT_FINISHED_MAX").ok();
+    let health_timeout_env = std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_TIMEOUT_MS").ok();
+    let health_inflight_env = std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT").ok();
+    let health_upstream_conc_env =
+        std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_UPSTREAM_CONCURRENCY").ok();
+
+    let effective_recent_max = recent_max_env
+        .as_deref()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2_000)
+        .clamp(200, 20_000);
+
+    let s5 = &snapshot.stats_5m;
+    let s1 = &snapshot.stats_1h;
+    let ok_pct = |ok: usize, total: usize| -> String {
+        if total == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.0}%", (ok as f64) * 100.0 / (total as f64))
+        }
+    };
+
+    lines.push(Line::from(vec![Span::styled(
+        crate::tui::i18n::pick(ui.language, "运行态概览", "Runtime overview"),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("5m ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!(
+                "ok={}  p95={}  att={}  429={}  5xx={}  n={}",
+                ok_pct(s5.ok_2xx, s5.total),
+                s5.p95_ms
+                    .map(|v| format!("{v}ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                s5.avg_attempts
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                s5.err_429,
+                s5.err_5xx,
+                s5.total
+            ),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("1h ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!(
+                "ok={}  p95={}  att={}  429={}  5xx={}  n={}",
+                ok_pct(s1.ok_2xx, s1.total),
+                s1.p95_ms
+                    .map(|v| format!("{v}ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                s1.avg_attempts
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                s1.err_429,
+                s1.err_5xx,
+                s1.total
+            ),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    if let Some((pid, n)) = s5.top_provider.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("5m top provider: ", Style::default().fg(p.muted)),
+            Span::styled(pid.to_string(), Style::default().fg(p.text)),
+            Span::styled(format!("  n={n}"), Style::default().fg(p.muted)),
+        ]));
+    }
+    if let Some((cfg, n)) = s5.top_config.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("5m top config: ", Style::default().fg(p.muted)),
+            Span::styled(cfg.to_string(), Style::default().fg(p.text)),
+            Span::styled(format!("  n={n}"), Style::default().fg(p.muted)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        crate::tui::i18n::pick(ui.language, "TUI 选项", "TUI options"),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "语言：", "language: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(lang_name, Style::default().fg(p.text)),
+        Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "  (按 L 切换，并落盘到 ui.language)",
+                "  (press L to toggle and persist to ui.language)",
+            ),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "刷新间隔：", "refresh: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(format!("{}ms", ui.refresh_ms), Style::default().fg(p.text)),
+        Span::styled(
+            format!(
+                "  env CODEX_HELPER_TUI_REFRESH_MS={}",
+                refresh_env.as_deref().unwrap_or("-")
+            ),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "窗口采样：", "window samples: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            format!("recent_finished_max={effective_recent_max}"),
+            Style::default().fg(p.text),
+        ),
+        Span::styled(
+            format!(
+                "  env CODEX_HELPER_RECENT_FINISHED_MAX={}",
+                recent_max_env.as_deref().unwrap_or("-")
+            ),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        crate::tui::i18n::pick(ui.language, "Health Check", "Health Check"),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "timeout_ms={}  max_inflight={}  upstream_concurrency={}",
+            health_timeout_env.as_deref().unwrap_or("-"),
+            health_inflight_env.as_deref().unwrap_or("-"),
+            health_upstream_conc_env.as_deref().unwrap_or("-"),
+        ),
+        Style::default().fg(p.muted),
+    )]));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        crate::tui::i18n::pick(ui.language, "路径", "Paths"),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("config: ", Style::default().fg(p.muted)),
+        Span::styled(
+            crate::config::config_file_path().display().to_string(),
+            Style::default().fg(p.text),
+        ),
+    ]));
+    let home = crate::config::proxy_home_dir();
+    lines.push(Line::from(vec![
+        Span::styled("home:   ", Style::default().fg(p.muted)),
+        Span::styled(home.display().to_string(), Style::default().fg(p.text)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("logs:   ", Style::default().fg(p.muted)),
+        Span::styled(
+            home.join("logs").display().to_string(),
+            Style::default().fg(p.text),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("reports:", Style::default().fg(p.muted)),
+        Span::styled(
+            home.join("reports").display().to_string(),
+            Style::default().fg(p.text),
+        ),
+    ]));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        crate::tui::i18n::pick(ui.language, "常用快捷键", "Common keys"),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(crate::tui::i18n::pick(
+        ui.language,
+        "  1-6 切页  ? 帮助  q 退出  L 语言  (Configs: i 详情  Stats: y 导出/复制)",
+        "  1-6 pages  ? help  q quit  L language  (Configs: i details  Stats: y export/copy)",
+    )));
+
+    lines.push(Line::from(""));
+    let updated_ms = snapshot.refreshed_at.elapsed().as_millis();
+    lines.push(Line::from(vec![
+        Span::styled("updated: ", Style::default().fg(p.muted)),
+        Span::styled(format!("{updated_ms}ms"), Style::default().fg(p.muted)),
+        Span::raw("  "),
+        Span::styled("now: ", Style::default().fg(p.muted)),
+        Span::styled(now_epoch_ms.to_string(), Style::default().fg(p.muted)),
+    ]));
+
+    let content = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(p.muted))
+        .wrap(Wrap { trim: false });
     f.render_widget(content, area);
 }
 
@@ -1745,8 +1971,8 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
             ),
             Page::Settings => crate::tui::i18n::pick(
                 ui.language,
-                "q 退出  L 语言  ? 帮助",
-                "q quit  L language  ? help",
+                "q 退出  L 语言  ? 帮助  （本页为运行态/配置入口）",
+                "q quit  L language  ? help  (runtime + config overview)",
             ),
         },
         Overlay::Help => crate::tui::i18n::pick(
@@ -2417,6 +2643,7 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui::Language) 
             Line::from("            1 总览  2 配置  3 会话  4 请求  5 统计  6 设置"),
             Line::from("  L          切换语言（中/英，自动落盘）"),
             Line::from("  Tab        切换焦点（总览页）"),
+            Line::from("  6 设置     查看运行态与关键配置入口"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "推理强度",
@@ -2492,6 +2719,7 @@ fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui::Language) 
                 "            1 Dashboard  2 Configs  3 Sessions  4 Requests  5 Stats  6 Settings",
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
+            Line::from("  6 Settings show runtime + config overview"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Effort",
