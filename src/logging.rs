@@ -258,7 +258,7 @@ pub struct HttpDebugRef {
     pub file: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct RetryInfo {
     pub attempts: u32,
     pub upstream_chain: Vec<String>,

@@ -52,6 +52,8 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         ui.page = p;
         if ui.page == Page::Configs {
             ui.focus = Focus::Configs;
+        } else if ui.page == Page::Requests {
+            ui.focus = Focus::Requests;
         } else if ui.page == Page::Dashboard && ui.focus == Focus::Configs {
             ui.focus = Focus::Sessions;
         }
@@ -183,6 +185,92 @@ async fn handle_key_normal(
             apply_session_provider_override(state, sid, None).await;
             ui.toast = Some(("session cfg override: <clear>".to_string(), Instant::now()));
             true
+        }
+        KeyCode::Char('e') if ui.page == Page::Requests => {
+            ui.request_page_errors_only = !ui.request_page_errors_only;
+            ui.toast = Some((
+                format!(
+                    "requests filter: errors_only={}",
+                    ui.request_page_errors_only
+                ),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('s') if ui.page == Page::Requests => {
+            ui.request_page_scope_session = !ui.request_page_scope_session;
+            ui.toast = Some((
+                format!(
+                    "requests scope: {}",
+                    if ui.request_page_scope_session {
+                        "selected session"
+                    } else {
+                        "all"
+                    }
+                ),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Requests => {
+            let selected_sid = snapshot
+                .rows
+                .get(ui.selected_session_idx)
+                .and_then(|r| r.session_id.as_deref());
+            let filtered_len = snapshot
+                .recent
+                .iter()
+                .filter(|r| {
+                    if ui.request_page_errors_only && r.status_code < 400 {
+                        return false;
+                    }
+                    if ui.request_page_scope_session {
+                        match (selected_sid, r.session_id.as_deref()) {
+                            (Some(sid), Some(rid)) => sid == rid,
+                            (Some(_), None) => false,
+                            (None, _) => true,
+                        }
+                    } else {
+                        true
+                    }
+                })
+                .count();
+            if let Some(next) = adjust_table_selection(&mut ui.request_page_table, -1, filtered_len)
+            {
+                ui.selected_request_page_idx = next;
+                return true;
+            }
+            false
+        }
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Requests => {
+            let selected_sid = snapshot
+                .rows
+                .get(ui.selected_session_idx)
+                .and_then(|r| r.session_id.as_deref());
+            let filtered_len = snapshot
+                .recent
+                .iter()
+                .filter(|r| {
+                    if ui.request_page_errors_only && r.status_code < 400 {
+                        return false;
+                    }
+                    if ui.request_page_scope_session {
+                        match (selected_sid, r.session_id.as_deref()) {
+                            (Some(sid), Some(rid)) => sid == rid,
+                            (Some(_), None) => false,
+                            (None, _) => true,
+                        }
+                    } else {
+                        true
+                    }
+                })
+                .count();
+            if let Some(next) = adjust_table_selection(&mut ui.request_page_table, 1, filtered_len)
+            {
+                ui.selected_request_page_idx = next;
+                return true;
+            }
+            false
         }
         KeyCode::Up | KeyCode::Char('k') => match ui.focus {
             Focus::Sessions => {

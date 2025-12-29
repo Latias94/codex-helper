@@ -6,6 +6,7 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
+use crate::logging::RetryInfo;
 use crate::sessions;
 use crate::usage::UsageMetrics;
 
@@ -51,6 +52,8 @@ pub struct FinishedRequest {
     pub upstream_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryInfo>,
     pub service: String,
     pub method: String,
     pub path: String,
@@ -355,6 +358,7 @@ impl ProxyState {
         duration_ms: u64,
         ended_at_ms: u64,
         usage: Option<UsageMetrics>,
+        retry: Option<RetryInfo>,
     ) {
         let mut active = self.active_requests.write().await;
         let Some(req) = active.remove(&id) else {
@@ -371,6 +375,7 @@ impl ProxyState {
             provider_id: req.provider_id,
             upstream_base_url: req.upstream_base_url,
             usage: usage.clone(),
+            retry,
             service: req.service,
             method: req.method,
             path: req.path,

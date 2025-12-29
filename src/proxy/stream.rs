@@ -131,6 +131,7 @@ impl Drop for StreamFinalize {
         guard.finished = true;
         let already_logged = guard.logged;
         let usage_for_state = guard.usage.clone();
+        let retry_for_state = self.retry.clone();
         let stream_error = guard.stream_error;
 
         let dur = self.start.elapsed().as_millis() as u64;
@@ -187,6 +188,7 @@ impl Drop for StreamFinalize {
                     dur,
                     started_at_ms + dur,
                     usage_for_state,
+                    retry_for_state,
                 )
                 .await;
         });

@@ -817,9 +817,17 @@ pub async fn handle_proxy(
                 retry_info_for_chain(&upstream_chain),
                 None,
             );
+            let retry = retry_info_for_chain(&upstream_chain);
             proxy
                 .state
-                .finish_request(request_id, status.as_u16(), dur, started_at_ms + dur, None)
+                .finish_request(
+                    request_id,
+                    status.as_u16(),
+                    dur,
+                    started_at_ms + dur,
+                    None,
+                    retry,
+                )
                 .await;
             if let Some(model) = request_model.as_deref() {
                 return Err((
@@ -938,9 +946,17 @@ pub async fn handle_proxy(
                     retry_info_for_chain(&upstream_chain),
                     http_debug,
                 );
+                let retry = retry_info_for_chain(&upstream_chain);
                 proxy
                     .state
-                    .finish_request(request_id, status.as_u16(), dur, started_at_ms + dur, None)
+                    .finish_request(
+                        request_id,
+                        status.as_u16(),
+                        dur,
+                        started_at_ms + dur,
+                        None,
+                        retry,
+                    )
                     .await;
                 return Err((status, err_str));
             }
@@ -1139,12 +1155,19 @@ pub async fn handle_proxy(
                     cwd.clone(),
                     effective_effort.clone(),
                     None,
-                    retry,
+                    retry.clone(),
                     http_debug,
                 );
                 proxy
                     .state
-                    .finish_request(request_id, status_code, dur, started_at_ms + dur, None)
+                    .finish_request(
+                        request_id,
+                        status_code,
+                        dur,
+                        started_at_ms + dur,
+                        None,
+                        retry,
+                    )
                     .await;
                 return Err((StatusCode::BAD_GATEWAY, e.to_string()));
             }
@@ -1273,9 +1296,17 @@ pub async fn handle_proxy(
                         retry_info_for_chain(&upstream_chain),
                         http_debug,
                     );
+                    let retry = retry_info_for_chain(&upstream_chain);
                     proxy
                         .state
-                        .finish_request(request_id, status.as_u16(), dur, started_at_ms + dur, None)
+                        .finish_request(
+                            request_id,
+                            status.as_u16(),
+                            dur,
+                            started_at_ms + dur,
+                            None,
+                            retry,
+                        )
                         .await;
                     return Err((status, err_str));
                 }
@@ -1466,7 +1497,7 @@ pub async fn handle_proxy(
                 cwd.clone(),
                 effective_effort.clone(),
                 usage.clone(),
-                retry,
+                retry.clone(),
                 http_debug,
             );
             proxy
@@ -1477,6 +1508,7 @@ pub async fn handle_proxy(
                     dur,
                     started_at_ms + dur,
                     usage.clone(),
+                    retry,
                 )
                 .await;
 
@@ -1546,9 +1578,17 @@ pub async fn handle_proxy(
         retry_info_for_chain(&upstream_chain),
         http_debug,
     );
+    let retry = retry_info_for_chain(&upstream_chain);
     proxy
         .state
-        .finish_request(request_id, status.as_u16(), dur, started_at_ms + dur, None)
+        .finish_request(
+            request_id,
+            status.as_u16(),
+            dur,
+            started_at_ms + dur,
+            None,
+            retry,
+        )
         .await;
     Err((status, "retry attempts exhausted".to_string()))
 }
