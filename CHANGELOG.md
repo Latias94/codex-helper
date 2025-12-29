@@ -5,98 +5,32 @@ All notable changes to this project will be documented in this file.
 
 ## [0.10.0] - Unreleased
 ### 亮点 / Highlights
-- TUI 全面升级：用 `ratatui v0.30` 重写内置面板，信息层级更清晰、布局更有“呼吸感”，并为后续功能页扩展预留了结构化模块。  
-  TUI upgrade: rewrite the built-in dashboard with `ratatui v0.30`, with clearer information hierarchy, more breathable layout, and a modular structure for future features.
-- TUI Configs 页：新增 Configs 视图用于查看 level 分组/启用状态，并可快速设置全局/会话级配置覆盖（pin 到单一 config）。  
-  TUI Configs page: add a Configs view for level grouping/enabled status, with quick global/session overrides (pin to a single config).
-- TUI 热编辑并即时生效：在 Configs 页可直接切换 `enabled`、调整 `level`，变更会立即影响路由，并自动落盘到配置文件（重启后仍生效）。  
-  Live config edits in TUI: toggle `enabled` and adjust `level` directly in the Configs page; changes take effect immediately for routing and are persisted to the config file.
-- TUI 多页监控与可解释性：新增 Sessions/Requests 页，支持快速筛选，并在请求详情中展示“上游尝试链路（route chain）”。  
-  Multi-page monitoring + explainability: add Sessions/Requests pages with quick filters, and show the upstream attempt chain (route chain) in request details.
-- TUI 用量与测速：新增 Stats 页展示 token/请求聚合与 Top config/provider；Configs 页支持一键健康检查（/models）并展示延迟与错误信息。  
-  Usage + speed insights in TUI: add a Stats page with token/request rollups and top config/provider tables; add one-key health checks (/models) in Configs with latency/error details.
-- 模型白名单与映射（支持通配符）：为每个上游增加 `supported_models` / `model_mapping`（兼容 JSON `supportedModels` / `modelMapping`），代理会自动过滤不支持的上游并在转发前重写 `model` 字段。  
-  Model allowlist + mapping (wildcards supported): add per-upstream `supported_models` / `model_mapping` (JSON compatible via `supportedModels` / `modelMapping`); the proxy skips incompatible upstreams and rewrites `model` before forwarding.
-- Level 分组（跨配置降级）：为每个配置增加 `level` / `enabled`，当存在多个 level 时，会按 level 从低到高（1→10）进行自动路由与故障降级。  
-  Level-based config failover: add `level` / `enabled` to each config; when multiple levels exist, the proxy routes and fails over from lower to higher levels (1→10).
+- 重新设计 TUI：使用 `ratatui v0.30` 重写，信息分层更清晰（Header 总览 / 页面主体 / Footer 快捷键），为后续功能扩展预留结构。  
+  Redesigned TUI: rewritten with `ratatui v0.30`, clearer hierarchy (header overview / page body / footer shortcuts) and a structure ready for future features.
+- 更清晰的导航与指引：`1-6` 切换页面，`?` 查看帮助，`L` 切换中英（首次启动默认跟随系统语言）。  
+  Clearer navigation: `1-6` switches pages, `?` opens help, `L` toggles CN/EN (first run follows system language).
+- 代理可用性一眼可见：Header 展示 5m/1h 成功率、p95、429/5xx、平均尝试次数，并把 health check “进行中总览”放到顶部。  
+  Proxy availability at a glance: header shows 5m/1h success rate, p95, 429/5xx, avg attempts, plus an in-progress health-check overview.
+- Configs 可解释 + 可操作：支持 `enabled/level` 热编辑并落盘；`i` 打开 config/provider 详情（auth、模型/映射、LB/health、延迟/错误）。  
+  Configs is explainable and actionable: hot-edit `enabled/level` with persistence; `i` opens config/provider details (auth, models/mapping, LB/health, latency/errors).
+- Stats 报告：Stats 页支持一键复制/导出报告（例如最近错误 Top 状态码/路径/模型），方便分享与排障。  
+  Stats reports: one-key copy/export (e.g. recent top errors by status/path/model) for sharing and debugging.
+- Settings 页补齐：从 “coming soon” 变为运行态与配置入口信息面板。  
+  Settings page is now real: replaces “coming soon” with a runtime/config entry overview panel.
 
 ### 新增 / Added
-- 启动时模型路由配置告警：提示未配置白名单/映射、仅配置映射未配置白名单、以及“映射目标不在白名单”等高风险配置。  
-  Startup warnings for model routing config: warns about missing allowlist/mapping, mapping without allowlist, and invalid mapping targets.
-- `config` 子命令增强：支持 `config set-level` / `config enable` / `config disable`，并在 `config list` 中显示 `level/enabled`。  
-  Better `config` subcommands: add `config set-level` / `config enable` / `config disable`, and show `level/enabled` in `config list`.
-- TUI Sessions 页：按会话维度查看活跃/错误/覆盖等状态，并提供联动筛选与快速重置。  
-  TUI Sessions page: inspect sessions with active/error/override views, plus linked filters and quick reset.
-- TUI Requests 页：按请求维度查看最新请求，支持错误筛选与 scope 切换，并展示每次重试的上游链路。  
-  TUI Requests page: inspect recent requests with error filter and scope switch, and show the per-retry upstream chain.
-- TUI Stats 页：展示按天聚合的 token 趋势、按 config/provider 的 Top 用量表；可通过 `CODEX_HELPER_PRICE_INPUT_PER_1K_USD` / `CODEX_HELPER_PRICE_OUTPUT_PER_1K_USD` 启用粗略成本估算。  
-  TUI Stats page: show daily token rollups and top usage tables by config/provider; enable coarse cost estimates via `CODEX_HELPER_PRICE_INPUT_PER_1K_USD` / `CODEX_HELPER_PRICE_OUTPUT_PER_1K_USD`.
-- TUI Stats 交互：支持在 config/provider 之间切换焦点并查看明细；支持切换时间窗口（7/21/60 天）。  
-  TUI Stats interactions: switch focus between config/provider with a detail panel, and cycle time windows (7/21/60 days).
-- Stats 持久化（回放请求日志）：启动时会从 `~/.codex-helper/logs/requests.jsonl` 回放最近一段请求记录以恢复用量聚合（可通过 `CODEX_HELPER_USAGE_REPLAY_*` 环境变量控制）。  
-  Stats persistence (log replay): replay recent `~/.codex-helper/logs/requests.jsonl` entries on startup to restore usage rollups (configurable via `CODEX_HELPER_USAGE_REPLAY_*` env vars).
-- TUI Configs 健康检查：`h` 检测选中 config，`H` 批量检测所有 config；结果会展示每个 upstream 的延迟与状态码。  
-  TUI Configs health checks: `h` checks selected config, `H` checks all configs; results show per-upstream latency and status code.
-- 健康检查体验增强：Configs 列表展示进行中/取消状态；支持 `c`/`C` 取消检查，并提供批量检查并发上限（`CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT`）。  
-  Health check UX improvements: show running/cancel states in Configs; support `c`/`C` to cancel checks, plus a max in-flight limit (`CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT`).
-- TUI 可发现性增强：顶部 Tabs 标题包含页号（`1-6`），Help 弹窗同步更新，便于快速切页。  
-  TUI discoverability: top tabs include page numbers (`1-6`) and the Help modal reflects this for faster page switching.
-- TUI 本地化（中/英）：首次启动默认跟随系统语言（可通过 `ui.language` 或 `CODEX_HELPER_TUI_LANG` 覆盖），并支持在 TUI 内按 `L` 一键切换并落盘。  
-  TUI i18n (zh/en): first run defaults to system locale (override via `ui.language` or `CODEX_HELPER_TUI_LANG`), and press `L` in the TUI to toggle language and persist it.
-- Stats 一键导出/复制报告：在 Stats 页按 `y` 可把选中项的窗口聚合与最近错误分布导出到 `~/.codex-helper/reports/`，并尝试复制到剪贴板。  
-  One-key Stats report: press `y` in Stats to export a report for the selected item into `~/.codex-helper/reports/` and attempt to copy it to clipboard.
-- TUI 可用性指标（5m/1h）：Header 与 Config 详情中展示短窗口成功率、p95 延迟、重试率/attempts、429/5xx 错误计数，便于多中转场景快速判断“当前是否稳定、是否在反复重试”（可用 `CODEX_HELPER_RECENT_FINISHED_MAX` 调整窗口统计的请求保留数量）。  
-  TUI availability metrics (5m/1h): show short-window success rate, p95 latency, retry rate/attempts, and 429/5xx counts in the header and config details for multi-proxy stability checks (tune the sample size via `CODEX_HELPER_RECENT_FINISHED_MAX`).
-- 请求日志增强：`requests.jsonl` 增加 `provider_id` 字段（如 upstream tags 里配置了 `provider_id`），用于更准确的统计与排障。  
-  Request log enhancement: add `provider_id` field to `requests.jsonl` (when upstream tags include `provider_id`) for better stats and debugging.
-
-### 测试 / Tests
-- 新增用例覆盖：按模型过滤上游、以及请求体 `model` 自动映射。  
-  Add tests for: skipping upstreams by model support, and request body `model` mapping.
-
-## [0.5.0] - 2025-12-27
-### 亮点 / Highlights
-- Codex 任务结束通知：当 Codex 的一轮对话执行完成时，可以由 codex-helper 触发系统通知（默认关闭），并支持合并/限流以避免刷屏；也可配置自定义 Hook（exec，stdin 接收聚合 JSON）。  
-  Codex turn-complete notifications: when a Codex turn completes, codex-helper can trigger a system notification (disabled by default) with merge/rate-limit to avoid spam; or call a custom hook (exec, aggregated JSON via stdin).
-- 配置体验升级：支持 `~/.codex-helper/config.toml`（优先）与旧版 `config.json`（兼容）；提供 `codex-helper config init` 一键生成带注释的 TOML 默认模板（含配置示例）；首次自动落盘默认生成 TOML。  
-  Better config UX: support `~/.codex-helper/config.toml` (preferred) while remaining compatible with legacy `config.json`; add `codex-helper config init` to generate a commented TOML default template (with examples); default to TOML on first write.
-
-### 新增 / Added
-- Codex `notify` 集成：支持系统通知与自定义 Hook（exec，stdin 接收聚合 JSON），并提供默认的合并/限流策略以减少噪音（系统通知默认关闭）。  
-  Codex `notify` integration: system notifications and a custom hook (exec, aggregated JSON via stdin), with default merge/rate-limit policy to reduce noise (system notifications disabled by default).
-- 双格式配置：支持 `~/.codex-helper/config.toml`（优先）与 `config.json`（兼容），并提供 `codex-helper config init` 生成带注释的 TOML 模板。  
-  Dual config formats: support `~/.codex-helper/config.toml` (preferred) and `config.json` (compatible), plus `codex-helper config init` to generate a commented TOML template.
-
-### 变更 / Changed
-- 文档更新：说明 notify 的配置方式与 TOML 配置的优先级。  
-  Docs update: describe notify configuration and TOML precedence.
-
-## [0.4.1] - 2025-12-27
-### Changed
-- `switch on` now sets `model_providers.codex_proxy.request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries), while preserving any user-defined value.
-- Proxy module refactor: split `proxy.rs` into `src/proxy/*` to make retry/streaming logic easier to reason about and test.
-
-### Fixed
-- Streaming (SSE) upstream disconnects now count as upstream failures and apply a cooldown penalty, improving failover when Codex retries the stream.
-- `retry.attempts` no longer counts `all_upstreams_avoided` marker entries.
-
-## [0.4.0] - 2025-12-23
-### Added
-- `session list/search` now shows rounds/turn counts and `last_response_at` (and includes these fields in `session export`).
-- Session stats cache at `~/.codex-helper/cache/session_stats.json` to speed up `session list/search` (turn counts + timestamps).
-- Retry now honors `Retry-After: <seconds>` when present.
-- Codex bootstrap/import now imports all `model_providers.*` entries from `~/.codex/config.toml` as switchable configs (instead of only the active provider).
-- Runtime-only upstream config overrides: per-session and global (applies to new requests only; does not interrupt in-flight streaming).
-- TUI provider switch menu: `p` for session override, `P` for global override (with clear option).
+- Level 分组与跨配置降级：为每个 config 增加 `level` / `enabled`，多 level 时按 `1→10` 自动路由与故障降级。  
+  Level-based routing + failover: per-config `level` / `enabled`, routes/fails over from `1→10` when multiple levels exist.
+- 模型白名单与映射（通配符）：新增 `supported_models` / `model_mapping`（兼容 JSON `supportedModels` / `modelMapping`），在转发前过滤不支持上游并重写 `model`。  
+  Model allowlist + mapping (wildcards): `supported_models` / `model_mapping` (JSON `supportedModels` / `modelMapping` compatible), filters incompatible upstreams and rewrites `model` before forwarding.
+- `config` 子命令增强：新增 `config set-level` / `config enable` / `config disable`，并在 `config list` 中显示 `level/enabled`。  
+  Enhanced `config` subcommands: add `config set-level` / `config enable` / `config disable`, and show `level/enabled` in `config list`.
 
 ### Changed
-- Default retry status codes now include `429` (useful during high-demand throttling).
-- `session list/search` candidate ordering prefers session file `mtime` (better behavior for resumed sessions).
-- `rounds` is now computed as `min(user_turns, assistant_turns)` (best-effort).
-- HTTP request body previews are now gated by `CODEX_HELPER_HTTP_LOG_REQUEST_BODY=1` (default off).
-- Proxy hot path reduces copying/cloning: `Bytes` request bodies, lazy header-entry materialization, and zero-copy filtering when no active rules.
-- TUI sessions list: improved layout and keeps selection visible while scrolling.
-- Documentation refresh: remove untested Claude sections; highlight auto-retry and session-cache behavior.
+- 默认重试状态码包含 `429`。  
+  Default retry status codes include `429`.
+- TUI 渲染层重构：按 `src/tui/view/{chrome,widgets,modals,pages}` 拆分，便于持续迭代与新增页面。  
+  TUI renderer refactor: split into `src/tui/view/{chrome,widgets,modals,pages}` for easier iteration and new pages.
 
 ## [0.3.0] - 2025-12-21
 ### Added
@@ -111,9 +45,9 @@ All notable changes to this project will be documented in this file.
   - `GET /__codex_helper/status/active`
   - `GET /__codex_helper/status/recent`
 - Extra request log fields: `session_id`, `cwd`, and `reasoning_effort` when available.
-- Non-2xx requests include a small header/body preview in logs by default (disable via `CODEX_HELPER_HTTP_WARN=0`).
+- Non-2xx requests include a small header/body preview in logs by default (disable with `CODEX_HELPER_HTTP_WARN=0`).
 - `http_debug.auth_resolution` records where upstream auth headers came from (never includes secrets), to help diagnose auth/config issues.
-- `http_debug` is split to `requests_debug.jsonl` by default (disable via `CODEX_HELPER_HTTP_DEBUG_SPLIT=0`).
+- `http_debug` is split to `requests_debug.jsonl` by default (disable with `CODEX_HELPER_HTTP_DEBUG_SPLIT=0`).
 - `runtime.log` auto-rotates on startup when running with the built-in TUI (size/retention via `CODEX_HELPER_RUNTIME_LOG_MAX_BYTES` / `CODEX_HELPER_RUNTIME_LOG_MAX_FILES`).
 
 ### Changed
