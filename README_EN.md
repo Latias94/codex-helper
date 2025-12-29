@@ -225,6 +225,14 @@ If you prefer to keep upstreams in separate configs, codex-helper also supports 
   codex-helper config enable packy-main
   ```
 
+- Overwrite Codex configs from Codex CLI (reset to defaults):
+  
+  ```bash
+  # overwrite codex-helper Codex configs (resets active/enabled/level to defaults)
+  codex-helper config overwrite-from-codex --dry-run
+  codex-helper config overwrite-from-codex
+  ```
+
 ### Sessions, usage, diagnostics
 
 - Session helpers (Codex):

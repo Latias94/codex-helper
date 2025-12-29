@@ -187,6 +187,14 @@ ch
   codex-helper config enable packy-main
   ```
 
+- 从 Codex CLI 覆盖导入账号/配置（重置为默认分组）：
+  
+  ```bash
+  # 覆盖 codex-helper 的 Codex 配置（active/enabled/level 等回到默认）
+  codex-helper config overwrite-from-codex --dry-run
+  codex-helper config overwrite-from-codex
+  ```
+
 ### 会话、用量与诊断
 
 - 会话助手（Codex）：

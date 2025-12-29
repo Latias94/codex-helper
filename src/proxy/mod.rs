@@ -15,6 +15,7 @@ use tracing::{info, instrument, warn};
 
 mod classify;
 mod retry;
+mod runtime_config;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -37,6 +38,7 @@ use self::retry::{
     backoff_sleep, retry_info_for_chain, retry_options, retry_sleep, should_retry_class,
     should_retry_status,
 };
+use self::runtime_config::RuntimeConfig;
 use self::stream::{SseSuccessMeta, build_sse_success_response};
 
 fn read_json_file(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -293,7 +295,7 @@ fn warn_http_debug(status_code: u16, http_debug: &HttpDebugLog) {
 #[derive(Clone)]
 pub struct ProxyService {
     pub client: Client,
-    pub config: Arc<ProxyConfig>,
+    config: Arc<RuntimeConfig>,
     pub service_name: &'static str,
     lb_states: Arc<Mutex<HashMap<String, LbState>>>,
     filter: RequestFilter,
@@ -334,7 +336,7 @@ impl ProxyService {
         }
         Self {
             client,
-            config,
+            config: Arc::new(RuntimeConfig::new(config)),
             service_name,
             lb_states,
             filter: RequestFilter::new(),
@@ -342,11 +344,11 @@ impl ProxyService {
         }
     }
 
-    fn service_manager(&self) -> &ServiceConfigManager {
+    fn service_manager<'a>(&self, cfg: &'a ProxyConfig) -> &'a ServiceConfigManager {
         match self.service_name {
-            "codex" => &self.config.codex,
-            "claude" => &self.config.claude,
-            _ => &self.config.codex,
+            "codex" => &cfg.codex,
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
         }
     }
 
@@ -365,8 +367,12 @@ impl ProxyService {
         None
     }
 
-    async fn lbs_for_request(&self, session_id: Option<&str>) -> Vec<LoadBalancer> {
-        let mgr = self.service_manager();
+    async fn lbs_for_request(
+        &self,
+        cfg: &ProxyConfig,
+        session_id: Option<&str>,
+    ) -> Vec<LoadBalancer> {
+        let mgr = self.service_manager(cfg);
         let meta_overrides = self
             .state
             .get_config_meta_overrides(self.service_name)
@@ -592,7 +598,11 @@ pub async fn handle_proxy(
 
     let session_id = extract_session_id(&client_headers);
 
-    let lbs = proxy.lbs_for_request(session_id.as_deref()).await;
+    proxy.config.maybe_reload_from_disk().await;
+    let cfg_snapshot = proxy.config.snapshot().await;
+    let lbs = proxy
+        .lbs_for_request(cfg_snapshot.as_ref(), session_id.as_deref())
+        .await;
     if lbs.is_empty() {
         let dur = start.elapsed().as_millis() as u64;
         let status = StatusCode::BAD_GATEWAY;
@@ -784,7 +794,7 @@ pub async fn handle_proxy(
         )
         .await;
 
-    let retry_opt = retry_options(&proxy.config.retry);
+    let retry_opt = retry_options(&cfg_snapshot.retry);
     let total_upstreams = lbs
         .iter()
         .map(|lb| lb.service.upstreams.len())
@@ -1270,7 +1280,8 @@ pub async fn handle_proxy(
                     method: method.clone(),
                     path: uri.path().to_string(),
                 },
-            ));
+            )
+            .await);
         } else {
             let bytes = match resp.bytes().await {
                 Ok(b) => b,
@@ -1568,7 +1579,7 @@ pub async fn handle_proxy(
             // Poll usage once after a user request finishes (e.g. packycode), used to drive auto-switching.
             if is_user_turn && is_codex_service {
                 usage_providers::poll_for_codex_upstream(
-                    proxy.config.clone(),
+                    cfg_snapshot.clone(),
                     proxy.lb_states.clone(),
                     &selected.config_name,
                     selected.index,

@@ -197,7 +197,7 @@ impl Drop for StreamFinalize {
     }
 }
 
-pub(super) fn build_sse_success_response(
+pub(super) async fn build_sse_success_response(
     proxy: &ProxyService,
     lb: LoadBalancer,
     selected: SelectedUpstream,
@@ -286,8 +286,9 @@ pub(super) fn build_sse_success_response(
     };
 
     if is_user_turn && is_codex_service {
+        let cfg_snapshot = proxy.config.snapshot().await;
         tokio::spawn({
-            let cfg = proxy.config.clone();
+            let cfg = cfg_snapshot;
             let lb_states = proxy.lb_states.clone();
             let config_name = selected.config_name.clone();
             let upstream_index = selected.index;

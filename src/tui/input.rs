@@ -6,7 +6,10 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Url;
 use tokio::sync::{OnceCell, Semaphore};
 
-use crate::config::{UpstreamConfig, load_config, proxy_home_dir, save_config};
+use crate::config::{
+    UpstreamConfig, load_config, overwrite_codex_config_from_codex_cli_in_place, proxy_home_dir,
+    save_config,
+};
 use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
 
 use super::Language;
@@ -21,7 +24,7 @@ pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
 
 pub(in crate::tui) async fn handle_key_event(
     state: Arc<ProxyState>,
-    providers: &[ProviderOption],
+    providers: &mut Vec<ProviderOption>,
     ui: &mut UiState,
     snapshot: &Snapshot,
     key: KeyEvent,
@@ -80,7 +83,7 @@ pub(in crate::tui) async fn handle_key_event(
         },
         Overlay::EffortMenu => handle_key_effort_menu(&state, ui, snapshot, key).await,
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
-            handle_key_provider_menu(&state, providers, ui, snapshot, key).await
+            handle_key_provider_menu(&state, providers.as_slice(), ui, snapshot, key).await
         }
     }
 }
@@ -470,7 +473,7 @@ fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
 
 async fn handle_key_normal(
     state: &Arc<ProxyState>,
-    providers: &[ProviderOption],
+    providers: &mut Vec<ProviderOption>,
     ui: &mut UiState,
     snapshot: &Snapshot,
     key: KeyEvent,
@@ -492,6 +495,43 @@ async fn handle_key_normal(
         KeyCode::Char('?') => {
             ui.overlay = Overlay::Help;
             true
+        }
+        KeyCode::Char('O') if ui.page == Page::Settings => {
+            if ui.service_name != "codex" {
+                ui.toast = Some((
+                    "overwrite-from-codex is only supported for Codex service".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            }
+
+            match load_config().await {
+                Ok(mut cfg) => {
+                    if let Err(err) = overwrite_codex_config_from_codex_cli_in_place(&mut cfg) {
+                        ui.toast = Some((
+                            format!("overwrite-from-codex failed: {err}"),
+                            Instant::now(),
+                        ));
+                        return true;
+                    }
+                    if let Err(err) = save_config(&cfg).await {
+                        ui.toast = Some((format!("save failed: {err}"), Instant::now()));
+                        return true;
+                    }
+
+                    *providers = crate::tui::build_provider_options(&cfg, ui.service_name);
+                    ui.clamp_selection(snapshot, providers.len());
+                    ui.toast = Some((
+                        format!("overwrote configs from ~/.codex (n={})", providers.len()),
+                        Instant::now(),
+                    ));
+                    true
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("load config failed: {err}"), Instant::now()));
+                    true
+                }
+            }
         }
         KeyCode::Char('i') if ui.page == Page::Configs => {
             ui.overlay = Overlay::ConfigInfo;

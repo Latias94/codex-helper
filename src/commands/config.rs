@@ -1,6 +1,7 @@
 use crate::config::{
     ServiceConfig, ServiceKind, UpstreamAuth, UpstreamConfig, config_file_path,
-    import_codex_config_from_codex_cli, init_config_toml, load_config, save_config,
+    import_codex_config_from_codex_cli, init_config_toml, load_config,
+    overwrite_codex_config_from_codex_cli_in_place, save_config,
 };
 use crate::{CliError, CliResult, ConfigCommand};
 
@@ -355,6 +356,29 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                     force, names
                 );
             }
+        }
+        ConfigCommand::OverwriteFromCodex { dry_run } => {
+            let cfg = load_config()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+
+            let mut working = if dry_run { cfg.clone() } else { cfg };
+            overwrite_codex_config_from_codex_cli_in_place(&mut working)
+                .map_err(|e| CliError::CodexConfig(e.to_string()))?;
+
+            if dry_run {
+                println!("Dry-run: no files written.");
+            } else {
+                save_config(&working)
+                    .await
+                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            }
+
+            let names: Vec<_> = working.codex.configs.keys().cloned().collect();
+            println!(
+                "Overwrote Codex configs from ~/.codex (dry_run = {}): {:?}",
+                dry_run, names
+            );
         }
     }
 

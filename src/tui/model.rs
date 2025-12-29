@@ -226,6 +226,96 @@ pub(in crate::tui) fn short_sid(sid: &str, max: usize) -> String {
     format!("{head}…{tail}")
 }
 
+pub fn build_provider_options(
+    cfg: &crate::config::ProxyConfig,
+    service_name: &str,
+) -> Vec<ProviderOption> {
+    let upstream_summary = |u: &crate::config::UpstreamConfig| -> UpstreamSummary {
+        let auth = if let Some(env) = u.auth.auth_token_env.as_deref()
+            && !env.trim().is_empty()
+        {
+            format!("bearer env {env}")
+        } else if u
+            .auth
+            .auth_token
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            "bearer inline".to_string()
+        } else if let Some(env) = u.auth.api_key_env.as_deref()
+            && !env.trim().is_empty()
+        {
+            format!("x-api-key env {env}")
+        } else if u
+            .auth
+            .api_key
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            "x-api-key inline".to_string()
+        } else {
+            "-".to_string()
+        };
+
+        let mut tags = u
+            .tags
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>();
+        tags.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut supported_models = u.supported_models.keys().cloned().collect::<Vec<_>>();
+        supported_models.sort();
+
+        let mut model_mapping = u
+            .model_mapping
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>();
+        model_mapping.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        UpstreamSummary {
+            base_url: u.base_url.clone(),
+            provider_id: u.tags.get("provider_id").cloned(),
+            auth,
+            tags,
+            supported_models,
+            model_mapping,
+        }
+    };
+
+    let mut providers: Vec<ProviderOption> = match service_name {
+        "claude" => cfg
+            .claude
+            .configs
+            .iter()
+            .map(|(name, svc)| ProviderOption {
+                name: name.clone(),
+                alias: svc.alias.clone(),
+                enabled: svc.enabled,
+                level: svc.level.clamp(1, 10),
+                active: cfg.claude.active.as_deref() == Some(name.as_str()),
+                upstreams: svc.upstreams.iter().map(upstream_summary).collect(),
+            })
+            .collect(),
+        _ => cfg
+            .codex
+            .configs
+            .iter()
+            .map(|(name, svc)| ProviderOption {
+                name: name.clone(),
+                alias: svc.alias.clone(),
+                enabled: svc.enabled,
+                level: svc.level.clamp(1, 10),
+                active: cfg.codex.active.as_deref() == Some(name.as_str()),
+                upstreams: svc.upstreams.iter().map(upstream_summary).collect(),
+            })
+            .collect(),
+    };
+    providers.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+    providers
+}
+
 fn session_sort_key(row: &SessionRow) -> u64 {
     row.last_ended_at_ms
         .unwrap_or(0)

@@ -216,8 +216,16 @@ pub(super) fn render_settings_page(
     )]));
     lines.push(Line::from(crate::tui::i18n::pick(
         ui.language,
-        "  1-6 切页  ? 帮助  q 退出  L 语言  (Configs: i 详情  Stats: y 导出/复制)",
-        "  1-6 pages  ? help  q quit  L language  (Configs: i details  Stats: y export/copy)",
+        if ui.service_name == "codex" {
+            "  1-6 切页  ? 帮助  q 退出  L 语言  (Configs: i 详情  Stats: y 导出/复制  Settings: O 覆盖导入)"
+        } else {
+            "  1-6 切页  ? 帮助  q 退出  L 语言  (Configs: i 详情  Stats: y 导出/复制)"
+        },
+        if ui.service_name == "codex" {
+            "  1-6 pages  ? help  q quit  L language  (Configs: i details  Stats: y export/copy  Settings: O overwrite)"
+        } else {
+            "  1-6 pages  ? help  q quit  L language  (Configs: i details  Stats: y export/copy)"
+        },
     )));
 
     lines.push(Line::from(""));

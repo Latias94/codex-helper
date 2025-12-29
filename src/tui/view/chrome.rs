@@ -267,13 +267,13 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Requests => crate::tui::i18n::pick(
                 ui.language,
-                "q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  ? 帮助",
-                "q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
+                "1-6 页面  q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  ? 帮助",
+                "1-6 pages  q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
             ),
             Page::Sessions => crate::tui::i18n::pick(
                 ui.language,
-                "q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  ? 帮助",
-                "q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help",
+                "1-6 页面  q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  ? 帮助",
+                "1-6 pages  q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help",
             ),
             Page::Stats => crate::tui::i18n::pick(
                 ui.language,
@@ -282,8 +282,16 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Settings => crate::tui::i18n::pick(
                 ui.language,
-                "q 退出  L 语言  ? 帮助  （本页为运行态/配置入口）",
-                "q quit  L language  ? help  (runtime + config overview)",
+                if ui.service_name == "codex" {
+                    "1-6 页面  q 退出  L 语言  O 覆盖导入(~/.codex)  ? 帮助"
+                } else {
+                    "1-6 页面  q 退出  L 语言  ? 帮助"
+                },
+                if ui.service_name == "codex" {
+                    "1-6 pages  q quit  L language  O overwrite(~/.codex)  ? help"
+                } else {
+                    "1-6 pages  q quit  L language  ? help"
+                },
             ),
         },
         Overlay::Help => crate::tui::i18n::pick(

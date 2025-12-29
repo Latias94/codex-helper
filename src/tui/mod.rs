@@ -9,7 +9,8 @@ mod view;
 
 pub(crate) use i18n::Language;
 pub(crate) use i18n::{detect_system_language, parse_language};
-pub use model::{ProviderOption, UpstreamSummary};
+#[allow(unused_imports)]
+pub use model::{ProviderOption, UpstreamSummary, build_provider_options};
 
 use std::io;
 use std::sync::Arc;
@@ -65,6 +66,7 @@ pub async fn run_dashboard(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
+    let mut providers = providers;
     ui.clamp_selection(&snapshot, providers.len());
 
     let mut should_redraw = true;
@@ -104,7 +106,7 @@ pub async fn run_dashboard(
                 let Some(Ok(event)) = maybe_event else { continue; };
                 match event {
                     Event::Key(key) if input::should_accept_key_event(&key) => {
-                        if input::handle_key_event(state.clone(), &providers, &mut ui, &snapshot, key).await {
+                        if input::handle_key_event(state.clone(), &mut providers, &mut ui, &snapshot, key).await {
                             if ui.needs_snapshot_refresh {
                                 snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
                                 ui.clamp_selection(&snapshot, providers.len());
