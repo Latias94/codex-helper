@@ -54,12 +54,33 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
             ui.focus = Focus::Configs;
         } else if ui.page == Page::Requests {
             ui.focus = Focus::Requests;
+        } else if ui.page == Page::Sessions {
+            ui.focus = Focus::Sessions;
         } else if ui.page == Page::Dashboard && ui.focus == Focus::Configs {
             ui.focus = Focus::Sessions;
         }
         return true;
     }
     false
+}
+
+fn apply_selected_session(ui: &mut UiState, snapshot: &Snapshot, idx: usize) {
+    ui.selected_session_idx = idx.min(snapshot.rows.len().saturating_sub(1));
+    ui.selected_session_id = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .and_then(|r| r.session_id.clone());
+
+    ui.sessions_table.select(if snapshot.rows.is_empty() {
+        None
+    } else {
+        Some(ui.selected_session_idx)
+    });
+
+    ui.selected_request_idx = 0;
+    let req_len = filtered_requests_len(snapshot, ui.selected_session_idx);
+    ui.requests_table
+        .select(if req_len == 0 { None } else { Some(0) });
 }
 
 async fn apply_effort_override(state: &ProxyState, sid: String, effort: Option<String>) {
@@ -186,6 +207,118 @@ async fn handle_key_normal(
             ui.toast = Some(("session cfg override: <clear>".to_string(), Instant::now()));
             true
         }
+        KeyCode::Char('a') if ui.page == Page::Sessions => {
+            ui.sessions_page_active_only = !ui.sessions_page_active_only;
+            ui.selected_sessions_page_idx = 0;
+            ui.toast = Some((
+                format!(
+                    "sessions filter: active_only={}",
+                    ui.sessions_page_active_only
+                ),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('e') if ui.page == Page::Sessions => {
+            ui.sessions_page_errors_only = !ui.sessions_page_errors_only;
+            ui.selected_sessions_page_idx = 0;
+            ui.toast = Some((
+                format!(
+                    "sessions filter: errors_only={}",
+                    ui.sessions_page_errors_only
+                ),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('v') if ui.page == Page::Sessions => {
+            ui.sessions_page_overrides_only = !ui.sessions_page_overrides_only;
+            ui.selected_sessions_page_idx = 0;
+            ui.toast = Some((
+                format!(
+                    "sessions filter: overrides_only={}",
+                    ui.sessions_page_overrides_only
+                ),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('r') if ui.page == Page::Sessions => {
+            ui.sessions_page_active_only = false;
+            ui.sessions_page_errors_only = false;
+            ui.sessions_page_overrides_only = false;
+            ui.selected_sessions_page_idx = 0;
+            ui.toast = Some(("sessions filter: reset".to_string(), Instant::now()));
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Sessions => {
+            let filtered = snapshot
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    if ui.sessions_page_active_only && row.active_count == 0 {
+                        return false;
+                    }
+                    if ui.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
+                        return false;
+                    }
+                    if ui.sessions_page_overrides_only
+                        && row.override_effort.is_none()
+                        && row.override_config_name.is_none()
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .take(200)
+                .map(|(idx, _)| idx)
+                .collect::<Vec<_>>();
+
+            let len = filtered.len();
+            if let Some(next) = adjust_table_selection(&mut ui.sessions_page_table, -1, len) {
+                ui.selected_sessions_page_idx = next;
+                if let Some(&row_idx) = filtered.get(next) {
+                    apply_selected_session(ui, snapshot, row_idx);
+                }
+                return true;
+            }
+            false
+        }
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Sessions => {
+            let filtered = snapshot
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    if ui.sessions_page_active_only && row.active_count == 0 {
+                        return false;
+                    }
+                    if ui.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
+                        return false;
+                    }
+                    if ui.sessions_page_overrides_only
+                        && row.override_effort.is_none()
+                        && row.override_config_name.is_none()
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .take(200)
+                .map(|(idx, _)| idx)
+                .collect::<Vec<_>>();
+
+            let len = filtered.len();
+            if let Some(next) = adjust_table_selection(&mut ui.sessions_page_table, 1, len) {
+                ui.selected_sessions_page_idx = next;
+                if let Some(&row_idx) = filtered.get(next) {
+                    apply_selected_session(ui, snapshot, row_idx);
+                }
+                return true;
+            }
+            false
+        }
         KeyCode::Char('e') if ui.page == Page::Requests => {
             ui.request_page_errors_only = !ui.request_page_errors_only;
             ui.toast = Some((
@@ -277,13 +410,7 @@ async fn handle_key_normal(
                 if let Some(next) =
                     adjust_table_selection(&mut ui.sessions_table, -1, snapshot.rows.len())
                 {
-                    ui.selected_session_idx = next;
-                    ui.selected_session_id =
-                        snapshot.rows.get(next).and_then(|r| r.session_id.clone());
-                    ui.selected_request_idx = 0;
-                    let req_len = filtered_requests_len(snapshot, next);
-                    ui.requests_table
-                        .select(if req_len == 0 { None } else { Some(0) });
+                    apply_selected_session(ui, snapshot, next);
                     return true;
                 }
                 false
@@ -304,13 +431,7 @@ async fn handle_key_normal(
                 if let Some(next) =
                     adjust_table_selection(&mut ui.sessions_table, 1, snapshot.rows.len())
                 {
-                    ui.selected_session_idx = next;
-                    ui.selected_session_id =
-                        snapshot.rows.get(next).and_then(|r| r.session_id.clone());
-                    ui.selected_request_idx = 0;
-                    let req_len = filtered_requests_len(snapshot, next);
-                    ui.requests_table
-                        .select(if req_len == 0 { None } else { Some(0) });
+                    apply_selected_session(ui, snapshot, next);
                     return true;
                 }
                 false

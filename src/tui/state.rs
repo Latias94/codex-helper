@@ -15,6 +15,10 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_request_page_idx: usize,
     pub(in crate::tui) request_page_errors_only: bool,
     pub(in crate::tui) request_page_scope_session: bool,
+    pub(in crate::tui) selected_sessions_page_idx: usize,
+    pub(in crate::tui) sessions_page_active_only: bool,
+    pub(in crate::tui) sessions_page_errors_only: bool,
+    pub(in crate::tui) sessions_page_overrides_only: bool,
     pub(in crate::tui) effort_menu_idx: usize,
     pub(in crate::tui) provider_menu_idx: usize,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
@@ -23,6 +27,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) sessions_table: TableState,
     pub(in crate::tui) requests_table: TableState,
     pub(in crate::tui) request_page_table: TableState,
+    pub(in crate::tui) sessions_page_table: TableState,
     pub(in crate::tui) menu_list: ListState,
 }
 
@@ -39,6 +44,10 @@ impl Default for UiState {
             selected_request_page_idx: 0,
             request_page_errors_only: false,
             request_page_scope_session: false,
+            selected_sessions_page_idx: 0,
+            sessions_page_active_only: false,
+            sessions_page_errors_only: false,
+            sessions_page_overrides_only: false,
             effort_menu_idx: 0,
             provider_menu_idx: 0,
             toast: None,
@@ -47,6 +56,7 @@ impl Default for UiState {
             sessions_table: TableState::default(),
             requests_table: TableState::default(),
             request_page_table: TableState::default(),
+            sessions_page_table: TableState::default(),
             menu_list: ListState::default(),
         }
     }
