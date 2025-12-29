@@ -7,6 +7,10 @@
 
 ---
 
+## 截图
+
+![内置 TUI 面板](https://raw.githubusercontent.com/Latias94/codex-helper/main/screenshots/main.png)
+
 ## 为什么需要 codex-helper？
 
 如果你有下面这些情况，codex-helper 会很合适：

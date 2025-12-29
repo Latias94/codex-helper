@@ -7,6 +7,10 @@
 
 ---
 
+## Screenshot
+
+![Built-in TUI dashboard](https://raw.githubusercontent.com/Latias94/codex-helper/main/screenshots/main.png)
+
 ## Why codex-helper?
 
 codex-helper is a good fit if any of these sound familiar:
