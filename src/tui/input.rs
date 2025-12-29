@@ -9,6 +9,7 @@ use tokio::sync::{OnceCell, Semaphore};
 use crate::config::{UpstreamConfig, load_config, proxy_home_dir, save_config};
 use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
 
+use super::Language;
 use super::model::{ProviderOption, Snapshot, filtered_requests_len, now_ms};
 use super::report::build_stats_report;
 use super::state::{UiState, adjust_table_selection};
@@ -34,6 +35,10 @@ pub(in crate::tui) async fn handle_key_event(
         Overlay::Help => match key.code {
             KeyCode::Esc | KeyCode::Char('?') => {
                 ui.overlay = Overlay::None;
+                true
+            }
+            KeyCode::Char('L') => {
+                toggle_language(ui).await;
                 true
             }
             _ => false,
@@ -139,6 +144,60 @@ async fn persist_config_meta(
     }
     save_config(&cfg).await?;
     Ok(())
+}
+
+async fn persist_ui_language(language: Language) -> anyhow::Result<()> {
+    let mut cfg = load_config().await?;
+    cfg.ui.language = Some(match language {
+        Language::Zh => "zh".to_string(),
+        Language::En => "en".to_string(),
+    });
+    save_config(&cfg).await?;
+    Ok(())
+}
+
+fn language_name(language: Language) -> &'static str {
+    match language {
+        Language::Zh => "中文",
+        Language::En => "English",
+    }
+}
+
+async fn toggle_language(ui: &mut UiState) {
+    let next = if ui.language == Language::En {
+        Language::Zh
+    } else {
+        Language::En
+    };
+    ui.language = next;
+    match persist_ui_language(next).await {
+        Ok(()) => {
+            ui.toast = Some((
+                format!(
+                    "{}{}{}",
+                    crate::tui::i18n::pick(ui.language, "语言：", "language: "),
+                    language_name(next),
+                    crate::tui::i18n::pick(ui.language, "（已保存）", " (saved)")
+                ),
+                Instant::now(),
+            ));
+        }
+        Err(err) => {
+            let suffix = match ui.language {
+                Language::Zh => format!("（保存失败：{err}）"),
+                Language::En => format!(" (save failed: {err})"),
+            };
+            ui.toast = Some((
+                format!(
+                    "{}{}{}",
+                    crate::tui::i18n::pick(ui.language, "语言：", "language: "),
+                    language_name(next),
+                    suffix
+                ),
+                Instant::now(),
+            ));
+        }
+    }
 }
 
 fn shorten_err(err: &str, max: usize) -> String {
@@ -388,6 +447,10 @@ async fn handle_key_normal(
     match key.code {
         KeyCode::Char('q') => {
             ui.should_exit = true;
+            true
+        }
+        KeyCode::Char('L') => {
+            toggle_language(ui).await;
             true
         }
         KeyCode::Char('?') => {

@@ -1,3 +1,4 @@
+mod i18n;
 mod input;
 mod model;
 mod report;
@@ -6,6 +7,8 @@ mod terminal;
 mod types;
 mod view;
 
+pub(crate) use i18n::Language;
+pub(crate) use i18n::{detect_system_language, parse_language};
 pub use model::{ProviderOption, UpstreamSummary};
 
 use std::io;
@@ -31,6 +34,7 @@ pub async fn run_dashboard(
     service_name: &'static str,
     port: u16,
     providers: Vec<ProviderOption>,
+    language: Language,
     shutdown: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -50,6 +54,7 @@ pub async fn run_dashboard(
 
     let mut ui = UiState::default();
     ui.service_name = service_name;
+    ui.language = language;
     let palette = Palette::default();
 
     let mut events = EventStream::new();

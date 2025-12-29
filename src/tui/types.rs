@@ -61,14 +61,14 @@ impl EffortChoice {
     }
 }
 
-pub(in crate::tui) fn page_titles() -> [&'static str; 6] {
+pub(in crate::tui) fn page_titles(lang: Language) -> [&'static str; 6] {
     [
-        "1 Dashboard",
-        "2 Configs",
-        "3 Sessions",
-        "4 Requests",
-        "5 Stats",
-        "6 Settings",
+        crate::tui::i18n::pick(lang, "1 总览", "1 Dashboard"),
+        crate::tui::i18n::pick(lang, "2 配置", "2 Configs"),
+        crate::tui::i18n::pick(lang, "3 会话", "3 Sessions"),
+        crate::tui::i18n::pick(lang, "4 请求", "4 Requests"),
+        crate::tui::i18n::pick(lang, "5 统计", "5 Stats"),
+        crate::tui::i18n::pick(lang, "6 设置", "6 Settings"),
     ]
 }
 
@@ -82,3 +82,4 @@ pub(in crate::tui) fn page_index(page: Page) -> usize {
         Page::Settings => 5,
     }
 }
+use crate::tui::Language;

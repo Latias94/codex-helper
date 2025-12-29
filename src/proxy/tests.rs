@@ -8,7 +8,8 @@ use axum::routing::post;
 use reqwest::Client;
 
 use crate::config::{
-    ProxyConfig, RetryConfig, ServiceConfig, ServiceConfigManager, UpstreamAuth, UpstreamConfig,
+    ProxyConfig, RetryConfig, ServiceConfig, ServiceConfigManager, UiConfig, UpstreamAuth,
+    UpstreamConfig,
 };
 use crate::proxy::ProxyService;
 
@@ -46,6 +47,7 @@ fn make_proxy_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> Prox
         retry,
         notify: Default::default(),
         default_service: None,
+        ui: UiConfig::default(),
     }
 }
 
@@ -546,6 +548,7 @@ async fn proxy_falls_back_to_level_2_config_after_retryable_failure() {
         retry,
         notify: Default::default(),
         default_service: None,
+        ui: UiConfig::default(),
     };
 
     let proxy = ProxyService::new(

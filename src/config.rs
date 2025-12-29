@@ -307,6 +307,18 @@ pub struct ProxyConfig {
     /// 默认目标服务（用于 CLI 默认选择 codex/claude）
     #[serde(default)]
     pub default_service: Option<ServiceKind>,
+    /// UI settings (mainly for the built-in TUI).
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UiConfig {
+    /// UI language: `en`, `zh`, or `auto` (default: unset).
+    ///
+    /// When unset, codex-helper will pick a default language based on system locale for the first run.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 fn config_dir() -> PathBuf {

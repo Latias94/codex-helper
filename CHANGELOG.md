@@ -41,6 +41,8 @@ All notable changes to this project will be documented in this file.
   Health check UX improvements: show running/cancel states in Configs; support `c`/`C` to cancel checks, plus a max in-flight limit (`CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT`).
 - TUI 可发现性增强：顶部 Tabs 标题包含页号（`1-6`），Help 弹窗同步更新，便于快速切页。  
   TUI discoverability: top tabs include page numbers (`1-6`) and the Help modal reflects this for faster page switching.
+- TUI 本地化（中/英）：首次启动默认跟随系统语言（可通过 `ui.language` 或 `CODEX_HELPER_TUI_LANG` 覆盖），并支持在 TUI 内按 `L` 一键切换并落盘。  
+  TUI i18n (zh/en): first run defaults to system locale (override via `ui.language` or `CODEX_HELPER_TUI_LANG`), and press `L` in the TUI to toggle language and persist it.
 - Stats 一键导出/复制报告：在 Stats 页按 `y` 可把选中项的窗口聚合与最近错误分布导出到 `~/.codex-helper/reports/`，并尝试复制到剪贴板。  
   One-key Stats report: press `y` in Stats to export a report for the selected item into `~/.codex-helper/reports/` and attempt to copy it to clipboard.
 - 请求日志增强：`requests.jsonl` 增加 `provider_id` 字段（如 upstream tags 里配置了 `provider_id`），用于更准确的统计与排障。  

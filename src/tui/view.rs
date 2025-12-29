@@ -43,12 +43,20 @@ pub(in crate::tui) fn render_app(
 
     match ui.overlay {
         Overlay::None => {}
-        Overlay::Help => render_help_modal(f, p),
+        Overlay::Help => render_help_modal(f, p, ui.language),
         Overlay::EffortMenu => render_effort_modal(f, p, ui),
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             let title = match ui.overlay {
-                Overlay::ProviderMenuSession => "Session provider override",
-                Overlay::ProviderMenuGlobal => "Global provider override",
+                Overlay::ProviderMenuSession => crate::tui::i18n::pick(
+                    ui.language,
+                    "会话 Provider 覆盖",
+                    "Session provider override",
+                ),
+                Overlay::ProviderMenuGlobal => crate::tui::i18n::pick(
+                    ui.language,
+                    "全局 Provider 覆盖",
+                    "Global provider override",
+                ),
                 _ => unreachable!(),
             };
             render_provider_modal(f, p, ui, providers, title);
@@ -108,9 +116,9 @@ fn render_header(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
     let focus = match ui.focus {
-        Focus::Sessions => "Sessions",
-        Focus::Requests => "Requests",
-        Focus::Configs => "Configs",
+        Focus::Sessions => crate::tui::i18n::pick(ui.language, "会话", "Sessions"),
+        Focus::Requests => crate::tui::i18n::pick(ui.language, "请求", "Requests"),
+        Focus::Configs => crate::tui::i18n::pick(ui.language, "配置", "Configs"),
     };
     let title = Line::from(vec![
         Span::styled(
@@ -123,44 +131,72 @@ fn render_header(
             Style::default().fg(p.muted),
         ),
         Span::raw("  "),
-        Span::styled(format!("focus: {focus}"), Style::default().fg(p.muted)),
+        Span::styled(
+            format!(
+                "{}{focus}",
+                crate::tui::i18n::pick(ui.language, "焦点：", "focus: ")
+            ),
+            Style::default().fg(p.muted),
+        ),
     ]);
 
     let subtitle = Line::from(vec![
-        Span::styled("active ", Style::default().fg(p.muted)),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "活跃 ", "active "),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(active_total.to_string(), Style::default().fg(p.good)),
         Span::raw("   "),
-        Span::styled("errors(80) ", Style::default().fg(p.muted)),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "错误(80) ", "errors(80) "),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(
             recent_err.to_string(),
             Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
         ),
         Span::raw("   "),
-        Span::styled("hc ", Style::default().fg(p.muted)),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "健康检查 ", "hc "),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(
             if hc_running > 0 {
-                format!("run:{hc_running} cancel:{hc_canceling}")
+                if ui.language == crate::tui::Language::Zh {
+                    format!("运行:{hc_running} 取消:{hc_canceling}")
+                } else {
+                    format!("run:{hc_running} cancel:{hc_canceling}")
+                }
             } else {
                 "-".to_string()
             },
             Style::default().fg(if hc_running > 0 { p.accent } else { p.muted }),
         ),
         Span::raw("   "),
-        Span::styled("overrides ", Style::default().fg(p.muted)),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "覆盖 ", "overrides "),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(
             format!("{overrides_effort}/{overrides_cfg}"),
             Style::default().fg(p.muted),
         ),
         Span::raw("   "),
-        Span::styled("cfg(global) ", Style::default().fg(p.muted)),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "配置(全局) ", "cfg(global) "),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(global_cfg.to_string(), Style::default().fg(p.accent)),
         Span::raw("   "),
-        Span::styled("updated ", Style::default().fg(p.muted)),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "刷新 ", "updated "),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(format!("{updated}ms"), Style::default().fg(p.muted)),
     ]);
 
     let tabs = ratatui::widgets::Tabs::new(
-        page_titles()
+        page_titles(ui.language)
             .iter()
             .map(|t| Line::from(*t))
             .collect::<Vec<_>>(),
@@ -198,7 +234,13 @@ fn render_body(
         Page::Sessions => render_sessions_page(f, p, ui, snapshot, area),
         Page::Requests => render_requests_page(f, p, ui, snapshot, area),
         Page::Stats => stats::render_stats_page(f, p, ui, snapshot, providers, area),
-        Page::Settings => render_placeholder(f, p, "Settings view (coming soon)", area),
+        Page::Settings => render_placeholder(
+            f,
+            p,
+            ui.language,
+            crate::tui::i18n::pick(ui.language, "设置（开发中）", "Settings (coming soon)"),
+            area,
+        ),
     }
 }
 
@@ -1133,7 +1175,13 @@ fn render_requests_page(
     f.render_widget(content, columns[1]);
 }
 
-fn render_placeholder(f: &mut Frame<'_>, p: Palette, title: &str, area: Rect) {
+fn render_placeholder(
+    f: &mut Frame<'_>,
+    p: Palette,
+    lang: crate::tui::Language,
+    title: &str,
+    area: Rect,
+) {
     let block = Block::default()
         .title(Span::styled(
             title,
@@ -1143,10 +1191,14 @@ fn render_placeholder(f: &mut Frame<'_>, p: Palette, title: &str, area: Rect) {
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
     f.render_widget(block, area);
-    let content = Paragraph::new("This page is reserved for future operations and workflows.")
-        .style(Style::default().fg(p.muted))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
+    let content = Paragraph::new(crate::tui::i18n::pick(
+        lang,
+        "本页预留给后续操作与工作流。",
+        "This page is reserved for future operations and workflows.",
+    ))
+    .style(Style::default().fg(p.muted))
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: true });
     f.render_widget(content, area);
 }
 
@@ -1575,26 +1627,52 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
 
     let left = match ui.overlay {
         Overlay::None => match ui.page {
-            Page::Dashboard => {
-                "1-6 pages  q quit  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set effort  x clear  p session cfg  P global cfg  ? help"
-            }
-            Page::Configs => {
-                "1-6 pages  q quit  ↑/↓ select  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter global override  Backspace clear  o session override  O clear  ? help"
-            }
-            Page::Requests => "q quit  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
-            Page::Sessions => {
-                "q quit  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help"
-            }
-            Page::Stats => {
-                "1-6 pages  q quit  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  y copy+export report  ? help"
-            }
-            Page::Settings => "q quit  ? help",
+            Page::Dashboard => crate::tui::i18n::pick(
+                ui.language,
+                "1-6 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  Enter effort  l/m/h/X 设置  x 清除  p 会话配置  P 全局配置  ? 帮助",
+                "1-6 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set  x clear  p session cfg  P global cfg  ? help",
+            ),
+            Page::Configs => crate::tui::i18n::pick(
+                ui.language,
+                "1-6 页面  q 退出  L 语言  ↑/↓ 选择  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 全局 override  Backspace 清除  o 会话 override  O 清除  ? 帮助",
+                "1-6 pages  q quit  L language  ↑/↓ select  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter global override  Backspace clear  o session override  O clear  ? help",
+            ),
+            Page::Requests => crate::tui::i18n::pick(
+                ui.language,
+                "q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  ? 帮助",
+                "q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
+            ),
+            Page::Sessions => crate::tui::i18n::pick(
+                ui.language,
+                "q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  ? 帮助",
+                "q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help",
+            ),
+            Page::Stats => crate::tui::i18n::pick(
+                ui.language,
+                "1-6 页面  q 退出  L 语言  Tab 焦点(config/provider)  ↑/↓ 选择  d 天数(7/21/60)  e 仅看错误(recent)  y 复制+导出报告  ? 帮助",
+                "1-6 pages  q quit  L language  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  y copy+export report  ? help",
+            ),
+            Page::Settings => crate::tui::i18n::pick(
+                ui.language,
+                "q 退出  L 语言  ? 帮助",
+                "q quit  L language  ? help",
+            ),
         },
-        Overlay::Help => "Esc close help",
-        Overlay::EffortMenu => "↑/↓ select  Enter apply  Esc cancel",
-        Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
-            "↑/↓ select  Enter apply  Esc cancel"
-        }
+        Overlay::Help => crate::tui::i18n::pick(
+            ui.language,
+            "Esc 关闭帮助  L 语言",
+            "Esc close help  L language",
+        ),
+        Overlay::EffortMenu => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 选择  Enter 应用  Esc 取消",
+            "↑/↓ select  Enter apply  Esc cancel",
+        ),
+        Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 选择  Enter 应用  Esc 取消",
+            "↑/↓ select  Enter apply  Esc cancel",
+        ),
     };
     let right = ui.toast.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
 
@@ -1614,90 +1692,165 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
     );
 }
 
-fn render_help_modal(f: &mut Frame<'_>, p: Palette) {
+fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui::Language) {
     let area = centered_rect(70, 70, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(
-            "Help",
+            crate::tui::i18n::pick(lang, "帮助", "Help"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.focus))
         .style(Style::default().bg(p.panel));
 
-    let lines = vec![
-        Line::from(vec![Span::styled(
-            "Navigation",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  Tab        switch focus (Dashboard)"),
-        Line::from("  ↑/↓, j/k   move selection"),
-        Line::from("  1-6        switch page"),
-        Line::from(
-            "            1 Dashboard  2 Configs  3 Sessions  4 Requests  5 Stats  6 Settings",
-        ),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Effort",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  Enter      open effort menu (on Sessions)"),
-        Line::from("  l/m/h/X    set low/medium/high/xhigh"),
-        Line::from("  x          clear effort override"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Provider override",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  p          session provider override"),
-        Line::from("  P          global provider override"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Configs page",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  Enter      set global override to selected config"),
-        Line::from("  Backspace  clear global override"),
-        Line::from("  o          set session override to selected config"),
-        Line::from("  O          clear session override"),
-        Line::from("  t          toggle enabled (hot reload + saved)"),
-        Line::from("  +/-        adjust level (hot reload + saved)"),
-        Line::from("  h/H        run health checks (selected/all)"),
-        Line::from("  c/C        cancel health checks (selected/all)"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Requests page",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  e          toggle errors-only filter"),
-        Line::from("  s          toggle scope (all vs selected session)"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Sessions page",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  a          toggle active-only"),
-        Line::from("  e          toggle errors-only"),
-        Line::from("  v          toggle overrides-only"),
-        Line::from("  r          reset filters"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Stats page",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  Tab        switch focus (config vs provider)"),
-        Line::from("  d          cycle time window (7/21/60 days)"),
-        Line::from("  e          toggle errors-only (recent breakdown)"),
-        Line::from("  y          copy + export report (selected item)"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Quit",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("  q          quit and request shutdown"),
-        Line::from("  Esc/?      close this modal"),
-    ];
+    let lines = if lang == crate::tui::Language::Zh {
+        vec![
+            Line::from(vec![Span::styled(
+                "导航",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  ↑/↓, j/k   移动选中项"),
+            Line::from("  1-6        切换页面"),
+            Line::from("            1 总览  2 配置  3 会话  4 请求  5 统计  6 设置"),
+            Line::from("  L          切换语言（中/英，自动落盘）"),
+            Line::from("  Tab        切换焦点（总览页）"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "推理强度",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  Enter      打开 effort 菜单（会话列表）"),
+            Line::from("  l/m/h/X    设置 low/medium/high/xhigh"),
+            Line::from("  x          清除 effort 覆盖"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Provider 覆盖",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  p          会话级 provider 覆盖"),
+            Line::from("  P          全局 provider 覆盖"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "配置页（Configs）",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  Enter      设置全局 override 为当前 config"),
+            Line::from("  Backspace  清除全局 override"),
+            Line::from("  o          设置会话 override 为当前 config"),
+            Line::from("  O          清除会话 override"),
+            Line::from("  t          切换 enabled（热更新 + 落盘）"),
+            Line::from("  +/-        调整 level（热更新 + 落盘）"),
+            Line::from("  h/H        运行健康检查（当前/全部）"),
+            Line::from("  c/C        取消健康检查（当前/全部）"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "请求页（Requests）",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  e          仅看错误（errors-only）"),
+            Line::from("  s          scope：全部 vs 当前会话"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "会话页（Sessions）",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  a          仅看活跃（active-only）"),
+            Line::from("  e          仅看错误（errors-only）"),
+            Line::from("  v          仅看覆盖（overrides-only）"),
+            Line::from("  r          重置筛选"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "统计页（Stats）",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  Tab        切换焦点（config vs provider）"),
+            Line::from("  d          切换窗口（7/21/60 天）"),
+            Line::from("  e          recent 仅看错误"),
+            Line::from("  y          复制 + 导出报告（当前选中项）"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "退出",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  q          退出并触发 shutdown"),
+            Line::from("  Esc/?      关闭帮助"),
+        ]
+    } else {
+        vec![
+            Line::from(vec![Span::styled(
+                "Navigation",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  Tab        switch focus (Dashboard)"),
+            Line::from("  ↑/↓, j/k   move selection"),
+            Line::from("  1-6        switch page"),
+            Line::from(
+                "            1 Dashboard  2 Configs  3 Sessions  4 Requests  5 Stats  6 Settings",
+            ),
+            Line::from("  L          toggle language (zh/en, persisted)"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Effort",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  Enter      open effort menu (on Sessions)"),
+            Line::from("  l/m/h/X    set low/medium/high/xhigh"),
+            Line::from("  x          clear effort override"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Provider override",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  p          session provider override"),
+            Line::from("  P          global provider override"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Configs page",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  Enter      set global override to selected config"),
+            Line::from("  Backspace  clear global override"),
+            Line::from("  o          set session override to selected config"),
+            Line::from("  O          clear session override"),
+            Line::from("  t          toggle enabled (hot reload + saved)"),
+            Line::from("  +/-        adjust level (hot reload + saved)"),
+            Line::from("  h/H        run health checks (selected/all)"),
+            Line::from("  c/C        cancel health checks (selected/all)"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Requests page",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  e          toggle errors-only filter"),
+            Line::from("  s          toggle scope (all vs selected session)"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Sessions page",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  a          toggle active-only"),
+            Line::from("  e          toggle errors-only"),
+            Line::from("  v          toggle overrides-only"),
+            Line::from("  r          reset filters"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Stats page",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  Tab        switch focus (config vs provider)"),
+            Line::from("  d          cycle time window (7/21/60 days)"),
+            Line::from("  e          toggle errors-only (recent breakdown)"),
+            Line::from("  y          copy + export report (selected item)"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Quit",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  q          quit and request shutdown"),
+            Line::from("  Esc/?      close this modal"),
+        ]
+    };
 
     let content = Paragraph::new(Text::from(lines))
         .block(block)

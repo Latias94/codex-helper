@@ -653,11 +653,46 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
         }
     }
 
-    let cfg = match service_name {
-        "codex" => Arc::new(load_or_bootstrap_for_service(ServiceKind::Codex).await?),
-        "claude" => Arc::new(load_or_bootstrap_for_service(ServiceKind::Claude).await?),
-        _ => Arc::new(load_or_bootstrap_for_service(ServiceKind::Codex).await?),
+    let mut cfg = match service_name {
+        "codex" => load_or_bootstrap_for_service(ServiceKind::Codex).await?,
+        "claude" => load_or_bootstrap_for_service(ServiceKind::Claude).await?,
+        _ => load_or_bootstrap_for_service(ServiceKind::Codex).await?,
     };
+
+    let tui_lang = {
+        let env_lang_raw = std::env::var("CODEX_HELPER_TUI_LANG").ok();
+        let env_lang = env_lang_raw.as_deref().and_then(|s| {
+            if s.trim().eq_ignore_ascii_case("auto") {
+                Some(tui::detect_system_language())
+            } else {
+                tui::parse_language(s)
+            }
+        });
+        if let Some(l) = env_lang {
+            l
+        } else if let Some(s) = cfg.ui.language.as_deref() {
+            if s.trim().eq_ignore_ascii_case("auto") {
+                tui::detect_system_language()
+            } else {
+                tui::parse_language(s).unwrap_or_else(|| {
+                    tracing::warn!("Invalid ui.language '{}', falling back to system locale", s);
+                    tui::detect_system_language()
+                })
+            }
+        } else {
+            let detected = tui::detect_system_language();
+            cfg.ui.language = Some(match detected {
+                tui::Language::Zh => "zh".to_string(),
+                tui::Language::En => "en".to_string(),
+            });
+            if let Err(err) = crate::config::save_config(&cfg).await {
+                tracing::warn!("Failed to persist ui.language to config: {}", err);
+            }
+            detected
+        }
+    };
+
+    let cfg = Arc::new(cfg);
 
     // Require at least one valid upstream config, so we fail fast instead of discovering
     // it during an actual user request.
@@ -774,6 +809,7 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
             service_name,
             port,
             providers,
+            tui_lang,
             shutdown_tx.clone(),
             shutdown_rx.clone(),
         ));
