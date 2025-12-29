@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
   Live config edits in TUI: toggle `enabled` and adjust `level` directly in the Configs page; changes take effect immediately for routing and are persisted to the config file.
 - TUI 多页监控与可解释性：新增 Sessions/Requests 页，支持快速筛选，并在请求详情中展示“上游尝试链路（route chain）”。  
   Multi-page monitoring + explainability: add Sessions/Requests pages with quick filters, and show the upstream attempt chain (route chain) in request details.
+- TUI 用量与测速：新增 Stats 页展示 token/请求聚合与 Top config/provider；Configs 页支持一键健康检查（/models）并展示延迟与错误信息。  
+  Usage + speed insights in TUI: add a Stats page with token/request rollups and top config/provider tables; add one-key health checks (/models) in Configs with latency/error details.
 - 模型白名单与映射（支持通配符）：为每个上游增加 `supported_models` / `model_mapping`（兼容 JSON `supportedModels` / `modelMapping`），代理会自动过滤不支持的上游并在转发前重写 `model` 字段。  
   Model allowlist + mapping (wildcards supported): add per-upstream `supported_models` / `model_mapping` (JSON compatible via `supportedModels` / `modelMapping`); the proxy skips incompatible upstreams and rewrites `model` before forwarding.
 - Level 分组（跨配置降级）：为每个配置增加 `level` / `enabled`，当存在多个 level 时，会按 level 从低到高（1→10）进行自动路由与故障降级。  
@@ -27,6 +29,10 @@ All notable changes to this project will be documented in this file.
   TUI Sessions page: inspect sessions with active/error/override views, plus linked filters and quick reset.
 - TUI Requests 页：按请求维度查看最新请求，支持错误筛选与 scope 切换，并展示每次重试的上游链路。  
   TUI Requests page: inspect recent requests with error filter and scope switch, and show the per-retry upstream chain.
+- TUI Stats 页：展示按天聚合的 token 趋势、按 config/provider 的 Top 用量表；可通过 `CODEX_HELPER_PRICE_INPUT_PER_1K_USD` / `CODEX_HELPER_PRICE_OUTPUT_PER_1K_USD` 启用粗略成本估算。  
+  TUI Stats page: show daily token rollups and top usage tables by config/provider; enable coarse cost estimates via `CODEX_HELPER_PRICE_INPUT_PER_1K_USD` / `CODEX_HELPER_PRICE_OUTPUT_PER_1K_USD`.
+- TUI Configs 健康检查：`h` 检测选中 config，`H` 批量检测所有 config；结果会展示每个 upstream 的延迟与状态码。  
+  TUI Configs health checks: `h` checks selected config, `H` checks all configs; results show per-upstream latency and status code.
 
 ### 测试 / Tests
 - 新增用例覆盖：按模型过滤上游、以及请求体 `model` 自动映射。  

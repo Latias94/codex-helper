@@ -11,6 +11,7 @@ pub(in crate::tui) enum Page {
     Configs,
     Sessions,
     Requests,
+    Stats,
     Settings,
 }
 
@@ -54,8 +55,15 @@ impl EffortChoice {
     }
 }
 
-pub(in crate::tui) fn page_titles() -> [&'static str; 5] {
-    ["Dashboard", "Configs", "Sessions", "Requests", "Settings"]
+pub(in crate::tui) fn page_titles() -> [&'static str; 6] {
+    [
+        "Dashboard",
+        "Configs",
+        "Sessions",
+        "Requests",
+        "Stats",
+        "Settings",
+    ]
 }
 
 pub(in crate::tui) fn page_index(page: Page) -> usize {
@@ -64,6 +72,7 @@ pub(in crate::tui) fn page_index(page: Page) -> usize {
         Page::Configs => 1,
         Page::Sessions => 2,
         Page::Requests => 3,
-        Page::Settings => 4,
+        Page::Stats => 4,
+        Page::Settings => 5,
     }
 }

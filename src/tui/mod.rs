@@ -95,7 +95,7 @@ pub async fn run_dashboard(
                 let Some(Ok(event)) = maybe_event else { continue; };
                 match event {
                     Event::Key(key) if input::should_accept_key_event(&key) => {
-                        if input::handle_key_event(&state, &providers, &mut ui, &snapshot, key).await {
+                        if input::handle_key_event(state.clone(), &providers, &mut ui, &snapshot, key).await {
                             should_redraw = true;
                         }
                     }

@@ -1,9 +1,11 @@
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use reqwest::Url;
 
-use crate::config::{load_config, save_config};
-use crate::state::ProxyState;
+use crate::config::{UpstreamConfig, load_config, save_config};
+use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
 
 use super::model::{ProviderOption, Snapshot, filtered_requests_len, now_ms};
 use super::state::{UiState, adjust_table_selection};
@@ -14,7 +16,7 @@ pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
 }
 
 pub(in crate::tui) async fn handle_key_event(
-    state: &ProxyState,
+    state: Arc<ProxyState>,
     providers: &[ProviderOption],
     ui: &mut UiState,
     snapshot: &Snapshot,
@@ -25,7 +27,7 @@ pub(in crate::tui) async fn handle_key_event(
     }
 
     match ui.overlay {
-        Overlay::None => handle_key_normal(state, providers, ui, snapshot, key).await,
+        Overlay::None => handle_key_normal(&state, providers, ui, snapshot, key).await,
         Overlay::Help => match key.code {
             KeyCode::Esc | KeyCode::Char('?') => {
                 ui.overlay = Overlay::None;
@@ -33,9 +35,9 @@ pub(in crate::tui) async fn handle_key_event(
             }
             _ => false,
         },
-        Overlay::EffortMenu => handle_key_effort_menu(state, ui, snapshot, key).await,
+        Overlay::EffortMenu => handle_key_effort_menu(&state, ui, snapshot, key).await,
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
-            handle_key_provider_menu(state, providers, ui, snapshot, key).await
+            handle_key_provider_menu(&state, providers, ui, snapshot, key).await
         }
     }
 }
@@ -46,7 +48,8 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         KeyCode::Char('2') => Some(Page::Configs),
         KeyCode::Char('3') => Some(Page::Sessions),
         KeyCode::Char('4') => Some(Page::Requests),
-        KeyCode::Char('5') => Some(Page::Settings),
+        KeyCode::Char('5') => Some(Page::Stats),
+        KeyCode::Char('6') => Some(Page::Settings),
         _ => None,
     };
     if let Some(p) = page {
@@ -135,8 +138,103 @@ async fn persist_config_meta(
     Ok(())
 }
 
+fn shorten_err(err: &str, max: usize) -> String {
+    if err.chars().count() <= max {
+        return err.to_string();
+    }
+    err.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+}
+
+fn health_check_timeout() -> Duration {
+    let ms = std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2_500)
+        .clamp(300, 20_000);
+    Duration::from_millis(ms)
+}
+
+fn health_check_url(base_url: &str) -> anyhow::Result<Url> {
+    let mut url = Url::parse(base_url)?;
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Ok(url.join("models")?)
+}
+
+async fn probe_upstream(client: &reqwest::Client, upstream: &UpstreamConfig) -> UpstreamHealth {
+    let mut out = UpstreamHealth {
+        base_url: upstream.base_url.clone(),
+        ..UpstreamHealth::default()
+    };
+
+    let url = match health_check_url(&upstream.base_url) {
+        Ok(u) => u,
+        Err(e) => {
+            out.ok = Some(false);
+            out.error = Some(shorten_err(&format!("invalid base_url: {e}"), 140));
+            return out;
+        }
+    };
+
+    let start = Instant::now();
+    let mut req = client.get(url).header("Accept", "application/json");
+    if let Some(token) = upstream.auth.resolve_auth_token() {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    } else if let Some(key) = upstream.auth.resolve_api_key() {
+        req = req.header("X-API-Key", key);
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            out.latency_ms = Some(start.elapsed().as_millis() as u64);
+            out.status_code = Some(resp.status().as_u16());
+            out.ok = Some(resp.status().is_success());
+            if !resp.status().is_success() {
+                out.error = Some(shorten_err(&format!("HTTP {}", resp.status()), 140));
+            }
+        }
+        Err(e) => {
+            out.latency_ms = Some(start.elapsed().as_millis() as u64);
+            out.ok = Some(false);
+            out.error = Some(shorten_err(&e.to_string(), 140));
+        }
+    }
+    out
+}
+
+async fn run_config_health_check(ui: &UiState, config_name: &str) -> anyhow::Result<ConfigHealth> {
+    let cfg = load_config().await?;
+    let mgr = if ui.service_name == "claude" {
+        &cfg.claude
+    } else {
+        &cfg.codex
+    };
+    let Some(svc) = mgr.configs.get(config_name) else {
+        anyhow::bail!("config '{config_name}' not found");
+    };
+
+    let timeout = health_check_timeout();
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout)
+        .build()?;
+
+    let checked_at_ms = now_ms();
+    let mut upstreams = Vec::new();
+    for upstream in &svc.upstreams {
+        upstreams.push(probe_upstream(&client, upstream).await);
+    }
+
+    Ok(ConfigHealth {
+        checked_at_ms,
+        upstreams,
+    })
+}
+
 async fn handle_key_normal(
-    state: &ProxyState,
+    state: &Arc<ProxyState>,
     providers: &[ProviderOption],
     ui: &mut UiState,
     snapshot: &Snapshot,
@@ -305,6 +403,86 @@ async fn handle_key_normal(
             } else {
                 ui.toast = Some((format!("config {} level={next}", pvd.name), Instant::now()));
             }
+            true
+        }
+        KeyCode::Char('h') if ui.page == Page::Configs => {
+            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+                return true;
+            };
+            let service_name = ui.service_name;
+            let config_name = pvd.name.clone();
+            let state = Arc::clone(state);
+            ui.toast = Some((
+                format!("health check started: {config_name}"),
+                Instant::now(),
+            ));
+            tokio::spawn(async move {
+                let mut tmp_ui = UiState::default();
+                tmp_ui.service_name = service_name;
+                match run_config_health_check(&tmp_ui, &config_name).await {
+                    Ok(health) => {
+                        state
+                            .record_config_health(service_name, config_name, health)
+                            .await;
+                    }
+                    Err(err) => {
+                        let health = ConfigHealth {
+                            checked_at_ms: now_ms(),
+                            upstreams: vec![UpstreamHealth {
+                                base_url: "<load_config>".to_string(),
+                                ok: Some(false),
+                                status_code: None,
+                                latency_ms: None,
+                                error: Some(shorten_err(&err.to_string(), 140)),
+                            }],
+                        };
+                        state
+                            .record_config_health(service_name, config_name, health)
+                            .await;
+                    }
+                }
+            });
+            true
+        }
+        KeyCode::Char('H') if ui.page == Page::Configs => {
+            let service_name = ui.service_name;
+            let configs = providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+            let state = Arc::clone(state);
+            ui.toast = Some((
+                format!("health check started: {} configs", configs.len()),
+                Instant::now(),
+            ));
+            tokio::spawn(async move {
+                let mut tmp_ui = UiState::default();
+                tmp_ui.service_name = service_name;
+                for (idx, config_name) in configs.into_iter().enumerate() {
+                    if idx > 0 {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    match run_config_health_check(&tmp_ui, &config_name).await {
+                        Ok(health) => {
+                            state
+                                .record_config_health(service_name, config_name, health)
+                                .await;
+                        }
+                        Err(err) => {
+                            let health = ConfigHealth {
+                                checked_at_ms: now_ms(),
+                                upstreams: vec![UpstreamHealth {
+                                    base_url: "<load_config>".to_string(),
+                                    ok: Some(false),
+                                    status_code: None,
+                                    latency_ms: None,
+                                    error: Some(shorten_err(&err.to_string(), 140)),
+                                }],
+                            };
+                            state
+                                .record_config_health(service_name, config_name, health)
+                                .await;
+                        }
+                    }
+                }
+            });
             true
         }
         KeyCode::Char('a') if ui.page == Page::Sessions => {

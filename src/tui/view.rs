@@ -15,6 +15,8 @@ use super::model::{
 use super::state::UiState;
 use super::types::{EffortChoice, Focus, Overlay, Page, page_index, page_titles};
 
+mod stats;
+
 pub(in crate::tui) fn render_app(
     f: &mut Frame<'_>,
     p: Palette,
@@ -172,6 +174,7 @@ fn render_body(
         Page::Configs => render_configs_page(f, p, ui, snapshot, providers, area),
         Page::Sessions => render_sessions_page(f, p, ui, snapshot, area),
         Page::Requests => render_requests_page(f, p, ui, snapshot, area),
+        Page::Stats => stats::render_stats_page(f, p, ui, snapshot, providers, area),
         Page::Settings => render_placeholder(f, p, "Settings view (coming soon)", area),
     }
 }
@@ -534,7 +537,7 @@ fn render_configs_page(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["Lvl", "Name", "Alias", "On", "Up"])
+    let header = Row::new(["Lvl", "Name", "Alias", "On", "Up", "Health"])
         .style(Style::default().fg(p.muted))
         .height(1);
 
@@ -561,6 +564,34 @@ fn render_configs_page(
                 .unwrap_or("-");
             let on = if enabled { "on" } else { "off" };
             let up = cfg.upstreams.len().to_string();
+            let health = snapshot
+                .config_health
+                .get(cfg.name.as_str())
+                .map(|h| {
+                    let total = h.upstreams.len().max(1);
+                    let ok = h.upstreams.iter().filter(|u| u.ok == Some(true)).count();
+                    let best_ms = h
+                        .upstreams
+                        .iter()
+                        .filter(|u| u.ok == Some(true))
+                        .filter_map(|u| u.latency_ms)
+                        .min();
+                    if ok > 0 {
+                        if let Some(ms) = best_ms {
+                            format!("{ok}/{total} {ms}ms")
+                        } else {
+                            format!("{ok}/{total} ok")
+                        }
+                    } else {
+                        let status = h.upstreams.iter().filter_map(|u| u.status_code).next();
+                        if let Some(code) = status {
+                            format!("err {code}")
+                        } else {
+                            "err".to_string()
+                        }
+                    }
+                })
+                .unwrap_or_else(|| "-".to_string());
 
             let mut style = Style::default().fg(if enabled { p.text } else { p.muted });
             if global_override == Some(cfg.name.as_str()) {
@@ -576,6 +607,7 @@ fn render_configs_page(
                 alias.to_string(),
                 on.to_string(),
                 up,
+                health,
             ])
             .style(style)
             .height(1)
@@ -592,10 +624,11 @@ fn render_configs_page(
         rows,
         [
             Constraint::Length(4),
-            Constraint::Length(18),
-            Constraint::Min(12),
+            Constraint::Length(16),
+            Constraint::Min(10),
             Constraint::Length(3),
             Constraint::Length(3),
+            Constraint::Length(12),
         ],
     )
     .header(header)
@@ -680,6 +713,59 @@ fn render_configs_page(
             Span::styled(routing, Style::default().fg(p.muted)),
         ]));
 
+        if let Some(health) = snapshot.config_health.get(cfg.name.as_str()) {
+            let age = format_age(now_ms(), Some(health.checked_at_ms));
+            lines.push(Line::from(vec![
+                Span::styled("health: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    format!("checked {age} ago"),
+                    Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+                ),
+            ]));
+            for (idx, u) in health.upstreams.iter().enumerate() {
+                let ok = u.ok.unwrap_or(false);
+                let status = u
+                    .status_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let ms = u
+                    .latency_ms
+                    .map(|c| format!("{c}ms"))
+                    .unwrap_or_else(|| "-".to_string());
+                let head = format!("{idx:>2}. ");
+                lines.push(Line::from(vec![
+                    Span::styled(head, Style::default().fg(p.muted)),
+                    Span::styled(
+                        if ok { "ok" } else { "err" },
+                        Style::default().fg(if ok { p.good } else { p.warn }),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(status, Style::default().fg(p.muted)),
+                    Span::raw("  "),
+                    Span::styled(ms, Style::default().fg(p.muted)),
+                    Span::raw("  "),
+                    Span::styled(shorten(&u.base_url, 60), Style::default().fg(p.text)),
+                ]));
+                if !ok
+                    && let Some(e) = u.error.as_deref()
+                    && !e.trim().is_empty()
+                {
+                    lines.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled(shorten(e, 80), Style::default().fg(p.muted)),
+                    ]));
+                }
+            }
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("health: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    "not checked (press 'h')",
+                    Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             "Upstreams",
@@ -715,6 +801,8 @@ fn render_configs_page(
             "  o            set session override to selected config",
         ));
         lines.push(Line::from("  O            clear session override"));
+        lines.push(Line::from("  h            health check selected config"));
+        lines.push(Line::from("  H            health check all configs"));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             "Edit (hot reload + persisted)",
@@ -1418,12 +1506,13 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
                 "q quit  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set effort  x clear  p session cfg  P global cfg  ? help"
             }
             Page::Configs => {
-                "q quit  ↑/↓ select  t toggle enabled  +/- level  Enter global override  Backspace clear  o session override  O clear  ? help"
+                "q quit  ↑/↓ select  t toggle enabled  +/- level  h check  H check all  Enter global override  Backspace clear  o session override  O clear  ? help"
             }
             Page::Requests => "q quit  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
             Page::Sessions => {
                 "q quit  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help"
             }
+            Page::Stats => "q quit  ? help",
             Page::Settings => "q quit  ? help",
         },
         Overlay::Help => "Esc close help",

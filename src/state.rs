@@ -10,6 +10,63 @@ use crate::logging::RetryInfo;
 use crate::sessions;
 use crate::usage::UsageMetrics;
 
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct UsageBucket {
+    pub requests_total: u64,
+    pub requests_error: u64,
+    pub duration_ms_total: u64,
+    pub usage: UsageMetrics,
+}
+
+impl UsageBucket {
+    fn record(&mut self, status_code: u16, duration_ms: u64, usage: Option<&UsageMetrics>) {
+        self.requests_total = self.requests_total.saturating_add(1);
+        if status_code >= 400 {
+            self.requests_error = self.requests_error.saturating_add(1);
+        }
+        self.duration_ms_total = self.duration_ms_total.saturating_add(duration_ms);
+        if let Some(u) = usage {
+            self.usage.add_assign(u);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct UsageRollupView {
+    pub since_start: UsageBucket,
+    pub by_day: Vec<(i32, UsageBucket)>,
+    pub by_config: Vec<(String, UsageBucket)>,
+    pub by_provider: Vec<(String, UsageBucket)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UsageRollup {
+    since_start: UsageBucket,
+    by_day: HashMap<i32, UsageBucket>,
+    by_config: HashMap<String, UsageBucket>,
+    by_provider: HashMap<String, UsageBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct UpstreamHealth {
+    pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct ConfigHealth {
+    pub checked_at_ms: u64,
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamHealth>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ActiveRequest {
     pub id: u64,
@@ -133,6 +190,8 @@ pub struct ProxyState {
     session_stats: RwLock<HashMap<String, SessionStats>>,
     active_requests: RwLock<HashMap<u64, ActiveRequest>>,
     recent_finished: RwLock<VecDeque<FinishedRequest>>,
+    usage_rollups: RwLock<HashMap<String, UsageRollup>>,
+    config_health: RwLock<HashMap<String, HashMap<String, ConfigHealth>>>,
 }
 
 impl ProxyState {
@@ -167,6 +226,8 @@ impl ProxyState {
             session_stats: RwLock::new(HashMap::new()),
             active_requests: RwLock::new(HashMap::new()),
             recent_finished: RwLock::new(VecDeque::new()),
+            usage_rollups: RwLock::new(HashMap::new()),
+            config_health: RwLock::new(HashMap::new()),
         })
     }
 
@@ -312,6 +373,67 @@ impl ProxyState {
             .unwrap_or_default()
     }
 
+    pub async fn record_config_health(
+        &self,
+        service_name: &str,
+        config_name: String,
+        health: ConfigHealth,
+    ) {
+        let mut guard = self.config_health.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        per_service.insert(config_name, health);
+    }
+
+    pub async fn get_config_health(&self, service_name: &str) -> HashMap<String, ConfigHealth> {
+        let guard = self.config_health.read().await;
+        guard.get(service_name).cloned().unwrap_or_default()
+    }
+
+    pub async fn get_usage_rollup_view(
+        &self,
+        service_name: &str,
+        top_n: usize,
+        days: usize,
+    ) -> UsageRollupView {
+        let guard = self.usage_rollups.read().await;
+        let Some(rollup) = guard.get(service_name) else {
+            return UsageRollupView::default();
+        };
+
+        let mut by_day = rollup
+            .by_day
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect::<Vec<_>>();
+        by_day.sort_by_key(|(k, _)| *k);
+        if by_day.len() > days {
+            by_day = by_day[by_day.len().saturating_sub(days)..].to_vec();
+        }
+
+        let mut by_config = rollup
+            .by_config
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>();
+        by_config.sort_by_key(|(_, v)| std::cmp::Reverse(v.usage.total_tokens));
+        by_config.truncate(top_n);
+
+        let mut by_provider = rollup
+            .by_provider
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>();
+        by_provider.sort_by_key(|(_, v)| std::cmp::Reverse(v.usage.total_tokens));
+        by_provider.truncate(top_n);
+
+        UsageRollupView {
+            since_start: rollup.since_start.clone(),
+            by_day,
+            by_config,
+            by_provider,
+        }
+    }
+
     pub async fn resolve_session_cwd(&self, session_id: &str) -> Option<String> {
         if self.session_cwd_cache_max_entries == 0 {
             return sessions::find_codex_session_cwd_by_id(session_id)
@@ -437,6 +559,39 @@ impl ProxyState {
             ended_at_ms,
         };
 
+        {
+            let day = (ended_at_ms / 86_400_000) as i32;
+            let cfg_key = finished
+                .config_name
+                .clone()
+                .unwrap_or_else(|| "-".to_string());
+            let provider_key = finished
+                .provider_id
+                .clone()
+                .unwrap_or_else(|| "-".to_string());
+
+            let mut rollups = self.usage_rollups.write().await;
+            let rollup = rollups.entry(finished.service.clone()).or_default();
+            rollup
+                .since_start
+                .record(status_code, duration_ms, usage.as_ref());
+            rollup
+                .by_day
+                .entry(day)
+                .or_default()
+                .record(status_code, duration_ms, usage.as_ref());
+            rollup.by_config.entry(cfg_key).or_default().record(
+                status_code,
+                duration_ms,
+                usage.as_ref(),
+            );
+            rollup.by_provider.entry(provider_key).or_default().record(
+                status_code,
+                duration_ms,
+                usage.as_ref(),
+            );
+        }
+
         if let Some(sid) = finished.session_id.as_deref() {
             let mut stats = self.session_stats.write().await;
             let entry = stats.entry(sid.to_string()).or_default();
@@ -535,6 +690,19 @@ impl ProxyState {
                 }
                 v.last_seen_ms >= cutoff_override
             });
+        }
+
+        // Keep a bounded number of days of rollup data to avoid unbounded growth.
+        let keep_days: i32 = std::env::var("CODEX_HELPER_USAGE_ROLLUP_KEEP_DAYS")
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(60);
+        let now_day = (now_ms / 86_400_000) as i32;
+        let cutoff_day = now_day.saturating_sub(keep_days);
+        let mut rollups = self.usage_rollups.write().await;
+        for rollup in rollups.values_mut() {
+            rollup.by_day.retain(|day, _| *day >= cutoff_day);
         }
 
         let cutoff_cwd =

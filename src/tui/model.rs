@@ -3,7 +3,9 @@ use std::time::Instant;
 
 use ratatui::prelude::{Color, Style};
 
-use crate::state::{ActiveRequest, FinishedRequest, ProxyState, SessionStats};
+use crate::state::{
+    ActiveRequest, ConfigHealth, FinishedRequest, ProxyState, SessionStats, UsageRollupView,
+};
 use crate::usage::UsageMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -53,6 +55,8 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) config_overrides: HashMap<String, String>,
     pub(in crate::tui) global_override: Option<String>,
     pub(in crate::tui) config_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
+    pub(in crate::tui) usage_rollup: UsageRollupView,
+    pub(in crate::tui) config_health: HashMap<String, ConfigHealth>,
     pub(in crate::tui) refreshed_at: Instant,
 }
 
@@ -399,7 +403,17 @@ fn build_session_rows(
 }
 
 pub(in crate::tui) async fn refresh_snapshot(state: &ProxyState, service_name: &str) -> Snapshot {
-    let (active, recent, overrides, config_overrides, global_override, stats, config_meta) = tokio::join!(
+    let (
+        active,
+        recent,
+        overrides,
+        config_overrides,
+        global_override,
+        stats,
+        config_meta,
+        rollup,
+        health,
+    ) = tokio::join!(
         state.list_active_requests(),
         state.list_recent_finished(200),
         state.list_session_effort_overrides(),
@@ -407,6 +421,8 @@ pub(in crate::tui) async fn refresh_snapshot(state: &ProxyState, service_name: &
         state.get_global_config_override(),
         state.list_session_stats(),
         state.get_config_meta_overrides(service_name),
+        state.get_usage_rollup_view(service_name, 12, 21),
+        state.get_config_health(service_name),
     );
 
     let rows = build_session_rows(active, &recent, &overrides, &config_overrides, &stats);
@@ -417,6 +433,8 @@ pub(in crate::tui) async fn refresh_snapshot(state: &ProxyState, service_name: &
         config_overrides,
         global_override,
         config_meta_overrides: config_meta,
+        usage_rollup: rollup,
+        config_health: health,
         refreshed_at: Instant::now(),
     }
 }
