@@ -1134,6 +1134,16 @@ pub async fn handle_proxy(
                     continue;
                 }
 
+                // Even when we have no remaining in-request retries, mark this upstream as cooled down
+                // so external retries (e.g. Codex request_max_retries) can fail over to another upstream.
+                if should_retry_class(&retry_opt, Some("upstream_transport_error")) {
+                    lb.penalize(
+                        selected.index,
+                        retry_opt.transport_cooldown_secs,
+                        "upstream_transport_error_final",
+                    );
+                }
+
                 let dur = start.elapsed().as_millis() as u64;
                 let status_code = StatusCode::BAD_GATEWAY.as_u16();
                 let upstream_headers_ms = upstream_start.elapsed().as_millis() as u64;
@@ -1312,6 +1322,16 @@ pub async fn handle_proxy(
                         continue;
                     }
 
+                    // Same reasoning as transport errors: without in-request retries, external retries
+                    // should not get stuck repeatedly selecting the same broken upstream.
+                    if should_retry_class(&retry_opt, Some("upstream_transport_error")) {
+                        lb.penalize(
+                            selected.index,
+                            retry_opt.transport_cooldown_secs,
+                            "upstream_body_read_error_final",
+                        );
+                    }
+
                     let dur = start.elapsed().as_millis() as u64;
                     let status = StatusCode::BAD_GATEWAY;
                     let http_debug = if should_include_http_warn(status.as_u16())
@@ -1389,6 +1409,34 @@ pub async fn handle_proxy(
                 cls.as_deref().unwrap_or("-"),
                 model_note.as_str()
             ));
+
+            // If this looks like a transient / retryable upstream failure, but we have no remaining
+            // in-request retries, proactively cool down this upstream so the next external retry
+            // (Codex/app-level) can fail over to other upstreams.
+            if !success
+                && attempt_index + 1 >= retry_opt.max_attempts
+                && (should_retry_status(&retry_opt, status_code)
+                    || should_retry_class(&retry_opt, cls.as_deref()))
+            {
+                match cls.as_deref() {
+                    Some("cloudflare_challenge") => lb.penalize(
+                        selected.index,
+                        retry_opt.cloudflare_challenge_cooldown_secs,
+                        "cloudflare_challenge_final",
+                    ),
+                    Some("cloudflare_timeout") => lb.penalize(
+                        selected.index,
+                        retry_opt.cloudflare_timeout_cooldown_secs,
+                        "cloudflare_timeout_final",
+                    ),
+                    _ if status_code >= 500 => lb.penalize(
+                        selected.index,
+                        retry_opt.transport_cooldown_secs,
+                        &format!("status_{}_final", status_code),
+                    ),
+                    _ => {}
+                }
+            }
 
             let retryable = !status.is_success()
                 && attempt_index + 1 < retry_opt.max_attempts
