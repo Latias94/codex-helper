@@ -192,7 +192,7 @@ ch
   ```bash
   # 覆盖 codex-helper 的 Codex 配置（active/enabled/level 等回到默认）
   codex-helper config overwrite-from-codex --dry-run
-  codex-helper config overwrite-from-codex
+  codex-helper config overwrite-from-codex --yes
   ```
 
 ### 会话、用量与诊断

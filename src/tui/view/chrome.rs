@@ -283,12 +283,12 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             Page::Settings => crate::tui::i18n::pick(
                 ui.language,
                 if ui.service_name == "codex" {
-                    "1-6 页面  q 退出  L 语言  O 覆盖导入(~/.codex)  ? 帮助"
+                    "1-6 页面  q 退出  L 语言  O 覆盖导入(~/.codex，二次确认)  ? 帮助"
                 } else {
                     "1-6 页面  q 退出  L 语言  ? 帮助"
                 },
                 if ui.service_name == "codex" {
-                    "1-6 pages  q quit  L language  O overwrite(~/.codex)  ? help"
+                    "1-6 pages  q quit  L language  O overwrite(~/.codex, confirm)  ? help"
                 } else {
                     "1-6 pages  q quit  L language  ? help"
                 },

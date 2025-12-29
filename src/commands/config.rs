@@ -357,7 +357,12 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 );
             }
         }
-        ConfigCommand::OverwriteFromCodex { dry_run } => {
+        ConfigCommand::OverwriteFromCodex { dry_run, yes } => {
+            if !dry_run && !yes {
+                return Err(CliError::ProxyConfig(
+                    "该操作会覆盖并重建 Codex 配置（active/enabled/level 会重置），请使用 --yes 确认，或先用 --dry-run 预览".to_string(),
+                ));
+            }
             let cfg = load_config()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;

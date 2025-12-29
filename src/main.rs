@@ -316,6 +316,9 @@ enum ConfigCommand {
         /// Preview changes without writing ~/.codex-helper/config (toml/json)
         #[arg(long)]
         dry_run: bool,
+        /// Confirm overwriting configs (required unless --dry-run)
+        #[arg(long)]
+        yes: bool,
     },
 }
 

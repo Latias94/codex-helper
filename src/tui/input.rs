@@ -505,6 +505,25 @@ async fn handle_key_normal(
                 return true;
             }
 
+            let now = Instant::now();
+            if let Some(prev) = ui.pending_overwrite_from_codex_confirm_at
+                && now.duration_since(prev) <= Duration::from_secs(3)
+            {
+                ui.pending_overwrite_from_codex_confirm_at = None;
+            } else {
+                ui.pending_overwrite_from_codex_confirm_at = Some(now);
+                ui.toast = Some((
+                    crate::tui::i18n::pick(
+                        ui.language,
+                        "再次按 O 确认覆盖导入（3s 内）",
+                        "Press O again to confirm overwrite (within 3s)",
+                    )
+                    .to_string(),
+                    now,
+                ));
+                return true;
+            }
+
             match load_config().await {
                 Ok(mut cfg) => {
                     if let Err(err) = overwrite_codex_config_from_codex_cli_in_place(&mut cfg) {

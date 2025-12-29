@@ -230,7 +230,7 @@ If you prefer to keep upstreams in separate configs, codex-helper also supports 
   ```bash
   # overwrite codex-helper Codex configs (resets active/enabled/level to defaults)
   codex-helper config overwrite-from-codex --dry-run
-  codex-helper config overwrite-from-codex
+  codex-helper config overwrite-from-codex --yes
   ```
 
 ### Sessions, usage, diagnostics
