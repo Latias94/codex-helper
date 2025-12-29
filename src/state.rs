@@ -1,8 +1,11 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
@@ -69,6 +72,21 @@ pub struct ConfigHealth {
     pub checked_at_ms: u64,
     #[serde(default)]
     pub upstreams: Vec<UpstreamHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct HealthCheckStatus {
+    pub started_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub total: u32,
+    pub completed: u32,
+    pub ok: u32,
+    pub err: u32,
+    pub cancel_requested: bool,
+    pub canceled: bool,
+    pub done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -196,6 +214,7 @@ pub struct ProxyState {
     recent_finished: RwLock<VecDeque<FinishedRequest>>,
     usage_rollups: RwLock<HashMap<String, UsageRollup>>,
     config_health: RwLock<HashMap<String, HashMap<String, ConfigHealth>>>,
+    health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
 }
 
 impl ProxyState {
@@ -232,6 +251,7 @@ impl ProxyState {
             recent_finished: RwLock::new(VecDeque::new()),
             usage_rollups: RwLock::new(HashMap::new()),
             config_health: RwLock::new(HashMap::new()),
+            health_checks: RwLock::new(HashMap::new()),
         })
     }
 
@@ -393,6 +413,131 @@ impl ProxyState {
         guard.get(service_name).cloned().unwrap_or_default()
     }
 
+    pub async fn list_health_checks(
+        &self,
+        service_name: &str,
+    ) -> HashMap<String, HealthCheckStatus> {
+        let guard = self.health_checks.read().await;
+        guard.get(service_name).cloned().unwrap_or_default()
+    }
+
+    pub async fn try_begin_health_check(
+        &self,
+        service_name: &str,
+        config_name: &str,
+        total: usize,
+        now_ms: u64,
+    ) -> bool {
+        let mut guard = self.health_checks.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        if let Some(existing) = per_service.get(config_name)
+            && !existing.done
+        {
+            return false;
+        }
+        per_service.insert(
+            config_name.to_string(),
+            HealthCheckStatus {
+                started_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                total: total.min(u32::MAX as usize) as u32,
+                completed: 0,
+                ok: 0,
+                err: 0,
+                cancel_requested: false,
+                canceled: false,
+                done: false,
+                last_error: None,
+            },
+        );
+        true
+    }
+
+    pub async fn request_cancel_health_check(
+        &self,
+        service_name: &str,
+        config_name: &str,
+        now_ms: u64,
+    ) -> bool {
+        let mut guard = self.health_checks.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return false;
+        };
+        let Some(st) = per_service.get_mut(config_name) else {
+            return false;
+        };
+        if st.done {
+            return false;
+        }
+        st.cancel_requested = true;
+        st.updated_at_ms = now_ms;
+        true
+    }
+
+    pub async fn is_health_check_cancel_requested(
+        &self,
+        service_name: &str,
+        config_name: &str,
+    ) -> bool {
+        let guard = self.health_checks.read().await;
+        guard
+            .get(service_name)
+            .and_then(|m| m.get(config_name))
+            .is_some_and(|s| s.cancel_requested && !s.done)
+    }
+
+    pub async fn record_health_check_result(
+        &self,
+        service_name: &str,
+        config_name: &str,
+        now_ms: u64,
+        upstream: UpstreamHealth,
+    ) {
+        {
+            let mut guard = self.config_health.write().await;
+            let per_service = guard.entry(service_name.to_string()).or_default();
+            let entry = per_service
+                .entry(config_name.to_string())
+                .or_insert_with(|| ConfigHealth {
+                    checked_at_ms: now_ms,
+                    upstreams: Vec::new(),
+                });
+            entry.checked_at_ms = entry.checked_at_ms.max(now_ms);
+            entry.upstreams.push(upstream.clone());
+        }
+
+        let mut guard = self.health_checks.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let st = per_service.entry(config_name.to_string()).or_default();
+        st.updated_at_ms = now_ms;
+        st.completed = st.completed.saturating_add(1);
+        match upstream.ok {
+            Some(true) => st.ok = st.ok.saturating_add(1),
+            Some(false) => {
+                st.err = st.err.saturating_add(1);
+                if st.last_error.is_none() {
+                    st.last_error = upstream.error.clone();
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub async fn finish_health_check(
+        &self,
+        service_name: &str,
+        config_name: &str,
+        now_ms: u64,
+        canceled: bool,
+    ) {
+        let mut guard = self.health_checks.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let st = per_service.entry(config_name.to_string()).or_default();
+        st.updated_at_ms = now_ms;
+        st.canceled = canceled;
+        st.done = true;
+    }
+
     pub async fn get_usage_rollup_view(
         &self,
         service_name: &str,
@@ -465,6 +610,175 @@ impl ProxyState {
             by_provider,
             by_provider_day,
         }
+    }
+
+    pub async fn replay_usage_from_requests_log(
+        &self,
+        service_name: &str,
+        log_path: PathBuf,
+        base_url_to_provider_id: HashMap<String, String>,
+    ) -> usize {
+        let enabled = std::env::var("CODEX_HELPER_USAGE_REPLAY_ON_STARTUP")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "y" | "on"
+                )
+            })
+            .unwrap_or(true);
+        if !enabled {
+            return 0;
+        }
+
+        let already_has_data = {
+            let guard = self.usage_rollups.read().await;
+            guard
+                .get(service_name)
+                .is_some_and(|r| r.since_start.requests_total > 0)
+        };
+        if already_has_data {
+            return 0;
+        }
+
+        if !log_path.exists() {
+            return 0;
+        }
+
+        let max_bytes = std::env::var("CODEX_HELPER_USAGE_REPLAY_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8 * 1024 * 1024);
+        let max_lines = std::env::var("CODEX_HELPER_USAGE_REPLAY_MAX_LINES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(20_000);
+
+        let mut file = match std::fs::File::open(&log_path) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        let len = match file.metadata().map(|m| m.len()) {
+            Ok(n) => n,
+            Err(_) => 0,
+        };
+        let start = len.saturating_sub(max_bytes as u64);
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return 0;
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_err() {
+            return 0;
+        }
+        if start > 0 {
+            if let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                buf = buf[pos + 1..].to_vec();
+            } else {
+                return 0;
+            }
+        }
+
+        let text = match std::str::from_utf8(&buf) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let lines = text
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>();
+        let start_idx = lines.len().saturating_sub(max_lines);
+
+        let mut events = Vec::new();
+        for line in &lines[start_idx..] {
+            let Ok(v) = serde_json::from_str::<JsonValue>(line) else {
+                continue;
+            };
+            let Some(svc) = v.get("service").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if svc != service_name {
+                continue;
+            }
+
+            let ended_at_ms = v.get("timestamp_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+            let status_code = v.get("status_code").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+            let duration_ms = v.get("duration_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+            let config_name = v
+                .get("config_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let upstream_base_url = v
+                .get("upstream_base_url")
+                .and_then(|x| x.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let provider_id = v
+                .get("provider_id")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| base_url_to_provider_id.get(&upstream_base_url).cloned())
+                .unwrap_or_else(|| "-".to_string());
+            let usage = v
+                .get("usage")
+                .and_then(|u| serde_json::from_value::<UsageMetrics>(u.clone()).ok());
+
+            events.push((
+                ended_at_ms,
+                status_code,
+                duration_ms,
+                config_name,
+                provider_id,
+                usage,
+            ));
+        }
+
+        if events.is_empty() {
+            return 0;
+        }
+
+        let mut guard = self.usage_rollups.write().await;
+        let rollup = guard.entry(service_name.to_string()).or_default();
+        for (ended_at_ms, status_code, duration_ms, cfg_key, provider_key, usage) in events.iter() {
+            let day = (*ended_at_ms / 86_400_000) as i32;
+            rollup
+                .since_start
+                .record(*status_code, *duration_ms, usage.as_ref());
+            rollup.by_day.entry(day).or_default().record(
+                *status_code,
+                *duration_ms,
+                usage.as_ref(),
+            );
+            rollup.by_config.entry(cfg_key.clone()).or_default().record(
+                *status_code,
+                *duration_ms,
+                usage.as_ref(),
+            );
+            rollup
+                .by_config_day
+                .entry(cfg_key.clone())
+                .or_default()
+                .entry(day)
+                .or_default()
+                .record(*status_code, *duration_ms, usage.as_ref());
+            rollup
+                .by_provider
+                .entry(provider_key.clone())
+                .or_default()
+                .record(*status_code, *duration_ms, usage.as_ref());
+            rollup
+                .by_provider_day
+                .entry(provider_key.clone())
+                .or_default()
+                .entry(day)
+                .or_default()
+                .record(*status_code, *duration_ms, usage.as_ref());
+        }
+
+        events.len()
     }
 
     pub async fn resolve_session_cwd(&self, session_id: &str) -> Option<String> {

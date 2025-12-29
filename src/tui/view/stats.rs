@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, W
 
 use crate::state::UsageBucket;
 use crate::tui::ProviderOption;
-use crate::tui::model::{Palette, Snapshot, tokens_short};
+use crate::tui::model::{Palette, Snapshot, shorten, tokens_short};
 use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
 
@@ -441,23 +441,168 @@ fn render_detail_panel(
     let tips = Text::from(vec![
         Line::from(vec![
             Span::styled("Tab", Style::default().fg(p.text)),
-            Span::styled(" switch focus  ", Style::default().fg(p.muted)),
+            Span::styled(" focus  ", Style::default().fg(p.muted)),
             Span::styled("d", Style::default().fg(p.text)),
-            Span::styled(" cycle window  ", Style::default().fg(p.muted)),
+            Span::styled(" window  ", Style::default().fg(p.muted)),
+            Span::styled("e", Style::default().fg(p.text)),
+            Span::styled(" errors_only(recent)", Style::default().fg(p.muted)),
         ]),
         Line::from(vec![
             Span::styled("↑/↓", Style::default().fg(p.text)),
             Span::styled(" select  ", Style::default().fg(p.muted)),
             Span::styled("1-6", Style::default().fg(p.text)),
-            Span::styled(" switch pages", Style::default().fg(p.muted)),
+            Span::styled(" pages", Style::default().fg(p.muted)),
         ]),
     ]);
+
+    let errors_only = ui.stats_errors_only;
+    let mut recent_total = 0u64;
+    let mut recent_err = 0u64;
+    let mut class_2xx = 0u64;
+    let mut class_3xx = 0u64;
+    let mut class_4xx = 0u64;
+    let mut class_5xx = 0u64;
+    let mut by_model: std::collections::HashMap<String, (u64, i64)> =
+        std::collections::HashMap::new();
+    let mut by_path: std::collections::HashMap<String, (u64, u64, i64)> =
+        std::collections::HashMap::new();
+    let mut by_status: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+
+    for r in &snapshot.recent {
+        let matches = match ui.stats_focus {
+            StatsFocus::Configs => r.config_name.as_deref() == Some(name),
+            StatsFocus::Providers => r.provider_id.as_deref() == Some(name),
+        };
+        if !matches {
+            continue;
+        }
+        if errors_only && r.status_code < 400 {
+            continue;
+        }
+        recent_total += 1;
+        if r.status_code >= 400 {
+            recent_err += 1;
+        }
+        match r.status_code {
+            200..=299 => class_2xx += 1,
+            300..=399 => class_3xx += 1,
+            400..=499 => class_4xx += 1,
+            _ => class_5xx += 1,
+        }
+        *by_status.entry(r.status_code).or_insert(0) += 1;
+        let model = r.model.as_deref().unwrap_or("-");
+        let tokens = r.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+        by_model
+            .entry(model.to_string())
+            .and_modify(|(c, t)| {
+                *c = c.saturating_add(1);
+                *t = t.saturating_add(tokens);
+            })
+            .or_insert((1, tokens));
+        by_path
+            .entry(r.path.clone())
+            .and_modify(|(c, e, t)| {
+                *c = c.saturating_add(1);
+                if r.status_code >= 400 {
+                    *e = e.saturating_add(1);
+                }
+                *t = t.saturating_add(tokens);
+            })
+            .or_insert((1, if r.status_code >= 400 { 1 } else { 0 }, tokens));
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Recent breakdown ",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if errors_only {
+                "(errors only)"
+            } else {
+                "(all)"
+            },
+            Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("req  ", Style::default().fg(p.muted)),
+        Span::styled(recent_total.to_string(), Style::default().fg(p.text)),
+        Span::raw("   "),
+        Span::styled("err  ", Style::default().fg(p.muted)),
+        Span::styled(recent_err.to_string(), Style::default().fg(p.warn)),
+        Span::raw("   "),
+        Span::styled("2xx/3xx/4xx/5xx  ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{class_2xx}/{class_3xx}/{class_4xx}/{class_5xx}"),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+
+    let mut status_items = by_status.into_iter().collect::<Vec<_>>();
+    status_items.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    let top_status = status_items
+        .into_iter()
+        .take(6)
+        .map(|(s, c)| format!("{s}:{c}"))
+        .collect::<Vec<_>>()
+        .join("  ");
+    if !top_status.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("top status  ", Style::default().fg(p.muted)),
+            Span::styled(shorten(&top_status, 56), Style::default().fg(p.muted)),
+        ]));
+    }
+
+    let mut models = by_model.into_iter().collect::<Vec<_>>();
+    models.sort_by_key(|(_, (_, tok))| std::cmp::Reverse(*tok));
+    let top_models = models
+        .into_iter()
+        .take(5)
+        .map(|(m, (c, tok))| format!("{}({} / {})", shorten(&m, 18), c, tokens_short(tok)))
+        .collect::<Vec<_>>()
+        .join("  ");
+    if !top_models.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("top models  ", Style::default().fg(p.muted)),
+            Span::styled(shorten(&top_models, 56), Style::default().fg(p.muted)),
+        ]));
+    }
+
+    let mut paths = by_path.into_iter().collect::<Vec<_>>();
+    paths.sort_by_key(|(_, (_, _, tok))| std::cmp::Reverse(*tok));
+    let top_paths = paths
+        .into_iter()
+        .take(5)
+        .map(|(path, (c, e, tok))| {
+            let path = shorten(&path, 22);
+            if e > 0 {
+                format!("{path}({c} err{e} / {})", tokens_short(tok))
+            } else {
+                format!("{path}({c} / {})", tokens_short(tok))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    if !top_paths.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("top paths   ", Style::default().fg(p.muted)),
+            Span::styled(shorten(&top_paths, 56), Style::default().fg(p.muted)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    for l in tips.lines {
+        lines.push(l);
+    }
+
     f.render_widget(
-        Paragraph::new(tips)
+        Paragraph::new(Text::from(lines))
             .block(
                 Block::default()
                     .title(Span::styled(
-                        "Tips",
+                        "Recent (<=200) + Tips",
                         Style::default().fg(p.muted).add_modifier(Modifier::DIM),
                     ))
                     .borders(Borders::ALL)

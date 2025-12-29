@@ -235,6 +235,8 @@ pub struct RequestLog<'a> {
     pub status_code: u16,
     pub duration_ms: u64,
     pub config_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     pub upstream_base_url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -274,6 +276,8 @@ struct HttpDebugLogEntry<'a> {
     pub status_code: u16,
     pub duration_ms: u64,
     pub config_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     pub upstream_base_url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -393,6 +397,7 @@ pub fn log_request_with_debug(
     status_code: u16,
     duration_ms: u64,
     config_name: &str,
+    provider_id: Option<String>,
     upstream_base_url: &str,
     session_id: Option<String>,
     cwd: Option<String>,
@@ -440,6 +445,7 @@ pub fn log_request_with_debug(
             status_code,
             duration_ms,
             config_name,
+            provider_id: provider_id.clone(),
             upstream_base_url,
             session_id: session_id.clone(),
             cwd: cwd.clone(),
@@ -486,6 +492,7 @@ pub fn log_request_with_debug(
         status_code,
         duration_ms,
         config_name,
+        provider_id,
         upstream_base_url,
         session_id,
         cwd,

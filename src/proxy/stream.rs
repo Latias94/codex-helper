@@ -43,6 +43,7 @@ struct StreamFinalize {
     request_body_len: usize,
     upstream_request_body_len: usize,
     config_name: String,
+    provider_id: Option<String>,
     upstream_base_url: String,
     retry: Option<RetryInfo>,
     session_id: Option<String>,
@@ -159,6 +160,7 @@ impl Drop for StreamFinalize {
                 self.status_code,
                 dur,
                 &self.config_name,
+                self.provider_id.clone(),
                 &self.upstream_base_url,
                 self.session_id.clone(),
                 self.cwd.clone(),
@@ -249,6 +251,7 @@ pub(super) fn build_sse_success_response(
     let method_s = method.to_string();
     let path_s = path.clone();
     let config_name = selected.config_name.clone();
+    let provider_id = selected.upstream.tags.get("provider_id").cloned();
     let base_url = selected.upstream.base_url.clone();
     let service_name = proxy.service_name.to_string();
     let start_time = start;
@@ -266,6 +269,7 @@ pub(super) fn build_sse_success_response(
         request_body_len,
         upstream_request_body_len,
         config_name: config_name.clone(),
+        provider_id: provider_id.clone(),
         upstream_base_url: base_url.clone(),
         retry: retry.clone(),
         session_id: session_id.clone(),
@@ -362,6 +366,7 @@ pub(super) fn build_sse_success_response(
                         status.as_u16(),
                         dur,
                         &config_name,
+                        provider_id.clone(),
                         &base_url,
                         session_id.clone(),
                         cwd.clone(),

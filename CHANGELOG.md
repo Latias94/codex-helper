@@ -33,8 +33,14 @@ All notable changes to this project will be documented in this file.
   TUI Stats page: show daily token rollups and top usage tables by config/provider; enable coarse cost estimates via `CODEX_HELPER_PRICE_INPUT_PER_1K_USD` / `CODEX_HELPER_PRICE_OUTPUT_PER_1K_USD`.
 - TUI Stats 交互：支持在 config/provider 之间切换焦点并查看明细；支持切换时间窗口（7/21/60 天）。  
   TUI Stats interactions: switch focus between config/provider with a detail panel, and cycle time windows (7/21/60 days).
+- Stats 持久化（回放请求日志）：启动时会从 `~/.codex-helper/logs/requests.jsonl` 回放最近一段请求记录以恢复用量聚合（可通过 `CODEX_HELPER_USAGE_REPLAY_*` 环境变量控制）。  
+  Stats persistence (log replay): replay recent `~/.codex-helper/logs/requests.jsonl` entries on startup to restore usage rollups (configurable via `CODEX_HELPER_USAGE_REPLAY_*` env vars).
 - TUI Configs 健康检查：`h` 检测选中 config，`H` 批量检测所有 config；结果会展示每个 upstream 的延迟与状态码。  
   TUI Configs health checks: `h` checks selected config, `H` checks all configs; results show per-upstream latency and status code.
+- 健康检查体验增强：Configs 列表展示进行中/取消状态；支持 `c`/`C` 取消检查，并提供批量检查并发上限（`CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT`）。  
+  Health check UX improvements: show running/cancel states in Configs; support `c`/`C` to cancel checks, plus a max in-flight limit (`CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT`).
+- 请求日志增强：`requests.jsonl` 增加 `provider_id` 字段（如 upstream tags 里配置了 `provider_id`），用于更准确的统计与排障。  
+  Request log enhancement: add `provider_id` field to `requests.jsonl` (when upstream tags include `provider_id`) for better stats and debugging.
 
 ### 测试 / Tests
 - 新增用例覆盖：按模型过滤上游、以及请求体 `model` 自动映射。  

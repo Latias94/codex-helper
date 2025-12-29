@@ -564,34 +564,49 @@ fn render_configs_page(
                 .unwrap_or("-");
             let on = if enabled { "on" } else { "off" };
             let up = cfg.upstreams.len().to_string();
-            let health = snapshot
-                .config_health
-                .get(cfg.name.as_str())
-                .map(|h| {
-                    let total = h.upstreams.len().max(1);
-                    let ok = h.upstreams.iter().filter(|u| u.ok == Some(true)).count();
-                    let best_ms = h
-                        .upstreams
-                        .iter()
-                        .filter(|u| u.ok == Some(true))
-                        .filter_map(|u| u.latency_ms)
-                        .min();
-                    if ok > 0 {
-                        if let Some(ms) = best_ms {
-                            format!("{ok}/{total} {ms}ms")
+            let health = if let Some(st) = snapshot.health_checks.get(cfg.name.as_str())
+                && !st.done
+            {
+                if st.cancel_requested {
+                    format!("cancel {}/{}", st.completed, st.total.max(1))
+                } else {
+                    format!("run {}/{}", st.completed, st.total.max(1))
+                }
+            } else if let Some(st) = snapshot.health_checks.get(cfg.name.as_str())
+                && st.done
+                && st.canceled
+            {
+                "canceled".to_string()
+            } else {
+                snapshot
+                    .config_health
+                    .get(cfg.name.as_str())
+                    .map(|h| {
+                        let total = h.upstreams.len().max(1);
+                        let ok = h.upstreams.iter().filter(|u| u.ok == Some(true)).count();
+                        let best_ms = h
+                            .upstreams
+                            .iter()
+                            .filter(|u| u.ok == Some(true))
+                            .filter_map(|u| u.latency_ms)
+                            .min();
+                        if ok > 0 {
+                            if let Some(ms) = best_ms {
+                                format!("{ok}/{total} {ms}ms")
+                            } else {
+                                format!("{ok}/{total} ok")
+                            }
                         } else {
-                            format!("{ok}/{total} ok")
+                            let status = h.upstreams.iter().filter_map(|u| u.status_code).next();
+                            if let Some(code) = status {
+                                format!("err {code}")
+                            } else {
+                                "err".to_string()
+                            }
                         }
-                    } else {
-                        let status = h.upstreams.iter().filter_map(|u| u.status_code).next();
-                        if let Some(code) = status {
-                            format!("err {code}")
-                        } else {
-                            "err".to_string()
-                        }
-                    }
-                })
-                .unwrap_or_else(|| "-".to_string());
+                    })
+                    .unwrap_or_else(|| "-".to_string())
+            };
 
             let mut style = Style::default().fg(if enabled { p.text } else { p.muted });
             if global_override == Some(cfg.name.as_str()) {
@@ -713,6 +728,39 @@ fn render_configs_page(
             Span::styled(routing, Style::default().fg(p.muted)),
         ]));
 
+        if let Some(st) = snapshot.health_checks.get(cfg.name.as_str()) {
+            let status = if !st.done {
+                if st.cancel_requested {
+                    format!("cancel {}/{}", st.completed, st.total.max(1))
+                } else {
+                    format!("running {}/{}", st.completed, st.total.max(1))
+                }
+            } else if st.canceled {
+                "canceled".to_string()
+            } else {
+                "done".to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("health_check: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    status,
+                    Style::default().fg(if st.done && !st.canceled {
+                        p.good
+                    } else {
+                        p.warn
+                    }),
+                ),
+            ]));
+            if let Some(e) = st.last_error.as_deref()
+                && !e.trim().is_empty()
+            {
+                lines.push(Line::from(vec![
+                    Span::raw("             "),
+                    Span::styled(shorten(e, 80), Style::default().fg(p.muted)),
+                ]));
+            }
+        }
+
         if let Some(health) = snapshot.config_health.get(cfg.name.as_str()) {
             let age = format_age(now_ms(), Some(health.checked_at_ms));
             lines.push(Line::from(vec![
@@ -803,6 +851,8 @@ fn render_configs_page(
         lines.push(Line::from("  O            clear session override"));
         lines.push(Line::from("  h            health check selected config"));
         lines.push(Line::from("  H            health check all configs"));
+        lines.push(Line::from("  c            cancel health check (selected)"));
+        lines.push(Line::from("  C            cancel health check (all)"));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             "Edit (hot reload + persisted)",
@@ -1506,14 +1556,14 @@ fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
                 "q quit  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set effort  x clear  p session cfg  P global cfg  ? help"
             }
             Page::Configs => {
-                "q quit  ↑/↓ select  t toggle enabled  +/- level  h check  H check all  Enter global override  Backspace clear  o session override  O clear  ? help"
+                "q quit  ↑/↓ select  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter global override  Backspace clear  o session override  O clear  ? help"
             }
             Page::Requests => "q quit  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
             Page::Sessions => {
                 "q quit  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help"
             }
             Page::Stats => {
-                "q quit  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  ? help"
+                "q quit  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  ? help"
             }
             Page::Settings => "q quit  ? help",
         },

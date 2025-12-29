@@ -309,6 +309,30 @@ impl ProxyService {
     ) -> Self {
         let state = ProxyState::new();
         ProxyState::spawn_cleanup_task(state.clone());
+        {
+            let service_name = service_name;
+            let state = state.clone();
+            let log_path = crate::config::proxy_home_dir()
+                .join("logs")
+                .join("requests.jsonl");
+            let mut base_url_to_provider_id = HashMap::new();
+            let mgr = match service_name {
+                "claude" => &config.claude,
+                _ => &config.codex,
+            };
+            for svc in mgr.configs.values() {
+                for up in &svc.upstreams {
+                    if let Some(pid) = up.tags.get("provider_id") {
+                        base_url_to_provider_id.insert(up.base_url.clone(), pid.clone());
+                    }
+                }
+            }
+            tokio::spawn(async move {
+                let _ = state
+                    .replay_usage_from_requests_log(service_name, log_path, base_url_to_provider_id)
+                    .await;
+            });
+        }
         Self {
             client,
             config,
@@ -609,6 +633,7 @@ pub async fn handle_proxy(
             status.as_u16(),
             dur,
             "-",
+            None,
             "-",
             session_id.clone(),
             None,
@@ -691,6 +716,7 @@ pub async fn handle_proxy(
                 status.as_u16(),
                 dur,
                 "-",
+                None,
                 "-",
                 session_id.clone(),
                 cwd.clone(),
@@ -832,6 +858,7 @@ pub async fn handle_proxy(
                 status.as_u16(),
                 dur,
                 "-",
+                None,
                 "-",
                 session_id.clone(),
                 cwd.clone(),
@@ -961,6 +988,7 @@ pub async fn handle_proxy(
                     status.as_u16(),
                     dur,
                     &selected.config_name,
+                    selected.upstream.tags.get("provider_id").cloned(),
                     &selected.upstream.base_url,
                     session_id.clone(),
                     cwd.clone(),
@@ -1173,6 +1201,7 @@ pub async fn handle_proxy(
                     status_code,
                     dur,
                     &selected.config_name,
+                    selected.upstream.tags.get("provider_id").cloned(),
                     &selected.upstream.base_url,
                     session_id.clone(),
                     cwd.clone(),
@@ -1311,6 +1340,7 @@ pub async fn handle_proxy(
                         status.as_u16(),
                         dur,
                         &selected.config_name,
+                        selected.upstream.tags.get("provider_id").cloned(),
                         &selected.upstream.base_url,
                         session_id.clone(),
                         cwd.clone(),
@@ -1515,6 +1545,7 @@ pub async fn handle_proxy(
                 status_code,
                 dur,
                 &selected.config_name,
+                selected.upstream.tags.get("provider_id").cloned(),
                 &selected.upstream.base_url,
                 session_id.clone(),
                 cwd.clone(),
@@ -1593,6 +1624,7 @@ pub async fn handle_proxy(
         status.as_u16(),
         dur,
         "-",
+        None,
         "-",
         session_id.clone(),
         cwd.clone(),

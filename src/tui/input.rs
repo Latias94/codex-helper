@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Url;
+use tokio::sync::{OnceCell, Semaphore};
 
 use crate::config::{UpstreamConfig, load_config, save_config};
 use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
@@ -155,6 +157,29 @@ fn health_check_timeout() -> Duration {
     Duration::from_millis(ms)
 }
 
+fn health_check_upstream_concurrency() -> usize {
+    std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_UPSTREAM_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+        .min(32)
+}
+
+fn health_check_max_inflight_configs() -> usize {
+    std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2)
+        .min(16)
+}
+
+fn health_check_config_semaphore() -> &'static OnceCell<Arc<Semaphore>> {
+    static SEM: OnceCell<Arc<Semaphore>> = OnceCell::const_new();
+    &SEM
+}
+
 fn health_check_url(base_url: &str) -> anyhow::Result<Url> {
     let mut url = Url::parse(base_url)?;
     if !url.path().ends_with('/') {
@@ -204,9 +229,12 @@ async fn probe_upstream(client: &reqwest::Client, upstream: &UpstreamConfig) -> 
     out
 }
 
-async fn run_config_health_check(ui: &UiState, config_name: &str) -> anyhow::Result<ConfigHealth> {
+async fn load_upstreams_for_config(
+    service_name: &str,
+    config_name: &str,
+) -> anyhow::Result<Vec<UpstreamConfig>> {
     let cfg = load_config().await?;
-    let mgr = if ui.service_name == "claude" {
+    let mgr = if service_name == "claude" {
         &cfg.claude
     } else {
         &cfg.codex
@@ -214,23 +242,76 @@ async fn run_config_health_check(ui: &UiState, config_name: &str) -> anyhow::Res
     let Some(svc) = mgr.configs.get(config_name) else {
         anyhow::bail!("config '{config_name}' not found");
     };
+    Ok(svc.upstreams.clone())
+}
 
+async fn run_health_check_for_config(
+    state: Arc<ProxyState>,
+    service_name: &'static str,
+    config_name: String,
+    upstreams: Vec<UpstreamConfig>,
+) {
     let timeout = health_check_timeout();
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(timeout)
-        .build()?;
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            let now = now_ms();
+            state
+                .record_health_check_result(
+                    service_name,
+                    &config_name,
+                    now,
+                    UpstreamHealth {
+                        base_url: "<client>".to_string(),
+                        ok: Some(false),
+                        status_code: None,
+                        latency_ms: None,
+                        error: Some(shorten_err(&err.to_string(), 140)),
+                    },
+                )
+                .await;
+            state
+                .finish_health_check(service_name, &config_name, now, false)
+                .await;
+            return;
+        }
+    };
 
-    let checked_at_ms = now_ms();
-    let mut upstreams = Vec::new();
-    for upstream in &svc.upstreams {
-        upstreams.push(probe_upstream(&client, upstream).await);
+    let upstream_conc = health_check_upstream_concurrency();
+    let sem = Arc::new(Semaphore::new(upstream_conc));
+    let mut futs = FuturesUnordered::new();
+    for upstream in upstreams {
+        let client = client.clone();
+        let sem = Arc::clone(&sem);
+        futs.push(async move {
+            let _permit = sem.acquire().await;
+            probe_upstream(&client, &upstream).await
+        });
     }
 
-    Ok(ConfigHealth {
-        checked_at_ms,
-        upstreams,
-    })
+    let mut canceled = false;
+    while let Some(up) = futs.next().await {
+        let now = now_ms();
+        state
+            .record_health_check_result(service_name, &config_name, now, up)
+            .await;
+        if state
+            .is_health_check_cancel_requested(service_name, &config_name)
+            .await
+        {
+            canceled = true;
+            break;
+        }
+    }
+
+    let now = now_ms();
+    state
+        .finish_health_check(service_name, &config_name, now, canceled)
+        .await;
 }
 
 async fn handle_key_normal(
@@ -345,6 +426,14 @@ async fn handle_key_normal(
             ui.stats_days = next;
             ui.needs_snapshot_refresh = true;
             ui.toast = Some((format!("stats days: {next}"), Instant::now()));
+            true
+        }
+        KeyCode::Char('e') if ui.page == Page::Stats => {
+            ui.stats_errors_only = !ui.stats_errors_only;
+            ui.toast = Some((
+                format!("stats: errors_only={}", ui.stats_errors_only),
+                Instant::now(),
+            ));
             true
         }
         KeyCode::Enter if ui.page == Page::Configs => {
@@ -478,36 +567,53 @@ async fn handle_key_normal(
             };
             let service_name = ui.service_name;
             let config_name = pvd.name.clone();
+
+            let upstreams = match load_upstreams_for_config(service_name, &config_name).await {
+                Ok(v) => v,
+                Err(err) => {
+                    ui.toast = Some((format!("health check load failed: {err}"), Instant::now()));
+                    return true;
+                }
+            };
+
+            let now = now_ms();
+            if !state
+                .try_begin_health_check(service_name, &config_name, upstreams.len(), now)
+                .await
+            {
+                ui.toast = Some((
+                    format!("health check already running: {config_name}"),
+                    Instant::now(),
+                ));
+                return true;
+            }
+
+            state
+                .record_config_health(
+                    service_name,
+                    config_name.clone(),
+                    ConfigHealth {
+                        checked_at_ms: now,
+                        upstreams: Vec::new(),
+                    },
+                )
+                .await;
+
             let state = Arc::clone(state);
             ui.toast = Some((
-                format!("health check started: {config_name}"),
+                format!("health check queued: {config_name}"),
                 Instant::now(),
             ));
+            let upstreams_for_task = upstreams;
             tokio::spawn(async move {
-                let mut tmp_ui = UiState::default();
-                tmp_ui.service_name = service_name;
-                match run_config_health_check(&tmp_ui, &config_name).await {
-                    Ok(health) => {
-                        state
-                            .record_config_health(service_name, config_name, health)
-                            .await;
-                    }
-                    Err(err) => {
-                        let health = ConfigHealth {
-                            checked_at_ms: now_ms(),
-                            upstreams: vec![UpstreamHealth {
-                                base_url: "<load_config>".to_string(),
-                                ok: Some(false),
-                                status_code: None,
-                                latency_ms: None,
-                                error: Some(shorten_err(&err.to_string(), 140)),
-                            }],
-                        };
-                        state
-                            .record_config_health(service_name, config_name, health)
-                            .await;
-                    }
-                }
+                let sem = health_check_config_semaphore()
+                    .get_or_init(|| async {
+                        Arc::new(Semaphore::new(health_check_max_inflight_configs()))
+                    })
+                    .await;
+                let _permit = sem.clone().acquire_owned().await;
+                run_health_check_for_config(state, service_name, config_name, upstreams_for_task)
+                    .await;
             });
             true
         }
@@ -516,40 +622,124 @@ async fn handle_key_normal(
             let configs = providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
             let state = Arc::clone(state);
             ui.toast = Some((
-                format!("health check started: {} configs", configs.len()),
+                format!("health check queued: {} configs", configs.len()),
                 Instant::now(),
             ));
             tokio::spawn(async move {
-                let mut tmp_ui = UiState::default();
-                tmp_ui.service_name = service_name;
-                for (idx, config_name) in configs.into_iter().enumerate() {
-                    if idx > 0 {
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                    }
-                    match run_config_health_check(&tmp_ui, &config_name).await {
-                        Ok(health) => {
+                let sem = health_check_config_semaphore()
+                    .get_or_init(|| async {
+                        Arc::new(Semaphore::new(health_check_max_inflight_configs()))
+                    })
+                    .await
+                    .clone();
+
+                let cfg = match load_config().await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        let now = now_ms();
+                        for config_name in configs {
                             state
-                                .record_config_health(service_name, config_name, health)
+                                .try_begin_health_check(service_name, &config_name, 1, now)
+                                .await;
+                            state
+                                .record_health_check_result(
+                                    service_name,
+                                    &config_name,
+                                    now,
+                                    UpstreamHealth {
+                                        base_url: "<load_config>".to_string(),
+                                        ok: Some(false),
+                                        status_code: None,
+                                        latency_ms: None,
+                                        error: Some(shorten_err(&err.to_string(), 140)),
+                                    },
+                                )
+                                .await;
+                            state
+                                .finish_health_check(service_name, &config_name, now, false)
                                 .await;
                         }
-                        Err(err) => {
-                            let health = ConfigHealth {
-                                checked_at_ms: now_ms(),
-                                upstreams: vec![UpstreamHealth {
-                                    base_url: "<load_config>".to_string(),
-                                    ok: Some(false),
-                                    status_code: None,
-                                    latency_ms: None,
-                                    error: Some(shorten_err(&err.to_string(), 140)),
-                                }],
-                            };
-                            state
-                                .record_config_health(service_name, config_name, health)
-                                .await;
-                        }
+                        return;
                     }
+                };
+
+                let mgr = if service_name == "claude" {
+                    &cfg.claude
+                } else {
+                    &cfg.codex
+                };
+                for config_name in configs {
+                    let Some(svc) = mgr.configs.get(&config_name) else {
+                        continue;
+                    };
+                    let upstreams = svc.upstreams.clone();
+                    let now = now_ms();
+                    if !state
+                        .try_begin_health_check(service_name, &config_name, upstreams.len(), now)
+                        .await
+                    {
+                        continue;
+                    }
+                    state
+                        .record_config_health(
+                            service_name,
+                            config_name.clone(),
+                            ConfigHealth {
+                                checked_at_ms: now,
+                                upstreams: Vec::new(),
+                            },
+                        )
+                        .await;
+
+                    let state = Arc::clone(&state);
+                    let sem = sem.clone();
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire_owned().await;
+                        run_health_check_for_config(state, service_name, config_name, upstreams)
+                            .await;
+                    });
+
+                    tokio::time::sleep(Duration::from_millis(40)).await;
                 }
             });
+            true
+        }
+        KeyCode::Char('c') if ui.page == Page::Configs => {
+            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+                return true;
+            };
+            let now = now_ms();
+            if state
+                .request_cancel_health_check(ui.service_name, pvd.name.as_str(), now)
+                .await
+            {
+                ui.toast = Some((
+                    format!("health check cancel requested: {}", pvd.name),
+                    Instant::now(),
+                ));
+            } else {
+                ui.toast = Some((
+                    format!("health check not running: {}", pvd.name),
+                    Instant::now(),
+                ));
+            }
+            true
+        }
+        KeyCode::Char('C') if ui.page == Page::Configs => {
+            let now = now_ms();
+            let mut count = 0usize;
+            for p in providers {
+                if state
+                    .request_cancel_health_check(ui.service_name, p.name.as_str(), now)
+                    .await
+                {
+                    count += 1;
+                }
+            }
+            ui.toast = Some((
+                format!("health check cancel requested: {count} configs"),
+                Instant::now(),
+            ));
             true
         }
         KeyCode::Char('a') if ui.page == Page::Sessions => {
