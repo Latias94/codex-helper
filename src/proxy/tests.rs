@@ -1,11 +1,17 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use axum::body::{Body, Bytes};
 use axum::Json;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::post;
+use futures_util::stream;
 use reqwest::Client;
+use tokio::time::{Duration, sleep};
 
 use crate::config::{
     ProxyConfig, RetryConfig, ServiceConfig, ServiceConfigManager, UiConfig, UpstreamAuth,
@@ -162,6 +168,110 @@ async fn proxy_failover_retries_502_then_uses_second_upstream() {
     proxy_handle.abort();
     u1_handle.abort();
     u2_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_streaming_parses_usage_even_when_usage_is_late_in_stream() {
+    // Large prefix with no `data:` lines: should push the stream well past 1MB without triggering JSON parse.
+    // The final `data:` line includes `response.usage`, which codex-helper should still detect.
+    let prefix = Bytes::from(format!("event: {}\n\n", "x".repeat(4096)));
+    let n = 320usize; // ~1.3MB before usage
+    let usage = Bytes::from(
+        "event: response.completed\n\
+data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+    );
+
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let prefix = prefix.clone();
+            let usage = usage.clone();
+            async move {
+                let mut items = Vec::with_capacity(n + 1);
+                for _ in 0..n {
+                    items.push(prefix.clone());
+                }
+                items.push(usage);
+                let s = stream::iter(items.into_iter().map(|b| Ok::<Bytes, Infallible>(b)));
+                let mut resp = Response::new(Body::from_stream(s));
+                *resp.status_mut() = StatusCode::OK;
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                resp
+            }
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let proxy_client = Client::new();
+    let retry = RetryConfig {
+        max_attempts: 1,
+        backoff_ms: 0,
+        backoff_max_ms: 0,
+        jitter_ms: 0,
+        on_status: "502".to_string(),
+        on_class: Vec::new(),
+        cloudflare_challenge_cooldown_secs: 0,
+        cloudflare_timeout_cooldown_secs: 0,
+        transport_cooldown_secs: 0,
+    };
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        proxy_client,
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = resp.bytes().await.expect("read bytes");
+
+    let mut finished = Vec::new();
+    for _ in 0..50 {
+        finished = state.list_recent_finished(10).await;
+        if !finished.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !finished.is_empty(),
+        "expected finished request to be recorded"
+    );
+    let u = finished[0].usage.as_ref().expect("usage should be parsed");
+    assert_eq!(u.total_tokens, 3);
+
+    proxy_handle.abort();
+    u_handle.abort();
 }
 
 #[tokio::test]

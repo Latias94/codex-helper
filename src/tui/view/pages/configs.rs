@@ -4,7 +4,7 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap};
 
 use crate::tui::ProviderOption;
-use crate::tui::model::{Palette, Snapshot, format_age, now_ms, short_sid, shorten};
+use crate::tui::model::{Palette, Snapshot, format_age, now_ms, short_sid, shorten, shorten_middle};
 use crate::tui::state::UiState;
 
 pub(super) fn render_configs_page(
@@ -295,7 +295,7 @@ pub(super) fn render_configs_page(
                     Span::raw("  "),
                     Span::styled(ms, Style::default().fg(p.muted)),
                     Span::raw("  "),
-                    Span::styled(shorten(&u.base_url, 60), Style::default().fg(p.text)),
+                    Span::styled(shorten_middle(&u.base_url, 60), Style::default().fg(p.text)),
                 ]));
                 if !ok
                     && let Some(e) = u.error.as_deref()

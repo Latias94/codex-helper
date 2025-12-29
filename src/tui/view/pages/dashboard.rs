@@ -9,7 +9,7 @@ use ratatui::widgets::{
 use crate::tui::ProviderOption;
 use crate::tui::model::{
     Palette, Snapshot, basename, format_age, now_ms, short_sid, shorten, status_style,
-    tokens_short, usage_line,
+    shorten_middle, tokens_short, usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -200,7 +200,7 @@ fn render_session_details(
         .unwrap_or("-");
     let cwd = selected
         .and_then(|r| r.cwd.as_deref())
-        .map(|s| shorten(s, 64))
+        .map(|s| shorten_middle(s, 64))
         .unwrap_or_else(|| "-".to_string());
 
     let override_effort = selected
@@ -376,7 +376,7 @@ fn render_requests_panel(
                 status_style(p, Some(r.status_code)),
             );
             let method = Span::styled(r.method.clone(), Style::default().fg(p.muted));
-            let path = shorten(&r.path, 48);
+            let path = shorten_middle(&r.path, 48);
             let dur = format!("{}ms", r.duration_ms);
             let tok = r
                 .usage

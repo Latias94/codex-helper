@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -18,6 +19,18 @@ use super::classify::classify_upstream_response;
 use super::{
     HttpDebugBase, ProxyService, SelectedUpstream, header_map_to_entries, warn_http_debug,
 };
+
+fn stream_buffer_max_bytes() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("CODEX_HELPER_STREAM_BUFFER_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1024 * 1024)
+            .clamp(64 * 1024, 32 * 1024 * 1024)
+    })
+}
 
 #[derive(Default)]
 struct StreamUsageState {
@@ -245,7 +258,7 @@ pub(super) async fn build_sse_success_response(
         );
     }
 
-    let max_collect = 1024 * 1024usize;
+    let max_keep = stream_buffer_max_bytes();
     let usage_state = Arc::new(Mutex::new(StreamUsageState::default()));
     let usage_state_inner = usage_state.clone();
     let method_s = method.to_string();
@@ -316,12 +329,22 @@ pub(super) async fn build_sse_success_response(
                 if guard.first_chunk_ms.is_none() {
                     guard.first_chunk_ms = Some(_finalize.upstream_start.elapsed().as_millis() as u64);
                 }
-                let remaining = max_collect.saturating_sub(guard.buffer.len());
-                if remaining == 0 {
-                    return Ok(chunk);
+
+                // Keep collecting / scanning even for long streams; cap memory by discarding already-scanned bytes.
+                if guard.buffer.len().saturating_add(chunk.len()) > max_keep && guard.usage_scan_pos > 0 {
+                    let pos = guard.usage_scan_pos;
+                    guard.buffer.drain(..pos);
+                    guard.usage_scan_pos = 0;
                 }
-                let take = remaining.min(chunk.len());
-                guard.buffer.extend_from_slice(&chunk[..take]);
+                if chunk.len() > max_keep {
+                    // Extremely large chunks are unexpected; keep the tail to avoid unbounded growth.
+                    guard.buffer.clear();
+                    guard.buffer
+                        .extend_from_slice(&chunk[chunk.len().saturating_sub(max_keep)..]);
+                    guard.usage_scan_pos = 0;
+                } else {
+                    guard.buffer.extend_from_slice(&chunk);
+                }
                 if !guard.warned_non_success && !(200..300).contains(&status_code) {
                     if should_include_http_warn(status_code)
                         && let Some(h) =
@@ -351,6 +374,12 @@ pub(super) async fn build_sse_success_response(
                         usage_scan_pos,
                         usage,
                     );
+                }
+                // If the buffer grew large, drop already-scanned bytes to cap memory.
+                if guard.buffer.len() > max_keep && guard.usage_scan_pos > 0 {
+                    let pos = guard.usage_scan_pos;
+                    guard.buffer.drain(..pos);
+                    guard.usage_scan_pos = 0;
                 }
                 if let Some(usage) = guard.usage.clone() {
                     guard.logged = true;

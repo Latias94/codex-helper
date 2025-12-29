@@ -42,28 +42,65 @@ fn extract_usage_obj(payload: &Value) -> Option<&Value> {
     None
 }
 
-fn usage_from_value(usage_obj: &Value) -> UsageMetrics {
+fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
     let mut m = UsageMetrics::default();
+    let mut recognized = false;
 
     if let Some(v) = usage_obj.get("input_tokens") {
         m.input_tokens = to_i64(v);
+        recognized = true;
     }
     if let Some(v) = usage_obj.get("output_tokens") {
         m.output_tokens = to_i64(v);
+        recognized = true;
     }
     if let Some(v) = usage_obj.get("total_tokens") {
         m.total_tokens = to_i64(v);
-    } else {
-        m.total_tokens = m.input_tokens + m.output_tokens;
+        recognized = true;
     }
+
+    // OpenAI Chat Completions compatibility (`prompt_tokens` / `completion_tokens`).
+    if let Some(v) = usage_obj.get("prompt_tokens") {
+        m.input_tokens = to_i64(v);
+        recognized = true;
+    }
+    if let Some(v) = usage_obj.get("completion_tokens") {
+        m.output_tokens = to_i64(v);
+        recognized = true;
+    }
+
+    // Some providers may expose reasoning tokens directly.
+    if let Some(v) = usage_obj.get("reasoning_tokens") {
+        m.reasoning_tokens = to_i64(v);
+        recognized = true;
+    }
+
     if let Some(details) = usage_obj
         .get("output_tokens_details")
         .and_then(|v| v.as_object())
         && let Some(v) = details.get("reasoning_tokens")
     {
         m.reasoning_tokens = to_i64(v);
+        recognized = true;
     }
-    m
+    if let Some(details) = usage_obj
+        .get("completion_tokens_details")
+        .and_then(|v| v.as_object())
+        && let Some(v) = details.get("reasoning_tokens")
+    {
+        m.reasoning_tokens = to_i64(v);
+        recognized = true;
+    }
+
+    // If total isn't provided, derive it from input/output when possible.
+    if usage_obj.get("total_tokens").is_none() {
+        m.total_tokens = m.input_tokens.saturating_add(m.output_tokens);
+    }
+
+    if !recognized {
+        return None;
+    }
+    Some(m)
 }
 
 pub fn extract_usage_from_bytes(data: &[u8]) -> Option<UsageMetrics> {
@@ -73,7 +110,7 @@ pub fn extract_usage_from_bytes(data: &[u8]) -> Option<UsageMetrics> {
     }
     let json: Value = serde_json::from_str(text).ok()?;
     let usage_obj = extract_usage_obj(&json)?;
-    Some(usage_from_value(usage_obj))
+    usage_from_value(usage_obj)
 }
 
 #[allow(dead_code)]
@@ -96,7 +133,9 @@ pub fn extract_usage_from_sse_bytes(data: &[u8]) -> Option<UsageMetrics> {
                 if let Ok(json) = serde_json::from_str::<Value>(payload_str)
                     && let Some(usage_obj) = extract_usage_obj(&json)
                 {
-                    last = Some(usage_from_value(usage_obj));
+                    if let Some(u) = usage_from_value(usage_obj) {
+                        last = Some(u);
+                    }
                 }
             }
         }
@@ -149,7 +188,9 @@ pub fn scan_usage_from_sse_bytes_incremental(
         if let Ok(json) = serde_json::from_slice::<Value>(payload)
             && let Some(usage_obj) = extract_usage_obj(&json)
         {
-            *last = Some(usage_from_value(usage_obj));
+            if let Some(u) = usage_from_value(usage_obj) {
+                *last = Some(u);
+            }
         }
     }
 
@@ -203,5 +244,34 @@ mod tests {
                 total_tokens: 3,
             })
         );
+    }
+
+    #[test]
+    fn parses_chat_completions_usage_fields() {
+        let json = r#"{
+          "id":"chatcmpl_x",
+          "object":"chat.completion",
+          "usage":{
+            "prompt_tokens":9,
+            "completion_tokens":12,
+            "total_tokens":21,
+            "completion_tokens_details":{"reasoning_tokens":5}
+          }
+        }"#;
+        assert_eq!(
+            extract_usage_from_bytes(json.as_bytes()),
+            Some(UsageMetrics {
+                input_tokens: 9,
+                output_tokens: 12,
+                reasoning_tokens: 5,
+                total_tokens: 21,
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_usage_schema_returns_none() {
+        let json = r#"{"usage":{"foo":123}}"#;
+        assert_eq!(extract_usage_from_bytes(json.as_bytes()), None);
     }
 }

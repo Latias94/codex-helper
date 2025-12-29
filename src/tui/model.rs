@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use ratatui::prelude::{Color, Style};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
@@ -203,14 +204,94 @@ pub(in crate::tui) fn now_ms() -> u64 {
 }
 
 pub(in crate::tui) fn basename(path: &str) -> &str {
-    path.rsplit_once('/').map(|(_, b)| b).unwrap_or(path)
+    let path = path.trim_end_matches(|c| c == '/' || c == '\\');
+    let slash = path.rfind('/');
+    let backslash = path.rfind('\\');
+    let idx = match (slash, backslash) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    if let Some(i) = idx {
+        &path[i.saturating_add(1)..]
+    } else {
+        path
+    }
 }
 
 pub(in crate::tui) fn shorten(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    shorten_head(s, max)
+}
+
+pub(in crate::tui) fn shorten_middle(s: &str, max: usize) -> String {
+    if display_width(s) <= max {
         return s.to_string();
     }
-    s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let remaining = max.saturating_sub(1);
+    let head_w = remaining / 2;
+    let tail_w = remaining.saturating_sub(head_w);
+    let head = prefix_by_width(s, head_w);
+    let tail = suffix_by_width(s, tail_w);
+    format!("{head}…{tail}")
+}
+
+fn shorten_head(s: &str, max: usize) -> String {
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let head = prefix_by_width(s, max.saturating_sub(1));
+    format!("{head}…")
+}
+
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+fn prefix_by_width(s: &str, max_width: usize) -> &str {
+    if max_width == 0 {
+        return "";
+    }
+    let mut width = 0usize;
+    let mut end = 0usize;
+    for (i, ch) in s.char_indices() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(w) > max_width {
+            break;
+        }
+        width = width.saturating_add(w);
+        end = i.saturating_add(ch.len_utf8());
+    }
+    &s[..end]
+}
+
+fn suffix_by_width(s: &str, max_width: usize) -> &str {
+    if max_width == 0 {
+        return "";
+    }
+    let mut width = 0usize;
+    let mut start = s.len();
+    for (i, ch) in s.char_indices().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(w) > max_width {
+            break;
+        }
+        width = width.saturating_add(w);
+        start = i;
+    }
+    &s[start..]
 }
 
 pub(in crate::tui) fn short_sid(sid: &str, max: usize) -> String {
@@ -224,6 +305,36 @@ pub(in crate::tui) fn short_sid(sid: &str, max: usize) -> String {
     let tail = sid.chars().rev().take(tail_len).collect::<Vec<_>>();
     let tail = tail.into_iter().rev().collect::<String>();
     format!("{head}…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn basename_handles_unix_and_windows_paths() {
+        assert_eq!(basename("/a/b/c"), "c");
+        assert_eq!(basename("/a/b/c/"), "c");
+        assert_eq!(basename(r"C:\a\b\c"), "c");
+        assert_eq!(basename(r"C:\a\b\c\"), "c");
+    }
+
+    #[test]
+    fn shorten_respects_display_width_cjk() {
+        let s = "你好世界";
+        let out = shorten(s, 5);
+        assert_eq!(out, "你好…");
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
+    }
+
+    #[test]
+    fn shorten_middle_keeps_both_ends() {
+        let s = "abcdef";
+        assert_eq!(shorten_middle(s, 5), "ab…ef");
+    }
 }
 
 pub fn build_provider_options(

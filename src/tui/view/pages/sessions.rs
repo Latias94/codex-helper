@@ -4,7 +4,7 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, now_ms, short_sid, shorten, status_style,
+    Palette, Snapshot, basename, format_age, now_ms, short_sid, shorten, shorten_middle, status_style,
     tokens_short, usage_line,
 };
 use crate::tui::state::UiState;
@@ -195,7 +195,7 @@ pub(super) fn render_sessions_page(
         let cwd_full = row
             .cwd
             .as_deref()
-            .map(|s| shorten(s, 80))
+            .map(|s| shorten_middle(s, 80))
             .unwrap_or_else(|| "-".to_string());
         let model = row.last_model.as_deref().unwrap_or("-");
         let provider = row.last_provider_id.as_deref().unwrap_or("-");

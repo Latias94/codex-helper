@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, W
 
 use crate::state::UsageBucket;
 use crate::tui::ProviderOption;
-use crate::tui::model::{Palette, Snapshot, shorten, tokens_short};
+use crate::tui::model::{Palette, Snapshot, shorten, shorten_middle, tokens_short};
 use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
 
@@ -576,7 +576,7 @@ fn render_detail_panel(
         .into_iter()
         .take(5)
         .map(|(path, (c, e, tok))| {
-            let path = shorten(&path, 22);
+            let path = shorten_middle(&path, 22);
             if e > 0 {
                 format!("{path}({c} err{e} / {})", tokens_short(tok))
             } else {

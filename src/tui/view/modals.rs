@@ -3,7 +3,9 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::tui::ProviderOption;
-use crate::tui::model::{Palette, Snapshot, compute_window_stats, now_ms, short_sid, shorten};
+use crate::tui::model::{
+    Palette, Snapshot, compute_window_stats, now_ms, short_sid, shorten, shorten_middle,
+};
 use crate::tui::state::UiState;
 use crate::tui::types::{EffortChoice, Overlay};
 
@@ -447,7 +449,7 @@ pub(super) fn render_config_info_modal(
                     Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
                     Span::styled(pid.to_string(), Style::default().fg(p.muted)),
                     Span::raw("  "),
-                    Span::styled(shorten(&up.base_url, 100), Style::default().fg(p.text)),
+                    Span::styled(shorten_middle(&up.base_url, 100), Style::default().fg(p.text)),
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("     "),

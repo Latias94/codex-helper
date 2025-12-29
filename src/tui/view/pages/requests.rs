@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
-use crate::tui::model::{Palette, Snapshot, format_age, now_ms, shorten, status_style};
+use crate::tui::model::{Palette, Snapshot, format_age, now_ms, shorten, shorten_middle, status_style};
 use crate::tui::state::UiState;
 
 pub(super) fn render_requests_page(
@@ -92,7 +92,7 @@ pub(super) fn render_requests_page(
             let model = r.model.as_deref().unwrap_or("-").to_string();
             let cfg = r.config_name.as_deref().unwrap_or("-").to_string();
             let pid = r.provider_id.as_deref().unwrap_or("-").to_string();
-            let path = shorten(&r.path, 60);
+            let path = shorten_middle(&r.path, 60);
 
             Row::new(vec![
                 Cell::from(Span::styled(age, Style::default().fg(p.muted))),
@@ -150,7 +150,7 @@ pub(super) fn render_requests_page(
         ]));
         lines.push(Line::from(vec![
             Span::styled("path: ", Style::default().fg(p.muted)),
-            Span::styled(shorten(&r.path, 80), Style::default().fg(p.text)),
+            Span::styled(shorten_middle(&r.path, 80), Style::default().fg(p.text)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("model: ", Style::default().fg(p.muted)),
@@ -176,7 +176,7 @@ pub(super) fn render_requests_page(
         if let Some(u) = r.upstream_base_url.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("upstream: ", Style::default().fg(p.muted)),
-                Span::styled(shorten(u, 80), Style::default().fg(p.text)),
+                Span::styled(shorten_middle(u, 80), Style::default().fg(p.text)),
             ]));
         }
 
@@ -194,7 +194,7 @@ pub(super) fn render_requests_page(
             for (idx, entry) in retry.upstream_chain.iter().take(max).enumerate() {
                 lines.push(Line::from(vec![
                     Span::styled(format!("{:>2}. ", idx + 1), Style::default().fg(p.muted)),
-                    Span::styled(shorten(entry, 120), Style::default().fg(p.muted)),
+                    Span::styled(shorten_middle(entry, 120), Style::default().fg(p.muted)),
                 ]));
             }
             if retry.upstream_chain.len() > max {
