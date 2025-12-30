@@ -118,35 +118,31 @@ The most common and powerful way to use codex-helper is to let it **fail over be
 
 The key idea: put your primary and backup upstreams **in the same config’s `upstreams` array**.
 
-Example `~/.codex-helper/config.json`:
+> Common pitfall: if you split each provider into its own config and keep them all at the default `level = 1` (so `config list` shows `L1` everywhere), codex-helper will **not** fail over across configs — it will prefer the `active` config.  
+> To enable cross-config failover, use at least two distinct levels (see below), or move backup endpoints back into a single config’s `upstreams`.
 
-```jsonc
-{
-  "version": 1,
-  "codex": {
-    "active": "codex-main",
-    "configs": {
-      "codex-main": {
-        "name": "codex-main",
-        "alias": null,
-        "enabled": true,
-        "level": 1,
-        "upstreams": [
-          {
-            "base_url": "https://codex-api.packycode.com/v1",
-            "auth": { "auth_token_env": "PACKYCODE_API_KEY" },
-            "tags": { "provider_id": "packycode", "source": "codex-config" }
-          },
-          {
-            "base_url": "https://co.yes.vg/v1",
-            "auth": { "auth_token_env": "YESCODE_API_KEY" },
-            "tags": { "provider_id": "yes", "source": "codex-config" }
-          }
-        ]
-      }
-    }
-  }
-}
+Example `~/.codex-helper/config.toml` (recommended):
+
+```toml
+version = 1
+
+[codex]
+active = "codex-main"
+
+[codex.configs.codex-main]
+name = "codex-main"
+enabled = true
+level = 1
+
+[[codex.configs.codex-main.upstreams]]
+base_url = "https://codex-api.packycode.com/v1"
+auth = { auth_token_env = "PACKYCODE_API_KEY" }
+tags = { provider_id = "packycode", source = "codex-config" }
+
+[[codex.configs.codex-main.upstreams]]
+base_url = "https://co.yes.vg/v1"
+auth = { auth_token_env = "YESCODE_API_KEY" }
+tags = { provider_id = "yes", source = "codex-config" }
 ```
 
 With this layout:
@@ -162,7 +158,7 @@ With this layout:
 If you prefer to keep upstreams in separate configs, codex-helper also supports **level-based config grouping**:
 
 - Each config has a `level` (1..=10, lower is higher priority).
-- Cross-config routing is opt-in: codex-helper only routes across configs when there are **multiple distinct levels**.
+- Cross-config routing is opt-in: codex-helper only routes across configs when there are **multiple distinct levels**. If everything is `level = 1`, it effectively behaves like “use active”.
 - Within the same level, the `active` config is preferred.
 - Set `enabled = false` to exclude a config from automatic routing (unless it is the active config).
 
@@ -339,35 +335,24 @@ Codex official files:
 
 ### Config structure (brief)
 
-```jsonc
-{
-  "codex": {
-    "active": "openai-main",
-    "configs": {
-      "openai-main": {
-        "name": "openai-main",
-        "alias": "Main OpenAI quota",
-        "enabled": true,
-        "level": 1,
-        "upstreams": [
-          {
-            "base_url": "https://api.openai.com/v1",
-            "auth": {
-              "auth_token": null,
-              "auth_token_env": "OPENAI_API_KEY",
-              "api_key": null,
-              "api_key_env": null
-            },
-            "tags": {
-              "source": "codex-config",
-              "provider_id": "openai"
-            }
-          }
-        ]
-      }
-    }
-  }
-}
+codex-helper supports both `config.toml` (preferred) and `config.json` (legacy). If both exist, `config.toml` wins.
+
+```toml
+version = 1
+
+[codex]
+active = "openai-main"
+
+[codex.configs.openai-main]
+name = "openai-main"
+alias = "Main OpenAI quota"
+enabled = true
+level = 1
+
+[[codex.configs.openai-main.upstreams]]
+base_url = "https://api.openai.com/v1"
+auth = { auth_token_env = "OPENAI_API_KEY" }
+tags = { source = "codex-config", provider_id = "openai" }
 ```
 
 Key ideas:
@@ -461,33 +446,31 @@ You can also print a truncated `http_debug` JSON directly to the terminal on non
 
 Sensitive headers are redacted automatically (e.g. `Authorization`/`Cookie`). If you need to scrub secrets inside request bodies, consider using `~/.codex-helper/filter.json`.
 
-### Upstream retries (default 2 attempts)
+### Upstream retries (proxy-side, default 2 attempts)
 
 Some upstream failures are transient (network hiccups, 429 rate limits, 502/503/504/524, or Cloudflare/WAF-like HTML challenge pages). codex-helper can perform a small number of retries **before any response bytes are streamed to the client**, and will try to switch to a different upstream when possible.
 
-- Global defaults live under the `retry` block in `~/.codex-helper/config.json`. Environment variables with the same names can override them at runtime (useful for temporary debugging).
+- Strongly recommended: set Codex-side `model_providers.codex_proxy.request_max_retries = 0` so retry/failover happens in codex-helper (and you don’t burn Codex’s default request retries on the same 502). `switch on` writes `0` only when the key is absent.
+- Global defaults live under the `[retry]` block in `~/.codex-helper/config.toml` (or `config.json`). Environment variables with the same names can override them at runtime (useful for temporary debugging).
 - `CODEX_HELPER_RETRY_MAX_ATTEMPTS=2`: max attempts (default from `retry.max_attempts`; max 8; set to 1 to disable)
 - `CODEX_HELPER_RETRY_ON_STATUS=429,502,503,504,524`: retry on these status codes (supports ranges like `500-599`; if upstream returns `Retry-After`, codex-helper will prefer that backoff)
 - `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`: retry on these error classes
 - `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`: retry backoff (ms)
 - `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`: upstream cooldown penalties (seconds)
 
-Example config (`~/.codex-helper/config.json`):
+Example config (`~/.codex-helper/config.toml`):
 
-```jsonc
-{
-  "retry": {
-    "max_attempts": 2,
-    "backoff_ms": 200,
-    "backoff_max_ms": 2000,
-    "jitter_ms": 100,
-    "on_status": "429,502,503,504,524",
-    "on_class": ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"],
-    "cloudflare_challenge_cooldown_secs": 300,
-    "cloudflare_timeout_cooldown_secs": 60,
-    "transport_cooldown_secs": 30
-  }
-}
+```toml
+[retry]
+max_attempts = 2
+backoff_ms = 200
+backoff_max_ms = 2000
+jitter_ms = 100
+on_status = "429,502,503,504,524"
+on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
+cloudflare_challenge_cooldown_secs = 300
+cloudflare_timeout_cooldown_secs = 60
+transport_cooldown_secs = 30
 ```
 
 Note: retries may replay **non-idempotent POST requests** (potential double-billing or duplicate writes). Only enable retries if you accept this risk, and keep the attempt count low.

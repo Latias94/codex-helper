@@ -77,37 +77,33 @@ ch
 - 或被用量提供商标记为“额度用尽”（`usage_exhausted = true`）；
 - 在这种情况下，LB 会优先选择同一配置下的其他 upstream 作为备份。
 
-**关键点：主线路 + 备份线路优先放在同一个配置的 `upstreams` 里。**（也支持按 level 跨配置降级，见下文）
+**关键点：主线路 + 备份线路优先放在同一个配置的 `upstreams` 里。**
 
-示例（JSON 版本；TOML 字段基本一致）：
+> 常见误解：如果你把每个供应商都拆成一个 config，并且它们的 `level` 都是默认的 `1`（例如 `config list` 全是 `L1 on ...`），那么 codex-helper **不会**跨 config 自动切换；它会优先使用 `active` 那个 config。  
+> 想要跨 config 降级，请至少设置两档不同的 `level`（见下文），或把备份线路放回同一 config 的 `upstreams`。
 
-```jsonc
-{
-  "version": 1,
-  "codex": {
-    "active": "codex-main",
-    "configs": {
-      "codex-main": {
-        "name": "codex-main",
-        "alias": null,
-        "enabled": true,
-        "level": 1,
-        "upstreams": [
-          {
-            "base_url": "https://codex-api.packycode.com/v1",
-            "auth": { "auth_token_env": "PACKYCODE_API_KEY" },
-            "tags": { "provider_id": "packycode", "source": "codex-config" }
-          },
-          {
-            "base_url": "https://co.yes.vg/v1",
-            "auth": { "auth_token_env": "YESCODE_API_KEY" },
-            "tags": { "provider_id": "yes", "source": "codex-config" }
-          }
-        ]
-      }
-    }
-  }
-}
+示例（推荐：TOML，`~/.codex-helper/config.toml`）：
+
+```toml
+version = 1
+
+[codex]
+active = "codex-main"
+
+[codex.configs.codex-main]
+name = "codex-main"
+enabled = true
+level = 1
+
+[[codex.configs.codex-main.upstreams]]
+base_url = "https://codex-api.packycode.com/v1"
+auth = { auth_token_env = "PACKYCODE_API_KEY" }
+tags = { provider_id = "packycode", source = "codex-config" }
+
+[[codex.configs.codex-main.upstreams]]
+base_url = "https://co.yes.vg/v1"
+auth = { auth_token_env = "YESCODE_API_KEY" }
+tags = { provider_id = "yes", source = "codex-config" }
 ```
 
 在这份配置下：
@@ -121,12 +117,23 @@ ch
 
 ### Level 分组（跨配置降级，可选）
 
-如果你更希望把不同供应商/通道拆成多个 config，codex-helper 也支持 **按 level 分组的跨配置降级**：
+如果你更希望把不同供应商/通道拆成多个 config，codex-helper 也支持 **按 level 分组的跨配置降级**（推荐用于“中转优先，直连兜底”等场景）：
 
 - 每个 config 有一个 `level`（1..=10，越小优先级越高）。
-- 这是一个显式 opt-in：只有当存在 **多个不同的 level** 时，才会启用跨 config 自动路由/降级。
+- 这是一个显式 opt-in：只有当存在 **多个不同的 level** 时，才会启用跨 config 自动路由/降级；如果所有 config 都是 `level=1`，就相当于“只用 active”。
 - 同一 level 内会优先使用 `active` 配置。
 - `enabled = false` 可把该 config 排除出自动路由（除非它是 active）。
+- 实操建议：把“同一类线路”放同一 level（例如 `L1=各类中转`、`L2=官方/直连兜底`），并把 `retry.max_attempts` 设到足够覆盖你希望每次请求尝试的候选数量。
+
+例如：让 `L1` 优先使用中转（`right/packyapi/yescode/...`），失败时再降级到 `L2` 的直连 OpenAI：
+
+```bash
+codex-helper config set-level right 1
+codex-helper config set-level packyapi 1
+codex-helper config set-level yescode 1
+
+codex-helper config set-level openai 2
+```
 
 ---
 
@@ -305,39 +312,26 @@ Codex 官方文件：
 - `~/.codex/auth.json`：由 `codex login` 维护，codex-helper 只读取，不写入；
 - `~/.codex/config.toml`：由 Codex CLI 维护，codex-helper 仅在 `switch on/off` 时有限修改。
 
-### 配置文件简要结构（TOML/JSON）
+### 配置文件简要结构（推荐 TOML）
 
-codex-helper 支持 `config.toml` 与 `config.json`，且字段结构基本一致；如同时存在，以 `config.toml` 为准。
+codex-helper 支持 `config.toml` 与 `config.json`，字段结构基本一致；如同时存在，以 `config.toml` 为准。
 
-```jsonc
-{
-  "codex": {
-    "active": "openai-main",
-    "configs": {
-      "openai-main": {
-        "name": "openai-main",
-        "alias": "主 OpenAI 额度",
-        "enabled": true,
-        "level": 1,
-        "upstreams": [
-          {
-            "base_url": "https://api.openai.com/v1",
-            "auth": {
-              "auth_token": null,
-              "auth_token_env": "OPENAI_API_KEY",
-              "api_key": null,
-              "api_key_env": null
-            },
-            "tags": {
-              "source": "codex-config",
-              "provider_id": "openai"
-            }
-          }
-        ]
-      }
-    }
-  }
-}
+```toml
+version = 1
+
+[codex]
+active = "openai-main"
+
+[codex.configs.openai-main]
+name = "openai-main"
+alias = "主 OpenAI 额度"
+enabled = true
+level = 1
+
+[[codex.configs.openai-main.upstreams]]
+base_url = "https://api.openai.com/v1"
+auth = { auth_token_env = "OPENAI_API_KEY" }
+tags = { source = "codex-config", provider_id = "openai" }
 ```
 
 关键点：
@@ -410,33 +404,31 @@ codex-helper 支持 `config.toml` 与 `config.json`，且字段结构基本一�
 
   注意：敏感请求头会自动脱敏（例如 `Authorization`/`Cookie` 等）；如需进一步控制请求体中的敏感信息，建议配合 `~/.codex-helper/filter.json` 使用。
 
-### 上游重试（默认 2 次尝试）
+### 上游重试（代理侧，默认 2 次尝试）
 
 有些上游错误（例如网络抖动、429 限流、502/503/504/524、或看起来像 Cloudflare/WAF 的拦截页）可能是瞬态的；codex-helper 支持在**未开始向客户端输出响应**前进行有限次数的重试，并尽量切换到其它 upstream。
 
-- 主配置（`~/.codex-helper/config.toml` / `config.json`）的 `retry` 段可以设置全局默认值；同名环境变量可在运行时覆盖（用于临时调试）。
+- 强烈建议将 Codex 侧 `model_providers.codex_proxy.request_max_retries = 0`，让“重试与切换”主要由 codex-helper 负责，避免 Codex 默认 5 次重试把同一个 502 反复打满（`switch on` 会在该字段不存在时写入 0；如你手动改过，则不会覆盖）。
+- 主配置（`~/.codex-helper/config.toml` / `config.json`）的 `[retry]` 段可以设置全局默认值；同名环境变量可在运行时覆盖（用于临时调试）。
 - `CODEX_HELPER_RETRY_MAX_ATTEMPTS=2`：最大尝试次数（默认来自配置的 `retry.max_attempts`，最大 8；如需关闭重试请设为 1）
 - `CODEX_HELPER_RETRY_ON_STATUS=429,502,503,504,524`：遇到这些状态码时允许重试（支持 `a-b` 区间，例如 `500-599`；若上游返回 `Retry-After`，会优先按其等待时间退避）
 - `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`：按错误分类允许重试
 - `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`：重试退避参数（毫秒）
 - `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`：对触发重试的 upstream 施加冷却（秒）
 
-配置示例（JSON 版本）：
+配置示例（TOML）：
 
-```jsonc
-{
-  "retry": {
-    "max_attempts": 2,
-    "backoff_ms": 200,
-    "backoff_max_ms": 2000,
-    "jitter_ms": 100,
-    "on_status": "429,502,503,504,524",
-    "on_class": ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"],
-    "cloudflare_challenge_cooldown_secs": 300,
-    "cloudflare_timeout_cooldown_secs": 60,
-    "transport_cooldown_secs": 30
-  }
-}
+```toml
+[retry]
+max_attempts = 2
+backoff_ms = 200
+backoff_max_ms = 2000
+jitter_ms = 100
+on_status = "429,502,503,504,524"
+on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
+cloudflare_challenge_cooldown_secs = 300
+cloudflare_timeout_cooldown_secs = 60
+transport_cooldown_secs = 30
 ```
 
 注意：重试可能导致 **POST 请求重放**（例如重复计费/重复写入）。建议仅在你明确接受这一风险、且错误大多是瞬态的场景下开启，并将尝试次数控制在较小范围内。
