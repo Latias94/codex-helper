@@ -4,8 +4,8 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, now_ms, short_sid, shorten, shorten_middle, status_style,
-    tokens_short, usage_line,
+    Palette, Snapshot, basename, format_age, now_ms, short_sid, shorten, shorten_middle,
+    status_style, tokens_short, usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::view::widgets::kv_line;

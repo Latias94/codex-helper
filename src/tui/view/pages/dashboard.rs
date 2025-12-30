@@ -8,8 +8,8 @@ use ratatui::widgets::{
 
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, now_ms, short_sid, shorten, status_style,
-    shorten_middle, tokens_short, usage_line,
+    Palette, Snapshot, basename, format_age, now_ms, short_sid, shorten, shorten_middle,
+    status_style, tokens_short, usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};

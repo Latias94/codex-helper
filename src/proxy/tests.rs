@@ -3,8 +3,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use axum::body::{Body, Bytes};
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -204,7 +204,7 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
                         b"data: {\"ok\":true,\"upstream\":2}\n\n",
                     )]
                     .into_iter()
-                    .map(|b| Ok::<Bytes, Infallible>(b)),
+                    .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -331,7 +331,7 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
                         b"data: {\"ok\":true,\"upstream\":2}\n\n",
                     )]
                     .into_iter()
-                    .map(|b| Ok::<Bytes, Infallible>(b)),
+                    .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -477,7 +477,7 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
                         b"data: {\"ok\":true,\"upstream\":2}\n\n",
                     )]
                     .into_iter()
-                    .map(|b| Ok::<Bytes, Infallible>(b)),
+                    .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -609,7 +609,7 @@ async fn proxy_does_not_failover_when_502_is_not_retryable_and_threshold_not_rea
                         b"data: {\"ok\":true,\"upstream\":2}\n\n",
                     )]
                     .into_iter()
-                    .map(|b| Ok::<Bytes, Infallible>(b)),
+                    .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -827,7 +827,7 @@ data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_t
                     items.push(prefix.clone());
                 }
                 items.push(usage);
-                let s = stream::iter(items.into_iter().map(|b| Ok::<Bytes, Infallible>(b)));
+                let s = stream::iter(items.into_iter().map(Ok::<Bytes, Infallible>));
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
                 resp.headers_mut().insert(

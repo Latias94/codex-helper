@@ -449,7 +449,10 @@ pub(super) fn render_config_info_modal(
                     Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
                     Span::styled(pid.to_string(), Style::default().fg(p.muted)),
                     Span::raw("  "),
-                    Span::styled(shorten_middle(&up.base_url, 100), Style::default().fg(p.text)),
+                    Span::styled(
+                        shorten_middle(&up.base_url, 100),
+                        Style::default().fg(p.text),
+                    ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("     "),

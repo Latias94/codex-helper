@@ -204,7 +204,7 @@ pub(in crate::tui) fn now_ms() -> u64 {
 }
 
 pub(in crate::tui) fn basename(path: &str) -> &str {
-    let path = path.trim_end_matches(|c| c == '/' || c == '\\');
+    let path = path.trim_end_matches(['/', '\\']);
     let slash = path.rfind('/');
     let backslash = path.rfind('\\');
     let idx = match (slash, backslash) {
@@ -305,36 +305,6 @@ pub(in crate::tui) fn short_sid(sid: &str, max: usize) -> String {
     let tail = sid.chars().rev().take(tail_len).collect::<Vec<_>>();
     let tail = tail.into_iter().rev().collect::<String>();
     format!("{head}…{tail}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use pretty_assertions::assert_eq;
-    use unicode_width::UnicodeWidthStr;
-
-    #[test]
-    fn basename_handles_unix_and_windows_paths() {
-        assert_eq!(basename("/a/b/c"), "c");
-        assert_eq!(basename("/a/b/c/"), "c");
-        assert_eq!(basename(r"C:\a\b\c"), "c");
-        assert_eq!(basename(r"C:\a\b\c\"), "c");
-    }
-
-    #[test]
-    fn shorten_respects_display_width_cjk() {
-        let s = "你好世界";
-        let out = shorten(s, 5);
-        assert_eq!(out, "你好…");
-        assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
-    }
-
-    #[test]
-    fn shorten_middle_keeps_both_ends() {
-        let s = "abcdef";
-        assert_eq!(shorten_middle(s, 5), "ab…ef");
-    }
 }
 
 pub fn build_provider_options(
@@ -777,4 +747,34 @@ pub(in crate::tui) fn filtered_requests_len(
         })
         .take(60)
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn basename_handles_unix_and_windows_paths() {
+        assert_eq!(basename("/a/b/c"), "c");
+        assert_eq!(basename("/a/b/c/"), "c");
+        assert_eq!(basename(r"C:\a\b\c"), "c");
+        assert_eq!(basename(r"C:\a\b\c\"), "c");
+    }
+
+    #[test]
+    fn shorten_respects_display_width_cjk() {
+        let s = "你好世界";
+        let out = shorten(s, 5);
+        assert_eq!(out, "你好…");
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
+    }
+
+    #[test]
+    fn shorten_middle_keeps_both_ends() {
+        let s = "abcdef";
+        assert_eq!(shorten_middle(s, 5), "ab…ef");
+    }
 }

@@ -3,7 +3,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
-use crate::tui::model::{Palette, Snapshot, format_age, now_ms, shorten, shorten_middle, status_style};
+use crate::tui::model::{
+    Palette, Snapshot, format_age, now_ms, shorten, shorten_middle, status_style,
+};
 use crate::tui::state::UiState;
 
 pub(super) fn render_requests_page(

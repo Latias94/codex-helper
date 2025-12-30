@@ -4,7 +4,9 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap};
 
 use crate::tui::ProviderOption;
-use crate::tui::model::{Palette, Snapshot, format_age, now_ms, short_sid, shorten, shorten_middle};
+use crate::tui::model::{
+    Palette, Snapshot, format_age, now_ms, short_sid, shorten, shorten_middle,
+};
 use crate::tui::state::UiState;
 
 pub(super) fn render_configs_page(

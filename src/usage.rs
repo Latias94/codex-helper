@@ -132,10 +132,9 @@ pub fn extract_usage_from_sse_bytes(data: &[u8]) -> Option<UsageMetrics> {
                 }
                 if let Ok(json) = serde_json::from_str::<Value>(payload_str)
                     && let Some(usage_obj) = extract_usage_obj(&json)
+                    && let Some(u) = usage_from_value(usage_obj)
                 {
-                    if let Some(u) = usage_from_value(usage_obj) {
-                        last = Some(u);
-                    }
+                    last = Some(u);
                 }
             }
         }
@@ -187,10 +186,9 @@ pub fn scan_usage_from_sse_bytes_incremental(
 
         if let Ok(json) = serde_json::from_slice::<Value>(payload)
             && let Some(usage_obj) = extract_usage_obj(&json)
+            && let Some(u) = usage_from_value(usage_obj)
         {
-            if let Some(u) = usage_from_value(usage_obj) {
-                *last = Some(u);
-            }
+            *last = Some(u);
         }
     }
 
