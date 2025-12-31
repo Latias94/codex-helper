@@ -81,6 +81,9 @@ ch
 
   > 提示：如果你把每个供应商都拆成一个 config，并且它们的 `level` 都是默认的 `1`（例如 `config list` 全是 `L1 on ...`），codex-helper 仍会**优先**使用 `active`，但同级其他 config 也会参与 failover（避免 `active` 单点）。  
   > 如果你想要明确的“跨配置降级”（例如 `L1=中转优先`、`L2=官方兜底`），请至少设置两档不同的 `level`（见下文），或把备份线路放回同一 config 的 `upstreams`。
+  >
+  > 注意：如果你设置了 **pinned override**（例如 TUI 的 `p`：session provider override/pinned；旧版本也可能存在全局 pinned），路由会进入 `pinned` 模式，只会使用那一个 config，因此**不会跨 config failover**。  
+  > 想要“首选 + 可 failover”，请使用 `active`（TUI：`P` 选择全局 active，或在 Configs 页 `Enter` 设 active），并清除 pinned override。
 
 ### 配置场景速查表
 

@@ -119,6 +119,9 @@ The most common and powerful way to use codex-helper is to let it **fail over be
 The key idea: put your primary and backup upstreams **in the same config’s `upstreams` array**.
 
 > Note: if you split each provider into its own config and keep them all at the same `level` (e.g. everything is `level = 1`), codex-helper will still prefer the `active` config, but other same-level configs can participate in failover (to avoid a single point of failure).
+>
+> Important: a **pinned override** (e.g. TUI `p`: session provider override/pinned; older builds may also have a global pinned override) forces `pinned` routing mode and will only use that single config, so it will **not fail over across configs**.  
+> If you want “preferred + failover”, use `active` (TUI: `P` global active, or `Enter` on the Configs page) and clear any pinned override.
 
 ### Scenario quick matrix
 

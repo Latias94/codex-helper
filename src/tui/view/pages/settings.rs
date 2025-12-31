@@ -242,7 +242,7 @@ pub(super) fn render_settings_page(
             Span::styled("retry: ", Style::default().fg(p.muted)),
             Span::styled(
                 format!(
-                    "strategy={} attempts={} backoff={}..{} jitter={} cooldown(cf_chal={}s cf_to={}s transport={}s)",
+                    "strategy={} attempts={} backoff={}..{} jitter={} cooldown(cf_chal={}s cf_to={}s transport={}s) cooldown_backoff(factor={} max={}s)",
                     strategy,
                     retry.max_attempts,
                     retry.backoff_ms,
@@ -250,7 +250,9 @@ pub(super) fn render_settings_page(
                     retry.jitter_ms,
                     retry.cloudflare_challenge_cooldown_secs,
                     retry.cloudflare_timeout_cooldown_secs,
-                    retry.transport_cooldown_secs
+                    retry.transport_cooldown_secs,
+                    retry.cooldown_backoff_factor,
+                    retry.cooldown_backoff_max_secs
                 ),
                 Style::default().fg(p.muted),
             ),

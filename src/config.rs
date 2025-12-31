@@ -534,6 +534,15 @@ on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challe
 cloudflare_challenge_cooldown_secs = 300
 cloudflare_timeout_cooldown_secs = 60
 transport_cooldown_secs = 30
+
+# Optional: exponential cooldown backoff (mainly for "cheap primary + paid backup" setups).
+#
+# When enabled, each consecutive failure increases the cooldown penalty for the same upstream/config:
+#   effective_cooldown = min(base_cooldown * factor^streak, cooldown_backoff_max_secs)
+#
+# Set factor=1 to disable backoff (default behavior).
+cooldown_backoff_factor = 2
+cooldown_backoff_max_secs = 600
 "#;
 
 pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
