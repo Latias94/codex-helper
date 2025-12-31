@@ -324,7 +324,7 @@ pub struct ProxyConfig {
     /// Claude Code 等其他服务配置，后续扩展
     #[serde(default)]
     pub claude: ServiceConfigManager,
-    /// Global retry policy (can be overridden by env vars)
+    /// Global retry policy (proxy-side).
     #[serde(default)]
     pub retry: RetryConfig,
     /// Notify integration settings (used by `codex-helper notify ...`).
