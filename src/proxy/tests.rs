@@ -105,6 +105,8 @@ async fn proxy_failover_retries_502_then_uses_second_upstream() {
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![
@@ -226,6 +228,8 @@ async fn proxy_same_upstream_retries_502_then_succeeds_without_failover() {
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![
@@ -352,6 +356,8 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 60,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![
@@ -482,6 +488,8 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 60,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![
@@ -627,6 +635,8 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
         cloudflare_challenge_cooldown_secs: 60,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![
@@ -760,6 +770,8 @@ async fn proxy_does_not_failover_when_502_is_not_retryable_and_threshold_not_rea
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 60,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![
@@ -873,6 +885,8 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![
@@ -979,6 +993,8 @@ data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_t
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![UpstreamConfig {
@@ -1077,6 +1093,8 @@ async fn proxy_does_not_retry_or_failover_on_400() {
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![
@@ -1178,6 +1196,8 @@ async fn proxy_skips_upstreams_that_do_not_support_model() {
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![
@@ -1280,6 +1300,8 @@ async fn proxy_applies_model_mapping_to_request_body() {
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
     let cfg = make_proxy_config(
         vec![UpstreamConfig {
@@ -1369,6 +1391,8 @@ async fn proxy_falls_back_to_level_2_config_after_retryable_failure() {
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
 
     let mut mgr = ServiceConfigManager {
@@ -1493,6 +1517,8 @@ async fn proxy_failover_can_switch_configs_with_same_level() {
         cloudflare_challenge_cooldown_secs: 0,
         cloudflare_timeout_cooldown_secs: 0,
         transport_cooldown_secs: 0,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
     };
 
     let mut mgr = ServiceConfigManager {

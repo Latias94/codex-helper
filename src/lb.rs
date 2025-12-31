@@ -8,12 +8,51 @@ use tracing::info;
 pub const FAILURE_THRESHOLD: u32 = 3;
 pub const COOLDOWN_SECS: u64 = 30;
 
+#[derive(Debug, Clone, Copy)]
+pub struct CooldownBackoff {
+    pub factor: u64,
+    pub max_secs: u64,
+}
+
+impl CooldownBackoff {
+    pub const fn disabled() -> Self {
+        Self {
+            factor: 1,
+            max_secs: 0,
+        }
+    }
+
+    fn effective_cooldown_secs(&self, base_secs: u64, penalty_streak: u32) -> u64 {
+        if base_secs == 0 {
+            return 0;
+        }
+        if self.factor <= 1 {
+            return base_secs;
+        }
+        let cap = if self.max_secs == 0 {
+            base_secs
+        } else {
+            self.max_secs.max(base_secs)
+        };
+
+        let mut secs = base_secs;
+        for _ in 0..penalty_streak.min(64) {
+            secs = secs.saturating_mul(self.factor);
+            if secs >= cap {
+                return cap;
+            }
+        }
+        secs.min(cap)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LbState {
     pub failure_counts: Vec<u32>,
     pub cooldown_until: Vec<Option<std::time::Instant>>,
     pub usage_exhausted: Vec<bool>,
     pub last_good_index: Option<usize>,
+    pub penalty_streak: Vec<u32>,
 }
 
 impl LbState {
@@ -22,6 +61,7 @@ impl LbState {
             self.failure_counts = vec![0; len];
             self.cooldown_until = vec![None; len];
             self.usage_exhausted = vec![false; len];
+            self.penalty_streak = vec![0; len];
             // 如果 upstream 数量发生变化，原来的 last_good_index 很可能已经无效，直接清空。
             self.last_good_index = None;
         }
@@ -161,6 +201,16 @@ impl LoadBalancer {
     }
 
     pub fn penalize(&self, index: usize, cooldown_secs: u64, reason: &str) {
+        self.penalize_with_backoff(index, cooldown_secs, reason, CooldownBackoff::disabled());
+    }
+
+    pub fn penalize_with_backoff(
+        &self,
+        index: usize,
+        cooldown_secs: u64,
+        reason: &str,
+        backoff: CooldownBackoff,
+    ) {
         let mut map = match self.states.lock() {
             Ok(m) => m,
             Err(_) => return,
@@ -173,20 +223,36 @@ impl LoadBalancer {
             return;
         }
 
+        let streak = entry.penalty_streak.get(index).copied().unwrap_or(0);
+        let effective_secs = backoff.effective_cooldown_secs(cooldown_secs, streak);
+
         entry.failure_counts[index] = FAILURE_THRESHOLD;
         if let Some(slot) = entry.cooldown_until.get_mut(index) {
-            *slot = Some(std::time::Instant::now() + std::time::Duration::from_secs(cooldown_secs));
+            *slot = Some(std::time::Instant::now() + std::time::Duration::from_secs(effective_secs));
+        }
+        if let Some(slot) = entry.penalty_streak.get_mut(index) {
+            *slot = streak.saturating_add(1);
         }
         if entry.last_good_index == Some(index) {
             entry.last_good_index = None;
         }
         info!(
             "lb: upstream '{}' index {} penalized for {}s (reason: {})",
-            self.service.name, index, cooldown_secs, reason
+            self.service.name, index, effective_secs, reason
         );
     }
 
     pub fn record_result(&self, index: usize, success: bool) {
+        self.record_result_with_backoff(index, success, COOLDOWN_SECS, CooldownBackoff::disabled());
+    }
+
+    pub fn record_result_with_backoff(
+        &self,
+        index: usize,
+        success: bool,
+        failure_threshold_cooldown_secs: u64,
+        backoff: CooldownBackoff,
+    ) {
         let mut map = match self.states.lock() {
             Ok(m) => m,
             Err(_) => return,
@@ -203,6 +269,9 @@ impl LoadBalancer {
             if let Some(slot) = entry.cooldown_until.get_mut(index) {
                 *slot = None;
             }
+            if let Some(slot) = entry.penalty_streak.get_mut(index) {
+                *slot = 0;
+            }
             // 成功请求会将该 upstream 记为“最近可用线路”，后续优先继续使用。
             entry.last_good_index = Some(index);
         } else {
@@ -210,15 +279,32 @@ impl LoadBalancer {
             if entry.failure_counts[index] >= FAILURE_THRESHOLD
                 && let Some(slot) = entry.cooldown_until.get_mut(index)
             {
-                *slot =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS));
+                let base_secs = if failure_threshold_cooldown_secs == 0 {
+                    COOLDOWN_SECS
+                } else {
+                    failure_threshold_cooldown_secs
+                };
+                let streak = entry.penalty_streak.get(index).copied().unwrap_or(0);
+                let effective_secs = backoff.effective_cooldown_secs(base_secs, streak);
+                let now = std::time::Instant::now();
+                let new_until = now + std::time::Duration::from_secs(effective_secs);
+                let should_update = match *slot {
+                    Some(existing) => new_until > existing,
+                    None => true,
+                };
+                if should_update {
+                    *slot = Some(new_until);
+                }
+                if let Some(slot) = entry.penalty_streak.get_mut(index) {
+                    *slot = streak.saturating_add(1);
+                }
                 info!(
                     "lb: upstream '{}' index {} reached failure threshold {} (count = {}), entering cooldown for {}s",
                     self.service.name,
                     index,
                     FAILURE_THRESHOLD,
                     entry.failure_counts[index],
-                    COOLDOWN_SECS
+                    effective_secs
                 );
                 // 触发熔断时，如当前 last_good_index 指向该线路，则清空，允许后续选择其他线路。
                 if entry.last_good_index == Some(index) {

@@ -210,6 +210,12 @@ pub struct RetryConfig {
     pub cloudflare_challenge_cooldown_secs: u64,
     pub cloudflare_timeout_cooldown_secs: u64,
     pub transport_cooldown_secs: u64,
+    /// Optional exponential backoff for cooldown penalties.
+    /// When factor > 1, repeated penalties will increase cooldown up to max_secs.
+    #[serde(default)]
+    pub cooldown_backoff_factor: u64,
+    #[serde(default)]
+    pub cooldown_backoff_max_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -244,6 +250,8 @@ impl Default for RetryConfig {
             cloudflare_challenge_cooldown_secs: 300,
             cloudflare_timeout_cooldown_secs: 60,
             transport_cooldown_secs: 30,
+            cooldown_backoff_factor: 1,
+            cooldown_backoff_max_secs: 600,
         }
     }
 }

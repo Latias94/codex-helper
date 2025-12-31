@@ -6,6 +6,19 @@ use crate::config::RetryConfig;
 use crate::config::RetryStrategy;
 use crate::logging::RetryInfo;
 
+fn env_var(key: &str) -> Option<String> {
+    #[cfg(test)]
+    {
+        let _ = key;
+        None
+    }
+
+    #[cfg(not(test))]
+    {
+        std::env::var(key).ok()
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct RetryOptions {
     pub(super) max_attempts: u32,
@@ -18,6 +31,8 @@ pub(super) struct RetryOptions {
     pub(super) cloudflare_challenge_cooldown_secs: u64,
     pub(super) cloudflare_timeout_cooldown_secs: u64,
     pub(super) transport_cooldown_secs: u64,
+    pub(super) cooldown_backoff_factor: u64,
+    pub(super) cooldown_backoff_max_secs: u64,
 }
 
 pub(super) fn parse_status_ranges(spec: &str) -> Vec<(u16, u16)> {
@@ -36,31 +51,25 @@ pub(super) fn parse_status_ranges(spec: &str) -> Vec<(u16, u16)> {
 }
 
 pub(super) fn retry_options(cfg: &RetryConfig) -> RetryOptions {
-    let max_attempts = std::env::var("CODEX_HELPER_RETRY_MAX_ATTEMPTS")
-        .ok()
+    let max_attempts = env_var("CODEX_HELPER_RETRY_MAX_ATTEMPTS")
         .and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(cfg.max_attempts)
         .min(8);
-    let base_backoff_ms = std::env::var("CODEX_HELPER_RETRY_BACKOFF_MS")
-        .ok()
+    let base_backoff_ms = env_var("CODEX_HELPER_RETRY_BACKOFF_MS")
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(cfg.backoff_ms);
-    let max_backoff_ms = std::env::var("CODEX_HELPER_RETRY_BACKOFF_MAX_MS")
-        .ok()
+    let max_backoff_ms = env_var("CODEX_HELPER_RETRY_BACKOFF_MAX_MS")
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(cfg.backoff_max_ms);
-    let jitter_ms = std::env::var("CODEX_HELPER_RETRY_JITTER_MS")
-        .ok()
+    let jitter_ms = env_var("CODEX_HELPER_RETRY_JITTER_MS")
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(cfg.jitter_ms);
-    let retry_status_ranges = std::env::var("CODEX_HELPER_RETRY_ON_STATUS")
-        .ok()
+    let retry_status_ranges = env_var("CODEX_HELPER_RETRY_ON_STATUS")
         .map(|s| parse_status_ranges(&s))
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| parse_status_ranges(cfg.on_status.as_str()));
-    let retry_error_classes = std::env::var("CODEX_HELPER_RETRY_ON_CLASS")
-        .ok()
+    let retry_error_classes = env_var("CODEX_HELPER_RETRY_ON_CLASS")
         .map(|s| {
             s.split(',')
                 .map(|x| x.trim())
@@ -70,8 +79,7 @@ pub(super) fn retry_options(cfg: &RetryConfig) -> RetryOptions {
         })
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| cfg.on_class.clone());
-    let strategy = std::env::var("CODEX_HELPER_RETRY_STRATEGY")
-        .ok()
+    let strategy = env_var("CODEX_HELPER_RETRY_STRATEGY")
         .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
             "failover" => Some(RetryStrategy::Failover),
             "same_upstream" | "same-upstream" | "same" => Some(RetryStrategy::SameUpstream),
@@ -79,19 +87,24 @@ pub(super) fn retry_options(cfg: &RetryConfig) -> RetryOptions {
         })
         .unwrap_or(cfg.strategy);
     let cloudflare_challenge_cooldown_secs =
-        std::env::var("CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS")
-            .ok()
+        env_var("CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS")
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(cfg.cloudflare_challenge_cooldown_secs);
     let cloudflare_timeout_cooldown_secs =
-        std::env::var("CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS")
-            .ok()
+        env_var("CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS")
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(cfg.cloudflare_timeout_cooldown_secs);
-    let transport_cooldown_secs = std::env::var("CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS")
-        .ok()
+    let transport_cooldown_secs = env_var("CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS")
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(cfg.transport_cooldown_secs);
+    let cooldown_backoff_factor = env_var("CODEX_HELPER_RETRY_COOLDOWN_BACKOFF_FACTOR")
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(cfg.cooldown_backoff_factor)
+        .clamp(1, 16);
+    let cooldown_backoff_max_secs = env_var("CODEX_HELPER_RETRY_COOLDOWN_BACKOFF_MAX_SECS")
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(cfg.cooldown_backoff_max_secs)
+        .clamp(0, 24 * 60 * 60);
 
     RetryOptions {
         max_attempts,
@@ -104,6 +117,8 @@ pub(super) fn retry_options(cfg: &RetryConfig) -> RetryOptions {
         cloudflare_challenge_cooldown_secs,
         cloudflare_timeout_cooldown_secs,
         transport_cooldown_secs,
+        cooldown_backoff_factor,
+        cooldown_backoff_max_secs,
     }
 }
 
@@ -212,6 +227,8 @@ mod tests {
             cloudflare_challenge_cooldown_secs: 0,
             cloudflare_timeout_cooldown_secs: 0,
             transport_cooldown_secs: 0,
+            cooldown_backoff_factor: 1,
+            cooldown_backoff_max_secs: 0,
         };
         assert_eq!(retry_after_ms(&headers, &opt), Some(2_000));
     }

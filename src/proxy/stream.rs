@@ -70,6 +70,7 @@ struct StreamFinalize {
     lb: LoadBalancer,
     upstream_index: usize,
     transport_cooldown_secs: u64,
+    cooldown_backoff: crate::lb::CooldownBackoff,
 }
 
 impl StreamFinalize {
@@ -187,11 +188,17 @@ impl Drop for StreamFinalize {
         drop(guard);
 
         if stream_error {
-            self.lb.record_result(self.upstream_index, false);
-            self.lb.penalize(
+            self.lb.record_result_with_backoff(
+                self.upstream_index,
+                false,
+                crate::lb::COOLDOWN_SECS,
+                self.cooldown_backoff,
+            );
+            self.lb.penalize_with_backoff(
                 self.upstream_index,
                 self.transport_cooldown_secs,
                 "upstream_stream_error",
+                self.cooldown_backoff,
             );
         }
 
@@ -236,6 +243,7 @@ pub(super) async fn build_sse_success_response(
         is_user_turn,
         is_codex_service,
         transport_cooldown_secs,
+        cooldown_backoff,
         method,
         path,
     } = meta;
@@ -296,6 +304,7 @@ pub(super) async fn build_sse_success_response(
         lb: lb.clone(),
         upstream_index: selected.index,
         transport_cooldown_secs,
+        cooldown_backoff,
     };
 
     if is_user_turn && is_codex_service {
@@ -456,6 +465,7 @@ pub(super) struct SseSuccessMeta {
     pub(super) is_user_turn: bool,
     pub(super) is_codex_service: bool,
     pub(super) transport_cooldown_secs: u64,
+    pub(super) cooldown_backoff: crate::lb::CooldownBackoff,
     pub(super) method: Method,
     pub(super) path: String,
 }

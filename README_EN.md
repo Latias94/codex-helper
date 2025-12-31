@@ -118,8 +118,7 @@ The most common and powerful way to use codex-helper is to let it **fail over be
 
 The key idea: put your primary and backup upstreams **in the same config’s `upstreams` array**.
 
-> Common pitfall: if you split each provider into its own config and keep them all at the default `level = 1` (so `config list` shows `L1` everywhere), codex-helper will **not** fail over across configs — it will prefer the `active` config.  
-> To enable cross-config failover, use at least two distinct levels (see below), or move backup endpoints back into a single config’s `upstreams`.
+> Note: if you split each provider into its own config and keep them all at the same `level` (e.g. everything is `level = 1`), codex-helper will still prefer the `active` config, but other same-level configs can participate in failover (to avoid a single point of failure).
 
 Example `~/.codex-helper/config.toml` (recommended):
 
@@ -158,9 +157,12 @@ With this layout:
 If you prefer to keep upstreams in separate configs, codex-helper also supports **level-based config grouping**:
 
 - Each config has a `level` (1..=10, lower is higher priority).
-- Cross-config routing is opt-in: codex-helper only routes across configs when there are **multiple distinct levels**. If everything is `level = 1`, it effectively behaves like “use active”.
+- If there are **multiple distinct levels**, codex-helper routes from low to high (lower level is preferred).
+- If all configs share the same level, they are treated as same-level candidates: `active` is preferred, but other configs can still be used for failover.
 - Within the same level, the `active` config is preferred.
 - Set `enabled = false` to exclude a config from automatic routing (unless it is the active config).
+
+A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go as backup”: set the cheaper relay as `active` with `level = 1`, keep your direct/official provider at `level = 2`, and use cooldown penalties (optionally with cooldown backoff) to periodically probe back to the primary without hammering it on every request.
 
 ---
 
@@ -458,6 +460,7 @@ Some upstream failures are transient (network hiccups, 429 rate limits, 502/503/
 - `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`: retry on these error classes
 - `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`: retry backoff (ms)
 - `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`: upstream cooldown penalties (seconds)
+- `CODEX_HELPER_RETRY_COOLDOWN_BACKOFF_FACTOR=2` / `CODEX_HELPER_RETRY_COOLDOWN_BACKOFF_MAX_SECS=600`: exponential backoff for cooldown penalties (useful for “primary/backup + probe back” setups)
 
 Example config (`~/.codex-helper/config.toml`):
 
@@ -473,6 +476,8 @@ on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challe
 cloudflare_challenge_cooldown_secs = 300
 cloudflare_timeout_cooldown_secs = 60
 transport_cooldown_secs = 30
+cooldown_backoff_factor = 1
+cooldown_backoff_max_secs = 600
 ```
 
 Note: retries may replay **non-idempotent POST requests** (potential double-billing or duplicate writes). Only enable retries if you accept this risk, and keep the attempt count low.

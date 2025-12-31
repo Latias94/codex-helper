@@ -120,10 +120,13 @@ tags = { provider_id = "yes", source = "codex-config" }
 如果你更希望把不同供应商/通道拆成多个 config，codex-helper 也支持 **按 level 分组的跨配置降级**（推荐用于“中转优先，直连兜底”等场景）：
 
 - 每个 config 有一个 `level`（1..=10，越小优先级越高）。
-- 这是一个显式 opt-in：只有当存在 **多个不同的 level** 时，才会启用跨 config 自动路由/降级；如果所有 config 都是 `level=1`，就相当于“只用 active”。
+- 如果存在 **多个不同的 level**，会按 level 从小到大路由/降级（低 level 优先）。
+- 如果所有 config 都是同一个 level，则视为“同级候选”：仍会优先 `active`，但同级其他 config 也会参与 failover（避免 active 单点）。
 - 同一 level 内会优先使用 `active` 配置。
 - `enabled = false` 可把该 config 排除出自动路由（除非它是 active）。
 - 实操建议：把“同一类线路”放同一 level（例如 `L1=各类中转`、`L2=官方/直连兜底`），并把 `retry.max_attempts` 设到足够覆盖你希望每次请求尝试的候选数量。
+
+一个常见成本优化策略是“包月中转为主，按量备选为从”：把包月中转设为 `active` 且 `level=1`，把按量直连设为 `level=2`；当主线路不稳定时会自动降级到备选，同时通过冷却（以及可选的冷却退避）“隔一段时间探测回切”，避免一直按量计费。
 
 例如：让 `L1` 优先使用中转（`right/packyapi/yescode/...`），失败时再降级到 `L2` 的直连 OpenAI：
 
@@ -416,6 +419,7 @@ tags = { source = "codex-config", provider_id = "openai" }
 - `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`：按错误分类允许重试
 - `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`：重试退避参数（毫秒）
 - `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`：对触发重试的 upstream 施加冷却（秒）
+- `CODEX_HELPER_RETRY_COOLDOWN_BACKOFF_FACTOR=2` / `CODEX_HELPER_RETRY_COOLDOWN_BACKOFF_MAX_SECS=600`：对“冷却”启用指数退避（连续触发冷却会逐步加长冷却时间，上限为 `*_MAX_SECS`；用于“主从+回切探测”场景）
 
 配置示例（TOML）：
 
@@ -431,6 +435,8 @@ on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challe
 cloudflare_challenge_cooldown_secs = 300
 cloudflare_timeout_cooldown_secs = 60
 transport_cooldown_secs = 30
+cooldown_backoff_factor = 1
+cooldown_backoff_max_secs = 600
 ```
 
 注意：重试可能导致 **POST 请求重放**（例如重复计费/重复写入）。建议仅在你明确接受这一风险、且错误大多是瞬态的场景下开启，并将尝试次数控制在较小范围内。

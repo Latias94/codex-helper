@@ -59,6 +59,7 @@ fn lb_state_snapshot_json(lb: &LoadBalancer) -> Option<serde_json::Value> {
             serde_json::json!({
                 "idx": idx,
                 "failure_count": st.failure_counts.get(idx).copied(),
+                "penalty_streak": st.penalty_streak.get(idx).copied(),
                 "usage_exhausted": st.usage_exhausted.get(idx).copied(),
                 "cooldown_remaining_ms": cooldown_remaining_ms,
             })
@@ -936,6 +937,10 @@ pub async fn handle_proxy(
 
     let retry_opt = retry_options(&cfg_snapshot.retry);
     let retry_failover = retry_opt.strategy == RetryStrategy::Failover;
+    let cooldown_backoff = crate::lb::CooldownBackoff {
+        factor: retry_opt.cooldown_backoff_factor,
+        max_secs: retry_opt.cooldown_backoff_max_secs,
+    };
     log_retry_trace(serde_json::json!({
         "event": "retry_options",
         "service": proxy.service_name,
@@ -950,6 +955,8 @@ pub async fn handle_proxy(
         "cloudflare_challenge_cooldown_secs": retry_opt.cloudflare_challenge_cooldown_secs,
         "cloudflare_timeout_cooldown_secs": retry_opt.cloudflare_timeout_cooldown_secs,
         "transport_cooldown_secs": retry_opt.transport_cooldown_secs,
+        "cooldown_backoff_factor": retry_opt.cooldown_backoff_factor,
+        "cooldown_backoff_max_secs": retry_opt.cooldown_backoff_max_secs,
     }));
     let total_upstreams = lbs
         .iter()
@@ -1129,7 +1136,12 @@ pub async fn handle_proxy(
         let target_url = match proxy.build_target(&selected, &uri) {
             Ok((url, _headers)) => url,
             Err(e) => {
-                lb.record_result(selected.index, false);
+                lb.record_result_with_backoff(
+                    selected.index,
+                    false,
+                    crate::lb::COOLDOWN_SECS,
+                    cooldown_backoff,
+                );
                 let err_str = e.to_string();
                 upstream_chain.push(format!(
                     "{}:{} (idx={}) target_build_error={} model={}",
@@ -1312,7 +1324,12 @@ pub async fn handle_proxy(
                     "error": e.to_string(),
                 }));
                 if retry_failover {
-                    lb.record_result(selected.index, false);
+                    lb.record_result_with_backoff(
+                        selected.index,
+                        false,
+                        crate::lb::COOLDOWN_SECS,
+                        cooldown_backoff,
+                    );
                 }
                 let err_str = e.to_string();
                 upstream_chain.push(format!(
@@ -1327,10 +1344,11 @@ pub async fn handle_proxy(
                     && should_retry_class(&retry_opt, Some("upstream_transport_error"));
                 if can_retry {
                     if retry_failover {
-                        lb.penalize(
+                        lb.penalize_with_backoff(
                             selected.index,
                             retry_opt.transport_cooldown_secs,
                             "upstream_transport_error",
+                            cooldown_backoff,
                         );
                         avoid
                             .entry(selected.config_name.clone())
@@ -1344,10 +1362,11 @@ pub async fn handle_proxy(
                 // Even when we have no remaining in-request retries, mark this upstream as cooled down
                 // so external retries (e.g. Codex request_max_retries) can fail over to another upstream.
                 if should_retry_class(&retry_opt, Some("upstream_transport_error")) {
-                    lb.penalize(
+                    lb.penalize_with_backoff(
                         selected.index,
                         retry_opt.transport_cooldown_secs,
                         "upstream_transport_error_final",
+                        cooldown_backoff,
                     );
                 }
 
@@ -1460,7 +1479,12 @@ pub async fn handle_proxy(
         // 对用户对话轮次输出更有信息量的 info 日志（仅最终返回时打印，避免重试期间刷屏）。
 
         if is_stream && success {
-            lb.record_result(selected.index, true);
+            lb.record_result_with_backoff(
+                selected.index,
+                true,
+                crate::lb::COOLDOWN_SECS,
+                cooldown_backoff,
+            );
             upstream_chain.push(format!(
                 "{} (idx={}) status={} model={}",
                 selected.upstream.base_url,
@@ -1494,6 +1518,7 @@ pub async fn handle_proxy(
                     is_user_turn,
                     is_codex_service,
                     transport_cooldown_secs: retry_opt.transport_cooldown_secs,
+                    cooldown_backoff,
                     method: method.clone(),
                     path: uri.path().to_string(),
                 },
@@ -1517,7 +1542,12 @@ pub async fn handle_proxy(
                         "error": e.to_string(),
                     }));
                     if retry_failover {
-                        lb.record_result(selected.index, false);
+                        lb.record_result_with_backoff(
+                            selected.index,
+                            false,
+                            crate::lb::COOLDOWN_SECS,
+                            cooldown_backoff,
+                        );
                     }
                     let err_str = e.to_string();
                     upstream_chain.push(format!(
@@ -1532,10 +1562,11 @@ pub async fn handle_proxy(
                         && should_retry_class(&retry_opt, Some("upstream_transport_error"));
                     if can_retry {
                         if retry_failover {
-                            lb.penalize(
+                            lb.penalize_with_backoff(
                                 selected.index,
                                 retry_opt.transport_cooldown_secs,
                                 "upstream_body_read_error",
+                                cooldown_backoff,
                             );
                             avoid
                                 .entry(selected.config_name.clone())
@@ -1549,10 +1580,11 @@ pub async fn handle_proxy(
                     // Same reasoning as transport errors: without in-request retries, external retries
                     // should not get stuck repeatedly selecting the same broken upstream.
                     if should_retry_class(&retry_opt, Some("upstream_transport_error")) {
-                        lb.penalize(
+                        lb.penalize_with_backoff(
                             selected.index,
                             retry_opt.transport_cooldown_secs,
                             "upstream_body_read_error_final",
+                            cooldown_backoff,
                         );
                     }
 
@@ -1660,20 +1692,23 @@ pub async fn handle_proxy(
                     "should_retry_class": should_retry_class(&retry_opt, cls.as_deref()),
                 }));
                 match cls.as_deref() {
-                    Some("cloudflare_challenge") => lb.penalize(
+                    Some("cloudflare_challenge") => lb.penalize_with_backoff(
                         selected.index,
                         retry_opt.cloudflare_challenge_cooldown_secs,
                         "cloudflare_challenge_final",
+                        cooldown_backoff,
                     ),
-                    Some("cloudflare_timeout") => lb.penalize(
+                    Some("cloudflare_timeout") => lb.penalize_with_backoff(
                         selected.index,
                         retry_opt.cloudflare_timeout_cooldown_secs,
                         "cloudflare_timeout_final",
+                        cooldown_backoff,
                     ),
-                    _ if status_code >= 500 => lb.penalize(
+                    _ if status_code >= 500 => lb.penalize_with_backoff(
                         selected.index,
                         retry_opt.transport_cooldown_secs,
                         &format!("status_{}_final", status_code),
+                        cooldown_backoff,
                     ),
                     _ => {}
                 }
@@ -1719,18 +1754,31 @@ pub async fn handle_proxy(
                 if retry_failover {
                     // Treat retryable 5xx / WAF-like responses as upstream failures for LB tracking.
                     if status_code >= 500 || cls.is_some() {
-                        lb.record_result(selected.index, false);
+                        lb.record_result_with_backoff(
+                            selected.index,
+                            false,
+                            crate::lb::COOLDOWN_SECS,
+                            cooldown_backoff,
+                        );
                     }
                     match cls.as_deref() {
-                        Some("cloudflare_challenge") => lb.penalize(
+                        Some("cloudflare_challenge") => lb.penalize_with_backoff(
                             selected.index,
                             retry_opt.cloudflare_challenge_cooldown_secs,
                             "cloudflare_challenge",
+                            cooldown_backoff,
                         ),
-                        Some("cloudflare_timeout") => lb.penalize(
+                        Some("cloudflare_timeout") => lb.penalize_with_backoff(
                             selected.index,
                             retry_opt.cloudflare_timeout_cooldown_secs,
                             "cloudflare_timeout",
+                            cooldown_backoff,
+                        ),
+                        _ if status_code >= 500 => lb.penalize_with_backoff(
+                            selected.index,
+                            retry_opt.transport_cooldown_secs,
+                            &format!("status_{}", status_code),
+                            cooldown_backoff,
                         ),
                         _ => {}
                     }
@@ -1749,9 +1797,19 @@ pub async fn handle_proxy(
             // - generic 3xx/4xx => neutral (do not mark upstream good/bad to avoid sticky routing to a failing upstream,
             //   and also avoid penalizing upstreams for client-side mistakes).
             if success {
-                lb.record_result(selected.index, true);
+                lb.record_result_with_backoff(
+                    selected.index,
+                    true,
+                    crate::lb::COOLDOWN_SECS,
+                    cooldown_backoff,
+                );
             } else if status_code >= 500 || cls.is_some() {
-                lb.record_result(selected.index, false);
+                lb.record_result_with_backoff(
+                    selected.index,
+                    false,
+                    crate::lb::COOLDOWN_SECS,
+                    cooldown_backoff,
+                );
             }
 
             let retry = retry_info_for_chain(&upstream_chain);
