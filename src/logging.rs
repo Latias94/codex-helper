@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 
 use crate::config::proxy_home_dir;
 use crate::usage::UsageMetrics;
@@ -29,6 +30,13 @@ pub fn should_log_request_body_preview() -> bool {
     // Default OFF: request bodies can be large and often contain sensitive data.
     // Enable explicitly when debugging request payload issues.
     env_bool_default("CODEX_HELPER_HTTP_LOG_REQUEST_BODY", false)
+}
+
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn env_bool(key: &str) -> bool {
@@ -340,6 +348,49 @@ fn request_log_options() -> RequestLogOptions {
     })
 }
 
+fn retry_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_bool("CODEX_HELPER_RETRY_TRACE"))
+}
+
+fn retry_trace_path() -> PathBuf {
+    std::env::var("CODEX_HELPER_RETRY_TRACE_PATH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| proxy_home_dir().join("logs").join("retry_trace.jsonl"))
+}
+
+pub fn log_retry_trace(mut event: JsonValue) {
+    if !retry_trace_enabled() {
+        return;
+    }
+
+    if let JsonValue::Object(ref mut obj) = event {
+        obj.entry("ts_ms".to_string())
+            .or_insert_with(|| JsonValue::Number(serde_json::Number::from(now_ms())));
+    }
+
+    let opt = request_log_options();
+    let path = retry_trace_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let _guard = match log_lock().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+
+    if let Ok(line) = serde_json::to_string(&event) {
+        rotate_and_prune_if_needed(&path, opt);
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(file, "{}", line);
+        }
+    }
+}
+
 fn rotate_and_prune_if_needed(path: &PathBuf, opt: RequestLogOptions) {
     if opt.max_bytes == 0 {
         return;
@@ -411,10 +462,7 @@ pub fn log_request_with_debug(
         return;
     }
 
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let ts = now_ms();
 
     static DEBUG_SEQ: AtomicU64 = AtomicU64::new(0);
     let mut http_debug_for_main = http_debug;

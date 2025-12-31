@@ -26,7 +26,7 @@ use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
     AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, http_debug_options,
     http_warn_options, log_request_with_debug, make_body_preview, should_include_http_debug,
-    should_include_http_warn, should_log_request_body_preview,
+    should_include_http_warn, should_log_request_body_preview, log_retry_trace,
 };
 use crate::model_routing;
 use crate::state::{ActiveRequest, FinishedRequest, ProxyState};
@@ -40,6 +40,35 @@ use self::retry::{
 };
 use self::runtime_config::RuntimeConfig;
 use self::stream::{SseSuccessMeta, build_sse_success_response};
+
+fn lb_state_snapshot_json(lb: &LoadBalancer) -> Option<serde_json::Value> {
+    let map = match lb.states.lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    let st = map.get(&lb.service.name)?;
+    let now = std::time::Instant::now();
+    let upstreams = (0..lb.service.upstreams.len())
+        .map(|idx| {
+            let cooldown_remaining_ms = st
+                .cooldown_until
+                .get(idx)
+                .and_then(|x| *x)
+                .map(|until| until.saturating_duration_since(now).as_millis() as u64)
+                .filter(|&ms| ms > 0);
+            serde_json::json!({
+                "idx": idx,
+                "failure_count": st.failure_counts.get(idx).copied(),
+                "usage_exhausted": st.usage_exhausted.get(idx).copied(),
+                "cooldown_remaining_ms": cooldown_remaining_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(serde_json::json!({
+        "last_good_index": st.last_good_index,
+        "upstreams": upstreams,
+    }))
+}
 
 fn read_json_file(path: &std::path::Path) -> Option<serde_json::Value> {
     let bytes = std::fs::read(path).ok()?;
@@ -352,17 +381,17 @@ impl ProxyService {
         }
     }
 
-    async fn pinned_config_name(&self, session_id: Option<&str>) -> Option<String> {
+    async fn pinned_config(&self, session_id: Option<&str>) -> Option<(String, &'static str)> {
         if let Some(sid) = session_id
             && let Some(name) = self.state.get_session_config_override(sid).await
             && !name.trim().is_empty()
         {
-            return Some(name);
+            return Some((name, "session"));
         }
         if let Some(name) = self.state.get_global_config_override().await
             && !name.trim().is_empty()
         {
-            return Some(name);
+            return Some((name, "global"));
         }
         None
     }
@@ -377,15 +406,40 @@ impl ProxyService {
             .state
             .get_config_meta_overrides(self.service_name)
             .await;
-        if let Some(name) = self.pinned_config_name(session_id).await {
+        if let Some((name, source)) = self.pinned_config(session_id).await {
             if let Some(svc) = mgr
                 .configs
                 .get(&name)
                 .or_else(|| mgr.active_config())
                 .cloned()
             {
+                log_retry_trace(serde_json::json!({
+                    "event": "lbs_for_request",
+                    "service": self.service_name,
+                    "session_id": session_id,
+                    "mode": "pinned",
+                    "pinned_source": source,
+                    "pinned_name": name,
+                    "selected_config": svc.name,
+                    "selected_level": svc.level.clamp(1, 10),
+                    "selected_upstreams": svc.upstreams.len(),
+                    "active_config": mgr.active.as_deref(),
+                    "config_count": mgr.configs.len(),
+                }));
                 return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
             }
+            log_retry_trace(serde_json::json!({
+                "event": "lbs_for_request",
+                "service": self.service_name,
+                "session_id": session_id,
+                "mode": "pinned",
+                "pinned_source": source,
+                "pinned_name": name,
+                "selected_config": null,
+                "active_config": mgr.active.as_deref(),
+                "config_count": mgr.configs.len(),
+                "note": "pinned_config_not_found",
+            }));
             return Vec::new();
         }
 
@@ -425,6 +479,27 @@ impl ProxyService {
                 && let Some(svc) = mgr.configs.get(name)
                 && !svc.upstreams.is_empty()
             {
+                log_retry_trace(serde_json::json!({
+                    "event": "lbs_for_request",
+                    "service": self.service_name,
+                    "session_id": session_id,
+                    "mode": "single_level",
+                    "active_config": active_name,
+                    "selected_config": name,
+                    "selected_level": svc.level.clamp(1, 10),
+                    "selected_upstreams": svc.upstreams.len(),
+                    "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                    "eligible_details": configs.iter().map(|(n, svc)| {
+                        let (_, level_ovr) = meta_overrides.get(n.as_str()).copied().unwrap_or((None, None));
+                        serde_json::json!({
+                            "name": (*n).clone(),
+                            "level": level_ovr.unwrap_or(svc.level).clamp(1, 10),
+                            "enabled": svc.enabled,
+                            "upstreams": svc.upstreams.len(),
+                        })
+                    }).collect::<Vec<_>>(),
+                    "eligible_count": configs.len(),
+                }));
                 return vec![LoadBalancer::new(
                     Arc::new(svc.clone()),
                     self.lb_states.clone(),
@@ -432,6 +507,27 @@ impl ProxyService {
             }
 
             if let Some((_, svc)) = configs.iter().min_by_key(|(name, _)| *name) {
+                log_retry_trace(serde_json::json!({
+                    "event": "lbs_for_request",
+                    "service": self.service_name,
+                    "session_id": session_id,
+                    "mode": "single_level",
+                    "active_config": active_name,
+                    "selected_config": svc.name,
+                    "selected_level": svc.level.clamp(1, 10),
+                    "selected_upstreams": svc.upstreams.len(),
+                    "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                    "eligible_details": configs.iter().map(|(n, svc)| {
+                        let (_, level_ovr) = meta_overrides.get(n.as_str()).copied().unwrap_or((None, None));
+                        serde_json::json!({
+                            "name": (*n).clone(),
+                            "level": level_ovr.unwrap_or(svc.level).clamp(1, 10),
+                            "enabled": svc.enabled,
+                            "upstreams": svc.upstreams.len(),
+                        })
+                    }).collect::<Vec<_>>(),
+                    "eligible_count": configs.len(),
+                }));
                 return vec![LoadBalancer::new(
                     Arc::new((*svc).clone()),
                     self.lb_states.clone(),
@@ -439,8 +535,47 @@ impl ProxyService {
             }
 
             if let Some(svc) = mgr.active_config().cloned() {
+                log_retry_trace(serde_json::json!({
+                    "event": "lbs_for_request",
+                    "service": self.service_name,
+                    "session_id": session_id,
+                    "mode": "single_level_fallback_active_config",
+                    "active_config": active_name,
+                    "selected_config": svc.name,
+                    "selected_level": svc.level.clamp(1, 10),
+                    "selected_upstreams": svc.upstreams.len(),
+                    "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                    "eligible_details": configs.iter().map(|(n, svc)| {
+                        let (_, level_ovr) = meta_overrides.get(n.as_str()).copied().unwrap_or((None, None));
+                        serde_json::json!({
+                            "name": (*n).clone(),
+                            "level": level_ovr.unwrap_or(svc.level).clamp(1, 10),
+                            "enabled": svc.enabled,
+                            "upstreams": svc.upstreams.len(),
+                        })
+                    }).collect::<Vec<_>>(),
+                    "eligible_count": configs.len(),
+                }));
                 return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
             }
+            log_retry_trace(serde_json::json!({
+                "event": "lbs_for_request",
+                "service": self.service_name,
+                "session_id": session_id,
+                "mode": "single_level_empty",
+                "active_config": active_name,
+                "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                "eligible_details": configs.iter().map(|(n, svc)| {
+                    let (_, level_ovr) = meta_overrides.get(n.as_str()).copied().unwrap_or((None, None));
+                    serde_json::json!({
+                        "name": (*n).clone(),
+                        "level": level_ovr.unwrap_or(svc.level).clamp(1, 10),
+                        "enabled": svc.enabled,
+                        "upstreams": svc.upstreams.len(),
+                    })
+                }).collect::<Vec<_>>(),
+                "eligible_count": configs.len(),
+            }));
             return Vec::new();
         }
 
@@ -468,12 +603,42 @@ impl ProxyService {
             .map(|(_, svc)| LoadBalancer::new(Arc::new(svc.clone()), self.lb_states.clone()))
             .collect::<Vec<_>>();
         if !lbs.is_empty() {
+            log_retry_trace(serde_json::json!({
+                "event": "lbs_for_request",
+                "service": self.service_name,
+                "session_id": session_id,
+                "mode": "multi_level",
+                "active_config": active_name,
+                "eligible_configs": lbs.iter().map(|lb| serde_json::json!({
+                    "name": lb.service.name,
+                    "level": lb.service.level.clamp(1, 10),
+                    "upstreams": lb.service.upstreams.len(),
+                })).collect::<Vec<_>>(),
+                "eligible_count": lbs.len(),
+            }));
             return lbs;
         }
 
         if let Some(svc) = mgr.active_config().cloned() {
+            log_retry_trace(serde_json::json!({
+                "event": "lbs_for_request",
+                "service": self.service_name,
+                "session_id": session_id,
+                "mode": "multi_level_fallback_active_config",
+                "active_config": active_name,
+                "selected_config": svc.name,
+                "selected_level": svc.level.clamp(1, 10),
+                "selected_upstreams": svc.upstreams.len(),
+            }));
             return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
         }
+        log_retry_trace(serde_json::json!({
+            "event": "lbs_for_request",
+            "service": self.service_name,
+            "session_id": session_id,
+            "mode": "multi_level_empty",
+            "active_config": active_name,
+        }));
         Vec::new()
     }
 
@@ -796,6 +961,21 @@ pub async fn handle_proxy(
 
     let retry_opt = retry_options(&cfg_snapshot.retry);
     let retry_failover = retry_opt.strategy == RetryStrategy::Failover;
+    log_retry_trace(serde_json::json!({
+        "event": "retry_options",
+        "service": proxy.service_name,
+        "request_id": request_id,
+        "max_attempts": retry_opt.max_attempts,
+        "base_backoff_ms": retry_opt.base_backoff_ms,
+        "max_backoff_ms": retry_opt.max_backoff_ms,
+        "jitter_ms": retry_opt.jitter_ms,
+        "retry_status_ranges": retry_opt.retry_status_ranges,
+        "retry_error_classes": retry_opt.retry_error_classes,
+        "strategy": if retry_failover { "failover" } else { "same_upstream" },
+        "cloudflare_challenge_cooldown_secs": retry_opt.cloudflare_challenge_cooldown_secs,
+        "cloudflare_timeout_cooldown_secs": retry_opt.cloudflare_timeout_cooldown_secs,
+        "transport_cooldown_secs": retry_opt.transport_cooldown_secs,
+    }));
     let total_upstreams = lbs
         .iter()
         .map(|lb| lb.service.upstreams.len())
@@ -855,6 +1035,19 @@ pub async fn handle_proxy(
         }
 
         let Some((lb, selected)) = chosen else {
+            log_retry_trace(serde_json::json!({
+                "event": "attempt_no_upstream",
+                "service": proxy.service_name,
+                "request_id": request_id,
+                "attempt": attempt_index + 1,
+                "max_attempts": retry_opt.max_attempts,
+                "avoid": avoid.iter().map(|(k, v)| serde_json::json!({
+                    "config": k,
+                    "indices": v.iter().copied().collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "total_upstreams": total_upstreams,
+                "model": request_model.clone(),
+            }));
             let dur = start.elapsed().as_millis() as u64;
             let status = if request_model.is_some() {
                 StatusCode::NOT_FOUND
@@ -897,6 +1090,28 @@ pub async fn handle_proxy(
             }
             return Err((status, "no upstreams available".to_string()));
         };
+
+        let selected_config_name = selected.config_name.clone();
+        let selected_upstream_index = selected.index;
+        let selected_upstream_base_url = selected.upstream.base_url.clone();
+        let provider_id = selected.upstream.tags.get("provider_id").cloned();
+        log_retry_trace(serde_json::json!({
+            "event": "attempt_select",
+            "service": proxy.service_name,
+            "request_id": request_id,
+            "attempt": attempt_index + 1,
+            "max_attempts": retry_opt.max_attempts,
+            "strategy": if retry_failover { "failover" } else { "same_upstream" },
+            "config_name": selected_config_name,
+            "upstream_index": selected_upstream_index,
+            "upstream_base_url": selected_upstream_base_url,
+            "provider_id": provider_id.clone(),
+            "model": request_model.clone(),
+            "lb_state": lb_state_snapshot_json(&lb),
+            "avoid_for_config": avoid.get(&selected.config_name).map(|s| s.iter().copied().collect::<Vec<_>>()),
+            "avoided_total": avoid.values().map(|s| s.len()).sum::<usize>(),
+            "total_upstreams": total_upstreams,
+        }));
 
         let mut model_note = "-".to_string();
         let mut body_for_selected = body_for_upstream.clone();
@@ -1053,7 +1268,6 @@ pub async fn handle_proxy(
         }
 
         let upstream_request_headers = headers.clone();
-        let provider_id = selected.upstream.tags.get("provider_id").cloned();
         proxy
             .state
             .update_request_route(
@@ -1109,6 +1323,19 @@ pub async fn handle_proxy(
         let resp = match builder.send().await {
             Ok(r) => r,
             Err(e) => {
+                log_retry_trace(serde_json::json!({
+                    "event": "attempt_transport_error",
+                    "service": proxy.service_name,
+                    "request_id": request_id,
+                    "attempt": attempt_index + 1,
+                    "max_attempts": retry_opt.max_attempts,
+                    "strategy": if retry_failover { "failover" } else { "same_upstream" },
+                    "config_name": selected.config_name.as_str(),
+                    "upstream_index": selected.index,
+                    "upstream_base_url": selected.upstream.base_url.as_str(),
+                    "provider_id": provider_id.as_deref(),
+                    "error": e.to_string(),
+                }));
                 if retry_failover {
                     lb.record_result(selected.index, false);
                 }
@@ -1301,6 +1528,19 @@ pub async fn handle_proxy(
             let bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
+                    log_retry_trace(serde_json::json!({
+                        "event": "attempt_body_read_error",
+                        "service": proxy.service_name,
+                        "request_id": request_id,
+                        "attempt": attempt_index + 1,
+                        "max_attempts": retry_opt.max_attempts,
+                        "strategy": if retry_failover { "failover" } else { "same_upstream" },
+                        "config_name": selected.config_name.as_str(),
+                        "upstream_index": selected.index,
+                        "upstream_base_url": selected.upstream.base_url.as_str(),
+                        "provider_id": provider_id.as_deref(),
+                        "error": e.to_string(),
+                    }));
                     if retry_failover {
                         lb.record_result(selected.index, false);
                     }
@@ -1427,6 +1667,23 @@ pub async fn handle_proxy(
                 && (should_retry_status(&retry_opt, status_code)
                     || should_retry_class(&retry_opt, cls.as_deref()))
             {
+                log_retry_trace(serde_json::json!({
+                    "event": "attempt_final_retryable_failure",
+                    "service": proxy.service_name,
+                    "request_id": request_id,
+                    "attempt": attempt_index + 1,
+                    "max_attempts": retry_opt.max_attempts,
+                    "status_code": status_code,
+                    "class": cls.as_deref(),
+                    "hint": hint.as_deref(),
+                    "cf_ray": cf_ray.as_deref(),
+                    "config_name": selected.config_name.as_str(),
+                    "upstream_index": selected.index,
+                    "upstream_base_url": selected.upstream.base_url.as_str(),
+                    "provider_id": provider_id.as_deref(),
+                    "should_retry_status": should_retry_status(&retry_opt, status_code),
+                    "should_retry_class": should_retry_class(&retry_opt, cls.as_deref()),
+                }));
                 match cls.as_deref() {
                     Some("cloudflare_challenge") => lb.penalize(
                         selected.index,
@@ -1452,6 +1709,26 @@ pub async fn handle_proxy(
                 && (should_retry_status(&retry_opt, status_code)
                     || should_retry_class(&retry_opt, cls.as_deref()));
             if retryable {
+                log_retry_trace(serde_json::json!({
+                    "event": "attempt_retryable_failure",
+                    "service": proxy.service_name,
+                    "request_id": request_id,
+                    "attempt": attempt_index + 1,
+                    "next_attempt": attempt_index + 2,
+                    "max_attempts": retry_opt.max_attempts,
+                    "status_code": status_code,
+                    "class": cls.as_deref(),
+                    "hint": hint.as_deref(),
+                    "cf_ray": cf_ray.as_deref(),
+                    "config_name": selected.config_name.as_str(),
+                    "upstream_index": selected.index,
+                    "upstream_base_url": selected.upstream.base_url.as_str(),
+                    "provider_id": provider_id.as_deref(),
+                    "strategy": if retry_failover { "failover" } else { "same_upstream" },
+                    "retry_after": resp_headers.get("retry-after").and_then(|v| v.to_str().ok()),
+                    "should_retry_status": should_retry_status(&retry_opt, status_code),
+                    "should_retry_class": should_retry_class(&retry_opt, cls.as_deref()),
+                }));
                 let cls_s = cls.as_deref().unwrap_or("-");
                 info!(
                     "retrying after non-2xx status {} (class={}) for {} {} (config: {}, mode={}, next_attempt={}/{})",
