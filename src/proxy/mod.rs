@@ -475,63 +475,53 @@ impl ProxyService {
         };
 
         if !has_multi_level {
-            if let Some(name) = active_name
-                && let Some(svc) = mgr.configs.get(name)
-                && !svc.upstreams.is_empty()
-            {
-                log_retry_trace(serde_json::json!({
-                    "event": "lbs_for_request",
-                    "service": self.service_name,
-                    "session_id": session_id,
-                    "mode": "single_level",
-                    "active_config": active_name,
-                    "selected_config": name,
-                    "selected_level": svc.level.clamp(1, 10),
-                    "selected_upstreams": svc.upstreams.len(),
-                    "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
-                    "eligible_details": configs.iter().map(|(n, svc)| {
-                        let (_, level_ovr) = meta_overrides.get(n.as_str()).copied().unwrap_or((None, None));
+            let eligible_details = || {
+                configs
+                    .iter()
+                    .map(|(name, svc)| {
+                        let (_, level_ovr) = meta_overrides
+                            .get(name.as_str())
+                            .copied()
+                            .unwrap_or((None, None));
                         serde_json::json!({
-                            "name": (*n).clone(),
+                            "name": (*name).clone(),
                             "level": level_ovr.unwrap_or(svc.level).clamp(1, 10),
                             "enabled": svc.enabled,
                             "upstreams": svc.upstreams.len(),
                         })
-                    }).collect::<Vec<_>>(),
-                    "eligible_count": configs.len(),
-                }));
-                return vec![LoadBalancer::new(
-                    Arc::new(svc.clone()),
-                    self.lb_states.clone(),
-                )];
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let mut ordered = configs
+                .iter()
+                .map(|(name, svc)| ((*name).clone(), (*svc).clone()))
+                .collect::<Vec<_>>();
+            ordered.sort_by(|(a, _), (b, _)| a.cmp(b));
+            if let Some(active) = active_name
+                && let Some(pos) = ordered.iter().position(|(n, _)| n == active)
+            {
+                let item = ordered.remove(pos);
+                ordered.insert(0, item);
             }
 
-            if let Some((_, svc)) = configs.iter().min_by_key(|(name, _)| *name) {
+            let lbs = ordered
+                .into_iter()
+                .map(|(_, svc)| LoadBalancer::new(Arc::new(svc), self.lb_states.clone()))
+                .collect::<Vec<_>>();
+            if !lbs.is_empty() {
                 log_retry_trace(serde_json::json!({
                     "event": "lbs_for_request",
                     "service": self.service_name,
                     "session_id": session_id,
-                    "mode": "single_level",
+                    "mode": "single_level_multi",
                     "active_config": active_name,
-                    "selected_config": svc.name,
-                    "selected_level": svc.level.clamp(1, 10),
-                    "selected_upstreams": svc.upstreams.len(),
+                    "selected_configs": lbs.iter().map(|lb| lb.service.name.clone()).collect::<Vec<_>>(),
                     "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
-                    "eligible_details": configs.iter().map(|(n, svc)| {
-                        let (_, level_ovr) = meta_overrides.get(n.as_str()).copied().unwrap_or((None, None));
-                        serde_json::json!({
-                            "name": (*n).clone(),
-                            "level": level_ovr.unwrap_or(svc.level).clamp(1, 10),
-                            "enabled": svc.enabled,
-                            "upstreams": svc.upstreams.len(),
-                        })
-                    }).collect::<Vec<_>>(),
+                    "eligible_details": eligible_details(),
                     "eligible_count": configs.len(),
                 }));
-                return vec![LoadBalancer::new(
-                    Arc::new((*svc).clone()),
-                    self.lb_states.clone(),
-                )];
+                return lbs;
             }
 
             if let Some(svc) = mgr.active_config().cloned() {
@@ -545,19 +535,12 @@ impl ProxyService {
                     "selected_level": svc.level.clamp(1, 10),
                     "selected_upstreams": svc.upstreams.len(),
                     "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
-                    "eligible_details": configs.iter().map(|(n, svc)| {
-                        let (_, level_ovr) = meta_overrides.get(n.as_str()).copied().unwrap_or((None, None));
-                        serde_json::json!({
-                            "name": (*n).clone(),
-                            "level": level_ovr.unwrap_or(svc.level).clamp(1, 10),
-                            "enabled": svc.enabled,
-                            "upstreams": svc.upstreams.len(),
-                        })
-                    }).collect::<Vec<_>>(),
+                    "eligible_details": eligible_details(),
                     "eligible_count": configs.len(),
                 }));
                 return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
             }
+
             log_retry_trace(serde_json::json!({
                 "event": "lbs_for_request",
                 "service": self.service_name,
@@ -565,15 +548,7 @@ impl ProxyService {
                 "mode": "single_level_empty",
                 "active_config": active_name,
                 "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
-                "eligible_details": configs.iter().map(|(n, svc)| {
-                    let (_, level_ovr) = meta_overrides.get(n.as_str()).copied().unwrap_or((None, None));
-                    serde_json::json!({
-                        "name": (*n).clone(),
-                        "level": level_ovr.unwrap_or(svc.level).clamp(1, 10),
-                        "enabled": svc.enabled,
-                        "upstreams": svc.upstreams.len(),
-                    })
-                }).collect::<Vec<_>>(),
+                "eligible_details": eligible_details(),
                 "eligible_count": configs.len(),
             }));
             return Vec::new();
