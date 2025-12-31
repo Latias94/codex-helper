@@ -7,8 +7,9 @@ use reqwest::Url;
 use tokio::sync::{OnceCell, Semaphore};
 
 use crate::config::{
-    UpstreamConfig, load_config, overwrite_codex_config_from_codex_cli_in_place, proxy_home_dir,
-    save_config,
+    SyncCodexAuthFromCodexOptions, UpstreamConfig, load_config,
+    overwrite_codex_config_from_codex_cli_in_place, proxy_home_dir, save_config,
+    sync_codex_auth_from_codex_cli,
 };
 use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
 
@@ -83,7 +84,7 @@ pub(in crate::tui) async fn handle_key_event(
         },
         Overlay::EffortMenu => handle_key_effort_menu(&state, ui, snapshot, key).await,
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
-            handle_key_provider_menu(&state, providers.as_slice(), ui, snapshot, key).await
+            handle_key_provider_menu(&state, providers, ui, snapshot, key).await
         }
     }
 }
@@ -151,12 +152,50 @@ async fn apply_session_provider_override(state: &ProxyState, sid: String, cfg: O
     }
 }
 
-async fn apply_global_provider_override(state: &ProxyState, cfg: Option<String>) {
-    if let Some(cfg) = cfg {
-        state.set_global_config_override(cfg).await;
-    } else {
-        state.clear_global_config_override().await;
+async fn apply_global_active_config(
+    state: &ProxyState,
+    providers: &mut Vec<ProviderOption>,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    cfg_name: Option<String>,
+) -> anyhow::Result<()> {
+    // Do not pin routing via runtime override; only persist the preferred config (active),
+    // so failover across configs remains possible.
+    state.clear_global_config_override().await;
+
+    let mut cfg = load_config().await?;
+    if ui.service_name == "codex" {
+        let _ = sync_codex_auth_from_codex_cli(
+            &mut cfg,
+            SyncCodexAuthFromCodexOptions {
+                add_missing: false,
+                set_active: false,
+                force: false,
+            },
+        );
     }
+
+    let mgr = if ui.service_name == "claude" {
+        &mut cfg.claude
+    } else {
+        &mut cfg.codex
+    };
+    if let Some(name) = cfg_name.as_deref()
+        && !mgr.configs.contains_key(name)
+    {
+        anyhow::bail!("unknown provider: {name}");
+    }
+    mgr.active = cfg_name;
+
+    save_config(&cfg).await?;
+
+    // Best-effort: ask the running server to reload immediately.
+    let url = format!("http://127.0.0.1:{}/__codex_helper/config/reload", ui.port);
+    let _ = reqwest::Client::new().post(&url).send().await;
+
+    *providers = crate::tui::build_provider_options(&cfg, ui.service_name);
+    ui.clamp_selection(snapshot, providers.len());
+    Ok(())
 }
 
 async fn persist_config_meta(
@@ -757,16 +796,36 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Enter if ui.page == Page::Configs => {
-            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+            let Some(name) = providers.get(ui.selected_config_idx).map(|p| p.name.clone()) else {
                 return true;
             };
-            apply_global_provider_override(state, Some(pvd.name.clone())).await;
-            ui.toast = Some((format!("global cfg override: {}", pvd.name), Instant::now()));
+            match apply_global_active_config(
+                state,
+                providers,
+                ui,
+                snapshot,
+                Some(name.clone()),
+            )
+            .await
+            {
+                Ok(()) => {
+                    ui.toast = Some((format!("active cfg: {name}"), Instant::now()));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("set active failed: {err}"), Instant::now()));
+                }
+            }
             true
         }
         KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Configs => {
-            apply_global_provider_override(state, None).await;
-            ui.toast = Some(("global cfg override: <clear>".to_string(), Instant::now()));
+            match apply_global_active_config(state, providers, ui, snapshot, None).await {
+                Ok(()) => {
+                    ui.toast = Some(("active cfg: <auto>".to_string(), Instant::now()));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("set active failed: {err}"), Instant::now()));
+                }
+            }
             true
         }
         KeyCode::Char('o') if ui.page == Page::Configs => {
@@ -1396,7 +1455,12 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('P') => {
-            let current = snapshot.global_override.as_deref().unwrap_or("");
+            let current = snapshot
+                .global_override
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| providers.iter().find(|p| p.active).map(|p| p.name.as_str()))
+                .unwrap_or("");
             ui.provider_menu_idx = providers
                 .iter()
                 .position(|p| p.name == current)
@@ -1455,7 +1519,7 @@ async fn handle_key_effort_menu(
 
 async fn handle_key_provider_menu(
     state: &ProxyState,
-    providers: &[ProviderOption],
+    providers: &mut Vec<ProviderOption>,
     ui: &mut UiState,
     snapshot: &Snapshot,
     key: KeyEvent,
@@ -1484,14 +1548,21 @@ async fn handle_key_provider_menu(
 
             match ui.overlay {
                 Overlay::ProviderMenuGlobal => {
-                    apply_global_provider_override(state, chosen.clone()).await;
-                    ui.toast = Some((
-                        format!(
-                            "global cfg override: {}",
-                            chosen.as_deref().unwrap_or("<clear>")
-                        ),
-                        Instant::now(),
-                    ));
+                    match apply_global_active_config(state, providers, ui, snapshot, chosen.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            let active = providers
+                                .iter()
+                                .find(|p| p.active)
+                                .map(|p| p.name.as_str())
+                                .unwrap_or("<auto>");
+                            ui.toast = Some((format!("active cfg: {active}"), Instant::now()));
+                        }
+                        Err(err) => {
+                            ui.toast = Some((format!("set active failed: {err}"), Instant::now()));
+                        }
+                    }
                 }
                 Overlay::ProviderMenuSession => {
                     let Some(sid) = snapshot

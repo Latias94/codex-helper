@@ -352,9 +352,9 @@ pub(super) fn render_configs_page(
             "  i            provider details (scrollable)",
         )));
         lines.push(Line::from(
-            "  Enter        set global override to selected config",
+            "  Enter        set active config (same-level failover enabled)",
         ));
-        lines.push(Line::from("  Backspace    clear global override"));
+        lines.push(Line::from("  Backspace    clear active (auto)"));
         lines.push(Line::from(
             "  o            set session override to selected config",
         ));

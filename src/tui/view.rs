@@ -49,8 +49,8 @@ pub(in crate::tui) fn render_app(
                 ),
                 Overlay::ProviderMenuGlobal => crate::tui::i18n::pick(
                     ui.language,
-                    "全局 Provider 覆盖",
-                    "Global provider override",
+                    "全局 active Provider",
+                    "Global active provider",
                 ),
                 _ => unreachable!(),
             };

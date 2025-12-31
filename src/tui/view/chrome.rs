@@ -219,7 +219,7 @@ pub(super) fn render_header(
         ),
         Span::raw("   "),
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "配置(全局) ", "cfg(global) "),
+            crate::tui::i18n::pick(ui.language, "覆盖(全局) ", "override(global) "),
             Style::default().fg(p.muted),
         ),
         Span::styled(global_cfg.to_string(), Style::default().fg(p.accent)),
@@ -268,8 +268,8 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Configs => crate::tui::i18n::pick(
                 ui.language,
-                "1-6 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 全局 override  Backspace 清除  o 会话 override  O 清除  ? 帮助",
-                "1-6 pages  q quit  L language  ↑/↓ select  i details  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter global override  Backspace clear  o session override  O clear  ? help",
+                "1-6 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 设为 active  Backspace 自动  o 会话 override  O 清除  ? 帮助",
+                "1-6 pages  q quit  L language  ↑/↓ select  i details  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter set active  Backspace auto  o session override  O clear  ? help",
             ),
             Page::Requests => crate::tui::i18n::pick(
                 ui.language,
