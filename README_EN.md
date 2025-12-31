@@ -120,6 +120,15 @@ The key idea: put your primary and backup upstreams **in the same config’s `up
 
 > Note: if you split each provider into its own config and keep them all at the same `level` (e.g. everything is `level = 1`), codex-helper will still prefer the `active` config, but other same-level configs can participate in failover (to avoid a single point of failure).
 
+### Scenario quick matrix
+
+| Goal | Recommended layout | Key fields | Notes |
+| --- | --- | --- | --- |
+| One account, multiple endpoints (auto failover) | One config with multiple `[[...upstreams]]` | `codex.active`, `[[...upstreams]]`, `retry.strategy="failover"` | Simplest and most reliable |
+| Multiple providers as same-level backups | Multiple configs, all same `level` | `codex.active`, each config `enabled=true`, `retry.max_attempts>=2` | `active` is preferred; other same-level configs still participate in failover |
+| Relay-first, direct/official backup | Multiple configs with `level=1/2` | `level`, `enabled`, `retry.strategy="failover"` | Degrades across levels; when alternatives exist, fully cooled configs are skipped |
+| Monthly primary + pay-as-you-go backup (cost) | Same as above (`L1=monthly`, `L2=payg`) | `retry.transport_cooldown_secs`, `retry.cooldown_backoff_factor`, `retry.cooldown_backoff_max_secs` | Degrade to backup when unstable, and “probe back” via cooldown/backoff |
+
 Example `~/.codex-helper/config.toml` (recommended):
 
 ```toml

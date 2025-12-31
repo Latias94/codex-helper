@@ -82,6 +82,15 @@ ch
   > 提示：如果你把每个供应商都拆成一个 config，并且它们的 `level` 都是默认的 `1`（例如 `config list` 全是 `L1 on ...`），codex-helper 仍会**优先**使用 `active`，但同级其他 config 也会参与 failover（避免 `active` 单点）。  
   > 如果你想要明确的“跨配置降级”（例如 `L1=中转优先`、`L2=官方兜底`），请至少设置两档不同的 `level`（见下文），或把备份线路放回同一 config 的 `upstreams`。
 
+### 配置场景速查表
+
+| 场景目标 | 推荐布局 | 关键字段 | 备注 |
+| --- | --- | --- | --- |
+| 单账号多 endpoint 自动切换 | 单个 config + 多个 `[[...upstreams]]` | `codex.active`、`[[...upstreams]]`、`retry.strategy="failover"` | 最简单、最稳定；优先推荐 |
+| 多供应商同级互为备份（避免 active 单点） | 多个 config，全部同一 `level` | `codex.active`、各 config `enabled=true`、`retry.max_attempts>=2` | 同级会优先 `active`，但其他同级也会参与 failover |
+| 中转优先，官方/直连兜底 | 多个 config + `level=1/2` 分级 | `level`、`enabled`、`retry.strategy="failover"` | 失败时跨 level 降级；有其他候选时会跳过处于 cooldown 的 config |
+| 包月中转为主，按量备选为从（省钱+回切探测） | 同上（`L1=包月中转`，`L2=按量直连`） | `retry.transport_cooldown_secs`、`retry.cooldown_backoff_factor`、`retry.cooldown_backoff_max_secs` | 主线路不稳会降级到备选，并通过冷却/退避“隔一段时间探测回切” |
+
 示例（推荐：TOML，`~/.codex-helper/config.toml`）：
 
 ```toml
