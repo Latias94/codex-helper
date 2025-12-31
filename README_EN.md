@@ -125,14 +125,26 @@ The key idea: put your primary and backup upstreams **in the same config’s `up
 
 ### Scenario quick matrix
 
-| Goal | Recommended layout | Key fields | Notes |
-| --- | --- | --- | --- |
-| One account, multiple endpoints (auto failover) | One config with multiple `[[...upstreams]]` | `codex.active`, `[[...upstreams]]`, `retry.strategy="failover"` | Simplest and most reliable |
-| Multiple providers as same-level backups | Multiple configs, all same `level` | `codex.active`, each config `enabled=true`, `retry.max_attempts>=2` | `active` is preferred; other same-level configs still participate in failover |
-| Relay-first, direct/official backup | Multiple configs with `level=1/2` | `level`, `enabled`, `retry.strategy="failover"` | Degrades across levels; when alternatives exist, fully cooled configs are skipped |
-| Monthly primary + pay-as-you-go backup (cost) | Same as above (`L1=monthly`, `L2=payg`) | `retry.transport_cooldown_secs`, `retry.cooldown_backoff_factor`, `retry.cooldown_backoff_max_secs` | Degrade to backup when unstable, and “probe back” via cooldown/backoff |
+Think of codex-helper config in 2 layers:
 
-Example `~/.codex-helper/config.toml` (recommended):
+1) **Grouping (routing)**: each config has a `level` (1..=10). `active` is preferred. `enabled=false` excludes a config from automatic routing (unless it is the active config).
+2) **Strategy (retry)**: controls how codex-helper retries/cools down/probes back.
+
+If you already imported accounts via `codex-helper config overwrite-from-codex --yes` (most common), you usually don’t need to hand-write `[[...upstreams]]`. You only need:
+
+- Grouping: `codex-helper config set-level <name> <level>` + `codex-helper config set-active <name>`
+- Strategy: `codex-helper config set-retry-profile <balanced|same-upstream|aggressive-failover|cost-primary>`
+
+> Note: `set-retry-profile` overwrites the whole `[retry]` block. If you want advanced tweaks (`max_attempts`, `on_status`, `transport_cooldown_secs`, ...), apply a profile first, then edit the config file.
+
+| Goal | What to change after import | Suggested retry profile | Notes |
+| --- | --- | --- | --- |
+| One account, multiple endpoints (auto failover) | Merge multiple endpoints into one config’s `upstreams` (see Template A) | `balanced` | Simplest and most reliable |
+| Multiple providers as same-level backups | Keep them at the same `level` (default is 1) and set one `active` (see Template B) | `balanced` | `active` is preferred; other same-level configs still participate in failover |
+| Relay-first, direct/official backup | Put relays at `level=1`, direct/official at `level=2` (see Template C) | `balanced` | Degrades across levels; fully cooled configs are skipped when alternatives exist |
+| Monthly primary + pay-as-you-go backup (cost) | Same grouping as above, set the monthly relay as `active` (see Template D) | `cost-primary` | Degrade to backup when unstable, and “probe back” via cooldown/backoff |
+
+#### Template A: one config with multiple upstream endpoints
 
 ```toml
 version = 1
@@ -156,13 +168,60 @@ auth = { auth_token_env = "YESCODE_API_KEY" }
 tags = { provider_id = "yes", source = "codex-config" }
 ```
 
-With this layout:
+Notes:
 
-- `active = "codex-main"` → the load balancer chooses between `upstreams[0]` (Packy) and `upstreams[1]` (Yes);
-- when an upstream either:
-  - exceeds the failure threshold (`FAILURE_THRESHOLD` in `src/lb.rs`), or
-  - is marked `usage_exhausted = true` by `usage_providers`,
-  the LB will prefer the other upstream whenever possible.
+- `active` points to this config, so the LB can fail over between multiple upstream endpoints.
+- When an upstream fails or is marked `usage_exhausted`, codex-helper prefers other upstreams when possible.
+
+#### Template B: multiple providers as same-level backups (import-first)
+
+```bash
+codex-helper config overwrite-from-codex --yes
+
+# Pick a preferred config (still allows same-level failover)
+codex-helper config set-active right
+
+codex-helper config set-retry-profile balanced
+```
+
+> Want fewer candidates? Disable configs you don’t want in automatic routing (active is still eligible): `codex-helper config disable some-provider`.
+
+#### Template C: relay-first, direct/official backup (level grouping)
+
+> `right/packyapi/yescode/openai` are just example names; replace them with what you see in `codex-helper config list`.
+
+```bash
+codex-helper config overwrite-from-codex --yes
+
+# L1: relays
+codex-helper config set-level right 1
+codex-helper config set-level packyapi 1
+codex-helper config set-level yescode 1
+
+# L2: direct/official backup
+codex-helper config set-level openai 2
+
+codex-helper config set-active right
+codex-helper config set-retry-profile balanced
+```
+
+#### Template D: monthly primary + pay-as-you-go backup (cost + probe-back)
+
+> `right/openai` are just example names; replace them with what you see in `codex-helper config list`.
+
+```bash
+codex-helper config overwrite-from-codex --yes
+
+# L1: monthly relay (cheap, may be flaky)
+codex-helper config set-level right 1
+codex-helper config set-active right
+
+# L2: pay-as-you-go direct (more expensive, more reliable)
+codex-helper config set-level openai 2
+
+# Cost-primary enables cooldown exponential backoff for probe-back.
+codex-helper config set-retry-profile cost-primary
+```
 
 ### Level-based multi-config failover (optional)
 
@@ -229,6 +288,13 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
 
   ```bash
   codex-helper config set-active openai-main
+  ```
+
+- Set a curated retry profile (writes the `[retry]` block; good when you only want “pick a strategy”):
+
+  ```bash
+  codex-helper config set-retry-profile balanced
+  codex-helper config set-retry-profile cost-primary
   ```
 
 - Level-based routing controls (multi-config failover):

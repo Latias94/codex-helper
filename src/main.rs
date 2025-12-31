@@ -14,7 +14,7 @@ mod usage;
 mod usage_providers;
 
 use axum::Router;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -302,6 +302,12 @@ enum ConfigCommand {
         #[arg(long)]
         claude: bool,
     },
+    /// Set retry policy to a curated profile (writes to ~/.codex-helper/config.*)
+    #[command(name = "set-retry-profile")]
+    SetRetryProfile {
+        #[arg(value_enum)]
+        profile: RetryProfile,
+    },
     /// Import Codex upstream config from ~/.codex/config.toml + auth.json into ~/.codex-helper/config (toml/json)
     ImportFromCodex {
         /// Overwrite existing Codex configs in ~/.codex-helper/config (toml/json)
@@ -320,6 +326,19 @@ enum ConfigCommand {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+enum RetryProfile {
+    /// Default balanced settings (recommended for most users).
+    Balanced,
+    /// Prefer retrying the same upstream (useful for CF/network flakiness).
+    SameUpstream,
+    /// Try harder before giving up (more attempts; can increase cost/latency).
+    AggressiveFailover,
+    /// Cost-optimized primary/backup: enable cooldown exponential backoff for probe-back.
+    CostPrimary,
 }
 
 #[derive(Subcommand, Debug)]

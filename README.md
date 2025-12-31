@@ -87,14 +87,28 @@ ch
 
 ### 配置场景速查表
 
-| 场景目标 | 推荐布局 | 关键字段 | 备注 |
-| --- | --- | --- | --- |
-| 单账号多 endpoint 自动切换 | 单个 config + 多个 `[[...upstreams]]` | `codex.active`、`[[...upstreams]]`、`retry.strategy="failover"` | 最简单、最稳定；优先推荐 |
-| 多供应商同级互为备份（避免 active 单点） | 多个 config，全部同一 `level` | `codex.active`、各 config `enabled=true`、`retry.max_attempts>=2` | 同级会优先 `active`，但其他同级也会参与 failover |
-| 中转优先，官方/直连兜底 | 多个 config + `level=1/2` 分级 | `level`、`enabled`、`retry.strategy="failover"` | 失败时跨 level 降级；有其他候选时会跳过处于 cooldown 的 config |
-| 包月中转为主，按量备选为从（省钱+回切探测） | 同上（`L1=包月中转`，`L2=按量直连`） | `retry.transport_cooldown_secs`、`retry.cooldown_backoff_factor`、`retry.cooldown_backoff_max_secs` | 主线路不稳会降级到备选，并通过冷却/退避“隔一段时间探测回切” |
+把配置理解成两层就不容易迷路：
 
-示例（推荐：TOML，`~/.codex-helper/config.toml`）：
+1) **分组（routing）**：每个 config 有 `level`（1..=10），`active` 是首选，`enabled=false` 可把它排除出自动路由（但如果它是 active 仍会参与）。
+2) **策略（retry）**：决定失败时怎么重试/怎么冷却/是否“回切探测”。
+
+如果你已经用 `codex-helper config overwrite-from-codex --yes` 同步过账号信息（最常见），通常不需要手写 `[[...upstreams]]`；你只需要：
+
+- 分组：`codex-helper config set-level <name> <level>` + `codex-helper config set-active <name>`
+- 策略：`codex-helper config set-retry-profile <balanced|same-upstream|aggressive-failover|cost-primary>`
+
+> 注意：`set-retry-profile` 会覆盖整个 `[retry]` 段；如果你要高级微调（例如 `max_attempts`、`on_status`、`transport_cooldown_secs`），可以在执行 profile 后再手改配置文件。
+
+| 场景目标 | 你只需要怎么“分组”（导入后） | 建议策略（profile） | 备注 |
+| --- | --- | --- | --- |
+| 单账号多 endpoint 自动切换 | 需要把多个 endpoint 合并到同一个 config 的 `upstreams`（见模板 A） | `balanced` | 最简单、最稳定；优先推荐 |
+| 多供应商同级互为备份（避免 active 单点） | 让多个 config 都是同一个 `level`（默认就是 1），并设置一个 `active`（见模板 B） | `balanced` | 同级会优先 `active`，但其他同级也会参与 failover |
+| 中转优先，官方/直连兜底 | 把中转设 `level=1`，把直连/官方设 `level=2`（见模板 C） | `balanced` | 失败时跨 level 降级；有其他候选时会跳过处于 cooldown 的 config |
+| 包月中转为主，按量备选为从（省钱+回切探测） | 同上（`L1=包月中转`，`L2=按量直连`），并把包月中转设为 `active`（见模板 D） | `cost-primary` | 主线路不稳会降级到备选，并通过冷却/退避“隔一段时间探测回切” |
+
+#### 模板 A：单账号多 endpoint（同一个 config 多 upstream）
+
+适合你希望“同一类账号/同一中转商”的多个 endpoint 自动切换（最快最稳）。这需要你手动把多个 endpoint 放进同一个 config 的 `upstreams`：
 
 ```toml
 version = 1
@@ -118,14 +132,62 @@ auth = { auth_token_env = "YESCODE_API_KEY" }
 tags = { provider_id = "yes", source = "codex-config" }
 ```
 
-在这份配置下：
+说明：
 
-- `active = "codex-main"` → 负载均衡器会在 `upstreams[0]`（Packy）和 `upstreams[1]`（Yes）之间选择；
-- 当某个 upstream：
-  - 连续失败达到阈值（`FAILURE_THRESHOLD`，见 `src/lb.rs`），或
-  - 被 `usage_providers` 标记为 `usage_exhausted = true`  
-  时，LB 会优先避开它，尽量选择列表中的其他 upstream；
-- 所有 upstream 都被视为“不可用”时，仍会兜底返回第一个，避免完全断流。
+- `active` 指向这个 config，LB 会在多个 upstream 之间自动切换。
+- 当某个 upstream 失败/被标记为 `usage_exhausted` 时，会尽量选择其他 upstream；全部不可用时会兜底返回第一个，避免硬断流。
+
+#### 模板 B：多供应商同级互备（导入后只改 active）
+
+```bash
+codex-helper config overwrite-from-codex --yes
+
+# 选择一个首选（但仍允许同级 failover）
+codex-helper config set-active right
+
+# 同级互备一般用默认 profile 即可
+codex-helper config set-retry-profile balanced
+```
+
+> 想缩小候选集：把你不希望参与自动路由的 config `disable` 掉（active 除外）。例如：`codex-helper config disable some-provider`。
+
+#### 模板 C：中转优先，直连/官方兜底（level 分级）
+
+> 下面的 `right/packyapi/yescode/openai` 仅为示例，请以 `codex-helper config list` 输出的真实名称替换。
+
+```bash
+codex-helper config overwrite-from-codex --yes
+
+# L1：各类中转
+codex-helper config set-level right 1
+codex-helper config set-level packyapi 1
+codex-helper config set-level yescode 1
+
+# L2：直连/官方兜底
+codex-helper config set-level openai 2
+
+# 首选一个中转（仍允许跨 level 降级）
+codex-helper config set-active right
+codex-helper config set-retry-profile balanced
+```
+
+#### 模板 D：包月中转主、按量直连从（省钱 + 回切探测）
+
+> 下面的 `right/openai` 仅为示例，请以 `codex-helper config list` 输出的真实名称替换。
+
+```bash
+codex-helper config overwrite-from-codex --yes
+
+# L1：包月中转（便宜但可能不稳）
+codex-helper config set-level right 1
+codex-helper config set-active right
+
+# L2：按量直连（贵但稳）
+codex-helper config set-level openai 2
+
+# 开启 cost-primary：失败越多，冷却越久；冷却到期会“探测回切”
+codex-helper config set-retry-profile cost-primary
+```
 
 ### Level 分组（跨配置降级，可选）
 
@@ -203,6 +265,13 @@ codex-helper config set-level openai 2
 
   ```bash
   codex-helper config set-active openai-main
+  ```
+
+- 设置重试策略预设（写入 `[retry]` 段，适合“只选策略，不想调一堆参数”的用法）：
+
+  ```bash
+  codex-helper config set-retry-profile balanced
+  codex-helper config set-retry-profile cost-primary
   ```
 
 - 调整 Level 分组 / 启用禁用（用于跨配置降级）：
