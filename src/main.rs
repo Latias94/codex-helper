@@ -218,6 +218,9 @@ enum ConfigCommand {
         /// Overwrite existing config.toml (backing up to config.toml.bak)
         #[arg(long)]
         force: bool,
+        /// Do not auto-import Codex providers from ~/.codex/config.toml (template only)
+        #[arg(long)]
+        no_import: bool,
     },
     /// List configs in ~/.codex-helper/config.toml (or config.json)
     List {

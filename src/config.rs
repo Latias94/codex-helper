@@ -274,7 +274,7 @@ impl Default for RetryStrategy {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            profile: None,
+            profile: Some(RetryProfileName::Balanced),
             max_attempts: None,
             backoff_ms: None,
             backoff_max_ms: None,
@@ -549,6 +549,14 @@ version = 1
 # default_service = "codex"
 # default_service = "claude"
 
+# --- 自动导入（可选） ---
+#
+# 如果你的机器上已配置 Codex CLI（存在 `~/.codex/config.toml`），`codex-helper config init`
+# 会尝试自动把 Codex providers 导入到本文件中，避免你手动抄写 base_url/env_key。
+#
+# 如果你只想生成纯模板（不导入），请使用：
+#   codex-helper config init --no-import
+
 # --- 通用：上游配置（账号 / API Key） ---
 #
 # 大部分用户只需要改这一段。
@@ -684,7 +692,42 @@ profile = "balanced"
 # cooldown_backoff_max_secs = 600
 "#;
 
-pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
+fn insert_after_version_block(template: &str, insert: &str) -> String {
+    let needle = "version = 1\n\n";
+    if let Some(idx) = template.find(needle) {
+        let insert_pos = idx + needle.len();
+        let mut out = String::with_capacity(template.len() + insert.len() + 2);
+        out.push_str(&template[..insert_pos]);
+        out.push_str(insert);
+        out.push('\n');
+        out.push_str(&template[insert_pos..]);
+        return out;
+    }
+    format!("{template}\n\n{insert}\n")
+}
+
+fn codex_bootstrap_snippet() -> Result<Option<String>> {
+    #[derive(Serialize)]
+    struct CodexOnly<'a> {
+        codex: &'a ServiceConfigManager,
+    }
+
+    let mut cfg = ProxyConfig::default();
+    ensure_config_version(&mut cfg);
+    if bootstrap_from_codex(&mut cfg).is_err() {
+        return Ok(None);
+    }
+    if cfg.codex.configs.is_empty() {
+        return Ok(None);
+    }
+
+    let body = toml::to_string_pretty(&CodexOnly { codex: &cfg.codex })?;
+    Ok(Some(format!(
+        "# --- 自动导入：来自 ~/.codex/config.toml + auth.json ---\n{body}"
+    )))
+}
+
+pub async fn init_config_toml(force: bool, import_codex: bool) -> Result<PathBuf> {
     let dir = config_dir();
     fs::create_dir_all(&dir).await?;
     let path = config_toml_path();
@@ -704,7 +747,14 @@ pub async fn init_config_toml(force: bool) -> Result<PathBuf> {
     }
 
     let tmp_path = dir.join("config.toml.tmp");
-    fs::write(&tmp_path, CONFIG_TOML_TEMPLATE.as_bytes()).await?;
+
+    let mut text = CONFIG_TOML_TEMPLATE.to_string();
+    if import_codex {
+        if let Some(snippet) = codex_bootstrap_snippet()? {
+            text = insert_after_version_block(&text, snippet.as_str());
+        }
+    }
+    fs::write(&tmp_path, text.as_bytes()).await?;
     fs::rename(&tmp_path, &path).await?;
     Ok(path)
 }
@@ -1782,6 +1832,83 @@ enabled = true
                 "expected config.toml to take precedence over config.json (home={:?})",
                 home
             );
+        });
+    }
+
+    #[test]
+    fn init_config_toml_inserts_codex_bootstrap_when_available() {
+        let env = setup_temp_codex_home();
+        let home = env.home.clone();
+
+        // Provide a minimal Codex config that bootstrap_from_codex can parse.
+        write_file(
+            &home.join("config.toml"),
+            r#"
+model_provider = "right"
+
+[model_providers.right]
+name = "right"
+base_url = "https://www.right.codes/codex/v1"
+env_key = "RIGHTCODE_API_KEY"
+"#,
+        );
+        write_file(&home.join("auth.json"), r#"{ "RIGHTCODE_API_KEY": "sk-test-123" }"#);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async move {
+            let path = super::init_config_toml(true, true).await.expect("init_config_toml");
+            let text = std::fs::read_to_string(&path).expect("read config.toml");
+            assert!(
+                text.contains("\n[codex]\n"),
+                "expected init to insert a real [codex] block (path={:?})",
+                path
+            );
+            assert!(
+                text.contains("active = \"right\""),
+                "expected imported active config to be present"
+            );
+            assert!(
+                text.contains("\n[retry]\n") && text.contains("profile = \"balanced\""),
+                "expected retry.profile default to be visible"
+            );
+        });
+    }
+
+    #[test]
+    fn init_config_toml_can_skip_codex_bootstrap_with_no_import() {
+        let env = setup_temp_codex_home();
+        let home = env.home.clone();
+
+        // Even if Codex config exists, no_import should not insert the real [codex] block.
+        write_file(
+            &home.join("config.toml"),
+            r#"
+model_provider = "right"
+
+[model_providers.right]
+name = "right"
+base_url = "https://www.right.codes/codex/v1"
+env_key = "RIGHTCODE_API_KEY"
+"#,
+        );
+        write_file(&home.join("auth.json"), r#"{ "RIGHTCODE_API_KEY": "sk-test-123" }"#);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async move {
+            let path = super::init_config_toml(true, false).await.expect("init_config_toml");
+            let text = std::fs::read_to_string(&path).expect("read config.toml");
+            assert!(
+                !text.contains("\n[codex]\n"),
+                "expected no_import to skip inserting a real [codex] block"
+            );
+            // But the template still contains the commented example.
+            assert!(text.contains("# [codex]"));
         });
     }
 

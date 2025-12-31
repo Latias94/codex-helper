@@ -28,8 +28,8 @@ async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result<&'static s
 
 pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
     match cmd {
-        ConfigCommand::Init { force } => {
-            let path = init_config_toml(force)
+        ConfigCommand::Init { force, no_import } => {
+            let path = init_config_toml(force, !no_import)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!("Wrote TOML config template to {:?}", path);
