@@ -453,14 +453,7 @@ Sensitive headers are redacted automatically (e.g. `Authorization`/`Cookie`). If
 Some upstream failures are transient (network hiccups, 429 rate limits, 502/503/504/524, or Cloudflare/WAF-like HTML challenge pages). codex-helper can perform a small number of retries **before any response bytes are streamed to the client**, and will try to switch to a different upstream when possible.
 
 - Strongly recommended: set Codex-side `model_providers.codex_proxy.request_max_retries = 0` so retry/failover happens in codex-helper (and you don’t burn Codex’s default request retries on the same 502). `switch on` writes `0` only when the key is absent.
-- Global defaults live under the `[retry]` block in `~/.codex-helper/config.toml` (or `config.json`). Environment variables with the same names can override them at runtime (useful for temporary debugging).
-- `CODEX_HELPER_RETRY_MAX_ATTEMPTS=2`: max attempts (default from `retry.max_attempts`; max 8; set to 1 to disable)
-- `CODEX_HELPER_RETRY_STRATEGY=failover|same_upstream`: retry strategy (default `failover`; `same_upstream` prefers retrying the same upstream and can help with CF/network flakiness)
-- `CODEX_HELPER_RETRY_ON_STATUS=429,502,503,504,524`: retry on these status codes (supports ranges like `500-599`; if upstream returns `Retry-After`, codex-helper will prefer that backoff)
-- `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`: retry on these error classes
-- `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`: retry backoff (ms)
-- `CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS=300` / `CODEX_HELPER_RETRY_CLOUDFLARE_TIMEOUT_COOLDOWN_SECS=60` / `CODEX_HELPER_RETRY_TRANSPORT_COOLDOWN_SECS=30`: upstream cooldown penalties (seconds)
-- `CODEX_HELPER_RETRY_COOLDOWN_BACKOFF_FACTOR=2` / `CODEX_HELPER_RETRY_COOLDOWN_BACKOFF_MAX_SECS=600`: exponential backoff for cooldown penalties (useful for “primary/backup + probe back” setups)
+- Global defaults live under the `[retry]` block in `~/.codex-helper/config.toml` (or `config.json`). Starting from `v0.8.0`, retry parameters are no longer overridable via environment variables.
 
 Example config (`~/.codex-helper/config.toml`):
 
