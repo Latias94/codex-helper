@@ -809,9 +809,41 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
 
 /// 获取 codex-helper 的主目录（用于配置、日志等）
 pub fn proxy_home_dir() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".codex-helper")
+    if let Ok(dir) = env::var("CODEX_HELPER_HOME") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    #[cfg(test)]
+    {
+        static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        TEST_HOME
+            .get_or_init(|| {
+                let mut dir = std::env::temp_dir();
+                let unique = format!(
+                    "codex-helper-test-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                );
+                dir.push(unique);
+                dir.push(".codex-helper");
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            })
+            .clone()
+    }
+
+    #[cfg(not(test))]
+    {
+        home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".codex-helper")
+    }
 }
 
 fn codex_home() -> PathBuf {
@@ -1766,7 +1798,10 @@ mod tests {
         dir.push(suffix);
         std::fs::create_dir_all(&dir).expect("create temp codex home");
         let mut scoped = ScopedEnv::new();
+        let proxy_home = dir.join(".codex-helper");
+        std::fs::create_dir_all(&proxy_home).expect("create temp proxy home");
         unsafe {
+            scoped.set("CODEX_HELPER_HOME", &proxy_home);
             scoped.set("CODEX_HOME", &dir);
             // 将 HOME 也指向该目录，确保 proxy_home_dir()/config.json 也被隔离在测试目录中。
             scoped.set("HOME", &dir);
