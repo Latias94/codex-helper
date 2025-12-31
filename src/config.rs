@@ -155,6 +155,7 @@ pub fn model_routing_warnings(cfg: &ProxyConfig, service_name: &str) -> Vec<Stri
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     /// 配置标识（map key），保持稳定
+    #[serde(default)]
     pub name: String,
     /// 可选别名，便于展示/记忆
     #[serde(default)]
@@ -758,6 +759,7 @@ pub async fn load_config() -> Result<ProxyConfig> {
         let text = fs::read_to_string(&toml_path).await?;
         let mut cfg = toml::from_str::<ProxyConfig>(&text)?;
         ensure_config_version(&mut cfg);
+        normalize_proxy_config(&mut cfg);
         return Ok(cfg);
     }
 
@@ -766,17 +768,20 @@ pub async fn load_config() -> Result<ProxyConfig> {
         let bytes = fs::read(json_path).await?;
         let mut cfg = serde_json::from_slice::<ProxyConfig>(&bytes)?;
         ensure_config_version(&mut cfg);
+        normalize_proxy_config(&mut cfg);
         return Ok(cfg);
     }
 
     let mut cfg = ProxyConfig::default();
     ensure_config_version(&mut cfg);
+    normalize_proxy_config(&mut cfg);
     Ok(cfg)
 }
 
 pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
     let mut cfg = cfg.clone();
     ensure_config_version(&mut cfg);
+    normalize_proxy_config(&mut cfg);
 
     let dir = config_dir();
     fs::create_dir_all(&dir).await?;
@@ -805,6 +810,19 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
     fs::write(&tmp_path, &data).await?;
     fs::rename(&tmp_path, &path).await?;
     Ok(())
+}
+
+fn normalize_proxy_config(cfg: &mut ProxyConfig) {
+    fn normalize_mgr(mgr: &mut ServiceConfigManager) {
+        for (key, svc) in mgr.configs.iter_mut() {
+            if svc.name.trim().is_empty() {
+                svc.name = key.clone();
+            }
+        }
+    }
+
+    normalize_mgr(&mut cfg.codex);
+    normalize_mgr(&mut cfg.claude);
 }
 
 /// 获取 codex-helper 的主目录（用于配置、日志等）
@@ -1815,6 +1833,49 @@ enabled = true
             assert!(
                 cfg.notify.enabled,
                 "expected config.toml to take precedence over config.json (home={:?})",
+                home
+            );
+        });
+    }
+
+    #[test]
+    fn load_config_toml_allows_missing_service_name_and_infers_from_key() {
+        let env = setup_temp_codex_home();
+        let home = env.home.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 1
+
+[codex]
+active = "right"
+
+[codex.configs.right]
+# name omitted on purpose
+
+[[codex.configs.right.upstreams]]
+base_url = "https://www.right.codes/codex/v1"
+[codex.configs.right.upstreams.auth]
+auth_token_env = "RIGHTCODE_API_KEY"
+"#,
+            );
+
+            let cfg = super::load_config().await.expect("load_config");
+            let svc = cfg
+                .codex
+                .configs
+                .get("right")
+                .expect("codex config 'right'");
+            assert_eq!(
+                svc.name, "right",
+                "expected ServiceConfig.name to default to the map key (home={:?})",
                 home
             );
         });
