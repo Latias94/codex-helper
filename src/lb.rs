@@ -15,13 +15,6 @@ pub struct CooldownBackoff {
 }
 
 impl CooldownBackoff {
-    pub const fn disabled() -> Self {
-        Self {
-            factor: 1,
-            max_secs: 0,
-        }
-    }
-
     fn effective_cooldown_secs(&self, base_secs: u64, penalty_streak: u32) -> u64 {
         if base_secs == 0 {
             return 0;
@@ -88,7 +81,7 @@ impl LoadBalancer {
         Self { service, states }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn select_upstream(&self) -> Option<SelectedUpstream> {
         self.select_upstream_avoiding(&HashSet::new())
     }
@@ -219,10 +212,6 @@ impl LoadBalancer {
         })
     }
 
-    pub fn penalize(&self, index: usize, cooldown_secs: u64, reason: &str) {
-        self.penalize_with_backoff(index, cooldown_secs, reason, CooldownBackoff::disabled());
-    }
-
     pub fn penalize_with_backoff(
         &self,
         index: usize,
@@ -259,10 +248,6 @@ impl LoadBalancer {
             "lb: upstream '{}' index {} penalized for {}s (reason: {})",
             self.service.name, index, effective_secs, reason
         );
-    }
-
-    pub fn record_result(&self, index: usize, success: bool) {
-        self.record_result_with_backoff(index, success, COOLDOWN_SECS, CooldownBackoff::disabled());
     }
 
     pub fn record_result_with_backoff(
@@ -430,9 +415,14 @@ mod tests {
         let states = Arc::new(Mutex::new(HashMap::new()));
         let lb = LoadBalancer::new(Arc::new(service), states.clone());
 
+        let disabled_backoff = CooldownBackoff {
+            factor: 1,
+            max_secs: 0,
+        };
+
         // 对 primary 连续记录 FAILURE_THRESHOLD 次失败。
         for _ in 0..FAILURE_THRESHOLD {
-            lb.record_result(0, false);
+            lb.record_result_with_backoff(0, false, COOLDOWN_SECS, disabled_backoff);
         }
 
         // 此时应选择 backup（index 1），因为 index 0 已达到失败阈值。

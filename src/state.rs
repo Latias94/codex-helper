@@ -381,11 +381,6 @@ impl ProxyState {
         guard.clone()
     }
 
-    pub async fn set_global_config_override(&self, config_name: String) {
-        let mut guard = self.global_config_override.write().await;
-        *guard = Some(config_name);
-    }
-
     pub async fn clear_global_config_override(&self) {
         let mut guard = self.global_config_override.write().await;
         *guard = None;

@@ -256,19 +256,14 @@ pub struct RetryConfig {
     pub cooldown_backoff_max_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryStrategy {
     /// Prefer switching to another upstream on retry (default).
+    #[default]
     Failover,
     /// Prefer retrying the same upstream (opt-in).
     SameUpstream,
-}
-
-impl Default for RetryStrategy {
-    fn default() -> Self {
-        Self::Failover
-    }
 }
 
 impl Default for RetryConfig {
@@ -749,10 +744,8 @@ pub async fn init_config_toml(force: bool, import_codex: bool) -> Result<PathBuf
     let tmp_path = dir.join("config.toml.tmp");
 
     let mut text = CONFIG_TOML_TEMPLATE.to_string();
-    if import_codex {
-        if let Some(snippet) = codex_bootstrap_snippet()? {
-            text = insert_after_version_block(&text, snippet.as_str());
-        }
+    if import_codex && let Some(snippet) = codex_bootstrap_snippet()? {
+        text = insert_after_version_block(&text, snippet.as_str());
     }
     fs::write(&tmp_path, text.as_bytes()).await?;
     fs::rename(&tmp_path, &path).await?;
