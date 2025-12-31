@@ -745,9 +745,11 @@ async fn proxy_multi_config_failover_across_requests_respects_cooldown() {
             b_hits.fetch_add(1, Ordering::SeqCst);
             async move {
                 let s = stream::iter(
-                    vec![Bytes::from_static(b"data: {\"ok\":true,\"upstream\":\"backup\"}\n\n")]
-                        .into_iter()
-                        .map(Ok::<Bytes, Infallible>),
+                    vec![Bytes::from_static(
+                        b"data: {\"ok\":true,\"upstream\":\"backup\"}\n\n",
+                    )]
+                    .into_iter()
+                    .map(Ok::<Bytes, Infallible>),
                 );
                 let mut resp = Response::new(Body::from_stream(s));
                 *resp.status_mut() = StatusCode::OK;
@@ -1812,7 +1814,10 @@ async fn proxy_runtime_config_reports_resolved_retry_profile() {
 
     let client = reqwest::Client::new();
     let v: serde_json::Value = client
-        .get(format!("http://{}/__codex_helper/config/runtime", proxy_addr))
+        .get(format!(
+            "http://{}/__codex_helper/config/runtime",
+            proxy_addr
+        ))
         .send()
         .await
         .expect("send")
@@ -1827,14 +1832,20 @@ async fn proxy_runtime_config_reports_resolved_retry_profile() {
         retry.get("profile").is_none(),
         "runtime endpoint should expose resolved retry config (no profile field)"
     );
-    assert_eq!(retry.get("strategy").and_then(|x| x.as_str()), Some("failover"));
+    assert_eq!(
+        retry.get("strategy").and_then(|x| x.as_str()),
+        Some("failover")
+    );
     assert_eq!(retry.get("max_attempts").and_then(|x| x.as_u64()), Some(2));
     assert_eq!(
-        retry.get("cooldown_backoff_factor").and_then(|x| x.as_u64()),
+        retry
+            .get("cooldown_backoff_factor")
+            .and_then(|x| x.as_u64()),
         Some(2)
     );
     assert_eq!(
-        retry.get("cooldown_backoff_max_secs")
+        retry
+            .get("cooldown_backoff_max_secs")
             .and_then(|x| x.as_u64()),
         Some(900)
     );

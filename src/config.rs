@@ -1845,14 +1845,19 @@ base_url = "https://www.right.codes/codex/v1"
 env_key = "RIGHTCODE_API_KEY"
 "#,
         );
-        write_file(&home.join("auth.json"), r#"{ "RIGHTCODE_API_KEY": "sk-test-123" }"#);
+        write_file(
+            &home.join("auth.json"),
+            r#"{ "RIGHTCODE_API_KEY": "sk-test-123" }"#,
+        );
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build tokio runtime");
         rt.block_on(async move {
-            let path = super::init_config_toml(true, true).await.expect("init_config_toml");
+            let path = super::init_config_toml(true, true)
+                .await
+                .expect("init_config_toml");
             let text = std::fs::read_to_string(&path).expect("read config.toml");
             assert!(
                 text.contains("\n[codex]\n"),
@@ -1887,14 +1892,19 @@ base_url = "https://www.right.codes/codex/v1"
 env_key = "RIGHTCODE_API_KEY"
 "#,
         );
-        write_file(&home.join("auth.json"), r#"{ "RIGHTCODE_API_KEY": "sk-test-123" }"#);
+        write_file(
+            &home.join("auth.json"),
+            r#"{ "RIGHTCODE_API_KEY": "sk-test-123" }"#,
+        );
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build tokio runtime");
         rt.block_on(async move {
-            let path = super::init_config_toml(true, false).await.expect("init_config_toml");
+            let path = super::init_config_toml(true, false)
+                .await
+                .expect("init_config_toml");
             let text = std::fs::read_to_string(&path).expect("read config.toml");
             assert!(
                 !text.contains("\n[codex]\n"),
@@ -1915,7 +1925,12 @@ env_key = "RIGHTCODE_API_KEY"
         assert_eq!(resolved.backoff_max_ms, 2_000);
         assert_eq!(resolved.jitter_ms, 100);
         assert_eq!(resolved.on_status, "429,502,503,504,524");
-        assert!(resolved.on_class.iter().any(|c| c == "upstream_transport_error"));
+        assert!(
+            resolved
+                .on_class
+                .iter()
+                .any(|c| c == "upstream_transport_error")
+        );
         assert_eq!(resolved.cloudflare_challenge_cooldown_secs, 300);
         assert_eq!(resolved.cloudflare_timeout_cooldown_secs, 60);
         assert_eq!(resolved.transport_cooldown_secs, 30);

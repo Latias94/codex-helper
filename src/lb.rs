@@ -236,7 +236,8 @@ impl LoadBalancer {
 
         entry.failure_counts[index] = FAILURE_THRESHOLD;
         if let Some(slot) = entry.cooldown_until.get_mut(index) {
-            *slot = Some(std::time::Instant::now() + std::time::Duration::from_secs(effective_secs));
+            *slot =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(effective_secs));
         }
         if let Some(slot) = entry.penalty_streak.get_mut(index) {
             *slot = streak.saturating_add(1);

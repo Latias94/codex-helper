@@ -796,17 +796,14 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Enter if ui.page == Page::Configs => {
-            let Some(name) = providers.get(ui.selected_config_idx).map(|p| p.name.clone()) else {
+            let Some(name) = providers
+                .get(ui.selected_config_idx)
+                .map(|p| p.name.clone())
+            else {
                 return true;
             };
-            match apply_global_active_config(
-                state,
-                providers,
-                ui,
-                snapshot,
-                Some(name.clone()),
-            )
-            .await
+            match apply_global_active_config(state, providers, ui, snapshot, Some(name.clone()))
+                .await
             {
                 Ok(()) => {
                     ui.toast = Some((format!("active cfg: {name}"), Instant::now()));

@@ -25,8 +25,8 @@ use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
     AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, http_debug_options,
-    http_warn_options, log_request_with_debug, make_body_preview, should_include_http_debug,
-    should_include_http_warn, should_log_request_body_preview, log_retry_trace,
+    http_warn_options, log_request_with_debug, log_retry_trace, make_body_preview,
+    should_include_http_debug, should_include_http_warn, should_log_request_body_preview,
 };
 use crate::model_routing;
 use crate::state::{ActiveRequest, FinishedRequest, ProxyState};
@@ -1773,7 +1773,11 @@ pub async fn handle_proxy(
                     method,
                     uri.path(),
                     selected.config_name,
-                    if retry_failover { "failover" } else { "same_upstream" },
+                    if retry_failover {
+                        "failover"
+                    } else {
+                        "same_upstream"
+                    },
                     attempt_index + 2,
                     retry_opt.max_attempts
                 );
