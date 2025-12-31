@@ -92,7 +92,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - Streaming responses are only proxied as SSE when upstream is `2xx`; non-2xx responses are buffered to enable classification/logging and optional retry before returning to the client.
-- Retry defaults to 2 attempts; set `CODEX_HELPER_RETRY_MAX_ATTEMPTS=1` to disable.
+- Retry defaults to 2 attempts; set `retry.max_attempts = 1` to disable.
 
 ### Fixed
 - `cargo-binstall` metadata: correct `pkg-url`/`bin-dir` templates to match cargo-dist GitHub release artifacts (including Windows `.zip` layout), so `cargo binstall codex-helper` downloads binaries instead of building from source.
