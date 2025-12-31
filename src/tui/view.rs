@@ -25,7 +25,7 @@ pub(in crate::tui) fn render_app(
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(0),
             Constraint::Length(1),
         ])

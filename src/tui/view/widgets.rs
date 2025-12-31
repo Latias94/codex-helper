@@ -33,7 +33,9 @@ pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
 fn render_background(area: Rect, buf: &mut Buffer, p: Palette) {
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
-            buf[(x, y)].set_style(Style::default().bg(p.bg));
+            let cell = &mut buf[(x, y)];
+            cell.set_symbol(" ");
+            cell.set_style(Style::default().bg(p.bg));
         }
     }
 }
@@ -46,5 +48,34 @@ pub(super) struct BackgroundWidget {
 impl Widget for BackgroundWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
         render_background(area, buf, self.p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::layout::Rect;
+    use ratatui::prelude::Buffer;
+
+    use super::render_background;
+    use crate::tui::model::Palette;
+
+    #[test]
+    fn background_clears_symbols() {
+        let p = Palette::default();
+        let area = Rect::new(0, 0, 4, 2);
+        let mut buf = Buffer::empty(area);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)].set_symbol("x");
+            }
+        }
+
+        render_background(area, &mut buf, p);
+
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                assert_eq!(buf[(x, y)].symbol(), " ");
+            }
+        }
     }
 }

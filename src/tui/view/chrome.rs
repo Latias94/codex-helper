@@ -18,7 +18,13 @@ pub(super) fn render_header(
     port: u16,
     area: Rect,
 ) {
-    let inner = area.inner(Margin {
+    let content_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+    let inner = content_area.inner(Margin {
         horizontal: 1,
         vertical: 0,
     });
