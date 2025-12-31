@@ -94,6 +94,21 @@ impl LoadBalancer {
     }
 
     pub fn select_upstream_avoiding(&self, avoid: &HashSet<usize>) -> Option<SelectedUpstream> {
+        self.select_upstream_avoiding_inner(avoid, false)
+    }
+
+    pub fn select_upstream_avoiding_strict(
+        &self,
+        avoid: &HashSet<usize>,
+    ) -> Option<SelectedUpstream> {
+        self.select_upstream_avoiding_inner(avoid, true)
+    }
+
+    fn select_upstream_avoiding_inner(
+        &self,
+        avoid: &HashSet<usize>,
+        strict: bool,
+    ) -> Option<SelectedUpstream> {
         if self.service.upstreams.is_empty() {
             return None;
         }
@@ -185,6 +200,10 @@ impl LoadBalancer {
                 index: idx,
                 upstream,
             });
+        }
+
+        if strict {
+            return None;
         }
 
         // 兜底：所有 upstream 都已达到失败阈值时，仍然返回第一个，以保证永远有兜底。

@@ -972,6 +972,8 @@ pub async fn handle_proxy(
             break;
         }
 
+        let strict_multi_config = lbs.len() > 1;
+
         let mut chosen: Option<(LoadBalancer, SelectedUpstream)> = None;
         for lb in &lbs {
             let cfg_name = lb.service.name.clone();
@@ -983,7 +985,11 @@ pub async fn handle_proxy(
                 }
                 let next = {
                     let avoid_ref: &HashSet<usize> = &*avoid_set;
-                    lb.select_upstream_avoiding(avoid_ref)
+                    if strict_multi_config {
+                        lb.select_upstream_avoiding_strict(avoid_ref)
+                    } else {
+                        lb.select_upstream_avoiding(avoid_ref)
+                    }
                 };
                 let Some(selected) = next else {
                     break;
@@ -1013,6 +1019,25 @@ pub async fn handle_proxy(
             }
             if chosen.is_some() {
                 break;
+            }
+        }
+
+        // When we have multiple config candidates, prefer skipping configs that are fully cooled down.
+        // However, if *all* configs are cooled/unavailable, fall back to the original "always pick one"
+        // behavior to avoid a hard outage.
+        if chosen.is_none() && strict_multi_config {
+            for lb in &lbs {
+                let cfg_name = lb.service.name.clone();
+                let avoid_set = avoid.entry(cfg_name.clone()).or_default();
+                let upstream_total = lb.service.upstreams.len();
+                if upstream_total > 0 && avoid_set.len() >= upstream_total {
+                    continue;
+                }
+                let avoid_ref: &HashSet<usize> = &*avoid_set;
+                if let Some(selected) = lb.select_upstream_avoiding(avoid_ref) {
+                    chosen = Some((lb.clone(), selected));
+                    break;
+                }
             }
         }
 

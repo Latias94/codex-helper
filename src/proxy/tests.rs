@@ -716,6 +716,166 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
 }
 
 #[tokio::test]
+async fn proxy_multi_config_failover_across_requests_respects_cooldown() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+
+    let p_hits = primary_hits.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            p_hits.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "err": "primary 502" })),
+            )
+        }),
+    );
+    let (p_addr, p_handle) = spawn_axum_server(primary);
+
+    let b_hits = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            b_hits.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let s = stream::iter(
+                    vec![Bytes::from_static(b"data: {\"ok\":true,\"upstream\":\"backup\"}\n\n")]
+                        .into_iter()
+                        .map(Ok::<Bytes, Infallible>),
+                );
+                let mut resp = Response::new(Body::from_stream(s));
+                *resp.status_mut() = StatusCode::OK;
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                resp
+            }
+        }),
+    );
+    let (b_addr, b_handle) = spawn_axum_server(backup);
+
+    let retry = RetryConfig {
+        max_attempts: 1,
+        backoff_ms: 0,
+        backoff_max_ms: 0,
+        jitter_ms: 0,
+        on_status: "502".to_string(),
+        on_class: Vec::new(),
+        strategy: RetryStrategy::Failover,
+        cloudflare_challenge_cooldown_secs: 0,
+        cloudflare_timeout_cooldown_secs: 0,
+        transport_cooldown_secs: 60,
+        cooldown_backoff_factor: 1,
+        cooldown_backoff_max_secs: 0,
+    };
+
+    let mut mgr = ServiceConfigManager {
+        active: Some("primary".to_string()),
+        ..Default::default()
+    };
+    mgr.configs.insert(
+        "primary".to_string(),
+        ServiceConfig {
+            name: "primary".to_string(),
+            alias: None,
+            enabled: true,
+            level: 1,
+            upstreams: vec![UpstreamConfig {
+                base_url: format!("http://{}/v1", p_addr),
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: None,
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: {
+                    let mut t = HashMap::new();
+                    t.insert("provider_id".to_string(), "primary".to_string());
+                    t
+                },
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        },
+    );
+    mgr.configs.insert(
+        "backup".to_string(),
+        ServiceConfig {
+            name: "backup".to_string(),
+            alias: None,
+            enabled: true,
+            level: 2,
+            upstreams: vec![UpstreamConfig {
+                base_url: format!("http://{}/v1", b_addr),
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: None,
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: {
+                    let mut t = HashMap::new();
+                    t.insert("provider_id".to_string(), "backup".to_string());
+                    t
+                },
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        },
+    );
+
+    let cfg = ProxyConfig {
+        version: Some(1),
+        codex: mgr,
+        claude: ServiceConfigManager::default(),
+        retry,
+        notify: Default::default(),
+        default_service: None,
+        ui: UiConfig::default(),
+    };
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+
+    let resp1 = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp1.status(), StatusCode::BAD_GATEWAY);
+
+    let resp2 = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    p_handle.abort();
+    b_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_does_not_failover_when_502_is_not_retryable_and_threshold_not_reached() {
     let upstream1_hits = Arc::new(AtomicUsize::new(0));
     let upstream2_hits = Arc::new(AtomicUsize::new(0));
