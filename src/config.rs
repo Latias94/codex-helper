@@ -516,43 +516,47 @@ fn ensure_config_version(cfg: &mut ProxyConfig) {
 
 const CONFIG_TOML_DOC_HEADER: &str = r#"# codex-helper config.toml
 #
-# This file is optional. If present, codex-helper will prefer it over config.json.
-# - To generate a commented template: `codex-helper config init`
-# - To keep config secrets off disk, prefer *_env fields (e.g. auth_token_env/api_key_env).
+# 本文件可选；如果存在，codex-helper 会优先使用它（而不是 config.json）。
 #
-# Note: some commands may rewrite this file; the header is preserved to keep the docs close to the config.
+# 常用命令：
+# - 生成带注释的模板：`codex-helper config init`
+#
+# 安全建议：
+# - 尽量用环境变量保存密钥（*_env 字段，例如 auth_token_env / api_key_env），不要把 token 明文写入文件。
+#
+# 备注：某些命令会重写此文件；会保留本段 header，方便把说明贴近配置。
 "#;
 
 const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 #
-# codex-helper supports both config.json and config.toml:
-# - If `config.toml` exists, it takes precedence over `config.json`.
-# - Otherwise `config.json` is used (backward-compatible default).
+# codex-helper 同时支持 config.json 与 config.toml：
+# - 如果 `config.toml` 存在，则优先使用它；
+# - 否则使用 `config.json`（兼容旧版本）。
 #
-# This template focuses on discoverability: it includes commented examples and per-field notes.
+# 本模板以“可发现性”为主：包含可直接抄的示例，以及每个字段的说明。
 #
-# Paths:
-# - Linux/macOS: ~/.codex-helper/config.toml
-# - Windows:     %USERPROFILE%\.codex-helper\config.toml
+# 路径：
+# - Linux/macOS：`~/.codex-helper/config.toml`
+# - Windows：    `%USERPROFILE%\.codex-helper\config.toml`
 #
-# Tip:
-# - Generate/overwrite this template: `codex-helper config init [--force]`
-# - Fresh installs default to writing TOML on first write.
+# 小贴士：
+# - 生成/覆盖本模板：`codex-helper config init [--force]`
+# - 新安装时：首次写入配置默认会写 TOML。
 
 version = 1
 
-# Which service to use by default when you omit --codex/--claude.
+# 省略 --codex/--claude 时默认使用哪个服务。
 # default_service = "codex"
 # default_service = "claude"
 
-# --- Common: upstream configs (accounts / API keys) ---
+# --- 通用：上游配置（账号 / API Key） ---
 #
-# Most users only need to edit this section.
+# 大部分用户只需要改这一段。
 #
-# Notes:
-# - Prefer env-based secrets (`*_env`) instead of writing tokens to disk.
-# - For multi-upstream failover, put multiple `[[...upstreams]]` under the same config.
-# - Optional: set per-config `level` (1..=10) to enable level-based routing across configs (only when multiple distinct levels exist).
+# 说明：
+# - 优先使用环境变量方式保存密钥（`*_env`），避免写入磁盘。
+# - 单个 config 内可配置多个 `[[...upstreams]]`，用于“同账号多 endpoint 自动切换”。
+# - 可选：给每个 config 设置 `level`（1..=10）用于“按 level 分组跨配置降级”（只有存在多个不同 level 时才会生效）。
 #
 # [codex]
 # active = "codex-main"
@@ -563,17 +567,17 @@ version = 1
 # # enabled = true
 # # level = 1
 #
-# # Primary upstream
+# # 主线路 upstream
 # [[codex.configs.codex-main.upstreams]]
 # base_url = "https://api.openai.com/v1"
 # [codex.configs.codex-main.upstreams.auth]
 # auth_token_env = "OPENAI_API_KEY"
 # # or: api_key_env = "OPENAI_API_KEY"
-# # (not recommended) auth_token = "sk-..."
+# # （不推荐）auth_token = "sk-..."
 # [codex.configs.codex-main.upstreams.tags]
 # provider_id = "openai"
 #
-# # Backup upstream
+# # 备份线路 upstream
 # [[codex.configs.codex-main.upstreams]]
 # base_url = "https://your-backup-provider.example/v1"
 # [codex.configs.codex-main.upstreams.auth]
@@ -581,101 +585,101 @@ version = 1
 # [codex.configs.codex-main.upstreams.tags]
 # provider_id = "backup"
 #
-# Claude configs share the same structure under [claude].
+# Claude 配置在 [claude] 下结构相同。
 #
 # ---
 #
-# --- Notify integration (Codex `notify` hook) ---
+# --- 通知集成（Codex `notify` hook） ---
 #
-# This is optional and disabled by default.
-# It is designed for multi-Codex workflows: low-noise, duration-based, and rate-limited.
+# 可选功能，默认关闭。
+# 设计目标：多 Codex 工作流下的低噪声通知（按耗时过滤 + 合并 + 限流）。
 #
-# To enable:
-# 1) In Codex config `~/.codex/config.toml`:
+# 启用步骤：
+# 1) 在 Codex 配置 `~/.codex/config.toml` 中添加：
 #      notify = ["codex-helper", "notify", "codex"]
-# 2) Here:
+# 2) 在本文件中开启：
 #      notify.enabled = true
 #      notify.system.enabled = true
 #
 [notify]
-# Master switch for notify processing (both system and exec sinks).
+# 通知总开关（system toast 与 exec 回调都受此控制）。
 enabled = false
 
 [notify.system]
-# System notifications are supported on:
-# - Windows: toast via powershell.exe
-# - macOS: `osascript`
+# 系统通知支持：
+# - Windows：toast（powershell.exe）
+# - macOS：`osascript`
 enabled = false
 
 [notify.policy]
-# D: duration-based filter (milliseconds)
+# D：按耗时过滤（毫秒）
 min_duration_ms = 60000
 
-# A: merge + rate-limit (milliseconds)
+# A：合并 + 限流（毫秒）
 merge_window_ms = 10000
 global_cooldown_ms = 60000
 per_thread_cooldown_ms = 180000
 
-# How far back to look in proxy /__codex_helper/status/recent (milliseconds).
-# codex-helper matches Codex "thread-id" to proxy FinishedRequest.session_id.
+# 在 proxy /__codex_helper/status/recent 中向前回看多久（毫秒）。
+# codex-helper 会把 Codex 的 "thread-id" 匹配到 proxy 的 FinishedRequest.session_id。
 recent_search_window_ms = 300000
-# HTTP timeout for the proxy recent endpoint (milliseconds)
+# 访问 recent endpoint 的 HTTP 超时（毫秒）
 recent_endpoint_timeout_ms = 500
 
 [notify.exec]
-# Optional callback sink: run a command and write aggregated JSON to stdin.
+# 可选回调：执行一个命令，并把聚合后的 JSON 写到 stdin。
 enabled = false
 # command = ["python", "my_hook.py"]
 
 # ---
 #
-# --- Retry policy (proxy-side) ---
+# --- 重试策略（代理侧） ---
 #
-# Controls codex-helper's own retries before returning a response to Codex.
-# Note: if you also enable Codex retries, you may get "double retry".
+# 控制 codex-helper 在返回给 Codex 之前进行的内部重试。
+# 注意：如果你同时开启了 Codex 自身的重试，可能会出现“双重重试”。
 #
 [retry]
-# Retry policy preset (recommended):
-# - "balanced" (default)
-# - "same-upstream"
-# - "aggressive-failover"
-# - "cost-primary" (monthly primary + pay-as-you-go backup)
+# 策略预设（推荐）：
+# - "balanced"（默认）
+# - "same-upstream"（倾向同 upstream 重试，适合 CF/网络抖动）
+# - "aggressive-failover"（更激进：更多尝试次数，可能增加时延/成本）
+# - "cost-primary"（省钱主从：包月主线路 + 按量备选，支持回切探测）
 profile = "balanced"
 
-# The fields below are optional per-field overrides on top of the profile.
-# Max attempts per request (including the first attempt). Set to 1 to disable retries.
+# 下面这些字段是“覆盖项”（在 profile 默认值之上进行覆盖）。
+# 每个请求的最大尝试次数（包含第一次）。设为 1 表示关闭重试。
 # max_attempts = 2
 
-# Retry strategy:
-# - "failover": prefer switching to another upstream on retry (default)
-# - "same_upstream": prefer retrying the same upstream (useful for CF/network flakiness)
+# 重试策略：
+# - "failover"：更倾向切换到其他 upstream（默认）
+# - "same_upstream"：更倾向重试同一 upstream（适合 CF/网络抖动）
 # strategy = "failover"
 
-# Base backoff between attempts (milliseconds).
+# 重试间隔的基础 backoff（毫秒）。
 # backoff_ms = 200
-# Maximum backoff cap (milliseconds).
+# backoff 的最大上限（毫秒）。
 # backoff_max_ms = 2000
-# Random jitter added to backoff (milliseconds).
+# 在 backoff 上叠加的随机 jitter（毫秒）。
 # jitter_ms = 100
 
-# HTTP status codes/ranges that are retryable (string form).
-# Examples: "429,502,503,504,524" or "429,500-599".
+# 可重试的 HTTP 状态码/范围（字符串形式）。
+# 示例："429,502,503,504,524" 或 "429,500-599"。
 # on_status = "429,502,503,504,524"
 
-# Retryable error classes (from codex-helper classification).
+# 可重试的错误分类（来自 codex-helper 的 classify）。
 # on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
 
-# Cooldown penalties (seconds) applied to an upstream after certain failure classes.
+# 对某些失败类型施加冷却（秒）。
 # cloudflare_challenge_cooldown_secs = 300
 # cloudflare_timeout_cooldown_secs = 60
 # transport_cooldown_secs = 30
 
-# Optional: exponential cooldown backoff (mainly for "cheap primary + paid backup" setups).
+# 可选：冷却的指数退避（主要用于“便宜主线路不稳 → 降级到备选 → 隔一段时间探测回切”）。
 #
-# When enabled, each consecutive failure increases the cooldown penalty for the same upstream/config:
+# 启用后：同一 upstream/config 连续失败次数越多，冷却越久：
 #   effective_cooldown = min(base_cooldown * factor^streak, cooldown_backoff_max_secs)
 #
-# Set factor=1 to disable backoff (default behavior).
+# factor=1 表示关闭退避（默认行为）。
 # cooldown_backoff_factor = 2
 # cooldown_backoff_max_secs = 600
 "#;
