@@ -452,6 +452,14 @@ Most users do not need to touch these. If you want deeper customization, these f
 - Detailed debug logs (optional): `~/.codex-helper/logs/requests_debug.jsonl` (only created when `http_debug` split is enabled)
 - Session stats cache (auto-generated): `~/.codex-helper/cache/session_stats.json` (speeds up `session list/search` rounds/timestamps; invalidated by session file `mtime+size`—delete this file to force a full rescan if needed)
 
+To quickly generate a commented `config.toml` template:
+
+```bash
+codex-helper config init
+```
+
+> Note: the generated template comments are Chinese by default.
+
 Codex official files:
 
 - `~/.codex/auth.json`: managed by `codex login`; codex-helper only reads it.

@@ -435,6 +435,8 @@ codex-helper session last --path ~/code/my-app
 codex-helper config init
 ```
 
+> 说明：模板注释默认是中文。
+
 Codex 官方文件：
 
 - `~/.codex/auth.json`：由 `codex login` 维护，codex-helper 只读取，不写入；
