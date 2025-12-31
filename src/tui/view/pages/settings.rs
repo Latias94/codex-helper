@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use crate::config::RetryStrategy;
 use crate::tui::model::{Palette, Snapshot, now_ms};
 use crate::tui::state::UiState;
 
@@ -233,11 +234,16 @@ pub(super) fn render_settings_page(
         ),
     ]));
     if let Some(retry) = ui.last_runtime_retry.as_ref() {
+        let strategy = match retry.strategy {
+            RetryStrategy::Failover => "failover",
+            RetryStrategy::SameUpstream => "same_upstream",
+        };
         lines.push(Line::from(vec![
             Span::styled("retry: ", Style::default().fg(p.muted)),
             Span::styled(
                 format!(
-                    "attempts={} backoff={}..{} jitter={} cooldown(cf_chal={}s cf_to={}s transport={}s)",
+                    "strategy={} attempts={} backoff={}..{} jitter={} cooldown(cf_chal={}s cf_to={}s transport={}s)",
+                    strategy,
                     retry.max_attempts,
                     retry.backoff_ms,
                     retry.backoff_max_ms,

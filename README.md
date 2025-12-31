@@ -411,6 +411,7 @@ tags = { source = "codex-config", provider_id = "openai" }
 - 强烈建议将 Codex 侧 `model_providers.codex_proxy.request_max_retries = 0`，让“重试与切换”主要由 codex-helper 负责，避免 Codex 默认 5 次重试把同一个 502 反复打满（`switch on` 会在该字段不存在时写入 0；如你手动改过，则不会覆盖）。
 - 主配置（`~/.codex-helper/config.toml` / `config.json`）的 `[retry]` 段可以设置全局默认值；同名环境变量可在运行时覆盖（用于临时调试）。
 - `CODEX_HELPER_RETRY_MAX_ATTEMPTS=2`：最大尝试次数（默认来自配置的 `retry.max_attempts`，最大 8；如需关闭重试请设为 1）
+- `CODEX_HELPER_RETRY_STRATEGY=failover|same_upstream`：重试策略（默认 `failover` 更倾向切换 upstream；`same_upstream` 更倾向在同一 upstream 上重试，适合 CF/网络抖动场景）
 - `CODEX_HELPER_RETRY_ON_STATUS=429,502,503,504,524`：遇到这些状态码时允许重试（支持 `a-b` 区间，例如 `500-599`；若上游返回 `Retry-After`，会优先按其等待时间退避）
 - `CODEX_HELPER_RETRY_ON_CLASS=upstream_transport_error,cloudflare_timeout,cloudflare_challenge`：按错误分类允许重试
 - `CODEX_HELPER_RETRY_BACKOFF_MS=200` / `CODEX_HELPER_RETRY_BACKOFF_MAX_MS=2000` / `CODEX_HELPER_RETRY_JITTER_MS=100`：重试退避参数（毫秒）
@@ -421,6 +422,7 @@ tags = { source = "codex-config", provider_id = "openai" }
 ```toml
 [retry]
 max_attempts = 2
+strategy = "failover"
 backoff_ms = 200
 backoff_max_ms = 2000
 jitter_ms = 100

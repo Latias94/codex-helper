@@ -3,6 +3,7 @@ use rand::Rng;
 use tokio::time::sleep;
 
 use crate::config::RetryConfig;
+use crate::config::RetryStrategy;
 use crate::logging::RetryInfo;
 
 #[derive(Clone)]
@@ -13,6 +14,7 @@ pub(super) struct RetryOptions {
     pub(super) jitter_ms: u64,
     pub(super) retry_status_ranges: Vec<(u16, u16)>,
     pub(super) retry_error_classes: Vec<String>,
+    pub(super) strategy: RetryStrategy,
     pub(super) cloudflare_challenge_cooldown_secs: u64,
     pub(super) cloudflare_timeout_cooldown_secs: u64,
     pub(super) transport_cooldown_secs: u64,
@@ -68,6 +70,14 @@ pub(super) fn retry_options(cfg: &RetryConfig) -> RetryOptions {
         })
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| cfg.on_class.clone());
+    let strategy = std::env::var("CODEX_HELPER_RETRY_STRATEGY")
+        .ok()
+        .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "failover" => Some(RetryStrategy::Failover),
+            "same_upstream" | "same-upstream" | "same" => Some(RetryStrategy::SameUpstream),
+            _ => None,
+        })
+        .unwrap_or(cfg.strategy);
     let cloudflare_challenge_cooldown_secs =
         std::env::var("CODEX_HELPER_RETRY_CLOUDFLARE_CHALLENGE_COOLDOWN_SECS")
             .ok()
@@ -90,6 +100,7 @@ pub(super) fn retry_options(cfg: &RetryConfig) -> RetryOptions {
         jitter_ms,
         retry_status_ranges,
         retry_error_classes,
+        strategy,
         cloudflare_challenge_cooldown_secs,
         cloudflare_timeout_cooldown_secs,
         transport_cooldown_secs,
@@ -197,6 +208,7 @@ mod tests {
             jitter_ms: 0,
             retry_status_ranges: vec![(429, 429)],
             retry_error_classes: Vec::new(),
+            strategy: RetryStrategy::Failover,
             cloudflare_challenge_cooldown_secs: 0,
             cloudflare_timeout_cooldown_secs: 0,
             transport_cooldown_secs: 0,

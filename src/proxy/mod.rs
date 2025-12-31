@@ -20,7 +20,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-use crate::config::{ProxyConfig, ServiceConfigManager};
+use crate::config::{ProxyConfig, RetryStrategy, ServiceConfigManager};
 use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
@@ -795,6 +795,7 @@ pub async fn handle_proxy(
         .await;
 
     let retry_opt = retry_options(&cfg_snapshot.retry);
+    let retry_failover = retry_opt.strategy == RetryStrategy::Failover;
     let total_upstreams = lbs
         .iter()
         .map(|lb| lb.service.upstreams.len())
@@ -1108,7 +1109,9 @@ pub async fn handle_proxy(
         let resp = match builder.send().await {
             Ok(r) => r,
             Err(e) => {
-                lb.record_result(selected.index, false);
+                if retry_failover {
+                    lb.record_result(selected.index, false);
+                }
                 let err_str = e.to_string();
                 upstream_chain.push(format!(
                     "{}:{} (idx={}) transport_error={} model={}",
@@ -1121,15 +1124,17 @@ pub async fn handle_proxy(
                 let can_retry = attempt_index + 1 < retry_opt.max_attempts
                     && should_retry_class(&retry_opt, Some("upstream_transport_error"));
                 if can_retry {
-                    lb.penalize(
-                        selected.index,
-                        retry_opt.transport_cooldown_secs,
-                        "upstream_transport_error",
-                    );
-                    avoid
-                        .entry(selected.config_name.clone())
-                        .or_default()
-                        .insert(selected.index);
+                    if retry_failover {
+                        lb.penalize(
+                            selected.index,
+                            retry_opt.transport_cooldown_secs,
+                            "upstream_transport_error",
+                        );
+                        avoid
+                            .entry(selected.config_name.clone())
+                            .or_default()
+                            .insert(selected.index);
+                    }
                     backoff_sleep(&retry_opt, attempt_index).await;
                     continue;
                 }
@@ -1296,7 +1301,9 @@ pub async fn handle_proxy(
             let bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
-                    lb.record_result(selected.index, false);
+                    if retry_failover {
+                        lb.record_result(selected.index, false);
+                    }
                     let err_str = e.to_string();
                     upstream_chain.push(format!(
                         "{}:{} (idx={}) body_read_error={} model={}",
@@ -1309,15 +1316,17 @@ pub async fn handle_proxy(
                     let can_retry = attempt_index + 1 < retry_opt.max_attempts
                         && should_retry_class(&retry_opt, Some("upstream_transport_error"));
                     if can_retry {
-                        lb.penalize(
-                            selected.index,
-                            retry_opt.transport_cooldown_secs,
-                            "upstream_body_read_error",
-                        );
-                        avoid
-                            .entry(selected.config_name.clone())
-                            .or_default()
-                            .insert(selected.index);
+                        if retry_failover {
+                            lb.penalize(
+                                selected.index,
+                                retry_opt.transport_cooldown_secs,
+                                "upstream_body_read_error",
+                            );
+                            avoid
+                                .entry(selected.config_name.clone())
+                                .or_default()
+                                .insert(selected.index);
+                        }
                         backoff_sleep(&retry_opt, attempt_index).await;
                         continue;
                     }
@@ -1443,38 +1452,41 @@ pub async fn handle_proxy(
                 && (should_retry_status(&retry_opt, status_code)
                     || should_retry_class(&retry_opt, cls.as_deref()));
             if retryable {
-                // Treat retryable 5xx / WAF-like responses as upstream failures for LB tracking.
-                if status_code >= 500 || cls.is_some() {
-                    lb.record_result(selected.index, false);
-                }
                 let cls_s = cls.as_deref().unwrap_or("-");
                 info!(
-                    "retrying after non-2xx status {} (class={}) for {} {} (config: {}, next_attempt={}/{})",
+                    "retrying after non-2xx status {} (class={}) for {} {} (config: {}, mode={}, next_attempt={}/{})",
                     status_code,
                     cls_s,
                     method,
                     uri.path(),
                     selected.config_name,
+                    if retry_failover { "failover" } else { "same_upstream" },
                     attempt_index + 2,
                     retry_opt.max_attempts
                 );
-                match cls.as_deref() {
-                    Some("cloudflare_challenge") => lb.penalize(
-                        selected.index,
-                        retry_opt.cloudflare_challenge_cooldown_secs,
-                        "cloudflare_challenge",
-                    ),
-                    Some("cloudflare_timeout") => lb.penalize(
-                        selected.index,
-                        retry_opt.cloudflare_timeout_cooldown_secs,
-                        "cloudflare_timeout",
-                    ),
-                    _ => {}
+                if retry_failover {
+                    // Treat retryable 5xx / WAF-like responses as upstream failures for LB tracking.
+                    if status_code >= 500 || cls.is_some() {
+                        lb.record_result(selected.index, false);
+                    }
+                    match cls.as_deref() {
+                        Some("cloudflare_challenge") => lb.penalize(
+                            selected.index,
+                            retry_opt.cloudflare_challenge_cooldown_secs,
+                            "cloudflare_challenge",
+                        ),
+                        Some("cloudflare_timeout") => lb.penalize(
+                            selected.index,
+                            retry_opt.cloudflare_timeout_cooldown_secs,
+                            "cloudflare_timeout",
+                        ),
+                        _ => {}
+                    }
+                    avoid
+                        .entry(selected.config_name.clone())
+                        .or_default()
+                        .insert(selected.index);
                 }
-                avoid
-                    .entry(selected.config_name.clone())
-                    .or_default()
-                    .insert(selected.index);
                 retry_sleep(&retry_opt, attempt_index, &resp_headers).await;
                 continue;
             }

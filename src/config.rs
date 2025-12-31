@@ -205,9 +205,26 @@ pub struct RetryConfig {
     pub jitter_ms: u64,
     pub on_status: String,
     pub on_class: Vec<String>,
+    #[serde(default)]
+    pub strategy: RetryStrategy,
     pub cloudflare_challenge_cooldown_secs: u64,
     pub cloudflare_timeout_cooldown_secs: u64,
     pub transport_cooldown_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryStrategy {
+    /// Prefer switching to another upstream on retry (default).
+    Failover,
+    /// Prefer retrying the same upstream (opt-in).
+    SameUpstream,
+}
+
+impl Default for RetryStrategy {
+    fn default() -> Self {
+        Self::Failover
+    }
 }
 
 impl Default for RetryConfig {
@@ -223,6 +240,7 @@ impl Default for RetryConfig {
                 "cloudflare_timeout".to_string(),
                 "cloudflare_challenge".to_string(),
             ],
+            strategy: RetryStrategy::Failover,
             cloudflare_challenge_cooldown_secs: 300,
             cloudflare_timeout_cooldown_secs: 60,
             transport_cooldown_secs: 30,
@@ -484,6 +502,11 @@ enabled = false
 [retry]
 # Max attempts per request (including the first attempt). Set to 1 to disable retries.
 max_attempts = 2
+
+# Retry strategy:
+# - "failover": prefer switching to another upstream on retry (default)
+# - "same_upstream": prefer retrying the same upstream (useful for CF/network flakiness)
+# strategy = "failover"
 
 # Base backoff between attempts (milliseconds).
 backoff_ms = 200
