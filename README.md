@@ -79,8 +79,8 @@ ch
 
 **关键点：主线路 + 备份线路优先放在同一个配置的 `upstreams` 里。**
 
-> 常见误解：如果你把每个供应商都拆成一个 config，并且它们的 `level` 都是默认的 `1`（例如 `config list` 全是 `L1 on ...`），那么 codex-helper **不会**跨 config 自动切换；它会优先使用 `active` 那个 config。  
-> 想要跨 config 降级，请至少设置两档不同的 `level`（见下文），或把备份线路放回同一 config 的 `upstreams`。
+  > 提示：如果你把每个供应商都拆成一个 config，并且它们的 `level` 都是默认的 `1`（例如 `config list` 全是 `L1 on ...`），codex-helper 仍会**优先**使用 `active`，但同级其他 config 也会参与 failover（避免 `active` 单点）。  
+  > 如果你想要明确的“跨配置降级”（例如 `L1=中转优先`、`L2=官方兜底`），请至少设置两档不同的 `level`（见下文），或把备份线路放回同一 config 的 `upstreams`。
 
 示例（推荐：TOML，`~/.codex-helper/config.toml`）：
 
