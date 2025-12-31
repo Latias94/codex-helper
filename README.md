@@ -435,7 +435,10 @@ codex-helper session last --path ~/code/my-app
 codex-helper config init
 ```
 
-> 说明：模板注释默认是中文。
+> 说明：
+> - 模板注释默认是中文；
+> - 如果检测到 `~/.codex/config.toml`，会 best-effort 自动把 Codex providers 导入到生成的 `config.toml`；
+> - 只想生成纯模板（不导入）可用：`codex-helper config init --no-import`。
 
 Codex 官方文件：
 

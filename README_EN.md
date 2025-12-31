@@ -458,7 +458,10 @@ To quickly generate a commented `config.toml` template:
 codex-helper config init
 ```
 
-> Note: the generated template comments are Chinese by default.
+> Notes:
+> - The generated template comments are Chinese by default.
+> - If `~/.codex/config.toml` is present, codex-helper will best-effort auto-import Codex providers into the generated `config.toml`.
+> - Use `codex-helper config init --no-import` for a template-only file.
 
 Codex official files:
 
