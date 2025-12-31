@@ -1036,14 +1036,7 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         let base_url_opt = provider_table
             .get("base_url")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| {
-                if provider_id == "openai" {
-                    Some("https://api.openai.com/v1".to_string())
-                } else {
-                    None
-                }
-            });
+            .map(|s| s.to_string());
 
         let base_url = match base_url_opt {
             Some(u) if !u.trim().is_empty() => u,
@@ -1143,36 +1136,6 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         }
     }
 
-    // Ensure openai exists as a safe default (even if model_providers table is absent).
-    if !cfg.codex.configs.contains_key("openai") {
-        let mut tags = HashMap::new();
-        tags.insert("source".into(), "codex-config".into());
-        tags.insert("provider_id".into(), "openai".into());
-        tags.insert("requires_openai_auth".into(), "true".into());
-        cfg.codex.configs.insert(
-            "openai".into(),
-            ServiceConfig {
-                name: "openai".into(),
-                alias: None,
-                enabled: true,
-                level: 1,
-                upstreams: vec![UpstreamConfig {
-                    base_url: "https://api.openai.com/v1".into(),
-                    auth: UpstreamAuth {
-                        auth_token: None,
-                        auth_token_env: None,
-                        api_key: None,
-                        api_key_env: None,
-                    },
-                    tags,
-                    supported_models: HashMap::new(),
-                    model_mapping: HashMap::new(),
-                }],
-            },
-        );
-        imported_any = true;
-    }
-
     if !imported_any {
         anyhow::bail!("未能从 ~/.codex/config.toml 推导出任何可用的 Codex 上游配置");
     }
@@ -1181,13 +1144,7 @@ fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
     if imported_active && cfg.codex.configs.contains_key(&current_provider_id) {
         cfg.codex.active = Some(current_provider_id);
     } else {
-        cfg.codex.active = cfg
-            .codex
-            .configs
-            .keys()
-            .min()
-            .cloned()
-            .or_else(|| Some("openai".to_string()));
+        cfg.codex.active = cfg.codex.configs.keys().min().cloned();
     }
 
     Ok(())
@@ -2183,6 +2140,10 @@ env_key = "RIGHTCODE_API_KEY"
         let cfg_path = home.join("config.toml");
         let config_text = r#"
 model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
 "#;
         write_file(&cfg_path, config_text);
 
