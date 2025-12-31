@@ -2,7 +2,7 @@ use axum::http::HeaderMap;
 use rand::Rng;
 use tokio::time::sleep;
 
-use crate::config::RetryConfig;
+use crate::config::ResolvedRetryConfig;
 use crate::config::RetryStrategy;
 use crate::logging::RetryInfo;
 
@@ -37,7 +37,7 @@ pub(super) fn parse_status_ranges(spec: &str) -> Vec<(u16, u16)> {
     out
 }
 
-pub(super) fn retry_options(cfg: &RetryConfig) -> RetryOptions {
+pub(super) fn retry_options(cfg: &ResolvedRetryConfig) -> RetryOptions {
     let max_attempts = cfg.max_attempts.clamp(1, 8);
     let base_backoff_ms = cfg.backoff_ms;
     let max_backoff_ms = cfg.backoff_max_ms;

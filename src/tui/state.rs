@@ -1,6 +1,6 @@
 use ratatui::widgets::{ListState, TableState};
 
-use crate::config::RetryConfig;
+use crate::config::ResolvedRetryConfig;
 
 use super::Language;
 use super::model::{Snapshot, filtered_requests_len};
@@ -38,7 +38,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) pending_overwrite_from_codex_confirm_at: Option<std::time::Instant>,
     pub(in crate::tui) last_runtime_config_loaded_at_ms: Option<u64>,
     pub(in crate::tui) last_runtime_config_source_mtime_ms: Option<u64>,
-    pub(in crate::tui) last_runtime_retry: Option<RetryConfig>,
+    pub(in crate::tui) last_runtime_retry: Option<ResolvedRetryConfig>,
     pub(in crate::tui) last_runtime_config_refresh_at: Option<std::time::Instant>,
     pub(in crate::tui) should_exit: bool,
     pub(in crate::tui) configs_table: TableState,

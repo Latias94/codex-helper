@@ -197,25 +197,63 @@ impl ServiceConfigManager {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryConfig {
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetryProfileName {
+    Balanced,
+    SameUpstream,
+    AggressiveFailover,
+    CostPrimary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedRetryConfig {
     pub max_attempts: u32,
     pub backoff_ms: u64,
     pub backoff_max_ms: u64,
     pub jitter_ms: u64,
     pub on_status: String,
     pub on_class: Vec<String>,
-    #[serde(default)]
     pub strategy: RetryStrategy,
     pub cloudflare_challenge_cooldown_secs: u64,
     pub cloudflare_timeout_cooldown_secs: u64,
     pub transport_cooldown_secs: u64,
+    pub cooldown_backoff_factor: u64,
+    pub cooldown_backoff_max_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Curated retry policy preset. When set, codex-helper starts from the profile defaults,
+    /// then applies any explicitly configured fields below as overrides.
+    #[serde(default)]
+    pub profile: Option<RetryProfileName>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub backoff_ms: Option<u64>,
+    #[serde(default)]
+    pub backoff_max_ms: Option<u64>,
+    #[serde(default)]
+    pub jitter_ms: Option<u64>,
+    #[serde(default)]
+    pub on_status: Option<String>,
+    #[serde(default)]
+    pub on_class: Option<Vec<String>>,
+    #[serde(default)]
+    pub strategy: Option<RetryStrategy>,
+    #[serde(default)]
+    pub cloudflare_challenge_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub cloudflare_timeout_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub transport_cooldown_secs: Option<u64>,
     /// Optional exponential backoff for cooldown penalties.
     /// When factor > 1, repeated penalties will increase cooldown up to max_secs.
     #[serde(default)]
-    pub cooldown_backoff_factor: u64,
+    pub cooldown_backoff_factor: Option<u64>,
     #[serde(default)]
-    pub cooldown_backoff_max_secs: u64,
+    pub cooldown_backoff_max_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,23 +274,112 @@ impl Default for RetryStrategy {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_attempts: 2,
-            backoff_ms: 200,
-            backoff_max_ms: 2_000,
-            jitter_ms: 100,
-            on_status: "429,502,503,504,524".to_string(),
-            on_class: vec![
-                "upstream_transport_error".to_string(),
-                "cloudflare_timeout".to_string(),
-                "cloudflare_challenge".to_string(),
-            ],
-            strategy: RetryStrategy::Failover,
-            cloudflare_challenge_cooldown_secs: 300,
-            cloudflare_timeout_cooldown_secs: 60,
-            transport_cooldown_secs: 30,
-            cooldown_backoff_factor: 1,
-            cooldown_backoff_max_secs: 600,
+            profile: None,
+            max_attempts: None,
+            backoff_ms: None,
+            backoff_max_ms: None,
+            jitter_ms: None,
+            on_status: None,
+            on_class: None,
+            strategy: None,
+            cloudflare_challenge_cooldown_secs: None,
+            cloudflare_timeout_cooldown_secs: None,
+            transport_cooldown_secs: None,
+            cooldown_backoff_factor: None,
+            cooldown_backoff_max_secs: None,
         }
+    }
+}
+
+impl RetryProfileName {
+    pub fn defaults(self) -> ResolvedRetryConfig {
+        match self {
+            RetryProfileName::Balanced => ResolvedRetryConfig {
+                max_attempts: 2,
+                backoff_ms: 200,
+                backoff_max_ms: 2_000,
+                jitter_ms: 100,
+                on_status: "429,502,503,504,524".to_string(),
+                on_class: vec![
+                    "upstream_transport_error".to_string(),
+                    "cloudflare_timeout".to_string(),
+                    "cloudflare_challenge".to_string(),
+                ],
+                strategy: RetryStrategy::Failover,
+                cloudflare_challenge_cooldown_secs: 300,
+                cloudflare_timeout_cooldown_secs: 60,
+                transport_cooldown_secs: 30,
+                cooldown_backoff_factor: 1,
+                cooldown_backoff_max_secs: 600,
+            },
+            RetryProfileName::SameUpstream => ResolvedRetryConfig {
+                strategy: RetryStrategy::SameUpstream,
+                ..RetryProfileName::Balanced.defaults()
+            },
+            RetryProfileName::AggressiveFailover => ResolvedRetryConfig {
+                max_attempts: 3,
+                backoff_ms: 200,
+                backoff_max_ms: 2_500,
+                jitter_ms: 150,
+                strategy: RetryStrategy::Failover,
+                ..RetryProfileName::Balanced.defaults()
+            },
+            RetryProfileName::CostPrimary => ResolvedRetryConfig {
+                strategy: RetryStrategy::Failover,
+                transport_cooldown_secs: 30,
+                cooldown_backoff_factor: 2,
+                cooldown_backoff_max_secs: 900,
+                ..RetryProfileName::Balanced.defaults()
+            },
+        }
+    }
+}
+
+impl RetryConfig {
+    pub fn resolve(&self) -> ResolvedRetryConfig {
+        let mut out = self
+            .profile
+            .unwrap_or(RetryProfileName::Balanced)
+            .defaults();
+
+        if let Some(v) = self.max_attempts {
+            out.max_attempts = v;
+        }
+        if let Some(v) = self.backoff_ms {
+            out.backoff_ms = v;
+        }
+        if let Some(v) = self.backoff_max_ms {
+            out.backoff_max_ms = v;
+        }
+        if let Some(v) = self.jitter_ms {
+            out.jitter_ms = v;
+        }
+        if let Some(v) = self.on_status.as_deref() {
+            out.on_status = v.to_string();
+        }
+        if let Some(v) = self.on_class.as_ref() {
+            out.on_class = v.clone();
+        }
+        if let Some(v) = self.strategy {
+            out.strategy = v;
+        }
+        if let Some(v) = self.cloudflare_challenge_cooldown_secs {
+            out.cloudflare_challenge_cooldown_secs = v;
+        }
+        if let Some(v) = self.cloudflare_timeout_cooldown_secs {
+            out.cloudflare_timeout_cooldown_secs = v;
+        }
+        if let Some(v) = self.transport_cooldown_secs {
+            out.transport_cooldown_secs = v;
+        }
+        if let Some(v) = self.cooldown_backoff_factor {
+            out.cooldown_backoff_factor = v;
+        }
+        if let Some(v) = self.cooldown_backoff_max_secs {
+            out.cooldown_backoff_max_secs = v;
+        }
+
+        out
     }
 }
 
@@ -508,8 +635,16 @@ enabled = false
 # Note: if you also enable Codex retries, you may get "double retry".
 #
 [retry]
+# Retry policy preset (recommended):
+# - "balanced" (default)
+# - "same-upstream"
+# - "aggressive-failover"
+# - "cost-primary" (monthly primary + pay-as-you-go backup)
+profile = "balanced"
+
+# The fields below are optional per-field overrides on top of the profile.
 # Max attempts per request (including the first attempt). Set to 1 to disable retries.
-max_attempts = 2
+# max_attempts = 2
 
 # Retry strategy:
 # - "failover": prefer switching to another upstream on retry (default)
@@ -517,23 +652,23 @@ max_attempts = 2
 # strategy = "failover"
 
 # Base backoff between attempts (milliseconds).
-backoff_ms = 200
+# backoff_ms = 200
 # Maximum backoff cap (milliseconds).
-backoff_max_ms = 2000
+# backoff_max_ms = 2000
 # Random jitter added to backoff (milliseconds).
-jitter_ms = 100
+# jitter_ms = 100
 
 # HTTP status codes/ranges that are retryable (string form).
 # Examples: "429,502,503,504,524" or "429,500-599".
-on_status = "429,502,503,504,524"
+# on_status = "429,502,503,504,524"
 
 # Retryable error classes (from codex-helper classification).
-on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
+# on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
 
 # Cooldown penalties (seconds) applied to an upstream after certain failure classes.
-cloudflare_challenge_cooldown_secs = 300
-cloudflare_timeout_cooldown_secs = 60
-transport_cooldown_secs = 30
+# cloudflare_challenge_cooldown_secs = 300
+# cloudflare_timeout_cooldown_secs = 60
+# transport_cooldown_secs = 30
 
 # Optional: exponential cooldown backoff (mainly for "cheap primary + paid backup" setups).
 #
@@ -541,8 +676,8 @@ transport_cooldown_secs = 30
 #   effective_cooldown = min(base_cooldown * factor^streak, cooldown_backoff_max_secs)
 #
 # Set factor=1 to disable backoff (default behavior).
-cooldown_backoff_factor = 2
-cooldown_backoff_max_secs = 600
+# cooldown_backoff_factor = 2
+# cooldown_backoff_max_secs = 600
 "#;
 
 pub async fn init_config_toml(force: bool) -> Result<PathBuf> {

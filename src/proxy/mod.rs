@@ -935,7 +935,8 @@ pub async fn handle_proxy(
         )
         .await;
 
-    let retry_opt = retry_options(&cfg_snapshot.retry);
+    let retry_cfg = cfg_snapshot.retry.resolve();
+    let retry_opt = retry_options(&retry_cfg);
     let retry_failover = retry_opt.strategy == RetryStrategy::Failover;
     let cooldown_backoff = crate::lb::CooldownBackoff {
         factor: retry_opt.cooldown_backoff_factor,
@@ -2066,7 +2067,7 @@ pub fn router(proxy: ProxyService) -> Router {
         config_path: String,
         loaded_at_ms: u64,
         source_mtime_ms: Option<u64>,
-        retry: crate::config::RetryConfig,
+        retry: crate::config::ResolvedRetryConfig,
     }
 
     #[derive(serde::Serialize)]
@@ -2083,7 +2084,7 @@ pub fn router(proxy: ProxyService) -> Router {
             config_path: crate::config::config_file_path().display().to_string(),
             loaded_at_ms: proxy.config.last_loaded_at_ms(),
             source_mtime_ms: proxy.config.last_mtime_ms().await,
-            retry: cfg.retry.clone(),
+            retry: cfg.retry.resolve(),
         }))
     }
 
@@ -2102,7 +2103,7 @@ pub fn router(proxy: ProxyService) -> Router {
                 config_path: crate::config::config_file_path().display().to_string(),
                 loaded_at_ms: proxy.config.last_loaded_at_ms(),
                 source_mtime_ms: proxy.config.last_mtime_ms().await,
-                retry: cfg.retry.clone(),
+                retry: cfg.retry.resolve(),
             },
         }))
     }

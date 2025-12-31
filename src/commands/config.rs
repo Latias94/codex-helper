@@ -1,5 +1,5 @@
 use crate::config::{
-    RetryConfig, RetryStrategy, ServiceConfig, ServiceKind, UpstreamAuth, UpstreamConfig,
+    RetryConfig, RetryProfileName, ServiceConfig, ServiceKind, UpstreamAuth, UpstreamConfig,
     config_file_path, import_codex_config_from_codex_cli, init_config_toml, load_config,
     overwrite_codex_config_from_codex_cli_in_place, save_config,
 };
@@ -346,45 +346,36 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
 
-            cfg.retry = match profile {
-                RetryProfile::Balanced => RetryConfig::default(),
-                RetryProfile::SameUpstream => RetryConfig {
-                    strategy: RetryStrategy::SameUpstream,
-                    ..RetryConfig::default()
-                },
-                RetryProfile::AggressiveFailover => RetryConfig {
-                    max_attempts: 3,
-                    backoff_ms: 200,
-                    backoff_max_ms: 2_500,
-                    jitter_ms: 150,
-                    strategy: RetryStrategy::Failover,
-                    ..RetryConfig::default()
-                },
-                RetryProfile::CostPrimary => RetryConfig {
-                    strategy: RetryStrategy::Failover,
-                    transport_cooldown_secs: 30,
-                    cooldown_backoff_factor: 2,
-                    cooldown_backoff_max_secs: 900,
-                    ..RetryConfig::default()
-                },
+            let profile_name = match profile {
+                RetryProfile::Balanced => RetryProfileName::Balanced,
+                RetryProfile::SameUpstream => RetryProfileName::SameUpstream,
+                RetryProfile::AggressiveFailover => RetryProfileName::AggressiveFailover,
+                RetryProfile::CostPrimary => RetryProfileName::CostPrimary,
+            };
+
+            // Apply profile and clear explicit per-field overrides to keep config minimal.
+            cfg.retry = RetryConfig {
+                profile: Some(profile_name),
+                ..RetryConfig::default()
             };
 
             save_config(&cfg)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!("Set retry profile to '{:?}'", profile);
+            let resolved = cfg.retry.resolve();
             println!(
                 "retry: strategy={:?} max_attempts={} backoff={}..{} jitter={} cooldown(cf_chal={}s cf_to={}s transport={}s) cooldown_backoff(factor={} max={}s)",
-                cfg.retry.strategy,
-                cfg.retry.max_attempts,
-                cfg.retry.backoff_ms,
-                cfg.retry.backoff_max_ms,
-                cfg.retry.jitter_ms,
-                cfg.retry.cloudflare_challenge_cooldown_secs,
-                cfg.retry.cloudflare_timeout_cooldown_secs,
-                cfg.retry.transport_cooldown_secs,
-                cfg.retry.cooldown_backoff_factor,
-                cfg.retry.cooldown_backoff_max_secs,
+                resolved.strategy,
+                resolved.max_attempts,
+                resolved.backoff_ms,
+                resolved.backoff_max_ms,
+                resolved.jitter_ms,
+                resolved.cloudflare_challenge_cooldown_secs,
+                resolved.cloudflare_timeout_cooldown_secs,
+                resolved.transport_cooldown_secs,
+                resolved.cooldown_backoff_factor,
+                resolved.cooldown_backoff_max_secs,
             );
         }
         ConfigCommand::ImportFromCodex { force } => {

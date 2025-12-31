@@ -149,6 +149,16 @@ codex-helper config set-active right
 codex-helper config set-retry-profile balanced
 ```
 
+如果你更想直接改 `config.toml`，等价写法是：
+
+```toml
+[codex]
+active = "right"
+
+[retry]
+profile = "balanced"
+```
+
 > 想缩小候选集：把你不希望参与自动路由的 config `disable` 掉（active 除外）。例如：`codex-helper config disable some-provider`。
 
 #### 模板 C：中转优先，直连/官方兜底（level 分级）
@@ -171,6 +181,22 @@ codex-helper config set-active right
 codex-helper config set-retry-profile balanced
 ```
 
+等价的 `config.toml`（示例）：
+
+```toml
+[codex]
+active = "right"
+
+[codex.configs.right]
+level = 1
+
+[codex.configs.openai]
+level = 2
+
+[retry]
+profile = "balanced"
+```
+
 #### 模板 D：包月中转主、按量直连从（省钱 + 回切探测）
 
 > 下面的 `right/openai` 仅为示例，请以 `codex-helper config list` 输出的真实名称替换。
@@ -188,6 +214,24 @@ codex-helper config set-level openai 2
 # 开启 cost-primary：失败越多，冷却越久；冷却到期会“探测回切”
 codex-helper config set-retry-profile cost-primary
 ```
+
+等价的 `config.toml`（示例）：
+
+```toml
+[codex]
+active = "right"
+
+[codex.configs.right]
+level = 1
+
+[codex.configs.openai]
+level = 2
+
+[retry]
+profile = "cost-primary"
+```
+
+> 注意：如果 config 名称包含 `-` 等字符，请在 TOML 里用引号，例如：`[codex.configs."openai-main"]`。
 
 ### Level 分组（跨配置降级，可选）
 

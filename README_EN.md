@@ -184,6 +184,16 @@ codex-helper config set-active right
 codex-helper config set-retry-profile balanced
 ```
 
+If you prefer editing `config.toml` directly, the equivalent is:
+
+```toml
+[codex]
+active = "right"
+
+[retry]
+profile = "balanced"
+```
+
 > Want fewer candidates? Disable configs you don’t want in automatic routing (active is still eligible): `codex-helper config disable some-provider`.
 
 #### Template C: relay-first, direct/official backup (level grouping)
@@ -205,6 +215,22 @@ codex-helper config set-active right
 codex-helper config set-retry-profile balanced
 ```
 
+Equivalent `config.toml` (example):
+
+```toml
+[codex]
+active = "right"
+
+[codex.configs.right]
+level = 1
+
+[codex.configs.openai]
+level = 2
+
+[retry]
+profile = "balanced"
+```
+
 #### Template D: monthly primary + pay-as-you-go backup (cost + probe-back)
 
 > `right/openai` are just example names; replace them with what you see in `codex-helper config list`.
@@ -222,6 +248,24 @@ codex-helper config set-level openai 2
 # Cost-primary enables cooldown exponential backoff for probe-back.
 codex-helper config set-retry-profile cost-primary
 ```
+
+Equivalent `config.toml` (example):
+
+```toml
+[codex]
+active = "right"
+
+[codex.configs.right]
+level = 1
+
+[codex.configs.openai]
+level = 2
+
+[retry]
+profile = "cost-primary"
+```
+
+> Note: if a config name contains `-` etc, quote it in TOML, e.g. `[codex.configs."openai-main"]`.
 
 ### Level-based multi-config failover (optional)
 

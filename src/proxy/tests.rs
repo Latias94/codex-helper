@@ -95,18 +95,19 @@ async fn proxy_failover_retries_502_then_uses_second_upstream() {
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 2,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(2),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![
@@ -218,18 +219,19 @@ async fn proxy_same_upstream_retries_502_then_succeeds_without_failover() {
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 2,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::SameUpstream,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(2),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::SameUpstream),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![
@@ -346,18 +348,19 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 1,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 60,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(1),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(60),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![
@@ -478,18 +481,19 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 1,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: vec!["upstream_transport_error".to_string()],
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 60,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(1),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(vec!["upstream_transport_error".to_string()]),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(60),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![
@@ -625,18 +629,19 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 1,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: vec!["cloudflare_challenge".to_string()],
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 60,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(1),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(vec!["cloudflare_challenge".to_string()]),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(60),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![
@@ -757,18 +762,19 @@ async fn proxy_multi_config_failover_across_requests_respects_cooldown() {
     let (b_addr, b_handle) = spawn_axum_server(backup);
 
     let retry = RetryConfig {
-        max_attempts: 1,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 60,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(1),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(60),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
 
     let mut mgr = ServiceConfigManager {
@@ -920,18 +926,19 @@ async fn proxy_does_not_failover_when_502_is_not_retryable_and_threshold_not_rea
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 1,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 60,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(1),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(60),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![
@@ -1035,18 +1042,19 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 5,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(5),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![
@@ -1143,18 +1151,19 @@ data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_t
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 1,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(1),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![UpstreamConfig {
@@ -1243,18 +1252,19 @@ async fn proxy_does_not_retry_or_failover_on_400() {
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 2,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(2),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![
@@ -1346,18 +1356,19 @@ async fn proxy_skips_upstreams_that_do_not_support_model() {
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 1,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(1),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![
@@ -1450,18 +1461,19 @@ async fn proxy_applies_model_mapping_to_request_body() {
 
     let proxy_client = Client::new();
     let retry = RetryConfig {
-        max_attempts: 1,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(1),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
     let cfg = make_proxy_config(
         vec![UpstreamConfig {
@@ -1541,18 +1553,19 @@ async fn proxy_falls_back_to_level_2_config_after_retryable_failure() {
     let (l2_addr, l2_handle) = spawn_axum_server(level2);
 
     let retry = RetryConfig {
-        max_attempts: 2,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(2),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
 
     let mut mgr = ServiceConfigManager {
@@ -1667,18 +1680,19 @@ async fn proxy_failover_can_switch_configs_with_same_level() {
     let (c2_addr, c2_handle) = spawn_axum_server(config2);
 
     let retry = RetryConfig {
-        max_attempts: 2,
-        backoff_ms: 0,
-        backoff_max_ms: 0,
-        jitter_ms: 0,
-        on_status: "502".to_string(),
-        on_class: Vec::new(),
-        strategy: RetryStrategy::Failover,
-        cloudflare_challenge_cooldown_secs: 0,
-        cloudflare_timeout_cooldown_secs: 0,
-        transport_cooldown_secs: 0,
-        cooldown_backoff_factor: 1,
-        cooldown_backoff_max_secs: 0,
+        max_attempts: Some(2),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some("502".to_string()),
+        on_class: Some(Vec::new()),
+        strategy: Some(RetryStrategy::Failover),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
     };
 
     let mut mgr = ServiceConfigManager {
