@@ -14,8 +14,8 @@ use reqwest::Client;
 use tokio::time::{Duration, sleep};
 
 use crate::config::{
-    ProxyConfig, RetryConfig, RetryStrategy, ServiceConfig, ServiceConfigManager, UiConfig,
-    UpstreamAuth, UpstreamConfig,
+    ProxyConfig, RetryConfig, RetryProfileName, RetryStrategy, ServiceConfig, ServiceConfigManager,
+    UiConfig, UpstreamAuth, UpstreamConfig,
 };
 use crate::proxy::ProxyService;
 
@@ -1776,4 +1776,68 @@ async fn proxy_failover_can_switch_configs_with_same_level() {
     proxy_handle.abort();
     c1_handle.abort();
     c2_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_runtime_config_reports_resolved_retry_profile() {
+    let proxy_client = Client::new();
+    let retry = RetryConfig {
+        profile: Some(RetryProfileName::CostPrimary),
+        ..Default::default()
+    };
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        proxy_client,
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let v: serde_json::Value = client
+        .get(format!("http://{}/__codex_helper/config/runtime", proxy_addr))
+        .send()
+        .await
+        .expect("send")
+        .error_for_status()
+        .expect("status ok")
+        .json()
+        .await
+        .expect("json");
+
+    let retry = v.get("retry").expect("retry field");
+    assert!(
+        retry.get("profile").is_none(),
+        "runtime endpoint should expose resolved retry config (no profile field)"
+    );
+    assert_eq!(retry.get("strategy").and_then(|x| x.as_str()), Some("failover"));
+    assert_eq!(retry.get("max_attempts").and_then(|x| x.as_u64()), Some(2));
+    assert_eq!(
+        retry.get("cooldown_backoff_factor").and_then(|x| x.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        retry.get("cooldown_backoff_max_secs")
+            .and_then(|x| x.as_u64()),
+        Some(900)
+    );
+
+    proxy_handle.abort();
 }
