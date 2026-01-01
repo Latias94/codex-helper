@@ -44,6 +44,31 @@ fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
     format!("{}ms", total_ms / n)
 }
 
+fn calc_output_rate_tok_s(bucket: &UsageBucket) -> Option<f64> {
+    let output = bucket.usage.output_tokens.max(0) as f64;
+    if output <= 0.0 {
+        return None;
+    }
+    if bucket.generation_ms_total == 0 {
+        return None;
+    }
+    Some(output / (bucket.generation_ms_total as f64 / 1000.0))
+}
+
+fn fmt_tok_s_0(rate: Option<f64>) -> String {
+    let Some(v) = rate.filter(|v| v.is_finite() && *v > 0.0) else {
+        return "-".to_string();
+    };
+    format!("{:.0}", v)
+}
+
+fn fmt_avg_ttfb_ms(bucket: &UsageBucket) -> String {
+    if bucket.ttfb_samples == 0 {
+        return "-".to_string();
+    }
+    format!("{}ms", bucket.ttfb_ms_total / bucket.ttfb_samples)
+}
+
 pub(super) fn render_stats_page(
     f: &mut Frame<'_>,
     p: Palette,
@@ -241,6 +266,7 @@ fn render_bucket_table_stateful(
         Cell::from(Span::styled("req", Style::default().fg(p.muted))),
         Cell::from(Span::styled("err%", Style::default().fg(p.muted))),
         Cell::from(Span::styled("tok", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("tok/s", Style::default().fg(p.muted))),
         Cell::from(Span::styled("avg", Style::default().fg(p.muted))),
         Cell::from(Span::styled("usd", Style::default().fg(p.muted))),
     ])
@@ -252,11 +278,13 @@ fn render_bucket_table_stateful(
             let cost = estimate_cost_usd(b)
                 .map(|v| format!("{v:.2}"))
                 .unwrap_or_else(|| "-".to_string());
+            let rate = fmt_tok_s_0(calc_output_rate_tok_s(b));
             Row::new(vec![
                 Cell::from(name.clone()),
                 Cell::from(b.requests_total.to_string()),
                 Cell::from(fmt_pct(b.requests_error, b.requests_total)),
                 Cell::from(tokens_short(b.usage.total_tokens)),
+                Cell::from(rate),
                 Cell::from(fmt_avg_ms(b.duration_ms_total, b.requests_total)),
                 Cell::from(cost),
             ])
@@ -266,9 +294,10 @@ fn render_bucket_table_stateful(
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(40),
+            Constraint::Percentage(35),
             Constraint::Length(6),
             Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Length(7),
             Constraint::Length(6),
             Constraint::Length(8),
@@ -362,6 +391,9 @@ fn render_detail_panel(
 
     let err_pct = fmt_pct(bucket.requests_error, bucket.requests_total);
     let avg_ms = fmt_avg_ms(bucket.duration_ms_total, bucket.requests_total);
+    let out_rate = calc_output_rate_tok_s(bucket);
+    let out_rate_s = fmt_tok_s_0(out_rate);
+    let avg_ttfb = fmt_avg_ttfb_ms(bucket);
     let cost = estimate_cost_usd(bucket)
         .map(|v| format!("${v:.2}"))
         .unwrap_or_else(|| "-".to_string());
@@ -394,11 +426,24 @@ fn render_detail_panel(
                 Style::default().fg(p.accent),
             ),
             Span::raw("   "),
+            Span::styled("tok/s  ", Style::default().fg(p.muted)),
+            Span::styled(out_rate_s, Style::default().fg(p.text)),
+            Span::raw("   "),
             Span::styled("avg  ", Style::default().fg(p.muted)),
             Span::styled(avg_ms, Style::default().fg(p.text)),
             Span::raw("   "),
             Span::styled("usd  ", Style::default().fg(p.muted)),
             Span::styled(cost, Style::default().fg(p.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled("ttfb(avg)  ", Style::default().fg(p.muted)),
+            Span::styled(avg_ttfb, Style::default().fg(p.text)),
+            Span::raw("   "),
+            Span::styled("gen_ms  ", Style::default().fg(p.muted)),
+            Span::styled(
+                bucket.generation_ms_total.to_string(),
+                Style::default().fg(p.muted),
+            ),
         ]),
         Line::from(vec![
             Span::styled("tok(in/out/rsn)  ", Style::default().fg(p.muted)),

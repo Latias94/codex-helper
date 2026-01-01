@@ -147,6 +147,7 @@ impl Drop for StreamFinalize {
         let already_logged = guard.logged;
         let usage_for_state = guard.usage.clone();
         let retry_for_state = self.retry.clone();
+        let ttfb_ms_for_state = guard.first_chunk_ms;
         let stream_error = guard.stream_error;
 
         let dur = self.start.elapsed().as_millis() as u64;
@@ -173,6 +174,7 @@ impl Drop for StreamFinalize {
                 &self.path,
                 self.status_code,
                 dur,
+                guard.first_chunk_ms,
                 &self.config_name,
                 self.provider_id.clone(),
                 &self.upstream_base_url,
@@ -211,6 +213,7 @@ impl Drop for StreamFinalize {
                     started_at_ms + dur,
                     usage_for_state,
                     retry_for_state,
+                    ttfb_ms_for_state,
                 )
                 .await;
         });
@@ -404,6 +407,7 @@ pub(super) async fn build_sse_success_response(
                         &path_s,
                         status.as_u16(),
                         dur,
+                        guard.first_chunk_ms,
                         &config_name,
                         provider_id.clone(),
                         &base_url,

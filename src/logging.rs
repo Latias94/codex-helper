@@ -242,6 +242,11 @@ pub struct RequestLog<'a> {
     pub path: &'a str,
     pub status_code: u16,
     pub duration_ms: u64,
+    /// Time to first byte / first chunk from the upstream (ms).
+    /// - For streaming responses: measured to the first response body chunk.
+    /// - For non-streaming responses: measured to response headers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<u64>,
     pub config_name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
@@ -283,6 +288,8 @@ struct HttpDebugLogEntry<'a> {
     pub path: &'a str,
     pub status_code: u16,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<u64>,
     pub config_name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
@@ -447,6 +454,7 @@ pub fn log_request_with_debug(
     path: &str,
     status_code: u16,
     duration_ms: u64,
+    ttfb_ms: Option<u64>,
     config_name: &str,
     provider_id: Option<String>,
     upstream_base_url: &str,
@@ -492,6 +500,7 @@ pub fn log_request_with_debug(
             path,
             status_code,
             duration_ms,
+            ttfb_ms,
             config_name,
             provider_id: provider_id.clone(),
             upstream_base_url,
@@ -539,6 +548,7 @@ pub fn log_request_with_debug(
         path,
         status_code,
         duration_ms,
+        ttfb_ms,
         config_name,
         provider_id,
         upstream_base_url,

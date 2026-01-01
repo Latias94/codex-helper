@@ -4,7 +4,7 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
 use crate::tui::model::{
-    Palette, Snapshot, format_age, now_ms, shorten, shorten_middle, status_style,
+    Palette, Snapshot, format_age, now_ms, shorten, shorten_middle, status_style, usage_line,
 };
 use crate::tui::state::UiState;
 
@@ -180,6 +180,38 @@ pub(super) fn render_requests_page(
                 Span::styled("upstream: ", Style::default().fg(p.muted)),
                 Span::styled(shorten_middle(u, 80), Style::default().fg(p.text)),
             ]));
+        }
+
+        if let Some(ttfb_ms) = r.ttfb_ms.filter(|v| *v > 0) {
+            lines.push(Line::from(vec![
+                Span::styled("ttfb: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{ttfb_ms}ms"), Style::default().fg(p.text)),
+            ]));
+        }
+
+        if let Some(u) = r.usage.as_ref().filter(|u| u.total_tokens > 0) {
+            lines.push(Line::from(vec![
+                Span::styled("usage: ", Style::default().fg(p.muted)),
+                Span::styled(usage_line(u), Style::default().fg(p.accent)),
+            ]));
+
+            let ttfb_ms = r.ttfb_ms.unwrap_or(0);
+            let gen_ms = if ttfb_ms > 0 && ttfb_ms < r.duration_ms {
+                r.duration_ms.saturating_sub(ttfb_ms)
+            } else {
+                r.duration_ms
+            };
+            let out_tok_s = if gen_ms > 0 && u.output_tokens > 0 {
+                Some((u.output_tokens as f64) / (gen_ms as f64 / 1000.0))
+            } else {
+                None
+            };
+            if let Some(rate) = out_tok_s.filter(|v| v.is_finite() && *v > 0.0) {
+                lines.push(Line::from(vec![
+                    Span::styled("out_tok/s: ", Style::default().fg(p.muted)),
+                    Span::styled(format!("{rate:.1}"), Style::default().fg(p.text)),
+                ]));
+            }
         }
 
         lines.push(Line::from(""));

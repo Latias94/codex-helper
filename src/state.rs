@@ -33,11 +33,22 @@ pub struct UsageBucket {
     pub requests_total: u64,
     pub requests_error: u64,
     pub duration_ms_total: u64,
+    pub requests_with_usage: u64,
+    pub duration_ms_with_usage_total: u64,
+    pub generation_ms_total: u64,
+    pub ttfb_ms_total: u64,
+    pub ttfb_samples: u64,
     pub usage: UsageMetrics,
 }
 
 impl UsageBucket {
-    fn record(&mut self, status_code: u16, duration_ms: u64, usage: Option<&UsageMetrics>) {
+    fn record(
+        &mut self,
+        status_code: u16,
+        duration_ms: u64,
+        usage: Option<&UsageMetrics>,
+        ttfb_ms: Option<u64>,
+    ) {
         self.requests_total = self.requests_total.saturating_add(1);
         if status_code >= 400 {
             self.requests_error = self.requests_error.saturating_add(1);
@@ -45,6 +56,20 @@ impl UsageBucket {
         self.duration_ms_total = self.duration_ms_total.saturating_add(duration_ms);
         if let Some(u) = usage {
             self.usage.add_assign(u);
+            self.requests_with_usage = self.requests_with_usage.saturating_add(1);
+            self.duration_ms_with_usage_total = self
+                .duration_ms_with_usage_total
+                .saturating_add(duration_ms);
+
+            let gen_ms = match ttfb_ms {
+                Some(ttfb) if ttfb > 0 && ttfb < duration_ms => duration_ms.saturating_sub(ttfb),
+                _ => duration_ms,
+            };
+            self.generation_ms_total = self.generation_ms_total.saturating_add(gen_ms);
+            if let Some(ttfb) = ttfb_ms.filter(|v| *v > 0) {
+                self.ttfb_ms_total = self.ttfb_ms_total.saturating_add(ttfb);
+                self.ttfb_samples = self.ttfb_samples.saturating_add(1);
+            }
         }
     }
 }
@@ -166,6 +191,8 @@ pub struct FinishedRequest {
     pub path: String,
     pub status_code: u16,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<u64>,
     pub ended_at_ms: u64,
 }
 
@@ -814,6 +841,7 @@ impl ProxyState {
             let usage = v
                 .get("usage")
                 .and_then(|u| serde_json::from_value::<UsageMetrics>(u.clone()).ok());
+            let ttfb_ms = v.get("ttfb_ms").and_then(|x| x.as_u64());
 
             events.push((
                 ended_at_ms,
@@ -822,6 +850,7 @@ impl ProxyState {
                 config_name,
                 provider_id,
                 usage,
+                ttfb_ms,
             ));
         }
 
@@ -831,20 +860,24 @@ impl ProxyState {
 
         let mut guard = self.usage_rollups.write().await;
         let rollup = guard.entry(service_name.to_string()).or_default();
-        for (ended_at_ms, status_code, duration_ms, cfg_key, provider_key, usage) in events.iter() {
+        for (ended_at_ms, status_code, duration_ms, cfg_key, provider_key, usage, ttfb_ms) in
+            events.iter()
+        {
             let day = (*ended_at_ms / 86_400_000) as i32;
             rollup
                 .since_start
-                .record(*status_code, *duration_ms, usage.as_ref());
+                .record(*status_code, *duration_ms, usage.as_ref(), *ttfb_ms);
             rollup.by_day.entry(day).or_default().record(
                 *status_code,
                 *duration_ms,
                 usage.as_ref(),
+                *ttfb_ms,
             );
             rollup.by_config.entry(cfg_key.clone()).or_default().record(
                 *status_code,
                 *duration_ms,
                 usage.as_ref(),
+                *ttfb_ms,
             );
             rollup
                 .by_config_day
@@ -852,19 +885,19 @@ impl ProxyState {
                 .or_default()
                 .entry(day)
                 .or_default()
-                .record(*status_code, *duration_ms, usage.as_ref());
+                .record(*status_code, *duration_ms, usage.as_ref(), *ttfb_ms);
             rollup
                 .by_provider
                 .entry(provider_key.clone())
                 .or_default()
-                .record(*status_code, *duration_ms, usage.as_ref());
+                .record(*status_code, *duration_ms, usage.as_ref(), *ttfb_ms);
             rollup
                 .by_provider_day
                 .entry(provider_key.clone())
                 .or_default()
                 .entry(day)
                 .or_default()
-                .record(*status_code, *duration_ms, usage.as_ref());
+                .record(*status_code, *duration_ms, usage.as_ref(), *ttfb_ms);
         }
 
         events.len()
@@ -970,6 +1003,7 @@ impl ProxyState {
         ended_at_ms: u64,
         usage: Option<UsageMetrics>,
         retry: Option<RetryInfo>,
+        ttfb_ms: Option<u64>,
     ) {
         let mut active = self.active_requests.write().await;
         let Some(req) = active.remove(&id) else {
@@ -992,6 +1026,7 @@ impl ProxyState {
             path: req.path,
             status_code,
             duration_ms,
+            ttfb_ms,
             ended_at_ms,
         };
 
@@ -1010,16 +1045,18 @@ impl ProxyState {
             let rollup = rollups.entry(finished.service.clone()).or_default();
             rollup
                 .since_start
-                .record(status_code, duration_ms, usage.as_ref());
-            rollup
-                .by_day
-                .entry(day)
-                .or_default()
-                .record(status_code, duration_ms, usage.as_ref());
+                .record(status_code, duration_ms, usage.as_ref(), finished.ttfb_ms);
+            rollup.by_day.entry(day).or_default().record(
+                status_code,
+                duration_ms,
+                usage.as_ref(),
+                finished.ttfb_ms,
+            );
             rollup.by_config.entry(cfg_key.clone()).or_default().record(
                 status_code,
                 duration_ms,
                 usage.as_ref(),
+                finished.ttfb_ms,
             );
             rollup
                 .by_config_day
@@ -1027,20 +1064,20 @@ impl ProxyState {
                 .or_default()
                 .entry(day)
                 .or_default()
-                .record(status_code, duration_ms, usage.as_ref());
+                .record(status_code, duration_ms, usage.as_ref(), finished.ttfb_ms);
 
             rollup
                 .by_provider
                 .entry(provider_key.clone())
                 .or_default()
-                .record(status_code, duration_ms, usage.as_ref());
+                .record(status_code, duration_ms, usage.as_ref(), finished.ttfb_ms);
             rollup
                 .by_provider_day
                 .entry(provider_key)
                 .or_default()
                 .entry(day)
                 .or_default()
-                .record(status_code, duration_ms, usage.as_ref());
+                .record(status_code, duration_ms, usage.as_ref(), finished.ttfb_ms);
         }
 
         if let Some(sid) = finished.session_id.as_deref() {

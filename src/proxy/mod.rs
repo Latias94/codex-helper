@@ -782,6 +782,7 @@ pub async fn handle_proxy(
             uri.path(),
             status.as_u16(),
             dur,
+            None,
             "-",
             None,
             "-",
@@ -865,6 +866,7 @@ pub async fn handle_proxy(
                 uri.path(),
                 status.as_u16(),
                 dur,
+                None,
                 "-",
                 None,
                 "-",
@@ -1068,6 +1070,7 @@ pub async fn handle_proxy(
                 uri.path(),
                 status.as_u16(),
                 dur,
+                None,
                 "-",
                 None,
                 "-",
@@ -1088,6 +1091,7 @@ pub async fn handle_proxy(
                     started_at_ms + dur,
                     None,
                     retry,
+                    None,
                 )
                 .await;
             if let Some(model) = request_model.as_deref() {
@@ -1225,6 +1229,7 @@ pub async fn handle_proxy(
                     uri.path(),
                     status.as_u16(),
                     dur,
+                    None,
                     &selected.config_name,
                     selected.upstream.tags.get("provider_id").cloned(),
                     &selected.upstream.base_url,
@@ -1245,6 +1250,7 @@ pub async fn handle_proxy(
                         started_at_ms + dur,
                         None,
                         retry,
+                        None,
                     )
                     .await;
                 return Err((status, err_str));
@@ -1471,6 +1477,7 @@ pub async fn handle_proxy(
                     uri.path(),
                     status_code,
                     dur,
+                    None,
                     &selected.config_name,
                     selected.upstream.tags.get("provider_id").cloned(),
                     &selected.upstream.base_url,
@@ -1490,6 +1497,7 @@ pub async fn handle_proxy(
                         started_at_ms + dur,
                         None,
                         retry,
+                        None,
                     )
                     .await;
                 return Err((StatusCode::BAD_GATEWAY, e.to_string()));
@@ -1651,6 +1659,7 @@ pub async fn handle_proxy(
                         uri.path(),
                         status.as_u16(),
                         dur,
+                        Some(upstream_headers_ms),
                         &selected.config_name,
                         selected.upstream.tags.get("provider_id").cloned(),
                         &selected.upstream.base_url,
@@ -1671,6 +1680,7 @@ pub async fn handle_proxy(
                             started_at_ms + dur,
                             None,
                             retry,
+                            Some(upstream_headers_ms),
                         )
                         .await;
                     return Err((status, err_str));
@@ -1954,6 +1964,7 @@ pub async fn handle_proxy(
                 uri.path(),
                 status_code,
                 dur,
+                Some(upstream_headers_ms),
                 &selected.config_name,
                 selected.upstream.tags.get("provider_id").cloned(),
                 &selected.upstream.base_url,
@@ -1973,6 +1984,7 @@ pub async fn handle_proxy(
                     started_at_ms + dur,
                     usage.clone(),
                     retry,
+                    Some(upstream_headers_ms),
                 )
                 .await;
 
@@ -2033,6 +2045,7 @@ pub async fn handle_proxy(
         uri.path(),
         status.as_u16(),
         dur,
+        None,
         "-",
         None,
         "-",
@@ -2053,6 +2066,7 @@ pub async fn handle_proxy(
             started_at_ms + dur,
             None,
             retry,
+            None,
         )
         .await;
     Err((status, "retry attempts exhausted".to_string()))
