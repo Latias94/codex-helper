@@ -196,6 +196,17 @@ pub struct FinishedRequest {
     pub ended_at_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct FinishRequestParams {
+    pub id: u64,
+    pub status_code: u16,
+    pub duration_ms: u64,
+    pub ended_at_ms: u64,
+    pub usage: Option<UsageMetrics>,
+    pub retry: Option<RetryInfo>,
+    pub ttfb_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct SessionStats {
     pub turns_total: u64,
@@ -995,23 +1006,14 @@ impl ProxyState {
         req.upstream_base_url = Some(upstream_base_url);
     }
 
-    pub async fn finish_request(
-        &self,
-        id: u64,
-        status_code: u16,
-        duration_ms: u64,
-        ended_at_ms: u64,
-        usage: Option<UsageMetrics>,
-        retry: Option<RetryInfo>,
-        ttfb_ms: Option<u64>,
-    ) {
+    pub async fn finish_request(&self, params: FinishRequestParams) {
         let mut active = self.active_requests.write().await;
-        let Some(req) = active.remove(&id) else {
+        let Some(req) = active.remove(&params.id) else {
             return;
         };
 
         let finished = FinishedRequest {
-            id,
+            id: params.id,
             session_id: req.session_id,
             cwd: req.cwd,
             model: req.model,
@@ -1019,19 +1021,19 @@ impl ProxyState {
             config_name: req.config_name,
             provider_id: req.provider_id,
             upstream_base_url: req.upstream_base_url,
-            usage: usage.clone(),
-            retry,
+            usage: params.usage.clone(),
+            retry: params.retry,
             service: req.service,
             method: req.method,
             path: req.path,
-            status_code,
-            duration_ms,
-            ttfb_ms,
-            ended_at_ms,
+            status_code: params.status_code,
+            duration_ms: params.duration_ms,
+            ttfb_ms: params.ttfb_ms,
+            ended_at_ms: params.ended_at_ms,
         };
 
         {
-            let day = (ended_at_ms / 86_400_000) as i32;
+            let day = (finished.ended_at_ms / 86_400_000) as i32;
             let cfg_key = finished
                 .config_name
                 .clone()
@@ -1043,19 +1045,22 @@ impl ProxyState {
 
             let mut rollups = self.usage_rollups.write().await;
             let rollup = rollups.entry(finished.service.clone()).or_default();
-            rollup
-                .since_start
-                .record(status_code, duration_ms, usage.as_ref(), finished.ttfb_ms);
+            rollup.since_start.record(
+                finished.status_code,
+                finished.duration_ms,
+                finished.usage.as_ref(),
+                finished.ttfb_ms,
+            );
             rollup.by_day.entry(day).or_default().record(
-                status_code,
-                duration_ms,
-                usage.as_ref(),
+                finished.status_code,
+                finished.duration_ms,
+                finished.usage.as_ref(),
                 finished.ttfb_ms,
             );
             rollup.by_config.entry(cfg_key.clone()).or_default().record(
-                status_code,
-                duration_ms,
-                usage.as_ref(),
+                finished.status_code,
+                finished.duration_ms,
+                finished.usage.as_ref(),
                 finished.ttfb_ms,
             );
             rollup
@@ -1064,20 +1069,35 @@ impl ProxyState {
                 .or_default()
                 .entry(day)
                 .or_default()
-                .record(status_code, duration_ms, usage.as_ref(), finished.ttfb_ms);
+                .record(
+                    finished.status_code,
+                    finished.duration_ms,
+                    finished.usage.as_ref(),
+                    finished.ttfb_ms,
+                );
 
             rollup
                 .by_provider
                 .entry(provider_key.clone())
                 .or_default()
-                .record(status_code, duration_ms, usage.as_ref(), finished.ttfb_ms);
+                .record(
+                    finished.status_code,
+                    finished.duration_ms,
+                    finished.usage.as_ref(),
+                    finished.ttfb_ms,
+                );
             rollup
                 .by_provider_day
                 .entry(provider_key)
                 .or_default()
                 .entry(day)
                 .or_default()
-                .record(status_code, duration_ms, usage.as_ref(), finished.ttfb_ms);
+                .record(
+                    finished.status_code,
+                    finished.duration_ms,
+                    finished.usage.as_ref(),
+                    finished.ttfb_ms,
+                );
         }
 
         if let Some(sid) = finished.session_id.as_deref() {
@@ -1097,15 +1117,15 @@ impl ProxyState {
                 .config_name
                 .clone()
                 .or(entry.last_config_name.clone());
-            if let Some(u) = usage.as_ref() {
+            if let Some(u) = finished.usage.as_ref() {
                 entry.last_usage = Some(u.clone());
                 entry.total_usage.add_assign(u);
                 entry.turns_with_usage = entry.turns_with_usage.saturating_add(1);
             }
-            entry.last_status = Some(status_code);
-            entry.last_duration_ms = Some(duration_ms);
-            entry.last_ended_at_ms = Some(ended_at_ms);
-            entry.last_seen_ms = ended_at_ms;
+            entry.last_status = Some(finished.status_code);
+            entry.last_duration_ms = Some(finished.duration_ms);
+            entry.last_ended_at_ms = Some(finished.ended_at_ms);
+            entry.last_seen_ms = finished.ended_at_ms;
         }
 
         let mut recent = self.recent_finished.write().await;

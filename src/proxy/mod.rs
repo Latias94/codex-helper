@@ -1084,15 +1084,15 @@ pub async fn handle_proxy(
             let retry = retry_info_for_chain(&upstream_chain);
             proxy
                 .state
-                .finish_request(
-                    request_id,
-                    status.as_u16(),
-                    dur,
-                    started_at_ms + dur,
-                    None,
+                .finish_request(crate::state::FinishRequestParams {
+                    id: request_id,
+                    status_code: status.as_u16(),
+                    duration_ms: dur,
+                    ended_at_ms: started_at_ms + dur,
+                    usage: None,
                     retry,
-                    None,
-                )
+                    ttfb_ms: None,
+                })
                 .await;
             if let Some(model) = request_model.as_deref() {
                 return Err((
@@ -1243,15 +1243,15 @@ pub async fn handle_proxy(
                 let retry = retry_info_for_chain(&upstream_chain);
                 proxy
                     .state
-                    .finish_request(
-                        request_id,
-                        status.as_u16(),
-                        dur,
-                        started_at_ms + dur,
-                        None,
+                    .finish_request(crate::state::FinishRequestParams {
+                        id: request_id,
+                        status_code: status.as_u16(),
+                        duration_ms: dur,
+                        ended_at_ms: started_at_ms + dur,
+                        usage: None,
                         retry,
-                        None,
-                    )
+                        ttfb_ms: None,
+                    })
                     .await;
                 return Err((status, err_str));
             }
@@ -1490,15 +1490,15 @@ pub async fn handle_proxy(
                 );
                 proxy
                     .state
-                    .finish_request(
-                        request_id,
+                    .finish_request(crate::state::FinishRequestParams {
+                        id: request_id,
                         status_code,
-                        dur,
-                        started_at_ms + dur,
-                        None,
+                        duration_ms: dur,
+                        ended_at_ms: started_at_ms + dur,
+                        usage: None,
                         retry,
-                        None,
-                    )
+                        ttfb_ms: None,
+                    })
                     .await;
                 return Err((StatusCode::BAD_GATEWAY, e.to_string()));
             }
@@ -1673,15 +1673,15 @@ pub async fn handle_proxy(
                     let retry = retry_info_for_chain(&upstream_chain);
                     proxy
                         .state
-                        .finish_request(
-                            request_id,
-                            status.as_u16(),
-                            dur,
-                            started_at_ms + dur,
-                            None,
+                        .finish_request(crate::state::FinishRequestParams {
+                            id: request_id,
+                            status_code: status.as_u16(),
+                            duration_ms: dur,
+                            ended_at_ms: started_at_ms + dur,
+                            usage: None,
                             retry,
-                            Some(upstream_headers_ms),
-                        )
+                            ttfb_ms: Some(upstream_headers_ms),
+                        })
                         .await;
                     return Err((status, err_str));
                 }
@@ -1977,15 +1977,15 @@ pub async fn handle_proxy(
             );
             proxy
                 .state
-                .finish_request(
-                    request_id,
+                .finish_request(crate::state::FinishRequestParams {
+                    id: request_id,
                     status_code,
-                    dur,
-                    started_at_ms + dur,
-                    usage.clone(),
+                    duration_ms: dur,
+                    ended_at_ms: started_at_ms + dur,
+                    usage: usage.clone(),
                     retry,
-                    Some(upstream_headers_ms),
-                )
+                    ttfb_ms: Some(upstream_headers_ms),
+                })
                 .await;
 
             // Poll usage once after a user request finishes (e.g. packycode), used to drive auto-switching.
@@ -2059,15 +2059,15 @@ pub async fn handle_proxy(
     let retry = retry_info_for_chain(&upstream_chain);
     proxy
         .state
-        .finish_request(
-            request_id,
-            status.as_u16(),
-            dur,
-            started_at_ms + dur,
-            None,
+        .finish_request(crate::state::FinishRequestParams {
+            id: request_id,
+            status_code: status.as_u16(),
+            duration_ms: dur,
+            ended_at_ms: started_at_ms + dur,
+            usage: None,
             retry,
-            None,
-        )
+            ttfb_ms: None,
+        })
         .await;
     Err((status, "retry attempts exhausted".to_string()))
 }

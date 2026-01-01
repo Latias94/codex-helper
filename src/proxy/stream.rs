@@ -206,15 +206,15 @@ impl Drop for StreamFinalize {
 
         tokio::spawn(async move {
             state
-                .finish_request(
-                    request_id,
+                .finish_request(crate::state::FinishRequestParams {
+                    id: request_id,
                     status_code,
-                    dur,
-                    started_at_ms + dur,
-                    usage_for_state,
-                    retry_for_state,
-                    ttfb_ms_for_state,
-                )
+                    duration_ms: dur,
+                    ended_at_ms: started_at_ms + dur,
+                    usage: usage_for_state,
+                    retry: retry_for_state,
+                    ttfb_ms: ttfb_ms_for_state,
+                })
                 .await;
         });
     }
