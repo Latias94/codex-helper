@@ -766,6 +766,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  e          toggle errors-only"),
             Line::from("  v          toggle overrides-only"),
             Line::from("  r          reset filters"),
+            Line::from("  t          view transcript (Codex)"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Stats page",
@@ -788,6 +789,123 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
     let content = Paragraph::new(Text::from(lines))
         .block(block)
         .style(Style::default().fg(p.muted))
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, area);
+}
+
+pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
+    let area = centered_rect(92, 90, f.area());
+    f.render_widget(Clear, area);
+
+    let sid = ui.selected_session_id.as_deref().unwrap_or("-");
+    let title = format!(
+        "{}: {}",
+        crate::tui::i18n::pick(ui.language, "会话对话记录", "Session transcript"),
+        short_sid(sid, 28)
+    );
+
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("sid: ", Style::default().fg(p.muted)),
+        Span::styled(short_sid(sid, 36), Style::default().fg(p.text)),
+        Span::raw("   "),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "按键：", "keys: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  t/Esc 关闭  L 语言",
+                "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  t/Esc close  L language",
+            ),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+
+    if let Some(meta) = ui.session_transcript_meta.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("meta: ", Style::default().fg(p.muted)),
+            Span::styled(
+                shorten_middle(meta.id.as_str(), 44),
+                Style::default().fg(p.text),
+            ),
+            Span::raw("   "),
+            Span::styled("cwd: ", Style::default().fg(p.muted)),
+            Span::styled(
+                meta.cwd
+                    .as_deref()
+                    .map(|s| shorten_middle(s, 60))
+                    .unwrap_or_else(|| "-".to_string()),
+                Style::default().fg(p.text),
+            ),
+        ]));
+    }
+
+    if let Some(file) = ui.session_transcript_file.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("file: ", Style::default().fg(p.muted)),
+            Span::styled(shorten_middle(file, 120), Style::default().fg(p.muted)),
+        ]));
+    }
+
+    if let Some(err) = ui.session_transcript_error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("error: {err}"),
+            Style::default().fg(p.bad),
+        )));
+    }
+
+    lines.push(Line::from(""));
+
+    if ui.session_transcript_messages.is_empty() {
+        lines.push(Line::from(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "未找到可展示的对话消息（可能该会话不在 ~/.codex/sessions，或格式发生变化）。",
+                "No transcript messages found (session file missing or format changed).",
+            ),
+            Style::default().fg(p.muted),
+        )));
+    } else {
+        for msg in ui.session_transcript_messages.iter() {
+            let role_style = if msg.role.eq_ignore_ascii_case("Assistant") {
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+            };
+            let head = if let Some(ts) = msg.timestamp.as_deref() {
+                format!("[{}] {}", ts, msg.role)
+            } else {
+                msg.role.clone()
+            };
+
+            lines.push(Line::from(Span::styled(head, role_style)));
+            for line in msg.text.lines() {
+                lines.push(Line::from(Span::raw(format!("  {line}"))));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_h).min(u16::MAX as usize) as u16;
+    ui.session_transcript_scroll = ui.session_transcript_scroll.min(max_scroll);
+
+    let content = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(p.text))
+        .scroll((ui.session_transcript_scroll, 0))
         .wrap(Wrap { trim: false });
     f.render_widget(content, area);
 }

@@ -1,6 +1,7 @@
 use ratatui::widgets::{ListState, TableState};
 
 use crate::config::ResolvedRetryConfig;
+use crate::sessions::{SessionMeta, SessionTranscriptMessage};
 
 use super::Language;
 use super::model::{Snapshot, filtered_requests_len};
@@ -35,6 +36,11 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_stats_provider_idx: usize,
     pub(in crate::tui) needs_snapshot_refresh: bool,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
+    pub(in crate::tui) session_transcript_meta: Option<SessionMeta>,
+    pub(in crate::tui) session_transcript_file: Option<String>,
+    pub(in crate::tui) session_transcript_messages: Vec<SessionTranscriptMessage>,
+    pub(in crate::tui) session_transcript_scroll: u16,
+    pub(in crate::tui) session_transcript_error: Option<String>,
     pub(in crate::tui) pending_overwrite_from_codex_confirm_at: Option<std::time::Instant>,
     pub(in crate::tui) last_runtime_config_loaded_at_ms: Option<u64>,
     pub(in crate::tui) last_runtime_config_source_mtime_ms: Option<u64>,
@@ -82,6 +88,11 @@ impl Default for UiState {
             selected_stats_provider_idx: 0,
             needs_snapshot_refresh: false,
             toast: None,
+            session_transcript_meta: None,
+            session_transcript_file: None,
+            session_transcript_messages: Vec::new(),
+            session_transcript_scroll: 0,
+            session_transcript_error: None,
             pending_overwrite_from_codex_confirm_at: None,
             last_runtime_config_loaded_at_ms: None,
             last_runtime_config_source_mtime_ms: None,

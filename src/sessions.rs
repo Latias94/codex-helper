@@ -1,5 +1,5 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -28,6 +28,22 @@ pub struct SessionSummary {
     /// Conversation rounds (best-effort; currently `min(user_turns, assistant_turns)`).
     pub rounds: usize,
     pub first_user_message: Option<String>,
+}
+
+/// Basic metadata for a Codex session (best-effort parsed from JSONL).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: String,
+    pub cwd: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// A single transcript message extracted from a Codex session JSONL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTranscriptMessage {
+    pub timestamp: Option<String>,
+    pub role: String,
+    pub text: String,
 }
 
 const MAX_SCAN_FILES: usize = 10_000;
@@ -329,6 +345,217 @@ pub async fn find_codex_session_cwd_by_id(session_id: &str) -> Result<Option<Str
     Ok(None)
 }
 
+/// Best-effort: locate a Codex session JSONL file by session id.
+///
+/// We first try to match the UUID suffix in the `rollout-...-<uuid>.jsonl` filename (fast path),
+/// then fall back to scanning session_meta records to match `payload.id`.
+pub async fn find_codex_session_file_by_id(session_id: &str) -> Result<Option<PathBuf>> {
+    let root = codex_sessions_dir();
+    if !root.exists() {
+        return Ok(None);
+    }
+
+    let mut scanned_files: usize = 0;
+    let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u32>().ok()).await?;
+
+    'outer: for (_year, year_path) in year_dirs {
+        let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
+        for (_month, month_path) in month_dirs {
+            let day_dirs = collect_dirs_desc(&month_path, |s| s.parse::<u8>().ok()).await?;
+            for (_day, day_path) in day_dirs {
+                let day_files = collect_rollout_files_sorted(&day_path).await?;
+                for path in day_files {
+                    if scanned_files >= MAX_SCAN_FILES {
+                        break 'outer;
+                    }
+                    scanned_files += 1;
+
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                        && let Some((_ts, uuid)) = parse_timestamp_and_uuid(name)
+                        && uuid == session_id
+                    {
+                        return Ok(Some(path));
+                    }
+
+                    if let Some(meta) = read_codex_session_meta(&path).await?
+                        && meta.id == session_id
+                    {
+                        return Ok(Some(path));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Read the `session_meta` record from a Codex session JSONL file (best-effort).
+pub async fn read_codex_session_meta(path: &Path) -> Result<Option<SessionMeta>> {
+    let file = fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open session file {:?}", path))?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let mut lines_scanned = 0usize;
+    while let Some(line) = lines.next_line().await? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        lines_scanned += 1;
+        if lines_scanned > HEAD_SCAN_LINES {
+            break;
+        }
+
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if let Some(meta) = parse_session_meta(&value) {
+            return Ok(Some(SessionMeta {
+                id: meta.id,
+                cwd: meta.cwd,
+                created_at: meta.created_at,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Read a best-effort transcript from a Codex session JSONL file.
+///
+/// If `tail` is Some(N), only the last N extracted messages are returned.
+pub async fn read_codex_session_transcript(
+    path: &Path,
+    tail: Option<usize>,
+) -> Result<Vec<SessionTranscriptMessage>> {
+    match tail {
+        Some(0) => Ok(Vec::new()),
+        Some(n) => read_codex_session_transcript_tail(path, n).await,
+        None => read_codex_session_transcript_full(path).await,
+    }
+}
+
+async fn read_codex_session_transcript_full(path: &Path) -> Result<Vec<SessionTranscriptMessage>> {
+    let file = fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open session file {:?}", path))?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let mut out: Vec<SessionTranscriptMessage> = Vec::new();
+    while let Some(line) = lines.next_line().await? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let Some(msg) = extract_transcript_message(&value) else {
+            continue;
+        };
+        if msg.text.trim().is_empty() {
+            continue;
+        }
+        out.push(msg);
+    }
+    Ok(out)
+}
+
+async fn read_codex_session_transcript_tail(
+    path: &Path,
+    n: usize,
+) -> Result<Vec<SessionTranscriptMessage>> {
+    // Best-effort optimization: read a bounded window from the file tail instead of scanning the
+    // whole JSONL. If we don't collect enough messages, expand the window a few times.
+    let mut max_bytes = TAIL_SCAN_MAX_BYTES;
+    let mut last: Vec<SessionTranscriptMessage> = Vec::new();
+    for _ in 0..5 {
+        let (bytes, started_mid) = read_file_tail_bytes(path, max_bytes).await?;
+        last = extract_transcript_messages_from_jsonl_bytes(&bytes, started_mid, n);
+        if last.len() >= n {
+            break;
+        }
+        max_bytes = max_bytes.saturating_mul(2).min(16 * 1024 * 1024);
+    }
+    Ok(last)
+}
+
+async fn read_file_tail_bytes(path: &Path, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
+    let meta = fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to stat session file {:?}", path))?;
+    let len = meta.len();
+    let start = len.saturating_sub(max_bytes as u64);
+    let started_mid = start > 0;
+
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open session file {:?}", path))?;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await?;
+    Ok((buf, started_mid))
+}
+
+fn extract_transcript_messages_from_jsonl_bytes(
+    bytes: &[u8],
+    started_mid: bool,
+    tail_n: usize,
+) -> Vec<SessionTranscriptMessage> {
+    if tail_n == 0 {
+        return Vec::new();
+    }
+
+    let mut slice = bytes;
+    if started_mid {
+        // If we started mid-file, the first line might be partial; drop it.
+        if let Some(pos) = slice.iter().position(|&b| b == b'\n') {
+            slice = &slice[pos + 1..];
+        }
+    }
+
+    let mut ring: VecDeque<SessionTranscriptMessage> = VecDeque::with_capacity(tail_n.max(1));
+
+    for raw in slice.split(|&b| b == b'\n') {
+        if raw.is_empty() {
+            continue;
+        }
+        let line = match std::str::from_utf8(raw) {
+            Ok(s) => s.trim().trim_end_matches('\r'),
+            Err(_) => continue,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(msg) = extract_transcript_message(&value) else {
+            continue;
+        };
+        if msg.text.trim().is_empty() {
+            continue;
+        }
+
+        ring.push_back(msg);
+        if ring.len() > tail_n {
+            ring.pop_front();
+        }
+    }
+
+    ring.into_iter().collect()
+}
+
 #[cfg(test)]
 async fn summarize_session_for_current_dir(
     path: &Path,
@@ -403,6 +630,80 @@ fn user_message_text(value: &Value) -> Option<&str> {
         return None;
     }
     payload.get("message").and_then(|v| v.as_str())
+}
+
+fn normalize_role(role: &str) -> String {
+    match role {
+        "user" => "User".to_string(),
+        "assistant" => "Assistant".to_string(),
+        "system" => "System".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn assistant_or_user_message_from_response_item(value: &Value) -> Option<(String, String)> {
+    let obj = value.as_object()?;
+    let type_str = obj.get("type")?.as_str()?;
+    if type_str != "response_item" {
+        return None;
+    }
+    let payload = obj.get("payload")?.as_object()?;
+    let payload_type = payload.get("type")?.as_str()?;
+    if payload_type != "message" {
+        return None;
+    }
+
+    let role = payload.get("role")?.as_str()?;
+    let text = payload
+        .get("content")
+        .and_then(|v| v.as_array())
+        .and_then(|items| extract_text_from_content_items(items))?;
+
+    Some((normalize_role(role), text))
+}
+
+fn extract_text_from_content_items(items: &[Value]) -> Option<String> {
+    let mut out = String::new();
+    for item in items {
+        let obj = match item.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let t = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if !t.ends_with("_text") && t != "text" {
+            continue;
+        }
+        let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        out.push_str(text);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn extract_transcript_message(value: &Value) -> Option<SessionTranscriptMessage> {
+    let timestamp = value
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if let Some(msg) = user_message_text(value) {
+        return Some(SessionTranscriptMessage {
+            timestamp,
+            role: "User".to_string(),
+            text: msg.to_string(),
+        });
+    }
+
+    if let Some((role, text)) = assistant_or_user_message_from_response_item(value) {
+        return Some(SessionTranscriptMessage {
+            timestamp,
+            role,
+            text,
+        });
+    }
+
+    None
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -935,5 +1236,50 @@ mod tests {
             Some("2025-12-22T00:00:04.000Z"),
             "updated_at should prefer last_response_at"
         );
+    }
+
+    #[tokio::test]
+    async fn read_codex_session_transcript_extracts_messages_and_tail() {
+        let dir = std::env::temp_dir().join(format!("codex-helper-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create tmp dir");
+        let path =
+            dir.join("rollout-2025-12-22T00-00-00-00000000-0000-0000-0000-000000000000.jsonl");
+
+        let meta_line = serde_json::json!({
+            "timestamp": "2025-12-22T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "cwd": "G:/code/project",
+                "timestamp": "2025-12-22T00:00:00.000Z"
+            }
+        })
+        .to_string();
+
+        let lines = [
+            meta_line,
+            r#"{"timestamp":"2025-12-22T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#.to_string(),
+            r#"{"timestamp":"2025-12-22T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#.to_string(),
+            r#"{"timestamp":"2025-12-22T00:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"next"}}"#.to_string(),
+            r#"{"timestamp":"2025-12-22T00:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#.to_string(),
+        ]
+        .join("\n");
+        std::fs::write(&path, lines).expect("write session file");
+
+        let all = read_codex_session_transcript(&path, None)
+            .await
+            .expect("read transcript ok");
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0].role, "User");
+        assert_eq!(all[0].text, "hi");
+        assert_eq!(all[1].role, "Assistant");
+        assert_eq!(all[1].text, "hello");
+
+        let tail = read_codex_session_transcript(&path, Some(2))
+            .await
+            .expect("read tail ok");
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].text, "next");
+        assert_eq!(tail[1].text, "ok");
     }
 }

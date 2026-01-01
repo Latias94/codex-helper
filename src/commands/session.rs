@@ -1,5 +1,6 @@
 use crate::sessions::{
-    SessionSummary, find_codex_sessions_for_current_dir, find_codex_sessions_for_dir,
+    SessionSummary, find_codex_session_file_by_id, find_codex_sessions_for_current_dir,
+    find_codex_sessions_for_dir, read_codex_session_meta, read_codex_session_transcript,
     search_codex_sessions_for_current_dir, search_codex_sessions_for_dir,
 };
 use crate::{CliResult, SessionCommand};
@@ -69,6 +70,83 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                 println!("  codex resume {}", s.id);
             } else {
                 println!("No Codex sessions found under ~/.codex/sessions");
+            }
+        }
+        SessionCommand::Transcript {
+            id,
+            all,
+            tail,
+            format,
+            timestamps,
+            path,
+        } => {
+            let session_opt: Option<SessionSummary> = if let Some(p) = path.as_deref() {
+                let root = std::path::PathBuf::from(p);
+                let sessions = find_codex_sessions_for_dir(&root, usize::MAX).await?;
+                sessions.into_iter().find(|s| s.id == id)
+            } else {
+                let sessions = find_codex_sessions_for_current_dir(usize::MAX).await?;
+                sessions.into_iter().find(|s| s.id == id)
+            };
+
+            let session_path = if let Some(sess) = session_opt.as_ref() {
+                sess.path.clone()
+            } else if let Some(found) = find_codex_session_file_by_id(&id).await? {
+                found
+            } else {
+                println!("Session with id {} not found under ~/.codex/sessions", id);
+                return Ok(());
+            };
+
+            let meta = read_codex_session_meta(&session_path).await?;
+            println!("Codex session transcript:");
+            println!("  id: {}", id);
+            if let Some(meta) = meta.as_ref() {
+                if let Some(cwd) = meta.cwd.as_deref() {
+                    println!("  cwd: {}", cwd);
+                }
+                if let Some(ts) = meta.created_at.as_deref() {
+                    println!("  created_at: {}", ts);
+                }
+            }
+            println!("  file: {:?}", session_path);
+            println!();
+
+            let slice = if all { None } else { Some(tail) };
+            let messages = read_codex_session_transcript(&session_path, slice).await?;
+
+            let fmt = format.to_lowercase();
+            if fmt == "json" {
+                let json =
+                    serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string());
+                println!("{json}");
+                return Ok(());
+            }
+
+            if fmt == "markdown" {
+                println!("# Codex session transcript\n");
+                println!("- id: `{}`", id);
+                if let Some(cwd) = meta.as_ref().and_then(|m| m.cwd.as_deref()) {
+                    println!("- cwd: `{}`", cwd);
+                }
+                println!();
+                for m in messages {
+                    println!("## {}", m.role);
+                    println!();
+                    println!("{}", m.text);
+                    println!();
+                }
+                return Ok(());
+            }
+
+            // Default: text
+            for m in messages {
+                if timestamps && let Some(ts) = m.timestamp.as_deref() {
+                    println!("[{}] {}: {}", ts, m.role, m.text);
+                    continue;
+                }
+                println!("{}: {}", m.role, m.text);
+                println!();
             }
         }
         SessionCommand::Search { query, limit, path } => {

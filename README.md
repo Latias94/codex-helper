@@ -57,7 +57,7 @@ ch
 它会自动帮你：
 
 - 启动 Codex 本地代理，监听 `127.0.0.1:3211`；
-- 如果在交互终端运行，会默认显示一个内置 TUI 面板（可用 `--no-tui` 关闭；按 `q` 退出；`1-6` 切页，`2` 为 Configs/Level 分组视图）；
+- 如果在交互终端运行，会默认显示一个内置 TUI 面板（可用 `--no-tui` 关闭；按 `q` 退出；`1-6` 切页；在 Sessions 页按 `t` 查看对话记录）；
 - 对 429/5xx/网络抖动等瞬态错误在**未开始向客户端输出响应**前进行有限次数的自动重试（可配置）；
 - 在修改前检查 `~/.codex/config.toml`，如已指向本地代理且存在备份，会询问是否先恢复原始配置；
 - 必要时修改 `model_provider` 与 `model_providers.codex_proxy`，让 Codex 走本地代理，并只在首次写入备份；
@@ -345,6 +345,7 @@ codex-helper config set-level openai 2
   ```bash
   codex-helper session list
   codex-helper session last
+  codex-helper session transcript <ID> --tail 40
   ```
 
 - 请求用量 / 日志：
@@ -403,6 +404,7 @@ cd ~/code/my-app
 
 codex-helper session list   # 列出与当前项目相关的最近会话
 codex-helper session last   # 给出最近一次会话 + 对应 resume 命令
+codex-helper session transcript <ID> --tail 40   # 查看最近对话，用于辨认某个 session
 ```
 
 `session list` 会额外展示每个会话的轮数（rounds）与最后更新时间（last_update，优先取最后一次 assistant 响应时间）。

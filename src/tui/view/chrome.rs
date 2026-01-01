@@ -278,8 +278,8 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Sessions => crate::tui::i18n::pick(
                 ui.language,
-                "1-6 页面  q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  ? 帮助",
-                "1-6 pages  q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  ? help",
+                "1-6 页面  q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  ? 帮助",
+                "1-6 pages  q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  t transcript  ? help",
             ),
             Page::Stats => crate::tui::i18n::pick(
                 ui.language,
@@ -319,6 +319,11 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ui.language,
             "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言",
             "↑/↓ scroll  PgUp/PgDn page  Esc close  L language",
+        ),
+        Overlay::SessionTranscript => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  t/Esc 关闭  L 语言",
+            "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  t/Esc close  L language",
         ),
     };
     let right = ui.toast.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");

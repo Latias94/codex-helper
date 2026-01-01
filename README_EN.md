@@ -62,7 +62,7 @@ This will:
 - When writing `model_providers.codex_proxy`, set `request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries); you can override it in `~/.codex/config.toml`;
 - Automatically retry a small number of times for transient failures (429/5xx/network hiccups) **before any response bytes are streamed to the client** (configurable);
 - If `~/.codex-helper/config.toml` / `config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
-- If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit; use `1-6` to switch pages, with `2` for Configs/level routing);
+- If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit; use `1-6` to switch pages; on Sessions page press `t` to view transcript);
 - On Ctrl+C, attempt to restore the original Codex config from the backup.
 
 After that, you keep using your usual `codex ...` commands; codex-helper just sits in the middle.
@@ -368,6 +368,7 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
   ```bash
   codex-helper session list
   codex-helper session last
+  codex-helper session transcript <ID> --tail 40
   ```
 
 - Usage & logs:
@@ -426,6 +427,7 @@ cd ~/code/my-app
 
 codex-helper session list   # list recent sessions for this project
 codex-helper session last   # show last session + a codex resume command
+codex-helper session transcript <ID> --tail 40   # view recent conversation to identify a session
 ```
 
 `session list` now includes the conversation rounds (`rounds`) and the last update timestamp (`last_update`, which prefers the last assistant response time when available).

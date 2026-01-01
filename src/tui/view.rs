@@ -40,6 +40,7 @@ pub(in crate::tui) fn render_app(
         Overlay::Help => modals::render_help_modal(f, p, ui.language),
         Overlay::ConfigInfo => modals::render_config_info_modal(f, p, ui, snapshot, providers),
         Overlay::EffortMenu => modals::render_effort_modal(f, p, ui),
+        Overlay::SessionTranscript => modals::render_session_transcript_modal(f, p, ui),
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             let title = match ui.overlay {
                 Overlay::ProviderMenuSession => crate::tui::i18n::pick(

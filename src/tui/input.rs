@@ -11,6 +11,9 @@ use crate::config::{
     overwrite_codex_config_from_codex_cli_in_place, proxy_home_dir, save_config,
     sync_codex_auth_from_codex_cli,
 };
+use crate::sessions::{
+    find_codex_session_file_by_id, read_codex_session_meta, read_codex_session_transcript,
+};
 use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
 
 use super::Language;
@@ -39,6 +42,41 @@ pub(in crate::tui) async fn handle_key_event(
         Overlay::Help => match key.code {
             KeyCode::Esc | KeyCode::Char('?') => {
                 ui.overlay = Overlay::None;
+                true
+            }
+            KeyCode::Char('L') => {
+                toggle_language(ui).await;
+                true
+            }
+            _ => false,
+        },
+        Overlay::SessionTranscript => match key.code {
+            KeyCode::Esc | KeyCode::Char('t') => {
+                ui.overlay = Overlay::None;
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                ui.session_transcript_scroll = ui.session_transcript_scroll.saturating_sub(1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                ui.session_transcript_scroll = ui.session_transcript_scroll.saturating_add(1);
+                true
+            }
+            KeyCode::PageUp => {
+                ui.session_transcript_scroll = ui.session_transcript_scroll.saturating_sub(10);
+                true
+            }
+            KeyCode::PageDown => {
+                ui.session_transcript_scroll = ui.session_transcript_scroll.saturating_add(10);
+                true
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                ui.session_transcript_scroll = 0;
+                true
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                ui.session_transcript_scroll = u16::MAX;
                 true
             }
             KeyCode::Char('L') => {
@@ -1160,6 +1198,43 @@ async fn handle_key_normal(
             ui.sessions_page_overrides_only = false;
             ui.selected_sessions_page_idx = 0;
             ui.toast = Some(("sessions filter: reset".to_string(), Instant::now()));
+            true
+        }
+        KeyCode::Char('t') if ui.page == Page::Sessions => {
+            let Some(sid) = ui.selected_session_id.clone() else {
+                ui.toast = Some(("no session selected".to_string(), Instant::now()));
+                return true;
+            };
+
+            ui.session_transcript_meta = None;
+            ui.session_transcript_file = None;
+            ui.session_transcript_messages.clear();
+            ui.session_transcript_scroll = u16::MAX;
+            ui.session_transcript_error = None;
+
+            match find_codex_session_file_by_id(&sid).await {
+                Ok(Some(path)) => {
+                    ui.session_transcript_file = Some(path.to_string_lossy().to_string());
+                    match read_codex_session_meta(&path).await {
+                        Ok(meta) => ui.session_transcript_meta = meta,
+                        Err(e) => ui.session_transcript_error = Some(e.to_string()),
+                    }
+                    match read_codex_session_transcript(&path, Some(80)).await {
+                        Ok(msgs) => ui.session_transcript_messages = msgs,
+                        Err(e) => ui.session_transcript_error = Some(e.to_string()),
+                    }
+                    ui.overlay = Overlay::SessionTranscript;
+                }
+                Ok(None) => {
+                    ui.toast = Some((
+                        "no Codex session file found for this session id".to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    ui.toast = Some((format!("failed to load transcript: {e}"), Instant::now()));
+                }
+            }
             true
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Sessions => {

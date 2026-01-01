@@ -355,6 +355,26 @@ enum SessionCommand {
         #[arg(long)]
         path: Option<String>,
     },
+    /// Print a session transcript (best-effort) by session id
+    Transcript {
+        /// Session id (from `session list`)
+        id: String,
+        /// Print the full transcript (can be large)
+        #[arg(long)]
+        all: bool,
+        /// Print only the last N messages (ignored with --all)
+        #[arg(long, default_value_t = 40)]
+        tail: usize,
+        /// Output format: text | markdown | json
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Include timestamps when available (text format only)
+        #[arg(long)]
+        timestamps: bool,
+        /// Optional directory hint to resolve the session id; defaults to current dir
+        #[arg(long)]
+        path: Option<String>,
+    },
     /// Search Codex sessions by user message content
     Search {
         /// Substring to search in user messages
