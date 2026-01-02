@@ -28,7 +28,7 @@ toml = "0.8"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "fs"] }
 axum = { version = "0.8.7", features = ["http2", "macros", "ws"] }
 hyper = { version = "1.8.1", features = ["full"] }
-reqwest = { version = "0.12.24", features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13.1", features = ["json", "stream"] }
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
