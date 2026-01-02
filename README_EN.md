@@ -3,6 +3,8 @@
 > Put Codex behind a small local “bumper”:  
 > centralize all your relays / keys / quotas, auto-switch when an upstream is exhausted or failing, and get handy CLI helpers for sessions, filtering, and diagnostics.
 
+Current version: `v0.10.0`
+
 > 中文说明: `README.md`
 
 ---
@@ -62,7 +64,7 @@ This will:
 - When writing `model_providers.codex_proxy`, set `request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries); you can override it in `~/.codex/config.toml`;
 - Automatically retry a small number of times for transient failures (429/5xx/network hiccups) **before any response bytes are streamed to the client** (configurable);
 - If `~/.codex-helper/config.toml` / `config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
-- If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit; use `1-6` to switch pages; on Sessions page press `t` to view transcript);
+- If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit; use `1-7` to switch pages; use `7` to browse history; on Sessions/History press `t` to view transcript);
 - On Ctrl+C, attempt to restore the original Codex config from the backup.
 
 After that, you keep using your usual `codex ...` commands; codex-helper just sits in the middle.

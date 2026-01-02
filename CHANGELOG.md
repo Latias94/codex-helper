@@ -3,6 +3,19 @@ All notable changes to this project will be documented in this file.
 
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
+## [0.10.0] - 2026-01-02
+### 新增 / Added
+- TUI 新增 `7 历史` 页面：展示当前目录相关的 Codex 本地历史会话（`~/.codex/sessions`），可在未活跃会话上直接打开 transcript。
+  TUI adds `7 History`: browse Codex local history sessions (`~/.codex/sessions`) for the current directory and open transcripts even for inactive sessions.
+
+### 改进 / Improved
+- TUI transcript 视图升级为全屏“页面式”展示，并新增 `A`（全量/尾部切换）与 `y`（复制到剪贴板）。
+  TUI transcript view is now full-screen, with `A` (toggle all/tail) and `y` (copy to clipboard).
+
+### 修复 / Fixed
+- 修复切换页面时偶发的 UI 残影：页面切换时强制 `terminal.clear()` 后重绘。
+  Fix occasional UI artifacts when switching pages: force a `terminal.clear()` on page switch before redraw.
+
 ## [0.9.0] - 2026-01-01
 ### 新增 / Added
 - 新增 `codex-helper session transcript <ID>`：按 session id 输出 Codex 会话的历史对话（best-effort 解析 `~/.codex/sessions/*.jsonl`），用于快速辨认 session（支持 `--tail/--all` 以及 `--format text|markdown|json`）。
