@@ -1,7 +1,7 @@
 use ratatui::widgets::{ListState, TableState};
 
 use crate::config::ResolvedRetryConfig;
-use crate::sessions::{SessionMeta, SessionTranscriptMessage};
+use crate::sessions::{SessionMeta, SessionSummary, SessionTranscriptMessage};
 
 use super::Language;
 use super::model::{Snapshot, filtered_requests_len};
@@ -36,8 +36,15 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_stats_provider_idx: usize,
     pub(in crate::tui) needs_snapshot_refresh: bool,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
+    pub(in crate::tui) codex_history_sessions: Vec<SessionSummary>,
+    pub(in crate::tui) codex_history_error: Option<String>,
+    pub(in crate::tui) codex_history_loaded_at_ms: Option<u64>,
+    pub(in crate::tui) needs_codex_history_refresh: bool,
+    pub(in crate::tui) selected_codex_history_idx: usize,
     pub(in crate::tui) session_transcript_meta: Option<SessionMeta>,
+    pub(in crate::tui) session_transcript_sid: Option<String>,
     pub(in crate::tui) session_transcript_file: Option<String>,
+    pub(in crate::tui) session_transcript_tail: Option<usize>,
     pub(in crate::tui) session_transcript_messages: Vec<SessionTranscriptMessage>,
     pub(in crate::tui) session_transcript_scroll: u16,
     pub(in crate::tui) session_transcript_error: Option<String>,
@@ -52,6 +59,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) requests_table: TableState,
     pub(in crate::tui) request_page_table: TableState,
     pub(in crate::tui) sessions_page_table: TableState,
+    pub(in crate::tui) codex_history_table: TableState,
     pub(in crate::tui) stats_configs_table: TableState,
     pub(in crate::tui) stats_providers_table: TableState,
     pub(in crate::tui) menu_list: ListState,
@@ -88,8 +96,15 @@ impl Default for UiState {
             selected_stats_provider_idx: 0,
             needs_snapshot_refresh: false,
             toast: None,
+            codex_history_sessions: Vec::new(),
+            codex_history_error: None,
+            codex_history_loaded_at_ms: None,
+            needs_codex_history_refresh: false,
+            selected_codex_history_idx: 0,
             session_transcript_meta: None,
+            session_transcript_sid: None,
             session_transcript_file: None,
+            session_transcript_tail: Some(80),
             session_transcript_messages: Vec::new(),
             session_transcript_scroll: 0,
             session_transcript_error: None,
@@ -104,6 +119,7 @@ impl Default for UiState {
             requests_table: TableState::default(),
             request_page_table: TableState::default(),
             sessions_page_table: TableState::default(),
+            codex_history_table: TableState::default(),
             stats_configs_table: TableState::default(),
             stats_providers_table: TableState::default(),
             menu_list: ListState::default(),

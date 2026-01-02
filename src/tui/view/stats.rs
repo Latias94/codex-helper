@@ -495,7 +495,7 @@ fn render_detail_panel(
         Line::from(vec![
             Span::styled("↑/↓", Style::default().fg(p.text)),
             Span::styled(" select  ", Style::default().fg(p.muted)),
-            Span::styled("1-6", Style::default().fg(p.text)),
+            Span::styled("1-7", Style::default().fg(p.text)),
             Span::styled(" pages", Style::default().fg(p.muted)),
         ]),
     ]);

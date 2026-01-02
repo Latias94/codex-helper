@@ -27,7 +27,7 @@ use tokio::sync::watch;
 
 use crate::state::ProxyState;
 
-use self::model::{Palette, refresh_snapshot};
+use self::model::{Palette, now_ms, refresh_snapshot};
 use self::state::UiState;
 use self::terminal::TerminalGuard;
 
@@ -72,8 +72,16 @@ pub async fn run_dashboard(
     ui.clamp_selection(&snapshot, providers.len());
 
     let mut should_redraw = true;
+    let mut last_drawn_page = ui.page;
     loop {
         if should_redraw {
+            if ui.page != last_drawn_page {
+                // Defensive: some terminals occasionally leave stale cells when only a small
+                // region changes (e.g., switching tabs). A full clear on page switch keeps the
+                // UI visually consistent without clearing on every tick.
+                terminal.clear()?;
+                last_drawn_page = ui.page;
+            }
             terminal.draw(|f| {
                 view::render_app(
                     f,
@@ -141,6 +149,40 @@ pub async fn run_dashboard(
                                 snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
                                 ui.clamp_selection(&snapshot, providers.len());
                                 ui.needs_snapshot_refresh = false;
+                            }
+                            if ui.needs_codex_history_refresh {
+                                ui.codex_history_error = None;
+                                match crate::sessions::find_codex_sessions_for_current_dir(200).await {
+                                    Ok(list) => {
+                                        ui.codex_history_sessions = list;
+                                        ui.codex_history_loaded_at_ms = Some(now_ms());
+                                        ui.selected_codex_history_idx = 0;
+                                        ui.codex_history_table.select(if ui.codex_history_sessions.is_empty() {
+                                            None
+                                        } else {
+                                            Some(0)
+                                        });
+                                        let count = ui.codex_history_sessions.len();
+                                        let zh = format!("history: 已加载 {count} 个会话");
+                                        let en = format!("history: loaded {count} sessions");
+                                        ui.toast = Some((
+                                            crate::tui::i18n::pick(ui.language, &zh, &en).to_string(),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        ui.codex_history_sessions.clear();
+                                        ui.codex_history_loaded_at_ms = Some(now_ms());
+                                        ui.codex_history_error = Some(e.to_string());
+                                        let zh = format!("history: 加载失败：{e}");
+                                        let en = format!("history: load failed: {e}");
+                                        ui.toast = Some((
+                                            crate::tui::i18n::pick(ui.language, &zh, &en).to_string(),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
+                                ui.needs_codex_history_refresh = false;
                             }
                             should_redraw = true;
                         }

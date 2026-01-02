@@ -640,8 +640,8 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from("  ↑/↓, j/k   移动选中项"),
-            Line::from("  1-6        切换页面"),
-            Line::from("            1 总览  2 配置  3 会话  4 请求  5 统计  6 设置"),
+            Line::from("  1-7        切换页面"),
+            Line::from("            1 总览  2 配置  3 会话  4 请求  5 统计  6 设置  7 历史"),
             Line::from("  L          切换语言（中/英，自动落盘）"),
             Line::from("  Tab        切换焦点（总览页）"),
             Line::from("  6 设置     查看运行态与关键配置入口"),
@@ -690,6 +690,14 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  e          仅看错误（errors-only）"),
             Line::from("  v          仅看覆盖（overrides-only）"),
             Line::from("  r          重置筛选"),
+            Line::from("  t          对话记录（全屏）"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "历史页（History）",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  r          刷新历史会话列表"),
+            Line::from("  t/Enter    打开对话记录（全屏）"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "统计页（Stats）",
@@ -715,9 +723,9 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             )]),
             Line::from("  Tab        switch focus (Dashboard)"),
             Line::from("  ↑/↓, j/k   move selection"),
-            Line::from("  1-6        switch page"),
+            Line::from("  1-7        switch page"),
             Line::from(
-                "            1 Dashboard  2 Configs  3 Sessions  4 Requests  5 Stats  6 Settings",
+                "            1 Dashboard  2 Configs  3 Sessions  4 Requests  5 Stats  6 Settings  7 History",
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
             Line::from("  6 Settings show runtime + config overview"),
@@ -766,7 +774,14 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  e          toggle errors-only"),
             Line::from("  v          toggle overrides-only"),
             Line::from("  r          reset filters"),
-            Line::from("  t          view transcript (Codex)"),
+            Line::from("  t          transcript (full-screen)"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "History page",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  r          refresh history session list"),
+            Line::from("  t/Enter    open transcript (full-screen)"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Stats page",
@@ -794,12 +809,18 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
 }
 
 pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
-    let area = centered_rect(92, 90, f.area());
+    // Use a full-screen "page-like" overlay so users can mouse-select/copy without
+    // accidentally including other panels in the selection rectangle.
+    let area = f.area();
     f.render_widget(Clear, area);
 
-    let sid = ui.selected_session_id.as_deref().unwrap_or("-");
+    let sid = ui.session_transcript_sid.as_deref().unwrap_or("-");
+    let mode = match ui.session_transcript_tail {
+        Some(n) => format!("tail {n}"),
+        None => "all".to_string(),
+    };
     let title = format!(
-        "{}: {}",
+        "{}: {}  [{mode}]",
         crate::tui::i18n::pick(ui.language, "会话对话记录", "Session transcript"),
         short_sid(sid, 28)
     );
@@ -825,8 +846,8 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
         Span::styled(
             crate::tui::i18n::pick(
                 ui.language,
-                "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  t/Esc 关闭  L 语言",
-                "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  t/Esc close  L language",
+                "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  A 全量/尾部  y 复制  t/Esc 关闭  L 语言",
+                "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  A all/tail  y copy  t/Esc close  L language",
             ),
             Style::default().fg(p.muted),
         ),
@@ -878,6 +899,14 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
             Style::default().fg(p.muted),
         )));
     } else {
+        lines.push(Line::from(vec![
+            Span::styled("messages: ", Style::default().fg(p.muted)),
+            Span::styled(
+                ui.session_transcript_messages.len().to_string(),
+                Style::default().fg(p.text),
+            ),
+        ]));
+        lines.push(Line::from(""));
         for msg in ui.session_transcript_messages.iter() {
             let role_style = if msg.role.eq_ignore_ascii_case("Assistant") {
                 Style::default().fg(p.accent).add_modifier(Modifier::BOLD)

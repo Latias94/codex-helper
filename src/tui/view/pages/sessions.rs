@@ -311,7 +311,7 @@ pub(super) fn render_sessions_page(
         lines.push(Line::from("  e toggle errors-only"));
         lines.push(Line::from("  v toggle overrides-only"));
         lines.push(Line::from("  r reset filters"));
-        lines.push(Line::from("  t view transcript (Codex)"));
+        lines.push(Line::from("  t transcript (full-screen)"));
         lines.push(Line::from("  Enter effort menu  p/P provider override"));
     } else {
         lines.push(Line::from(Span::styled(

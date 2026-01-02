@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,55 @@ pub(in crate::tui) async fn handle_key_event(
         Overlay::SessionTranscript => match key.code {
             KeyCode::Esc | KeyCode::Char('t') => {
                 ui.overlay = Overlay::None;
+                true
+            }
+            KeyCode::Char('A') | KeyCode::Char('a') => {
+                let Some(file) = ui.session_transcript_file.as_deref() else {
+                    ui.toast = Some(("no transcript file loaded".to_string(), Instant::now()));
+                    return true;
+                };
+
+                ui.session_transcript_tail = match ui.session_transcript_tail {
+                    Some(_) => None,
+                    None => Some(80),
+                };
+                ui.session_transcript_messages.clear();
+                ui.session_transcript_scroll = u16::MAX;
+                ui.session_transcript_error = None;
+
+                let path = PathBuf::from(file);
+                match read_codex_session_transcript(&path, ui.session_transcript_tail).await {
+                    Ok(msgs) => {
+                        ui.session_transcript_messages = msgs;
+                        ui.toast = Some((
+                            match ui.session_transcript_tail {
+                                Some(n) => format!("transcript: loaded tail {n}"),
+                                None => "transcript: loaded all".to_string(),
+                            },
+                            Instant::now(),
+                        ));
+                    }
+                    Err(e) => {
+                        ui.session_transcript_error = Some(e.to_string());
+                        ui.toast =
+                            Some((format!("transcript: reload failed: {e}"), Instant::now()));
+                    }
+                }
+                true
+            }
+            KeyCode::Char('y') => {
+                let text = format_session_transcript_text(ui);
+                match try_copy_to_clipboard(&text) {
+                    Ok(()) => {
+                        ui.toast = Some((
+                            "transcript: copied to clipboard".to_string(),
+                            Instant::now(),
+                        ))
+                    }
+                    Err(e) => {
+                        ui.toast = Some((format!("transcript: copy failed: {e}"), Instant::now()))
+                    }
+                }
                 true
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -135,6 +185,7 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         KeyCode::Char('4') => Some(Page::Requests),
         KeyCode::Char('5') => Some(Page::Stats),
         KeyCode::Char('6') => Some(Page::Settings),
+        KeyCode::Char('7') => Some(Page::History),
         _ => None,
     };
     if let Some(p) = page {
@@ -144,9 +195,15 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         } else if ui.page == Page::Requests {
             ui.focus = Focus::Requests;
         } else if ui.page == Page::Sessions
+            || ui.page == Page::History
             || (ui.page == Page::Dashboard && ui.focus == Focus::Configs)
         {
             ui.focus = Focus::Sessions;
+        }
+        if ui.page == Page::History {
+            ui.needs_codex_history_refresh = true;
+            ui.selected_codex_history_idx = 0;
+            ui.codex_history_table.select(None);
         }
         return true;
     }
@@ -546,6 +603,69 @@ fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
         cmd.args(["-selection", "clipboard"]);
         run(cmd, report)
     }
+}
+
+fn format_session_transcript_text(ui: &UiState) -> String {
+    let sid = ui.session_transcript_sid.as_deref().unwrap_or("-");
+    let mode = match ui.session_transcript_tail {
+        Some(n) => format!("tail {n}"),
+        None => "all".to_string(),
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("sid: {sid}\n"));
+    out.push_str(&format!("mode: {mode}\n"));
+
+    if let Some(meta) = ui.session_transcript_meta.as_ref() {
+        out.push_str(&format!(
+            "meta: id={} cwd={}\n",
+            meta.id,
+            meta.cwd.as_deref().unwrap_or("-")
+        ));
+    }
+    if let Some(file) = ui.session_transcript_file.as_deref() {
+        out.push_str(&format!("file: {file}\n"));
+    }
+    out.push('\n');
+
+    for msg in ui.session_transcript_messages.iter() {
+        let head = if let Some(ts) = msg.timestamp.as_deref() {
+            format!("[{}] {}", ts, msg.role)
+        } else {
+            msg.role.clone()
+        };
+        out.push_str(&head);
+        out.push('\n');
+        out.push_str(msg.text.as_str());
+        out.push_str("\n\n");
+    }
+
+    out
+}
+
+async fn open_session_transcript_from_path(
+    ui: &mut UiState,
+    sid: String,
+    path: &Path,
+    tail: Option<usize>,
+) {
+    ui.session_transcript_sid = Some(sid);
+    ui.session_transcript_meta = None;
+    ui.session_transcript_file = Some(path.to_string_lossy().to_string());
+    ui.session_transcript_tail = tail;
+    ui.session_transcript_messages.clear();
+    ui.session_transcript_scroll = u16::MAX;
+    ui.session_transcript_error = None;
+
+    match read_codex_session_meta(path).await {
+        Ok(meta) => ui.session_transcript_meta = meta,
+        Err(e) => ui.session_transcript_error = Some(e.to_string()),
+    }
+    match read_codex_session_transcript(path, tail).await {
+        Ok(msgs) => ui.session_transcript_messages = msgs,
+        Err(e) => ui.session_transcript_error = Some(e.to_string()),
+    }
+    ui.overlay = Overlay::SessionTranscript;
 }
 
 async fn handle_key_normal(
@@ -1200,30 +1320,25 @@ async fn handle_key_normal(
             ui.toast = Some(("sessions filter: reset".to_string(), Instant::now()));
             true
         }
+        KeyCode::Char('r') if ui.page == Page::History => {
+            ui.needs_codex_history_refresh = true;
+            ui.toast = Some((
+                crate::tui::i18n::pick(ui.language, "history: 刷新中…", "history: refreshing…")
+                    .to_string(),
+                Instant::now(),
+            ));
+            true
+        }
         KeyCode::Char('t') if ui.page == Page::Sessions => {
             let Some(sid) = ui.selected_session_id.clone() else {
                 ui.toast = Some(("no session selected".to_string(), Instant::now()));
                 return true;
             };
-
-            ui.session_transcript_meta = None;
-            ui.session_transcript_file = None;
-            ui.session_transcript_messages.clear();
-            ui.session_transcript_scroll = u16::MAX;
-            ui.session_transcript_error = None;
+            ui.session_transcript_sid = Some(sid.clone());
 
             match find_codex_session_file_by_id(&sid).await {
                 Ok(Some(path)) => {
-                    ui.session_transcript_file = Some(path.to_string_lossy().to_string());
-                    match read_codex_session_meta(&path).await {
-                        Ok(meta) => ui.session_transcript_meta = meta,
-                        Err(e) => ui.session_transcript_error = Some(e.to_string()),
-                    }
-                    match read_codex_session_transcript(&path, Some(80)).await {
-                        Ok(msgs) => ui.session_transcript_messages = msgs,
-                        Err(e) => ui.session_transcript_error = Some(e.to_string()),
-                    }
-                    ui.overlay = Overlay::SessionTranscript;
+                    open_session_transcript_from_path(ui, sid, &path, Some(80)).await;
                 }
                 Ok(None) => {
                     ui.toast = Some((
@@ -1236,6 +1351,34 @@ async fn handle_key_normal(
                 }
             }
             true
+        }
+        KeyCode::Enter | KeyCode::Char('t') if ui.page == Page::History => {
+            let Some(summary) = ui
+                .codex_history_sessions
+                .get(ui.selected_codex_history_idx)
+                .cloned()
+            else {
+                ui.toast = Some(("history: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            open_session_transcript_from_path(ui, summary.id, &summary.path, Some(80)).await;
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::History => {
+            let len = ui.codex_history_sessions.len();
+            if let Some(next) = adjust_table_selection(&mut ui.codex_history_table, -1, len) {
+                ui.selected_codex_history_idx = next;
+                return true;
+            }
+            false
+        }
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::History => {
+            let len = ui.codex_history_sessions.len();
+            if let Some(next) = adjust_table_selection(&mut ui.codex_history_table, 1, len) {
+                ui.selected_codex_history_idx = next;
+                return true;
+            }
+            false
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Sessions => {
             let filtered = snapshot
