@@ -47,6 +47,8 @@ pub async fn run_dashboard(
         .unwrap_or(500)
         .clamp(100, 5_000);
 
+    let io_timeout = Duration::from_millis((refresh_ms / 2).clamp(50, 250));
+
     let mut term_guard = TerminalGuard::enter()?;
     let stdout = io::stdout();
 
@@ -66,6 +68,8 @@ pub async fn run_dashboard(
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(refresh_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
 
     let mut snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
     let mut providers = providers;
@@ -103,8 +107,11 @@ pub async fn run_dashboard(
 
         tokio::select! {
             _ = ticker.tick() => {
-                snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
-                ui.clamp_selection(&snapshot, providers.len());
+                let refresh = refresh_snapshot(&state, service_name, ui.stats_days);
+                if let Ok(new_snapshot) = tokio::time::timeout(io_timeout, refresh).await {
+                    snapshot = new_snapshot;
+                    ui.clamp_selection(&snapshot, providers.len());
+                }
                 if ui.page == crate::tui::types::Page::Settings
                     && ui
                         .last_runtime_config_refresh_at
@@ -122,7 +129,7 @@ pub async fn run_dashboard(
                             .json::<serde_json::Value>()
                             .await
                     };
-                    if let Ok(v) = fetch.await {
+                    if let Ok(Ok(v)) = tokio::time::timeout(io_timeout, fetch).await {
                         ui.last_runtime_config_loaded_at_ms =
                             v.get("loaded_at_ms").and_then(|x| x.as_u64());
                         ui.last_runtime_config_source_mtime_ms =
@@ -138,7 +145,13 @@ pub async fn run_dashboard(
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 ui.should_exit = true;
-                should_redraw = true;
+                let _ = shutdown.send(true);
+                break;
+            }
+            _ = &mut ctrl_c => {
+                ui.should_exit = true;
+                let _ = shutdown.send(true);
+                break;
             }
             maybe_event = events.next() => {
                 let Some(Ok(event)) = maybe_event else { continue; };

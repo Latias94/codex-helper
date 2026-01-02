@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
 ### 修复 / Fixed
 - 修复切换页面时偶发的 UI 残影：页面切换时强制 `terminal.clear()` 后重绘。
   Fix occasional UI artifacts when switching pages: force a `terminal.clear()` on page switch before redraw.
+- 修复 TUI 在 Ctrl+C/关停时偶发卡住：为快照刷新与 Settings 页本地 HTTP 拉取增加超时，并监听 Ctrl+C 信号以更快退出。
+  Fix occasional TUI hangs on Ctrl+C/shutdown: add timeouts to snapshot refresh and Settings local HTTP fetch, and listen for Ctrl+C for faster exit.
 
 ## [0.9.0] - 2026-01-01
 ### 新增 / Added
