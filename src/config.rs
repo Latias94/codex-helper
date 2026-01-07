@@ -208,7 +208,7 @@ pub enum RetryProfileName {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResolvedRetryConfig {
+pub struct ResolvedRetryLayerConfig {
     pub max_attempts: u32,
     pub backoff_ms: u64,
     pub backoff_max_ms: u64,
@@ -216,6 +216,14 @@ pub struct ResolvedRetryConfig {
     pub on_status: String,
     pub on_class: Vec<String>,
     pub strategy: RetryStrategy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedRetryConfig {
+    pub upstream: ResolvedRetryLayerConfig,
+    pub provider: ResolvedRetryLayerConfig,
+    pub never_on_status: String,
+    pub never_on_class: Vec<String>,
     pub cloudflare_challenge_cooldown_secs: u64,
     pub cloudflare_timeout_cooldown_secs: u64,
     pub transport_cooldown_secs: u64,
@@ -223,12 +231,8 @@ pub struct ResolvedRetryConfig {
     pub cooldown_backoff_max_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryConfig {
-    /// Curated retry policy preset. When set, codex-helper starts from the profile defaults,
-    /// then applies any explicitly configured fields below as overrides.
-    #[serde(default)]
-    pub profile: Option<RetryProfileName>,
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetryLayerConfig {
     #[serde(default)]
     pub max_attempts: Option<u32>,
     #[serde(default)]
@@ -243,6 +247,38 @@ pub struct RetryConfig {
     pub on_class: Option<Vec<String>>,
     #[serde(default)]
     pub strategy: Option<RetryStrategy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Curated retry policy preset. When set, codex-helper starts from the profile defaults,
+    /// then applies any explicitly configured fields below as overrides.
+    #[serde(default)]
+    pub profile: Option<RetryProfileName>,
+    // Legacy (pre-v0.10.0) flat retry fields (kept for backward compatibility).
+    // Prefer the nested `upstream` / `provider` blocks for new configs.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub backoff_ms: Option<u64>,
+    #[serde(default)]
+    pub backoff_max_ms: Option<u64>,
+    #[serde(default)]
+    pub jitter_ms: Option<u64>,
+    #[serde(default)]
+    pub on_status: Option<String>,
+    #[serde(default)]
+    pub on_class: Option<Vec<String>>,
+    #[serde(default)]
+    pub strategy: Option<RetryStrategy>,
+    #[serde(default)]
+    pub upstream: Option<RetryLayerConfig>,
+    #[serde(default)]
+    pub provider: Option<RetryLayerConfig>,
+    #[serde(default)]
+    pub never_on_status: Option<String>,
+    #[serde(default)]
+    pub never_on_class: Option<Vec<String>>,
     #[serde(default)]
     pub cloudflare_challenge_cooldown_secs: Option<u64>,
     #[serde(default)]
@@ -278,6 +314,10 @@ impl Default for RetryConfig {
             on_status: None,
             on_class: None,
             strategy: None,
+            upstream: None,
+            provider: None,
+            never_on_status: None,
+            never_on_class: None,
             cloudflare_challenge_cooldown_secs: None,
             cloudflare_timeout_cooldown_secs: None,
             transport_cooldown_secs: None,
@@ -291,17 +331,30 @@ impl RetryProfileName {
     pub fn defaults(self) -> ResolvedRetryConfig {
         match self {
             RetryProfileName::Balanced => ResolvedRetryConfig {
-                max_attempts: 2,
-                backoff_ms: 200,
-                backoff_max_ms: 2_000,
-                jitter_ms: 100,
-                on_status: "429,502,503,504,524".to_string(),
-                on_class: vec![
-                    "upstream_transport_error".to_string(),
-                    "cloudflare_timeout".to_string(),
-                    "cloudflare_challenge".to_string(),
-                ],
-                strategy: RetryStrategy::Failover,
+                upstream: ResolvedRetryLayerConfig {
+                    max_attempts: 2,
+                    backoff_ms: 200,
+                    backoff_max_ms: 2_000,
+                    jitter_ms: 100,
+                    on_status: "429,500-599,524".to_string(),
+                    on_class: vec![
+                        "upstream_transport_error".to_string(),
+                        "cloudflare_timeout".to_string(),
+                        "cloudflare_challenge".to_string(),
+                    ],
+                    strategy: RetryStrategy::SameUpstream,
+                },
+                provider: ResolvedRetryLayerConfig {
+                    max_attempts: 2,
+                    backoff_ms: 0,
+                    backoff_max_ms: 0,
+                    jitter_ms: 0,
+                    on_status: "401,403,404,408,429,500-599,524".to_string(),
+                    on_class: vec!["upstream_transport_error".to_string()],
+                    strategy: RetryStrategy::Failover,
+                },
+                never_on_status: "400,413,415,422".to_string(),
+                never_on_class: vec!["client_error_non_retryable".to_string()],
                 cloudflare_challenge_cooldown_secs: 300,
                 cloudflare_timeout_cooldown_secs: 60,
                 transport_cooldown_secs: 30,
@@ -309,19 +362,46 @@ impl RetryProfileName {
                 cooldown_backoff_max_secs: 600,
             },
             RetryProfileName::SameUpstream => ResolvedRetryConfig {
-                strategy: RetryStrategy::SameUpstream,
+                upstream: ResolvedRetryLayerConfig {
+                    max_attempts: 3,
+                    ..RetryProfileName::Balanced.defaults().upstream
+                },
+                provider: ResolvedRetryLayerConfig {
+                    max_attempts: 1,
+                    ..RetryProfileName::Balanced.defaults().provider
+                },
                 ..RetryProfileName::Balanced.defaults()
             },
             RetryProfileName::AggressiveFailover => ResolvedRetryConfig {
-                max_attempts: 3,
-                backoff_ms: 200,
-                backoff_max_ms: 2_500,
-                jitter_ms: 150,
-                strategy: RetryStrategy::Failover,
+                upstream: ResolvedRetryLayerConfig {
+                    max_attempts: 2,
+                    backoff_ms: 200,
+                    backoff_max_ms: 2_500,
+                    jitter_ms: 150,
+                    on_status: "429,500-599,524".to_string(),
+                    on_class: vec![
+                        "upstream_transport_error".to_string(),
+                        "cloudflare_timeout".to_string(),
+                        "cloudflare_challenge".to_string(),
+                    ],
+                    strategy: RetryStrategy::SameUpstream,
+                },
+                provider: ResolvedRetryLayerConfig {
+                    max_attempts: 3,
+                    backoff_ms: 0,
+                    backoff_max_ms: 0,
+                    jitter_ms: 0,
+                    on_status: "401,403,404,408,429,500-599,524".to_string(),
+                    on_class: vec!["upstream_transport_error".to_string()],
+                    strategy: RetryStrategy::Failover,
+                },
                 ..RetryProfileName::Balanced.defaults()
             },
             RetryProfileName::CostPrimary => ResolvedRetryConfig {
-                strategy: RetryStrategy::Failover,
+                provider: ResolvedRetryLayerConfig {
+                    max_attempts: 2,
+                    ..RetryProfileName::Balanced.defaults().provider
+                },
                 transport_cooldown_secs: 30,
                 cooldown_backoff_factor: 2,
                 cooldown_backoff_max_secs: 900,
@@ -338,26 +418,84 @@ impl RetryConfig {
             .unwrap_or(RetryProfileName::Balanced)
             .defaults();
 
-        if let Some(v) = self.max_attempts {
-            out.max_attempts = v;
+        // Legacy flat fields map to the upstream layer by default, so existing configs that only
+        // tuned `max_attempts` / `on_status` keep a similar "retry the current upstream" behavior.
+        // If `upstream` is explicitly configured, it always takes precedence.
+        if self.upstream.is_none() {
+            if let Some(v) = self.max_attempts {
+                out.upstream.max_attempts = v;
+            }
+            if let Some(v) = self.backoff_ms {
+                out.upstream.backoff_ms = v;
+            }
+            if let Some(v) = self.backoff_max_ms {
+                out.upstream.backoff_max_ms = v;
+            }
+            if let Some(v) = self.jitter_ms {
+                out.upstream.jitter_ms = v;
+            }
+            if let Some(v) = self.on_status.as_deref() {
+                out.upstream.on_status = v.to_string();
+            }
+            if let Some(v) = self.on_class.as_ref() {
+                out.upstream.on_class = v.clone();
+            }
+            if let Some(v) = self.strategy {
+                out.upstream.strategy = v;
+            }
         }
-        if let Some(v) = self.backoff_ms {
-            out.backoff_ms = v;
+
+        if let Some(layer) = self.upstream.as_ref() {
+            if let Some(v) = layer.max_attempts {
+                out.upstream.max_attempts = v;
+            }
+            if let Some(v) = layer.backoff_ms {
+                out.upstream.backoff_ms = v;
+            }
+            if let Some(v) = layer.backoff_max_ms {
+                out.upstream.backoff_max_ms = v;
+            }
+            if let Some(v) = layer.jitter_ms {
+                out.upstream.jitter_ms = v;
+            }
+            if let Some(v) = layer.on_status.as_deref() {
+                out.upstream.on_status = v.to_string();
+            }
+            if let Some(v) = layer.on_class.as_ref() {
+                out.upstream.on_class = v.clone();
+            }
+            if let Some(v) = layer.strategy {
+                out.upstream.strategy = v;
+            }
         }
-        if let Some(v) = self.backoff_max_ms {
-            out.backoff_max_ms = v;
+        if let Some(layer) = self.provider.as_ref() {
+            if let Some(v) = layer.max_attempts {
+                out.provider.max_attempts = v;
+            }
+            if let Some(v) = layer.backoff_ms {
+                out.provider.backoff_ms = v;
+            }
+            if let Some(v) = layer.backoff_max_ms {
+                out.provider.backoff_max_ms = v;
+            }
+            if let Some(v) = layer.jitter_ms {
+                out.provider.jitter_ms = v;
+            }
+            if let Some(v) = layer.on_status.as_deref() {
+                out.provider.on_status = v.to_string();
+            }
+            if let Some(v) = layer.on_class.as_ref() {
+                out.provider.on_class = v.clone();
+            }
+            if let Some(v) = layer.strategy {
+                out.provider.strategy = v;
+            }
         }
-        if let Some(v) = self.jitter_ms {
-            out.jitter_ms = v;
+        if let Some(v) = self.never_on_status.as_deref() {
+            out.never_on_status = v.to_string();
         }
-        if let Some(v) = self.on_status.as_deref() {
-            out.on_status = v.to_string();
-        }
-        if let Some(v) = self.on_class.as_ref() {
-            out.on_class = v.clone();
-        }
-        if let Some(v) = self.strategy {
-            out.strategy = v;
+        if let Some(v) = self.never_on_class.as_ref() {
+            out.never_on_class = v.clone();
         }
         if let Some(v) = self.cloudflare_challenge_cooldown_secs {
             out.cloudflare_challenge_cooldown_secs = v;
@@ -651,27 +789,37 @@ enabled = false
 profile = "balanced"
 
 # 下面这些字段是“覆盖项”（在 profile 默认值之上进行覆盖）。
-# 每个请求的最大尝试次数（包含第一次）。设为 1 表示关闭重试。
+#
+# 两层模型：
+# - retry.upstream：在当前 provider/config 内，对单个 upstream 的内部重试（默认更偏向同一 upstream）。
+# - retry.provider：当 upstream 层无法恢复时，决定是否切换到其他 upstream / 其他同级 config/provider。
+#
+# 覆盖示例（可按需取消注释）：
+#
+# [retry.upstream]
 # max_attempts = 2
-
-# 重试策略：
-# - "failover"：更倾向切换到其他 upstream（默认）
-# - "same_upstream"：更倾向重试同一 upstream（适合 CF/网络抖动）
-# strategy = "failover"
-
-# 重试间隔的基础 backoff（毫秒）。
+# strategy = "same_upstream"
 # backoff_ms = 200
-# backoff 的最大上限（毫秒）。
 # backoff_max_ms = 2000
-# 在 backoff 上叠加的随机 jitter（毫秒）。
 # jitter_ms = 100
-
-# 可重试的 HTTP 状态码/范围（字符串形式）。
-# 示例："429,502,503,504,524" 或 "429,500-599"。
-# on_status = "429,502,503,504,524"
-
-# 可重试的错误分类（来自 codex-helper 的 classify）。
+# on_status = "429,500-599,524"
 # on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
+#
+# [retry.provider]
+# max_attempts = 2
+# strategy = "failover"
+# on_status = "401,403,404,408,429,500-599,524"
+# on_class = ["upstream_transport_error"]
+
+# 明确禁止重试/切换的 HTTP 状态码/范围（字符串形式）。
+# 示例："400,422"。
+# never_on_status = "400,422"
+
+# 明确禁止重试/切换的错误分类（来自 codex-helper 的 classify）。
+# 默认包含 "client_error_non_retryable"（常见请求格式/参数错误）。
+# never_on_class = ["client_error_non_retryable"]
+
+# 兼容说明：旧版扁平字段（max_attempts/on_status/strategy/...）仍可解析，默认映射到 retry.upstream.*。
 
 # 对某些失败类型施加冷却（秒）。
 # cloudflare_challenge_cooldown_secs = 300
@@ -1972,17 +2120,32 @@ env_key = "RIGHTCODE_API_KEY"
     fn retry_profile_defaults_to_balanced_when_unset() {
         let cfg = RetryConfig::default();
         let resolved = cfg.resolve();
-        assert_eq!(resolved.strategy, RetryStrategy::Failover);
-        assert_eq!(resolved.max_attempts, 2);
-        assert_eq!(resolved.backoff_ms, 200);
-        assert_eq!(resolved.backoff_max_ms, 2_000);
-        assert_eq!(resolved.jitter_ms, 100);
-        assert_eq!(resolved.on_status, "429,502,503,504,524");
+        assert_eq!(resolved.upstream.strategy, RetryStrategy::SameUpstream);
+        assert_eq!(resolved.upstream.max_attempts, 2);
+        assert_eq!(resolved.upstream.backoff_ms, 200);
+        assert_eq!(resolved.upstream.backoff_max_ms, 2_000);
+        assert_eq!(resolved.upstream.jitter_ms, 100);
+        assert_eq!(resolved.upstream.on_status, "429,500-599,524");
         assert!(
             resolved
+                .upstream
                 .on_class
                 .iter()
                 .any(|c| c == "upstream_transport_error")
+        );
+
+        assert_eq!(resolved.provider.strategy, RetryStrategy::Failover);
+        assert_eq!(resolved.provider.max_attempts, 2);
+        assert_eq!(
+            resolved.provider.on_status,
+            "401,403,404,408,429,500-599,524"
+        );
+        assert_eq!(resolved.never_on_status, "400,413,415,422");
+        assert!(
+            resolved
+                .never_on_class
+                .iter()
+                .any(|c| c == "client_error_non_retryable")
         );
         assert_eq!(resolved.cloudflare_challenge_cooldown_secs, 300);
         assert_eq!(resolved.cloudflare_timeout_cooldown_secs, 60);
@@ -1998,10 +2161,32 @@ env_key = "RIGHTCODE_API_KEY"
             ..RetryConfig::default()
         };
         let resolved = cfg.resolve();
-        assert_eq!(resolved.strategy, RetryStrategy::Failover);
+        assert_eq!(resolved.provider.strategy, RetryStrategy::Failover);
         assert_eq!(resolved.cooldown_backoff_factor, 2);
         assert_eq!(resolved.cooldown_backoff_max_secs, 900);
         assert_eq!(resolved.transport_cooldown_secs, 30);
+    }
+
+    #[test]
+    fn retry_profile_aggressive_failover_enables_broader_failover_with_guardrails() {
+        let cfg = RetryConfig {
+            profile: Some(RetryProfileName::AggressiveFailover),
+            ..RetryConfig::default()
+        };
+        let resolved = cfg.resolve();
+        assert_eq!(resolved.provider.max_attempts, 3);
+        assert_eq!(resolved.provider.strategy, RetryStrategy::Failover);
+        assert_eq!(
+            resolved.provider.on_status,
+            "401,403,404,408,429,500-599,524"
+        );
+        assert_eq!(resolved.never_on_status, "400,413,415,422");
+        assert!(
+            resolved
+                .never_on_class
+                .iter()
+                .any(|c| c == "client_error_non_retryable")
+        );
     }
 
     #[test]
@@ -2014,8 +2199,8 @@ env_key = "RIGHTCODE_API_KEY"
             ..RetryConfig::default()
         };
         let resolved = cfg.resolve();
-        assert_eq!(resolved.max_attempts, 5);
-        assert_eq!(resolved.strategy, RetryStrategy::Failover);
+        assert_eq!(resolved.upstream.max_attempts, 5);
+        assert_eq!(resolved.upstream.strategy, RetryStrategy::Failover);
     }
 
     #[test]

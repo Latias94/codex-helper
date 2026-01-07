@@ -365,12 +365,16 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             println!("Set retry profile to '{:?}'", profile);
             let resolved = cfg.retry.resolve();
             println!(
-                "retry: strategy={:?} max_attempts={} backoff={}..{} jitter={} cooldown(cf_chal={}s cf_to={}s transport={}s) cooldown_backoff(factor={} max={}s)",
-                resolved.strategy,
-                resolved.max_attempts,
-                resolved.backoff_ms,
-                resolved.backoff_max_ms,
-                resolved.jitter_ms,
+                "retry: upstream(strategy={:?} max_attempts={} backoff={}..{} jitter={}) provider(strategy={:?} max_attempts={}) guardrails(never_on_status='{}' never_on_class={:?}) cooldown(cf_chal={}s cf_to={}s transport={}s) cooldown_backoff(factor={} max={}s)",
+                resolved.upstream.strategy,
+                resolved.upstream.max_attempts,
+                resolved.upstream.backoff_ms,
+                resolved.upstream.backoff_max_ms,
+                resolved.upstream.jitter_ms,
+                resolved.provider.strategy,
+                resolved.provider.max_attempts,
+                resolved.never_on_status,
+                resolved.never_on_class,
                 resolved.cloudflare_challenge_cooldown_secs,
                 resolved.cloudflare_timeout_cooldown_secs,
                 resolved.transport_cooldown_secs,

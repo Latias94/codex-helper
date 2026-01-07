@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, 
 use axum::routing::{any, get};
 use reqwest::Client;
 use std::sync::OnceLock;
-use tracing::{info, instrument, warn};
+use tracing::{instrument, warn};
 
 mod classify;
 mod retry;
@@ -26,21 +26,21 @@ use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
     AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, http_debug_options,
     http_warn_options, log_request_with_debug, log_retry_trace, make_body_preview,
-    should_include_http_debug, should_include_http_warn, should_log_request_body_preview,
+    should_include_http_warn, should_log_request_body_preview,
 };
 use crate::model_routing;
 use crate::state::{ActiveRequest, FinishedRequest, ProxyState};
 use crate::usage::extract_usage_from_bytes;
-use crate::usage_providers;
 
 use self::classify::classify_upstream_response;
 use self::retry::{
-    backoff_sleep, retry_info_for_chain, retry_options, retry_sleep, should_retry_class,
-    should_retry_status,
+    backoff_sleep, retry_info_for_chain, retry_plan, retry_sleep, should_never_retry_class,
+    should_never_retry_status, should_retry_class, should_retry_status,
 };
 use self::runtime_config::RuntimeConfig;
 use self::stream::{SseSuccessMeta, build_sse_success_response};
 
+#[allow(dead_code)]
 fn lb_state_snapshot_json(lb: &LoadBalancer) -> Option<serde_json::Value> {
     let map = match lb.states.lock() {
         Ok(m) => m,
@@ -297,7 +297,9 @@ fn header_map_to_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
 struct HttpDebugBase {
     debug_max_body_bytes: usize,
     warn_max_body_bytes: usize,
+    #[allow(dead_code)]
     request_body_len: usize,
+    #[allow(dead_code)]
     upstream_request_body_len: usize,
     client_uri: String,
     target_url: String,
@@ -938,28 +940,42 @@ pub async fn handle_proxy(
         .await;
 
     let retry_cfg = cfg_snapshot.retry.resolve();
-    let retry_opt = retry_options(&retry_cfg);
-    let retry_failover = retry_opt.strategy == RetryStrategy::Failover;
+    let plan = retry_plan(&retry_cfg);
+    let upstream_opt = &plan.upstream;
+    let provider_opt = &plan.provider;
     let cooldown_backoff = crate::lb::CooldownBackoff {
-        factor: retry_opt.cooldown_backoff_factor,
-        max_secs: retry_opt.cooldown_backoff_max_secs,
+        factor: plan.cooldown_backoff_factor,
+        max_secs: plan.cooldown_backoff_max_secs,
     };
     log_retry_trace(serde_json::json!({
         "event": "retry_options",
         "service": proxy.service_name,
         "request_id": request_id,
-        "max_attempts": retry_opt.max_attempts,
-        "base_backoff_ms": retry_opt.base_backoff_ms,
-        "max_backoff_ms": retry_opt.max_backoff_ms,
-        "jitter_ms": retry_opt.jitter_ms,
-        "retry_status_ranges": retry_opt.retry_status_ranges,
-        "retry_error_classes": retry_opt.retry_error_classes,
-        "strategy": if retry_failover { "failover" } else { "same_upstream" },
-        "cloudflare_challenge_cooldown_secs": retry_opt.cloudflare_challenge_cooldown_secs,
-        "cloudflare_timeout_cooldown_secs": retry_opt.cloudflare_timeout_cooldown_secs,
-        "transport_cooldown_secs": retry_opt.transport_cooldown_secs,
-        "cooldown_backoff_factor": retry_opt.cooldown_backoff_factor,
-        "cooldown_backoff_max_secs": retry_opt.cooldown_backoff_max_secs,
+        "upstream": {
+            "max_attempts": upstream_opt.max_attempts,
+            "base_backoff_ms": upstream_opt.base_backoff_ms,
+            "max_backoff_ms": upstream_opt.max_backoff_ms,
+            "jitter_ms": upstream_opt.jitter_ms,
+            "retry_status_ranges": upstream_opt.retry_status_ranges,
+            "retry_error_classes": upstream_opt.retry_error_classes,
+            "strategy": if upstream_opt.strategy == RetryStrategy::Failover { "failover" } else { "same_upstream" },
+        },
+        "provider": {
+            "max_attempts": provider_opt.max_attempts,
+            "base_backoff_ms": provider_opt.base_backoff_ms,
+            "max_backoff_ms": provider_opt.max_backoff_ms,
+            "jitter_ms": provider_opt.jitter_ms,
+            "retry_status_ranges": provider_opt.retry_status_ranges,
+            "retry_error_classes": provider_opt.retry_error_classes,
+            "strategy": if provider_opt.strategy == RetryStrategy::Failover { "failover" } else { "same_upstream" },
+        },
+        "never_status_ranges": plan.never_status_ranges,
+        "never_error_classes": plan.never_error_classes,
+        "cloudflare_challenge_cooldown_secs": plan.cloudflare_challenge_cooldown_secs,
+        "cloudflare_timeout_cooldown_secs": plan.cloudflare_timeout_cooldown_secs,
+        "transport_cooldown_secs": plan.transport_cooldown_secs,
+        "cooldown_backoff_factor": plan.cooldown_backoff_factor,
+        "cooldown_backoff_max_secs": plan.cooldown_backoff_max_secs,
     }));
     let total_upstreams = lbs
         .iter()
@@ -967,24 +983,48 @@ pub async fn handle_proxy(
         .sum::<usize>();
     let mut avoid: HashMap<String, HashSet<usize>> = HashMap::new();
     let mut upstream_chain: Vec<String> = Vec::new();
+    let mut avoided_total: usize = 0;
 
-    for attempt_index in 0..retry_opt.max_attempts {
-        let avoided_total = avoid.values().map(|s| s.len()).sum::<usize>();
-        if total_upstreams > 0 && avoided_total >= total_upstreams {
-            upstream_chain.push(format!("all_upstreams_avoided total={total_upstreams}"));
+    // --- Two-layer retry model ---
+    //
+    // Layer 1 (upstream): retry within the current provider/config (default: same_upstream).
+    // Layer 2 (provider): after upstream retries are exhausted (or failure is not upstream-retryable),
+    // fail over to another provider/config when eligible.
+    //
+    // Guardrails: never_on_status / never_on_class prevent amplifying obvious client-side mistakes.
+    let mut tried_configs: HashSet<String> = HashSet::new();
+    let strict_multi_config = lbs.len() > 1;
+    let mut global_attempt: u32 = 0;
+    let mut last_err: Option<(StatusCode, String)> = None;
+
+    for provider_attempt in 0..provider_opt.max_attempts {
+        // Pick the next provider/config in the precomputed order, skipping ones we've already tried.
+        let mut provider_lb: Option<LoadBalancer> = None;
+        for lb in &lbs {
+            if tried_configs.contains(&lb.service.name) {
+                continue;
+            }
+            provider_lb = Some(lb.clone());
             break;
         }
+        let Some(lb) = provider_lb else {
+            break;
+        };
+        let config_name = lb.service.name.clone();
 
-        let strict_multi_config = lbs.len() > 1;
+        // Try all upstreams under this provider/config (respecting in-request avoid set).
+        'upstreams: loop {
+            let avoid_set = avoid.entry(config_name.clone()).or_default();
+            let upstream_total = lb.service.upstreams.len();
+            if upstream_total > 0 && avoid_set.len() >= upstream_total {
+                break 'upstreams;
+            }
 
-        let mut chosen: Option<(LoadBalancer, SelectedUpstream)> = None;
-        for lb in &lbs {
-            let cfg_name = lb.service.name.clone();
-            let avoid_set = avoid.entry(cfg_name.clone()).or_default();
-            loop {
+            // Select an eligible upstream inside this provider/config (skip unsupported models).
+            let selected = loop {
                 let upstream_total = lb.service.upstreams.len();
                 if upstream_total > 0 && avoid_set.len() >= upstream_total {
-                    break;
+                    break None;
                 }
                 let next = {
                     let avoid_ref: &HashSet<usize> = &*avoid_set;
@@ -995,7 +1035,7 @@ pub async fn handle_proxy(
                     }
                 };
                 let Some(selected) = next else {
-                    break;
+                    break None;
                 };
 
                 if let Some(ref requested_model) = request_model {
@@ -1012,216 +1052,626 @@ pub async fn handle_proxy(
                             selected.index,
                             requested_model
                         ));
-                        avoid_set.insert(selected.index);
+                        if avoid_set.insert(selected.index) {
+                            avoided_total = avoided_total.saturating_add(1);
+                        }
                         continue;
                     }
                 }
 
-                chosen = Some((lb.clone(), selected));
-                break;
-            }
-            if chosen.is_some() {
-                break;
-            }
-        }
-
-        // When we have multiple config candidates, prefer skipping configs that are fully cooled down.
-        // However, if *all* configs are cooled/unavailable, fall back to the original "always pick one"
-        // behavior to avoid a hard outage.
-        if chosen.is_none() && strict_multi_config {
-            for lb in &lbs {
-                let cfg_name = lb.service.name.clone();
-                let avoid_set = avoid.entry(cfg_name.clone()).or_default();
-                let upstream_total = lb.service.upstreams.len();
-                if upstream_total > 0 && avoid_set.len() >= upstream_total {
-                    continue;
-                }
-                let avoid_ref: &HashSet<usize> = &*avoid_set;
-                if let Some(selected) = lb.select_upstream_avoiding(avoid_ref) {
-                    chosen = Some((lb.clone(), selected));
-                    break;
-                }
-            }
-        }
-
-        let Some((lb, selected)) = chosen else {
-            log_retry_trace(serde_json::json!({
-                "event": "attempt_no_upstream",
-                "service": proxy.service_name,
-                "request_id": request_id,
-                "attempt": attempt_index + 1,
-                "max_attempts": retry_opt.max_attempts,
-                "avoid": avoid.iter().map(|(k, v)| serde_json::json!({
-                    "config": k,
-                    "indices": v.iter().copied().collect::<Vec<_>>(),
-                })).collect::<Vec<_>>(),
-                "total_upstreams": total_upstreams,
-                "model": request_model.clone(),
-            }));
-            let dur = start.elapsed().as_millis() as u64;
-            let status = if request_model.is_some() {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::BAD_GATEWAY
+                break Some(selected);
             };
-            log_request_with_debug(
-                proxy.service_name,
-                method.as_str(),
-                uri.path(),
-                status.as_u16(),
-                dur,
-                None,
-                "-",
-                None,
-                "-",
-                session_id.clone(),
-                cwd.clone(),
-                effective_effort.clone(),
-                None,
-                retry_info_for_chain(&upstream_chain),
-                None,
-            );
-            let retry = retry_info_for_chain(&upstream_chain);
-            proxy
-                .state
-                .finish_request(crate::state::FinishRequestParams {
-                    id: request_id,
-                    status_code: status.as_u16(),
-                    duration_ms: dur,
-                    ended_at_ms: started_at_ms + dur,
-                    usage: None,
-                    retry,
-                    ttfb_ms: None,
-                })
-                .await;
-            if let Some(model) = request_model.as_deref() {
-                return Err((
-                    status,
-                    format!("no upstreams support requested model '{model}'"),
-                ));
-            }
-            return Err((status, "no upstreams available".to_string()));
-        };
 
-        let selected_config_name = selected.config_name.clone();
-        let selected_upstream_index = selected.index;
-        let selected_upstream_base_url = selected.upstream.base_url.clone();
-        let provider_id = selected.upstream.tags.get("provider_id").cloned();
-        log_retry_trace(serde_json::json!({
-            "event": "attempt_select",
-            "service": proxy.service_name,
-            "request_id": request_id,
-            "attempt": attempt_index + 1,
-            "max_attempts": retry_opt.max_attempts,
-            "strategy": if retry_failover { "failover" } else { "same_upstream" },
-            "config_name": selected_config_name,
-            "upstream_index": selected_upstream_index,
-            "upstream_base_url": selected_upstream_base_url,
-            "provider_id": provider_id.clone(),
-            "model": request_model.clone(),
-            "lb_state": lb_state_snapshot_json(&lb),
-            "avoid_for_config": avoid.get(&selected.config_name).map(|s| s.iter().copied().collect::<Vec<_>>()),
-            "avoided_total": avoid.values().map(|s| s.len()).sum::<usize>(),
-            "total_upstreams": total_upstreams,
-        }));
+            let Some(selected) = selected else {
+                break 'upstreams;
+            };
 
-        let mut model_note = "-".to_string();
-        let mut body_for_selected = body_for_upstream.clone();
-        if let Some(ref requested_model) = request_model {
-            let effective_model =
-                model_routing::effective_model(&selected.upstream.model_mapping, requested_model);
-            if effective_model != *requested_model {
-                if let Some(modified) =
-                    apply_model_override(body_for_upstream.as_ref(), effective_model.as_str())
-                {
-                    body_for_selected = Bytes::from(modified);
-                }
-                model_note = format!("{requested_model}->{effective_model}");
-            } else {
-                model_note = requested_model.clone();
-            }
-        }
-
-        let filtered_body = proxy.filter.apply_bytes(body_for_selected);
-        let upstream_request_body_len = filtered_body.len();
-        let upstream_request_body_debug = if request_body_previews && debug_max > 0 {
-            Some(make_body_preview(
-                &filtered_body,
-                client_content_type,
-                debug_max,
-            ))
-        } else {
-            None
-        };
-        let upstream_request_body_warn = if request_body_previews && warn_max > 0 {
-            Some(make_body_preview(
-                &filtered_body,
-                client_content_type,
-                warn_max,
-            ))
-        } else {
-            None
-        };
-
-        let target_url = match proxy.build_target(&selected, &uri) {
-            Ok((url, _headers)) => url,
-            Err(e) => {
-                lb.record_result_with_backoff(
-                    selected.index,
-                    false,
-                    crate::lb::COOLDOWN_SECS,
-                    cooldown_backoff,
+            let mut model_note = "-".to_string();
+            let mut body_for_selected = body_for_upstream.clone();
+            if let Some(ref requested_model) = request_model {
+                let effective_model = model_routing::effective_model(
+                    &selected.upstream.model_mapping,
+                    requested_model,
                 );
-                let err_str = e.to_string();
-                upstream_chain.push(format!(
-                    "{}:{} (idx={}) target_build_error={} model={}",
-                    selected.config_name,
-                    selected.upstream.base_url,
-                    selected.index,
-                    err_str,
-                    model_note.as_str()
-                ));
-                avoid
-                    .entry(selected.config_name.clone())
-                    .or_default()
-                    .insert(selected.index);
+                if effective_model != *requested_model {
+                    if let Some(modified) =
+                        apply_model_override(body_for_upstream.as_ref(), effective_model.as_str())
+                    {
+                        body_for_selected = Bytes::from(modified);
+                    }
+                    model_note = format!("{requested_model}->{effective_model}");
+                } else {
+                    model_note = requested_model.clone();
+                }
+            }
 
-                let can_retry = attempt_index + 1 < retry_opt.max_attempts;
-                if can_retry {
-                    backoff_sleep(&retry_opt, attempt_index).await;
-                    continue;
+            let filtered_body = proxy.filter.apply_bytes(body_for_selected);
+            let upstream_request_body_len = filtered_body.len();
+            let upstream_request_body_debug = if request_body_previews && debug_max > 0 {
+                Some(make_body_preview(
+                    &filtered_body,
+                    client_content_type,
+                    debug_max,
+                ))
+            } else {
+                None
+            };
+            let upstream_request_body_warn = if request_body_previews && warn_max > 0 {
+                Some(make_body_preview(
+                    &filtered_body,
+                    client_content_type,
+                    warn_max,
+                ))
+            } else {
+                None
+            };
+
+            // Layer 1: retry the same upstream a small number of times.
+            for upstream_attempt in 0..upstream_opt.max_attempts {
+                global_attempt = global_attempt.saturating_add(1);
+                let provider_id = selected.upstream.tags.get("provider_id").cloned();
+                let mut avoid_for_config = avoid_set.iter().copied().collect::<Vec<_>>();
+                avoid_for_config.sort_unstable();
+
+                log_retry_trace(serde_json::json!({
+                    "event": "attempt_select",
+                    "service": proxy.service_name,
+                    "request_id": request_id,
+                    "attempt": global_attempt,
+                    "provider_attempt": provider_attempt + 1,
+                    "upstream_attempt": upstream_attempt + 1,
+                    "provider_max_attempts": provider_opt.max_attempts,
+                    "upstream_max_attempts": upstream_opt.max_attempts,
+                    "config_name": selected.config_name.as_str(),
+                    "upstream_index": selected.index,
+                    "upstream_base_url": selected.upstream.base_url.as_str(),
+                    "provider_id": provider_id.as_deref(),
+                    "avoid_for_config": avoid_for_config,
+                    "avoided_total": avoided_total,
+                    "total_upstreams": total_upstreams,
+                    "model": model_note.as_str(),
+                }));
+
+                let target_url = match proxy.build_target(&selected, &uri) {
+                    Ok((url, _headers)) => url,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        upstream_chain.push(format!(
+                            "{}:{} (idx={}) target_build_error={} model={}",
+                            selected.config_name,
+                            selected.upstream.base_url,
+                            selected.index,
+                            err_str,
+                            model_note.as_str()
+                        ));
+                        if avoid_set.insert(selected.index) {
+                            avoided_total = avoided_total.saturating_add(1);
+                        }
+                        last_err = Some((StatusCode::BAD_GATEWAY, err_str));
+                        break;
+                    }
+                };
+
+                // copy headers, stripping host/content-length and hop-by-hop.
+                // auth headers:
+                // - if upstream config provides a token/key, override client values;
+                // - otherwise, preserve client Authorization / X-API-Key (required for requires_openai_auth=true providers).
+                let mut headers = filter_request_headers(&client_headers);
+                let client_has_auth = headers.contains_key("authorization");
+                let (token, _token_src) = resolve_auth_token_with_source(
+                    proxy.service_name,
+                    &selected.upstream.auth,
+                    client_has_auth,
+                );
+                if let Some(token) = token
+                    && let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}"))
+                {
+                    headers.insert(HeaderName::from_static("authorization"), v);
                 }
 
-                let dur = start.elapsed().as_millis() as u64;
-                let status = StatusCode::BAD_GATEWAY;
-                let client_headers_entries = client_headers_entries_cache
-                    .get_or_init(|| header_map_to_entries(&client_headers))
-                    .clone();
-                let http_debug = if should_include_http_warn(status.as_u16()) {
-                    Some(HttpDebugLog {
-                        request_body_len: Some(request_body_len),
-                        upstream_request_body_len: Some(upstream_request_body_len),
-                        upstream_headers_ms: None,
-                        upstream_first_chunk_ms: None,
-                        upstream_body_read_ms: None,
-                        upstream_error_class: Some("target_build_error".to_string()),
-                        upstream_error_hint: Some(
-                            "构造上游 target_url 失败（通常是 base_url 配置错误）。".to_string(),
-                        ),
-                        upstream_cf_ray: None,
+                let client_has_x_api_key = headers.contains_key("x-api-key");
+                let (api_key, _api_key_src) = resolve_api_key_with_source(
+                    proxy.service_name,
+                    &selected.upstream.auth,
+                    client_has_x_api_key,
+                );
+                if let Some(key) = api_key
+                    && let Ok(v) = HeaderValue::from_str(&key)
+                {
+                    headers.insert(HeaderName::from_static("x-api-key"), v);
+                }
+
+                let upstream_request_headers = headers.clone();
+                proxy
+                    .state
+                    .update_request_route(
+                        request_id,
+                        selected.config_name.clone(),
+                        provider_id.clone(),
+                        selected.upstream.base_url.clone(),
+                    )
+                    .await;
+
+                let debug_base = if debug_max > 0 || warn_max > 0 {
+                    Some(HttpDebugBase {
+                        debug_max_body_bytes: debug_max,
+                        warn_max_body_bytes: warn_max,
+                        request_body_len,
+                        upstream_request_body_len,
                         client_uri: uri.to_string(),
-                        target_url: "-".to_string(),
-                        client_headers: client_headers_entries,
-                        upstream_request_headers: Vec::new(),
+                        target_url: target_url.to_string(),
+                        client_headers: client_headers_entries_cache
+                            .get_or_init(|| header_map_to_entries(&client_headers))
+                            .clone(),
+                        upstream_request_headers: header_map_to_entries(&upstream_request_headers),
                         auth_resolution: None,
-                        client_body: client_body_warn.clone(),
-                        upstream_request_body: upstream_request_body_warn.clone(),
-                        upstream_response_headers: None,
-                        upstream_response_body: None,
-                        upstream_error: Some(err_str.clone()),
+                        client_body_debug: client_body_debug.clone(),
+                        upstream_request_body_debug: upstream_request_body_debug.clone(),
+                        client_body_warn: client_body_warn.clone(),
+                        upstream_request_body_warn: upstream_request_body_warn.clone(),
                     })
                 } else {
                     None
+                };
+
+                let builder = proxy
+                    .client
+                    .request(method.clone(), target_url.clone())
+                    .headers(headers)
+                    .body(filtered_body.clone());
+
+                let upstream_start = Instant::now();
+                let resp = match builder.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        upstream_chain.push(format!(
+                            "{}:{} (idx={}) transport_error={} model={}",
+                            selected.config_name,
+                            selected.upstream.base_url,
+                            selected.index,
+                            err_str,
+                            model_note.as_str()
+                        ));
+                        // Upstream-layer retry only for classified transient transport errors.
+                        let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
+                            && should_retry_class(upstream_opt, Some("upstream_transport_error"));
+                        if can_retry_upstream {
+                            backoff_sleep(upstream_opt, upstream_attempt).await;
+                            continue;
+                        }
+
+                        lb.penalize_with_backoff(
+                            selected.index,
+                            plan.transport_cooldown_secs,
+                            "upstream_transport_error",
+                            cooldown_backoff,
+                        );
+                        if avoid_set.insert(selected.index) {
+                            avoided_total = avoided_total.saturating_add(1);
+                        }
+                        last_err = Some((StatusCode::BAD_GATEWAY, err_str));
+                        break;
+                    }
+                };
+
+                let upstream_headers_ms = upstream_start.elapsed().as_millis() as u64;
+                let status = resp.status();
+                let success = status.is_success();
+                let resp_headers = resp.headers().clone();
+                let resp_headers_filtered = filter_response_headers(&resp_headers);
+
+                if is_stream && success {
+                    lb.record_result_with_backoff(
+                        selected.index,
+                        true,
+                        crate::lb::COOLDOWN_SECS,
+                        cooldown_backoff,
+                    );
+                    let retry = retry_info_for_chain(&upstream_chain);
+                    return Ok(build_sse_success_response(
+                        &proxy,
+                        lb.clone(),
+                        selected.clone(),
+                        resp,
+                        SseSuccessMeta {
+                            status,
+                            resp_headers,
+                            resp_headers_filtered,
+                            start,
+                            started_at_ms,
+                            upstream_start,
+                            upstream_headers_ms,
+                            request_body_len,
+                            upstream_request_body_len,
+                            debug_base,
+                            retry,
+                            session_id: session_id.clone(),
+                            cwd: cwd.clone(),
+                            effective_effort: effective_effort.clone(),
+                            request_id,
+                            is_user_turn,
+                            is_codex_service,
+                            transport_cooldown_secs: plan.transport_cooldown_secs,
+                            cooldown_backoff,
+                            method: method.clone(),
+                            path: uri.path().to_string(),
+                        },
+                    )
+                    .await);
+                }
+
+                let bytes = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        upstream_chain.push(format!(
+                            "{}:{} (idx={}) body_read_error={} model={}",
+                            selected.config_name,
+                            selected.upstream.base_url,
+                            selected.index,
+                            err_str,
+                            model_note.as_str()
+                        ));
+                        let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
+                            && should_retry_class(upstream_opt, Some("upstream_transport_error"));
+                        if can_retry_upstream {
+                            backoff_sleep(upstream_opt, upstream_attempt).await;
+                            continue;
+                        }
+                        lb.penalize_with_backoff(
+                            selected.index,
+                            plan.transport_cooldown_secs,
+                            "upstream_body_read_error",
+                            cooldown_backoff,
+                        );
+                        if avoid_set.insert(selected.index) {
+                            avoided_total = avoided_total.saturating_add(1);
+                        }
+                        last_err = Some((StatusCode::BAD_GATEWAY, err_str));
+                        break;
+                    }
+                };
+
+                let _upstream_body_read_ms = upstream_start.elapsed().as_millis() as u64;
+                let dur = start.elapsed().as_millis() as u64;
+
+                let status_code = status.as_u16();
+                let (cls, _hint, _cf_ray) =
+                    classify_upstream_response(status_code, &resp_headers, bytes.as_ref());
+                let never_retry = should_never_retry_status(&plan, status_code)
+                    || should_never_retry_class(&plan, cls.as_deref());
+
+                upstream_chain.push(format!(
+                    "{} (idx={}) status={} class={} model={}",
+                    selected.upstream.base_url,
+                    selected.index,
+                    status_code,
+                    cls.as_deref().unwrap_or("-"),
+                    model_note.as_str()
+                ));
+
+                if success {
+                    lb.record_result_with_backoff(
+                        selected.index,
+                        true,
+                        crate::lb::COOLDOWN_SECS,
+                        cooldown_backoff,
+                    );
+
+                    let usage = extract_usage_from_bytes(&bytes);
+                    let usage_for_log = usage.clone();
+                    let retry = retry_info_for_chain(&upstream_chain);
+                    let retry_for_log = retry.clone();
+                    proxy
+                        .state
+                        .finish_request(crate::state::FinishRequestParams {
+                            id: request_id,
+                            status_code,
+                            duration_ms: dur,
+                            ended_at_ms: started_at_ms + dur,
+                            usage,
+                            retry,
+                            ttfb_ms: Some(upstream_headers_ms),
+                        })
+                        .await;
+
+                    log_request_with_debug(
+                        proxy.service_name,
+                        method.as_str(),
+                        uri.path(),
+                        status_code,
+                        dur,
+                        Some(upstream_headers_ms),
+                        &selected.config_name,
+                        provider_id.clone(),
+                        &selected.upstream.base_url,
+                        session_id.clone(),
+                        cwd.clone(),
+                        effective_effort.clone(),
+                        usage_for_log,
+                        retry_for_log,
+                        None,
+                    );
+
+                    let mut builder = Response::builder().status(status);
+                    for (name, value) in resp_headers_filtered.iter() {
+                        builder = builder.header(name, value);
+                    }
+                    return Ok(builder.body(Body::from(bytes)).unwrap());
+                }
+
+                if never_retry {
+                    lb.record_result_with_backoff(
+                        selected.index,
+                        false,
+                        crate::lb::COOLDOWN_SECS,
+                        cooldown_backoff,
+                    );
+
+                    let retry = retry_info_for_chain(&upstream_chain);
+                    let retry_for_log = retry.clone();
+                    proxy
+                        .state
+                        .finish_request(crate::state::FinishRequestParams {
+                            id: request_id,
+                            status_code,
+                            duration_ms: dur,
+                            ended_at_ms: started_at_ms + dur,
+                            usage: None,
+                            retry,
+                            ttfb_ms: Some(upstream_headers_ms),
+                        })
+                        .await;
+
+                    log_request_with_debug(
+                        proxy.service_name,
+                        method.as_str(),
+                        uri.path(),
+                        status_code,
+                        dur,
+                        Some(upstream_headers_ms),
+                        &selected.config_name,
+                        provider_id.clone(),
+                        &selected.upstream.base_url,
+                        session_id.clone(),
+                        cwd.clone(),
+                        effective_effort.clone(),
+                        None,
+                        retry_for_log,
+                        None,
+                    );
+
+                    let mut builder = Response::builder().status(status);
+                    for (name, value) in resp_headers_filtered.iter() {
+                        builder = builder.header(name, value);
+                    }
+                    return Ok(builder.body(Body::from(bytes)).unwrap());
+                }
+
+                let upstream_retryable = should_retry_status(upstream_opt, status_code)
+                    || should_retry_class(upstream_opt, cls.as_deref());
+                let can_retry_upstream =
+                    upstream_retryable && upstream_attempt + 1 < upstream_opt.max_attempts;
+                if can_retry_upstream {
+                    retry_sleep(upstream_opt, upstream_attempt, &resp_headers).await;
+                    continue;
+                }
+
+                // Upstream-layer exhausted; decide whether to fail over (first within config, then to another config).
+                let provider_retryable = should_retry_status(provider_opt, status_code)
+                    || should_retry_class(provider_opt, cls.as_deref());
+                if provider_retryable {
+                    lb.penalize_with_backoff(
+                        selected.index,
+                        plan.transport_cooldown_secs,
+                        &format!("status_{}", status_code),
+                        cooldown_backoff,
+                    );
+                    last_err = Some((status, String::from_utf8_lossy(bytes.as_ref()).to_string()));
+
+                    if avoid_set.insert(selected.index) {
+                        avoided_total = avoided_total.saturating_add(1);
+                    }
+                    break;
+                }
+
+                // Not retryable for provider failover either: return the error as-is.
+                let retry = retry_info_for_chain(&upstream_chain);
+                let retry_for_log = retry.clone();
+                proxy
+                    .state
+                    .finish_request(crate::state::FinishRequestParams {
+                        id: request_id,
+                        status_code,
+                        duration_ms: dur,
+                        ended_at_ms: started_at_ms + dur,
+                        usage: None,
+                        retry,
+                        ttfb_ms: Some(upstream_headers_ms),
+                    })
+                    .await;
+
+                log_request_with_debug(
+                    proxy.service_name,
+                    method.as_str(),
+                    uri.path(),
+                    status_code,
+                    dur,
+                    Some(upstream_headers_ms),
+                    &selected.config_name,
+                    provider_id.clone(),
+                    &selected.upstream.base_url,
+                    session_id.clone(),
+                    cwd.clone(),
+                    effective_effort.clone(),
+                    None,
+                    retry_for_log,
+                    None,
+                );
+
+                let mut builder = Response::builder().status(status);
+                for (name, value) in resp_headers_filtered.iter() {
+                    builder = builder.header(name, value);
+                }
+                return Ok(builder.body(Body::from(bytes)).unwrap());
+            }
+
+            // If we don't have any more upstreams under this provider/config, move to next provider;
+            // otherwise, continue selecting another upstream under the same provider/config.
+            let upstream_total = lb.service.upstreams.len();
+            if upstream_total > 0 && avoid_set.len() >= upstream_total {
+                break 'upstreams;
+            }
+            continue 'upstreams;
+        }
+
+        tried_configs.insert(config_name);
+
+        // Provider layer: optional backoff between providers (usually 0).
+        if provider_opt.base_backoff_ms > 0 {
+            backoff_sleep(provider_opt, provider_attempt).await;
+        }
+    }
+
+    // If we reach here, all provider attempts are exhausted.
+    if let Some((status, msg)) = last_err {
+        let dur = start.elapsed().as_millis() as u64;
+        log_request_with_debug(
+            proxy.service_name,
+            method.as_str(),
+            uri.path(),
+            status.as_u16(),
+            dur,
+            None,
+            "-",
+            None,
+            "-",
+            session_id.clone(),
+            cwd.clone(),
+            effective_effort.clone(),
+            None,
+            retry_info_for_chain(&upstream_chain),
+            None,
+        );
+        let retry = retry_info_for_chain(&upstream_chain);
+        proxy
+            .state
+            .finish_request(crate::state::FinishRequestParams {
+                id: request_id,
+                status_code: status.as_u16(),
+                duration_ms: dur,
+                ended_at_ms: started_at_ms + dur,
+                usage: None,
+                retry,
+                ttfb_ms: None,
+            })
+            .await;
+        return Err((status, msg));
+    }
+
+    return Err((
+        StatusCode::BAD_GATEWAY,
+        "no upstreams available".to_string(),
+    ));
+
+    #[cfg(any())]
+    {
+        for attempt_index in 0..retry_opt.max_attempts {
+            let avoided_total = avoid.values().map(|s| s.len()).sum::<usize>();
+            if total_upstreams > 0 && avoided_total >= total_upstreams {
+                upstream_chain.push(format!("all_upstreams_avoided total={total_upstreams}"));
+                break;
+            }
+
+            let strict_multi_config = lbs.len() > 1;
+
+            let mut chosen: Option<(LoadBalancer, SelectedUpstream)> = None;
+            for lb in &lbs {
+                let cfg_name = lb.service.name.clone();
+                let avoid_set = avoid.entry(cfg_name.clone()).or_default();
+                loop {
+                    let upstream_total = lb.service.upstreams.len();
+                    if upstream_total > 0 && avoid_set.len() >= upstream_total {
+                        break;
+                    }
+                    let next = {
+                        let avoid_ref: &HashSet<usize> = &*avoid_set;
+                        if strict_multi_config {
+                            lb.select_upstream_avoiding_strict(avoid_ref)
+                        } else {
+                            lb.select_upstream_avoiding(avoid_ref)
+                        }
+                    };
+                    let Some(selected) = next else {
+                        break;
+                    };
+
+                    if let Some(ref requested_model) = request_model {
+                        let supported = model_routing::is_model_supported(
+                            &selected.upstream.supported_models,
+                            &selected.upstream.model_mapping,
+                            requested_model,
+                        );
+                        if !supported {
+                            upstream_chain.push(format!(
+                                "{}:{} (idx={}) skipped_unsupported_model={}",
+                                selected.config_name,
+                                selected.upstream.base_url,
+                                selected.index,
+                                requested_model
+                            ));
+                            avoid_set.insert(selected.index);
+                            continue;
+                        }
+                    }
+
+                    chosen = Some((lb.clone(), selected));
+                    break;
+                }
+                if chosen.is_some() {
+                    break;
+                }
+            }
+
+            // When we have multiple config candidates, prefer skipping configs that are fully cooled down.
+            // However, if *all* configs are cooled/unavailable, fall back to the original "always pick one"
+            // behavior to avoid a hard outage.
+            if chosen.is_none() && strict_multi_config {
+                for lb in &lbs {
+                    let cfg_name = lb.service.name.clone();
+                    let avoid_set = avoid.entry(cfg_name.clone()).or_default();
+                    let upstream_total = lb.service.upstreams.len();
+                    if upstream_total > 0 && avoid_set.len() >= upstream_total {
+                        continue;
+                    }
+                    let avoid_ref: &HashSet<usize> = &*avoid_set;
+                    if let Some(selected) = lb.select_upstream_avoiding(avoid_ref) {
+                        chosen = Some((lb.clone(), selected));
+                        break;
+                    }
+                }
+            }
+
+            let Some((lb, selected)) = chosen else {
+                log_retry_trace(serde_json::json!({
+                    "event": "attempt_no_upstream",
+                    "service": proxy.service_name,
+                    "request_id": request_id,
+                    "attempt": attempt_index + 1,
+                    "max_attempts": retry_opt.max_attempts,
+                    "avoid": avoid.iter().map(|(k, v)| serde_json::json!({
+                        "config": k,
+                        "indices": v.iter().copied().collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                    "total_upstreams": total_upstreams,
+                    "model": request_model.clone(),
+                }));
+                let dur = start.elapsed().as_millis() as u64;
+                let status = if request_model.is_some() {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::BAD_GATEWAY
                 };
                 log_request_with_debug(
                     proxy.service_name,
@@ -1230,15 +1680,15 @@ pub async fn handle_proxy(
                     status.as_u16(),
                     dur,
                     None,
-                    &selected.config_name,
-                    selected.upstream.tags.get("provider_id").cloned(),
-                    &selected.upstream.base_url,
+                    "-",
+                    None,
+                    "-",
                     session_id.clone(),
                     cwd.clone(),
                     effective_effort.clone(),
                     None,
                     retry_info_for_chain(&upstream_chain),
-                    http_debug,
+                    None,
                 );
                 let retry = retry_info_for_chain(&upstream_chain);
                 proxy
@@ -1253,160 +1703,322 @@ pub async fn handle_proxy(
                         ttfb_ms: None,
                     })
                     .await;
-                return Err((status, err_str));
+                if let Some(model) = request_model.as_deref() {
+                    return Err((
+                        status,
+                        format!("no upstreams support requested model '{model}'"),
+                    ));
+                }
+                return Err((status, "no upstreams available".to_string()));
+            };
+
+            let selected_config_name = selected.config_name.clone();
+            let selected_upstream_index = selected.index;
+            let selected_upstream_base_url = selected.upstream.base_url.clone();
+            let provider_id = selected.upstream.tags.get("provider_id").cloned();
+            log_retry_trace(serde_json::json!({
+                "event": "attempt_select",
+                "service": proxy.service_name,
+                "request_id": request_id,
+                "attempt": attempt_index + 1,
+                "max_attempts": retry_opt.max_attempts,
+                "strategy": if retry_failover { "failover" } else { "same_upstream" },
+                "config_name": selected_config_name,
+                "upstream_index": selected_upstream_index,
+                "upstream_base_url": selected_upstream_base_url,
+                "provider_id": provider_id.clone(),
+                "model": request_model.clone(),
+                "lb_state": lb_state_snapshot_json(&lb),
+                "avoid_for_config": avoid.get(&selected.config_name).map(|s| s.iter().copied().collect::<Vec<_>>()),
+                "avoided_total": avoid.values().map(|s| s.len()).sum::<usize>(),
+                "total_upstreams": total_upstreams,
+            }));
+
+            let mut model_note = "-".to_string();
+            let mut body_for_selected = body_for_upstream.clone();
+            if let Some(ref requested_model) = request_model {
+                let effective_model = model_routing::effective_model(
+                    &selected.upstream.model_mapping,
+                    requested_model,
+                );
+                if effective_model != *requested_model {
+                    if let Some(modified) =
+                        apply_model_override(body_for_upstream.as_ref(), effective_model.as_str())
+                    {
+                        body_for_selected = Bytes::from(modified);
+                    }
+                    model_note = format!("{requested_model}->{effective_model}");
+                } else {
+                    model_note = requested_model.clone();
+                }
             }
-        };
 
-        // copy headers, stripping host/content-length and hop-by-hop.
-        // auth headers:
-        // - if upstream config provides a token/key, override client values;
-        // - otherwise, preserve client Authorization / X-API-Key (required for requires_openai_auth=true providers).
-        let mut headers = filter_request_headers(&client_headers);
-        let client_has_auth = headers.contains_key("authorization");
-        let (token, token_src) = resolve_auth_token_with_source(
-            proxy.service_name,
-            &selected.upstream.auth,
-            client_has_auth,
-        );
-        if let Some(token) = token
-            && let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}"))
-        {
-            headers.insert(HeaderName::from_static("authorization"), v);
-        }
+            let filtered_body = proxy.filter.apply_bytes(body_for_selected);
+            let upstream_request_body_len = filtered_body.len();
+            let upstream_request_body_debug = if request_body_previews && debug_max > 0 {
+                Some(make_body_preview(
+                    &filtered_body,
+                    client_content_type,
+                    debug_max,
+                ))
+            } else {
+                None
+            };
+            let upstream_request_body_warn = if request_body_previews && warn_max > 0 {
+                Some(make_body_preview(
+                    &filtered_body,
+                    client_content_type,
+                    warn_max,
+                ))
+            } else {
+                None
+            };
 
-        let client_has_x_api_key = headers.contains_key("x-api-key");
-        let (api_key, api_key_src) = resolve_api_key_with_source(
-            proxy.service_name,
-            &selected.upstream.auth,
-            client_has_x_api_key,
-        );
-        if let Some(key) = api_key
-            && let Ok(v) = HeaderValue::from_str(&key)
-        {
-            headers.insert(HeaderName::from_static("x-api-key"), v);
-        }
-
-        let upstream_request_headers = headers.clone();
-        proxy
-            .state
-            .update_request_route(
-                request_id,
-                selected.config_name.clone(),
-                provider_id.clone(),
-                selected.upstream.base_url.clone(),
-            )
-            .await;
-        let auth_resolution = AuthResolutionLog {
-            authorization: Some(token_src),
-            x_api_key: Some(api_key_src),
-        };
-
-        let debug_base = if debug_max > 0 || warn_max > 0 {
-            Some(HttpDebugBase {
-                debug_max_body_bytes: debug_max,
-                warn_max_body_bytes: warn_max,
-                request_body_len,
-                upstream_request_body_len,
-                client_uri: uri.to_string(),
-                target_url: target_url.to_string(),
-                client_headers: client_headers_entries_cache
-                    .get_or_init(|| header_map_to_entries(&client_headers))
-                    .clone(),
-                upstream_request_headers: header_map_to_entries(&upstream_request_headers),
-                auth_resolution: Some(auth_resolution),
-                client_body_debug: client_body_debug.clone(),
-                upstream_request_body_debug: upstream_request_body_debug.clone(),
-                client_body_warn: client_body_warn.clone(),
-                upstream_request_body_warn: upstream_request_body_warn.clone(),
-            })
-        } else {
-            None
-        };
-
-        // 详细转发日志仅在 debug 级别输出，避免刷屏。
-        tracing::debug!(
-            "forwarding {} {} to {} ({})",
-            method,
-            uri.path(),
-            target_url,
-            selected.config_name
-        );
-
-        let builder = proxy
-            .client
-            .request(method.clone(), target_url.clone())
-            .headers(headers)
-            .body(filtered_body.clone());
-
-        let upstream_start = Instant::now();
-        let resp = match builder.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                log_retry_trace(serde_json::json!({
-                    "event": "attempt_transport_error",
-                    "service": proxy.service_name,
-                    "request_id": request_id,
-                    "attempt": attempt_index + 1,
-                    "max_attempts": retry_opt.max_attempts,
-                    "strategy": if retry_failover { "failover" } else { "same_upstream" },
-                    "config_name": selected.config_name.as_str(),
-                    "upstream_index": selected.index,
-                    "upstream_base_url": selected.upstream.base_url.as_str(),
-                    "provider_id": provider_id.as_deref(),
-                    "error": e.to_string(),
-                }));
-                if retry_failover {
+            let target_url = match proxy.build_target(&selected, &uri) {
+                Ok((url, _headers)) => url,
+                Err(e) => {
                     lb.record_result_with_backoff(
                         selected.index,
                         false,
                         crate::lb::COOLDOWN_SECS,
                         cooldown_backoff,
                     );
+                    let err_str = e.to_string();
+                    upstream_chain.push(format!(
+                        "{}:{} (idx={}) target_build_error={} model={}",
+                        selected.config_name,
+                        selected.upstream.base_url,
+                        selected.index,
+                        err_str,
+                        model_note.as_str()
+                    ));
+                    avoid
+                        .entry(selected.config_name.clone())
+                        .or_default()
+                        .insert(selected.index);
+
+                    let can_retry = attempt_index + 1 < retry_opt.max_attempts;
+                    if can_retry {
+                        backoff_sleep(&retry_opt, attempt_index).await;
+                        continue;
+                    }
+
+                    let dur = start.elapsed().as_millis() as u64;
+                    let status = StatusCode::BAD_GATEWAY;
+                    let client_headers_entries = client_headers_entries_cache
+                        .get_or_init(|| header_map_to_entries(&client_headers))
+                        .clone();
+                    let http_debug = if should_include_http_warn(status.as_u16()) {
+                        Some(HttpDebugLog {
+                            request_body_len: Some(request_body_len),
+                            upstream_request_body_len: Some(upstream_request_body_len),
+                            upstream_headers_ms: None,
+                            upstream_first_chunk_ms: None,
+                            upstream_body_read_ms: None,
+                            upstream_error_class: Some("target_build_error".to_string()),
+                            upstream_error_hint: Some(
+                                "构造上游 target_url 失败（通常是 base_url 配置错误）。"
+                                    .to_string(),
+                            ),
+                            upstream_cf_ray: None,
+                            client_uri: uri.to_string(),
+                            target_url: "-".to_string(),
+                            client_headers: client_headers_entries,
+                            upstream_request_headers: Vec::new(),
+                            auth_resolution: None,
+                            client_body: client_body_warn.clone(),
+                            upstream_request_body: upstream_request_body_warn.clone(),
+                            upstream_response_headers: None,
+                            upstream_response_body: None,
+                            upstream_error: Some(err_str.clone()),
+                        })
+                    } else {
+                        None
+                    };
+                    log_request_with_debug(
+                        proxy.service_name,
+                        method.as_str(),
+                        uri.path(),
+                        status.as_u16(),
+                        dur,
+                        None,
+                        &selected.config_name,
+                        selected.upstream.tags.get("provider_id").cloned(),
+                        &selected.upstream.base_url,
+                        session_id.clone(),
+                        cwd.clone(),
+                        effective_effort.clone(),
+                        None,
+                        retry_info_for_chain(&upstream_chain),
+                        http_debug,
+                    );
+                    let retry = retry_info_for_chain(&upstream_chain);
+                    proxy
+                        .state
+                        .finish_request(crate::state::FinishRequestParams {
+                            id: request_id,
+                            status_code: status.as_u16(),
+                            duration_ms: dur,
+                            ended_at_ms: started_at_ms + dur,
+                            usage: None,
+                            retry,
+                            ttfb_ms: None,
+                        })
+                        .await;
+                    return Err((status, err_str));
                 }
-                let err_str = e.to_string();
-                upstream_chain.push(format!(
-                    "{}:{} (idx={}) transport_error={} model={}",
-                    selected.config_name,
-                    selected.upstream.base_url,
-                    selected.index,
-                    err_str,
-                    model_note.as_str()
-                ));
-                let can_retry = attempt_index + 1 < retry_opt.max_attempts
-                    && should_retry_class(&retry_opt, Some("upstream_transport_error"));
-                if can_retry {
+            };
+
+            // copy headers, stripping host/content-length and hop-by-hop.
+            // auth headers:
+            // - if upstream config provides a token/key, override client values;
+            // - otherwise, preserve client Authorization / X-API-Key (required for requires_openai_auth=true providers).
+            let mut headers = filter_request_headers(&client_headers);
+            let client_has_auth = headers.contains_key("authorization");
+            let (token, token_src) = resolve_auth_token_with_source(
+                proxy.service_name,
+                &selected.upstream.auth,
+                client_has_auth,
+            );
+            if let Some(token) = token
+                && let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}"))
+            {
+                headers.insert(HeaderName::from_static("authorization"), v);
+            }
+
+            let client_has_x_api_key = headers.contains_key("x-api-key");
+            let (api_key, api_key_src) = resolve_api_key_with_source(
+                proxy.service_name,
+                &selected.upstream.auth,
+                client_has_x_api_key,
+            );
+            if let Some(key) = api_key
+                && let Ok(v) = HeaderValue::from_str(&key)
+            {
+                headers.insert(HeaderName::from_static("x-api-key"), v);
+            }
+
+            let upstream_request_headers = headers.clone();
+            proxy
+                .state
+                .update_request_route(
+                    request_id,
+                    selected.config_name.clone(),
+                    provider_id.clone(),
+                    selected.upstream.base_url.clone(),
+                )
+                .await;
+            let auth_resolution = AuthResolutionLog {
+                authorization: Some(token_src),
+                x_api_key: Some(api_key_src),
+            };
+
+            let debug_base = if debug_max > 0 || warn_max > 0 {
+                Some(HttpDebugBase {
+                    debug_max_body_bytes: debug_max,
+                    warn_max_body_bytes: warn_max,
+                    request_body_len,
+                    upstream_request_body_len,
+                    client_uri: uri.to_string(),
+                    target_url: target_url.to_string(),
+                    client_headers: client_headers_entries_cache
+                        .get_or_init(|| header_map_to_entries(&client_headers))
+                        .clone(),
+                    upstream_request_headers: header_map_to_entries(&upstream_request_headers),
+                    auth_resolution: Some(auth_resolution),
+                    client_body_debug: client_body_debug.clone(),
+                    upstream_request_body_debug: upstream_request_body_debug.clone(),
+                    client_body_warn: client_body_warn.clone(),
+                    upstream_request_body_warn: upstream_request_body_warn.clone(),
+                })
+            } else {
+                None
+            };
+
+            // 详细转发日志仅在 debug 级别输出，避免刷屏。
+            tracing::debug!(
+                "forwarding {} {} to {} ({})",
+                method,
+                uri.path(),
+                target_url,
+                selected.config_name
+            );
+
+            let builder = proxy
+                .client
+                .request(method.clone(), target_url.clone())
+                .headers(headers)
+                .body(filtered_body.clone());
+
+            let upstream_start = Instant::now();
+            let resp = match builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    log_retry_trace(serde_json::json!({
+                        "event": "attempt_transport_error",
+                        "service": proxy.service_name,
+                        "request_id": request_id,
+                        "attempt": attempt_index + 1,
+                        "max_attempts": retry_opt.max_attempts,
+                        "strategy": if retry_failover { "failover" } else { "same_upstream" },
+                        "config_name": selected.config_name.as_str(),
+                        "upstream_index": selected.index,
+                        "upstream_base_url": selected.upstream.base_url.as_str(),
+                        "provider_id": provider_id.as_deref(),
+                        "error": e.to_string(),
+                    }));
                     if retry_failover {
+                        lb.record_result_with_backoff(
+                            selected.index,
+                            false,
+                            crate::lb::COOLDOWN_SECS,
+                            cooldown_backoff,
+                        );
+                    }
+                    let err_str = e.to_string();
+                    upstream_chain.push(format!(
+                        "{}:{} (idx={}) transport_error={} model={}",
+                        selected.config_name,
+                        selected.upstream.base_url,
+                        selected.index,
+                        err_str,
+                        model_note.as_str()
+                    ));
+                    let can_retry = attempt_index + 1 < retry_opt.max_attempts
+                        && should_retry_class(&retry_opt, Some("upstream_transport_error"));
+                    if can_retry {
+                        if retry_failover {
+                            lb.penalize_with_backoff(
+                                selected.index,
+                                retry_opt.transport_cooldown_secs,
+                                "upstream_transport_error",
+                                cooldown_backoff,
+                            );
+                            avoid
+                                .entry(selected.config_name.clone())
+                                .or_default()
+                                .insert(selected.index);
+                        }
+                        backoff_sleep(&retry_opt, attempt_index).await;
+                        continue;
+                    }
+
+                    // Even when we have no remaining in-request retries, mark this upstream as cooled down
+                    // so external retries (e.g. Codex request_max_retries) can fail over to another upstream.
+                    if should_retry_class(&retry_opt, Some("upstream_transport_error")) {
                         lb.penalize_with_backoff(
                             selected.index,
                             retry_opt.transport_cooldown_secs,
-                            "upstream_transport_error",
+                            "upstream_transport_error_final",
                             cooldown_backoff,
                         );
-                        avoid
-                            .entry(selected.config_name.clone())
-                            .or_default()
-                            .insert(selected.index);
                     }
-                    backoff_sleep(&retry_opt, attempt_index).await;
-                    continue;
-                }
 
-                // Even when we have no remaining in-request retries, mark this upstream as cooled down
-                // so external retries (e.g. Codex request_max_retries) can fail over to another upstream.
-                if should_retry_class(&retry_opt, Some("upstream_transport_error")) {
-                    lb.penalize_with_backoff(
-                        selected.index,
-                        retry_opt.transport_cooldown_secs,
-                        "upstream_transport_error_final",
-                        cooldown_backoff,
-                    );
-                }
-
-                let dur = start.elapsed().as_millis() as u64;
-                let status_code = StatusCode::BAD_GATEWAY.as_u16();
-                let upstream_headers_ms = upstream_start.elapsed().as_millis() as u64;
-                let retry = retry_info_for_chain(&upstream_chain);
-                let http_debug_warn = debug_base.as_ref().and_then(|b| {
+                    let dur = start.elapsed().as_millis() as u64;
+                    let status_code = StatusCode::BAD_GATEWAY.as_u16();
+                    let upstream_headers_ms = upstream_start.elapsed().as_millis() as u64;
+                    let retry = retry_info_for_chain(&upstream_chain);
+                    let http_debug_warn = debug_base.as_ref().and_then(|b| {
                     if b.warn_max_body_bytes == 0 {
                         return None;
                     }
@@ -1433,13 +2045,13 @@ pub async fn handle_proxy(
                         upstream_error: Some(err_str.clone()),
                     })
                 });
-                if should_include_http_warn(status_code)
-                    && let Some(h) = http_debug_warn.as_ref()
-                {
-                    warn_http_debug(status_code, h);
-                }
-                let http_debug = if should_include_http_debug(status_code) {
-                    debug_base.as_ref().and_then(|b| {
+                    if should_include_http_warn(status_code)
+                        && let Some(h) = http_debug_warn.as_ref()
+                    {
+                        warn_http_debug(status_code, h);
+                    }
+                    let http_debug = if should_include_http_debug(status_code) {
+                        debug_base.as_ref().and_then(|b| {
                         if b.debug_max_body_bytes == 0 {
                             return None;
                         }
@@ -1466,168 +2078,168 @@ pub async fn handle_proxy(
                             upstream_error: Some(err_str.clone()),
                         })
                     })
-                } else if should_include_http_warn(status_code) {
-                    http_debug_warn.clone()
-                } else {
-                    None
-                };
-                log_request_with_debug(
-                    proxy.service_name,
-                    method.as_str(),
-                    uri.path(),
-                    status_code,
-                    dur,
-                    None,
-                    &selected.config_name,
-                    selected.upstream.tags.get("provider_id").cloned(),
-                    &selected.upstream.base_url,
-                    session_id.clone(),
-                    cwd.clone(),
-                    effective_effort.clone(),
-                    None,
-                    retry.clone(),
-                    http_debug,
-                );
-                proxy
-                    .state
-                    .finish_request(crate::state::FinishRequestParams {
-                        id: request_id,
+                    } else if should_include_http_warn(status_code) {
+                        http_debug_warn.clone()
+                    } else {
+                        None
+                    };
+                    log_request_with_debug(
+                        proxy.service_name,
+                        method.as_str(),
+                        uri.path(),
                         status_code,
-                        duration_ms: dur,
-                        ended_at_ms: started_at_ms + dur,
-                        usage: None,
-                        retry,
-                        ttfb_ms: None,
-                    })
-                    .await;
-                return Err((StatusCode::BAD_GATEWAY, e.to_string()));
-            }
-        };
+                        dur,
+                        None,
+                        &selected.config_name,
+                        selected.upstream.tags.get("provider_id").cloned(),
+                        &selected.upstream.base_url,
+                        session_id.clone(),
+                        cwd.clone(),
+                        effective_effort.clone(),
+                        None,
+                        retry.clone(),
+                        http_debug,
+                    );
+                    proxy
+                        .state
+                        .finish_request(crate::state::FinishRequestParams {
+                            id: request_id,
+                            status_code,
+                            duration_ms: dur,
+                            ended_at_ms: started_at_ms + dur,
+                            usage: None,
+                            retry,
+                            ttfb_ms: None,
+                        })
+                        .await;
+                    return Err((StatusCode::BAD_GATEWAY, e.to_string()));
+                }
+            };
 
-        let upstream_headers_ms = upstream_start.elapsed().as_millis() as u64;
-        let status = resp.status();
-        let success = status.is_success();
-        let resp_headers = resp.headers().clone();
-        let resp_headers_filtered = filter_response_headers(&resp_headers);
+            let upstream_headers_ms = upstream_start.elapsed().as_millis() as u64;
+            let status = resp.status();
+            let success = status.is_success();
+            let resp_headers = resp.headers().clone();
+            let resp_headers_filtered = filter_response_headers(&resp_headers);
 
-        // 对用户对话轮次输出更有信息量的 info 日志（仅最终返回时打印，避免重试期间刷屏）。
+            // 对用户对话轮次输出更有信息量的 info 日志（仅最终返回时打印，避免重试期间刷屏）。
 
-        if is_stream && success {
-            lb.record_result_with_backoff(
-                selected.index,
-                true,
-                crate::lb::COOLDOWN_SECS,
-                cooldown_backoff,
-            );
-            upstream_chain.push(format!(
-                "{} (idx={}) status={} model={}",
-                selected.upstream.base_url,
-                selected.index,
-                status.as_u16(),
-                model_note.as_str()
-            ));
-            let retry = retry_info_for_chain(&upstream_chain);
-
-            return Ok(build_sse_success_response(
-                &proxy,
-                lb.clone(),
-                selected,
-                resp,
-                SseSuccessMeta {
-                    status,
-                    resp_headers,
-                    resp_headers_filtered,
-                    start,
-                    started_at_ms,
-                    upstream_start,
-                    upstream_headers_ms,
-                    request_body_len,
-                    upstream_request_body_len,
-                    debug_base,
-                    retry,
-                    session_id: session_id.clone(),
-                    cwd: cwd.clone(),
-                    effective_effort: effective_effort.clone(),
-                    request_id,
-                    is_user_turn,
-                    is_codex_service,
-                    transport_cooldown_secs: retry_opt.transport_cooldown_secs,
+            if is_stream && success {
+                lb.record_result_with_backoff(
+                    selected.index,
+                    true,
+                    crate::lb::COOLDOWN_SECS,
                     cooldown_backoff,
-                    method: method.clone(),
-                    path: uri.path().to_string(),
-                },
-            )
-            .await);
-        } else {
-            let bytes = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    log_retry_trace(serde_json::json!({
-                        "event": "attempt_body_read_error",
-                        "service": proxy.service_name,
-                        "request_id": request_id,
-                        "attempt": attempt_index + 1,
-                        "max_attempts": retry_opt.max_attempts,
-                        "strategy": if retry_failover { "failover" } else { "same_upstream" },
-                        "config_name": selected.config_name.as_str(),
-                        "upstream_index": selected.index,
-                        "upstream_base_url": selected.upstream.base_url.as_str(),
-                        "provider_id": provider_id.as_deref(),
-                        "error": e.to_string(),
-                    }));
-                    if retry_failover {
-                        lb.record_result_with_backoff(
-                            selected.index,
-                            false,
-                            crate::lb::COOLDOWN_SECS,
-                            cooldown_backoff,
-                        );
-                    }
-                    let err_str = e.to_string();
-                    upstream_chain.push(format!(
-                        "{}:{} (idx={}) body_read_error={} model={}",
-                        selected.config_name,
-                        selected.upstream.base_url,
-                        selected.index,
-                        err_str,
-                        model_note.as_str()
-                    ));
-                    let can_retry = attempt_index + 1 < retry_opt.max_attempts
-                        && should_retry_class(&retry_opt, Some("upstream_transport_error"));
-                    if can_retry {
+                );
+                upstream_chain.push(format!(
+                    "{} (idx={}) status={} model={}",
+                    selected.upstream.base_url,
+                    selected.index,
+                    status.as_u16(),
+                    model_note.as_str()
+                ));
+                let retry = retry_info_for_chain(&upstream_chain);
+
+                return Ok(build_sse_success_response(
+                    &proxy,
+                    lb.clone(),
+                    selected,
+                    resp,
+                    SseSuccessMeta {
+                        status,
+                        resp_headers,
+                        resp_headers_filtered,
+                        start,
+                        started_at_ms,
+                        upstream_start,
+                        upstream_headers_ms,
+                        request_body_len,
+                        upstream_request_body_len,
+                        debug_base,
+                        retry,
+                        session_id: session_id.clone(),
+                        cwd: cwd.clone(),
+                        effective_effort: effective_effort.clone(),
+                        request_id,
+                        is_user_turn,
+                        is_codex_service,
+                        transport_cooldown_secs: retry_opt.transport_cooldown_secs,
+                        cooldown_backoff,
+                        method: method.clone(),
+                        path: uri.path().to_string(),
+                    },
+                )
+                .await);
+            } else {
+                let bytes = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log_retry_trace(serde_json::json!({
+                            "event": "attempt_body_read_error",
+                            "service": proxy.service_name,
+                            "request_id": request_id,
+                            "attempt": attempt_index + 1,
+                            "max_attempts": retry_opt.max_attempts,
+                            "strategy": if retry_failover { "failover" } else { "same_upstream" },
+                            "config_name": selected.config_name.as_str(),
+                            "upstream_index": selected.index,
+                            "upstream_base_url": selected.upstream.base_url.as_str(),
+                            "provider_id": provider_id.as_deref(),
+                            "error": e.to_string(),
+                        }));
                         if retry_failover {
+                            lb.record_result_with_backoff(
+                                selected.index,
+                                false,
+                                crate::lb::COOLDOWN_SECS,
+                                cooldown_backoff,
+                            );
+                        }
+                        let err_str = e.to_string();
+                        upstream_chain.push(format!(
+                            "{}:{} (idx={}) body_read_error={} model={}",
+                            selected.config_name,
+                            selected.upstream.base_url,
+                            selected.index,
+                            err_str,
+                            model_note.as_str()
+                        ));
+                        let can_retry = attempt_index + 1 < retry_opt.max_attempts
+                            && should_retry_class(&retry_opt, Some("upstream_transport_error"));
+                        if can_retry {
+                            if retry_failover {
+                                lb.penalize_with_backoff(
+                                    selected.index,
+                                    retry_opt.transport_cooldown_secs,
+                                    "upstream_body_read_error",
+                                    cooldown_backoff,
+                                );
+                                avoid
+                                    .entry(selected.config_name.clone())
+                                    .or_default()
+                                    .insert(selected.index);
+                            }
+                            backoff_sleep(&retry_opt, attempt_index).await;
+                            continue;
+                        }
+
+                        // Same reasoning as transport errors: without in-request retries, external retries
+                        // should not get stuck repeatedly selecting the same broken upstream.
+                        if should_retry_class(&retry_opt, Some("upstream_transport_error")) {
                             lb.penalize_with_backoff(
                                 selected.index,
                                 retry_opt.transport_cooldown_secs,
-                                "upstream_body_read_error",
+                                "upstream_body_read_error_final",
                                 cooldown_backoff,
                             );
-                            avoid
-                                .entry(selected.config_name.clone())
-                                .or_default()
-                                .insert(selected.index);
                         }
-                        backoff_sleep(&retry_opt, attempt_index).await;
-                        continue;
-                    }
 
-                    // Same reasoning as transport errors: without in-request retries, external retries
-                    // should not get stuck repeatedly selecting the same broken upstream.
-                    if should_retry_class(&retry_opt, Some("upstream_transport_error")) {
-                        lb.penalize_with_backoff(
-                            selected.index,
-                            retry_opt.transport_cooldown_secs,
-                            "upstream_body_read_error_final",
-                            cooldown_backoff,
-                        );
-                    }
-
-                    let dur = start.elapsed().as_millis() as u64;
-                    let status = StatusCode::BAD_GATEWAY;
-                    let http_debug = if should_include_http_warn(status.as_u16())
-                        && let Some(b) = debug_base.as_ref()
-                    {
-                        Some(HttpDebugLog {
+                        let dur = start.elapsed().as_millis() as u64;
+                        let status = StatusCode::BAD_GATEWAY;
+                        let http_debug = if should_include_http_warn(status.as_u16())
+                            && let Some(b) = debug_base.as_ref()
+                        {
+                            Some(HttpDebugLog {
                             request_body_len: Some(b.request_body_len),
                             upstream_request_body_len: Some(b.upstream_request_body_len),
                             upstream_headers_ms: Some(upstream_headers_ms),
@@ -1650,299 +2262,262 @@ pub async fn handle_proxy(
                             upstream_response_body: None,
                             upstream_error: Some(err_str.clone()),
                         })
-                    } else {
-                        None
-                    };
-                    log_request_with_debug(
-                        proxy.service_name,
-                        method.as_str(),
-                        uri.path(),
-                        status.as_u16(),
-                        dur,
-                        Some(upstream_headers_ms),
-                        &selected.config_name,
-                        selected.upstream.tags.get("provider_id").cloned(),
-                        &selected.upstream.base_url,
-                        session_id.clone(),
-                        cwd.clone(),
-                        effective_effort.clone(),
-                        None,
-                        retry_info_for_chain(&upstream_chain),
-                        http_debug,
-                    );
-                    let retry = retry_info_for_chain(&upstream_chain);
-                    proxy
-                        .state
-                        .finish_request(crate::state::FinishRequestParams {
-                            id: request_id,
-                            status_code: status.as_u16(),
-                            duration_ms: dur,
-                            ended_at_ms: started_at_ms + dur,
-                            usage: None,
-                            retry,
-                            ttfb_ms: Some(upstream_headers_ms),
-                        })
-                        .await;
-                    return Err((status, err_str));
-                }
-            };
-            let upstream_body_read_ms = upstream_start.elapsed().as_millis() as u64;
-            let dur = start.elapsed().as_millis() as u64;
-            let usage = extract_usage_from_bytes(&bytes);
-            let status_code = status.as_u16();
-            let (cls, hint, cf_ray) =
-                classify_upstream_response(status_code, &resp_headers, bytes.as_ref());
-
-            upstream_chain.push(format!(
-                "{} (idx={}) status={} class={} model={}",
-                selected.upstream.base_url,
-                selected.index,
-                status_code,
-                cls.as_deref().unwrap_or("-"),
-                model_note.as_str()
-            ));
-
-            // If this looks like a transient / retryable upstream failure, but we have no remaining
-            // in-request retries, proactively cool down this upstream so the next external retry
-            // (Codex/app-level) can fail over to other upstreams.
-            if !success
-                && attempt_index + 1 >= retry_opt.max_attempts
-                && (should_retry_status(&retry_opt, status_code)
-                    || should_retry_class(&retry_opt, cls.as_deref()))
-            {
-                log_retry_trace(serde_json::json!({
-                    "event": "attempt_final_retryable_failure",
-                    "service": proxy.service_name,
-                    "request_id": request_id,
-                    "attempt": attempt_index + 1,
-                    "max_attempts": retry_opt.max_attempts,
-                    "status_code": status_code,
-                    "class": cls.as_deref(),
-                    "hint": hint.as_deref(),
-                    "cf_ray": cf_ray.as_deref(),
-                    "config_name": selected.config_name.as_str(),
-                    "upstream_index": selected.index,
-                    "upstream_base_url": selected.upstream.base_url.as_str(),
-                    "provider_id": provider_id.as_deref(),
-                    "should_retry_status": should_retry_status(&retry_opt, status_code),
-                    "should_retry_class": should_retry_class(&retry_opt, cls.as_deref()),
-                }));
-                match cls.as_deref() {
-                    Some("cloudflare_challenge") => lb.penalize_with_backoff(
-                        selected.index,
-                        retry_opt.cloudflare_challenge_cooldown_secs,
-                        "cloudflare_challenge_final",
-                        cooldown_backoff,
-                    ),
-                    Some("cloudflare_timeout") => lb.penalize_with_backoff(
-                        selected.index,
-                        retry_opt.cloudflare_timeout_cooldown_secs,
-                        "cloudflare_timeout_final",
-                        cooldown_backoff,
-                    ),
-                    _ if status_code >= 500 => lb.penalize_with_backoff(
-                        selected.index,
-                        retry_opt.transport_cooldown_secs,
-                        &format!("status_{}_final", status_code),
-                        cooldown_backoff,
-                    ),
-                    _ => {}
-                }
-            }
-
-            let retryable = !status.is_success()
-                && attempt_index + 1 < retry_opt.max_attempts
-                && (should_retry_status(&retry_opt, status_code)
-                    || should_retry_class(&retry_opt, cls.as_deref()));
-            if retryable {
-                log_retry_trace(serde_json::json!({
-                    "event": "attempt_retryable_failure",
-                    "service": proxy.service_name,
-                    "request_id": request_id,
-                    "attempt": attempt_index + 1,
-                    "next_attempt": attempt_index + 2,
-                    "max_attempts": retry_opt.max_attempts,
-                    "status_code": status_code,
-                    "class": cls.as_deref(),
-                    "hint": hint.as_deref(),
-                    "cf_ray": cf_ray.as_deref(),
-                    "config_name": selected.config_name.as_str(),
-                    "upstream_index": selected.index,
-                    "upstream_base_url": selected.upstream.base_url.as_str(),
-                    "provider_id": provider_id.as_deref(),
-                    "strategy": if retry_failover { "failover" } else { "same_upstream" },
-                    "retry_after": resp_headers.get("retry-after").and_then(|v| v.to_str().ok()),
-                    "should_retry_status": should_retry_status(&retry_opt, status_code),
-                    "should_retry_class": should_retry_class(&retry_opt, cls.as_deref()),
-                }));
-                let cls_s = cls.as_deref().unwrap_or("-");
-                info!(
-                    "retrying after non-2xx status {} (class={}) for {} {} (config: {}, mode={}, next_attempt={}/{})",
-                    status_code,
-                    cls_s,
-                    method,
-                    uri.path(),
-                    selected.config_name,
-                    if retry_failover {
-                        "failover"
-                    } else {
-                        "same_upstream"
-                    },
-                    attempt_index + 2,
-                    retry_opt.max_attempts
-                );
-                if retry_failover {
-                    // Treat retryable 5xx / WAF-like responses as upstream failures for LB tracking.
-                    if status_code >= 500 || cls.is_some() {
-                        lb.record_result_with_backoff(
-                            selected.index,
-                            false,
-                            crate::lb::COOLDOWN_SECS,
-                            cooldown_backoff,
+                        } else {
+                            None
+                        };
+                        log_request_with_debug(
+                            proxy.service_name,
+                            method.as_str(),
+                            uri.path(),
+                            status.as_u16(),
+                            dur,
+                            Some(upstream_headers_ms),
+                            &selected.config_name,
+                            selected.upstream.tags.get("provider_id").cloned(),
+                            &selected.upstream.base_url,
+                            session_id.clone(),
+                            cwd.clone(),
+                            effective_effort.clone(),
+                            None,
+                            retry_info_for_chain(&upstream_chain),
+                            http_debug,
                         );
+                        let retry = retry_info_for_chain(&upstream_chain);
+                        proxy
+                            .state
+                            .finish_request(crate::state::FinishRequestParams {
+                                id: request_id,
+                                status_code: status.as_u16(),
+                                duration_ms: dur,
+                                ended_at_ms: started_at_ms + dur,
+                                usage: None,
+                                retry,
+                                ttfb_ms: Some(upstream_headers_ms),
+                            })
+                            .await;
+                        return Err((status, err_str));
                     }
+                };
+                let upstream_body_read_ms = upstream_start.elapsed().as_millis() as u64;
+                let dur = start.elapsed().as_millis() as u64;
+                let usage = extract_usage_from_bytes(&bytes);
+                let status_code = status.as_u16();
+                let (cls, hint, cf_ray) =
+                    classify_upstream_response(status_code, &resp_headers, bytes.as_ref());
+                let never_retry = should_never_retry_status(&retry_opt, status_code)
+                    || should_never_retry_class(&retry_opt, cls.as_deref());
+
+                upstream_chain.push(format!(
+                    "{} (idx={}) status={} class={} model={}",
+                    selected.upstream.base_url,
+                    selected.index,
+                    status_code,
+                    cls.as_deref().unwrap_or("-"),
+                    model_note.as_str()
+                ));
+
+                // If this looks like a transient / retryable upstream failure, but we have no remaining
+                // in-request retries, proactively cool down this upstream so the next external retry
+                // (Codex/app-level) can fail over to other upstreams.
+                if !success
+                    && attempt_index + 1 >= retry_opt.max_attempts
+                    && !never_retry
+                    && (should_retry_status(&retry_opt, status_code)
+                        || should_retry_class(&retry_opt, cls.as_deref()))
+                {
+                    log_retry_trace(serde_json::json!({
+                        "event": "attempt_final_retryable_failure",
+                        "service": proxy.service_name,
+                        "request_id": request_id,
+                        "attempt": attempt_index + 1,
+                        "max_attempts": retry_opt.max_attempts,
+                        "status_code": status_code,
+                        "class": cls.as_deref(),
+                        "hint": hint.as_deref(),
+                        "cf_ray": cf_ray.as_deref(),
+                        "config_name": selected.config_name.as_str(),
+                        "upstream_index": selected.index,
+                        "upstream_base_url": selected.upstream.base_url.as_str(),
+                        "provider_id": provider_id.as_deref(),
+                        "should_retry_status": should_retry_status(&retry_opt, status_code),
+                        "should_retry_class": should_retry_class(&retry_opt, cls.as_deref()),
+                        "never_retry_status": should_never_retry_status(&retry_opt, status_code),
+                        "never_retry_class": should_never_retry_class(&retry_opt, cls.as_deref()),
+                    }));
                     match cls.as_deref() {
                         Some("cloudflare_challenge") => lb.penalize_with_backoff(
                             selected.index,
                             retry_opt.cloudflare_challenge_cooldown_secs,
-                            "cloudflare_challenge",
+                            "cloudflare_challenge_final",
                             cooldown_backoff,
                         ),
                         Some("cloudflare_timeout") => lb.penalize_with_backoff(
                             selected.index,
                             retry_opt.cloudflare_timeout_cooldown_secs,
-                            "cloudflare_timeout",
+                            "cloudflare_timeout_final",
                             cooldown_backoff,
                         ),
-                        _ if status_code >= 500 => lb.penalize_with_backoff(
+                        _ if status_code >= 400 => lb.penalize_with_backoff(
                             selected.index,
                             retry_opt.transport_cooldown_secs,
-                            &format!("status_{}", status_code),
+                            &format!("status_{}_final", status_code),
                             cooldown_backoff,
                         ),
                         _ => {}
                     }
-                    avoid
-                        .entry(selected.config_name.clone())
-                        .or_default()
-                        .insert(selected.index);
                 }
-                retry_sleep(&retry_opt, attempt_index, &resp_headers).await;
-                continue;
-            }
 
-            // Update LB state (final attempt):
-            // - 2xx => success
-            // - transport / 5xx / classified WAF failures => failure
-            // - generic 3xx/4xx => neutral (do not mark upstream good/bad to avoid sticky routing to a failing upstream,
-            //   and also avoid penalizing upstreams for client-side mistakes).
-            if success {
-                lb.record_result_with_backoff(
-                    selected.index,
-                    true,
-                    crate::lb::COOLDOWN_SECS,
-                    cooldown_backoff,
-                );
-            } else if status_code >= 500 || cls.is_some() {
-                lb.record_result_with_backoff(
-                    selected.index,
-                    false,
-                    crate::lb::COOLDOWN_SECS,
-                    cooldown_backoff,
-                );
-            }
-
-            let retry = retry_info_for_chain(&upstream_chain);
-
-            if is_user_turn {
-                let provider_id = selected
-                    .upstream
-                    .tags
-                    .get("provider_id")
-                    .map(|s| s.as_str())
-                    .unwrap_or("-");
-                info!(
-                    "user turn {} {} using config '{}' upstream[{}] provider_id='{}' base_url='{}'",
-                    method,
-                    uri.path(),
-                    selected.config_name,
-                    selected.index,
-                    provider_id,
-                    selected.upstream.base_url
-                );
-            }
-
-            let http_debug_warn = if should_include_http_warn(status_code)
-                && let Some(b) = debug_base.as_ref()
-            {
-                let max = b.warn_max_body_bytes;
-                let resp_ct = resp_headers
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok());
-                Some(HttpDebugLog {
-                    request_body_len: Some(b.request_body_len),
-                    upstream_request_body_len: Some(b.upstream_request_body_len),
-                    upstream_headers_ms: Some(upstream_headers_ms),
-                    upstream_first_chunk_ms: None,
-                    upstream_body_read_ms: Some(upstream_body_read_ms),
-                    upstream_error_class: cls.clone(),
-                    upstream_error_hint: hint.clone(),
-                    upstream_cf_ray: cf_ray.clone(),
-                    client_uri: b.client_uri.clone(),
-                    target_url: b.target_url.clone(),
-                    client_headers: b.client_headers.clone(),
-                    upstream_request_headers: b.upstream_request_headers.clone(),
-                    auth_resolution: b.auth_resolution.clone(),
-                    client_body: b.client_body_warn.clone(),
-                    upstream_request_body: b.upstream_request_body_warn.clone(),
-                    upstream_response_headers: Some(header_map_to_entries(&resp_headers)),
-                    upstream_response_body: Some(make_body_preview(bytes.as_ref(), resp_ct, max)),
-                    upstream_error: None,
-                })
-            } else {
-                None
-            };
-
-            if !status.is_success() {
-                if let Some(h) = http_debug_warn.as_ref() {
-                    warn_http_debug(status_code, h);
-                } else {
+                let retryable = !status.is_success()
+                    && attempt_index + 1 < retry_opt.max_attempts
+                    && !never_retry
+                    && (should_retry_status(&retry_opt, status_code)
+                        || should_retry_class(&retry_opt, cls.as_deref()));
+                if retryable {
+                    log_retry_trace(serde_json::json!({
+                        "event": "attempt_retryable_failure",
+                        "service": proxy.service_name,
+                        "request_id": request_id,
+                        "attempt": attempt_index + 1,
+                        "next_attempt": attempt_index + 2,
+                        "max_attempts": retry_opt.max_attempts,
+                        "status_code": status_code,
+                        "class": cls.as_deref(),
+                        "hint": hint.as_deref(),
+                        "cf_ray": cf_ray.as_deref(),
+                        "config_name": selected.config_name.as_str(),
+                        "upstream_index": selected.index,
+                        "upstream_base_url": selected.upstream.base_url.as_str(),
+                        "provider_id": provider_id.as_deref(),
+                        "strategy": if retry_failover { "failover" } else { "same_upstream" },
+                        "retry_after": resp_headers.get("retry-after").and_then(|v| v.to_str().ok()),
+                        "should_retry_status": should_retry_status(&retry_opt, status_code),
+                        "should_retry_class": should_retry_class(&retry_opt, cls.as_deref()),
+                        "never_retry_status": should_never_retry_status(&retry_opt, status_code),
+                        "never_retry_class": should_never_retry_class(&retry_opt, cls.as_deref()),
+                    }));
                     let cls_s = cls.as_deref().unwrap_or("-");
-                    let cf_ray_s = cf_ray.as_deref().unwrap_or("-");
-                    warn!(
-                        "upstream returned non-2xx status {} (class={}, cf_ray={}) for {} {} (config: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
+                    info!(
+                        "retrying after non-2xx status {} (class={}) for {} {} (config: {}, mode={}, next_attempt={}/{})",
                         status_code,
                         cls_s,
-                        cf_ray_s,
                         method,
                         uri.path(),
-                        selected.config_name
+                        selected.config_name,
+                        if retry_failover {
+                            "failover"
+                        } else {
+                            "same_upstream"
+                        },
+                        attempt_index + 2,
+                        retry_opt.max_attempts
+                    );
+                    if retry_failover {
+                        // Treat retryable 5xx / WAF-like responses as upstream failures for LB tracking.
+                        if status_code >= 500 || cls.is_some() {
+                            lb.record_result_with_backoff(
+                                selected.index,
+                                false,
+                                crate::lb::COOLDOWN_SECS,
+                                cooldown_backoff,
+                            );
+                        }
+                        match cls.as_deref() {
+                            Some("cloudflare_challenge") => lb.penalize_with_backoff(
+                                selected.index,
+                                retry_opt.cloudflare_challenge_cooldown_secs,
+                                "cloudflare_challenge",
+                                cooldown_backoff,
+                            ),
+                            Some("cloudflare_timeout") => lb.penalize_with_backoff(
+                                selected.index,
+                                retry_opt.cloudflare_timeout_cooldown_secs,
+                                "cloudflare_timeout",
+                                cooldown_backoff,
+                            ),
+                            _ if status_code >= 400 => lb.penalize_with_backoff(
+                                selected.index,
+                                retry_opt.transport_cooldown_secs,
+                                &format!("status_{}", status_code),
+                                cooldown_backoff,
+                            ),
+                            _ => {}
+                        }
+                        avoid
+                            .entry(selected.config_name.clone())
+                            .or_default()
+                            .insert(selected.index);
+                    }
+                    let skip_sleep = status_code >= 400 && status_code < 500 && status_code != 429;
+                    if !skip_sleep {
+                        retry_sleep(&retry_opt, attempt_index, &resp_headers).await;
+                    }
+                    continue;
+                }
+
+                // Update LB state (final attempt):
+                // - 2xx => success
+                // - transport / 5xx / classified WAF failures => failure
+                // - generic 3xx/4xx => neutral (do not mark upstream good/bad to avoid sticky routing to a failing upstream,
+                //   and also avoid penalizing upstreams for client-side mistakes).
+                if success {
+                    lb.record_result_with_backoff(
+                        selected.index,
+                        true,
+                        crate::lb::COOLDOWN_SECS,
+                        cooldown_backoff,
+                    );
+                } else if status_code >= 500 || cls.is_some() {
+                    lb.record_result_with_backoff(
+                        selected.index,
+                        false,
+                        crate::lb::COOLDOWN_SECS,
+                        cooldown_backoff,
                     );
                 }
-            }
 
-            let http_debug = if should_include_http_debug(status_code) {
-                debug_base.map(|b| {
-                    let max = b.debug_max_body_bytes;
+                let retry = retry_info_for_chain(&upstream_chain);
+
+                if is_user_turn {
+                    let provider_id = selected
+                        .upstream
+                        .tags
+                        .get("provider_id")
+                        .map(|s| s.as_str())
+                        .unwrap_or("-");
+                    info!(
+                        "user turn {} {} using config '{}' upstream[{}] provider_id='{}' base_url='{}'",
+                        method,
+                        uri.path(),
+                        selected.config_name,
+                        selected.index,
+                        provider_id,
+                        selected.upstream.base_url
+                    );
+                }
+
+                let http_debug_warn = if should_include_http_warn(status_code)
+                    && let Some(b) = debug_base.as_ref()
+                {
+                    let max = b.warn_max_body_bytes;
                     let resp_ct = resp_headers
                         .get("content-type")
                         .and_then(|v| v.to_str().ok());
-                    HttpDebugLog {
+                    Some(HttpDebugLog {
                         request_body_len: Some(b.request_body_len),
                         upstream_request_body_len: Some(b.upstream_request_body_len),
                         upstream_headers_ms: Some(upstream_headers_ms),
                         upstream_first_chunk_ms: None,
                         upstream_body_read_ms: Some(upstream_body_read_ms),
-                        upstream_error_class: cls,
-                        upstream_error_hint: hint,
-                        upstream_cf_ray: cf_ray,
-                        client_uri: b.client_uri,
-                        target_url: b.target_url,
-                        client_headers: b.client_headers,
-                        upstream_request_headers: b.upstream_request_headers,
-                        auth_resolution: b.auth_resolution,
-                        client_body: b.client_body_debug,
-                        upstream_request_body: b.upstream_request_body_debug,
+                        upstream_error_class: cls.clone(),
+                        upstream_error_hint: hint.clone(),
+                        upstream_cf_ray: cf_ray.clone(),
+                        client_uri: b.client_uri.clone(),
+                        target_url: b.target_url.clone(),
+                        client_headers: b.client_headers.clone(),
+                        upstream_request_headers: b.upstream_request_headers.clone(),
+                        auth_resolution: b.auth_resolution.clone(),
+                        client_body: b.client_body_warn.clone(),
+                        upstream_request_body: b.upstream_request_body_warn.clone(),
                         upstream_response_headers: Some(header_map_to_entries(&resp_headers)),
                         upstream_response_body: Some(make_body_preview(
                             bytes.as_ref(),
@@ -1950,126 +2525,179 @@ pub async fn handle_proxy(
                             max,
                         )),
                         upstream_error: None,
+                    })
+                } else {
+                    None
+                };
+
+                if !status.is_success() {
+                    if let Some(h) = http_debug_warn.as_ref() {
+                        warn_http_debug(status_code, h);
+                    } else {
+                        let cls_s = cls.as_deref().unwrap_or("-");
+                        let cf_ray_s = cf_ray.as_deref().unwrap_or("-");
+                        warn!(
+                            "upstream returned non-2xx status {} (class={}, cf_ray={}) for {} {} (config: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
+                            status_code,
+                            cls_s,
+                            cf_ray_s,
+                            method,
+                            uri.path(),
+                            selected.config_name
+                        );
                     }
-                })
-            } else if should_include_http_warn(status_code) {
-                http_debug_warn.clone()
-            } else {
-                None
-            };
+                }
 
-            log_request_with_debug(
-                proxy.service_name,
-                method.as_str(),
-                uri.path(),
-                status_code,
-                dur,
-                Some(upstream_headers_ms),
-                &selected.config_name,
-                selected.upstream.tags.get("provider_id").cloned(),
-                &selected.upstream.base_url,
-                session_id.clone(),
-                cwd.clone(),
-                effective_effort.clone(),
-                usage.clone(),
-                retry.clone(),
-                http_debug,
-            );
-            proxy
-                .state
-                .finish_request(crate::state::FinishRequestParams {
-                    id: request_id,
+                let http_debug = if should_include_http_debug(status_code) {
+                    debug_base.map(|b| {
+                        let max = b.debug_max_body_bytes;
+                        let resp_ct = resp_headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok());
+                        HttpDebugLog {
+                            request_body_len: Some(b.request_body_len),
+                            upstream_request_body_len: Some(b.upstream_request_body_len),
+                            upstream_headers_ms: Some(upstream_headers_ms),
+                            upstream_first_chunk_ms: None,
+                            upstream_body_read_ms: Some(upstream_body_read_ms),
+                            upstream_error_class: cls,
+                            upstream_error_hint: hint,
+                            upstream_cf_ray: cf_ray,
+                            client_uri: b.client_uri,
+                            target_url: b.target_url,
+                            client_headers: b.client_headers,
+                            upstream_request_headers: b.upstream_request_headers,
+                            auth_resolution: b.auth_resolution,
+                            client_body: b.client_body_debug,
+                            upstream_request_body: b.upstream_request_body_debug,
+                            upstream_response_headers: Some(header_map_to_entries(&resp_headers)),
+                            upstream_response_body: Some(make_body_preview(
+                                bytes.as_ref(),
+                                resp_ct,
+                                max,
+                            )),
+                            upstream_error: None,
+                        }
+                    })
+                } else if should_include_http_warn(status_code) {
+                    http_debug_warn.clone()
+                } else {
+                    None
+                };
+
+                log_request_with_debug(
+                    proxy.service_name,
+                    method.as_str(),
+                    uri.path(),
                     status_code,
-                    duration_ms: dur,
-                    ended_at_ms: started_at_ms + dur,
-                    usage: usage.clone(),
-                    retry,
-                    ttfb_ms: Some(upstream_headers_ms),
-                })
-                .await;
-
-            // Poll usage once after a user request finishes (e.g. packycode), used to drive auto-switching.
-            if is_user_turn && is_codex_service {
-                usage_providers::poll_for_codex_upstream(
-                    cfg_snapshot.clone(),
-                    proxy.lb_states.clone(),
+                    dur,
+                    Some(upstream_headers_ms),
                     &selected.config_name,
-                    selected.index,
-                )
-                .await;
-            }
+                    selected.upstream.tags.get("provider_id").cloned(),
+                    &selected.upstream.base_url,
+                    session_id.clone(),
+                    cwd.clone(),
+                    effective_effort.clone(),
+                    usage.clone(),
+                    retry.clone(),
+                    http_debug,
+                );
+                proxy
+                    .state
+                    .finish_request(crate::state::FinishRequestParams {
+                        id: request_id,
+                        status_code,
+                        duration_ms: dur,
+                        ended_at_ms: started_at_ms + dur,
+                        usage: usage.clone(),
+                        retry,
+                        ttfb_ms: Some(upstream_headers_ms),
+                    })
+                    .await;
 
-            let mut builder = Response::builder().status(status);
-            for (name, value) in resp_headers_filtered.iter() {
-                builder = builder.header(name, value);
+                // Poll usage once after a user request finishes (e.g. packycode), used to drive auto-switching.
+                if is_user_turn && is_codex_service {
+                    usage_providers::poll_for_codex_upstream(
+                        cfg_snapshot.clone(),
+                        proxy.lb_states.clone(),
+                        &selected.config_name,
+                        selected.index,
+                    )
+                    .await;
+                }
+
+                let mut builder = Response::builder().status(status);
+                for (name, value) in resp_headers_filtered.iter() {
+                    builder = builder.header(name, value);
+                }
+                return Ok(builder.body(Body::from(bytes)).unwrap());
             }
-            return Ok(builder.body(Body::from(bytes)).unwrap());
         }
-    }
 
-    let dur = start.elapsed().as_millis() as u64;
-    let status = StatusCode::BAD_GATEWAY;
-    let http_debug = if should_include_http_warn(status.as_u16()) {
-        let client_headers_entries = client_headers_entries_cache
-            .get_or_init(|| header_map_to_entries(&client_headers))
-            .clone();
-        Some(HttpDebugLog {
-            request_body_len: Some(request_body_len),
-            upstream_request_body_len: None,
-            upstream_headers_ms: None,
-            upstream_first_chunk_ms: None,
-            upstream_body_read_ms: None,
-            upstream_error_class: Some("retry_exhausted".to_string()),
-            upstream_error_hint: Some("所有重试尝试均未能返回可用响应。".to_string()),
-            upstream_cf_ray: None,
-            client_uri: uri.to_string(),
-            target_url: "-".to_string(),
-            client_headers: client_headers_entries,
-            upstream_request_headers: Vec::new(),
-            auth_resolution: None,
-            client_body: client_body_warn.clone(),
-            upstream_request_body: None,
-            upstream_response_headers: None,
-            upstream_response_body: None,
-            upstream_error: Some(format!(
-                "retry attempts exhausted; chain={:?}",
-                upstream_chain
-            )),
-        })
-    } else {
-        None
-    };
-    log_request_with_debug(
-        proxy.service_name,
-        method.as_str(),
-        uri.path(),
-        status.as_u16(),
-        dur,
-        None,
-        "-",
-        None,
-        "-",
-        session_id.clone(),
-        cwd.clone(),
-        effective_effort.clone(),
-        None,
-        retry_info_for_chain(&upstream_chain),
-        http_debug,
-    );
-    let retry = retry_info_for_chain(&upstream_chain);
-    proxy
-        .state
-        .finish_request(crate::state::FinishRequestParams {
-            id: request_id,
-            status_code: status.as_u16(),
-            duration_ms: dur,
-            ended_at_ms: started_at_ms + dur,
-            usage: None,
-            retry,
-            ttfb_ms: None,
-        })
-        .await;
-    Err((status, "retry attempts exhausted".to_string()))
+        let dur = start.elapsed().as_millis() as u64;
+        let status = StatusCode::BAD_GATEWAY;
+        let http_debug = if should_include_http_warn(status.as_u16()) {
+            let client_headers_entries = client_headers_entries_cache
+                .get_or_init(|| header_map_to_entries(&client_headers))
+                .clone();
+            Some(HttpDebugLog {
+                request_body_len: Some(request_body_len),
+                upstream_request_body_len: None,
+                upstream_headers_ms: None,
+                upstream_first_chunk_ms: None,
+                upstream_body_read_ms: None,
+                upstream_error_class: Some("retry_exhausted".to_string()),
+                upstream_error_hint: Some("所有重试尝试均未能返回可用响应。".to_string()),
+                upstream_cf_ray: None,
+                client_uri: uri.to_string(),
+                target_url: "-".to_string(),
+                client_headers: client_headers_entries,
+                upstream_request_headers: Vec::new(),
+                auth_resolution: None,
+                client_body: client_body_warn.clone(),
+                upstream_request_body: None,
+                upstream_response_headers: None,
+                upstream_response_body: None,
+                upstream_error: Some(format!(
+                    "retry attempts exhausted; chain={:?}",
+                    upstream_chain
+                )),
+            })
+        } else {
+            None
+        };
+        log_request_with_debug(
+            proxy.service_name,
+            method.as_str(),
+            uri.path(),
+            status.as_u16(),
+            dur,
+            None,
+            "-",
+            None,
+            "-",
+            session_id.clone(),
+            cwd.clone(),
+            effective_effort.clone(),
+            None,
+            retry_info_for_chain(&upstream_chain),
+            http_debug,
+        );
+        let retry = retry_info_for_chain(&upstream_chain);
+        proxy
+            .state
+            .finish_request(crate::state::FinishRequestParams {
+                id: request_id,
+                status_code: status.as_u16(),
+                duration_ms: dur,
+                ended_at_ms: started_at_ms + dur,
+                usage: None,
+                retry,
+                ttfb_ms: None,
+            })
+            .await;
+        Err((status, "retry attempts exhausted".to_string()))
+    }
 }
 
 pub fn router(proxy: ProxyService) -> Router {

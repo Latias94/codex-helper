@@ -3,14 +3,20 @@ All notable changes to this project will be documented in this file.
 
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
-## [0.10.0] - 2026-01-02
+## [0.10.0] - 2026-01-07
 ### 新增 / Added
 - TUI 新增 `7 历史` 页面：展示当前目录相关的 Codex 本地历史会话（`~/.codex/sessions`），可在未活跃会话上直接打开 transcript。
   TUI adds `7 History`: browse Codex local history sessions (`~/.codex/sessions`) for the current directory and open transcripts even for inactive sessions.
+- 增强 `aggressive-failover`：在更高尝试次数基础上，对更多非 2xx 错误尝试 failover 到备选 upstream/provider；并引入 `never_on_status` / `never_on_class` 兜底以避免对明显的客户端参数错误进行无意义切换。
+  Improve `aggressive-failover`: in addition to more attempts, fail over on a broader set of non-2xx errors; add `never_on_status` / `never_on_class` guardrails to avoid pointless switching on obvious client-side request mistakes.
 
 ### 改进 / Improved
 - TUI transcript 视图升级为全屏“页面式”展示，并新增 `A`（全量/尾部切换）与 `y`（复制到剪贴板）。
   TUI transcript view is now full-screen, with `A` (toggle all/tail) and `y` (copy to clipboard).
+- 重试/切换模型升级为“两层”：先在当前 provider/config 内做 upstream 级重试（默认优先同一 upstream），仍失败再做 provider/config 级 failover；在可用性优先模式下对 4xx（非 429）等路由/认证类错误也会更积极切换，并对失败线路施加冷却惩罚，降低“坏线路反复被选中”的概率。
+  Retry/failover model upgraded to two layers: retry within the current provider/config first (upstream-layer, default prefers the same upstream), then fail over across upstreams and configs/providers (provider/config layer). In availability-first mode, it also switches more aggressively on 4xx (except 429) routing/auth failures, and applies cooldown penalties to reduce repeatedly selecting a broken route.
+- 默认策略兜底补强：`balanced` 也会对常见上游认证/路由类错误（例如 401/403/404/408）触发 provider/config 级 failover；并默认启用 `never_on_status` / `never_on_class` 兜底，避免将明显的客户端参数错误扩散到多 provider（旧版 `[retry]` 扁平字段仍兼容）。
+  Default strategy guardrails: `balanced` now triggers provider/config failover on common auth/routing errors (e.g. 401/403/404/408) and enables `never_on_status` / `never_on_class` by default to avoid amplifying obvious client-side mistakes across providers (legacy flat `[retry]` fields remain compatible).
 
 ### 修复 / Fixed
 - 修复切换页面时偶发的 UI 残影：页面切换时强制 `terminal.clear()` 后重绘。

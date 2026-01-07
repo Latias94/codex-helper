@@ -234,7 +234,11 @@ pub(super) fn render_settings_page(
         ),
     ]));
     if let Some(retry) = ui.last_runtime_retry.as_ref() {
-        let strategy = match retry.strategy {
+        let upstream_strategy = match retry.upstream.strategy {
+            RetryStrategy::Failover => "failover",
+            RetryStrategy::SameUpstream => "same_upstream",
+        };
+        let provider_strategy = match retry.provider.strategy {
             RetryStrategy::Failover => "failover",
             RetryStrategy::SameUpstream => "same_upstream",
         };
@@ -242,12 +246,15 @@ pub(super) fn render_settings_page(
             Span::styled("retry: ", Style::default().fg(p.muted)),
             Span::styled(
                 format!(
-                    "strategy={} attempts={} backoff={}..{} jitter={} cooldown(cf_chal={}s cf_to={}s transport={}s) cooldown_backoff(factor={} max={}s)",
-                    strategy,
-                    retry.max_attempts,
-                    retry.backoff_ms,
-                    retry.backoff_max_ms,
-                    retry.jitter_ms,
+                    "upstream(strategy={} attempts={} backoff={}..{} jitter={}) provider(strategy={} attempts={}) guardrails(never_on_status='{}') cooldown(cf_chal={}s cf_to={}s transport={}s) cooldown_backoff(factor={} max={}s)",
+                    upstream_strategy,
+                    retry.upstream.max_attempts,
+                    retry.upstream.backoff_ms,
+                    retry.upstream.backoff_max_ms,
+                    retry.upstream.jitter_ms,
+                    provider_strategy,
+                    retry.provider.max_attempts,
+                    retry.never_on_status,
                     retry.cloudflare_challenge_cooldown_secs,
                     retry.cloudflare_timeout_cooldown_secs,
                     retry.transport_cooldown_secs,
@@ -258,8 +265,18 @@ pub(super) fn render_settings_page(
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("  on_status: ", Style::default().fg(p.muted)),
-            Span::styled(retry.on_status.clone(), Style::default().fg(p.muted)),
+            Span::styled("  upstream.on_status: ", Style::default().fg(p.muted)),
+            Span::styled(
+                retry.upstream.on_status.clone(),
+                Style::default().fg(p.muted),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  provider.on_status: ", Style::default().fg(p.muted)),
+            Span::styled(
+                retry.provider.on_status.clone(),
+                Style::default().fg(p.muted),
+            ),
         ]));
     }
 

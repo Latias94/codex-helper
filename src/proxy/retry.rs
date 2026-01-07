@@ -3,11 +3,12 @@ use rand::Rng;
 use tokio::time::sleep;
 
 use crate::config::ResolvedRetryConfig;
+use crate::config::ResolvedRetryLayerConfig;
 use crate::config::RetryStrategy;
 use crate::logging::RetryInfo;
 
 #[derive(Clone)]
-pub(super) struct RetryOptions {
+pub(super) struct RetryLayerOptions {
     pub(super) max_attempts: u32,
     pub(super) base_backoff_ms: u64,
     pub(super) max_backoff_ms: u64,
@@ -15,6 +16,14 @@ pub(super) struct RetryOptions {
     pub(super) retry_status_ranges: Vec<(u16, u16)>,
     pub(super) retry_error_classes: Vec<String>,
     pub(super) strategy: RetryStrategy,
+}
+
+#[derive(Clone)]
+pub(super) struct RetryPlan {
+    pub(super) upstream: RetryLayerOptions,
+    pub(super) provider: RetryLayerOptions,
+    pub(super) never_status_ranges: Vec<(u16, u16)>,
+    pub(super) never_error_classes: Vec<String>,
     pub(super) cloudflare_challenge_cooldown_secs: u64,
     pub(super) cloudflare_timeout_cooldown_secs: u64,
     pub(super) transport_cooldown_secs: u64,
@@ -37,7 +46,7 @@ pub(super) fn parse_status_ranges(spec: &str) -> Vec<(u16, u16)> {
     out
 }
 
-pub(super) fn retry_options(cfg: &ResolvedRetryConfig) -> RetryOptions {
+fn layer_options(cfg: &ResolvedRetryLayerConfig) -> RetryLayerOptions {
     let max_attempts = cfg.max_attempts.clamp(1, 8);
     let base_backoff_ms = cfg.backoff_ms;
     let max_backoff_ms = cfg.backoff_max_ms;
@@ -45,13 +54,8 @@ pub(super) fn retry_options(cfg: &ResolvedRetryConfig) -> RetryOptions {
     let retry_status_ranges = parse_status_ranges(cfg.on_status.as_str());
     let retry_error_classes = cfg.on_class.clone();
     let strategy = cfg.strategy;
-    let cloudflare_challenge_cooldown_secs = cfg.cloudflare_challenge_cooldown_secs;
-    let cloudflare_timeout_cooldown_secs = cfg.cloudflare_timeout_cooldown_secs;
-    let transport_cooldown_secs = cfg.transport_cooldown_secs;
-    let cooldown_backoff_factor = cfg.cooldown_backoff_factor.clamp(1, 16);
-    let cooldown_backoff_max_secs = cfg.cooldown_backoff_max_secs.clamp(0, 24 * 60 * 60);
 
-    RetryOptions {
+    RetryLayerOptions {
         max_attempts,
         base_backoff_ms,
         max_backoff_ms,
@@ -59,6 +63,25 @@ pub(super) fn retry_options(cfg: &ResolvedRetryConfig) -> RetryOptions {
         retry_status_ranges,
         retry_error_classes,
         strategy,
+    }
+}
+
+pub(super) fn retry_plan(cfg: &ResolvedRetryConfig) -> RetryPlan {
+    let upstream = layer_options(&cfg.upstream);
+    let provider = layer_options(&cfg.provider);
+    let never_status_ranges = parse_status_ranges(cfg.never_on_status.as_str());
+    let never_error_classes = cfg.never_on_class.clone();
+    let cloudflare_challenge_cooldown_secs = cfg.cloudflare_challenge_cooldown_secs;
+    let cloudflare_timeout_cooldown_secs = cfg.cloudflare_timeout_cooldown_secs;
+    let transport_cooldown_secs = cfg.transport_cooldown_secs;
+    let cooldown_backoff_factor = cfg.cooldown_backoff_factor.clamp(1, 16);
+    let cooldown_backoff_max_secs = cfg.cooldown_backoff_max_secs.clamp(0, 24 * 60 * 60);
+
+    RetryPlan {
+        upstream,
+        provider,
+        never_status_ranges,
+        never_error_classes,
         cloudflare_challenge_cooldown_secs,
         cloudflare_timeout_cooldown_secs,
         transport_cooldown_secs,
@@ -85,20 +108,33 @@ pub(super) fn retry_info_for_chain(chain: &[String]) -> Option<RetryInfo> {
     })
 }
 
-pub(super) fn should_retry_status(opt: &RetryOptions, status_code: u16) -> bool {
+pub(super) fn should_retry_status(opt: &RetryLayerOptions, status_code: u16) -> bool {
     opt.retry_status_ranges
         .iter()
         .any(|(a, b)| status_code >= *a && status_code <= *b)
 }
 
-pub(super) fn should_retry_class(opt: &RetryOptions, class: Option<&str>) -> bool {
+pub(super) fn should_retry_class(opt: &RetryLayerOptions, class: Option<&str>) -> bool {
     let Some(c) = class else {
         return false;
     };
     opt.retry_error_classes.iter().any(|x| x == c)
 }
 
-fn retry_after_ms(headers: &HeaderMap, opt: &RetryOptions) -> Option<u64> {
+pub(super) fn should_never_retry_status(plan: &RetryPlan, status_code: u16) -> bool {
+    plan.never_status_ranges
+        .iter()
+        .any(|(a, b)| status_code >= *a && status_code <= *b)
+}
+
+pub(super) fn should_never_retry_class(plan: &RetryPlan, class: Option<&str>) -> bool {
+    let Some(c) = class else {
+        return false;
+    };
+    plan.never_error_classes.iter().any(|x| x == c)
+}
+
+fn retry_after_ms(headers: &HeaderMap, opt: &RetryLayerOptions) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?.trim();
     if raw.is_empty() {
         return None;
@@ -109,7 +145,7 @@ fn retry_after_ms(headers: &HeaderMap, opt: &RetryOptions) -> Option<u64> {
     Some(ms.min(cap))
 }
 
-pub(super) async fn backoff_sleep(opt: &RetryOptions, attempt_index: u32) {
+pub(super) async fn backoff_sleep(opt: &RetryLayerOptions, attempt_index: u32) {
     if opt.base_backoff_ms == 0 {
         return;
     }
@@ -127,7 +163,11 @@ pub(super) async fn backoff_sleep(opt: &RetryOptions, attempt_index: u32) {
     .await;
 }
 
-pub(super) async fn retry_sleep(opt: &RetryOptions, attempt_index: u32, resp_headers: &HeaderMap) {
+pub(super) async fn retry_sleep(
+    opt: &RetryLayerOptions,
+    attempt_index: u32,
+    resp_headers: &HeaderMap,
+) {
     if let Some(mut ms) = retry_after_ms(resp_headers, opt) {
         if opt.jitter_ms > 0 {
             let jitter = rand::thread_rng().gen_range(0..=opt.jitter_ms);
@@ -161,7 +201,7 @@ mod tests {
     fn retry_after_ms_parses_seconds_and_caps() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("10"));
-        let opt = RetryOptions {
+        let opt = RetryLayerOptions {
             max_attempts: 3,
             base_backoff_ms: 200,
             max_backoff_ms: 2_000,
@@ -169,11 +209,6 @@ mod tests {
             retry_status_ranges: vec![(429, 429)],
             retry_error_classes: Vec::new(),
             strategy: RetryStrategy::Failover,
-            cloudflare_challenge_cooldown_secs: 0,
-            cloudflare_timeout_cooldown_secs: 0,
-            transport_cooldown_secs: 0,
-            cooldown_backoff_factor: 1,
-            cooldown_backoff_max_secs: 0,
         };
         assert_eq!(retry_after_ms(&headers, &opt), Some(2_000));
     }

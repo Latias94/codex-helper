@@ -60,7 +60,7 @@ ch
 
 - 启动 Codex 本地代理，监听 `127.0.0.1:3211`；
 - 如果在交互终端运行，会默认显示一个内置 TUI 面板（可用 `--no-tui` 关闭；按 `q` 退出；`1-7` 切页；`7` 查看历史会话；在 Sessions/History 页按 `t` 查看对话记录）；
-- 对 429/5xx/网络抖动等瞬态错误在**未开始向客户端输出响应**前进行有限次数的自动重试（可配置）；
+- 对 429/5xx/网络抖动等瞬态错误，以及常见上游认证/路由类错误（例如 401/403/404/408）在**未开始向客户端输出响应**前进行有限次数的自动重试/切换（可配置）；
 - 在修改前检查 `~/.codex/config.toml`，如已指向本地代理且存在备份，会询问是否先恢复原始配置；
 - 必要时修改 `model_provider` 与 `model_providers.codex_proxy`，让 Codex 走本地代理，并只在首次写入备份；
 - 写入 `model_providers.codex_proxy` 时，默认设置 `request_max_retries = 0` 以避免“Codex 重试 + codex-helper 重试”叠加（你也可以在 `~/.codex/config.toml` 中手动覆盖）；
@@ -99,7 +99,7 @@ ch
 - 分组：`codex-helper config set-level <name> <level>` + `codex-helper config set-active <name>`
 - 策略：`codex-helper config set-retry-profile <balanced|same-upstream|aggressive-failover|cost-primary>`
 
-> 注意：`set-retry-profile` 会覆盖整个 `[retry]` 段；如果你要高级微调（例如 `max_attempts`、`on_status`、`transport_cooldown_secs`），可以在执行 profile 后再手改配置文件。
+> 注意：`set-retry-profile` 会覆盖整个 `[retry]` 段；如果你要高级微调（例如 `retry.upstream.max_attempts`、`retry.provider.on_status`、`transport_cooldown_secs`，以及用于兜底的 `never_on_status` / `never_on_class`），可以在执行 profile 后再手改配置文件（旧版扁平字段仍兼容，但建议迁移到两层配置）。
 
 | 场景目标 | 你只需要怎么“分组”（导入后） | 建议策略（profile） | 备注 |
 | --- | --- | --- | --- |
@@ -244,7 +244,7 @@ profile = "cost-primary"
 - 如果所有 config 都是同一个 level，则视为“同级候选”：仍会优先 `active`，但同级其他 config 也会参与 failover（避免 active 单点）。
 - 同一 level 内会优先使用 `active` 配置。
 - `enabled = false` 可把该 config 排除出自动路由（除非它是 active）。
-- 实操建议：把“同一类线路”放同一 level（例如 `L1=各类中转`、`L2=官方/直连兜底`），并把 `retry.max_attempts` 设到足够覆盖你希望每次请求尝试的候选数量。
+- 实操建议：把“同一类线路”放同一 level（例如 `L1=各类中转`、`L2=官方/直连兜底`），并把 `retry.provider.max_attempts` 设到足够覆盖你希望每次请求尝试的候选数量（而 `retry.upstream.max_attempts` 控制单个候选内的重试次数）。
 
 一个常见成本优化策略是“包月中转为主，按量备选为从”：把包月中转设为 `active` 且 `level=1`，把按量直连设为 `level=2`；当主线路不稳定时会自动降级到备选，同时通过冷却（以及可选的冷却退避）“隔一段时间探测回切”，避免一直按量计费。
 
@@ -541,29 +541,43 @@ tags = { source = "codex-config", provider_id = "openai" }
 
   注意：敏感请求头会自动脱敏（例如 `Authorization`/`Cookie` 等）；如需进一步控制请求体中的敏感信息，建议配合 `~/.codex-helper/filter.json` 使用。
 
-### 上游重试（代理侧，默认 2 次尝试）
+### 两层重试与切换（默认：每个 upstream 2 次尝试；最多尝试 2 个 config/provider；同一 config 内会在多个 upstream 间切换）
 
-有些上游错误（例如网络抖动、429 限流、502/503/504/524、或看起来像 Cloudflare/WAF 的拦截页）可能是瞬态的；codex-helper 支持在**未开始向客户端输出响应**前进行有限次数的重试，并尽量切换到其它 upstream。
+有些上游错误（例如网络抖动、429 限流、5xx/524、或看起来像 Cloudflare/WAF 的拦截页）可能是瞬态的；codex-helper 在**未开始向客户端输出响应**前按“两层模型”执行：先在当前 provider/config 内做 upstream 级重试，仍失败再做 provider/config 级 failover（例如 401/403/404/408 等路由/认证类错误也会触发切换）。
 
 - 强烈建议将 Codex 侧 `model_providers.codex_proxy.request_max_retries = 0`，让“重试与切换”主要由 codex-helper 负责，避免 Codex 默认 5 次重试把同一个 502 反复打满（`switch on` 会在该字段不存在时写入 0；如你手动改过，则不会覆盖）。
 - 主配置（`~/.codex-helper/config.toml` / `config.json`）的 `[retry]` 段用于设置全局默认值（从 `v0.8.0` 起不再支持通过环境变量覆盖 retry 参数）。
 
-配置示例（TOML）：
+配置示例（TOML，两层可分别覆盖；profile 默认 `balanced`）：
 
 ```toml
 [retry]
+profile = "balanced"
+
+[retry.upstream]
 max_attempts = 2
-strategy = "failover"
+strategy = "same_upstream"
 backoff_ms = 200
 backoff_max_ms = 2000
 jitter_ms = 100
-on_status = "429,502,503,504,524"
+on_status = "429,500-599,524"
 on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
+
+[retry.provider]
+max_attempts = 2
+strategy = "failover"
+on_status = "401,403,404,408,429,500-599,524"
+on_class = ["upstream_transport_error"]
+
+never_on_status = "400,413,415,422"
+never_on_class = ["client_error_non_retryable"]
 cloudflare_challenge_cooldown_secs = 300
 cloudflare_timeout_cooldown_secs = 60
 transport_cooldown_secs = 30
 cooldown_backoff_factor = 1
 cooldown_backoff_max_secs = 600
+
+# 兼容说明：旧版扁平字段（max_attempts/on_status/strategy/...）仍可解析，默认映射到 retry.upstream.*。
 ```
 
 注意：重试可能导致 **POST 请求重放**（例如重复计费/重复写入）。建议仅在你明确接受这一风险、且错误大多是瞬态的场景下开启，并将尝试次数控制在较小范围内。

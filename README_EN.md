@@ -62,7 +62,7 @@ This will:
 - Start a Codex proxy on `127.0.0.1:3211`;
 - Guard and, if needed, rewrite `~/.codex/config.toml` to point Codex at the local proxy (backing up the original config on first run);
 - When writing `model_providers.codex_proxy`, set `request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries); you can override it in `~/.codex/config.toml`;
-- Automatically retry a small number of times for transient failures (429/5xx/network hiccups) **before any response bytes are streamed to the client** (configurable);
+- Automatically retry/fail over a small number of times for transient failures (429/5xx/network hiccups) and common provider auth/routing failures (e.g. 401/403/404/408) **before any response bytes are streamed to the client** (configurable);
 - If `~/.codex-helper/config.toml` / `config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;
 - If running in an interactive terminal, show a built-in TUI dashboard (disable with `--no-tui`; press `q` to quit; use `1-7` to switch pages; use `7` to browse history; on Sessions/History press `t` to view transcript);
 - On Ctrl+C, attempt to restore the original Codex config from the backup.
@@ -137,7 +137,7 @@ If you already imported accounts via `codex-helper config overwrite-from-codex -
 - Grouping: `codex-helper config set-level <name> <level>` + `codex-helper config set-active <name>`
 - Strategy: `codex-helper config set-retry-profile <balanced|same-upstream|aggressive-failover|cost-primary>`
 
-> Note: `set-retry-profile` overwrites the whole `[retry]` block. If you want advanced tweaks (`max_attempts`, `on_status`, `transport_cooldown_secs`, ...), apply a profile first, then edit the config file.
+> Note: `set-retry-profile` overwrites the whole `[retry]` block. If you want advanced tweaks (e.g. `retry.upstream.max_attempts`, `retry.provider.on_status`, `transport_cooldown_secs`, and guardrails like `never_on_status` / `never_on_class`), apply a profile first, then edit the config file (legacy flat fields are still accepted, but the layered config is recommended).
 
 | Goal | What to change after import | Suggested retry profile | Notes |
 | --- | --- | --- | --- |
@@ -585,29 +585,44 @@ You can also print a truncated `http_debug` JSON directly to the terminal on non
 
 Sensitive headers are redacted automatically (e.g. `Authorization`/`Cookie`). If you need to scrub secrets inside request bodies, consider using `~/.codex-helper/filter.json`.
 
-### Upstream retries (proxy-side, default 2 attempts)
+### Two-layer retry + failover (defaults: 2 attempts per upstream; try up to 2 configs/providers; switch across upstreams within a config)
 
-Some upstream failures are transient (network hiccups, 429 rate limits, 502/503/504/524, or Cloudflare/WAF-like HTML challenge pages). codex-helper can perform a small number of retries **before any response bytes are streamed to the client**, and will try to switch to a different upstream when possible.
+Some upstream failures are transient (network hiccups, 429 rate limits, 5xx/524, or Cloudflare/WAF-like HTML challenge pages) or provider-specific (common auth/routing failures like 401/403/404/408). codex-helper uses a two-layer model **before any response bytes are streamed to the client**: it retries within the current provider/config first (upstream layer), and if still failing, fails over to other upstreams and then other same-level configs/providers (provider/config layer).
 
 - Strongly recommended: set Codex-side `model_providers.codex_proxy.request_max_retries = 0` so retry/failover happens in codex-helper (and you don’t burn Codex’s default request retries on the same 502). `switch on` writes `0` only when the key is absent.
 - Global defaults live under the `[retry]` block in `~/.codex-helper/config.toml` (or `config.json`). Starting from `v0.8.0`, retry parameters are no longer overridable via environment variables.
 
-Example config (`~/.codex-helper/config.toml`):
+Example config (`~/.codex-helper/config.toml`, layered overrides; default profile is `balanced`):
 
 ```toml
 [retry]
+profile = "balanced"
+
+[retry.upstream]
 max_attempts = 2
-strategy = "failover"
+strategy = "same_upstream"
 backoff_ms = 200
 backoff_max_ms = 2000
 jitter_ms = 100
-on_status = "429,502,503,504,524"
+on_status = "429,500-599,524"
 on_class = ["upstream_transport_error", "cloudflare_timeout", "cloudflare_challenge"]
+
+[retry.provider]
+max_attempts = 2
+strategy = "failover"
+on_status = "401,403,404,408,429,500-599,524"
+on_class = ["upstream_transport_error"]
+
+never_on_status = "400,413,415,422"
+never_on_class = ["client_error_non_retryable"]
 cloudflare_challenge_cooldown_secs = 300
 cloudflare_timeout_cooldown_secs = 60
 transport_cooldown_secs = 30
 cooldown_backoff_factor = 1
 cooldown_backoff_max_secs = 600
+
+# Compatibility: legacy flat fields (max_attempts/on_status/strategy/...) are still accepted,
+# and are mapped to retry.upstream.* by default.
 ```
 
 Note: retries may replay **non-idempotent POST requests** (potential double-billing or duplicate writes). Only enable retries if you accept this risk, and keep the attempt count low.
