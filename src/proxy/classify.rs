@@ -69,14 +69,12 @@ fn extract_error_type(v: &Value) -> Option<String> {
     }
 
     // Anthropic-style: { "type": "error", "error": { "type": "...", ... } }
-    if let Some(t) = json_get_str(v, "type") {
-        if t == "error" {
-            if let Some(err) = v.get("error") {
-                if let Some(et) = json_get_str(err, "type") {
-                    return Some(et.to_string());
-                }
-            }
-        }
+    if let Some(t) = json_get_str(v, "type")
+        && t == "error"
+        && let Some(err) = v.get("error")
+        && let Some(et) = json_get_str(err, "type")
+    {
+        return Some(et.to_string());
     }
 
     None
@@ -121,48 +119,47 @@ pub(super) fn classify_upstream_response(
     if matches!(status_code, 400 | 409 | 413 | 415 | 422)
         && looks_like_json(headers)
         && !body.is_empty()
+        && let Ok(v) = serde_json::from_slice::<Value>(body)
     {
-        if let Ok(v) = serde_json::from_slice::<Value>(body) {
-            if let Some(t) = extract_error_type(&v) {
-                let t = t.to_ascii_lowercase();
-                let non_retryable_type = t == "invalid_request_error"
-                    || t == "validation_error"
-                    || t == "bad_request"
-                    || t == "context_limit"
-                    || t == "context_length_exceeded"
-                    || t == "token_limit"
-                    || t == "content_filter";
-                if non_retryable_type {
-                    return (
-                        Some("client_error_non_retryable".to_string()),
-                        Some(
-                            "检测到更可能是请求参数/限制类错误（非瞬态）；建议直接修正请求，而不是重试或切换 provider。"
-                                .to_string(),
-                        ),
-                        cf_ray,
-                    );
-                }
+        if let Some(t) = extract_error_type(&v) {
+            let t = t.to_ascii_lowercase();
+            let non_retryable_type = t == "invalid_request_error"
+                || t == "validation_error"
+                || t == "bad_request"
+                || t == "context_limit"
+                || t == "context_length_exceeded"
+                || t == "token_limit"
+                || t == "content_filter";
+            if non_retryable_type {
+                return (
+                    Some("client_error_non_retryable".to_string()),
+                    Some(
+                        "检测到更可能是请求参数/限制类错误（非瞬态）；建议直接修正请求，而不是重试或切换 provider。"
+                            .to_string(),
+                    ),
+                    cf_ray,
+                );
             }
+        }
 
-            if let Some(msg) = extract_error_message(&v) {
-                let m = msg.to_ascii_lowercase();
-                let non_retryable = (m.contains("tool_use") && m.contains("must be unique"))
-                    || m.contains("all messages must have non-empty content")
-                    || (m.contains("string should match pattern") && m.contains("srvtoolu_"))
-                    || (m.contains("unexpected") && m.contains("tool_use_id"))
-                    || (m.contains("json") && (m.contains("parse") || m.contains("invalid")))
-                    || (m.contains("schema") && m.contains("validation"));
+        if let Some(msg) = extract_error_message(&v) {
+            let m = msg.to_ascii_lowercase();
+            let non_retryable = (m.contains("tool_use") && m.contains("must be unique"))
+                || m.contains("all messages must have non-empty content")
+                || (m.contains("string should match pattern") && m.contains("srvtoolu_"))
+                || (m.contains("unexpected") && m.contains("tool_use_id"))
+                || (m.contains("json") && (m.contains("parse") || m.contains("invalid")))
+                || (m.contains("schema") && m.contains("validation"));
 
-                if non_retryable {
-                    return (
-                        Some("client_error_non_retryable".to_string()),
-                        Some(
-                            "检测到更可能是请求格式/参数错误（非瞬态）；建议直接修正请求，而不是重试或切换 provider。"
-                                .to_string(),
-                        ),
-                        cf_ray,
-                    );
-                }
+            if non_retryable {
+                return (
+                    Some("client_error_non_retryable".to_string()),
+                    Some(
+                        "检测到更可能是请求格式/参数错误（非瞬态）；建议直接修正请求，而不是重试或切换 provider。"
+                            .to_string(),
+                    ),
+                    cf_ray,
+                );
             }
         }
     }
