@@ -3,7 +3,7 @@
 > Put Codex behind a small local “bumper”:  
 > centralize all your relays / keys / quotas, auto-switch when an upstream is exhausted or failing, and get handy CLI helpers for sessions, filtering, and diagnostics.
 
-Current version: `v0.10.0`
+Current version: `v0.11.0`
 
 > 中文说明: `README.md`
 
@@ -613,7 +613,7 @@ strategy = "failover"
 on_status = "401,403,404,408,429,500-599,524"
 on_class = ["upstream_transport_error"]
 
-never_on_status = "400,413,415,422"
+never_on_status = "413,415,422"
 never_on_class = ["client_error_non_retryable"]
 cloudflare_challenge_cooldown_secs = 300
 cloudflare_timeout_cooldown_secs = 60

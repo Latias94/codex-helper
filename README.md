@@ -3,7 +3,7 @@
 > 让 Codex CLI 走一层本地“保险杠”：  
 > 集中管理所有中转站 / key / 配额，在额度用完或上游挂掉时自动切换，并提供会话与脱敏辅助工具。
 
-当前版本：`v0.10.0`
+当前版本：`v0.11.0`
 
 > English version: `README_EN.md`
 
@@ -569,7 +569,7 @@ strategy = "failover"
 on_status = "401,403,404,408,429,500-599,524"
 on_class = ["upstream_transport_error"]
 
-never_on_status = "400,413,415,422"
+never_on_status = "413,415,422"
 never_on_class = ["client_error_non_retryable"]
 cloudflare_challenge_cooldown_secs = 300
 cloudflare_timeout_cooldown_secs = 60

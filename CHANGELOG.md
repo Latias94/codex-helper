@@ -3,6 +3,15 @@ All notable changes to this project will be documented in this file.
 
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
+## [0.11.0] - 2026-01-09
+### 修复 / Fixed
+- 修复 `balanced` 等策略下，`never_on_status` 对 `400` 的默认 guardrail 会误伤可重试的错误分类（例如 `cloudflare_challenge`），导致 400 场景无法按 `on_class` 触发重试/切换的问题。
+  Fix an issue where the default `never_on_status` guardrail (including `400`) could override retryable error classes (e.g. `cloudflare_challenge`) under profiles like `balanced`, preventing retries/failover for certain 400 responses that should be eligible via `on_class`.
+
+### 变更 / Changed
+- 默认 `never_on_status` 移除 `400`，保留 `413/415/422` 作为更“确定是请求侧”的状态码兜底；仍建议使用 `never_on_class=["client_error_non_retryable"]` 阻止明显的参数/校验类错误扩散到多 provider。
+  Default `never_on_status` now excludes `400` and keeps `413/415/422` as more clearly client-side guardrails; keep using `never_on_class=["client_error_non_retryable"]` to avoid amplifying obvious request/validation mistakes across providers.
+
 ## [0.10.0] - 2026-01-07
 ### 新增 / Added
 - TUI 新增 `7 历史` 页面：展示当前目录相关的 Codex 本地历史会话（`~/.codex/sessions`），可在未活跃会话上直接打开 transcript。

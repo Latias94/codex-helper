@@ -353,7 +353,7 @@ impl RetryProfileName {
                     on_class: vec!["upstream_transport_error".to_string()],
                     strategy: RetryStrategy::Failover,
                 },
-                never_on_status: "400,413,415,422".to_string(),
+                never_on_status: "413,415,422".to_string(),
                 never_on_class: vec!["client_error_non_retryable".to_string()],
                 cloudflare_challenge_cooldown_secs: 300,
                 cloudflare_timeout_cooldown_secs: 60,
@@ -812,8 +812,8 @@ profile = "balanced"
 # on_class = ["upstream_transport_error"]
 
 # 明确禁止重试/切换的 HTTP 状态码/范围（字符串形式）。
-# 示例："400,422"。
-# never_on_status = "400,422"
+# 示例："413,415,422"。
+# never_on_status = "413,415,422"
 
 # 明确禁止重试/切换的错误分类（来自 codex-helper 的 classify）。
 # 默认包含 "client_error_non_retryable"（常见请求格式/参数错误）。
@@ -2140,7 +2140,7 @@ env_key = "RIGHTCODE_API_KEY"
             resolved.provider.on_status,
             "401,403,404,408,429,500-599,524"
         );
-        assert_eq!(resolved.never_on_status, "400,413,415,422");
+        assert_eq!(resolved.never_on_status, "413,415,422");
         assert!(
             resolved
                 .never_on_class
@@ -2180,7 +2180,7 @@ env_key = "RIGHTCODE_API_KEY"
             resolved.provider.on_status,
             "401,403,404,408,429,500-599,524"
         );
-        assert_eq!(resolved.never_on_status, "400,413,415,422");
+        assert_eq!(resolved.never_on_status, "413,415,422");
         assert!(
             resolved
                 .never_on_class

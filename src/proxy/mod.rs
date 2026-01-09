@@ -34,8 +34,8 @@ use crate::usage::extract_usage_from_bytes;
 
 use self::classify::classify_upstream_response;
 use self::retry::{
-    backoff_sleep, retry_info_for_chain, retry_plan, retry_sleep, should_never_retry_class,
-    should_never_retry_status, should_retry_class, should_retry_status,
+    backoff_sleep, retry_info_for_chain, retry_plan, retry_sleep, should_never_retry,
+    should_retry_class, should_retry_status,
 };
 use self::runtime_config::RuntimeConfig;
 use self::stream::{SseSuccessMeta, build_sse_success_response};
@@ -1339,8 +1339,7 @@ pub async fn handle_proxy(
                 let status_code = status.as_u16();
                 let (cls, _hint, _cf_ray) =
                     classify_upstream_response(status_code, &resp_headers, bytes.as_ref());
-                let never_retry = should_never_retry_status(&plan, status_code)
-                    || should_never_retry_class(&plan, cls.as_deref());
+                let never_retry = should_never_retry(&plan, status_code, cls.as_deref());
 
                 upstream_chain.push(format!(
                     "{} (idx={}) status={} class={} model={}",

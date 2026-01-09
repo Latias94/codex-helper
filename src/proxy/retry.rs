@@ -134,6 +134,24 @@ pub(super) fn should_never_retry_class(plan: &RetryPlan, class: Option<&str>) ->
     plan.never_error_classes.iter().any(|x| x == c)
 }
 
+/// Effective guardrail decision:
+/// - `never_on_class` always wins.
+/// - `never_on_status` is a guardrail for unclassified / client-ish errors, but is allowed to be
+///   overridden by an explicit `on_class` match on either retry layer (e.g. Cloudflare/WAF HTML
+///   challenge pages may return status 400).
+pub(super) fn should_never_retry(plan: &RetryPlan, status_code: u16, class: Option<&str>) -> bool {
+    if should_never_retry_class(plan, class) {
+        return true;
+    }
+    if !should_never_retry_status(plan, status_code) {
+        return false;
+    }
+
+    let class_is_explicitly_retryable =
+        should_retry_class(&plan.upstream, class) || should_retry_class(&plan.provider, class);
+    !class_is_explicitly_retryable
+}
+
 fn retry_after_ms(headers: &HeaderMap, opt: &RetryLayerOptions) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?.trim();
     if raw.is_empty() {
@@ -186,6 +204,7 @@ pub(super) async fn retry_sleep(
 mod tests {
     use super::*;
 
+    use crate::config::RetryProfileName;
     use axum::http::HeaderValue;
     use pretty_assertions::assert_eq;
 
@@ -232,5 +251,28 @@ mod tests {
             "all_upstreams_avoided total=1".to_string(),
         ];
         assert!(retry_info_for_chain(&chain).is_none());
+    }
+
+    #[test]
+    fn should_never_retry_allows_on_class_to_override_never_on_status() {
+        let resolved = RetryProfileName::Balanced.defaults();
+        let plan = retry_plan(&resolved);
+
+        // Default guardrail no longer blocks raw 400 by status alone.
+        assert!(!should_never_retry(&plan, 400, None));
+
+        // But Cloudflare/WAF challenge pages may still be retryable even if they are 400.
+        assert!(!should_never_retry(
+            &plan,
+            400,
+            Some("cloudflare_challenge")
+        ));
+
+        // Explicitly non-retryable client-side mistakes should remain blocked.
+        assert!(should_never_retry(
+            &plan,
+            400,
+            Some("client_error_non_retryable")
+        ));
     }
 }
