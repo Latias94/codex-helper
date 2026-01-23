@@ -18,7 +18,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -775,13 +777,12 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
     let app: Router = proxy_router(proxy);
 
     let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = bind_local_listener_or_explain(addr, service_name).await?;
     tracing::info!(
         "codex-helper listening on http://{} (service: {})",
         addr,
         service_name
     );
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let warnings = model_routing_warnings(&cfg, service_name);
@@ -873,6 +874,295 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
     Ok(())
 }
 
+async fn bind_local_listener_or_explain(
+    addr: SocketAddr,
+    service_name: &'static str,
+) -> anyhow::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr).await.map_err(|err| {
+        let help = listener_bind_help(addr, service_name, &err);
+        anyhow::Error::new(err).context(help)
+    })
+}
+
+fn listener_bind_help(addr: SocketAddr, service_name: &str, err: &std::io::Error) -> String {
+    let port = addr.port();
+    let example_port = port.saturating_add(1);
+
+    let service_flag = match service_name {
+        "codex" => Some("--codex"),
+        "claude" => Some("--claude"),
+        _ => None,
+    };
+
+    let mut example_cmd = vec!["codex-helper", "serve"];
+    if let Some(flag) = service_flag {
+        example_cmd.push(flag);
+    }
+    example_cmd.push("--port");
+    let example_port_s = example_port.to_string();
+    example_cmd.push(&example_port_s);
+    let example_cmd = example_cmd.join(" ");
+
+    let os_code = err.raw_os_error();
+    let kind = err.kind();
+    let is_addr_in_use = kind == ErrorKind::AddrInUse || os_code == Some(10048);
+    let is_windows_10013 = os_code == Some(10013);
+    let is_permission_denied = kind == ErrorKind::PermissionDenied || is_windows_10013;
+
+    if is_addr_in_use {
+        let mut lines = vec![format!(
+            "无法监听 http://{addr}（service: {service_name}）：端口 {port} 可能已被占用。"
+        )];
+        if let Some(hint) = port_owner_hint(port) {
+            lines.push(hint);
+        }
+        lines.push(format!(
+            "- 关闭占用该端口的进程，或改用其它端口，例如：`{example_cmd}`"
+        ));
+        return lines.join("\n");
+    }
+
+    if is_permission_denied {
+        let mut lines = vec![format!(
+            "无法监听 http://{addr}（service: {service_name}）：没有权限绑定到端口 {port}。"
+        )];
+        if is_windows_10013 {
+            lines.push(
+                "提示：Windows 的 (os error 10013) 既可能是权限/安全软件拦截，也可能是该端口被其它进程以“排他方式”占用（有时不会报 10048）。"
+                    .to_string(),
+            );
+        }
+        if let Some(hint) = port_owner_hint(port) {
+            lines.push(hint);
+        }
+        lines.push(format!(
+            "- 可先确认是否有残留 `codex-helper`/其它进程占用该端口，然后重试或换端口，例如：`{example_cmd}`"
+        ));
+        lines.push("- 如仍失败，可尝试以管理员身份运行，或检查防火墙/安全软件策略。".to_string());
+        return lines.join("\n");
+    }
+
+    format!(
+        "无法监听 http://{addr}（service: {service_name}）。\n\
+- 可尝试换端口，例如：`{example_cmd}`"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortOwner {
+    pid: u32,
+    name: Option<String>,
+}
+
+fn port_owner_hint(port: u16) -> Option<String> {
+    let owners = port_owners(port);
+    if owners.is_empty() {
+        return None;
+    }
+    let desc = owners
+        .into_iter()
+        .take(5)
+        .map(|o| match o.name {
+            Some(name) if !name.trim().is_empty() => format!("PID {} ({})", o.pid, name),
+            _ => format!("PID {}", o.pid),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("- 占用该端口的进程（尽力推断）：{desc}"))
+}
+
+#[cfg(windows)]
+fn port_owners(port: u16) -> Vec<PortOwner> {
+    let out = run_cmd_stdout("netstat", &["-ano", "-p", "tcp"]).unwrap_or_default();
+    let pids = parse_windows_netstat_listening_pids(&out, port);
+    pids.into_iter()
+        .map(|pid| PortOwner {
+            pid,
+            name: windows_tasklist_image_name(pid),
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn port_owners(port: u16) -> Vec<PortOwner> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(out) = run_cmd_stdout("ss", &["-ltnp"]) {
+            let owners = parse_linux_ss_listening_owners(&out, port);
+            if !owners.is_empty() {
+                return owners;
+            }
+        }
+    }
+
+    if let Some(out) = run_cmd_stdout_owned(
+        "lsof",
+        &[
+            "-nP".to_string(),
+            format!("-iTCP:{port}"),
+            "-sTCP:LISTEN".to_string(),
+        ],
+    ) {
+        let owners = parse_unix_lsof_owners(&out);
+        if !owners.is_empty() {
+            return owners;
+        }
+    }
+
+    Vec::new()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn port_owners(_port: u16) -> Vec<PortOwner> {
+    Vec::new()
+}
+
+fn run_cmd_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new(program).args(args).output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return None;
+    }
+    Some(stdout)
+}
+
+fn run_cmd_stdout_owned(program: &str, args: &[String]) -> Option<String> {
+    let output = ProcessCommand::new(program).args(args).output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return None;
+    }
+    Some(stdout)
+}
+
+#[cfg(windows)]
+fn parse_windows_netstat_listening_pids(output: &str, port: u16) -> Vec<u32> {
+    let port_suffix = format!(":{port}");
+    let mut pids = Vec::<u32>::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if !line.starts_with("TCP") {
+            continue;
+        }
+        let cols = line.split_whitespace().collect::<Vec<_>>();
+        if cols.len() < 5 {
+            continue;
+        }
+        let local = cols[1];
+        let state = cols[3];
+        let pid_s = cols[4];
+        if !state.eq_ignore_ascii_case("LISTENING") {
+            continue;
+        }
+        if !local.ends_with(&port_suffix) {
+            continue;
+        }
+        let Ok(pid) = pid_s.parse::<u32>() else {
+            continue;
+        };
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(windows)]
+fn windows_tasklist_image_name(pid: u32) -> Option<String> {
+    let filter = format!("PID eq {pid}");
+    let out = run_cmd_stdout_owned(
+        "tasklist",
+        &[
+            "/FI".to_string(),
+            filter,
+            "/FO".to_string(),
+            "CSV".to_string(),
+            "/NH".to_string(),
+        ],
+    )?;
+
+    let line = out.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    // When there is no such PID, `tasklist` prints an informational message (localized) without CSV quotes.
+    if !line.starts_with('"') {
+        return None;
+    }
+
+    // Example (CSV): "Image Name","PID","Session Name","Session#","Mem Usage"
+    let mut parts = line.split("\",\"");
+    let image = parts.next()?.trim().trim_matches('"').to_string();
+    if image.is_empty() { None } else { Some(image) }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_ss_listening_owners(output: &str, port: u16) -> Vec<PortOwner> {
+    let port_marker = format!(":{port}");
+    let mut owners = Vec::<PortOwner>::new();
+    for line in output.lines() {
+        if !line.contains("LISTEN") {
+            continue;
+        }
+        if !line.contains(&port_marker) {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(pid_pos) = rest.find("pid=") {
+            let after = &rest[pid_pos + 4..];
+            let pid_len = after.chars().take_while(|c| c.is_ascii_digit()).count();
+            if pid_len == 0 {
+                rest = &after;
+                continue;
+            }
+            let Ok(pid) = after[..pid_len].parse::<u32>() else {
+                rest = &after[pid_len..];
+                continue;
+            };
+
+            let name = rest[..pid_pos].rfind("((").and_then(|start| {
+                let sub = &rest[start..pid_pos];
+                let q1 = sub.find('"')?;
+                let after_q1 = &sub[q1 + 1..];
+                let q2 = after_q1.find('"')?;
+                Some(after_q1[..q2].to_string())
+            });
+
+            if !owners.iter().any(|o| o.pid == pid) {
+                owners.push(PortOwner { pid, name });
+            }
+            rest = &after[pid_len..];
+        }
+    }
+    owners
+}
+
+#[cfg(unix)]
+fn parse_unix_lsof_owners(output: &str) -> Vec<PortOwner> {
+    let mut owners = Vec::<PortOwner>::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("COMMAND") {
+            continue;
+        }
+        let cols = line.split_whitespace().collect::<Vec<_>>();
+        if cols.len() < 2 {
+            continue;
+        }
+        let name = cols[0].to_string();
+        let Ok(pid) = cols[1].parse::<u32>() else {
+            continue;
+        };
+        if !owners.iter().any(|o| o.pid == pid) {
+            owners.push(PortOwner {
+                pid,
+                name: Some(name),
+            });
+        }
+    }
+    owners
+}
+
 fn do_switch_on(port: u16, codex: bool, claude: bool) -> CliResult<()> {
     if codex && claude {
         return Err(CliError::Other(
@@ -890,6 +1180,97 @@ fn do_switch_on(port: u16, codex: bool, claude: bool) -> CliResult<()> {
         codex_integration::switch_on(port).map_err(|e| CliError::CodexConfig(e.to_string()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod listener_bind_help_tests {
+    use super::*;
+
+    #[test]
+    fn bind_help_mentions_addr_and_service() {
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
+        let err = std::io::Error::new(ErrorKind::AddrInUse, "in use");
+        let msg = listener_bind_help(addr, "codex", &err);
+        assert!(msg.contains("http://127.0.0.1:3211"));
+        assert!(msg.contains("service: codex"));
+    }
+
+    #[test]
+    fn bind_help_for_addr_in_use_is_friendly() {
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
+        let err = std::io::Error::new(ErrorKind::AddrInUse, "in use");
+        let msg = listener_bind_help(addr, "codex", &err);
+        assert!(msg.contains("端口 3211"));
+        assert!(msg.contains("可能已被占用"));
+        assert!(msg.contains("codex-helper serve"));
+    }
+
+    #[test]
+    fn bind_help_for_permission_denied_is_friendly() {
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
+        let err = std::io::Error::new(ErrorKind::PermissionDenied, "permission denied");
+        let msg = listener_bind_help(addr, "codex", &err);
+        assert!(msg.contains("没有权限绑定"));
+        assert!(msg.contains("管理员"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bind_help_for_windows_10013_mentions_10013() {
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
+        let err = std::io::Error::from_raw_os_error(10013);
+        let msg = listener_bind_help(addr, "codex", &err);
+        assert!(msg.contains("10013"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_netstat_parser_extracts_listening_pid() {
+        let sample = "\
+Active Connections\n\
+\n\
+  Proto  Local Address          Foreign Address        State           PID\n\
+  TCP    127.0.0.1:3211         0.0.0.0:0              LISTENING       4242\n\
+  TCP    127.0.0.1:3212         0.0.0.0:0              LISTENING       1111\n\
+  TCP    127.0.0.1:3211         0.0.0.0:0              LISTENING       4242\n\
+";
+        let pids = parse_windows_netstat_listening_pids(sample, 3211);
+        assert_eq!(pids, vec![4242]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_ss_parser_extracts_pid_and_name() {
+        let sample = "\
+State   Recv-Q  Send-Q   Local Address:Port   Peer Address:Port Process\n\
+LISTEN  0       4096     127.0.0.1:3211       0.0.0.0:*     users:((\"codex-helper\",pid=1234,fd=3))\n\
+";
+        let owners = parse_linux_ss_listening_owners(sample, 3211);
+        assert_eq!(
+            owners,
+            vec![PortOwner {
+                pid: 1234,
+                name: Some("codex-helper".to_string())
+            }]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_lsof_parser_extracts_pid_and_name() {
+        let sample = "\
+COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
+node    7777 user   23u  IPv4 0x0      0t0     TCP 127.0.0.1:3211 (LISTEN)\n\
+";
+        let owners = parse_unix_lsof_owners(sample);
+        assert_eq!(
+            owners,
+            vec![PortOwner {
+                pid: 7777,
+                name: Some("node".to_string())
+            }]
+        );
+    }
 }
 
 fn do_switch_off(codex: bool, claude: bool) -> CliResult<()> {

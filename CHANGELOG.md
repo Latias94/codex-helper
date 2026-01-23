@@ -3,6 +3,11 @@ All notable changes to this project will be documented in this file.
 
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
+## [0.12.0] - Not released
+### 改进 / Improved
+- 启动监听失败时，提供更友好的提示（端口占用/权限不足等），并在 Windows/Linux/macOS 下尽力显示占用端口的进程 PID/名称，便于快速定位冲突进程。
+  Provide friendlier bind/listen failure messages (port in use / permission denied, etc.) and best-effort show the PID/process holding the port on Windows/Linux/macOS for faster troubleshooting.
+
 ## [0.11.0] - 2026-01-09
 ### 修复 / Fixed
 - 修复 `balanced` 等策略下，`never_on_status` 对 `400` 的默认 guardrail 会误伤可重试的错误分类（例如 `cloudflare_challenge`），导致 400 场景无法按 `on_class` 触发重试/切换的问题。
