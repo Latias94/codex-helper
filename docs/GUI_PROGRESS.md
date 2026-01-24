@@ -53,6 +53,7 @@
 - [x] GUI-203 Actions: set/clear session pinned config, set/clear effort override
 - [x] GUI-207 Actions: set/clear global pinned config override
 - [x] GUI-204 Actions: toggle enabled, adjust level (persisted)
+- [x] GUI-208 Health checks: start/cancel + status + upstream results (running + attach v1)
 - [x] GUI-205 Import from Codex CLI (sync auth env keys best-effort) + overwrite confirmation flow
 - [x] GUI-206 Optional: advanced raw editor (TOML) with validation and “apply” button
 
@@ -84,7 +85,12 @@
 - [x] GUI-502 MVP attach (read-only) using existing endpoints:
   - `/__codex_helper/status/active`, `/status/recent`, `/config/runtime`
 - [x] GUI-503 Extend proxy API to `/__codex_helper/api/v1/...` for full control
-- [~] GUI-504 Full attach: config actions, overrides, health checks, history/transcript via API
+- [~] GUI-504 Full attach via API v1 (Clash Verge style)
+  - [x] Config actions: active/enabled/level
+  - [x] Overrides: session config/effort + global pinned
+  - [x] Health checks: start/cancel + status
+  - [x] History/transcript: list + tail/all + copy + open file
+  - [ ] Discovery UI: scan/list existing proxy instances
 - [x] GUI-505 Manual attach to a specified port (no discovery UI yet)
 
 **Definition of done**
@@ -118,3 +124,4 @@
 - 2026-01-24: Finished GUI-302/303 and GUI-505: transcript all/tail + copy + open file; manual attach by port.
 - 2026-01-24: Finished GUI-202: set/clear active (auto) in config form view.
 - 2026-01-24: Finished GUI-205: import/sync providers from Codex CLI (preview + apply & save).
+- 2026-01-24: Finished GUI-208: health check controls + attach v1 endpoints for status/start/cancel.

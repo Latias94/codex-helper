@@ -8,7 +8,7 @@ use super::i18n::{Language, pick};
 use super::proxy_control::{GuiConfigOption, PortInUseAction, ProxyModeKind};
 use super::util::open_in_file_manager;
 use crate::sessions::{SessionSummary, SessionTranscriptMessage};
-use crate::state::{ActiveRequest, FinishedRequest, SessionStats};
+use crate::state::{ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, SessionStats};
 use crate::usage::UsageMetrics;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1989,6 +1989,8 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let selected_name = ctx.view.config.selected_name.clone();
     let mut action_set_active: Option<String> = None;
     let mut action_clear_active = false;
+    let mut action_health_start: Option<(bool, Vec<String>)> = None;
+    let mut action_health_cancel: Option<(bool, Vec<String>)> = None;
     let mut action_save_apply = false;
 
     {
@@ -2089,6 +2091,149 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 ui.add(egui::DragValue::new(&mut svc.level).range(1..=10));
             });
 
+            cols[1].add_space(8.0);
+            cols[1].separator();
+            cols[1].label(pick(ctx.lang, "健康检查", "Health check"));
+
+            let selected_service = match ctx.view.config.service {
+                crate::config::ServiceKind::Claude => "claude",
+                crate::config::ServiceKind::Codex => "codex",
+            };
+
+            let (runtime_service, supports_v1, cfg_health, hc_status): (
+                Option<String>,
+                bool,
+                Option<ConfigHealth>,
+                Option<HealthCheckStatus>,
+            ) = match ctx.proxy.kind() {
+                ProxyModeKind::Running => {
+                    if let Some(r) = ctx.proxy.running() {
+                        let state = r.state.clone();
+                        let (health, checks) = ctx.rt.block_on(async {
+                            tokio::join!(
+                                state.get_config_health(r.service_name),
+                                state.list_health_checks(r.service_name)
+                            )
+                        });
+                        (
+                            Some(r.service_name.to_string()),
+                            true,
+                            health.get(&name).cloned(),
+                            checks.get(&name).cloned(),
+                        )
+                    } else {
+                        (None, false, None, None)
+                    }
+                }
+                ProxyModeKind::Attached => {
+                    if let Some(att) = ctx.proxy.attached() {
+                        (
+                            att.service_name.clone(),
+                            att.api_version == Some(1),
+                            att.config_health.get(&name).cloned(),
+                            att.health_checks.get(&name).cloned(),
+                        )
+                    } else {
+                        (None, false, None, None)
+                    }
+                }
+                _ => (None, false, None, None),
+            };
+
+            if runtime_service.is_none() {
+                cols[1].label(pick(
+                    ctx.lang,
+                    "代理未运行/未附着，无法执行健康检查。",
+                    "Proxy is not running/attached; health check disabled.",
+                ));
+            } else if !supports_v1 {
+                cols[1].label(pick(
+                    ctx.lang,
+                    "附着代理未启用 API v1：健康检查不可用。",
+                    "Attached proxy has no API v1: health check disabled.",
+                ));
+            } else if runtime_service.as_deref() != Some(selected_service) {
+                cols[1].label(pick(
+                    ctx.lang,
+                    "当前代理服务与所选服务不一致：健康检查已禁用。",
+                    "Runtime service differs from selected service: health check disabled.",
+                ));
+            } else {
+                if let Some(st) = hc_status.as_ref() {
+                    cols[1].label(format!(
+                        "status: {}/{} ok={} err={} cancel={} done={}",
+                        st.completed, st.total, st.ok, st.err, st.cancel_requested, st.done
+                    ));
+                    if let Some(e) = st.last_error.as_deref() {
+                        cols[1].colored_label(egui::Color32::from_rgb(200, 120, 40), e);
+                    }
+                } else {
+                    cols[1].label(pick(ctx.lang, "(无状态)", "(no status)"));
+                }
+
+                cols[1].horizontal(|ui| {
+                    if ui
+                        .button(pick(ctx.lang, "检查当前", "Check selected"))
+                        .clicked()
+                    {
+                        action_health_start = Some((false, vec![name.clone()]));
+                    }
+                    if ui
+                        .button(pick(ctx.lang, "取消当前", "Cancel selected"))
+                        .clicked()
+                    {
+                        action_health_cancel = Some((false, vec![name.clone()]));
+                    }
+                    if ui.button(pick(ctx.lang, "检查全部", "Check all")).clicked() {
+                        action_health_start = Some((true, Vec::new()));
+                    }
+                    if ui
+                        .button(pick(ctx.lang, "取消全部", "Cancel all"))
+                        .clicked()
+                    {
+                        action_health_cancel = Some((true, Vec::new()));
+                    }
+                });
+
+                if let Some(h) = cfg_health.as_ref() {
+                    cols[1].add_space(6.0);
+                    cols[1].label(format!(
+                        "{}: {}  upstreams={}",
+                        pick(ctx.lang, "最近检查", "Last checked"),
+                        h.checked_at_ms,
+                        h.upstreams.len()
+                    ));
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(&mut cols[1], |ui| {
+                            let max = 12usize;
+                            for up in h.upstreams.iter().rev().take(max) {
+                                let ok = up.ok.map(|v| if v { "ok" } else { "err" }).unwrap_or("-");
+                                let sc = up
+                                    .status_code
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "-".to_string());
+                                let lat = up
+                                    .latency_ms
+                                    .map(|v| format!("{v}ms"))
+                                    .unwrap_or_else(|| "-".to_string());
+                                let err = up
+                                    .error
+                                    .as_deref()
+                                    .map(|e| shorten(e, 60))
+                                    .unwrap_or_else(|| "-".to_string());
+                                ui.label(format!(
+                                    "{ok} {sc} {lat}  {}  {err}",
+                                    shorten_middle(&up.base_url, 48)
+                                ));
+                            }
+                            if h.upstreams.len() > max {
+                                ui.label(format!("… +{} more", h.upstreams.len() - max));
+                            }
+                        });
+                }
+            }
+
             cols[1].add_space(6.0);
             cols[1].horizontal(|ui| {
                 if ui
@@ -2133,6 +2278,23 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         };
         mgr.active = None;
         *ctx.last_info = Some(pick(ctx.lang, "已清除 active", "Active cleared").to_string());
+    }
+
+    if let Some((all, names)) = action_health_start {
+        if let Err(e) = ctx.proxy.start_health_checks(ctx.rt, all, names) {
+            *ctx.last_error = Some(format!("health check start failed: {e}"));
+        } else {
+            *ctx.last_info =
+                Some(pick(ctx.lang, "已开始健康检查", "Health check started").to_string());
+        }
+    }
+
+    if let Some((all, names)) = action_health_cancel {
+        if let Err(e) = ctx.proxy.cancel_health_checks(ctx.rt, all, names) {
+            *ctx.last_error = Some(format!("health check cancel failed: {e}"));
+        } else {
+            *ctx.last_info = Some(pick(ctx.lang, "已请求取消", "Cancel requested").to_string());
+        }
     }
 
     if action_save_apply {

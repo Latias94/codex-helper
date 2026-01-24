@@ -7,6 +7,8 @@ mod codex_integration;
 mod config;
 #[path = "../filter.rs"]
 mod filter;
+#[path = "../healthcheck.rs"]
+mod healthcheck;
 #[path = "../lb.rs"]
 mod lb;
 #[path = "../logging.rs"]

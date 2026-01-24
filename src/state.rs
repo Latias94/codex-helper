@@ -94,7 +94,7 @@ struct UsageRollup {
     by_provider_day: HashMap<String, HashMap<i32, UsageBucket>>,
 }
 
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UpstreamHealth {
     pub base_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,7 +107,7 @@ pub struct UpstreamHealth {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ConfigHealth {
     pub checked_at_ms: u64,
     #[serde(default)]
@@ -127,7 +127,7 @@ pub struct LbConfigView {
     pub upstreams: Vec<LbUpstreamView>,
 }
 
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct HealthCheckStatus {
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
@@ -285,6 +285,8 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
+    const MAX_HEALTH_RECORDS_PER_CONFIG: usize = 200;
+
     #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         Self::new_with_lb_states(None)
@@ -639,6 +641,15 @@ impl ProxyState {
                 });
             entry.checked_at_ms = entry.checked_at_ms.max(now_ms);
             entry.upstreams.push(upstream.clone());
+            if entry.upstreams.len() > Self::MAX_HEALTH_RECORDS_PER_CONFIG {
+                let extra = entry
+                    .upstreams
+                    .len()
+                    .saturating_sub(Self::MAX_HEALTH_RECORDS_PER_CONFIG);
+                if extra > 0 {
+                    entry.upstreams.drain(0..extra);
+                }
+            }
         }
 
         let mut guard = self.health_checks.write().await;

@@ -2,6 +2,7 @@ mod codex_integration;
 mod commands;
 mod config;
 mod filter;
+mod healthcheck;
 mod lb;
 mod logging;
 mod model_routing;

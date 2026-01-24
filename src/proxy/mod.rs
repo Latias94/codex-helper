@@ -2934,13 +2934,196 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/status/active",
                 "/__codex_helper/api/v1/status/recent",
                 "/__codex_helper/api/v1/status/session-stats",
+                "/__codex_helper/api/v1/status/health-checks",
+                "/__codex_helper/api/v1/status/config-health",
                 "/__codex_helper/api/v1/config/runtime",
                 "/__codex_helper/api/v1/config/reload",
                 "/__codex_helper/api/v1/configs",
                 "/__codex_helper/api/v1/overrides/session/effort",
                 "/__codex_helper/api/v1/overrides/session/config",
                 "/__codex_helper/api/v1/overrides/global-config",
+                "/__codex_helper/api/v1/healthcheck/start",
+                "/__codex_helper/api/v1/healthcheck/cancel",
             ],
+        }))
+    }
+
+    async fn list_health_checks(
+        proxy: ProxyService,
+    ) -> Result<
+        Json<std::collections::HashMap<String, crate::state::HealthCheckStatus>>,
+        (StatusCode, String),
+    > {
+        let map = proxy.state.list_health_checks(proxy.service_name).await;
+        Ok(Json(map))
+    }
+
+    async fn list_config_health(
+        proxy: ProxyService,
+    ) -> Result<
+        Json<std::collections::HashMap<String, crate::state::ConfigHealth>>,
+        (StatusCode, String),
+    > {
+        let map = proxy.state.get_config_health(proxy.service_name).await;
+        Ok(Json(map))
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct HealthCheckAction {
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        config_names: Vec<String>,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct HealthCheckActionResult {
+        started: Vec<String>,
+        already_running: Vec<String>,
+        missing: Vec<String>,
+        cancel_requested: Vec<String>,
+        not_running: Vec<String>,
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    async fn start_health_checks(
+        proxy: ProxyService,
+        Json(payload): Json<HealthCheckAction>,
+    ) -> Result<Json<HealthCheckActionResult>, (StatusCode, String)> {
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+
+        let mut targets = if payload.all {
+            mgr.configs.keys().cloned().collect::<Vec<_>>()
+        } else {
+            payload.config_names
+        };
+        targets.retain(|s| !s.trim().is_empty());
+        targets.sort();
+        targets.dedup();
+        if targets.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "expected { all: true } or non-empty config_names".to_string(),
+            ));
+        }
+
+        let mut started = Vec::new();
+        let mut already_running = Vec::new();
+        let mut missing = Vec::new();
+        for name in targets {
+            let Some(svc) = mgr.configs.get(&name) else {
+                missing.push(name);
+                continue;
+            };
+
+            let upstreams = svc.upstreams.clone();
+            let now = now_ms();
+            if !proxy
+                .state
+                .try_begin_health_check(proxy.service_name, &name, upstreams.len(), now)
+                .await
+            {
+                already_running.push(name);
+                continue;
+            }
+
+            proxy
+                .state
+                .record_config_health(
+                    proxy.service_name,
+                    name.clone(),
+                    crate::state::ConfigHealth {
+                        checked_at_ms: now,
+                        upstreams: Vec::new(),
+                    },
+                )
+                .await;
+
+            let state = proxy.state.clone();
+            let service_name = proxy.service_name;
+            let config_name = name.clone();
+            tokio::spawn(async move {
+                crate::healthcheck::run_health_check_for_config(
+                    state,
+                    service_name,
+                    config_name,
+                    upstreams,
+                )
+                .await;
+            });
+            started.push(name);
+        }
+
+        Ok(Json(HealthCheckActionResult {
+            started,
+            already_running,
+            missing,
+            cancel_requested: Vec::new(),
+            not_running: Vec::new(),
+        }))
+    }
+
+    async fn cancel_health_checks(
+        proxy: ProxyService,
+        Json(payload): Json<HealthCheckAction>,
+    ) -> Result<Json<HealthCheckActionResult>, (StatusCode, String)> {
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+
+        let mut targets = if payload.all {
+            mgr.configs.keys().cloned().collect::<Vec<_>>()
+        } else {
+            payload.config_names
+        };
+        targets.retain(|s| !s.trim().is_empty());
+        targets.sort();
+        targets.dedup();
+        if targets.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "expected { all: true } or non-empty config_names".to_string(),
+            ));
+        }
+
+        let now = now_ms();
+        let mut cancel_requested = Vec::new();
+        let mut not_running = Vec::new();
+        let mut missing = Vec::new();
+        for name in targets {
+            if !mgr.configs.contains_key(&name) {
+                missing.push(name);
+                continue;
+            }
+            let ok = proxy
+                .state
+                .request_cancel_health_check(proxy.service_name, &name, now)
+                .await;
+            if ok {
+                cancel_requested.push(name);
+            } else {
+                not_running.push(name);
+            }
+        }
+
+        Ok(Json(HealthCheckActionResult {
+            started: Vec::new(),
+            already_running: Vec::new(),
+            missing,
+            cancel_requested,
+            not_running,
         }))
     }
 
@@ -2987,6 +3170,10 @@ pub fn router(proxy: ProxyService) -> Router {
     let p18 = proxy.clone();
     let p19 = proxy.clone();
     let p20 = proxy.clone();
+    let p21 = proxy.clone();
+    let p22 = proxy.clone();
+    let p23 = proxy.clone();
+    let p24 = proxy.clone();
 
     Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -3005,6 +3192,14 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/status/session-stats",
             get(move || list_session_stats(p11.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/status/health-checks",
+            get(move || list_health_checks(p21.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/status/config-health",
+            get(move || list_config_health(p22.clone())),
         )
         .route(
             "/__codex_helper/api/v1/config/runtime",
@@ -3032,6 +3227,14 @@ pub fn router(proxy: ProxyService) -> Router {
             "/__codex_helper/api/v1/overrides/global-config",
             get(move || get_global_config_override(p19.clone()))
                 .post(move |payload| set_global_config_override(p20.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/healthcheck/start",
+            post(move |payload| start_health_checks(p23.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/healthcheck/cancel",
+            post(move |payload| cancel_health_checks(p24.clone(), payload)),
         )
         .route(
             "/__codex_helper/override/session",

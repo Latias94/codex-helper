@@ -13,7 +13,9 @@ use crate::config::{
     ProxyConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
 };
 use crate::proxy::ProxyService;
-use crate::state::{ActiveRequest, FinishedRequest, ProxyState, SessionStats};
+use crate::state::{
+    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, ProxyState, SessionStats,
+};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct GuiConfigOption {
@@ -76,6 +78,8 @@ pub struct AttachedStatus {
     pub session_effort_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
     pub configs: Vec<GuiConfigOption>,
+    pub config_health: HashMap<String, ConfigHealth>,
+    pub health_checks: HashMap<String, HealthCheckStatus>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
 }
@@ -96,6 +100,8 @@ impl AttachedStatus {
             session_effort_overrides: HashMap::new(),
             session_stats: HashMap::new(),
             configs: Vec::new(),
+            config_health: HashMap::new(),
+            health_checks: HashMap::new(),
             runtime_loaded_at_ms: None,
             runtime_source_mtime_ms: None,
         }
@@ -404,6 +410,8 @@ impl ProxyController {
                     session_effort,
                     stats,
                     configs,
+                    config_health,
+                    health_checks,
                 ) = tokio::try_join!(
                     get_json::<Vec<ActiveRequest>>(
                         &client,
@@ -445,6 +453,16 @@ impl ProxyController {
                         format!("{base}/__codex_helper/api/v1/configs"),
                         req_timeout,
                     ),
+                    get_json::<HashMap<String, ConfigHealth>>(
+                        &client,
+                        format!("{base}/__codex_helper/api/v1/status/config-health"),
+                        req_timeout,
+                    ),
+                    get_json::<HashMap<String, HealthCheckStatus>>(
+                        &client,
+                        format!("{base}/__codex_helper/api/v1/status/health-checks"),
+                        req_timeout,
+                    ),
                 )?;
 
                 return Ok::<_, anyhow::Error>((
@@ -457,6 +475,8 @@ impl ProxyController {
                     session_effort,
                     stats,
                     configs,
+                    config_health,
+                    health_checks,
                     Some(runtime.loaded_at_ms),
                     runtime.source_mtime_ms,
                 ));
@@ -499,6 +519,8 @@ impl ProxyController {
                 session_effort,
                 HashMap::new(),
                 Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
                 Some(runtime.loaded_at_ms),
                 runtime.source_mtime_ms,
             ))
@@ -515,6 +537,8 @@ impl ProxyController {
                 session_effort,
                 stats,
                 configs,
+                config_health,
+                health_checks,
                 runtime_loaded_at_ms,
                 runtime_source_mtime_ms,
             )) => {
@@ -529,6 +553,8 @@ impl ProxyController {
                     att.session_effort_overrides = session_effort;
                     att.session_stats = stats;
                     att.configs = configs;
+                    att.config_health = config_health;
+                    att.health_checks = health_checks;
                     att.runtime_loaded_at_ms = runtime_loaded_at_ms;
                     att.runtime_source_mtime_ms = runtime_source_mtime_ms;
                 }
@@ -701,6 +727,72 @@ impl ProxyController {
             client
                 .post(url)
                 .timeout(Duration::from_millis(800))
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    pub fn start_health_checks(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        all: bool,
+        config_names: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let base = match &self.mode {
+            ProxyMode::Running(r) => format!("http://127.0.0.1:{}", r.port),
+            ProxyMode::Attached(a) => {
+                if a.api_version != Some(1) {
+                    bail!("attached proxy does not support health checks (need api v1)");
+                }
+                a.base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            client
+                .post(format!("{base}/__codex_helper/api/v1/healthcheck/start"))
+                .timeout(Duration::from_millis(800))
+                .json(&serde_json::json!({ "all": all, "config_names": config_names }))
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    pub fn cancel_health_checks(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        all: bool,
+        config_names: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let base = match &self.mode {
+            ProxyMode::Running(r) => format!("http://127.0.0.1:{}", r.port),
+            ProxyMode::Attached(a) => {
+                if a.api_version != Some(1) {
+                    bail!("attached proxy does not support health checks (need api v1)");
+                }
+                a.base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            client
+                .post(format!("{base}/__codex_helper/api/v1/healthcheck/cancel"))
+                .timeout(Duration::from_millis(800))
+                .json(&serde_json::json!({ "all": all, "config_names": config_names }))
                 .send()
                 .await?
                 .error_for_status()?;
