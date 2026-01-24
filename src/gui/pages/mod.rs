@@ -240,6 +240,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ui.label(pick(ctx.lang, "正在启动…", "Starting..."));
         }
         ProxyModeKind::Running => {
+            let mut global_override_ui: Option<(Option<String>, Vec<GuiConfigOption>)> = None;
             if let Some(r) = ctx.proxy.running() {
                 ui.label(format!(
                     "{}: 127.0.0.1:{} ({})",
@@ -295,6 +296,67 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             }
                         });
                 }
+                if let Some(snapshot) = ctx.proxy.snapshot() {
+                    global_override_ui = Some((snapshot.global_override, snapshot.configs));
+                }
+            }
+
+            if let Some((global, configs)) = global_override_ui {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label(pick(
+                    ctx.lang,
+                    "全局覆盖（Pinned）",
+                    "Global override (pinned)",
+                ));
+                ui.horizontal(|ui| {
+                    ui.label(pick(ctx.lang, "固定配置", "Pinned config"));
+
+                    let mut selected = global.clone();
+                    egui::ComboBox::from_id_salt("global_cfg_override")
+                        .selected_text(match selected.as_deref() {
+                            Some(v) => v.to_string(),
+                            None => pick(ctx.lang, "<自动>", "<auto>").to_string(),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut selected,
+                                None,
+                                pick(ctx.lang, "<自动>", "<auto>"),
+                            );
+                            for cfg in configs.iter().filter(|c| c.enabled) {
+                                let label = match cfg.alias.as_deref() {
+                                    Some(a) if !a.trim().is_empty() => {
+                                        format!("{} ({a})", cfg.name)
+                                    }
+                                    _ => cfg.name.clone(),
+                                };
+                                ui.selectable_value(&mut selected, Some(cfg.name.clone()), label);
+                            }
+                        });
+
+                    if selected != global {
+                        match ctx.proxy.apply_global_config_override(ctx.rt, selected) {
+                            Ok(()) => {
+                                *ctx.last_info =
+                                    Some(pick(ctx.lang, "已应用全局覆盖", "Applied").to_string());
+                            }
+                            Err(e) => {
+                                *ctx.last_error =
+                                    Some(format!("apply global override failed: {e}"));
+                            }
+                        }
+                    }
+
+                    if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
+                        if let Err(e) = ctx.proxy.apply_global_config_override(ctx.rt, None) {
+                            *ctx.last_error = Some(format!("clear failed: {e}"));
+                        } else {
+                            *ctx.last_info =
+                                Some(pick(ctx.lang, "已清除全局覆盖", "Cleared").to_string());
+                        }
+                    }
+                });
             }
             if ui
                 .button(pick(ctx.lang, "停止代理", "Stop proxy"))
@@ -308,6 +370,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
         }
         ProxyModeKind::Attached => {
+            let mut global_override_ui: Option<(Option<String>, Vec<GuiConfigOption>, bool)> = None;
             if let Some(att) = ctx.proxy.attached() {
                 ui.label(format!(
                     "{}: {}",
@@ -350,6 +413,83 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
                 if let Some(err) = att.last_error.as_deref() {
                     ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
+                }
+
+                global_override_ui = Some((
+                    att.global_override.clone(),
+                    att.configs.clone(),
+                    att.api_version == Some(1),
+                ));
+            }
+
+            if let Some((global, configs, supports_v1)) = global_override_ui {
+                if supports_v1 && !configs.is_empty() {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.label(pick(
+                        ctx.lang,
+                        "全局覆盖（Pinned）",
+                        "Global override (pinned)",
+                    ));
+                    ui.horizontal(|ui| {
+                        ui.label(pick(ctx.lang, "固定配置", "Pinned config"));
+                        let mut selected = global.clone();
+                        egui::ComboBox::from_id_salt("global_cfg_override_attached")
+                            .selected_text(match selected.as_deref() {
+                                Some(v) => v.to_string(),
+                                None => pick(ctx.lang, "<自动>", "<auto>").to_string(),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut selected,
+                                    None,
+                                    pick(ctx.lang, "<自动>", "<auto>"),
+                                );
+                                for cfg in configs.iter().filter(|c| c.enabled) {
+                                    let label = match cfg.alias.as_deref() {
+                                        Some(a) if !a.trim().is_empty() => {
+                                            format!("{} ({a})", cfg.name)
+                                        }
+                                        _ => cfg.name.clone(),
+                                    };
+                                    ui.selectable_value(
+                                        &mut selected,
+                                        Some(cfg.name.clone()),
+                                        label,
+                                    );
+                                }
+                            });
+
+                        if selected != global {
+                            match ctx.proxy.apply_global_config_override(ctx.rt, selected) {
+                                Ok(()) => {
+                                    *ctx.last_info = Some(
+                                        pick(ctx.lang, "已应用全局覆盖", "Applied").to_string(),
+                                    );
+                                }
+                                Err(e) => {
+                                    *ctx.last_error =
+                                        Some(format!("apply global override failed: {e}"));
+                                }
+                            }
+                        }
+
+                        if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
+                            if let Err(e) = ctx.proxy.apply_global_config_override(ctx.rt, None) {
+                                *ctx.last_error = Some(format!("clear failed: {e}"));
+                            } else {
+                                *ctx.last_info =
+                                    Some(pick(ctx.lang, "已清除全局覆盖", "Cleared").to_string());
+                            }
+                        }
+                    });
+                } else if !supports_v1 {
+                    ui.add_space(6.0);
+                    ui.label(pick(
+                        ctx.lang,
+                        "附着代理未启用 API v1：全局覆盖不可用。",
+                        "Attached proxy has no API v1: global override disabled.",
+                    ));
                 }
             }
             ui.horizontal(|ui| {

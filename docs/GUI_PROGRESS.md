@@ -51,6 +51,7 @@
 - [x] GUI-201 Config list + details (active/enabled/level/upstreams, health summary)
 - [ ] GUI-202 Actions: set active / clear active (auto)
 - [x] GUI-203 Actions: set/clear session pinned config, set/clear effort override
+- [x] GUI-207 Actions: set/clear global pinned config override
 - [x] GUI-204 Actions: toggle enabled, adjust level (persisted)
 - [ ] GUI-205 Import from Codex CLI (sync auth env keys best-effort) + overwrite confirmation flow
 - [x] GUI-206 Optional: advanced raw editor (TOML) with validation and “apply” button
@@ -113,3 +114,4 @@
 - 2026-01-24: Finished GUI-201/204/206 (config form view for active/enabled/level + keep raw editor).
 - 2026-01-24: Finished GUI-301 (history list + transcript viewer tail); tray adds Reload/Open Config/Open Logs.
 - 2026-01-24: Finished GUI-503; GUI attach upgraded to read full runtime snapshot and write overrides (effort + session config + global override via API v1).
+- 2026-01-24: Finished GUI-207: global pinned config override UI (integrated + attach v1).

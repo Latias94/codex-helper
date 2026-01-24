@@ -642,6 +642,48 @@ impl ProxyController {
         }
     }
 
+    pub fn apply_global_config_override(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        config_name: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                let state = r.state.clone();
+                let now = now_ms();
+                rt.block_on(async move {
+                    match config_name {
+                        Some(name) => state.set_global_config_override(name, now).await,
+                        None => state.clear_global_config_override().await,
+                    }
+                });
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) {
+                    bail!("attached proxy does not support global config override (need api v1)");
+                }
+                let base = att.base_url.clone();
+                let client = self.http_client.clone();
+                let fut = async move {
+                    client
+                        .post(format!(
+                            "{base}/__codex_helper/api/v1/overrides/global-config"
+                        ))
+                        .timeout(Duration::from_millis(800))
+                        .json(&serde_json::json!({ "config_name": config_name }))
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
     pub fn reload_runtime_config(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         let (base, supports_v1) = match &self.mode {
             ProxyMode::Running(r) => (format!("http://127.0.0.1:{}", r.port), true),
