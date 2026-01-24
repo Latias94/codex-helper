@@ -1546,6 +1546,42 @@ fn render_settings(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.separator();
 
     ui.horizontal(|ui| {
+        let mut enabled = ctx.gui_cfg.proxy.auto_attach_or_start;
+        ui.checkbox(
+            &mut enabled,
+            pick(
+                ctx.lang,
+                "启动时自动附着/启动代理",
+                "Auto attach-or-start on launch",
+            ),
+        );
+        if enabled != ctx.gui_cfg.proxy.auto_attach_or_start {
+            ctx.gui_cfg.proxy.auto_attach_or_start = enabled;
+            if let Err(e) = ctx.gui_cfg.save() {
+                *ctx.last_error = Some(format!("save gui config failed: {e}"));
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        let mut enabled = ctx.gui_cfg.proxy.discovery_scan_fallback;
+        ui.checkbox(
+            &mut enabled,
+            pick(
+                ctx.lang,
+                "探测失败后扫 3210-3220",
+                "Scan 3210-3220 on failure",
+            ),
+        );
+        if enabled != ctx.gui_cfg.proxy.discovery_scan_fallback {
+            ctx.gui_cfg.proxy.discovery_scan_fallback = enabled;
+            if let Err(e) = ctx.gui_cfg.save() {
+                *ctx.last_error = Some(format!("save gui config failed: {e}"));
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "端口占用时", "On port in use"));
         let mut action = PortInUseAction::parse(&ctx.gui_cfg.attach.on_port_in_use);
         egui::ComboBox::from_id_salt("attach_port_in_use_action")

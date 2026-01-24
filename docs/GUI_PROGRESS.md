@@ -92,6 +92,7 @@
   - [x] Health checks: start/cancel + status
   - [x] History/transcript: list + tail/all + copy + open file
   - [x] Discovery UI: scan/list existing proxy instances (default 3210-3220)
+  - [x] Auto attach-or-start: probe configured port, fallback scan, then start
 - [x] GUI-505 Manual attach to a specified port (no discovery UI yet)
 
 **Definition of done**

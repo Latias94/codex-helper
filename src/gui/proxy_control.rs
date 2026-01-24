@@ -467,6 +467,96 @@ impl ProxyController {
         Ok(())
     }
 
+    pub fn probe_local_proxy(
+        &self,
+        rt: &tokio::runtime::Runtime,
+        port: u16,
+    ) -> Option<DiscoveredProxy> {
+        #[derive(Debug, serde::Deserialize)]
+        struct ApiCapabilities {
+            api_version: u32,
+            service_name: String,
+            #[serde(default)]
+            endpoints: Vec<String>,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct RuntimeConfigStatus {
+            loaded_at_ms: u64,
+            #[serde(default)]
+            source_mtime_ms: Option<u64>,
+        }
+
+        async fn get_json<T: serde::de::DeserializeOwned>(
+            client: &Client,
+            url: String,
+            timeout: Duration,
+        ) -> anyhow::Result<T> {
+            Ok(client
+                .get(url)
+                .timeout(timeout)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<T>()
+                .await?)
+        }
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            let base_url = format!("http://127.0.0.1:{port}");
+            let timeout = Duration::from_millis(250);
+
+            let caps = get_json::<ApiCapabilities>(
+                &client,
+                format!("{base_url}/__codex_helper/api/v1/capabilities"),
+                timeout,
+            )
+            .await;
+
+            if let Ok(c) = caps {
+                let runtime = get_json::<RuntimeConfigStatus>(
+                    &client,
+                    format!("{base_url}/__codex_helper/api/v1/config/runtime"),
+                    timeout,
+                )
+                .await
+                .ok();
+
+                return Some(DiscoveredProxy {
+                    port,
+                    base_url,
+                    api_version: Some(c.api_version),
+                    service_name: Some(c.service_name),
+                    endpoints: c.endpoints,
+                    runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
+                    last_error: None,
+                });
+            }
+
+            let runtime = get_json::<RuntimeConfigStatus>(
+                &client,
+                format!("{base_url}/__codex_helper/config/runtime"),
+                timeout,
+            )
+            .await;
+            match runtime {
+                Ok(r) => Some(DiscoveredProxy {
+                    port,
+                    base_url,
+                    api_version: None,
+                    service_name: None,
+                    endpoints: Vec::new(),
+                    runtime_loaded_at_ms: Some(r.loaded_at_ms),
+                    last_error: None,
+                }),
+                Err(_) => None,
+            }
+        };
+
+        rt.block_on(fut)
+    }
+
     pub fn detach(&mut self) {
         self.mode = ProxyMode::Stopped;
         self.last_start_error = None;

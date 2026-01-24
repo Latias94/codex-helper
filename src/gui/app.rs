@@ -58,6 +58,7 @@ struct GuiApp {
     pending_startup: Option<StartupBehavior>,
     allow_close_once: bool,
     single_instance: Option<SingleInstance>,
+    did_auto_connect: bool,
 }
 
 impl GuiApp {
@@ -95,6 +96,7 @@ impl GuiApp {
             pending_startup,
             allow_close_once: false,
             single_instance,
+            did_auto_connect: false,
         }
     }
 }
@@ -131,6 +133,78 @@ impl eframe::App for GuiApp {
             }
         } else if self.tray.is_some() && !self.gui_cfg.tray.enabled {
             self.tray = None;
+        }
+
+        // Auto attach-or-start:
+        // 1) Probe configured port; attach if proxy exists.
+        // 2) If probe fails and fallback enabled, scan 3210-3220; attach best candidate if any.
+        // 3) Otherwise start proxy (honors on-port-in-use setting, may prompt).
+        if !self.did_auto_connect
+            && self.gui_cfg.proxy.auto_attach_or_start
+            && matches!(
+                self.proxy.kind(),
+                super::proxy_control::ProxyModeKind::Stopped
+            )
+        {
+            self.did_auto_connect = true;
+
+            let preferred_port = self
+                .gui_cfg
+                .attach
+                .last_port
+                .unwrap_or(self.gui_cfg.proxy.default_port);
+
+            let mut attach_port: Option<u16> = None;
+            if self
+                .proxy
+                .probe_local_proxy(&self.rt, preferred_port)
+                .is_some()
+            {
+                attach_port = Some(preferred_port);
+            } else if self.gui_cfg.proxy.discovery_scan_fallback {
+                if self.proxy.scan_local_proxies(&self.rt, 3210..=3220).is_ok() {
+                    let discovered = self.proxy.discovered_proxies();
+                    if !discovered.is_empty() {
+                        // Best-effort selection:
+                        // - prefer last_port
+                        // - prefer matching service
+                        // - prefer api v1
+                        // - lowest port
+                        let desired_service = match self.gui_cfg.service_kind() {
+                            crate::config::ServiceKind::Codex => "codex",
+                            crate::config::ServiceKind::Claude => "claude",
+                        };
+                        attach_port = discovered
+                            .iter()
+                            .find(|p| p.port == preferred_port)
+                            .or_else(|| {
+                                discovered
+                                    .iter()
+                                    .find(|p| p.service_name.as_deref() == Some(desired_service))
+                            })
+                            .or_else(|| discovered.iter().find(|p| p.api_version == Some(1)))
+                            .or_else(|| discovered.iter().min_by_key(|p| p.port))
+                            .map(|p| p.port);
+                    }
+                }
+            }
+
+            if let Some(port) = attach_port {
+                self.proxy.request_attach(port);
+                self.gui_cfg.attach.last_port = Some(port);
+                let _ = self.gui_cfg.save();
+                self.last_info =
+                    Some(pick(lang, "自动附着到已运行代理", "Auto-attached to proxy").to_string());
+            } else {
+                let action = super::proxy_control::PortInUseAction::parse(
+                    &self.gui_cfg.attach.on_port_in_use,
+                );
+                self.proxy.request_start_or_prompt(
+                    &self.rt,
+                    action,
+                    self.gui_cfg.attach.remember_choice,
+                );
+            }
         }
 
         if let Some(behavior) = self.pending_startup.take() {
