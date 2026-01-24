@@ -1,4 +1,5 @@
 /target
+/dist
 /.codex-helper
 /repo-ref
 /.lspi/

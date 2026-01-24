@@ -42,6 +42,7 @@
 - [x] GUI-103 Show runtime status: listening addr/port, current active config, model routing warnings
 - [x] GUI-104 Sessions view backed by in-process `ProxyState` snapshot refresh
 - [x] GUI-105 Requests view backed by in-process `ProxyState` snapshot refresh
+- [x] GUI-106 Sessions list UX: stable ordering + active partitioning + search + “lock order”
 
 **Definition of done**
 - GUI can start/stop proxy, and live data (sessions/recent) updates.
@@ -129,3 +130,4 @@
 - 2026-01-24: Finished GUI-208: health check controls + attach v1 endpoints for status/start/cancel.
 - 2026-01-24: Finished GUI-405: startup behavior setting (show/minimized/to tray) and tray hide uses `Visible=false`.
 - 2026-01-24: Finished GUI-504 discovery: scan local ports 3210-3220 and attach with one click.
+- 2026-01-24: Finished GUI-106: sessions list stable ordering + search + lock order (avoid jitter with multiple CLIs).

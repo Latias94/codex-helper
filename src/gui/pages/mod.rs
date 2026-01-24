@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::autostart;
 use super::config::GuiConfig;
@@ -127,8 +127,12 @@ pub struct SessionsViewState {
     pub active_only: bool,
     pub errors_only: bool,
     pub overrides_only: bool,
+    pub lock_order: bool,
+    pub search: String,
     pub selected_session_id: Option<String>,
     pub selected_idx: usize,
+    ordered_session_ids: Vec<Option<String>>,
+    last_active_set: HashSet<Option<String>>,
     editor: SessionOverrideEditor,
 }
 
@@ -777,6 +781,30 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             &mut ctx.view.sessions.overrides_only,
             pick(ctx.lang, "仅覆盖", "Overrides only"),
         );
+        ui.checkbox(
+            &mut ctx.view.sessions.lock_order,
+            pick(ctx.lang, "锁定顺序", "Lock order"),
+        )
+        .on_hover_text(pick(
+            ctx.lang,
+            "暂停自动重排（活跃/最近分区与新会话插入也会暂停）",
+            "Pause auto reordering (active partitioning and new-session insertion are paused too).",
+        ));
+    });
+
+    ui.horizontal(|ui| {
+        ui.label(pick(ctx.lang, "搜索", "Search"));
+        ui.add_sized(
+            [320.0, 20.0],
+            egui::TextEdit::singleline(&mut ctx.view.sessions.search).hint_text(pick(
+                ctx.lang,
+                "按 session_id / cwd / model / config 过滤…",
+                "Filter by session_id / cwd / model / config...",
+            )),
+        );
+        if ui.button(pick(ctx.lang, "清空", "Clear")).clicked() {
+            ctx.view.sessions.search.clear();
+        }
     });
 
     ui.add_space(6.0);
@@ -789,10 +817,21 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         &session_stats,
     );
 
-    let filtered = rows
+    let mut row_index_by_id = HashMap::new();
+    for (idx, row) in rows.iter().enumerate() {
+        row_index_by_id.insert(row.session_id.clone(), idx);
+    }
+
+    sync_session_order(&mut ctx.view.sessions, &rows);
+
+    let q = ctx.view.sessions.search.trim().to_lowercase();
+    let filtered = ctx
+        .view
+        .sessions
+        .ordered_session_ids
         .iter()
-        .enumerate()
-        .filter(|(_, row)| {
+        .filter_map(|id| row_index_by_id.get(id).copied().map(|idx| &rows[idx]))
+        .filter(|row| {
             if ctx.view.sessions.active_only && row.active_count == 0 {
                 return false;
             }
@@ -805,7 +844,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             {
                 return false;
             }
-            true
+            session_row_matches_query(row, &q)
         })
         .take(400)
         .collect::<Vec<_>>();
@@ -819,7 +858,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         .and_then(|sid| {
             filtered
                 .iter()
-                .position(|(_, row)| row.session_id.as_deref() == Some(sid))
+                .position(|row| row.session_id.as_deref() == Some(sid))
         })
         .unwrap_or(
             ctx.view
@@ -829,9 +868,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         );
 
     ctx.view.sessions.selected_idx = selected_idx_in_filtered;
-    let selected = filtered
-        .get(ctx.view.sessions.selected_idx)
-        .map(|(_, row)| *row);
+    let selected = filtered.get(ctx.view.sessions.selected_idx).copied();
     ctx.view.sessions.selected_session_id = selected.and_then(|r| r.session_id.clone());
 
     // Sync editor to the selected session, but do not clobber while editing the same session.
@@ -853,7 +890,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .max_height(520.0)
             .show(&mut cols[0], |ui| {
                 let now = now_ms();
-                for (pos, (_, row)) in filtered.iter().enumerate() {
+                for (pos, row) in filtered.iter().enumerate() {
                     let selected = pos == ctx.view.sessions.selected_idx;
                     let sid = row
                         .session_id
@@ -1072,6 +1109,101 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ctx.proxy
             .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
     }
+}
+
+fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    for v in [
+        row.session_id.as_deref(),
+        row.cwd.as_deref(),
+        row.last_model.as_deref(),
+        row.last_provider_id.as_deref(),
+        row.last_config_name.as_deref(),
+    ] {
+        if let Some(s) = v {
+            if s.to_lowercase().contains(q) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn sync_session_order(state: &mut SessionsViewState, rows: &[SessionRow]) {
+    let mut current_set: HashSet<Option<String>> = HashSet::new();
+    let mut active_set: HashSet<Option<String>> = HashSet::new();
+    for row in rows {
+        current_set.insert(row.session_id.clone());
+        if row.active_count > 0 {
+            active_set.insert(row.session_id.clone());
+        }
+    }
+
+    if state.ordered_session_ids.is_empty() {
+        state.ordered_session_ids = rows.iter().map(|r| r.session_id.clone()).collect();
+        state.last_active_set = active_set;
+        return;
+    }
+
+    // Always prune sessions that no longer exist in the current snapshot.
+    state
+        .ordered_session_ids
+        .retain(|id| current_set.contains(id));
+
+    // Ensure new sessions show up in the list. When auto reordering is enabled, insert them
+    // just after the active partition (newest first, based on current snapshot ordering).
+    let mut known: HashSet<Option<String>> = state.ordered_session_ids.iter().cloned().collect();
+    let mut missing_active: Vec<Option<String>> = Vec::new();
+    let mut missing_inactive: Vec<Option<String>> = Vec::new();
+    for row in rows {
+        if known.contains(&row.session_id) {
+            continue;
+        }
+        known.insert(row.session_id.clone());
+        if active_set.contains(&row.session_id) {
+            missing_active.push(row.session_id.clone());
+        } else {
+            missing_inactive.push(row.session_id.clone());
+        }
+    }
+
+    if state.lock_order {
+        state.ordered_session_ids.extend(missing_active);
+        state.ordered_session_ids.extend(missing_inactive);
+        state.last_active_set = active_set;
+        return;
+    }
+
+    // Partition active sessions to the top, without reshuffling within each partition.
+    let mut active_ids: Vec<Option<String>> = Vec::new();
+    let mut inactive_ids: Vec<Option<String>> = Vec::new();
+    for id in state.ordered_session_ids.drain(..) {
+        if active_set.contains(&id) {
+            active_ids.push(id);
+        } else {
+            inactive_ids.push(id);
+        }
+    }
+    state.ordered_session_ids.extend(active_ids);
+    state.ordered_session_ids.extend(inactive_ids);
+
+    let insert_at = state
+        .ordered_session_ids
+        .iter()
+        .take_while(|id| active_set.contains(*id))
+        .count();
+    let active_missing_len = missing_active.len();
+    state
+        .ordered_session_ids
+        .splice(insert_at..insert_at, missing_active);
+    let insert_at2 = insert_at + active_missing_len;
+    state
+        .ordered_session_ids
+        .splice(insert_at2..insert_at2, missing_inactive);
+
+    state.last_active_set = active_set;
 }
 
 fn render_requests(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
