@@ -1680,7 +1680,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ctx.view.config.service = svc;
     });
 
-    let (active_name, names) = {
+    let (active_name, active_fallback, names) = {
         let cfg = ctx.view.config.working.as_ref().expect("checked above");
         let mgr = match ctx.view.config.service {
             crate::config::ServiceKind::Claude => &cfg.claude,
@@ -1692,7 +1692,11 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             let lb = mgr.configs.get(b).map(|c| c.level).unwrap_or(1);
             la.cmp(&lb).then_with(|| a.cmp(b))
         });
-        (mgr.active.clone(), v)
+        (
+            mgr.active.clone(),
+            mgr.active_config().map(|c| c.name.clone()),
+            v,
+        )
     };
 
     if names.is_empty() {
@@ -1717,6 +1721,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     let selected_name = ctx.view.config.selected_name.clone();
     let mut action_set_active: Option<String> = None;
+    let mut action_clear_active = false;
     let mut action_save_apply = false;
 
     {
@@ -1729,6 +1734,8 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 .show(&mut cols[0], |ui| {
                     for name in names.iter() {
                         let is_active = active_name.as_deref() == Some(name.as_str());
+                        let is_fallback_active = active_name.is_none()
+                            && active_fallback.as_deref() == Some(name.as_str());
                         let is_selected = selected_name.as_deref() == Some(name.as_str());
 
                         let svc = match ctx.view.config.service {
@@ -1757,6 +1764,8 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         }
                         if is_active {
                             label = format!("★ {label}");
+                        } else if is_fallback_active {
+                            label = format!("◇ {label}");
                         }
 
                         if ui.selectable_label(is_selected, label).clicked() {
@@ -1777,6 +1786,22 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 crate::config::ServiceKind::Claude => &mut cfg.claude,
                 crate::config::ServiceKind::Codex => &mut cfg.codex,
             };
+            let active_label = mgr
+                .active
+                .clone()
+                .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>").to_string());
+            let effective_label = mgr
+                .active_config()
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "-".to_string());
+
+            cols[1].label(format!("active: {active_label}"));
+            cols[1].label(format!(
+                "{}: {effective_label}",
+                pick(ctx.lang, "生效配置", "Effective")
+            ));
+            cols[1].add_space(6.0);
+
             let Some(svc) = mgr.configs.get_mut(&name) else {
                 cols[1].label(pick(
                     ctx.lang,
@@ -1807,6 +1832,13 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
 
                 if ui
+                    .button(pick(ctx.lang, "清除 active", "Clear active"))
+                    .clicked()
+                {
+                    action_clear_active = true;
+                }
+
+                if ui
                     .button(pick(ctx.lang, "保存并应用", "Save & apply"))
                     .clicked()
                 {
@@ -1824,6 +1856,16 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         };
         mgr.active = Some(name);
         *ctx.last_info = Some(pick(ctx.lang, "已设置 active", "Active set").to_string());
+    }
+
+    if action_clear_active {
+        let cfg = ctx.view.config.working.as_mut().expect("checked above");
+        let mgr = match ctx.view.config.service {
+            crate::config::ServiceKind::Claude => &mut cfg.claude,
+            crate::config::ServiceKind::Codex => &mut cfg.codex,
+        };
+        mgr.active = None;
+        *ctx.last_info = Some(pick(ctx.lang, "已清除 active", "Active cleared").to_string());
     }
 
     if action_save_apply {

@@ -49,7 +49,7 @@
 ### M2 — Config Editing (form-first)
 
 - [x] GUI-201 Config list + details (active/enabled/level/upstreams, health summary)
-- [ ] GUI-202 Actions: set active / clear active (auto)
+- [x] GUI-202 Actions: set active / clear active (auto)
 - [x] GUI-203 Actions: set/clear session pinned config, set/clear effort override
 - [x] GUI-207 Actions: set/clear global pinned config override
 - [x] GUI-204 Actions: toggle enabled, adjust level (persisted)
@@ -116,3 +116,4 @@
 - 2026-01-24: Finished GUI-503; GUI attach upgraded to read full runtime snapshot and write overrides (effort + session config + global override via API v1).
 - 2026-01-24: Finished GUI-207: global pinned config override UI (integrated + attach v1).
 - 2026-01-24: Finished GUI-302/303 and GUI-505: transcript all/tail + copy + open file; manual attach by port.
+- 2026-01-24: Finished GUI-202: set/clear active (auto) in config form view.
