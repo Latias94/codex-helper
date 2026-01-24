@@ -66,6 +66,7 @@
 - [x] GUI-301 History list for current dir (`~/.codex/sessions`) + refresh
 - [x] GUI-302 Transcript viewer: tail/all toggle, scrolling, copy-to-clipboard
 - [x] GUI-303 “Open in explorer/finder” for session file/logs (Windows-first)
+- [x] GUI-304 Open transcript from Sessions (jump to History + auto load by session_id)
 
 **Definition of done**
 - GUI can browse history and read/copy transcripts like TUI.
@@ -131,3 +132,4 @@
 - 2026-01-24: Finished GUI-405: startup behavior setting (show/minimized/to tray) and tray hide uses `Visible=false`.
 - 2026-01-24: Finished GUI-504 discovery: scan local ports 3210-3220 and attach with one click.
 - 2026-01-24: Finished GUI-106: sessions list stable ordering + search + lock order (avoid jitter with multiple CLIs).
+- 2026-01-24: Finished GUI-304: open transcript directly from Sessions (auto-navigate to History).

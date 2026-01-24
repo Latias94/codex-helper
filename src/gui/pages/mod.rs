@@ -23,6 +23,7 @@ pub enum Page {
 
 #[derive(Debug, Default)]
 pub struct ViewState {
+    pub requested_page: Option<Page>,
     pub sessions: SessionsViewState,
     pub requests: RequestsViewState,
     pub config: ConfigViewState,
@@ -948,6 +949,96 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].label(format!("provider: {provider}"));
         cols[1].label(format!("config(last): {last_cfg}"));
         cols[1].label(format!("effort(last): {effort_last}"));
+
+        cols[1].horizontal(|ui| {
+            let can_copy = row.session_id.is_some();
+            if ui
+                .add_enabled(
+                    can_copy,
+                    egui::Button::new(pick(ctx.lang, "复制 session_id", "Copy session_id")),
+                )
+                .clicked()
+            {
+                if let Some(sid) = row.session_id.as_deref() {
+                    ui.ctx().copy_text(sid.to_string());
+                    *ctx.last_info = Some(pick(ctx.lang, "已复制", "Copied").to_string());
+                }
+            }
+
+            let can_open_cwd = row.cwd.is_some();
+            if ui
+                .add_enabled(can_open_cwd, egui::Button::new(pick(ctx.lang, "打开 cwd", "Open cwd")))
+                .clicked()
+            {
+                if let Some(cwd) = row.cwd.as_deref() {
+                    let path = std::path::PathBuf::from(cwd);
+                    if let Err(e) = open_in_file_manager(&path, false) {
+                        *ctx.last_error = Some(format!("open cwd failed: {e}"));
+                    }
+                }
+            }
+
+            let can_open_transcript = row.session_id.is_some();
+            if ui
+                .add_enabled(
+                    can_open_transcript,
+                    egui::Button::new(pick(ctx.lang, "打开对话记录", "Open transcript")),
+                )
+                .clicked()
+            {
+                let Some(sid) = row.session_id.clone() else {
+                    return;
+                };
+                match ctx
+                    .rt
+                    .block_on(crate::sessions::find_codex_session_file_by_id(&sid))
+                {
+                    Ok(Some(path)) => {
+                        let pos = ctx.view.history.sessions.iter().position(|s| s.id == sid);
+                        let selected_idx = if let Some(pos) = pos {
+                            ctx.view.history.sessions[pos].path = path;
+                            pos
+                        } else {
+                            ctx.view.history.sessions.insert(
+                                0,
+                                SessionSummary {
+                                    id: sid.clone(),
+                                    path,
+                                    cwd: row.cwd.clone(),
+                                    created_at: None,
+                                    updated_at: None,
+                                    last_response_at: None,
+                                    user_turns: 0,
+                                    assistant_turns: 0,
+                                    rounds: 0,
+                                    first_user_message: Some(
+                                        pick(ctx.lang, "（来自 Sessions）", "(from Sessions)")
+                                            .to_string(),
+                                    ),
+                                },
+                            );
+                            0
+                        };
+
+                        ctx.view.history.selected_idx = selected_idx;
+                        ctx.view.history.selected_id = Some(sid.clone());
+                        ctx.view.history.loaded_for = None;
+                        ctx.view.history.auto_load_transcript = true;
+                        ctx.view.requested_page = Some(Page::History);
+                    }
+                    Ok(None) => {
+                        *ctx.last_error = Some(pick(
+                            ctx.lang,
+                            "未找到该 session_id 的本地 Codex 会话文件（~/.codex/sessions）。",
+                            "No local Codex session file found for this session_id (~/.codex/sessions).",
+                        ).to_string());
+                    }
+                    Err(e) => {
+                        *ctx.last_error = Some(format!("find session file failed: {e}"));
+                    }
+                }
+            }
+        });
 
         if let Some(status) = row.last_status {
             cols[1].label(format!("status(last): {status}"));

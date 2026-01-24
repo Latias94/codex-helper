@@ -339,5 +339,9 @@ impl eframe::App for GuiApp {
             };
             super::pages::render(ui, self.page, &mut page_ctx);
         });
+
+        if let Some(next) = self.view.requested_page.take() {
+            self.page = next;
+        }
     }
 }
