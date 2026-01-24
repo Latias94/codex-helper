@@ -62,8 +62,8 @@
 ### M3 — History + Transcript
 
 - [x] GUI-301 History list for current dir (`~/.codex/sessions`) + refresh
-- [~] GUI-302 Transcript viewer: tail/all toggle, paging/scrolling, copy-to-clipboard
-- [~] GUI-303 “Open in explorer/finder” for session file/logs (Windows-first)
+- [x] GUI-302 Transcript viewer: tail/all toggle, scrolling, copy-to-clipboard
+- [x] GUI-303 “Open in explorer/finder” for session file/logs (Windows-first)
 
 **Definition of done**
 - GUI can browse history and read/copy transcripts like TUI.
@@ -85,7 +85,7 @@
   - `/__codex_helper/status/active`, `/status/recent`, `/config/runtime`
 - [x] GUI-503 Extend proxy API to `/__codex_helper/api/v1/...` for full control
 - [~] GUI-504 Full attach: config actions, overrides, health checks, history/transcript via API
-- [ ] GUI-505 Optional: attach to a non-default port / discovery UI
+- [x] GUI-505 Manual attach to a specified port (no discovery UI yet)
 
 **Definition of done**
 - If the proxy is already running, GUI can attach and manage it (or at least observe, in MVP).
@@ -115,3 +115,4 @@
 - 2026-01-24: Finished GUI-301 (history list + transcript viewer tail); tray adds Reload/Open Config/Open Logs.
 - 2026-01-24: Finished GUI-503; GUI attach upgraded to read full runtime snapshot and write overrides (effort + session config + global override via API v1).
 - 2026-01-24: Finished GUI-207: global pinned config override UI (integrated + attach v1).
+- 2026-01-24: Finished GUI-302/303 and GUI-505: transcript all/tail + copy + open file; manual attach by port.

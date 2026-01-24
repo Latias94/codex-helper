@@ -6,6 +6,7 @@ use super::autostart;
 use super::config::GuiConfig;
 use super::i18n::{Language, pick};
 use super::proxy_control::{GuiConfigOption, PortInUseAction, ProxyModeKind};
+use super::util::open_in_file_manager;
 use crate::sessions::{SessionSummary, SessionTranscriptMessage};
 use crate::state::{ActiveRequest, FinishedRequest, SessionStats};
 use crate::usage::UsageMetrics;
@@ -70,10 +71,11 @@ pub struct HistoryViewState {
     pub selected_idx: usize,
     pub selected_id: Option<String>,
     pub auto_load_transcript: bool,
+    pub transcript_full: bool,
     pub transcript_tail: usize,
     pub transcript_messages: Vec<SessionTranscriptMessage>,
     pub transcript_error: Option<String>,
-    loaded_for: Option<(String, usize)>,
+    loaded_for: Option<(String, Option<usize>)>,
 }
 
 impl Default for HistoryViewState {
@@ -86,6 +88,7 @@ impl Default for HistoryViewState {
             selected_idx: 0,
             selected_id: None,
             auto_load_transcript: true,
+            transcript_full: false,
             transcript_tail: 80,
             transcript_messages: Vec::new(),
             transcript_error: None,
@@ -235,6 +238,39 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     *ctx.last_error = Some(e.to_string());
                 }
             }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(pick(
+                ctx.lang,
+                "手动附着到已运行的代理",
+                "Attach to an existing proxy",
+            ));
+            ui.horizontal(|ui| {
+                ui.label(pick(ctx.lang, "端口", "Port"));
+                let mut attach_port = ctx
+                    .gui_cfg
+                    .attach
+                    .last_port
+                    .unwrap_or(ctx.gui_cfg.proxy.default_port);
+                ui.add(egui::DragValue::new(&mut attach_port).range(1..=65535));
+                if Some(attach_port) != ctx.gui_cfg.attach.last_port {
+                    ctx.gui_cfg.attach.last_port = Some(attach_port);
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
+
+                if ui.button(pick(ctx.lang, "附着", "Attach")).clicked() {
+                    ctx.proxy.request_attach(attach_port);
+                    ctx.gui_cfg.attach.last_port = Some(attach_port);
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    } else {
+                        *ctx.last_info = Some(pick(ctx.lang, "正在附着…", "Attaching...").into());
+                    }
+                }
+            });
         }
         ProxyModeKind::Starting => {
             ui.label(pick(ctx.lang, "正在启动…", "Starting..."));
@@ -1206,16 +1242,18 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     // Auto-load transcript when selection/tail changes.
     if ctx.view.history.auto_load_transcript {
         if let Some(id) = ctx.view.history.selected_id.clone() {
-            let key = (id.clone(), ctx.view.history.transcript_tail);
+            let tail = if ctx.view.history.transcript_full {
+                None
+            } else {
+                Some(ctx.view.history.transcript_tail)
+            };
+            let key = (id.clone(), tail);
             if ctx.view.history.loaded_for.as_ref() != Some(&key) {
                 let path = ctx.view.history.sessions[selected_idx].path.clone();
-                let tail = ctx.view.history.transcript_tail;
                 match ctx
                     .rt
-                    .block_on(crate::sessions::read_codex_session_transcript(
-                        &path,
-                        Some(tail),
-                    )) {
+                    .block_on(crate::sessions::read_codex_session_transcript(&path, tail))
+                {
                     Ok(msgs) => {
                         ctx.view.history.transcript_messages = msgs;
                         ctx.view.history.transcript_error = None;
@@ -1269,12 +1307,23 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].add_space(4.0);
 
         cols[1].horizontal(|ui| {
+            let mut full = ctx.view.history.transcript_full;
+            ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
+            if full != ctx.view.history.transcript_full {
+                ctx.view.history.transcript_full = full;
+                ctx.view.history.loaded_for = None;
+            }
+
             ui.label(pick(ctx.lang, "尾部条数", "Tail"));
-            ui.add(
+            ui.add_enabled(
+                !ctx.view.history.transcript_full,
                 egui::DragValue::new(&mut ctx.view.history.transcript_tail)
                     .range(10..=500)
                     .speed(1),
             );
+            if ctx.view.history.transcript_full {
+                ui.label(pick(ctx.lang, "（忽略尾部设置）", "(tail ignored)"));
+            }
 
             if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
                 ctx.view.history.loaded_for = None;
@@ -1282,6 +1331,26 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 if !ctx.view.history.auto_load_transcript {
                     ctx.view.history.auto_load_transcript = true;
                 }
+            }
+
+            if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked() {
+                let path = ctx.view.history.sessions[selected_idx].path.clone();
+                if let Err(e) = open_in_file_manager(&path, true) {
+                    *ctx.last_error = Some(format!("open session failed: {e}"));
+                }
+            }
+
+            if ui.button(pick(ctx.lang, "复制", "Copy")).clicked() {
+                let mut out = String::new();
+                for msg in ctx.view.history.transcript_messages.iter() {
+                    let ts = msg.timestamp.as_deref().unwrap_or("-");
+                    let role = msg.role.as_str();
+                    out.push_str(&format!("[{ts}] {role}:\n"));
+                    out.push_str(msg.text.as_str());
+                    out.push_str("\n\n");
+                }
+                ui.ctx().copy_text(out);
+                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
             }
         });
 

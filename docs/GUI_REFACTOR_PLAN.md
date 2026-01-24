@@ -113,6 +113,7 @@ We add a separate GUI config file to avoid disrupting existing proxy config sema
   - `ui.refresh_ms = 500`
   - `proxy.default_service = "codex"|"claude"`
   - `proxy.default_port = 3211`
+  - `attach.last_port = 3211` (optional; used by manual attach UI)
   - `attach.on_port_in_use = "ask"|"attach"|"start_new_port"|"exit"`
   - `attach.remember_choice = true|false`
   - `window.close_behavior = "minimize_to_tray"|"exit"` (default: `minimize_to_tray`)

@@ -73,6 +73,8 @@ pub struct AttachConfig {
     pub on_port_in_use: String,
     #[serde(default)]
     pub remember_choice: bool,
+    #[serde(default)]
+    pub last_port: Option<u16>,
 }
 
 impl Default for AttachConfig {
@@ -80,6 +82,7 @@ impl Default for AttachConfig {
         Self {
             on_port_in_use: default_on_port_in_use(),
             remember_choice: false,
+            last_port: None,
         }
     }
 }
