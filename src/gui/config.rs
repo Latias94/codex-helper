@@ -91,12 +91,15 @@ impl Default for AttachConfig {
 pub struct WindowConfig {
     #[serde(default = "default_close_behavior")]
     pub close_behavior: String,
+    #[serde(default = "default_startup_behavior")]
+    pub startup_behavior: String,
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
             close_behavior: default_close_behavior(),
+            startup_behavior: default_startup_behavior(),
         }
     }
 }
@@ -152,6 +155,10 @@ fn default_on_port_in_use() -> String {
 }
 
 fn default_close_behavior() -> String {
+    "minimize_to_tray".to_string()
+}
+
+fn default_startup_behavior() -> String {
     "minimize_to_tray".to_string()
 }
 

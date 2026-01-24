@@ -8,6 +8,24 @@ use super::single_instance::{AcquireResult, SingleInstance};
 use super::tray::{TrayAction, TrayController};
 use super::util::open_in_file_manager;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupBehavior {
+    Show,
+    Minimized,
+    MinimizeToTray,
+}
+
+impl StartupBehavior {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "show" | "visible" => Self::Show,
+            "minimized" | "minimize" => Self::Minimized,
+            "tray" | "minimize_to_tray" | "minimized_to_tray" => Self::MinimizeToTray,
+            _ => Self::MinimizeToTray,
+        }
+    }
+}
+
 pub fn run() -> eframe::Result<()> {
     let single_instance = match SingleInstance::acquire_or_notify() {
         Ok(AcquireResult::Primary(guard)) => Some(guard),
@@ -37,7 +55,7 @@ struct GuiApp {
     rt: tokio::runtime::Runtime,
     proxy: ProxyController,
     tray: Option<TrayController>,
-    start_minimized: bool,
+    pending_startup: Option<StartupBehavior>,
     allow_close_once: bool,
     single_instance: Option<SingleInstance>,
 }
@@ -45,11 +63,20 @@ struct GuiApp {
 impl GuiApp {
     fn new(single_instance: Option<SingleInstance>) -> Self {
         let args = std::env::args().collect::<Vec<_>>();
-        let start_minimized = args
+        let gui_cfg = GuiConfig::load_or_default();
+        let arg_minimized = args
             .iter()
             .any(|a| a == "--autostart" || a == "--minimized");
+        let startup_behavior = if arg_minimized {
+            StartupBehavior::MinimizeToTray
+        } else {
+            StartupBehavior::parse(&gui_cfg.window.startup_behavior)
+        };
+        let pending_startup = match startup_behavior {
+            StartupBehavior::Show => None,
+            _ => Some(startup_behavior),
+        };
 
-        let gui_cfg = GuiConfig::load_or_default();
         let proxy_config_path = crate::config::config_file_path();
         let proxy_config_text = std::fs::read_to_string(&proxy_config_path).unwrap_or_default();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -65,7 +92,7 @@ impl GuiApp {
             rt,
             proxy,
             tray: None,
-            start_minimized,
+            pending_startup,
             allow_close_once: false,
             single_instance,
         }
@@ -86,14 +113,10 @@ impl eframe::App for GuiApp {
             .as_ref()
             .is_some_and(|si| si.check_show_requested())
         {
+            self.pending_startup = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-
-        if self.start_minimized {
-            self.start_minimized = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
 
         // Lazy-init tray: needs an event loop on this thread.
@@ -110,6 +133,21 @@ impl eframe::App for GuiApp {
             self.tray = None;
         }
 
+        if let Some(behavior) = self.pending_startup.take() {
+            match behavior {
+                StartupBehavior::Show => {}
+                StartupBehavior::Minimized => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                StartupBehavior::MinimizeToTray => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    if self.tray.is_some() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    }
+                }
+            }
+        }
+
         if let Some(tray) = self.tray.as_ref() {
             for action in tray.drain_actions() {
                 match action {
@@ -120,12 +158,17 @@ impl eframe::App for GuiApp {
                     }
                     TrayAction::Hide => {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     }
                     TrayAction::Toggle => {
                         let is_min = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(!is_min));
                         if is_min {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                         }
                     }
                     TrayAction::StartProxy => {
@@ -184,6 +227,9 @@ impl eframe::App for GuiApp {
             } else if self.gui_cfg.window.close_behavior == "minimize_to_tray" {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                if self.tray.is_some() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
             }
         }
 

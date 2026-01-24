@@ -1536,6 +1536,48 @@ fn render_settings(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     });
 
     ui.horizontal(|ui| {
+        ui.label(pick(ctx.lang, "启动时行为", "Startup behavior"));
+
+        let mut behavior = ctx.gui_cfg.window.startup_behavior.clone();
+        let selected_label = match behavior.as_str() {
+            "show" => pick(ctx.lang, "显示窗口", "Show window"),
+            "minimized" => pick(ctx.lang, "最小化到任务栏", "Minimize"),
+            _ => pick(ctx.lang, "最小化到托盘", "Minimize to tray"),
+        };
+
+        egui::ComboBox::from_id_salt("window_startup_behavior")
+            .selected_text(selected_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut behavior,
+                    "show".to_string(),
+                    pick(ctx.lang, "显示窗口", "Show window"),
+                );
+                ui.selectable_value(
+                    &mut behavior,
+                    "minimized".to_string(),
+                    pick(ctx.lang, "最小化到任务栏", "Minimize"),
+                );
+                ui.selectable_value(
+                    &mut behavior,
+                    "minimize_to_tray".to_string(),
+                    pick(ctx.lang, "最小化到托盘", "Minimize to tray"),
+                );
+            });
+
+        if behavior != ctx.gui_cfg.window.startup_behavior {
+            ctx.gui_cfg.window.startup_behavior = behavior;
+            if let Err(e) = ctx.gui_cfg.save() {
+                *ctx.last_error = Some(format!("save gui config failed: {e}"));
+            } else {
+                *ctx.last_info = Some(
+                    pick(ctx.lang, "已保存（下次启动生效）", "Saved (next launch)").to_string(),
+                );
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
         let mut enabled = ctx.gui_cfg.tray.enabled;
         ui.checkbox(&mut enabled, pick(ctx.lang, "启用托盘", "Enable tray"));
         if enabled != ctx.gui_cfg.tray.enabled {

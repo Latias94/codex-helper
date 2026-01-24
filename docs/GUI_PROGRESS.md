@@ -75,6 +75,7 @@
 - [x] GUI-402 Close-to-tray behavior (configurable)
 - [x] GUI-403 Autostart toggle (Windows registry; best-effort other platforms)
 - [x] GUI-404 Single-instance guard + focus existing instance
+- [x] GUI-405 Startup behavior: start minimized / minimize-to-tray (configurable)
 
 **Definition of done**
 - GUI behaves like a desktop companion: tray + autostart works on Windows.
@@ -125,3 +126,4 @@
 - 2026-01-24: Finished GUI-202: set/clear active (auto) in config form view.
 - 2026-01-24: Finished GUI-205: import/sync providers from Codex CLI (preview + apply & save).
 - 2026-01-24: Finished GUI-208: health check controls + attach v1 endpoints for status/start/cancel.
+- 2026-01-24: Finished GUI-405: startup behavior setting (show/minimized/to tray) and tray hide uses `Visible=false`.
