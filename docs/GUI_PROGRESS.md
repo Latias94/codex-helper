@@ -53,7 +53,7 @@
 - [x] GUI-203 Actions: set/clear session pinned config, set/clear effort override
 - [x] GUI-207 Actions: set/clear global pinned config override
 - [x] GUI-204 Actions: toggle enabled, adjust level (persisted)
-- [ ] GUI-205 Import from Codex CLI (sync auth env keys best-effort) + overwrite confirmation flow
+- [x] GUI-205 Import from Codex CLI (sync auth env keys best-effort) + overwrite confirmation flow
 - [x] GUI-206 Optional: advanced raw editor (TOML) with validation and “apply” button
 
 **Definition of done**
@@ -117,3 +117,4 @@
 - 2026-01-24: Finished GUI-207: global pinned config override UI (integrated + attach v1).
 - 2026-01-24: Finished GUI-302/303 and GUI-505: transcript all/tail + copy + open file; manual attach by port.
 - 2026-01-24: Finished GUI-202: set/clear active (auto) in config form view.
+- 2026-01-24: Finished GUI-205: import/sync providers from Codex CLI (preview + apply & save).
