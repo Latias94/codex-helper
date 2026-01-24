@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::config::proxy_home_dir;
@@ -273,7 +273,7 @@ pub struct HttpDebugRef {
     pub file: String,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct RetryInfo {
     pub attempts: u32,
     pub upstream_chain: Vec<String>,

@@ -8,7 +8,7 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use reqwest::Client;
 use std::sync::OnceLock;
 use tracing::{instrument, warn};
@@ -2707,12 +2707,39 @@ pub fn router(proxy: ProxyService) -> Router {
         effort: Option<String>,
     }
 
+    #[derive(serde::Deserialize)]
+    struct SessionConfigOverrideRequest {
+        session_id: String,
+        config_name: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GlobalConfigOverrideRequest {
+        config_name: Option<String>,
+    }
+
     #[derive(serde::Serialize)]
     struct RuntimeConfigStatus {
         config_path: String,
         loaded_at_ms: u64,
         source_mtime_ms: Option<u64>,
         retry: crate::config::ResolvedRetryConfig,
+    }
+
+    #[derive(serde::Serialize)]
+    struct ApiCapabilities {
+        api_version: u32,
+        service_name: &'static str,
+        endpoints: Vec<&'static str>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct ConfigOption {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+        enabled: bool,
+        level: u8,
     }
 
     #[derive(serde::Serialize)]
@@ -2794,11 +2821,92 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(Json(map))
     }
 
+    async fn set_session_config_override(
+        proxy: ProxyService,
+        Json(payload): Json<SessionConfigOverrideRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        if payload.session_id.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "session_id is required".to_string(),
+            ));
+        }
+        if let Some(config_name) = payload.config_name {
+            if config_name.trim().is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "config_name is empty".to_string()));
+            }
+            proxy
+                .state
+                .set_session_config_override(
+                    payload.session_id,
+                    config_name,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                )
+                .await;
+        } else {
+            proxy
+                .state
+                .clear_session_config_override(payload.session_id.as_str())
+                .await;
+        }
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn list_session_config_overrides(
+        proxy: ProxyService,
+    ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
+        let map = proxy.state.list_session_config_overrides().await;
+        Ok(Json(map))
+    }
+
+    async fn get_global_config_override(
+        proxy: ProxyService,
+    ) -> Result<Json<Option<String>>, (StatusCode, String)> {
+        Ok(Json(proxy.state.get_global_config_override().await))
+    }
+
+    async fn set_global_config_override(
+        proxy: ProxyService,
+        Json(payload): Json<GlobalConfigOverrideRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        if let Some(config_name) = payload.config_name {
+            if config_name.trim().is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "config_name is empty".to_string()));
+            }
+            proxy
+                .state
+                .set_global_config_override(
+                    config_name,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                )
+                .await;
+        } else {
+            proxy.state.clear_global_config_override().await;
+        }
+        Ok(StatusCode::NO_CONTENT)
+    }
+
     async fn list_active_requests(
         proxy: ProxyService,
     ) -> Result<Json<Vec<ActiveRequest>>, (StatusCode, String)> {
         let vec = proxy.state.list_active_requests().await;
         Ok(Json(vec))
+    }
+
+    async fn list_session_stats(
+        proxy: ProxyService,
+    ) -> Result<
+        Json<std::collections::HashMap<String, crate::state::SessionStats>>,
+        (StatusCode, String),
+    > {
+        let map = proxy.state.list_session_stats().await;
+        Ok(Json(map))
     }
 
     #[derive(serde::Deserialize)]
@@ -2815,6 +2923,49 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(Json(vec))
     }
 
+    async fn api_capabilities(
+        proxy: ProxyService,
+    ) -> Result<Json<ApiCapabilities>, (StatusCode, String)> {
+        Ok(Json(ApiCapabilities {
+            api_version: 1,
+            service_name: proxy.service_name,
+            endpoints: vec![
+                "/__codex_helper/api/v1/capabilities",
+                "/__codex_helper/api/v1/status/active",
+                "/__codex_helper/api/v1/status/recent",
+                "/__codex_helper/api/v1/status/session-stats",
+                "/__codex_helper/api/v1/config/runtime",
+                "/__codex_helper/api/v1/config/reload",
+                "/__codex_helper/api/v1/configs",
+                "/__codex_helper/api/v1/overrides/session/effort",
+                "/__codex_helper/api/v1/overrides/session/config",
+                "/__codex_helper/api/v1/overrides/global-config",
+            ],
+        }))
+    }
+
+    async fn list_configs(
+        proxy: ProxyService,
+    ) -> Result<Json<Vec<ConfigOption>>, (StatusCode, String)> {
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+        let mut out = mgr
+            .configs
+            .iter()
+            .map(|(name, c)| ConfigOption {
+                name: name.clone(),
+                alias: c.alias.clone(),
+                enabled: c.enabled,
+                level: c.level.clamp(1, 10),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+        Ok(Json(out))
+    }
+
     let p0 = proxy.clone();
     let p1 = proxy.clone();
     let p2 = proxy.clone();
@@ -2823,8 +2974,65 @@ pub fn router(proxy: ProxyService) -> Router {
     let p5 = proxy.clone();
     let p6 = proxy.clone();
     let p7 = proxy.clone();
+    let p8 = proxy.clone();
+    let p9 = proxy.clone();
+    let p10 = proxy.clone();
+    let p11 = proxy.clone();
+    let p12 = proxy.clone();
+    let p13 = proxy.clone();
+    let p14 = proxy.clone();
+    let p15 = proxy.clone();
+    let p16 = proxy.clone();
+    let p17 = proxy.clone();
+    let p18 = proxy.clone();
+    let p19 = proxy.clone();
+    let p20 = proxy.clone();
 
     Router::new()
+        // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
+        .route(
+            "/__codex_helper/api/v1/capabilities",
+            get(move || api_capabilities(p8.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/status/active",
+            get(move || list_active_requests(p9.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/status/recent",
+            get(move |q| list_recent_finished(p10.clone(), q)),
+        )
+        .route(
+            "/__codex_helper/api/v1/status/session-stats",
+            get(move || list_session_stats(p11.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/config/runtime",
+            get(move || runtime_config_status(p12.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/config/reload",
+            post(move || reload_runtime_config(p13.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/configs",
+            get(move || list_configs(p14.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/overrides/session/effort",
+            get(move || list_session_overrides(p15.clone()))
+                .post(move |payload| set_session_override(p16.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/overrides/session/config",
+            get(move || list_session_config_overrides(p17.clone()))
+                .post(move |payload| set_session_config_override(p18.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/overrides/global-config",
+            get(move || get_global_config_override(p19.clone()))
+                .post(move |payload| set_global_config_override(p20.clone(), payload)),
+        )
         .route(
             "/__codex_helper/override/session",
             get(move || list_session_overrides(p0.clone()))

@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
@@ -142,7 +142,7 @@ pub struct HealthCheckStatus {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveRequest {
     pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,7 +165,7 @@ pub struct ActiveRequest {
     pub started_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FinishedRequest {
     pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,7 +207,7 @@ pub struct FinishRequestParams {
     pub ttfb_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionStats {
     pub turns_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -417,6 +417,11 @@ impl ProxyState {
     pub async fn get_global_config_override(&self) -> Option<String> {
         let guard = self.global_config_override.read().await;
         guard.clone()
+    }
+
+    pub async fn set_global_config_override(&self, config_name: String, _now_ms: u64) {
+        let mut guard = self.global_config_override.write().await;
+        *guard = Some(config_name);
     }
 
     pub async fn clear_global_config_override(&self) {
