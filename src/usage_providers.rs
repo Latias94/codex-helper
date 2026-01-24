@@ -249,6 +249,12 @@ pub async fn poll_for_codex_upstream(
     config_name: &str,
     upstream_index: usize,
 ) {
+    // Tests should be hermetic and should not depend on any real user `usage_providers.json` on
+    // the machine running the suite. Disable provider polling during tests to avoid flakiness.
+    if cfg!(test) {
+        return;
+    }
+
     let providers_file = load_providers();
     if providers_file.providers.is_empty() {
         return;
