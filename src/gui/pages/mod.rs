@@ -204,6 +204,9 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     ui.separator();
 
+    let mut action_scan_local_proxies = false;
+    let mut action_attach_discovered: Option<u16> = None;
+
     // Sync defaults from GUI config (so Settings changes take effect without restart).
     // Avoid overriding the UI state while running/attached.
     if matches!(ctx.proxy.kind(), ProxyModeKind::Stopped) {
@@ -296,6 +299,71 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     }
                 }
             });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(pick(
+                ctx.lang,
+                "自动发现本机已运行的代理（端口 3210-3220）",
+                "Discover running local proxies (ports 3210-3220)",
+            ));
+            ui.horizontal(|ui| {
+                if ui
+                    .button(pick(ctx.lang, "扫描 3210-3220", "Scan 3210-3220"))
+                    .clicked()
+                {
+                    action_scan_local_proxies = true;
+                }
+                if let Some(t) = ctx.proxy.last_discovery_scan() {
+                    ui.label(format!(
+                        "{}: {}s",
+                        pick(ctx.lang, "上次扫描", "Last scan"),
+                        t.elapsed().as_secs()
+                    ));
+                }
+            });
+
+            let discovered = ctx.proxy.discovered_proxies().to_vec();
+            if discovered.is_empty() {
+                ui.label(pick(ctx.lang, "（未发现可用代理）", "(no proxies found)"));
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("discovered_proxies_grid")
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label(pick(ctx.lang, "端口", "Port"));
+                                ui.label(pick(ctx.lang, "服务", "Service"));
+                                ui.label(pick(ctx.lang, "API", "API"));
+                                ui.label(pick(ctx.lang, "状态", "Status"));
+                                ui.end_row();
+
+                                for p in discovered {
+                                    ui.label(p.port.to_string());
+                                    ui.label(
+                                        p.service_name
+                                            .as_deref()
+                                            .unwrap_or_else(|| pick(ctx.lang, "未知", "unknown")),
+                                    );
+                                    ui.label(match p.api_version {
+                                        Some(v) => format!("v{v}"),
+                                        None => "-".to_string(),
+                                    });
+                                    if let Some(err) = p.last_error.as_deref() {
+                                        ui.label(err);
+                                    } else {
+                                        ui.label(pick(ctx.lang, "可用", "OK"));
+                                    }
+
+                                    if ui.button(pick(ctx.lang, "附着", "Attach")).clicked() {
+                                        action_attach_discovered = Some(p.port);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
         }
         ProxyModeKind::Starting => {
             ui.label(pick(ctx.lang, "正在启动…", "Starting..."));
@@ -564,6 +632,28 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     *ctx.last_info = Some(pick(ctx.lang, "已取消附着", "Detached").to_string());
                 }
             });
+        }
+    }
+
+    if action_scan_local_proxies {
+        if let Err(e) = ctx.proxy.scan_local_proxies(ctx.rt, 3210..=3220) {
+            *ctx.last_error = Some(format!("scan failed: {e}"));
+        } else if ctx.proxy.discovered_proxies().is_empty() {
+            *ctx.last_info =
+                Some(pick(ctx.lang, "扫描完成：未发现代理", "Scan done: none found").to_string());
+        } else {
+            *ctx.last_info =
+                Some(pick(ctx.lang, "扫描完成：已列出可用代理", "Scan done").to_string());
+        }
+    }
+
+    if let Some(port) = action_attach_discovered {
+        ctx.proxy.request_attach(port);
+        ctx.gui_cfg.attach.last_port = Some(port);
+        if let Err(e) = ctx.gui_cfg.save() {
+            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+        } else {
+            *ctx.last_info = Some(pick(ctx.lang, "正在附着…", "Attaching...").into());
         }
     }
 

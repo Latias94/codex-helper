@@ -91,7 +91,7 @@
   - [x] Overrides: session config/effort + global pinned
   - [x] Health checks: start/cancel + status
   - [x] History/transcript: list + tail/all + copy + open file
-  - [ ] Discovery UI: scan/list existing proxy instances
+  - [x] Discovery UI: scan/list existing proxy instances (default 3210-3220)
 - [x] GUI-505 Manual attach to a specified port (no discovery UI yet)
 
 **Definition of done**
@@ -127,3 +127,4 @@
 - 2026-01-24: Finished GUI-205: import/sync providers from Codex CLI (preview + apply & save).
 - 2026-01-24: Finished GUI-208: health check controls + attach v1 endpoints for status/start/cancel.
 - 2026-01-24: Finished GUI-405: startup behavior setting (show/minimized/to tray) and tray hide uses `Visible=false`.
+- 2026-01-24: Finished GUI-504 discovery: scan local ports 3210-3220 and attach with one click.

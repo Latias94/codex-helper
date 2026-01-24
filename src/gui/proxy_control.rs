@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use futures_util::future::join_all;
 use reqwest::Client;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -159,6 +160,20 @@ pub struct ProxyController {
 
     port_in_use_modal: Option<PortInUseModal>,
     http_client: Client,
+
+    discovered: Vec<DiscoveredProxy>,
+    last_discovery_scan: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredProxy {
+    pub port: u16,
+    pub base_url: String,
+    pub api_version: Option<u32>,
+    pub service_name: Option<String>,
+    pub endpoints: Vec<String>,
+    pub runtime_loaded_at_ms: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 struct PortInUseModal {
@@ -176,6 +191,8 @@ impl ProxyController {
             last_start_error: None,
             port_in_use_modal: None,
             http_client: Client::new(),
+            discovered: Vec::new(),
+            last_discovery_scan: None,
         }
     }
 
@@ -211,6 +228,14 @@ impl ProxyController {
 
     pub fn last_start_error(&self) -> Option<&str> {
         self.last_start_error.as_deref()
+    }
+
+    pub fn discovered_proxies(&self) -> &[DiscoveredProxy] {
+        &self.discovered
+    }
+
+    pub fn last_discovery_scan(&self) -> Option<Instant> {
+        self.last_discovery_scan
     }
 
     pub fn running(&self) -> Option<&RunningProxy> {
@@ -333,6 +358,113 @@ impl ProxyController {
         self.mode = ProxyMode::Attached(AttachedStatus::new(port));
         self.last_start_error = None;
         self.port_in_use_modal = None;
+    }
+
+    pub fn scan_local_proxies(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        ports: std::ops::RangeInclusive<u16>,
+    ) -> anyhow::Result<()> {
+        #[derive(Debug, serde::Deserialize)]
+        struct ApiCapabilities {
+            api_version: u32,
+            service_name: String,
+            #[serde(default)]
+            endpoints: Vec<String>,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct RuntimeConfigStatus {
+            loaded_at_ms: u64,
+            #[serde(default)]
+            source_mtime_ms: Option<u64>,
+        }
+
+        async fn get_json<T: serde::de::DeserializeOwned>(
+            client: &Client,
+            url: String,
+            timeout: Duration,
+        ) -> anyhow::Result<T> {
+            Ok(client
+                .get(url)
+                .timeout(timeout)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<T>()
+                .await?)
+        }
+
+        async fn scan_port(client: Client, port: u16) -> Option<DiscoveredProxy> {
+            let base_url = format!("http://127.0.0.1:{port}");
+            let timeout = Duration::from_millis(250);
+
+            let caps = get_json::<ApiCapabilities>(
+                &client,
+                format!("{base_url}/__codex_helper/api/v1/capabilities"),
+                timeout,
+            )
+            .await;
+
+            if let Ok(c) = caps {
+                let runtime = get_json::<RuntimeConfigStatus>(
+                    &client,
+                    format!("{base_url}/__codex_helper/api/v1/config/runtime"),
+                    timeout,
+                )
+                .await
+                .ok();
+
+                return Some(DiscoveredProxy {
+                    port,
+                    base_url,
+                    api_version: Some(c.api_version),
+                    service_name: Some(c.service_name),
+                    endpoints: c.endpoints,
+                    runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
+                    last_error: None,
+                });
+            }
+
+            let runtime = get_json::<RuntimeConfigStatus>(
+                &client,
+                format!("{base_url}/__codex_helper/config/runtime"),
+                timeout,
+            )
+            .await;
+            match runtime {
+                Ok(r) => Some(DiscoveredProxy {
+                    port,
+                    base_url,
+                    api_version: None,
+                    service_name: None,
+                    endpoints: Vec::new(),
+                    runtime_loaded_at_ms: Some(r.loaded_at_ms),
+                    last_error: None,
+                }),
+                Err(_) => None,
+            }
+        }
+
+        let client = self.http_client.clone();
+        let ports_vec = ports.collect::<Vec<_>>();
+        let fut = async move {
+            let tasks = ports_vec
+                .into_iter()
+                .map(|port| scan_port(client.clone(), port));
+            let mut found = join_all(tasks)
+                .await
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            found.sort_by_key(|p| p.port);
+            Ok::<_, anyhow::Error>(found)
+        };
+
+        let found = rt.block_on(fut)?;
+        self.discovered = found;
+        self.last_discovery_scan = Some(Instant::now());
+        Ok(())
     }
 
     pub fn detach(&mut self) {
