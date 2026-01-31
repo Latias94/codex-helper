@@ -65,6 +65,7 @@ struct GuiApp {
     allow_close_once: bool,
     single_instance: Option<SingleInstance>,
     did_auto_connect: bool,
+    did_load_fonts: bool,
     _log_guard: Option<LogGuard>,
 }
 
@@ -104,6 +105,7 @@ impl GuiApp {
             allow_close_once: false,
             single_instance,
             did_auto_connect: false,
+            did_load_fonts: false,
             _log_guard: log_guard,
         }
     }
@@ -112,6 +114,11 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.0);
+
+        if !self.did_load_fonts {
+            self.did_load_fonts = true;
+            install_fonts(ctx);
+        }
 
         let lang: Language = self.gui_cfg.language_enum();
         let refresh =
@@ -360,4 +367,52 @@ fn init_gui_tracing() -> Option<LogGuard> {
         .with_writer(non_blocking)
         .init();
     Some(guard)
+}
+
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut installed_any = false;
+
+    #[cfg(windows)]
+    {
+        if let Some((name, data)) = load_windows_cjk_font() {
+            fonts.font_data.insert(name.clone(), data);
+            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                list.insert(0, name.clone());
+            }
+            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                // Keep existing monospace font first; add CJK as fallback.
+                if !list.contains(&name) {
+                    list.push(name.clone());
+                }
+            }
+            installed_any = true;
+            tracing::info!("gui fonts: installed windows cjk font: {name}");
+        } else {
+            tracing::warn!(
+                "gui fonts: failed to load any windows cjk font; chinese may render as tofu"
+            );
+        }
+    }
+
+    if installed_any {
+        ctx.set_fonts(fonts);
+    }
+}
+
+#[cfg(windows)]
+fn load_windows_cjk_font() -> Option<(String, egui::FontData)> {
+    fn try_load(name: &str, filename: &str) -> Option<(String, egui::FontData)> {
+        let path = std::path::PathBuf::from(r"C:\Windows\Fonts").join(filename);
+        let bytes = std::fs::read(&path).ok()?;
+        let data = egui::FontData::from_owned(bytes);
+        Some((name.to_string(), data))
+    }
+
+    // Prefer TTF/OTF to avoid TTC parsing issues.
+    try_load("Deng", "Deng.ttf")
+        .or_else(|| try_load("SimHei", "simhei.ttf"))
+        .or_else(|| try_load("SimKai", "simkai.ttf"))
+        .or_else(|| try_load("STKaiTi", "STKAITI.TTF"))
+        .or_else(|| try_load("SimsunExtG", "SimsunExtG.ttf"))
 }
