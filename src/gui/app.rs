@@ -1,5 +1,7 @@
 use eframe::egui;
 
+use tracing_subscriber::EnvFilter;
+
 use super::config::GuiConfig;
 use super::i18n::{Language, pick};
 use super::pages::{Page, PageCtx, ViewState};
@@ -7,6 +9,8 @@ use super::proxy_control::ProxyController;
 use super::single_instance::{AcquireResult, SingleInstance};
 use super::tray::{TrayAction, TrayController};
 use super::util::open_in_file_manager;
+
+type LogGuard = tracing_appender::non_blocking::WorkerGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupBehavior {
@@ -27,6 +31,8 @@ impl StartupBehavior {
 }
 
 pub fn run() -> eframe::Result<()> {
+    let log_guard = init_gui_tracing();
+
     let single_instance = match SingleInstance::acquire_or_notify() {
         Ok(AcquireResult::Primary(guard)) => Some(guard),
         Ok(AcquireResult::SecondaryNotified) => return Ok(()),
@@ -40,7 +46,7 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "codex-helper (GUI)",
         options,
-        Box::new(move |_cc| Ok(Box::new(GuiApp::new(single_instance)))),
+        Box::new(move |_cc| Ok(Box::new(GuiApp::new(single_instance, log_guard)))),
     )
 }
 
@@ -59,10 +65,11 @@ struct GuiApp {
     allow_close_once: bool,
     single_instance: Option<SingleInstance>,
     did_auto_connect: bool,
+    _log_guard: Option<LogGuard>,
 }
 
 impl GuiApp {
-    fn new(single_instance: Option<SingleInstance>) -> Self {
+    fn new(single_instance: Option<SingleInstance>, log_guard: Option<LogGuard>) -> Self {
         let args = std::env::args().collect::<Vec<_>>();
         let gui_cfg = GuiConfig::load_or_default();
         let arg_minimized = args
@@ -97,6 +104,7 @@ impl GuiApp {
             allow_close_once: false,
             single_instance,
             did_auto_connect: false,
+            _log_guard: log_guard,
         }
     }
 }
@@ -215,9 +223,6 @@ impl eframe::App for GuiApp {
                 }
                 StartupBehavior::MinimizeToTray => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    if self.tray.is_some() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                    }
                 }
             }
         }
@@ -232,7 +237,6 @@ impl eframe::App for GuiApp {
                     }
                     TrayAction::Hide => {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     }
                     TrayAction::Toggle => {
                         let is_min = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
@@ -242,7 +246,6 @@ impl eframe::App for GuiApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                         } else {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                         }
                     }
                     TrayAction::StartProxy => {
@@ -301,9 +304,6 @@ impl eframe::App for GuiApp {
             } else if self.gui_cfg.window.close_behavior == "minimize_to_tray" {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                if self.tray.is_some() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                }
             }
         }
 
@@ -344,4 +344,20 @@ impl eframe::App for GuiApp {
             self.page = next;
         }
     }
+}
+
+fn init_gui_tracing() -> Option<LogGuard> {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let log_dir = crate::config::proxy_home_dir().join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let file_appender = tracing_appender::rolling::never(&log_dir, "gui.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_ansi(false)
+        .with_writer(non_blocking)
+        .init();
+    Some(guard)
 }

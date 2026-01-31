@@ -47,10 +47,15 @@ impl TrayController {
 
         let menu = Menu::new();
         let show = MenuItem::with_id(id_show.clone(), pick(lang, "显示", "Show"), true, None);
-        let hide = MenuItem::with_id(id_hide.clone(), pick(lang, "隐藏", "Hide"), true, None);
+        let hide = MenuItem::with_id(
+            id_hide.clone(),
+            pick(lang, "最小化", "Minimize"),
+            true,
+            None,
+        );
         let toggle = MenuItem::with_id(
             id_toggle.clone(),
-            pick(lang, "显示/隐藏", "Show/Hide"),
+            pick(lang, "显示/最小化", "Show/Minimize"),
             true,
             None,
         );
