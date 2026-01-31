@@ -395,6 +395,27 @@ fn install_fonts(ctx: &egui::Context) {
         }
     }
 
+    #[cfg(not(windows))]
+    {
+        if let Some((name, data)) = load_system_cjk_font() {
+            fonts.font_data.insert(name.clone(), data);
+            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                list.insert(0, name.clone());
+            }
+            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                if !list.contains(&name) {
+                    list.push(name.clone());
+                }
+            }
+            installed_any = true;
+            tracing::info!("gui fonts: installed system cjk font: {name}");
+        } else {
+            tracing::warn!(
+                "gui fonts: failed to load any system cjk font; chinese may render as tofu"
+            );
+        }
+    }
+
     if installed_any {
         ctx.set_fonts(fonts);
     }
@@ -415,4 +436,71 @@ fn load_windows_cjk_font() -> Option<(String, egui::FontData)> {
         .or_else(|| try_load("SimKai", "simkai.ttf"))
         .or_else(|| try_load("STKaiTi", "STKAITI.TTF"))
         .or_else(|| try_load("SimsunExtG", "SimsunExtG.ttf"))
+}
+
+#[cfg(not(windows))]
+fn load_system_cjk_font() -> Option<(String, egui::FontData)> {
+    use fontdb::{Database, Family, Query};
+
+    fn try_load_face(db: &Database, family: &str) -> Option<(String, egui::FontData)> {
+        let id = db.query(&Query {
+            families: &[Family::Name(family)],
+            ..Query::default()
+        })?;
+        let face = db.face(id)?;
+        match &face.source {
+            fontdb::Source::Binary(data) => {
+                let bytes = data.as_ref().as_ref().to_vec();
+                Some((family.to_string(), egui::FontData::from_owned(bytes)))
+            }
+            #[cfg(feature = "fs")]
+            fontdb::Source::File(path) => {
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if ext != "ttf" && ext != "otf" {
+                    return None;
+                }
+                let bytes = std::fs::read(path).ok()?;
+                Some((family.to_string(), egui::FontData::from_owned(bytes)))
+            }
+            #[cfg(all(feature = "fs", feature = "memmap"))]
+            fontdb::Source::SharedFile(path, data) => {
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if ext != "ttf" && ext != "otf" {
+                    return None;
+                }
+                let bytes = data.as_ref().as_ref().to_vec();
+                Some((family.to_string(), egui::FontData::from_owned(bytes)))
+            }
+        }
+    }
+
+    let mut db = Database::new();
+    db.load_system_fonts();
+
+    // Best-effort. Many systems ship CJK fonts as .ttc; egui typically needs .ttf/.otf.
+    for family in [
+        "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "Noto Sans CJK KR",
+        "Source Han Sans SC",
+        "Source Han Sans CN",
+        "WenQuanYi Zen Hei",
+        "WenQuanYi Micro Hei",
+        "PingFang SC",
+        "Hiragino Sans GB",
+    ] {
+        if let Some(v) = try_load_face(&db, family) {
+            return Some(v);
+        }
+    }
+
+    None
 }
