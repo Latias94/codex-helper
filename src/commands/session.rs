@@ -75,13 +75,14 @@ fn spawn_windows_terminal_wt(
     dry_run: bool,
 ) -> CliResult<()> {
     let shell_base = basename_lower(shell);
-    let mut args: Vec<String> = Vec::new();
-    args.push("-w".to_string());
-    args.push(wt_window.to_string());
-    args.push("new-tab".to_string());
-    args.push("-d".to_string());
-    args.push(workdir.to_string());
-    args.push(shell.to_string());
+    let mut args: Vec<String> = vec![
+        "-w".to_string(),
+        wt_window.to_string(),
+        "new-tab".to_string(),
+        "-d".to_string(),
+        workdir.to_string(),
+        shell.to_string(),
+    ];
 
     if shell_base.contains("pwsh") || shell_base.contains("powershell") {
         args.push("-ExecutionPolicy".to_string());
@@ -125,12 +126,13 @@ fn spawn_wezterm(
     dry_run: bool,
 ) -> CliResult<()> {
     let shell_base = basename_lower(shell);
-    let mut args: Vec<String> = Vec::new();
-    args.push("start".to_string());
-    args.push("--cwd".to_string());
-    args.push(workdir.to_string());
-    args.push("--".to_string());
-    args.push(shell.to_string());
+    let mut args: Vec<String> = vec![
+        "start".to_string(),
+        "--cwd".to_string(),
+        workdir.to_string(),
+        "--".to_string(),
+        shell.to_string(),
+    ];
 
     if shell_base.contains("pwsh") || shell_base.contains("powershell") {
         if keep_open {
@@ -246,19 +248,15 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                 return Ok(());
             }
 
-            let term = terminal.unwrap_or_else(|| {
-                if cfg!(windows) {
-                    RecentTerminal::Wt
-                } else {
-                    RecentTerminal::Wezterm
-                }
+            let term = terminal.unwrap_or(if cfg!(windows) {
+                RecentTerminal::Wt
+            } else {
+                RecentTerminal::Wezterm
             });
-            let shell = shell.unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "pwsh".to_string()
-                } else {
-                    "sh".to_string()
-                }
+            let shell = shell.unwrap_or(if cfg!(windows) {
+                "pwsh".to_string()
+            } else {
+                "sh".to_string()
             });
 
             for (root, id, _cwd, _mtime_ms) in rows {

@@ -1164,7 +1164,7 @@ fn parse_linux_ss_listening_owners(output: &str, port: u16) -> Vec<PortOwner> {
             let after = &rest[pid_pos + 4..];
             let pid_len = after.chars().take_while(|c| c.is_ascii_digit()).count();
             if pid_len == 0 {
-                rest = &after;
+                rest = after;
                 continue;
             }
             let Ok(pid) = after[..pid_len].parse::<u32>() else {
@@ -1232,97 +1232,6 @@ fn do_switch_on(port: u16, codex: bool, claude: bool) -> CliResult<()> {
         codex_integration::switch_on(port).map_err(|e| CliError::CodexConfig(e.to_string()))?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod listener_bind_help_tests {
-    use super::*;
-
-    #[test]
-    fn bind_help_mentions_addr_and_service() {
-        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
-        let err = std::io::Error::new(ErrorKind::AddrInUse, "in use");
-        let msg = listener_bind_help(addr, "codex", &err);
-        assert!(msg.contains("http://127.0.0.1:3211"));
-        assert!(msg.contains("service: codex"));
-    }
-
-    #[test]
-    fn bind_help_for_addr_in_use_is_friendly() {
-        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
-        let err = std::io::Error::new(ErrorKind::AddrInUse, "in use");
-        let msg = listener_bind_help(addr, "codex", &err);
-        assert!(msg.contains("端口 3211"));
-        assert!(msg.contains("可能已被占用"));
-        assert!(msg.contains("codex-helper serve"));
-    }
-
-    #[test]
-    fn bind_help_for_permission_denied_is_friendly() {
-        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
-        let err = std::io::Error::new(ErrorKind::PermissionDenied, "permission denied");
-        let msg = listener_bind_help(addr, "codex", &err);
-        assert!(msg.contains("没有权限绑定"));
-        assert!(msg.contains("管理员"));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn bind_help_for_windows_10013_mentions_10013() {
-        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
-        let err = std::io::Error::from_raw_os_error(10013);
-        let msg = listener_bind_help(addr, "codex", &err);
-        assert!(msg.contains("10013"));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn windows_netstat_parser_extracts_listening_pid() {
-        let sample = "\
-Active Connections\n\
-\n\
-  Proto  Local Address          Foreign Address        State           PID\n\
-  TCP    127.0.0.1:3211         0.0.0.0:0              LISTENING       4242\n\
-  TCP    127.0.0.1:3212         0.0.0.0:0              LISTENING       1111\n\
-  TCP    127.0.0.1:3211         0.0.0.0:0              LISTENING       4242\n\
-";
-        let pids = parse_windows_netstat_listening_pids(sample, 3211);
-        assert_eq!(pids, vec![4242]);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn linux_ss_parser_extracts_pid_and_name() {
-        let sample = "\
-State   Recv-Q  Send-Q   Local Address:Port   Peer Address:Port Process\n\
-LISTEN  0       4096     127.0.0.1:3211       0.0.0.0:*     users:((\"codex-helper\",pid=1234,fd=3))\n\
-";
-        let owners = parse_linux_ss_listening_owners(sample, 3211);
-        assert_eq!(
-            owners,
-            vec![PortOwner {
-                pid: 1234,
-                name: Some("codex-helper".to_string())
-            }]
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn unix_lsof_parser_extracts_pid_and_name() {
-        let sample = "\
-COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
-node    7777 user   23u  IPv4 0x0      0t0     TCP 127.0.0.1:3211 (LISTEN)\n\
-";
-        let owners = parse_unix_lsof_owners(sample);
-        assert_eq!(
-            owners,
-            vec![PortOwner {
-                pid: 7777,
-                name: Some("node".to_string())
-            }]
-        );
-    }
 }
 
 fn do_switch_off(codex: bool, claude: bool) -> CliResult<()> {
@@ -1561,5 +1470,96 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod listener_bind_help_tests {
+    use super::*;
+
+    #[test]
+    fn bind_help_mentions_addr_and_service() {
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
+        let err = std::io::Error::new(ErrorKind::AddrInUse, "in use");
+        let msg = listener_bind_help(addr, "codex", &err);
+        assert!(msg.contains("http://127.0.0.1:3211"));
+        assert!(msg.contains("service: codex"));
+    }
+
+    #[test]
+    fn bind_help_for_addr_in_use_is_friendly() {
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
+        let err = std::io::Error::new(ErrorKind::AddrInUse, "in use");
+        let msg = listener_bind_help(addr, "codex", &err);
+        assert!(msg.contains("端口 3211"));
+        assert!(msg.contains("可能已被占用"));
+        assert!(msg.contains("codex-helper serve"));
+    }
+
+    #[test]
+    fn bind_help_for_permission_denied_is_friendly() {
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
+        let err = std::io::Error::new(ErrorKind::PermissionDenied, "permission denied");
+        let msg = listener_bind_help(addr, "codex", &err);
+        assert!(msg.contains("没有权限绑定"));
+        assert!(msg.contains("管理员"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bind_help_for_windows_10013_mentions_10013() {
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3211));
+        let err = std::io::Error::from_raw_os_error(10013);
+        let msg = listener_bind_help(addr, "codex", &err);
+        assert!(msg.contains("10013"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_netstat_parser_extracts_listening_pid() {
+        let sample = "\
+Active Connections\n\
+\n\
+  Proto  Local Address          Foreign Address        State           PID\n\
+  TCP    127.0.0.1:3211         0.0.0.0:0              LISTENING       4242\n\
+  TCP    127.0.0.1:3212         0.0.0.0:0              LISTENING       1111\n\
+  TCP    127.0.0.1:3211         0.0.0.0:0              LISTENING       4242\n\
+";
+        let pids = parse_windows_netstat_listening_pids(sample, 3211);
+        assert_eq!(pids, vec![4242]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_ss_parser_extracts_pid_and_name() {
+        let sample = "\
+State   Recv-Q  Send-Q   Local Address:Port   Peer Address:Port Process\n\
+LISTEN  0       4096     127.0.0.1:3211       0.0.0.0:*     users:((\"codex-helper\",pid=1234,fd=3))\n\
+";
+        let owners = parse_linux_ss_listening_owners(sample, 3211);
+        assert_eq!(
+            owners,
+            vec![PortOwner {
+                pid: 1234,
+                name: Some("codex-helper".to_string())
+            }]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_lsof_parser_extracts_pid_and_name() {
+        let sample = "\
+COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
+node    7777 user   23u  IPv4 0x0      0t0     TCP 127.0.0.1:3211 (LISTEN)\n\
+";
+        let owners = parse_unix_lsof_owners(sample);
+        assert_eq!(
+            owners,
+            vec![PortOwner {
+                pid: 7777,
+                name: Some("node".to_string())
+            }]
+        );
     }
 }

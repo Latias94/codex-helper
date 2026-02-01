@@ -642,7 +642,6 @@ pub(in crate::tui) fn filtered_requests_len(
 mod tests {
     use super::*;
 
-    use pretty_assertions::assert_eq;
     use unicode_width::UnicodeWidthStr;
 
     #[test]
