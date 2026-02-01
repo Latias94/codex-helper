@@ -346,6 +346,7 @@ codex-helper config set-level openai 2
 
   ```bash
   codex-helper session list
+  codex-helper session recent
   codex-helper session last
   codex-helper session transcript <ID> --tail 40
   ```
@@ -405,11 +406,25 @@ codex-helper
 cd ~/code/my-app
 
 codex-helper session list   # 列出与当前项目相关的最近会话
+codex-helper session recent # 跨项目列出最近会话（每行：project_root + session_id）
 codex-helper session last   # 给出最近一次会话 + 对应 resume 命令
 codex-helper session transcript <ID> --tail 40   # 查看最近对话，用于辨认某个 session
 ```
 
 `session list` 会额外展示每个会话的轮数（rounds）与最后更新时间（last_update，优先取最后一次 assistant 响应时间）。
+
+小技巧：`session list` 默认会完整输出 first prompt；如果你想让列表更紧凑，可以手动截断：
+
+```bash
+codex-helper session list --truncate 120
+```
+
+`session recent` 用于你在多个仓库之间频繁切换时快速 `codex resume`：默认筛选最近 12 小时内有更新（基于 session 文件 mtime）的会话，并按新到旧输出：
+
+```bash
+codex-helper session recent --since 12h --limit 50
+# <project_root> <session_id>
+```
 
 你也可以从任意目录查询指定项目的会话：
 

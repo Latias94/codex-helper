@@ -369,6 +369,7 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
 
   ```bash
   codex-helper session list
+  codex-helper session recent
   codex-helper session last
   codex-helper session transcript <ID> --tail 40
   ```
@@ -428,11 +429,25 @@ codex-helper
 cd ~/code/my-app
 
 codex-helper session list   # list recent sessions for this project
+codex-helper session recent # list recent sessions across projects (project_root + session_id per line)
 codex-helper session last   # show last session + a codex resume command
 codex-helper session transcript <ID> --tail 40   # view recent conversation to identify a session
 ```
 
 `session list` now includes the conversation rounds (`rounds`) and the last update timestamp (`last_update`, which prefers the last assistant response time when available).
+
+Tip: by default `session list` prints the full first prompt; you can truncate it for a tighter view:
+
+```bash
+codex-helper session list --truncate 120
+```
+
+`session recent` is designed for fast `codex resume` workflows when you're hopping between repos. By default it shows sessions updated within the last 12 hours (file mtime), newest first:
+
+```bash
+codex-helper session recent --since 12h --limit 50
+# <project_root> <session_id>
+```
 
 You can also query sessions for any directory without cd:
 

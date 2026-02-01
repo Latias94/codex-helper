@@ -1,7 +1,7 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,14 @@ pub struct SessionTranscriptMessage {
     pub text: String,
 }
 
+/// Minimal data for printing `project_root session_id` style lists.
+#[derive(Debug, Clone)]
+pub struct RecentSession {
+    pub id: String,
+    pub cwd: Option<String>,
+    pub mtime_ms: u64,
+}
+
 const MAX_SCAN_FILES: usize = 10_000;
 const HEAD_SCAN_LINES: usize = 512;
 const IO_CHUNK_SIZE: usize = 64 * 1024;
@@ -53,6 +61,7 @@ const TAIL_SCAN_MAX_BYTES: usize = 1024 * 1024;
 
 const SESSION_STATS_CACHE_VERSION: u32 = 1;
 const MAX_STATS_CACHE_ENTRIES: usize = 20_000;
+const MAX_SCAN_FILES_RECENT: usize = 200_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedSessionStats {
@@ -288,6 +297,97 @@ pub async fn search_codex_sessions_for_current_dir(
 ) -> Result<Vec<SessionSummary>> {
     let cwd = std::env::current_dir().context("failed to resolve current directory")?;
     search_codex_sessions_for_dir(&cwd, query, limit).await
+}
+
+/// List recent Codex sessions across all projects, filtered by session file mtime.
+///
+/// This is optimized for "resume" workflows: it avoids counting turns/timestamps and only reads the
+/// `session_meta` header for sessions that pass the recency filter.
+pub async fn find_recent_codex_sessions(
+    since: Duration,
+    limit: usize,
+) -> Result<Vec<RecentSession>> {
+    let root = codex_sessions_dir();
+    find_recent_codex_sessions_in_dir(&root, since, limit).await
+}
+
+async fn find_recent_codex_sessions_in_dir(
+    sessions_dir: &Path,
+    since: Duration,
+    limit: usize,
+) -> Result<Vec<RecentSession>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let since_ms = since.as_millis().min(u64::MAX as u128) as u64;
+    let threshold_ms = now_ms.saturating_sub(since_ms);
+
+    let mut out: Vec<RecentSession> = Vec::new();
+    let mut scanned_files: usize = 0;
+
+    let year_dirs = collect_dirs_desc(sessions_dir, |s| s.parse::<u32>().ok()).await?;
+    'outer: for (_year, year_path) in year_dirs {
+        let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
+        for (_month, month_path) in month_dirs {
+            let day_dirs = collect_dirs_desc(&month_path, |s| s.parse::<u8>().ok()).await?;
+            for (_day, day_path) in day_dirs {
+                let day_files = collect_rollout_files_sorted(&day_path).await?;
+                for path in day_files {
+                    if scanned_files >= MAX_SCAN_FILES_RECENT {
+                        break 'outer;
+                    }
+                    scanned_files += 1;
+
+                    let meta = match fs::metadata(&path).await {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let mtime_ms = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                        .unwrap_or(0);
+                    if mtime_ms < threshold_ms {
+                        continue;
+                    }
+
+                    let file_id = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .and_then(|name| parse_timestamp_and_uuid(name))
+                        .map(|(_, uuid)| uuid);
+
+                    let meta = read_codex_session_meta(&path).await?;
+                    let (id, cwd) = if let Some(meta) = meta {
+                        (meta.id, meta.cwd)
+                    } else if let Some(id) = file_id {
+                        (id, None)
+                    } else {
+                        continue;
+                    };
+
+                    out.push(RecentSession { id, cwd, mtime_ms });
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| match b.mtime_ms.cmp(&a.mtime_ms) {
+        Ordering::Equal => b.id.cmp(&a.id),
+        other => other,
+    });
+    out.truncate(limit);
+    Ok(out)
 }
 
 /// Find a Codex session's cwd by its session id (UUID suffix in rollout filename).
@@ -1281,5 +1381,62 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].text, "next");
         assert_eq!(tail[1].text, "ok");
+    }
+
+    #[tokio::test]
+    async fn recent_sessions_filters_by_mtime_and_prefers_meta_id() {
+        let tmp = std::env::temp_dir().join(format!("codex-helper-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+
+        let sessions = tmp.join("sessions").join("2026").join("02").join("01");
+        std::fs::create_dir_all(&sessions).expect("create sessions dir");
+
+        let file1 =
+            sessions.join("rollout-2026-02-01T00-00-00-11111111-1111-1111-1111-111111111111.jsonl");
+        let file2 =
+            sessions.join("rollout-2026-02-01T00-00-01-22222222-2222-2222-2222-222222222222.jsonl");
+
+        let meta1 = serde_json::json!({
+            "timestamp": "2026-02-01T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "sid-old",
+                "cwd": "G:/code/old",
+                "timestamp": "2026-02-01T00:00:00.000Z"
+            }
+        })
+        .to_string();
+        std::fs::write(&file1, meta1).expect("write file1");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let meta2 = serde_json::json!({
+            "timestamp": "2026-02-01T00:00:01.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "sid-new",
+                "cwd": "G:/code/new",
+                "timestamp": "2026-02-01T00:00:01.000Z"
+            }
+        })
+        .to_string();
+        std::fs::write(&file2, meta2).expect("write file2");
+
+        let recent = find_recent_codex_sessions_in_dir(
+            &tmp.join("sessions"),
+            Duration::from_secs(24 * 3600),
+            10,
+        )
+        .await
+        .expect("recent ok");
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].id, "sid-new");
+        assert_eq!(recent[1].id, "sid-old");
+
+        let none =
+            find_recent_codex_sessions_in_dir(&tmp.join("sessions"), Duration::from_secs(0), 10)
+                .await
+                .expect("recent ok");
+        assert_eq!(none.len(), 0, "since=0 should filter everything out");
     }
 }

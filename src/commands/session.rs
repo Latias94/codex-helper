@@ -1,13 +1,37 @@
 use crate::sessions::{
     SessionSummary, find_codex_session_file_by_id, find_codex_sessions_for_current_dir,
-    find_codex_sessions_for_dir, read_codex_session_meta, read_codex_session_transcript,
-    search_codex_sessions_for_current_dir, search_codex_sessions_for_dir,
+    find_codex_sessions_for_dir, find_recent_codex_sessions, read_codex_session_meta,
+    read_codex_session_transcript, search_codex_sessions_for_current_dir,
+    search_codex_sessions_for_dir,
 };
 use crate::{CliResult, SessionCommand};
 
+fn infer_project_root_from_cwd(cwd: &str) -> String {
+    let path = std::path::PathBuf::from(cwd);
+    if !path.is_absolute() {
+        return cwd.to_string();
+    }
+
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    let mut cur = canonical.clone();
+    loop {
+        if cur.join(".git").exists() {
+            return cur.to_string_lossy().to_string();
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    canonical.to_string_lossy().to_string()
+}
+
 pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
     match cmd {
-        SessionCommand::List { limit, path } => {
+        SessionCommand::List {
+            limit,
+            path,
+            truncate,
+        } => {
             let sessions: Vec<SessionSummary> = if let Some(p) = path {
                 let root = std::path::PathBuf::from(p);
                 find_codex_sessions_for_dir(&root, limit).await?
@@ -27,7 +51,11 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                         .as_deref()
                         .unwrap_or("")
                         .replace('\n', " ");
-                    let preview = super::doctor::truncate_for_display(&preview_raw, 80);
+                    let preview = if let Some(n) = truncate {
+                        super::doctor::truncate_for_display(&preview_raw, n)
+                    } else {
+                        preview_raw
+                    };
 
                     println!("- id: {}", s.id);
                     println!(
@@ -39,6 +67,22 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                     }
                     println!();
                 }
+            }
+        }
+        SessionCommand::Recent {
+            limit,
+            since,
+            raw_cwd,
+        } => {
+            let sessions = find_recent_codex_sessions(since.into(), limit).await?;
+            for s in sessions {
+                let cwd = s.cwd.as_deref().unwrap_or("-");
+                let root = if raw_cwd {
+                    cwd.to_string()
+                } else {
+                    infer_project_root_from_cwd(cwd)
+                };
+                println!("{} {}", root, s.id);
             }
         }
         SessionCommand::Last { path } => {

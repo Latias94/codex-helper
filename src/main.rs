@@ -357,6 +357,21 @@ enum SessionCommand {
         /// Optional directory to search sessions for; defaults to current dir
         #[arg(long)]
         path: Option<String>,
+        /// Truncate the first prompt to N characters (default: do not truncate)
+        #[arg(long)]
+        truncate: Option<usize>,
+    },
+    /// Print recent Codex sessions as `project_root session_id` (one per line)
+    Recent {
+        /// Maximum number of sessions to show
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Only include sessions updated within this duration (based on session file mtime)
+        #[arg(long, default_value = "12h")]
+        since: humantime::Duration,
+        /// Print the raw session cwd instead of inferring a git project root
+        #[arg(long)]
+        raw_cwd: bool,
     },
     /// Print a session transcript (best-effort) by session id
     Transcript {

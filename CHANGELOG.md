@@ -4,9 +4,15 @@ All notable changes to this project will be documented in this file.
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
 ## [0.12.0] - Not released
+### 新增 / Added
+- 新增 `codex-helper session recent`：按会话文件最后更新时间（mtime）筛选最近会话，并以 `project_root session_id` 的每行格式输出，便于快速 `codex resume`（支持 `--since/--limit/--raw-cwd`）。
+  Add `codex-helper session recent`: filter recent sessions by session file mtime and print `project_root session_id` per line for fast `codex resume` workflows (supports `--since/--limit/--raw-cwd`).
+
 ### 改进 / Improved
 - 启动监听失败时，提供更友好的提示（端口占用/权限不足等），并在 Windows/Linux/macOS 下尽力显示占用端口的进程 PID/名称，便于快速定位冲突进程。
   Provide friendlier bind/listen failure messages (port in use / permission denied, etc.) and best-effort show the PID/process holding the port on Windows/Linux/macOS for faster troubleshooting.
+- `codex-helper session list` 默认完整展示 first prompt，并提供 `--truncate` 以按需截断输出。
+  `codex-helper session list` now prints the full first prompt by default and provides `--truncate` for an optional compact view.
 
 ## [0.11.0] - 2026-01-09
 ### 修复 / Fixed
