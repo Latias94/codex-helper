@@ -54,6 +54,25 @@ pub struct RecentSession {
     pub mtime_ms: u64,
 }
 
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone)]
+pub struct SessionDayDir {
+    pub date: String,
+    pub path: PathBuf,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone)]
+pub struct SessionIndexItem {
+    pub id: String,
+    pub path: PathBuf,
+    pub cwd: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_hint: Option<String>,
+    pub mtime_ms: u64,
+    pub first_user_message: Option<String>,
+}
+
 pub fn infer_project_root_from_cwd(cwd: &str) -> String {
     let path = std::path::PathBuf::from(cwd);
     if !path.is_absolute() {
@@ -394,6 +413,77 @@ pub async fn find_recent_codex_session_summaries(
     }
 
     select_and_expand_headers(Vec::new(), headers, limit).await
+}
+
+#[cfg(feature = "gui")]
+pub async fn list_codex_session_day_dirs(limit: usize) -> Result<Vec<SessionDayDir>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let root = codex_sessions_dir();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<SessionDayDir> = Vec::new();
+    let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u32>().ok()).await?;
+    'outer: for (year, year_path) in year_dirs {
+        let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
+        for (month, month_path) in month_dirs {
+            let day_dirs = collect_dirs_desc(&month_path, |s| s.parse::<u8>().ok()).await?;
+            for (day, day_path) in day_dirs {
+                out.push(SessionDayDir {
+                    date: format!("{year:04}-{month:02}-{day:02}"),
+                    path: day_path,
+                });
+                if out.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "gui")]
+pub async fn list_codex_sessions_in_day_dir(
+    day_dir: &Path,
+    limit: usize,
+) -> Result<Vec<SessionIndexItem>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if !day_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let day_files = collect_rollout_files_sorted(day_dir).await?;
+    let mut out: Vec<SessionIndexItem> = Vec::new();
+    for path in day_files {
+        if out.len() >= limit {
+            break;
+        }
+        let header_opt = read_session_header(&path, &cwd).await?;
+        let Some(mut header) = header_opt else {
+            continue;
+        };
+        header.updated_hint = read_last_timestamp_from_tail(&header.path)
+            .await?
+            .or_else(|| header.created_at.clone());
+        out.push(SessionIndexItem {
+            id: header.id,
+            path: header.path,
+            cwd: header.cwd,
+            created_at: header.created_at,
+            updated_hint: header.updated_hint,
+            mtime_ms: header.mtime_ms,
+            first_user_message: Some(header.first_user_message),
+        });
+    }
+
+    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    Ok(out)
 }
 
 async fn find_recent_codex_sessions_in_dir(

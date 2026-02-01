@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
   GUI adds a `Stats` page: requests/tokens KPIs, per-day rollup, top configs/providers, plus optional cost estimate via `CODEX_HELPER_PRICE_*`.
 - 新增 attach 友好的 API v1 `GET /__codex_helper/api/v1/snapshot`：返回 GUI/TUI 所需的 dashboard 快照（含 usage rollup 与窗口统计），减少多次拉取。
   Add attach-friendly API v1 `GET /__codex_helper/api/v1/snapshot`: returns a dashboard snapshot (including usage rollup and window stats) to reduce multi-call polling.
+- GUI `History` 新增“全部(按日期)”视图：按日期分组浏览全部 Codex 本地会话，并支持对话预览与复制（默认隐藏工具调用）。
+  GUI `History` adds an “All (by date)” view: browse all local Codex sessions grouped by day, with transcript preview and copy (tool calls hidden by default).
 
 ### 改进 / Improved
 - 启动监听失败时，提供更友好的提示（端口占用/权限不足等），并在 Windows/Linux/macOS 下尽力显示占用端口的进程 PID/名称，便于快速定位冲突进程。
@@ -19,6 +21,8 @@ All notable changes to this project will be documented in this file.
   `codex-helper session list` now prints the full first prompt by default and provides `--truncate` for an optional compact view.
 - GUI `History` 页面新增“全局最近”范围：按 mtime（默认近 12 小时）列出最近 Codex 会话，并支持一键复制 `root id` 列表与在 Windows Terminal（`wt`）中直接执行 `codex resume`。
   GUI `History` adds a “Global recent” scope: list recent Codex sessions by mtime (default last 12 hours), copy `root id` lists, and open `codex resume` directly in Windows Terminal (`wt`).
+- GUI `History`/Transcript 性能优化：对话加载改为后台任务（避免 UI 卡死），并将消息列表改为虚拟滚动渲染，长对话也更流畅。
+  GUI `History`/Transcript performance: load transcripts in background (non-blocking UI) and render the message list via virtual scrolling for smoother long sessions.
 
 ## [0.11.0] - 2026-01-09
 ### 修复 / Fixed

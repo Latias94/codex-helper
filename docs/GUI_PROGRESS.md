@@ -68,6 +68,7 @@
 - [x] GUI-303 “Open in explorer/finder” for session file/logs (Windows-first)
 - [x] GUI-304 Open transcript from Sessions (jump to History + auto load by session_id)
 - [x] GUI-305 Global recent history: list recent sessions by mtime (default 12h) + copy `root id` + open `codex resume` in Windows Terminal (`wt`)
+- [x] GUI-306 All history by date: browse all Codex sessions grouped by day, with transcript preview and copy (tool calls hidden by default)
 
 **Definition of done**
 - GUI can browse history and read/copy transcripts like TUI.

@@ -8,7 +8,7 @@ use super::i18n::{Language, pick};
 use super::proxy_control::{PortInUseAction, ProxyModeKind};
 use super::util::{open_in_file_manager, spawn_windows_terminal_wt_new_tab};
 use crate::dashboard_core::ConfigOption;
-use crate::sessions::{SessionSummary, SessionTranscriptMessage};
+use crate::sessions::{SessionDayDir, SessionIndexItem, SessionSummary, SessionTranscriptMessage};
 use crate::state::{ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, SessionStats};
 use crate::usage::UsageMetrics;
 
@@ -106,9 +106,23 @@ pub struct HistoryViewState {
     pub shell: String,
     pub keep_open: bool,
     pub wt_window: i32,
+    pub all_days_limit: usize,
+    pub all_dates: Vec<SessionDayDir>,
+    pub all_selected_date: Option<String>,
+    pub all_day_limit: usize,
+    pub all_day_sessions: Vec<SessionIndexItem>,
+    loaded_day_for: Option<String>,
+    pub hide_tool_calls: bool,
+    pub transcript_view: TranscriptViewMode,
+    pub transcript_selected_msg_idx: usize,
+    transcript_plain_key: Option<(String, Option<usize>, bool)>,
+    transcript_plain_text: String,
+    transcript_load_seq: u64,
+    transcript_load: Option<TranscriptLoad>,
     pub auto_load_transcript: bool,
     pub transcript_full: bool,
     pub transcript_tail: usize,
+    pub transcript_raw_messages: Vec<SessionTranscriptMessage>,
     pub transcript_messages: Vec<SessionTranscriptMessage>,
     pub transcript_error: Option<String>,
     loaded_for: Option<(String, Option<usize>)>,
@@ -118,6 +132,7 @@ pub struct HistoryViewState {
 pub enum HistoryScope {
     CurrentProject,
     GlobalRecent,
+    AllByDate,
 }
 
 impl Default for HistoryViewState {
@@ -137,14 +152,42 @@ impl Default for HistoryViewState {
             shell: "pwsh".to_string(),
             keep_open: true,
             wt_window: -1,
+            all_days_limit: 120,
+            all_dates: Vec::new(),
+            all_selected_date: None,
+            all_day_limit: 500,
+            all_day_sessions: Vec::new(),
+            loaded_day_for: None,
+            hide_tool_calls: true,
+            transcript_view: TranscriptViewMode::Messages,
+            transcript_selected_msg_idx: 0,
+            transcript_plain_key: None,
+            transcript_plain_text: String::new(),
+            transcript_load_seq: 0,
+            transcript_load: None,
             auto_load_transcript: true,
             transcript_full: false,
             transcript_tail: 80,
+            transcript_raw_messages: Vec::new(),
             transcript_messages: Vec::new(),
             transcript_error: None,
             loaded_for: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptViewMode {
+    Messages,
+    PlainText,
+}
+
+#[derive(Debug)]
+struct TranscriptLoad {
+    seq: u64,
+    key: (String, Option<usize>),
+    rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<Vec<SessionTranscriptMessage>>)>,
+    join: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Default)]
@@ -1749,6 +1792,8 @@ fn render_stats(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 }
 
 fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
+    poll_transcript_loader(ctx);
+
     ui.heading(pick(ctx.lang, "历史会话", "History"));
     ui.label(pick(
         ctx.lang,
@@ -1764,6 +1809,7 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .selected_text(match ctx.view.history.scope {
                 HistoryScope::CurrentProject => pick(ctx.lang, "当前项目", "Current project"),
                 HistoryScope::GlobalRecent => pick(ctx.lang, "全局最近", "Global recent"),
+                HistoryScope::AllByDate => pick(ctx.lang, "全部(按日期)", "All (by date)"),
             })
             .show_ui(ui, |ui| {
                 ui.selectable_value(
@@ -1775,6 +1821,11 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     &mut ctx.view.history.scope,
                     HistoryScope::GlobalRecent,
                     pick(ctx.lang, "全局最近", "Global recent"),
+                );
+                ui.selectable_value(
+                    &mut ctx.view.history.scope,
+                    HistoryScope::AllByDate,
+                    pick(ctx.lang, "全部(按日期)", "All (by date)"),
                 );
             });
 
@@ -1800,8 +1851,26 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 "在 cwd 上向上查找 .git 作为项目根目录（用于复制/打开）",
                 "Find .git upward from cwd as the project root (for copy/open).",
             ));
+        } else if ctx.view.history.scope == HistoryScope::AllByDate {
+            ui.label(pick(ctx.lang, "最近天数", "Recent days"));
+            ui.add(
+                egui::DragValue::new(&mut ctx.view.history.all_days_limit)
+                    .range(1..=10_000)
+                    .speed(1),
+            );
+            ui.label(pick(ctx.lang, "当日上限", "Day limit"));
+            ui.add(
+                egui::DragValue::new(&mut ctx.view.history.all_day_limit)
+                    .range(1..=10_000)
+                    .speed(1),
+            );
         }
     });
+
+    if ctx.view.history.scope == HistoryScope::AllByDate {
+        render_history_all_by_date(ui, ctx);
+        return;
+    }
 
     ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "搜索", "Search"));
@@ -1861,6 +1930,7 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         }
                         Ok(list)
                     }
+                    HistoryScope::AllByDate => Ok(Vec::new()),
                 }
             };
             match ctx.rt.block_on(fut) {
@@ -1871,6 +1941,8 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     if ctx.view.history.sessions.is_empty() {
                         ctx.view.history.selected_idx = 0;
                         ctx.view.history.selected_id = None;
+                        cancel_transcript_load(&mut ctx.view.history);
+                        ctx.view.history.transcript_raw_messages.clear();
                         ctx.view.history.transcript_messages.clear();
                         ctx.view.history.transcript_error = None;
                         ctx.view.history.loaded_for = None;
@@ -1885,6 +1957,12 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         ctx.view.history.selected_id =
                             Some(ctx.view.history.sessions[0].id.clone());
                         ctx.view.history.loaded_for = None;
+                        cancel_transcript_load(&mut ctx.view.history);
+                        ctx.view.history.transcript_raw_messages.clear();
+                        ctx.view.history.transcript_messages.clear();
+                        ctx.view.history.transcript_error = None;
+                        ctx.view.history.transcript_plain_key = None;
+                        ctx.view.history.transcript_plain_text.clear();
                     }
                     *ctx.last_info = Some(pick(ctx.lang, "已刷新", "Refreshed").to_string());
                 }
@@ -1956,40 +2034,24 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ctx.view.history.selected_idx = selected_idx;
     ctx.view.history.selected_id = Some(ctx.view.history.sessions[selected_idx].id.clone());
 
-    // Auto-load transcript when selection/tail changes.
-    if ctx.view.history.auto_load_transcript {
-        if let Some(id) = ctx.view.history.selected_id.clone() {
-            let tail = if ctx.view.history.transcript_full {
-                None
-            } else {
-                Some(ctx.view.history.transcript_tail)
-            };
-            let key = (id.clone(), tail);
-            if ctx.view.history.loaded_for.as_ref() != Some(&key) {
-                let path = ctx.view.history.sessions[selected_idx].path.clone();
-                match ctx
-                    .rt
-                    .block_on(crate::sessions::read_codex_session_transcript(&path, tail))
-                {
-                    Ok(msgs) => {
-                        ctx.view.history.transcript_messages = msgs;
-                        ctx.view.history.transcript_error = None;
-                        ctx.view.history.loaded_for = Some(key);
-                    }
-                    Err(e) => {
-                        ctx.view.history.transcript_messages.clear();
-                        ctx.view.history.transcript_error = Some(e.to_string());
-                        ctx.view.history.loaded_for = None;
-                    }
-                }
-            }
-        }
+    if ctx.view.history.auto_load_transcript
+        && let Some(id) = ctx.view.history.selected_id.clone()
+    {
+        let tail = if ctx.view.history.transcript_full {
+            None
+        } else {
+            Some(ctx.view.history.transcript_tail)
+        };
+        let key = (id.clone(), tail);
+        let path = ctx.view.history.sessions[selected_idx].path.clone();
+        ensure_transcript_loading(ctx, path, key);
     }
 
     ui.add_space(6.0);
     ui.columns(2, |cols| {
         cols[0].heading(pick(ctx.lang, "会话列表", "Sessions"));
         cols[0].add_space(4.0);
+        let mut pending_select: Option<(usize, String)> = None;
         egui::ScrollArea::vertical()
             .max_height(520.0)
             .show(&mut cols[0], |ui| {
@@ -2033,14 +2095,41 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 shorten(first, 36)
                             )
                         }
+                        HistoryScope::AllByDate => {
+                            let root = s
+                                .cwd
+                                .as_deref()
+                                .map(|cwd| {
+                                    if ctx.view.history.infer_git_root {
+                                        crate::sessions::infer_project_root_from_cwd(cwd)
+                                    } else {
+                                        cwd.to_string()
+                                    }
+                                })
+                                .unwrap_or_else(|| "-".to_string());
+                            format!(
+                                "{}  {id_short}  r={rounds}  {last}  {}",
+                                shorten(&root, 44),
+                                shorten(first, 36)
+                            )
+                        }
                     };
                     if ui.selectable_label(selected, label).clicked() {
-                        ctx.view.history.selected_idx = idx;
-                        ctx.view.history.selected_id = Some(s.id.clone());
-                        ctx.view.history.loaded_for = None;
+                        pending_select = Some((idx, s.id.clone()));
                     }
                 }
             });
+
+        if let Some((idx, id)) = pending_select.take() {
+            ctx.view.history.selected_idx = idx;
+            ctx.view.history.selected_id = Some(id);
+            ctx.view.history.loaded_for = None;
+            cancel_transcript_load(&mut ctx.view.history);
+            ctx.view.history.transcript_error = None;
+            ctx.view.history.transcript_plain_key = None;
+            ctx.view.history.transcript_plain_text.clear();
+            ctx.view.history.transcript_selected_msg_idx = 0;
+        }
 
         cols[1].heading(pick(ctx.lang, "对话记录", "Transcript"));
         cols[1].add_space(4.0);
@@ -2158,11 +2247,41 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         });
 
         cols[1].horizontal(|ui| {
+            let mut hide = ctx.view.history.hide_tool_calls;
+            ui.checkbox(&mut hide, pick(ctx.lang, "隐藏工具调用", "Hide tool calls"));
+            if hide != ctx.view.history.hide_tool_calls {
+                ctx.view.history.hide_tool_calls = hide;
+                ctx.view.history.transcript_messages =
+                    filter_tool_calls(ctx.view.history.transcript_raw_messages.clone(), hide);
+                ctx.view.history.transcript_plain_key = None;
+                ctx.view.history.transcript_plain_text.clear();
+            }
+
+            ui.label(pick(ctx.lang, "显示", "View"));
+            egui::ComboBox::from_id_salt("history_transcript_view")
+                .selected_text(match ctx.view.history.transcript_view {
+                    TranscriptViewMode::Messages => pick(ctx.lang, "消息列表", "Messages"),
+                    TranscriptViewMode::PlainText => pick(ctx.lang, "纯文本", "Plain text"),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut ctx.view.history.transcript_view,
+                        TranscriptViewMode::Messages,
+                        pick(ctx.lang, "消息列表", "Messages"),
+                    );
+                    ui.selectable_value(
+                        &mut ctx.view.history.transcript_view,
+                        TranscriptViewMode::PlainText,
+                        pick(ctx.lang, "纯文本", "Plain text"),
+                    );
+                });
+
             let mut full = ctx.view.history.transcript_full;
             ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
             if full != ctx.view.history.transcript_full {
                 ctx.view.history.transcript_full = full;
                 ctx.view.history.loaded_for = None;
+                cancel_transcript_load(&mut ctx.view.history);
             }
 
             ui.label(pick(ctx.lang, "尾部条数", "Tail"));
@@ -2178,6 +2297,7 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
             if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
                 ctx.view.history.loaded_for = None;
+                cancel_transcript_load(&mut ctx.view.history);
                 // Next frame will load (auto_load_transcript=true) or user can click again.
                 if !ctx.view.history.auto_load_transcript {
                     ctx.view.history.auto_load_transcript = true;
@@ -2209,27 +2329,675 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             cols[1].colored_label(egui::Color32::from_rgb(200, 120, 40), err);
         }
 
-        egui::ScrollArea::vertical()
-            .max_height(480.0)
-            .show(&mut cols[1], |ui| {
-                if ctx.view.history.transcript_messages.is_empty() {
-                    ui.label(pick(ctx.lang, "（无内容）", "(empty)"));
-                    return;
+        render_transcript_body(&mut cols[1], ctx, 480.0);
+    });
+}
+
+fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        ui.label(pick(ctx.lang, "搜索", "Search"));
+        ui.add(
+            egui::TextEdit::singleline(&mut ctx.view.history.query)
+                .desired_width(260.0)
+                .hint_text(pick(
+                    ctx.lang,
+                    "关键词（匹配 cwd 或首条用户消息）",
+                    "keyword (cwd or first user message)",
+                )),
+        );
+
+        if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
+            let limit = ctx.view.history.all_days_limit;
+            match ctx
+                .rt
+                .block_on(crate::sessions::list_codex_session_day_dirs(limit))
+            {
+                Ok(dates) => {
+                    ctx.view.history.all_dates = dates;
+                    ctx.view.history.last_error = None;
+                    ctx.view.history.loaded_day_for = None;
+                    ctx.view.history.all_day_sessions.clear();
+                    ctx.view.history.selected_id = None;
+                    cancel_transcript_load(&mut ctx.view.history);
+                    ctx.view.history.transcript_raw_messages.clear();
+                    ctx.view.history.transcript_messages.clear();
+                    ctx.view.history.transcript_error = None;
+                    *ctx.last_info = Some(pick(ctx.lang, "已刷新", "Refreshed").to_string());
                 }
-                for msg in ctx.view.history.transcript_messages.iter_mut() {
+                Err(e) => {
+                    ctx.view.history.last_error = Some(e.to_string());
+                }
+            }
+        }
+
+        if ui
+            .button(pick(ctx.lang, "加载更多天", "Load more days"))
+            .clicked()
+        {
+            ctx.view.history.all_days_limit = ctx.view.history.all_days_limit.saturating_add(120);
+            let limit = ctx.view.history.all_days_limit;
+            match ctx
+                .rt
+                .block_on(crate::sessions::list_codex_session_day_dirs(limit))
+            {
+                Ok(dates) => {
+                    ctx.view.history.all_dates = dates;
+                    ctx.view.history.last_error = None;
+                    *ctx.last_info = Some(pick(ctx.lang, "已刷新", "Refreshed").to_string());
+                }
+                Err(e) => {
+                    ctx.view.history.last_error = Some(e.to_string());
+                }
+            }
+        }
+
+        ui.checkbox(
+            &mut ctx.view.history.auto_load_transcript,
+            pick(ctx.lang, "自动加载对话", "Auto load transcript"),
+        );
+    });
+
+    if let Some(err) = ctx.view.history.last_error.as_deref() {
+        ui.add_space(4.0);
+        ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
+    }
+
+    if ctx.view.history.all_dates.is_empty() {
+        ui.add_space(8.0);
+        ui.label(pick(
+            ctx.lang,
+            "暂无日期索引。点击“刷新”加载。",
+            "No date index loaded. Click Refresh.",
+        ));
+        return;
+    }
+
+    // Keep selected date stable.
+    if ctx
+        .view
+        .history
+        .all_selected_date
+        .as_deref()
+        .is_none_or(|d| !ctx.view.history.all_dates.iter().any(|x| x.date == d))
+    {
+        ctx.view.history.all_selected_date = Some(ctx.view.history.all_dates[0].date.clone());
+        ctx.view.history.loaded_day_for = None;
+    }
+
+    // Auto-load day sessions when date changes.
+    if let Some(date) = ctx.view.history.all_selected_date.clone() {
+        if ctx.view.history.loaded_day_for.as_deref() != Some(date.as_str()) {
+            let limit = ctx.view.history.all_day_limit;
+            let day_dir = ctx
+                .view
+                .history
+                .all_dates
+                .iter()
+                .find(|x| x.date == date)
+                .map(|x| x.path.clone());
+            if let Some(day_dir) = day_dir {
+                match ctx
+                    .rt
+                    .block_on(crate::sessions::list_codex_sessions_in_day_dir(
+                        &day_dir, limit,
+                    )) {
+                    Ok(list) => {
+                        ctx.view.history.all_day_sessions = list;
+                        ctx.view.history.loaded_day_for = Some(date.clone());
+                        ctx.view.history.selected_id = None;
+                        ctx.view.history.transcript_messages.clear();
+                        ctx.view.history.transcript_error = None;
+                        ctx.view.history.loaded_for = None;
+                    }
+                    Err(e) => {
+                        ctx.view.history.last_error = Some(e.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let q = ctx.view.history.query.trim().to_lowercase();
+
+    ui.add_space(6.0);
+    ui.columns(3, |cols| {
+        cols[0].heading(pick(ctx.lang, "日期", "Dates"));
+        cols[0].add_space(4.0);
+        {
+            let total = ctx.view.history.all_dates.len();
+            let row_h = 22.0;
+            egui::ScrollArea::vertical().max_height(520.0).show_rows(
+                &mut cols[0],
+                row_h,
+                total,
+                |ui, range| {
+                    for row in range {
+                        let d = &ctx.view.history.all_dates[row];
+                        let selected = ctx
+                            .view
+                            .history
+                            .all_selected_date
+                            .as_deref()
+                            .is_some_and(|x| x == d.date);
+                        if ui.selectable_label(selected, d.date.as_str()).clicked() {
+                            ctx.view.history.all_selected_date = Some(d.date.clone());
+                            ctx.view.history.loaded_day_for = None;
+                        }
+                    }
+                },
+            );
+        }
+
+        cols[1].heading(pick(ctx.lang, "会话", "Sessions"));
+        cols[1].add_space(4.0);
+
+        let mut visible_indices: Vec<usize> = Vec::new();
+        for (idx, s) in ctx.view.history.all_day_sessions.iter().enumerate() {
+            if q.is_empty() {
+                visible_indices.push(idx);
+                continue;
+            }
+            let mut matched = false;
+            if let Some(cwd) = s.cwd.as_deref() {
+                matched |= cwd.to_lowercase().contains(q.as_str());
+            }
+            if let Some(msg) = s.first_user_message.as_deref() {
+                matched |= msg.to_lowercase().contains(q.as_str());
+            }
+            if matched {
+                visible_indices.push(idx);
+            }
+        }
+
+        {
+            let total = visible_indices.len();
+            let row_h = 22.0;
+            egui::ScrollArea::vertical().max_height(520.0).show_rows(
+                &mut cols[1],
+                row_h,
+                total,
+                |ui, range| {
+                    for row in range {
+                        let idx = visible_indices[row];
+                        let s = &ctx.view.history.all_day_sessions[idx];
+                        let selected = ctx
+                            .view
+                            .history
+                            .selected_id
+                            .as_deref()
+                            .is_some_and(|id| id == s.id);
+
+                        let id_short = short_sid(&s.id, 16);
+                        let t = s
+                            .updated_hint
+                            .as_deref()
+                            .or(s.created_at.as_deref())
+                            .unwrap_or("-");
+                        let root_or_cwd = s
+                            .cwd
+                            .as_deref()
+                            .map(|cwd| {
+                                if ctx.view.history.infer_git_root {
+                                    crate::sessions::infer_project_root_from_cwd(cwd)
+                                } else {
+                                    cwd.to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "-".to_string());
+                        let first = s.first_user_message.as_deref().unwrap_or("-");
+                        let label = format!(
+                            "{}  {}  {}  {}",
+                            shorten(&root_or_cwd, 36),
+                            id_short,
+                            shorten(t, 19),
+                            shorten(first, 40)
+                        );
+                        if ui.selectable_label(selected, label).clicked() {
+                            ctx.view.history.selected_id = Some(s.id.clone());
+                            ctx.view.history.selected_idx = idx;
+                            ctx.view.history.loaded_for = None;
+                            cancel_transcript_load(&mut ctx.view.history);
+                            ctx.view.history.transcript_raw_messages.clear();
+                            ctx.view.history.transcript_messages.clear();
+                            ctx.view.history.transcript_error = None;
+                            ctx.view.history.transcript_plain_key = None;
+                            ctx.view.history.transcript_plain_text.clear();
+                        }
+                    }
+                },
+            );
+        }
+
+        cols[2].heading(pick(ctx.lang, "对话记录", "Transcript"));
+        cols[2].add_space(4.0);
+
+        let selected_idx = ctx.view.history.selected_id.as_deref().and_then(|id| {
+            ctx.view
+                .history
+                .all_day_sessions
+                .iter()
+                .position(|s| s.id == id)
+        });
+        let selected = selected_idx.and_then(|idx| ctx.view.history.all_day_sessions.get(idx));
+
+        if selected.is_none() {
+            cols[2].label(pick(
+                ctx.lang,
+                "选择一个会话以预览对话。",
+                "Select a session to preview.",
+            ));
+            return;
+        }
+        let selected = selected.unwrap();
+        let selected_id = selected.id.clone();
+        let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
+
+        let workdir = if selected_cwd != "-" && ctx.view.history.infer_git_root {
+            crate::sessions::infer_project_root_from_cwd(&selected_cwd)
+        } else {
+            selected_cwd.clone()
+        };
+
+        let resume_cmd = {
+            let t = ctx.view.history.resume_cmd.trim();
+            if t.is_empty() {
+                format!("codex resume {selected_id}")
+            } else if t.contains("{id}") {
+                t.replace("{id}", &selected_id)
+            } else {
+                format!("{t} {selected_id}")
+            }
+        };
+
+        cols[2].group(|ui| {
+            ui.label(pick(ctx.lang, "恢复", "Resume"));
+
+            ui.horizontal(|ui| {
+                ui.label(pick(ctx.lang, "命令模板", "Template"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut ctx.view.history.resume_cmd)
+                        .desired_width(260.0),
+                );
+                if ui
+                    .button(pick(ctx.lang, "用 bypass", "Use bypass"))
+                    .clicked()
+                {
+                    ctx.view.history.resume_cmd =
+                        "codex --dangerously-bypass-approvals-and-sandbox resume {id}".to_string();
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(pick(ctx.lang, "Shell", "Shell"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut ctx.view.history.shell).desired_width(140.0),
+                );
+                ui.checkbox(
+                    &mut ctx.view.history.keep_open,
+                    pick(ctx.lang, "保持打开", "Keep open"),
+                );
+            });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button(pick(ctx.lang, "复制 root+id", "Copy root+id"))
+                    .clicked()
+                {
+                    if workdir.trim().is_empty() || workdir == "-" {
+                        *ctx.last_error =
+                            Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
+                    } else {
+                        ui.ctx()
+                            .copy_text(format!("{} {}", workdir.trim(), selected_id));
+                        *ctx.last_info =
+                            Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+                    }
+                }
+
+                if ui
+                    .button(pick(ctx.lang, "复制 resume", "Copy resume"))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(resume_cmd.clone());
+                    *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+                }
+
+                if cfg!(windows)
+                    && ui
+                        .button(pick(ctx.lang, "在 wt 中恢复", "Open in wt"))
+                        .clicked()
+                {
+                    if workdir.trim().is_empty() || workdir == "-" {
+                        *ctx.last_error =
+                            Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
+                    } else if !std::path::Path::new(workdir.trim()).exists() {
+                        *ctx.last_error = Some(format!(
+                            "{}: {}",
+                            pick(ctx.lang, "目录不存在", "Directory not found"),
+                            workdir.trim()
+                        ));
+                    } else if let Err(e) = spawn_windows_terminal_wt_new_tab(
+                        ctx.view.history.wt_window,
+                        workdir.trim(),
+                        ctx.view.history.shell.trim(),
+                        ctx.view.history.keep_open,
+                        &resume_cmd,
+                    ) {
+                        *ctx.last_error = Some(format!("spawn wt failed: {e}"));
+                    }
+                }
+
+                if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked() {
+                    if let Err(e) = open_in_file_manager(&selected.path, true) {
+                        *ctx.last_error = Some(format!("open session failed: {e}"));
+                    }
+                }
+            });
+
+            ui.label(format!("id: {}", selected_id));
+            ui.label(format!("dir: {}", workdir));
+
+            if let Some(first) = selected.first_user_message.as_deref() {
+                let mut text = first.to_string();
+                ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .desired_rows(3)
+                        .font(egui::TextStyle::Monospace)
+                        .interactive(false),
+                );
+            }
+        });
+
+        if ctx.view.history.auto_load_transcript {
+            let tail = if ctx.view.history.transcript_full {
+                None
+            } else {
+                Some(ctx.view.history.transcript_tail)
+            };
+            let key = (selected_id.clone(), tail);
+            ensure_transcript_loading(ctx, selected.path.clone(), key);
+        }
+
+        cols[2].add_space(6.0);
+        cols[2].horizontal(|ui| {
+            let mut hide = ctx.view.history.hide_tool_calls;
+            ui.checkbox(&mut hide, pick(ctx.lang, "隐藏工具调用", "Hide tool calls"));
+            if hide != ctx.view.history.hide_tool_calls {
+                ctx.view.history.hide_tool_calls = hide;
+                ctx.view.history.transcript_messages =
+                    filter_tool_calls(ctx.view.history.transcript_raw_messages.clone(), hide);
+                ctx.view.history.transcript_plain_key = None;
+                ctx.view.history.transcript_plain_text.clear();
+            }
+
+            ui.label(pick(ctx.lang, "显示", "View"));
+            egui::ComboBox::from_id_salt("history_transcript_view_all")
+                .selected_text(match ctx.view.history.transcript_view {
+                    TranscriptViewMode::Messages => pick(ctx.lang, "消息列表", "Messages"),
+                    TranscriptViewMode::PlainText => pick(ctx.lang, "纯文本", "Plain text"),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut ctx.view.history.transcript_view,
+                        TranscriptViewMode::Messages,
+                        pick(ctx.lang, "消息列表", "Messages"),
+                    );
+                    ui.selectable_value(
+                        &mut ctx.view.history.transcript_view,
+                        TranscriptViewMode::PlainText,
+                        pick(ctx.lang, "纯文本", "Plain text"),
+                    );
+                });
+            let mut full = ctx.view.history.transcript_full;
+            ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
+            if full != ctx.view.history.transcript_full {
+                ctx.view.history.transcript_full = full;
+                ctx.view.history.loaded_for = None;
+                cancel_transcript_load(&mut ctx.view.history);
+            }
+
+            ui.label(pick(ctx.lang, "尾部条数", "Tail"));
+            ui.add_enabled(
+                !ctx.view.history.transcript_full,
+                egui::DragValue::new(&mut ctx.view.history.transcript_tail)
+                    .range(10..=500)
+                    .speed(1),
+            );
+            if ctx.view.history.transcript_full {
+                ui.label(pick(ctx.lang, "（忽略尾部设置）", "(tail ignored)"));
+            }
+
+            if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
+                ctx.view.history.loaded_for = None;
+                cancel_transcript_load(&mut ctx.view.history);
+                if !ctx.view.history.auto_load_transcript {
+                    ctx.view.history.auto_load_transcript = true;
+                }
+            }
+
+            if ui.button(pick(ctx.lang, "复制", "Copy")).clicked() {
+                let mut out = String::new();
+                for msg in ctx.view.history.transcript_messages.iter() {
                     let ts = msg.timestamp.as_deref().unwrap_or("-");
                     let role = msg.role.as_str();
-                    ui.label(format!("[{ts}] {role}:"));
+                    out.push_str(&format!("[{ts}] {role}:\n"));
+                    out.push_str(msg.text.as_str());
+                    out.push_str("\n\n");
+                }
+                ui.ctx().copy_text(out);
+                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+            }
+        });
+
+        if let Some(err) = ctx.view.history.transcript_error.as_deref() {
+            cols[2].colored_label(egui::Color32::from_rgb(200, 120, 40), err);
+        }
+
+        render_transcript_body(&mut cols[2], ctx, 360.0);
+    });
+}
+
+fn cancel_transcript_load(state: &mut HistoryViewState) {
+    if let Some(load) = state.transcript_load.take() {
+        load.join.abort();
+    }
+}
+
+fn poll_transcript_loader(ctx: &mut PageCtx<'_>) {
+    let Some(load) = ctx.view.history.transcript_load.as_mut() else {
+        return;
+    };
+    match load.rx.try_recv() {
+        Ok((seq, res)) => {
+            if seq != load.seq {
+                ctx.view.history.transcript_load = None;
+                return;
+            }
+
+            let key = load.key.clone();
+            ctx.view.history.transcript_load = None;
+
+            match res {
+                Ok(msgs) => {
+                    ctx.view.history.transcript_raw_messages = msgs;
+                    ctx.view.history.transcript_messages = filter_tool_calls(
+                        ctx.view.history.transcript_raw_messages.clone(),
+                        ctx.view.history.hide_tool_calls,
+                    );
+                    ctx.view.history.transcript_error = None;
+                    ctx.view.history.loaded_for = Some(key);
+                    ctx.view.history.transcript_selected_msg_idx = 0;
+                    ctx.view.history.transcript_plain_key = None;
+                    ctx.view.history.transcript_plain_text.clear();
+                }
+                Err(e) => {
+                    ctx.view.history.transcript_raw_messages.clear();
+                    ctx.view.history.transcript_messages.clear();
+                    ctx.view.history.transcript_error = Some(e.to_string());
+                    ctx.view.history.loaded_for = None;
+                    ctx.view.history.transcript_plain_key = None;
+                    ctx.view.history.transcript_plain_text.clear();
+                }
+            }
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            ctx.view.history.transcript_load = None;
+        }
+    }
+}
+
+fn ensure_transcript_loading(
+    ctx: &mut PageCtx<'_>,
+    path: std::path::PathBuf,
+    key: (String, Option<usize>),
+) {
+    if ctx.view.history.loaded_for.as_ref() == Some(&key) {
+        return;
+    }
+    if let Some(load) = ctx.view.history.transcript_load.as_ref()
+        && load.key == key
+    {
+        return;
+    }
+
+    start_transcript_load(ctx, path, key);
+}
+
+fn start_transcript_load(
+    ctx: &mut PageCtx<'_>,
+    path: std::path::PathBuf,
+    key: (String, Option<usize>),
+) {
+    cancel_transcript_load(&mut ctx.view.history);
+
+    ctx.view.history.transcript_load_seq = ctx.view.history.transcript_load_seq.saturating_add(1);
+    let seq = ctx.view.history.transcript_load_seq;
+    let tail = key.1;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let join = ctx.rt.spawn(async move {
+        let res = crate::sessions::read_codex_session_transcript(&path, tail).await;
+        let _ = tx.send((seq, res));
+    });
+
+    ctx.view.history.transcript_load = Some(TranscriptLoad { seq, key, rx, join });
+}
+
+fn render_transcript_body(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, max_height: f32) {
+    if ctx.view.history.transcript_load.is_some() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(pick(ctx.lang, "加载中…", "Loading..."));
+        });
+        ui.add_space(6.0);
+    }
+
+    if ctx.view.history.transcript_messages.is_empty() {
+        ui.label(pick(ctx.lang, "（无内容）", "(empty)"));
+        return;
+    }
+
+    match ctx.view.history.transcript_view {
+        TranscriptViewMode::Messages => {
+            let list_h = (max_height * 0.45).clamp(140.0, 260.0);
+            let total = ctx.view.history.transcript_messages.len();
+            let row_h = 22.0;
+
+            egui::ScrollArea::vertical().max_height(list_h).show_rows(
+                ui,
+                row_h,
+                total,
+                |ui, range| {
+                    for i in range {
+                        let selected = i == ctx.view.history.transcript_selected_msg_idx;
+                        let (ts, role, preview) = {
+                            let m = &ctx.view.history.transcript_messages[i];
+                            let ts = m.timestamp.as_deref().unwrap_or("-");
+                            let role = m.role.as_str();
+                            let first_line = m.text.lines().next().unwrap_or("");
+                            let preview = first_line.replace('\t', " ");
+                            (ts.to_string(), role.to_string(), preview)
+                        };
+                        let label = format!(
+                            "#{:>4}  {}  {}  {}",
+                            i.saturating_add(1),
+                            shorten(&ts, 19),
+                            shorten(&role, 10),
+                            shorten(&preview, 60)
+                        );
+                        if ui.selectable_label(selected, label).clicked() {
+                            ctx.view.history.transcript_selected_msg_idx = i;
+                        }
+                    }
+                },
+            );
+
+            ui.add_space(6.0);
+
+            if total == 0 {
+                return;
+            }
+            let idx = ctx
+                .view
+                .history
+                .transcript_selected_msg_idx
+                .min(total.saturating_sub(1));
+            ctx.view.history.transcript_selected_msg_idx = idx;
+
+            let (ts, role) = {
+                let m = &ctx.view.history.transcript_messages[idx];
+                (
+                    m.timestamp.clone().unwrap_or_else(|| "-".to_string()),
+                    m.role.clone(),
+                )
+            };
+            ui.label(format!("[{ts}] {role}:"));
+            ui.add(
+                egui::TextEdit::multiline(&mut ctx.view.history.transcript_messages[idx].text)
+                    .desired_rows(6)
+                    .font(egui::TextStyle::Monospace)
+                    .interactive(false),
+            );
+        }
+        TranscriptViewMode::PlainText => {
+            let cache_key = ctx
+                .view
+                .history
+                .loaded_for
+                .clone()
+                .map(|(id, tail)| (id, tail, ctx.view.history.hide_tool_calls));
+            if let Some(k) = cache_key.clone()
+                && ctx.view.history.transcript_plain_key.as_ref() != Some(&k)
+            {
+                ctx.view.history.transcript_plain_text.clear();
+                for msg in ctx.view.history.transcript_messages.iter() {
+                    let ts = msg.timestamp.as_deref().unwrap_or("-");
+                    let role = msg.role.as_str();
+                    ctx.view
+                        .history
+                        .transcript_plain_text
+                        .push_str(&format!("[{ts}] {role}:\n"));
+                    ctx.view.history.transcript_plain_text.push_str(&msg.text);
+                    ctx.view.history.transcript_plain_text.push_str("\n\n");
+                }
+                ctx.view.history.transcript_plain_key = Some(k);
+            }
+
+            egui::ScrollArea::vertical()
+                .max_height(max_height)
+                .show(ui, |ui| {
                     ui.add(
-                        egui::TextEdit::multiline(&mut msg.text)
-                            .desired_rows(3)
+                        egui::TextEdit::multiline(&mut ctx.view.history.transcript_plain_text)
+                            .desired_rows(18)
                             .font(egui::TextStyle::Monospace)
                             .interactive(false),
                     );
-                    ui.add_space(6.0);
-                }
-            });
-    });
+                });
+        }
+    }
 }
 
 fn render_placeholder(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, name: &str) {
@@ -2240,6 +3008,20 @@ fn render_placeholder(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, name: &str) {
         "后续阶段会把 TUI 的 Sessions/Requests/History 等能力逐步迁移到这里。",
         "Next milestones will port TUI Sessions/Requests/History features here.",
     ));
+}
+
+fn filter_tool_calls(
+    mut msgs: Vec<SessionTranscriptMessage>,
+    hide_tool_calls: bool,
+) -> Vec<SessionTranscriptMessage> {
+    if !hide_tool_calls {
+        return msgs;
+    }
+    msgs.retain(|m| {
+        let role = m.role.trim().to_ascii_lowercase();
+        role != "tool" && role != "tools" && role != "function"
+    });
+    msgs
 }
 
 fn render_settings(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
