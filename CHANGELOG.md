@@ -23,6 +23,8 @@ All notable changes to this project will be documented in this file.
   GUI `History` adds a “Global recent” scope: list recent Codex sessions by mtime (default last 12 hours), copy `root id` lists, and open `codex resume` directly in Windows Terminal (`wt`).
 - GUI `History`/Transcript 性能优化：对话加载改为后台任务（避免 UI 卡死），并将消息列表改为虚拟滚动渲染，长对话也更流畅。
   GUI `History`/Transcript performance: load transcripts in background (non-blocking UI) and render the message list via virtual scrolling for smoother long sessions.
+- 内部重构：将代码拆分为 workspace 的 `codex-helper-core` / `codex-helper-tui` / `codex-helper-gui` 三个 crate，降低耦合并提升可维护性（对外 CLI/GUI 使用方式不变）。
+  Internal refactor: split into a workspace with `codex-helper-core` / `codex-helper-tui` / `codex-helper-gui` crates to reduce coupling and improve maintainability (CLI/GUI usage unchanged).
 
 ## [0.11.0] - 2026-01-09
 ### 修复 / Fixed

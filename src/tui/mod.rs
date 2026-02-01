@@ -7,8 +7,8 @@ mod terminal;
 mod types;
 mod view;
 
-pub(crate) use i18n::Language;
-pub(crate) use i18n::{detect_system_language, parse_language};
+pub use i18n::Language;
+pub use i18n::{detect_system_language, parse_language};
 #[allow(unused_imports)]
 pub use model::{ProviderOption, UpstreamSummary, build_provider_options};
 

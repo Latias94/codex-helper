@@ -1,10 +1,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Language {
+pub enum Language {
     Zh,
     En,
 }
 
-pub(crate) fn parse_language(s: &str) -> Option<Language> {
+pub fn parse_language(s: &str) -> Option<Language> {
     let s = s.trim().to_ascii_lowercase();
     if s.is_empty() {
         return None;
@@ -18,7 +18,7 @@ pub(crate) fn parse_language(s: &str) -> Option<Language> {
     }
 }
 
-pub(crate) fn detect_system_language() -> Language {
+pub fn detect_system_language() -> Language {
     // Best-effort: prefer env vars to avoid platform-specific commands.
     // Common values:
     // - LANG=zh_CN.UTF-8
