@@ -5,8 +5,8 @@ All notable changes to this project will be documented in this file.
 
 ## [0.12.0] - Not released
 ### 新增 / Added
-- 新增 `codex-helper session recent`：按会话文件最后更新时间（mtime）筛选最近会话，并以 `project_root session_id` 的每行格式输出，便于快速 `codex resume`（支持 `--since/--limit/--raw-cwd`）。
-  Add `codex-helper session recent`: filter recent sessions by session file mtime and print `project_root session_id` per line for fast `codex resume` workflows (supports `--since/--limit/--raw-cwd`).
+- 新增 `codex-helper session recent`：按会话文件最后更新时间（mtime）筛选最近会话，并支持 `text/tsv/json` 输出；可选 `--open` 通过 Windows Terminal（`wt`）或 WezTerm 打开并执行恢复命令，便于快速 `codex resume`（支持 `--since/--limit/--raw-cwd/--format/--open/--terminal/--shell/--resume-cmd`）。
+  Add `codex-helper session recent`: filter recent sessions by session file mtime with `text/tsv/json` output; optionally `--open` via Windows Terminal (`wt`) or WezTerm to run a resume command for fast `codex resume` workflows (supports `--since/--limit/--raw-cwd/--format/--open/--terminal/--shell/--resume-cmd`).
 
 ### 改进 / Improved
 - 启动监听失败时，提供更友好的提示（端口占用/权限不足等），并在 Windows/Linux/macOS 下尽力显示占用端口的进程 PID/名称，便于快速定位冲突进程。

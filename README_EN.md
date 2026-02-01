@@ -449,6 +449,19 @@ codex-helper session recent --since 12h --limit 50
 # <project_root> <session_id>
 ```
 
+For scripts, prefer TSV/JSON output to avoid parsing ambiguity:
+
+```bash
+codex-helper session recent --format tsv
+codex-helper session recent --format json
+```
+
+On Windows, you can also open each session directly (best-effort):
+
+```bash
+codex-helper session recent --open --terminal wt --shell pwsh --resume-cmd "codex resume {id}"
+```
+
 You can also query sessions for any directory without cd:
 
 ```bash

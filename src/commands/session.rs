@@ -4,7 +4,19 @@ use crate::sessions::{
     read_codex_session_transcript, search_codex_sessions_for_current_dir,
     search_codex_sessions_for_dir,
 };
-use crate::{CliResult, SessionCommand};
+use crate::{CliResult, RecentFormat, RecentTerminal, SessionCommand};
+
+fn basename_lower(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_lowercase()
+}
+
+fn render_resume_cmd(template: &str, session_id: &str) -> String {
+    template.replace("{id}", session_id)
+}
 
 fn infer_project_root_from_cwd(cwd: &str) -> String {
     let path = std::path::PathBuf::from(cwd);
@@ -23,6 +35,156 @@ fn infer_project_root_from_cwd(cwd: &str) -> String {
         }
     }
     canonical.to_string_lossy().to_string()
+}
+
+fn print_recent_sessions(
+    format: RecentFormat,
+    rows: &[(String, String, Option<String>, u64)],
+) -> CliResult<()> {
+    match format {
+        RecentFormat::Text => {
+            for (root, id, _cwd, _mtime_ms) in rows {
+                println!("{root} {id}");
+            }
+        }
+        RecentFormat::Tsv => {
+            for (root, id, cwd, mtime_ms) in rows {
+                let cwd = cwd.as_deref().unwrap_or("");
+                println!("{root}\t{id}\t{cwd}\t{mtime_ms}");
+            }
+        }
+        RecentFormat::Json => {
+            #[derive(serde::Serialize)]
+            struct Row<'a> {
+                project_root: &'a str,
+                session_id: &'a str,
+                cwd: Option<&'a str>,
+                mtime_ms: u64,
+            }
+            let json_rows: Vec<Row<'_>> = rows
+                .iter()
+                .map(|(root, id, cwd, mtime_ms)| Row {
+                    project_root: root.as_str(),
+                    session_id: id.as_str(),
+                    cwd: cwd.as_deref(),
+                    mtime_ms: *mtime_ms,
+                })
+                .collect();
+            let s = serde_json::to_string_pretty(&json_rows).unwrap_or_else(|_| "[]".to_string());
+            println!("{s}");
+        }
+    }
+    Ok(())
+}
+
+fn spawn_cmd_dry_run(label: &str, program: &str, args: &[String]) {
+    let joined = std::iter::once(program.to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("DRY-RUN[{label}]: {joined}");
+}
+
+fn spawn_windows_terminal_wt(
+    wt_window: i32,
+    workdir: &str,
+    shell: &str,
+    keep_open: bool,
+    command: &str,
+    dry_run: bool,
+) -> CliResult<()> {
+    let shell_base = basename_lower(shell);
+    let mut args: Vec<String> = Vec::new();
+    args.push("-w".to_string());
+    args.push(wt_window.to_string());
+    args.push("new-tab".to_string());
+    args.push("-d".to_string());
+    args.push(workdir.to_string());
+    args.push(shell.to_string());
+
+    if shell_base.contains("pwsh") || shell_base.contains("powershell") {
+        args.push("-ExecutionPolicy".to_string());
+        args.push("Bypass".to_string());
+        if keep_open {
+            args.push("-NoExit".to_string());
+        }
+        args.push("-Command".to_string());
+        args.push(command.to_string());
+    } else if shell_base == "cmd" || shell_base == "cmd.exe" {
+        args.push(if keep_open { "/k" } else { "/c" }.to_string());
+        args.push(command.to_string());
+    } else {
+        return Err(crate::CliError::Other(format!(
+            "unsupported shell for wt: {} (supported: pwsh/powershell/cmd)",
+            shell
+        )));
+    }
+
+    if dry_run {
+        spawn_cmd_dry_run("wt", "wt", &args);
+        return Ok(());
+    }
+
+    std::process::Command::new("wt")
+        .args(&args)
+        .spawn()
+        .map_err(|e| {
+            crate::CliError::Other(format!(
+                "failed to spawn wt; is Windows Terminal installed and `wt` in PATH? ({e})"
+            ))
+        })?;
+    Ok(())
+}
+
+fn spawn_wezterm(
+    workdir: &str,
+    shell: &str,
+    keep_open: bool,
+    command: &str,
+    dry_run: bool,
+) -> CliResult<()> {
+    let shell_base = basename_lower(shell);
+    let mut args: Vec<String> = Vec::new();
+    args.push("start".to_string());
+    args.push("--cwd".to_string());
+    args.push(workdir.to_string());
+    args.push("--".to_string());
+    args.push(shell.to_string());
+
+    if shell_base.contains("pwsh") || shell_base.contains("powershell") {
+        if keep_open {
+            args.push("-NoExit".to_string());
+        }
+        args.push("-Command".to_string());
+        args.push(command.to_string());
+    } else if shell_base == "sh" || shell_base == "bash" || shell_base == "zsh" {
+        args.push("-lc".to_string());
+        if keep_open {
+            args.push(format!("{command}; exec {shell_base}"));
+        } else {
+            args.push(command.to_string());
+        }
+    } else {
+        return Err(crate::CliError::Other(format!(
+            "unsupported shell for wezterm: {} (supported: pwsh/powershell/sh/bash/zsh)",
+            shell
+        )));
+    }
+
+    if dry_run {
+        spawn_cmd_dry_run("wezterm", "wezterm", &args);
+        return Ok(());
+    }
+
+    std::process::Command::new("wezterm")
+        .args(&args)
+        .spawn()
+        .map_err(|e| {
+            crate::CliError::Other(format!(
+                "failed to spawn wezterm; is WezTerm installed and `wezterm` in PATH? ({e})"
+            ))
+        })?;
+    Ok(())
 }
 
 pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
@@ -73,16 +235,82 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
             limit,
             since,
             raw_cwd,
+            format,
+            open,
+            terminal,
+            shell,
+            keep_open,
+            resume_cmd,
+            wt_window,
+            delay_ms,
+            dry_run,
         } => {
             let sessions = find_recent_codex_sessions(since.into(), limit).await?;
+            let mut rows: Vec<(String, String, Option<String>, u64)> =
+                Vec::with_capacity(sessions.len());
             for s in sessions {
-                let cwd = s.cwd.as_deref().unwrap_or("-");
+                let cwd_opt = s.cwd.clone();
+                let cwd = cwd_opt.as_deref().unwrap_or("-");
                 let root = if raw_cwd {
                     cwd.to_string()
                 } else {
                     infer_project_root_from_cwd(cwd)
                 };
-                println!("{} {}", root, s.id);
+                rows.push((root, s.id, cwd_opt, s.mtime_ms));
+            }
+
+            print_recent_sessions(format, &rows)?;
+
+            if !open {
+                return Ok(());
+            }
+
+            let term = terminal.unwrap_or_else(|| {
+                if cfg!(windows) {
+                    RecentTerminal::Wt
+                } else {
+                    RecentTerminal::Wezterm
+                }
+            });
+            let shell = shell.unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "pwsh".to_string()
+                } else {
+                    "sh".to_string()
+                }
+            });
+
+            for (root, id, _cwd, _mtime_ms) in rows {
+                let workdir = root.trim();
+                if workdir.is_empty() || workdir == "-" {
+                    eprintln!(" [跳过] 会话 cwd 不可用: {id}");
+                    continue;
+                }
+                if !std::path::Path::new(workdir).exists() {
+                    eprintln!(" [跳过] 目录不存在: {workdir}");
+                    continue;
+                }
+
+                let full_cmd = render_resume_cmd(&resume_cmd, &id);
+                match term {
+                    RecentTerminal::Wt => {
+                        if !cfg!(windows) {
+                            return Err(crate::CliError::Other(
+                                "--terminal wt is only supported on Windows".to_string(),
+                            ));
+                        }
+                        spawn_windows_terminal_wt(
+                            wt_window, workdir, &shell, keep_open, &full_cmd, dry_run,
+                        )?;
+                    }
+                    RecentTerminal::Wezterm => {
+                        spawn_wezterm(workdir, &shell, keep_open, &full_cmd, dry_run)?;
+                    }
+                }
+
+                if delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
             }
         }
         SessionCommand::Last { path } => {

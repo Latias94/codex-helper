@@ -426,6 +426,19 @@ codex-helper session recent --since 12h --limit 50
 # <project_root> <session_id>
 ```
 
+脚本集成建议优先使用 TSV/JSON 输出，避免解析歧义：
+
+```bash
+codex-helper session recent --format tsv
+codex-helper session recent --format json
+```
+
+Windows 下也可以直接打开每个会话（best-effort）：
+
+```bash
+codex-helper session recent --open --terminal wt --shell pwsh --resume-cmd "codex resume {id}"
+```
+
 你也可以从任意目录查询指定项目的会话：
 
 ```bash

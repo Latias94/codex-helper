@@ -372,6 +372,33 @@ enum SessionCommand {
         /// Print the raw session cwd instead of inferring a git project root
         #[arg(long)]
         raw_cwd: bool,
+        /// Output format: text | tsv | json
+        #[arg(long, value_enum, default_value_t = RecentFormat::Text)]
+        format: RecentFormat,
+        /// Open each session in a new terminal window/tab (best-effort; Windows-first)
+        #[arg(long)]
+        open: bool,
+        /// Terminal backend used by --open (Windows: wt recommended; cross-platform: wezterm)
+        #[arg(long, value_enum)]
+        terminal: Option<RecentTerminal>,
+        /// Shell executable for --open (Windows examples: `pwsh` or full path to pwsh.exe)
+        #[arg(long)]
+        shell: Option<String>,
+        /// Keep the terminal open after running the resume command (best-effort)
+        #[arg(long, default_value_t = true)]
+        keep_open: bool,
+        /// Resume command template; supports `{id}` placeholder
+        #[arg(long, default_value = "codex resume {id}")]
+        resume_cmd: String,
+        /// Windows Terminal window id; use -1 to force a new window (wt only)
+        #[arg(long, default_value_t = -1)]
+        wt_window: i32,
+        /// Delay between opening terminals (milliseconds)
+        #[arg(long, default_value_t = 500)]
+        delay_ms: u64,
+        /// Print the spawn commands without executing them
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print a session transcript (best-effort) by session id
     Transcript {
@@ -421,6 +448,23 @@ enum SessionCommand {
         #[arg(long)]
         path: Option<String>,
     },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+enum RecentFormat {
+    Text,
+    Tsv,
+    Json,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+enum RecentTerminal {
+    /// Windows Terminal (`wt`)
+    Wt,
+    /// WezTerm (`wezterm`)
+    Wezterm,
 }
 
 #[derive(Subcommand, Debug)]
