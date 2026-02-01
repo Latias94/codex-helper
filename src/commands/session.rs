@@ -1,7 +1,7 @@
 use crate::sessions::{
     SessionSummary, find_codex_session_file_by_id, find_codex_sessions_for_current_dir,
-    find_codex_sessions_for_dir, find_recent_codex_sessions, read_codex_session_meta,
-    read_codex_session_transcript, search_codex_sessions_for_current_dir,
+    find_codex_sessions_for_dir, find_recent_codex_sessions, infer_project_root_from_cwd,
+    read_codex_session_meta, read_codex_session_transcript, search_codex_sessions_for_current_dir,
     search_codex_sessions_for_dir,
 };
 use crate::{CliResult, RecentFormat, RecentTerminal, SessionCommand};
@@ -16,25 +16,6 @@ fn basename_lower(path: &str) -> String {
 
 fn render_resume_cmd(template: &str, session_id: &str) -> String {
     template.replace("{id}", session_id)
-}
-
-fn infer_project_root_from_cwd(cwd: &str) -> String {
-    let path = std::path::PathBuf::from(cwd);
-    if !path.is_absolute() {
-        return cwd.to_string();
-    }
-
-    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-    let mut cur = canonical.clone();
-    loop {
-        if cur.join(".git").exists() {
-            return cur.to_string_lossy().to_string();
-        }
-        if !cur.pop() {
-            break;
-        }
-    }
-    canonical.to_string_lossy().to_string()
 }
 
 fn print_recent_sessions(

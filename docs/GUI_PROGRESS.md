@@ -67,6 +67,7 @@
 - [x] GUI-302 Transcript viewer: tail/all toggle, scrolling, copy-to-clipboard
 - [x] GUI-303 “Open in explorer/finder” for session file/logs (Windows-first)
 - [x] GUI-304 Open transcript from Sessions (jump to History + auto load by session_id)
+- [x] GUI-305 Global recent history: list recent sessions by mtime (default 12h) + copy `root id` + open `codex resume` in Windows Terminal (`wt`)
 
 **Definition of done**
 - GUI can browse history and read/copy transcripts like TUI.

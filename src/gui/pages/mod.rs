@@ -6,7 +6,7 @@ use super::autostart;
 use super::config::GuiConfig;
 use super::i18n::{Language, pick};
 use super::proxy_control::{PortInUseAction, ProxyModeKind};
-use super::util::open_in_file_manager;
+use super::util::{open_in_file_manager, spawn_windows_terminal_wt_new_tab};
 use crate::dashboard_core::ConfigOption;
 use crate::sessions::{SessionSummary, SessionTranscriptMessage};
 use crate::state::{ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, SessionStats};
@@ -92,12 +92,20 @@ impl Default for ImportCodexModalState {
 
 #[derive(Debug)]
 pub struct HistoryViewState {
+    pub scope: HistoryScope,
     pub query: String,
     pub sessions: Vec<SessionSummary>,
     pub last_error: Option<String>,
     pub loaded_at_ms: Option<u64>,
     pub selected_idx: usize,
     pub selected_id: Option<String>,
+    pub recent_since_hours: u32,
+    pub recent_limit: usize,
+    pub infer_git_root: bool,
+    pub resume_cmd: String,
+    pub shell: String,
+    pub keep_open: bool,
+    pub wt_window: i32,
     pub auto_load_transcript: bool,
     pub transcript_full: bool,
     pub transcript_tail: usize,
@@ -106,15 +114,29 @@ pub struct HistoryViewState {
     loaded_for: Option<(String, Option<usize>)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryScope {
+    CurrentProject,
+    GlobalRecent,
+}
+
 impl Default for HistoryViewState {
     fn default() -> Self {
         Self {
+            scope: HistoryScope::CurrentProject,
             query: String::new(),
             sessions: Vec::new(),
             last_error: None,
             loaded_at_ms: None,
             selected_idx: 0,
             selected_id: None,
+            recent_since_hours: 12,
+            recent_limit: 50,
+            infer_git_root: true,
+            resume_cmd: "codex resume {id}".to_string(),
+            shell: "pwsh".to_string(),
+            keep_open: true,
+            wt_window: -1,
             auto_load_transcript: true,
             transcript_full: false,
             transcript_tail: 80,
@@ -1737,24 +1759,108 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.add_space(6.0);
 
     ui.horizontal(|ui| {
+        ui.label(pick(ctx.lang, "范围", "Scope"));
+        egui::ComboBox::from_id_salt("history_scope")
+            .selected_text(match ctx.view.history.scope {
+                HistoryScope::CurrentProject => pick(ctx.lang, "当前项目", "Current project"),
+                HistoryScope::GlobalRecent => pick(ctx.lang, "全局最近", "Global recent"),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut ctx.view.history.scope,
+                    HistoryScope::CurrentProject,
+                    pick(ctx.lang, "当前项目", "Current project"),
+                );
+                ui.selectable_value(
+                    &mut ctx.view.history.scope,
+                    HistoryScope::GlobalRecent,
+                    pick(ctx.lang, "全局最近", "Global recent"),
+                );
+            });
+
+        if ctx.view.history.scope == HistoryScope::GlobalRecent {
+            ui.label(pick(ctx.lang, "最近(小时)", "Since (hours)"));
+            ui.add(
+                egui::DragValue::new(&mut ctx.view.history.recent_since_hours)
+                    .range(1..=168)
+                    .speed(1),
+            );
+            ui.label(pick(ctx.lang, "条数", "Limit"));
+            ui.add(
+                egui::DragValue::new(&mut ctx.view.history.recent_limit)
+                    .range(1..=500)
+                    .speed(1),
+            );
+            ui.checkbox(
+                &mut ctx.view.history.infer_git_root,
+                pick(ctx.lang, "git 根目录", "git root"),
+            )
+            .on_hover_text(pick(
+                ctx.lang,
+                "在 cwd 上向上查找 .git 作为项目根目录（用于复制/打开）",
+                "Find .git upward from cwd as the project root (for copy/open).",
+            ));
+        }
+    });
+
+    ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "搜索", "Search"));
         ui.add(
             egui::TextEdit::singleline(&mut ctx.view.history.query)
                 .desired_width(240.0)
                 .hint_text(pick(
                     ctx.lang,
-                    "输入关键词（匹配首条用户消息）",
-                    "keyword (first user message)",
+                    if ctx.view.history.scope == HistoryScope::GlobalRecent {
+                        "输入关键词（匹配 cwd 或首条用户消息）"
+                    } else {
+                        "输入关键词（匹配首条用户消息）"
+                    },
+                    if ctx.view.history.scope == HistoryScope::GlobalRecent {
+                        "keyword (cwd or first user message)"
+                    } else {
+                        "keyword (first user message)"
+                    },
                 )),
         );
 
         if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
             let query = ctx.view.history.query.trim().to_string();
+            let scope = ctx.view.history.scope;
+            let recent_since_hours = ctx.view.history.recent_since_hours;
+            let recent_limit = ctx.view.history.recent_limit;
             let fut = async move {
-                if query.is_empty() {
-                    crate::sessions::find_codex_sessions_for_current_dir(200).await
-                } else {
-                    crate::sessions::search_codex_sessions_for_current_dir(&query, 200).await
+                match scope {
+                    HistoryScope::CurrentProject => {
+                        if query.is_empty() {
+                            crate::sessions::find_codex_sessions_for_current_dir(200).await
+                        } else {
+                            crate::sessions::search_codex_sessions_for_current_dir(&query, 200)
+                                .await
+                        }
+                    }
+                    HistoryScope::GlobalRecent => {
+                        let since = std::time::Duration::from_secs(
+                            (recent_since_hours as u64).saturating_mul(3600),
+                        );
+                        let mut list = crate::sessions::find_recent_codex_session_summaries(
+                            since,
+                            recent_limit,
+                        )
+                        .await?;
+
+                        let q = query.trim().to_lowercase();
+                        if !q.is_empty() {
+                            list.retain(|s| {
+                                s.cwd
+                                    .as_deref()
+                                    .is_some_and(|cwd| cwd.to_lowercase().contains(q.as_str()))
+                                    || s.first_user_message
+                                        .as_deref()
+                                        .is_some_and(|msg| msg.to_lowercase().contains(q.as_str()))
+                            });
+                        }
+                        Ok(list)
+                    }
                 }
             };
             match ctx.rt.block_on(fut) {
@@ -1786,6 +1892,31 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     ctx.view.history.last_error = Some(e.to_string());
                 }
             }
+        }
+
+        if ctx.view.history.scope == HistoryScope::GlobalRecent
+            && ui
+                .button(pick(ctx.lang, "复制 root+id 列表", "Copy root+id list"))
+                .clicked()
+        {
+            let mut out = String::new();
+            for s in ctx.view.history.sessions.iter() {
+                let cwd = s.cwd.as_deref().unwrap_or("-");
+                if cwd == "-" {
+                    continue;
+                }
+                let root = if ctx.view.history.infer_git_root {
+                    crate::sessions::infer_project_root_from_cwd(cwd)
+                } else {
+                    cwd.to_string()
+                };
+                out.push_str(root.trim());
+                out.push(' ');
+                out.push_str(s.id.as_str());
+                out.push('\n');
+            }
+            ui.ctx().copy_text(out);
+            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
         }
 
         ui.checkbox(
@@ -1865,11 +1996,6 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 for (idx, s) in ctx.view.history.sessions.iter().enumerate() {
                     let selected = idx == ctx.view.history.selected_idx;
                     let id_short = short_sid(&s.id, 16);
-                    let cwd = s
-                        .cwd
-                        .as_deref()
-                        .map(|v| shorten(basename(v), 22))
-                        .unwrap_or_else(|| "-".to_string());
                     let rounds = s.rounds;
                     let last = s
                         .last_response_at
@@ -1877,10 +2003,37 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         .or(s.updated_at.as_deref())
                         .unwrap_or("-");
                     let first = s.first_user_message.as_deref().unwrap_or("-");
-                    let label = format!(
-                        "{id_short}  r={rounds}  {cwd}  {last}  {}",
-                        shorten(first, 40)
-                    );
+                    let label = match ctx.view.history.scope {
+                        HistoryScope::CurrentProject => {
+                            let cwd = s
+                                .cwd
+                                .as_deref()
+                                .map(|v| shorten(basename(v), 22))
+                                .unwrap_or_else(|| "-".to_string());
+                            format!(
+                                "{id_short}  r={rounds}  {cwd}  {last}  {}",
+                                shorten(first, 40)
+                            )
+                        }
+                        HistoryScope::GlobalRecent => {
+                            let root = s
+                                .cwd
+                                .as_deref()
+                                .map(|cwd| {
+                                    if ctx.view.history.infer_git_root {
+                                        crate::sessions::infer_project_root_from_cwd(cwd)
+                                    } else {
+                                        cwd.to_string()
+                                    }
+                                })
+                                .unwrap_or_else(|| "-".to_string());
+                            format!(
+                                "{}  {id_short}  r={rounds}  {last}  {}",
+                                shorten(&root, 44),
+                                shorten(first, 36)
+                            )
+                        }
+                    };
                     if ui.selectable_label(selected, label).clicked() {
                         ctx.view.history.selected_idx = idx;
                         ctx.view.history.selected_id = Some(s.id.clone());
@@ -1891,6 +2044,118 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         cols[1].heading(pick(ctx.lang, "对话记录", "Transcript"));
         cols[1].add_space(4.0);
+
+        let selected = &ctx.view.history.sessions[selected_idx];
+        let selected_id = selected.id.clone();
+        let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
+        let workdir = if selected_cwd != "-" && ctx.view.history.infer_git_root {
+            crate::sessions::infer_project_root_from_cwd(&selected_cwd)
+        } else {
+            selected_cwd.clone()
+        };
+        let resume_cmd = {
+            let t = ctx.view.history.resume_cmd.trim();
+            if t.is_empty() {
+                format!("codex resume {selected_id}")
+            } else if t.contains("{id}") {
+                t.replace("{id}", &selected_id)
+            } else {
+                format!("{t} {selected_id}")
+            }
+        };
+
+        cols[1].group(|ui| {
+            ui.label(pick(ctx.lang, "恢复", "Resume"));
+
+            ui.horizontal(|ui| {
+                ui.label(pick(ctx.lang, "命令模板", "Template"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut ctx.view.history.resume_cmd)
+                        .desired_width(260.0),
+                );
+                if ui
+                    .button(pick(ctx.lang, "用 bypass", "Use bypass"))
+                    .clicked()
+                {
+                    ctx.view.history.resume_cmd =
+                        "codex --dangerously-bypass-approvals-and-sandbox resume {id}".to_string();
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(pick(ctx.lang, "Shell", "Shell"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut ctx.view.history.shell).desired_width(140.0),
+                );
+                ui.checkbox(
+                    &mut ctx.view.history.keep_open,
+                    pick(ctx.lang, "保持打开", "Keep open"),
+                );
+            });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button(pick(ctx.lang, "复制 root+id", "Copy root+id"))
+                    .clicked()
+                {
+                    if workdir.trim().is_empty() || workdir == "-" {
+                        *ctx.last_error =
+                            Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
+                    } else {
+                        ui.ctx()
+                            .copy_text(format!("{} {}", workdir.trim(), selected_id));
+                        *ctx.last_info =
+                            Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+                    }
+                }
+
+                if ui
+                    .button(pick(ctx.lang, "复制 resume", "Copy resume"))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(resume_cmd.clone());
+                    *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+                }
+
+                if cfg!(windows)
+                    && ui
+                        .button(pick(ctx.lang, "在 wt 中恢复", "Open in wt"))
+                        .clicked()
+                {
+                    if workdir.trim().is_empty() || workdir == "-" {
+                        *ctx.last_error =
+                            Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
+                    } else if !std::path::Path::new(workdir.trim()).exists() {
+                        *ctx.last_error = Some(format!(
+                            "{}: {}",
+                            pick(ctx.lang, "目录不存在", "Directory not found"),
+                            workdir.trim()
+                        ));
+                    } else if let Err(e) = spawn_windows_terminal_wt_new_tab(
+                        ctx.view.history.wt_window,
+                        workdir.trim(),
+                        ctx.view.history.shell.trim(),
+                        ctx.view.history.keep_open,
+                        &resume_cmd,
+                    ) {
+                        *ctx.last_error = Some(format!("spawn wt failed: {e}"));
+                    }
+                }
+            });
+
+            ui.label(format!("id: {}", selected_id));
+            ui.label(format!("dir: {}", workdir));
+
+            if let Some(first) = selected.first_user_message.as_deref() {
+                let mut text = first.to_string();
+                ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .desired_rows(3)
+                        .font(egui::TextStyle::Monospace)
+                        .interactive(false),
+                );
+            }
+        });
 
         cols[1].horizontal(|ui| {
             let mut full = ctx.view.history.transcript_full;

@@ -54,6 +54,25 @@ pub struct RecentSession {
     pub mtime_ms: u64,
 }
 
+pub fn infer_project_root_from_cwd(cwd: &str) -> String {
+    let path = std::path::PathBuf::from(cwd);
+    if !path.is_absolute() {
+        return cwd.to_string();
+    }
+
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    let mut cur = canonical.clone();
+    loop {
+        if cur.join(".git").exists() {
+            return cur.to_string_lossy().to_string();
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    canonical.to_string_lossy().to_string()
+}
+
 const MAX_SCAN_FILES: usize = 10_000;
 const HEAD_SCAN_LINES: usize = 512;
 const IO_CHUNK_SIZE: usize = 64 * 1024;
@@ -309,6 +328,72 @@ pub async fn find_recent_codex_sessions(
 ) -> Result<Vec<RecentSession>> {
     let root = codex_sessions_dir();
     find_recent_codex_sessions_in_dir(&root, since, limit).await
+}
+
+#[cfg(feature = "gui")]
+pub async fn find_recent_codex_session_summaries(
+    since: Duration,
+    limit: usize,
+) -> Result<Vec<SessionSummary>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let sessions_dir = codex_sessions_dir();
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let since_ms = since.as_millis().min(u64::MAX as u128) as u64;
+    let threshold_ms = now_ms.saturating_sub(since_ms);
+
+    let mut headers: Vec<SessionHeader> = Vec::new();
+    let mut scanned_files: usize = 0;
+
+    let year_dirs = collect_dirs_desc(&sessions_dir, |s| s.parse::<u32>().ok()).await?;
+    'outer: for (_year, year_path) in year_dirs {
+        let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
+        for (_month, month_path) in month_dirs {
+            let day_dirs = collect_dirs_desc(&month_path, |s| s.parse::<u8>().ok()).await?;
+            for (_day, day_path) in day_dirs {
+                let day_files = collect_rollout_files_sorted(&day_path).await?;
+                for path in day_files {
+                    if scanned_files >= MAX_SCAN_FILES_RECENT {
+                        break 'outer;
+                    }
+                    scanned_files += 1;
+
+                    let meta = match fs::metadata(&path).await {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let mtime_ms = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                        .unwrap_or(0);
+                    if mtime_ms < threshold_ms {
+                        continue;
+                    }
+
+                    let header_opt = read_session_header(&path, &cwd).await?;
+                    let Some(header) = header_opt else {
+                        continue;
+                    };
+                    headers.push(header);
+                }
+            }
+        }
+    }
+
+    select_and_expand_headers(Vec::new(), headers, limit).await
 }
 
 async fn find_recent_codex_sessions_in_dir(

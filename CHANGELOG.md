@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
   Provide friendlier bind/listen failure messages (port in use / permission denied, etc.) and best-effort show the PID/process holding the port on Windows/Linux/macOS for faster troubleshooting.
 - `codex-helper session list` 默认完整展示 first prompt，并提供 `--truncate` 以按需截断输出。
   `codex-helper session list` now prints the full first prompt by default and provides `--truncate` for an optional compact view.
+- GUI `History` 页面新增“全局最近”范围：按 mtime（默认近 12 小时）列出最近 Codex 会话，并支持一键复制 `root id` 列表与在 Windows Terminal（`wt`）中直接执行 `codex resume`。
+  GUI `History` adds a “Global recent” scope: list recent Codex sessions by mtime (default last 12 hours), copy `root id` lists, and open `codex resume` directly in Windows Terminal (`wt`).
 
 ## [0.11.0] - 2026-01-09
 ### 修复 / Fixed
