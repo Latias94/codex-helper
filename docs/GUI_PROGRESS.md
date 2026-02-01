@@ -102,7 +102,7 @@
 
 ## Refactor Workstream (shared core)
 
-- [ ] CORE-001 Extract `Snapshot` building logic into UI-neutral module (shared by TUI + GUI)
+- [x] CORE-001 Extract `Snapshot` building logic into UI-neutral module (shared by TUI + GUI)
 - [ ] CORE-002 Keep rendering-only code in TUI; remove `ratatui` types from shared core
 - [ ] CORE-003 Add unit tests for snapshot aggregation (Windows path handling already exists; extend as needed)
 - [ ] CORE-004 Versioned API layer for attach mode (see M5)
@@ -116,6 +116,7 @@
 
 ## Change Log (append-only)
 
+- 2026-02-01: Added GUI Stats page; introduced `dashboard_core` snapshot/window stats; added API v1 `/snapshot` for attach mode.
 - 2026-01-24: Finished GUI-001..GUI-006 (GUI binary + `gui` feature, shell/nav, GUI config, zh/en toggle, raw config editor stub).
 - 2026-01-24: Finished GUI-101/102, GUI-501/502 (integrated start/stop, port-in-use prompt+remember, attach read-only refresh).
 - 2026-01-24: Finished GUI-104/105 (+ GUI-203): sessions/requests pages backed by in-process `ProxyState`, with session overrides editing (pinned config + effort).

@@ -5,6 +5,8 @@
 mod codex_integration;
 #[path = "../config.rs"]
 mod config;
+#[path = "../dashboard_core/mod.rs"]
+mod dashboard_core;
 #[path = "../filter.rs"]
 mod filter;
 #[path = "../healthcheck.rs"]

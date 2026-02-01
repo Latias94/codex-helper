@@ -13,21 +13,12 @@ use std::collections::HashMap;
 use crate::config::{
     ProxyConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
 };
+use crate::dashboard_core::{ApiV1Snapshot, ConfigOption, WindowStats, build_dashboard_snapshot};
 use crate::proxy::ProxyService;
 use crate::state::{
-    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, ProxyState, SessionStats,
+    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
+    SessionStats, UsageRollupView,
 };
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct GuiConfigOption {
-    pub name: String,
-    #[serde(default)]
-    pub alias: Option<String>,
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub level: u8,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortInUseAction {
@@ -78,9 +69,13 @@ pub struct AttachedStatus {
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
-    pub configs: Vec<GuiConfigOption>,
+    pub configs: Vec<ConfigOption>,
     pub config_health: HashMap<String, ConfigHealth>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
+    pub usage_rollup: UsageRollupView,
+    pub stats_5m: WindowStats,
+    pub stats_1h: WindowStats,
+    pub lb_view: HashMap<String, LbConfigView>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
 }
@@ -103,6 +98,10 @@ impl AttachedStatus {
             configs: Vec::new(),
             config_health: HashMap::new(),
             health_checks: HashMap::new(),
+            usage_rollup: UsageRollupView::default(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            lb_view: HashMap::new(),
             runtime_loaded_at_ms: None,
             runtime_source_mtime_ms: None,
         }
@@ -122,7 +121,13 @@ pub struct GuiRuntimeSnapshot {
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
-    pub configs: Vec<GuiConfigOption>,
+    pub configs: Vec<ConfigOption>,
+    pub config_health: HashMap<String, ConfigHealth>,
+    pub health_checks: HashMap<String, HealthCheckStatus>,
+    pub usage_rollup: UsageRollupView,
+    pub stats_5m: WindowStats,
+    pub stats_1h: WindowStats,
+    pub lb_view: HashMap<String, LbConfigView>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
     pub supports_v1: bool,
@@ -141,6 +146,12 @@ pub struct RunningProxy {
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
+    pub config_health: HashMap<String, ConfigHealth>,
+    pub health_checks: HashMap<String, HealthCheckStatus>,
+    pub usage_rollup: UsageRollupView,
+    pub stats_5m: WindowStats,
+    pub stats_1h: WindowStats,
+    pub lb_view: HashMap<String, LbConfigView>,
     shutdown_tx: watch::Sender<bool>,
     server_handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
@@ -281,6 +292,12 @@ impl ProxyController {
                 session_effort_overrides: r.session_effort_overrides.clone(),
                 session_stats: r.session_stats.clone(),
                 configs: list_configs_from_cfg(r.cfg.as_ref(), r.service_name),
+                config_health: r.config_health.clone(),
+                health_checks: r.health_checks.clone(),
+                usage_rollup: r.usage_rollup.clone(),
+                stats_5m: r.stats_5m.clone(),
+                stats_1h: r.stats_1h.clone(),
+                lb_view: r.lb_view.clone(),
                 runtime_loaded_at_ms: None,
                 runtime_source_mtime_ms: None,
                 supports_v1: true,
@@ -298,6 +315,12 @@ impl ProxyController {
                 session_effort_overrides: a.session_effort_overrides.clone(),
                 session_stats: a.session_stats.clone(),
                 configs: a.configs.clone(),
+                config_health: a.config_health.clone(),
+                health_checks: a.health_checks.clone(),
+                usage_rollup: a.usage_rollup.clone(),
+                stats_5m: a.stats_5m.clone(),
+                stats_1h: a.stats_1h.clone(),
+                lb_view: a.lb_view.clone(),
                 runtime_loaded_at_ms: a.runtime_loaded_at_ms,
                 runtime_source_mtime_ms: a.runtime_source_mtime_ms,
                 supports_v1: a.api_version == Some(1),
@@ -588,6 +611,8 @@ impl ProxyController {
             struct ApiCapabilities {
                 api_version: u32,
                 service_name: String,
+                #[serde(default)]
+                endpoints: Vec<String>,
             }
 
             #[derive(Debug, serde::Deserialize)]
@@ -613,6 +638,27 @@ impl ProxyController {
                     .await?)
             }
 
+            #[derive(Default)]
+            struct RefreshResult {
+                api_version: Option<u32>,
+                service_name: Option<String>,
+                active: Vec<ActiveRequest>,
+                recent: Vec<FinishedRequest>,
+                global_override: Option<String>,
+                session_cfg: HashMap<String, String>,
+                session_effort: HashMap<String, String>,
+                session_stats: HashMap<String, SessionStats>,
+                configs: Vec<ConfigOption>,
+                config_health: HashMap<String, ConfigHealth>,
+                health_checks: HashMap<String, HealthCheckStatus>,
+                usage_rollup: UsageRollupView,
+                stats_5m: WindowStats,
+                stats_1h: WindowStats,
+                lb_view: HashMap<String, LbConfigView>,
+                runtime_loaded_at_ms: Option<u64>,
+                runtime_source_mtime_ms: Option<u64>,
+            }
+
             let caps = get_json::<ApiCapabilities>(
                 &client,
                 format!("{base}/__codex_helper/api/v1/capabilities"),
@@ -623,6 +669,42 @@ impl ProxyController {
 
             if supports_v1 {
                 let caps = caps.expect("checked ok above");
+                let supports_snapshot = caps
+                    .endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/snapshot");
+
+                if supports_snapshot {
+                    let api = get_json::<ApiV1Snapshot>(
+                        &client,
+                        format!(
+                            "{base}/__codex_helper/api/v1/snapshot?recent_limit=600&stats_days=21"
+                        ),
+                        req_timeout,
+                    )
+                    .await?;
+
+                    return Ok::<_, anyhow::Error>(RefreshResult {
+                        api_version: Some(api.api_version),
+                        service_name: Some(api.service_name),
+                        active: api.snapshot.active,
+                        recent: api.snapshot.recent,
+                        global_override: api.snapshot.global_override,
+                        session_cfg: api.snapshot.session_config_overrides,
+                        session_effort: api.snapshot.session_effort_overrides,
+                        session_stats: api.snapshot.session_stats,
+                        configs: api.configs,
+                        config_health: api.snapshot.config_health,
+                        health_checks: api.snapshot.health_checks,
+                        usage_rollup: api.snapshot.usage_rollup,
+                        stats_5m: api.snapshot.stats_5m,
+                        stats_1h: api.snapshot.stats_1h,
+                        lb_view: api.snapshot.lb_view,
+                        runtime_loaded_at_ms: api.runtime_loaded_at_ms,
+                        runtime_source_mtime_ms: api.runtime_source_mtime_ms,
+                    });
+                }
+
                 let (
                     active,
                     recent,
@@ -670,7 +752,7 @@ impl ProxyController {
                         format!("{base}/__codex_helper/api/v1/status/session-stats"),
                         req_timeout,
                     ),
-                    get_json::<Vec<GuiConfigOption>>(
+                    get_json::<Vec<ConfigOption>>(
                         &client,
                         format!("{base}/__codex_helper/api/v1/configs"),
                         req_timeout,
@@ -687,21 +769,25 @@ impl ProxyController {
                     ),
                 )?;
 
-                return Ok::<_, anyhow::Error>((
-                    Some(caps.api_version),
-                    Some(caps.service_name),
+                return Ok::<_, anyhow::Error>(RefreshResult {
+                    api_version: Some(caps.api_version),
+                    service_name: Some(caps.service_name),
                     active,
                     recent,
                     global_override,
                     session_cfg,
                     session_effort,
-                    stats,
+                    session_stats: stats,
                     configs,
                     config_health,
                     health_checks,
-                    Some(runtime.loaded_at_ms),
-                    runtime.source_mtime_ms,
-                ));
+                    usage_rollup: UsageRollupView::default(),
+                    stats_5m: WindowStats::default(),
+                    stats_1h: WindowStats::default(),
+                    lb_view: HashMap::new(),
+                    runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
+                    runtime_source_mtime_ms: runtime.source_mtime_ms,
+                });
             }
 
             let (active, recent, runtime) = tokio::try_join!(
@@ -731,54 +817,48 @@ impl ProxyController {
             .ok()
             .unwrap_or_default();
 
-            Ok::<_, anyhow::Error>((
-                None,
-                None,
+            Ok::<_, anyhow::Error>(RefreshResult {
+                api_version: None,
+                service_name: None,
                 active,
                 recent,
-                None,
-                HashMap::new(),
+                global_override: None,
+                session_cfg: HashMap::new(),
                 session_effort,
-                HashMap::new(),
-                Vec::new(),
-                HashMap::new(),
-                HashMap::new(),
-                Some(runtime.loaded_at_ms),
-                runtime.source_mtime_ms,
-            ))
+                session_stats: HashMap::new(),
+                configs: Vec::new(),
+                config_health: HashMap::new(),
+                health_checks: HashMap::new(),
+                usage_rollup: UsageRollupView::default(),
+                stats_5m: WindowStats::default(),
+                stats_1h: WindowStats::default(),
+                lb_view: HashMap::new(),
+                runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
+                runtime_source_mtime_ms: runtime.source_mtime_ms,
+            })
         };
 
         match rt.block_on(fut) {
-            Ok((
-                api_version,
-                service_name,
-                active,
-                recent,
-                global_override,
-                session_cfg,
-                session_effort,
-                stats,
-                configs,
-                config_health,
-                health_checks,
-                runtime_loaded_at_ms,
-                runtime_source_mtime_ms,
-            )) => {
+            Ok(result) => {
                 if let ProxyMode::Attached(att) = &mut self.mode {
                     att.last_error = None;
-                    att.api_version = api_version;
-                    att.service_name = service_name;
-                    att.active = active;
-                    att.recent = recent;
-                    att.global_override = global_override;
-                    att.session_config_overrides = session_cfg;
-                    att.session_effort_overrides = session_effort;
-                    att.session_stats = stats;
-                    att.configs = configs;
-                    att.config_health = config_health;
-                    att.health_checks = health_checks;
-                    att.runtime_loaded_at_ms = runtime_loaded_at_ms;
-                    att.runtime_source_mtime_ms = runtime_source_mtime_ms;
+                    att.api_version = result.api_version;
+                    att.service_name = result.service_name;
+                    att.active = result.active;
+                    att.recent = result.recent;
+                    att.global_override = result.global_override;
+                    att.session_config_overrides = result.session_cfg;
+                    att.session_effort_overrides = result.session_effort;
+                    att.session_stats = result.session_stats;
+                    att.configs = result.configs;
+                    att.config_health = result.config_health;
+                    att.health_checks = result.health_checks;
+                    att.usage_rollup = result.usage_rollup;
+                    att.stats_5m = result.stats_5m;
+                    att.stats_1h = result.stats_1h;
+                    att.lb_view = result.lb_view;
+                    att.runtime_loaded_at_ms = result.runtime_loaded_at_ms;
+                    att.runtime_source_mtime_ms = result.runtime_source_mtime_ms;
                 }
             }
             Err(e) => {
@@ -1041,44 +1121,28 @@ impl ProxyController {
         r.last_refresh = Some(Instant::now());
 
         let state = r.state.clone();
+        let service_name = r.service_name.to_string();
         let fut = async move {
-            let (active, recent, global_override, session_cfg, session_effort, session_stats) = tokio::join!(
-                state.list_active_requests(),
-                state.list_recent_finished(200),
-                state.get_global_config_override(),
-                state.list_session_config_overrides(),
-                state.list_session_effort_overrides(),
-                state.list_session_stats(),
-            );
-            Ok::<
-                (
-                    Vec<ActiveRequest>,
-                    Vec<FinishedRequest>,
-                    Option<String>,
-                    HashMap<String, String>,
-                    HashMap<String, String>,
-                    HashMap<String, SessionStats>,
-                ),
-                anyhow::Error,
-            >((
-                active,
-                recent,
-                global_override,
-                session_cfg,
-                session_effort,
-                session_stats,
-            ))
+            Ok::<_, anyhow::Error>(
+                build_dashboard_snapshot(&state, service_name.as_str(), 600, 21).await,
+            )
         };
 
         match rt.block_on(fut) {
-            Ok((active, recent, global_override, session_cfg, session_effort, session_stats)) => {
+            Ok(snap) => {
                 r.last_error = None;
-                r.active = active;
-                r.recent = recent;
-                r.global_override = global_override;
-                r.session_config_overrides = session_cfg;
-                r.session_effort_overrides = session_effort;
-                r.session_stats = session_stats;
+                r.active = snap.active;
+                r.recent = snap.recent;
+                r.global_override = snap.global_override;
+                r.session_config_overrides = snap.session_config_overrides;
+                r.session_effort_overrides = snap.session_effort_overrides;
+                r.session_stats = snap.session_stats;
+                r.config_health = snap.config_health;
+                r.health_checks = snap.health_checks;
+                r.usage_rollup = snap.usage_rollup;
+                r.stats_5m = snap.stats_5m;
+                r.stats_1h = snap.stats_1h;
+                r.lb_view = snap.lb_view;
             }
             Err(e) => {
                 r.last_error = Some(e.to_string());
@@ -1274,6 +1338,12 @@ impl ProxyController {
             session_config_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),
             session_stats: HashMap::new(),
+            config_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            usage_rollup: UsageRollupView::default(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            lb_view: HashMap::new(),
             shutdown_tx,
             server_handle: Some(server_handle),
         });
@@ -1290,7 +1360,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn list_configs_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<GuiConfigOption> {
+fn list_configs_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<ConfigOption> {
     let mgr = match service_name {
         "claude" => &cfg.claude,
         _ => &cfg.codex,
@@ -1298,7 +1368,7 @@ fn list_configs_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<GuiConfig
     let mut out = mgr
         .configs
         .iter()
-        .map(|(name, c)| GuiConfigOption {
+        .map(|(name, c)| ConfigOption {
             name: name.clone(),
             alias: c.alias.clone(),
             enabled: c.enabled,

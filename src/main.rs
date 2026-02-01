@@ -1,6 +1,7 @@
 mod codex_integration;
 mod commands;
 mod config;
+mod dashboard_core;
 mod filter;
 mod healthcheck;
 mod lb;

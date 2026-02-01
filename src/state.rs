@@ -28,7 +28,7 @@ fn recent_finished_max() -> usize {
     })
 }
 
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UsageBucket {
     pub requests_total: u64,
     pub requests_error: u64,
@@ -74,7 +74,7 @@ impl UsageBucket {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UsageRollupView {
     pub since_start: UsageBucket,
     pub by_day: Vec<(i32, UsageBucket)>,
@@ -114,14 +114,14 @@ pub struct ConfigHealth {
     pub upstreams: Vec<UpstreamHealth>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct LbUpstreamView {
     pub failure_count: u32,
     pub cooldown_remaining_secs: Option<u64>,
     pub usage_exhausted: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct LbConfigView {
     pub last_good_index: Option<usize>,
     pub upstreams: Vec<LbUpstreamView>,

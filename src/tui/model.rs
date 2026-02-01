@@ -4,106 +4,13 @@ use std::time::Instant;
 use ratatui::prelude::{Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::dashboard_core::WindowStats;
+pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
     SessionStats, UsageRollupView,
 };
 use crate::usage::UsageMetrics;
-
-#[derive(Debug, Clone, Default)]
-pub(in crate::tui) struct WindowStats {
-    pub(in crate::tui) total: usize,
-    pub(in crate::tui) ok_2xx: usize,
-    pub(in crate::tui) err_429: usize,
-    pub(in crate::tui) err_4xx: usize,
-    pub(in crate::tui) err_5xx: usize,
-    pub(in crate::tui) p50_ms: Option<u64>,
-    pub(in crate::tui) p95_ms: Option<u64>,
-    pub(in crate::tui) avg_attempts: Option<f64>,
-    pub(in crate::tui) retry_rate: Option<f64>,
-    pub(in crate::tui) top_provider: Option<(String, usize)>,
-    pub(in crate::tui) top_config: Option<(String, usize)>,
-}
-
-pub(in crate::tui) fn compute_window_stats<F>(
-    recent: &[FinishedRequest],
-    now_ms: u64,
-    window_ms: u64,
-    mut include: F,
-) -> WindowStats
-where
-    F: FnMut(&FinishedRequest) -> bool,
-{
-    fn percentile(mut v: Vec<u64>, p: f64) -> Option<u64> {
-        if v.is_empty() {
-            return None;
-        }
-        let n = v.len();
-        let idx = ((p * (n.saturating_sub(1) as f64)).ceil() as usize).min(n - 1);
-        let (_, nth, _) = v.select_nth_unstable(idx);
-        Some(*nth)
-    }
-
-    let cutoff = now_ms.saturating_sub(window_ms);
-    let mut out = WindowStats::default();
-    let mut ok_lat = Vec::new();
-    let mut attempts_sum: u64 = 0;
-    let mut retry_cnt: u64 = 0;
-
-    let mut by_provider: HashMap<String, usize> = HashMap::new();
-    let mut by_config: HashMap<String, usize> = HashMap::new();
-
-    for r in recent.iter() {
-        if r.ended_at_ms < cutoff {
-            continue;
-        }
-        if !include(r) {
-            continue;
-        }
-        out.total += 1;
-
-        let attempts = r.retry.as_ref().map(|x| x.attempts).unwrap_or(1);
-        attempts_sum = attempts_sum.saturating_add(attempts as u64);
-        if attempts > 1 {
-            retry_cnt = retry_cnt.saturating_add(1);
-        }
-
-        if r.status_code == 429 {
-            out.err_429 += 1;
-        } else if (400..500).contains(&r.status_code) {
-            out.err_4xx += 1;
-        } else if (500..600).contains(&r.status_code) {
-            out.err_5xx += 1;
-        }
-
-        if (200..300).contains(&r.status_code) {
-            out.ok_2xx += 1;
-            ok_lat.push(r.duration_ms);
-
-            if let Some(pid) = r.provider_id.as_deref()
-                && !pid.trim().is_empty()
-            {
-                *by_provider.entry(pid.to_string()).or_insert(0) += 1;
-            }
-            if let Some(cfg) = r.config_name.as_deref()
-                && !cfg.trim().is_empty()
-            {
-                *by_config.entry(cfg.to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    out.p50_ms = percentile(ok_lat.clone(), 0.50);
-    out.p95_ms = percentile(ok_lat, 0.95);
-    if out.total > 0 {
-        out.avg_attempts = Some(attempts_sum as f64 / out.total as f64);
-        out.retry_rate = Some(retry_cnt as f64 / out.total as f64);
-    }
-
-    out.top_provider = by_provider.into_iter().max_by_key(|(_, v)| *v);
-    out.top_config = by_config.into_iter().max_by_key(|(_, v)| *v);
-    out
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UpstreamSummary {
@@ -682,49 +589,31 @@ pub(in crate::tui) async fn refresh_snapshot(
     service_name: &str,
     stats_days: usize,
 ) -> Snapshot {
-    let now = now_ms();
-    let (
-        active,
-        recent,
-        overrides,
-        config_overrides,
-        global_override,
-        stats,
-        config_meta,
-        rollup,
-        health,
-        health_checks,
-        lb_view,
-    ) = tokio::join!(
-        state.list_active_requests(),
-        state.list_recent_finished(2_000),
-        state.list_session_effort_overrides(),
-        state.list_session_config_overrides(),
-        state.get_global_config_override(),
-        state.list_session_stats(),
+    let (snap, config_meta) = tokio::join!(
+        crate::dashboard_core::build_dashboard_snapshot(state, service_name, 2_000, stats_days),
         state.get_config_meta_overrides(service_name),
-        state.get_usage_rollup_view(service_name, 12, stats_days),
-        state.get_config_health(service_name),
-        state.list_health_checks(service_name),
-        state.get_lb_view(),
     );
 
-    let rows = build_session_rows(active, &recent, &overrides, &config_overrides, &stats);
-    let stats_5m = compute_window_stats(&recent, now, 5 * 60_000, |_| true);
-    let stats_1h = compute_window_stats(&recent, now, 60 * 60_000, |_| true);
+    let rows = build_session_rows(
+        snap.active.clone(),
+        &snap.recent,
+        &snap.session_effort_overrides,
+        &snap.session_config_overrides,
+        &snap.session_stats,
+    );
     Snapshot {
         rows,
-        recent,
-        overrides,
-        config_overrides,
-        global_override,
+        recent: snap.recent,
+        overrides: snap.session_effort_overrides,
+        config_overrides: snap.session_config_overrides,
+        global_override: snap.global_override,
         config_meta_overrides: config_meta,
-        usage_rollup: rollup,
-        config_health: health,
-        health_checks,
-        lb_view,
-        stats_5m,
-        stats_1h,
+        usage_rollup: snap.usage_rollup,
+        config_health: snap.config_health,
+        health_checks: snap.health_checks,
+        lb_view: snap.lb_view,
+        stats_5m: snap.stats_5m,
+        stats_1h: snap.stats_1h,
         refreshed_at: Instant::now(),
     }
 }

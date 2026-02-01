@@ -2734,15 +2734,6 @@ pub fn router(proxy: ProxyService) -> Router {
     }
 
     #[derive(serde::Serialize)]
-    struct ConfigOption {
-        name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        alias: Option<String>,
-        enabled: bool,
-        level: u8,
-    }
-
-    #[derive(serde::Serialize)]
     struct ReloadResult {
         reloaded: bool,
         status: RuntimeConfigStatus,
@@ -2931,6 +2922,7 @@ pub fn router(proxy: ProxyService) -> Router {
             service_name: proxy.service_name,
             endpoints: vec![
                 "/__codex_helper/api/v1/capabilities",
+                "/__codex_helper/api/v1/snapshot",
                 "/__codex_helper/api/v1/status/active",
                 "/__codex_helper/api/v1/status/recent",
                 "/__codex_helper/api/v1/status/session-stats",
@@ -2945,6 +2937,54 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/healthcheck/start",
                 "/__codex_helper/api/v1/healthcheck/cancel",
             ],
+        }))
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SnapshotQuery {
+        recent_limit: Option<usize>,
+        stats_days: Option<usize>,
+    }
+
+    async fn api_v1_snapshot(
+        proxy: ProxyService,
+        Query(q): Query<SnapshotQuery>,
+    ) -> Result<Json<crate::dashboard_core::ApiV1Snapshot>, (StatusCode, String)> {
+        let recent_limit = q.recent_limit.unwrap_or(200).clamp(1, 2_000);
+        let stats_days = q.stats_days.unwrap_or(21).clamp(1, 365);
+
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+        let mut configs = mgr
+            .configs
+            .iter()
+            .map(|(name, c)| crate::dashboard_core::ConfigOption {
+                name: name.clone(),
+                alias: c.alias.clone(),
+                enabled: c.enabled,
+                level: c.level.clamp(1, 10),
+            })
+            .collect::<Vec<_>>();
+        configs.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+
+        let snapshot = crate::dashboard_core::build_dashboard_snapshot(
+            &proxy.state,
+            proxy.service_name,
+            recent_limit,
+            stats_days,
+        )
+        .await;
+
+        Ok(Json(crate::dashboard_core::ApiV1Snapshot {
+            api_version: 1,
+            service_name: proxy.service_name.to_string(),
+            runtime_loaded_at_ms: Some(proxy.config.last_loaded_at_ms()),
+            runtime_source_mtime_ms: proxy.config.last_mtime_ms().await,
+            configs,
+            snapshot,
         }))
     }
 
@@ -3129,7 +3169,7 @@ pub fn router(proxy: ProxyService) -> Router {
 
     async fn list_configs(
         proxy: ProxyService,
-    ) -> Result<Json<Vec<ConfigOption>>, (StatusCode, String)> {
+    ) -> Result<Json<Vec<crate::dashboard_core::ConfigOption>>, (StatusCode, String)> {
         let cfg = proxy.config.snapshot().await;
         let mgr = match proxy.service_name {
             "claude" => &cfg.claude,
@@ -3138,7 +3178,7 @@ pub fn router(proxy: ProxyService) -> Router {
         let mut out = mgr
             .configs
             .iter()
-            .map(|(name, c)| ConfigOption {
+            .map(|(name, c)| crate::dashboard_core::ConfigOption {
                 name: name.clone(),
                 alias: c.alias.clone(),
                 enabled: c.enabled,
@@ -3174,12 +3214,17 @@ pub fn router(proxy: ProxyService) -> Router {
     let p22 = proxy.clone();
     let p23 = proxy.clone();
     let p24 = proxy.clone();
+    let p25 = proxy.clone();
 
     Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
         .route(
             "/__codex_helper/api/v1/capabilities",
             get(move || api_capabilities(p8.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/snapshot",
+            get(move |q| api_v1_snapshot(p25.clone(), q)),
         )
         .route(
             "/__codex_helper/api/v1/status/active",

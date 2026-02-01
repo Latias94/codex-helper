@@ -196,6 +196,66 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
 }
 
 #[tokio::test]
+async fn proxy_api_v1_snapshot_works() {
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: {
+                let mut t = HashMap::new();
+                t.insert("provider_id".to_string(), "u1".to_string());
+                t
+            },
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let snap = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/snapshot?recent_limit=10&stats_days=7",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("snapshot send")
+        .error_for_status()
+        .expect("snapshot status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("snapshot json");
+
+    assert_eq!(snap.get("api_version").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(
+        snap.get("service_name").and_then(|v| v.as_str()),
+        Some("codex")
+    );
+    assert!(
+        snap.get("snapshot").is_some(),
+        "should include snapshot object"
+    );
+    assert!(snap.get("configs").is_some(), "should include configs list");
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_failover_retries_502_then_uses_second_upstream() {
     let upstream1_hits = Arc::new(AtomicUsize::new(0));
     let upstream2_hits = Arc::new(AtomicUsize::new(0));

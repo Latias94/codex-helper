@@ -7,6 +7,10 @@ All notable changes to this project will be documented in this file.
 ### 新增 / Added
 - 新增 `codex-helper session recent`：按会话文件最后更新时间（mtime）筛选最近会话，并支持 `text/tsv/json` 输出；可选 `--open` 通过 Windows Terminal（`wt`）或 WezTerm 打开并执行恢复命令，便于快速 `codex resume`（支持 `--since/--limit/--raw-cwd/--format/--open/--terminal/--shell/--resume-cmd`）。
   Add `codex-helper session recent`: filter recent sessions by session file mtime with `text/tsv/json` output; optionally `--open` via Windows Terminal (`wt`) or WezTerm to run a resume command for fast `codex resume` workflows (supports `--since/--limit/--raw-cwd/--format/--open/--terminal/--shell/--resume-cmd`).
+- GUI 新增 `Stats` 页面：展示 requests/tokens KPI、按天 rollup、Top configs/providers，并支持基于 `CODEX_HELPER_PRICE_*` 的成本估算（如配置）。
+  GUI adds a `Stats` page: requests/tokens KPIs, per-day rollup, top configs/providers, plus optional cost estimate via `CODEX_HELPER_PRICE_*`.
+- 新增 attach 友好的 API v1 `GET /__codex_helper/api/v1/snapshot`：返回 GUI/TUI 所需的 dashboard 快照（含 usage rollup 与窗口统计），减少多次拉取。
+  Add attach-friendly API v1 `GET /__codex_helper/api/v1/snapshot`: returns a dashboard snapshot (including usage rollup and window stats) to reduce multi-call polling.
 
 ### 改进 / Improved
 - 启动监听失败时，提供更友好的提示（端口占用/权限不足等），并在 Windows/Linux/macOS 下尽力显示占用端口的进程 PID/名称，便于快速定位冲突进程。
