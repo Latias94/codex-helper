@@ -539,7 +539,7 @@ async fn find_recent_codex_sessions_in_dir(
                     let file_id = path
                         .file_name()
                         .and_then(|s| s.to_str())
-                        .and_then(|name| parse_timestamp_and_uuid(name))
+                        .and_then(parse_timestamp_and_uuid)
                         .map(|(_, uuid)| uuid);
 
                     let meta = read_codex_session_meta(&path).await?;
