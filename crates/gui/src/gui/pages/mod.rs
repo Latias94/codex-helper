@@ -195,7 +195,7 @@ impl Default for HistoryViewState {
             applied_query: String::new(),
             recent_since_hours: 12,
             recent_limit: 50,
-            infer_git_root: true,
+            infer_git_root: false,
             resume_cmd: "codex resume {id}".to_string(),
             shell: "pwsh".to_string(),
             keep_open: true,
@@ -3090,15 +3090,46 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     .range(1..=500)
                     .speed(1),
             );
-            ui.checkbox(
-                &mut ctx.view.history.infer_git_root,
-                pick(ctx.lang, "git 根目录", "git root"),
-            )
-            .on_hover_text(pick(
-                ctx.lang,
-                "在 cwd 上向上查找 .git 作为项目根目录（用于复制/打开）",
-                "Find .git upward from cwd as the project root (for copy/open).",
-            ));
+            ui.label(pick(ctx.lang, "工作目录", "Workdir"));
+            let mut mode = ctx.gui_cfg.history.workdir_mode.trim().to_ascii_lowercase();
+            if mode != "cwd" && mode != "git_root" {
+                mode = "cwd".to_string();
+            }
+            let mut selected_mode = mode.clone();
+            egui::ComboBox::from_id_salt("history_workdir_mode")
+                .selected_text(match selected_mode.as_str() {
+                    "git_root" => pick(ctx.lang, "git 根目录", "git root"),
+                    _ => pick(ctx.lang, "会话 cwd", "session cwd"),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut selected_mode,
+                        "cwd".to_string(),
+                        pick(ctx.lang, "会话 cwd", "session cwd"),
+                    )
+                    .on_hover_text(pick(
+                        ctx.lang,
+                        "使用会话记录中的 cwd 作为恢复/复制的工作目录（推荐）",
+                        "Use the session's cwd as workdir (recommended).",
+                    ));
+                    ui.selectable_value(
+                        &mut selected_mode,
+                        "git_root".to_string(),
+                        pick(ctx.lang, "git 根目录", "git root"),
+                    )
+                    .on_hover_text(pick(
+                        ctx.lang,
+                        "在 cwd 上向上查找 .git 作为项目根目录（用于复制/打开）",
+                        "Find .git upward from cwd as project root (for copy/open).",
+                    ));
+                });
+            if selected_mode != mode {
+                ctx.gui_cfg.history.workdir_mode = selected_mode.clone();
+                ctx.view.history.infer_git_root = selected_mode == "git_root";
+                if let Err(e) = ctx.gui_cfg.save() {
+                    *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                }
+            }
         } else if ctx.view.history.scope == HistoryScope::AllByDate {
             ui.label(pick(ctx.lang, "最近天数", "Recent days"));
             ui.add(
@@ -3112,6 +3143,36 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     .range(1..=10_000)
                     .speed(1),
             );
+            ui.label(pick(ctx.lang, "工作目录", "Workdir"));
+            let mut mode = ctx.gui_cfg.history.workdir_mode.trim().to_ascii_lowercase();
+            if mode != "cwd" && mode != "git_root" {
+                mode = "cwd".to_string();
+            }
+            let mut selected_mode = mode.clone();
+            egui::ComboBox::from_id_salt("history_workdir_mode_all_by_date")
+                .selected_text(match selected_mode.as_str() {
+                    "git_root" => pick(ctx.lang, "git 根目录", "git root"),
+                    _ => pick(ctx.lang, "会话 cwd", "session cwd"),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut selected_mode,
+                        "cwd".to_string(),
+                        pick(ctx.lang, "会话 cwd", "session cwd"),
+                    );
+                    ui.selectable_value(
+                        &mut selected_mode,
+                        "git_root".to_string(),
+                        pick(ctx.lang, "git 根目录", "git root"),
+                    );
+                });
+            if selected_mode != mode {
+                ctx.gui_cfg.history.workdir_mode = selected_mode.clone();
+                ctx.view.history.infer_git_root = selected_mode == "git_root";
+                if let Err(e) = ctx.gui_cfg.save() {
+                    *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                }
+            }
         }
     });
 
@@ -3185,7 +3246,8 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
             };
             match ctx.rt.block_on(fut) {
-                Ok(list) => {
+                Ok(mut list) => {
+                    sort_session_summaries_by_mtime_desc(&mut list);
                     ctx.view.history.sessions_all = list;
                     ctx.view.history.search_transcript_applied = None;
                     ctx.view.history.loaded_at_ms = Some(now_ms());
@@ -3584,11 +3646,8 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let selected = &ctx.view.history.sessions[selected_idx];
         let selected_id = selected.id.clone();
         let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
-        let workdir = if selected_cwd != "-" && ctx.view.history.infer_git_root {
-            crate::sessions::infer_project_root_from_cwd(&selected_cwd)
-        } else {
-            selected_cwd.clone()
-        };
+        let workdir =
+            history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
         let resume_cmd = {
             let t = ctx.view.history.resume_cmd.trim();
             if t.is_empty() {
@@ -3605,28 +3664,51 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
             ui.horizontal(|ui| {
                 ui.label(pick(ctx.lang, "命令模板", "Template"));
-                ui.add(
+                let resp = ui.add(
                     egui::TextEdit::singleline(&mut ctx.view.history.resume_cmd)
                         .desired_width(260.0),
                 );
+                if resp.lost_focus()
+                    && ctx.gui_cfg.history.resume_cmd != ctx.view.history.resume_cmd
+                {
+                    ctx.gui_cfg.history.resume_cmd = ctx.view.history.resume_cmd.clone();
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
                 if ui
                     .button(pick(ctx.lang, "用 bypass", "Use bypass"))
                     .clicked()
                 {
                     ctx.view.history.resume_cmd =
                         "codex --dangerously-bypass-approvals-and-sandbox resume {id}".to_string();
+                    ctx.gui_cfg.history.resume_cmd = ctx.view.history.resume_cmd.clone();
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
                 }
             });
 
             ui.horizontal(|ui| {
                 ui.label(pick(ctx.lang, "Shell", "Shell"));
-                ui.add(
+                let resp = ui.add(
                     egui::TextEdit::singleline(&mut ctx.view.history.shell).desired_width(140.0),
                 );
-                ui.checkbox(
-                    &mut ctx.view.history.keep_open,
-                    pick(ctx.lang, "保持打开", "Keep open"),
-                );
+                if resp.lost_focus() && ctx.gui_cfg.history.shell != ctx.view.history.shell {
+                    ctx.gui_cfg.history.shell = ctx.view.history.shell.clone();
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
+                let mut keep_open = ctx.view.history.keep_open;
+                ui.checkbox(&mut keep_open, pick(ctx.lang, "保持打开", "Keep open"));
+                if keep_open != ctx.view.history.keep_open {
+                    ctx.view.history.keep_open = keep_open;
+                    ctx.gui_cfg.history.keep_open = keep_open;
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
             });
 
             ui.horizontal(|ui| {
@@ -3684,7 +3766,11 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             if cwd.is_empty() || cwd == "-" {
                                 return None;
                             }
-                            if !std::path::Path::new(cwd.as_str()).exists() {
+                            let workdir = history_workdir_from_cwd(
+                                cwd.as_str(),
+                                ctx.view.history.infer_git_root,
+                            );
+                            if !std::path::Path::new(workdir.as_str()).exists() {
                                 return None;
                             }
                             let sid = s.id.clone();
@@ -3698,7 +3784,7 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                     format!("{t} {sid}")
                                 }
                             };
-                            Some((cwd, cmd))
+                            Some((workdir, cmd))
                         })
                         .collect::<Vec<_>>();
 
@@ -4057,7 +4143,8 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     .block_on(crate::sessions::list_codex_sessions_in_day_dir(
                         &day_dir, limit,
                     )) {
-                    Ok(list) => {
+                    Ok(mut list) => {
+                        list.sort_by_key(|s| std::cmp::Reverse(s.mtime_ms));
                         ctx.view.history.all_day_sessions = list;
                         ctx.view.history.loaded_day_for = Some(date.clone());
                         ctx.view.history.selected_id = None;
@@ -4245,11 +4332,8 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let selected_id = selected.id.clone();
         let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
 
-        let workdir = if selected_cwd != "-" && ctx.view.history.infer_git_root {
-            crate::sessions::infer_project_root_from_cwd(&selected_cwd)
-        } else {
-            selected_cwd.clone()
-        };
+        let workdir =
+            history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
 
         let resume_cmd = {
             let t = ctx.view.history.resume_cmd.trim();
@@ -4267,28 +4351,51 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
             ui.horizontal(|ui| {
                 ui.label(pick(ctx.lang, "命令模板", "Template"));
-                ui.add(
+                let resp = ui.add(
                     egui::TextEdit::singleline(&mut ctx.view.history.resume_cmd)
                         .desired_width(260.0),
                 );
+                if resp.lost_focus()
+                    && ctx.gui_cfg.history.resume_cmd != ctx.view.history.resume_cmd
+                {
+                    ctx.gui_cfg.history.resume_cmd = ctx.view.history.resume_cmd.clone();
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
                 if ui
                     .button(pick(ctx.lang, "用 bypass", "Use bypass"))
                     .clicked()
                 {
                     ctx.view.history.resume_cmd =
                         "codex --dangerously-bypass-approvals-and-sandbox resume {id}".to_string();
+                    ctx.gui_cfg.history.resume_cmd = ctx.view.history.resume_cmd.clone();
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
                 }
             });
 
             ui.horizontal(|ui| {
                 ui.label(pick(ctx.lang, "Shell", "Shell"));
-                ui.add(
+                let resp = ui.add(
                     egui::TextEdit::singleline(&mut ctx.view.history.shell).desired_width(140.0),
                 );
-                ui.checkbox(
-                    &mut ctx.view.history.keep_open,
-                    pick(ctx.lang, "保持打开", "Keep open"),
-                );
+                if resp.lost_focus() && ctx.gui_cfg.history.shell != ctx.view.history.shell {
+                    ctx.gui_cfg.history.shell = ctx.view.history.shell.clone();
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
+                let mut keep_open = ctx.view.history.keep_open;
+                ui.checkbox(&mut keep_open, pick(ctx.lang, "保持打开", "Keep open"));
+                if keep_open != ctx.view.history.keep_open {
+                    ctx.view.history.keep_open = keep_open;
+                    ctx.gui_cfg.history.keep_open = keep_open;
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
             });
 
             ui.horizontal(|ui| {
@@ -4346,7 +4453,11 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             if cwd.is_empty() || cwd == "-" {
                                 return None;
                             }
-                            if !std::path::Path::new(cwd.as_str()).exists() {
+                            let workdir = history_workdir_from_cwd(
+                                cwd.as_str(),
+                                ctx.view.history.infer_git_root,
+                            );
+                            if !std::path::Path::new(workdir.as_str()).exists() {
                                 return None;
                             }
                             let sid = s.id.clone();
@@ -4360,7 +4471,7 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                     format!("{t} {sid}")
                                 }
                             };
-                            Some((cwd, cmd))
+                            Some((workdir, cmd))
                         })
                         .collect::<Vec<_>>();
 
@@ -6312,6 +6423,31 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn history_workdir_from_cwd(cwd: &str, infer_git_root: bool) -> String {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return "-".to_string();
+    }
+    if infer_git_root {
+        crate::sessions::infer_project_root_from_cwd(trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn path_mtime_ms(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn sort_session_summaries_by_mtime_desc(list: &mut Vec<SessionSummary>) {
+    list.sort_by_key(|s| std::cmp::Reverse(path_mtime_ms(s.path.as_path())));
 }
 
 fn format_age(now_ms: u64, ts_ms: Option<u64>) -> String {

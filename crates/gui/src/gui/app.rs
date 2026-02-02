@@ -173,9 +173,19 @@ impl GuiApp {
         };
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let proxy = ProxyController::new(gui_cfg.proxy.default_port, gui_cfg.service_kind());
+
+        let mut view = ViewState::default();
+        view.history.resume_cmd = gui_cfg.history.resume_cmd.clone();
+        view.history.shell = gui_cfg.history.shell.clone();
+        view.history.keep_open = gui_cfg.history.keep_open;
+        view.history.infer_git_root = gui_cfg
+            .history
+            .workdir_mode
+            .trim()
+            .eq_ignore_ascii_case("git_root");
         Self {
             page: initial_page,
-            view: ViewState::default(),
+            view,
             gui_cfg,
             proxy_config_path,
             proxy_config_text,

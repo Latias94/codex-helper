@@ -104,12 +104,28 @@ pub struct HistoryConfig {
     /// How to spawn Windows Terminal for batch resume: `tabs` or `windows`.
     #[serde(default = "default_wt_batch_mode")]
     pub wt_batch_mode: String,
+    /// Default shell for opening sessions in Windows Terminal (`pwsh`/`powershell`/`cmd`).
+    #[serde(default = "default_history_shell")]
+    pub shell: String,
+    /// Keep the spawned shell open after running the resume command.
+    #[serde(default = "default_true")]
+    pub keep_open: bool,
+    /// Resume command template. Use `{id}` placeholder for session id.
+    #[serde(default = "default_history_resume_cmd")]
+    pub resume_cmd: String,
+    /// Workdir mode for "copy root+id" and "open in wt": `cwd` or `git_root`.
+    #[serde(default = "default_history_workdir_mode")]
+    pub workdir_mode: String,
 }
 
 impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
             wt_batch_mode: default_wt_batch_mode(),
+            shell: default_history_shell(),
+            keep_open: default_true(),
+            resume_cmd: default_history_resume_cmd(),
+            workdir_mode: default_history_workdir_mode(),
         }
     }
 }
@@ -224,6 +240,18 @@ fn default_on_port_in_use() -> String {
 
 fn default_wt_batch_mode() -> String {
     "tabs".to_string()
+}
+
+fn default_history_shell() -> String {
+    "pwsh".to_string()
+}
+
+fn default_history_resume_cmd() -> String {
+    "codex resume {id}".to_string()
+}
+
+fn default_history_workdir_mode() -> String {
+    "cwd".to_string()
 }
 
 fn default_close_behavior() -> String {
