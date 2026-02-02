@@ -145,6 +145,8 @@ pub struct HistoryViewState {
     pub keep_open: bool,
     pub wt_window: i32,
     pub batch_selected_ids: HashSet<String>,
+    pub group_by_workdir: bool,
+    pub collapsed_workdirs: HashSet<String>,
     pub all_days_limit: usize,
     pub all_dates: Vec<SessionDayDir>,
     pub all_selected_date: Option<String>,
@@ -201,6 +203,8 @@ impl Default for HistoryViewState {
             keep_open: true,
             wt_window: -1,
             batch_selected_ids: HashSet::new(),
+            group_by_workdir: true,
+            collapsed_workdirs: HashSet::new(),
             all_days_limit: 120,
             all_dates: Vec::new(),
             all_selected_date: None,
@@ -3130,6 +3134,16 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     *ctx.last_error = Some(format!("save gui config failed: {e}"));
                 }
             }
+
+            ui.checkbox(
+                &mut ctx.view.history.group_by_workdir,
+                pick(ctx.lang, "按项目分组", "Group by project"),
+            )
+            .on_hover_text(pick(
+                ctx.lang,
+                "按工作目录分组并折叠，适合“第二天继续昨天的一堆会话”的批量恢复。",
+                "Group by workdir with collapsible headers; great for batch resume next day.",
+            ));
         } else if ctx.view.history.scope == HistoryScope::AllByDate {
             ui.label(pick(ctx.lang, "最近天数", "Recent days"));
             ui.add(
@@ -3540,83 +3554,262 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
         });
         cols[0].add_space(4.0);
+        let mut visible_ids: Vec<String> = Vec::new();
         egui::ScrollArea::vertical()
             .max_height(520.0)
             .show(&mut cols[0], |ui| {
-                for (idx, s) in ctx.view.history.sessions.iter().enumerate() {
-                    let selected = idx == ctx.view.history.selected_idx;
-                    let id_short = short_sid(&s.id, 16);
-                    let rounds = s.rounds;
-                    let last = s
-                        .last_response_at
-                        .as_deref()
-                        .or(s.updated_at.as_deref())
-                        .unwrap_or("-");
-                    let first = s.first_user_message.as_deref().unwrap_or("-");
-                    let label = match ctx.view.history.scope {
-                        HistoryScope::CurrentProject => {
-                            let cwd = s
-                                .cwd
-                                .as_deref()
-                                .map(|v| shorten(basename(v), 22))
-                                .unwrap_or_else(|| "-".to_string());
-                            format!(
-                                "{id_short}  r={rounds}  {cwd}  {last}  {}",
-                                shorten(first, 40)
-                            )
+                let group_enabled = ctx.view.history.scope == HistoryScope::GlobalRecent
+                    && ctx.view.history.group_by_workdir;
+
+                if group_enabled {
+                    #[derive(Debug)]
+                    struct WorkdirGroup {
+                        key: String,
+                        indices: Vec<usize>,
+                        last_mtime_ms: u64,
+                    }
+
+                    let now = now_ms();
+                    let mut order: Vec<String> = Vec::new();
+                    let mut groups: std::collections::HashMap<String, WorkdirGroup> =
+                        std::collections::HashMap::new();
+
+                    for (idx, s) in ctx.view.history.sessions.iter().enumerate() {
+                        let key = s
+                            .cwd
+                            .as_deref()
+                            .map(|cwd| {
+                                history_workdir_from_cwd(cwd, ctx.view.history.infer_git_root)
+                            })
+                            .unwrap_or_else(|| "-".to_string());
+                        let mtime_ms = path_mtime_ms(s.path.as_path());
+
+                        if !groups.contains_key(key.as_str()) {
+                            order.push(key.clone());
+                            groups.insert(
+                                key.clone(),
+                                WorkdirGroup {
+                                    key: key.clone(),
+                                    indices: Vec::new(),
+                                    last_mtime_ms: mtime_ms,
+                                },
+                            );
                         }
-                        HistoryScope::GlobalRecent => {
-                            let root = s
-                                .cwd
-                                .as_deref()
-                                .map(|cwd| {
-                                    if ctx.view.history.infer_git_root {
-                                        crate::sessions::infer_project_root_from_cwd(cwd)
-                                    } else {
-                                        cwd.to_string()
-                                    }
-                                })
-                                .unwrap_or_else(|| "-".to_string());
-                            format!(
-                                "{}  {id_short}  r={rounds}  {last}  {}",
-                                shorten(&root, 44),
-                                shorten(first, 36)
-                            )
+                        if let Some(g) = groups.get_mut(key.as_str()) {
+                            g.indices.push(idx);
+                            g.last_mtime_ms = g.last_mtime_ms.max(mtime_ms);
                         }
-                        HistoryScope::AllByDate => {
-                            let root = s
-                                .cwd
-                                .as_deref()
-                                .map(|cwd| {
-                                    if ctx.view.history.infer_git_root {
-                                        crate::sessions::infer_project_root_from_cwd(cwd)
-                                    } else {
-                                        cwd.to_string()
-                                    }
-                                })
-                                .unwrap_or_else(|| "-".to_string());
-                            format!(
-                                "{}  {id_short}  r={rounds}  {last}  {}",
-                                shorten(&root, 44),
-                                shorten(first, 36)
-                            )
-                        }
-                    };
-                    let sid = s.id.clone();
-                    ui.horizontal(|ui| {
-                        let mut checked = ctx.view.history.batch_selected_ids.contains(&sid);
-                        if ui.checkbox(&mut checked, "").changed() {
-                            if checked {
-                                ctx.view.history.batch_selected_ids.insert(sid.clone());
-                            } else {
-                                ctx.view.history.batch_selected_ids.remove(&sid);
+                    }
+
+                    let mut ordered = order
+                        .into_iter()
+                        .filter_map(|k| groups.remove(k.as_str()))
+                        .collect::<Vec<_>>();
+                    ordered.sort_by_key(|g| std::cmp::Reverse(g.last_mtime_ms));
+
+                    for g in ordered.into_iter() {
+                        let key = g.key.clone();
+                        let collapsed = ctx.view.history.collapsed_workdirs.contains(&key);
+                        let name = if key == "-" {
+                            pick(ctx.lang, "<未知目录>", "<unknown>").to_string()
+                        } else {
+                            shorten(basename(key.as_str()), 34)
+                        };
+                        let age = if g.last_mtime_ms > 0 {
+                            format_age(now, Some(g.last_mtime_ms))
+                        } else {
+                            "-".to_string()
+                        };
+                        let n = g.indices.len();
+
+                        ui.horizontal(|ui| {
+                            if ui.small_button(if collapsed { "▸" } else { "▾" }).clicked() {
+                                if collapsed {
+                                    ctx.view.history.collapsed_workdirs.remove(&key);
+                                } else {
+                                    ctx.view.history.collapsed_workdirs.insert(key.clone());
+                                }
                             }
+
+                            let header = format!("{name}  n={n}  {age}");
+                            ui.label(header).on_hover_text(key.as_str());
+
+                            if ui.small_button(pick(ctx.lang, "全选", "Select")).clicked() {
+                                for &idx in g.indices.iter() {
+                                    if let Some(s) = ctx.view.history.sessions.get(idx) {
+                                        ctx.view.history.batch_selected_ids.insert(s.id.clone());
+                                    }
+                                }
+                            }
+                            if ui.small_button(pick(ctx.lang, "清空", "Clear")).clicked() {
+                                for &idx in g.indices.iter() {
+                                    if let Some(s) = ctx.view.history.sessions.get(idx) {
+                                        ctx.view.history.batch_selected_ids.remove(&s.id);
+                                    }
+                                }
+                            }
+
+                            let can_open = cfg!(windows) && n > 0;
+                            let label = match ctx.lang {
+                                Language::Zh => format!("打开({n})"),
+                                Language::En => format!("Open ({n})"),
+                            };
+                            if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
+                                let mut items = Vec::new();
+                                for &idx in g.indices.iter() {
+                                    if let Some(s) = ctx.view.history.sessions.get(idx) {
+                                        items.extend(build_wt_items_from_session_summaries(
+                                            std::iter::once(s),
+                                            ctx.view.history.infer_git_root,
+                                            ctx.view.history.resume_cmd.as_str(),
+                                        ));
+                                    }
+                                }
+                                open_wt_items(ctx, items);
+                            }
+
+                            let open_n = 5usize.min(n);
+                            let label_n = match ctx.lang {
+                                Language::Zh => format!("打开最近{open_n}"),
+                                Language::En => format!("Open top {open_n}"),
+                            };
+                            if ui
+                                .add_enabled(can_open, egui::Button::new(label_n))
+                                .clicked()
+                            {
+                                let mut items = Vec::new();
+                                for &idx in g.indices.iter().take(open_n) {
+                                    if let Some(s) = ctx.view.history.sessions.get(idx) {
+                                        items.extend(build_wt_items_from_session_summaries(
+                                            std::iter::once(s),
+                                            ctx.view.history.infer_git_root,
+                                            ctx.view.history.resume_cmd.as_str(),
+                                        ));
+                                    }
+                                }
+                                open_wt_items(ctx, items);
+                            }
+                        });
+
+                        if collapsed {
+                            ui.add_space(4.0);
+                            continue;
                         }
 
-                        if ui.selectable_label(selected, label).clicked() {
-                            pending_select = Some((idx, sid.clone()));
+                        for &idx in g.indices.iter() {
+                            let Some(s) = ctx.view.history.sessions.get(idx) else {
+                                continue;
+                            };
+                            visible_ids.push(s.id.clone());
+
+                            let selected = idx == ctx.view.history.selected_idx;
+                            let id_short = short_sid(&s.id, 16);
+                            let rounds = s.rounds;
+                            let last = s
+                                .last_response_at
+                                .as_deref()
+                                .or(s.updated_at.as_deref())
+                                .unwrap_or("-");
+                            let first = s.first_user_message.as_deref().unwrap_or("-");
+                            let label =
+                                format!("{id_short}  r={rounds}  {last}  {}", shorten(first, 46));
+
+                            let sid = s.id.clone();
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                let mut checked =
+                                    ctx.view.history.batch_selected_ids.contains(&sid);
+                                if ui.checkbox(&mut checked, "").changed() {
+                                    if checked {
+                                        ctx.view.history.batch_selected_ids.insert(sid.clone());
+                                    } else {
+                                        ctx.view.history.batch_selected_ids.remove(&sid);
+                                    }
+                                }
+
+                                if ui.selectable_label(selected, label).clicked() {
+                                    pending_select = Some((idx, sid.clone()));
+                                }
+                            });
                         }
-                    });
+                        ui.add_space(6.0);
+                    }
+                } else {
+                    for (idx, s) in ctx.view.history.sessions.iter().enumerate() {
+                        visible_ids.push(s.id.clone());
+
+                        let selected = idx == ctx.view.history.selected_idx;
+                        let id_short = short_sid(&s.id, 16);
+                        let rounds = s.rounds;
+                        let last = s
+                            .last_response_at
+                            .as_deref()
+                            .or(s.updated_at.as_deref())
+                            .unwrap_or("-");
+                        let first = s.first_user_message.as_deref().unwrap_or("-");
+                        let label = match ctx.view.history.scope {
+                            HistoryScope::CurrentProject => {
+                                let cwd = s
+                                    .cwd
+                                    .as_deref()
+                                    .map(|v| shorten(basename(v), 22))
+                                    .unwrap_or_else(|| "-".to_string());
+                                format!(
+                                    "{id_short}  r={rounds}  {cwd}  {last}  {}",
+                                    shorten(first, 40)
+                                )
+                            }
+                            HistoryScope::GlobalRecent => {
+                                let root = s
+                                    .cwd
+                                    .as_deref()
+                                    .map(|cwd| {
+                                        history_workdir_from_cwd(
+                                            cwd,
+                                            ctx.view.history.infer_git_root,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "-".to_string());
+                                format!(
+                                    "{}  {id_short}  r={rounds}  {last}  {}",
+                                    shorten(&root, 44),
+                                    shorten(first, 36)
+                                )
+                            }
+                            HistoryScope::AllByDate => {
+                                let root = s
+                                    .cwd
+                                    .as_deref()
+                                    .map(|cwd| {
+                                        history_workdir_from_cwd(
+                                            cwd,
+                                            ctx.view.history.infer_git_root,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "-".to_string());
+                                format!(
+                                    "{}  {id_short}  r={rounds}  {last}  {}",
+                                    shorten(&root, 44),
+                                    shorten(first, 36)
+                                )
+                            }
+                        };
+                        let sid = s.id.clone();
+                        ui.horizontal(|ui| {
+                            let mut checked = ctx.view.history.batch_selected_ids.contains(&sid);
+                            if ui.checkbox(&mut checked, "").changed() {
+                                if checked {
+                                    ctx.view.history.batch_selected_ids.insert(sid.clone());
+                                } else {
+                                    ctx.view.history.batch_selected_ids.remove(&sid);
+                                }
+                            }
+
+                            if ui.selectable_label(selected, label).clicked() {
+                                pending_select = Some((idx, sid.clone()));
+                            }
+                        });
+                    }
                 }
             });
 
@@ -3624,8 +3817,8 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ctx.view.history.batch_selected_ids.clear();
         }
         if action_batch_select_visible {
-            for s in ctx.view.history.sessions.iter() {
-                ctx.view.history.batch_selected_ids.insert(s.id.clone());
+            for sid in visible_ids.iter() {
+                ctx.view.history.batch_selected_ids.insert(sid.clone());
             }
         }
 
@@ -6448,6 +6641,108 @@ fn path_mtime_ms(path: &std::path::Path) -> u64 {
 
 fn sort_session_summaries_by_mtime_desc(list: &mut Vec<SessionSummary>) {
     list.sort_by_key(|s| std::cmp::Reverse(path_mtime_ms(s.path.as_path())));
+}
+
+fn build_wt_items_from_session_summaries<'a, I>(
+    sessions: I,
+    infer_git_root: bool,
+    resume_cmd_template: &str,
+) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = &'a SessionSummary>,
+{
+    let mut out = Vec::new();
+    let t = resume_cmd_template.trim();
+    for s in sessions.into_iter() {
+        let Some(cwd) = s.cwd.as_deref() else {
+            continue;
+        };
+        let cwd = cwd.trim();
+        if cwd.is_empty() || cwd == "-" {
+            continue;
+        }
+
+        let workdir = history_workdir_from_cwd(cwd, infer_git_root);
+        if workdir.trim().is_empty() || workdir == "-" {
+            continue;
+        }
+        if !std::path::Path::new(workdir.as_str()).exists() {
+            continue;
+        }
+
+        let sid = s.id.as_str();
+        let cmd = if t.is_empty() {
+            format!("codex resume {sid}")
+        } else if t.contains("{id}") {
+            t.replace("{id}", sid)
+        } else {
+            format!("{t} {sid}")
+        };
+        out.push((workdir, cmd));
+    }
+    out
+}
+
+fn open_wt_items(ctx: &mut PageCtx<'_>, items: Vec<(String, String)>) {
+    if !cfg!(windows) {
+        *ctx.last_error = Some(pick(ctx.lang, "仅支持 Windows", "Windows only").to_string());
+        return;
+    }
+
+    if items.is_empty() {
+        *ctx.last_error = Some(
+            pick(
+                ctx.lang,
+                "没有可打开的会话（cwd 不可用或目录不存在）",
+                "No sessions to open (cwd unavailable or missing)",
+            )
+            .to_string(),
+        );
+        return;
+    }
+
+    let mode = ctx
+        .gui_cfg
+        .history
+        .wt_batch_mode
+        .trim()
+        .to_ascii_lowercase();
+    let shell = ctx.view.history.shell.trim();
+    let keep_open = ctx.view.history.keep_open;
+
+    let result = if mode == "windows" {
+        let mut last_err: Option<anyhow::Error> = None;
+        for (cwd, cmd) in items.iter() {
+            if let Err(e) =
+                spawn_windows_terminal_wt_new_tab(-1, cwd.as_str(), shell, keep_open, cmd.as_str())
+            {
+                last_err = Some(e);
+                break;
+            }
+        }
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    } else {
+        spawn_windows_terminal_wt_tabs_in_one_window(&items, shell, keep_open)
+    };
+
+    match result {
+        Ok(()) => {
+            *ctx.last_info = Some(
+                pick(
+                    ctx.lang,
+                    "已启动 Windows Terminal",
+                    "Started Windows Terminal",
+                )
+                .to_string(),
+            );
+        }
+        Err(e) => {
+            *ctx.last_error = Some(format!("spawn wt failed: {e}"));
+        }
+    }
 }
 
 fn format_age(now_ms: u64, ts_ms: Option<u64>) -> String {

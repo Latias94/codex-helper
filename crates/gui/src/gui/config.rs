@@ -239,7 +239,7 @@ fn default_on_port_in_use() -> String {
 }
 
 fn default_wt_batch_mode() -> String {
-    "tabs".to_string()
+    "windows".to_string()
 }
 
 fn default_history_shell() -> String {
