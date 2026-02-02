@@ -88,10 +88,30 @@ impl GuiApp {
 
         let proxy_config_path = crate::config::config_file_path();
         let proxy_config_text = std::fs::read_to_string(&proxy_config_path).unwrap_or_default();
+
+        let initial_page = {
+            let config_ready = proxy_config_path.exists() && !proxy_config_text.trim().is_empty();
+            let svc = gui_cfg.service_kind();
+            let switched = match svc {
+                crate::config::ServiceKind::Claude => {
+                    crate::codex_integration::claude_switch_status()
+                        .map(|s| s.enabled)
+                        .unwrap_or(false)
+                }
+                _ => crate::codex_integration::codex_switch_status()
+                    .map(|s| s.enabled)
+                    .unwrap_or(false),
+            };
+            if !config_ready || !switched {
+                Page::Setup
+            } else {
+                Page::Overview
+            }
+        };
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let proxy = ProxyController::new(gui_cfg.proxy.default_port, gui_cfg.service_kind());
         Self {
-            page: Page::Overview,
+            page: initial_page,
             view: ViewState::default(),
             gui_cfg,
             proxy_config_path,

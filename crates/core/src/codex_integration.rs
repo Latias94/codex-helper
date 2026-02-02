@@ -52,6 +52,111 @@ fn atomic_write(path: &PathBuf, data: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct CodexSwitchStatus {
+    /// Whether Codex currently appears to be configured to use the local codex-helper proxy.
+    pub enabled: bool,
+    /// Current `model_provider` value (if any).
+    pub model_provider: Option<String>,
+    /// Current `model_providers.codex_proxy.base_url` (if any).
+    pub base_url: Option<String>,
+    /// Whether a backup file exists for safe restore.
+    pub has_backup: bool,
+}
+
+pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
+    let cfg_path = codex_config_path();
+    let backup_path = codex_config_backup_path();
+
+    if !cfg_path.exists() {
+        return Ok(CodexSwitchStatus {
+            enabled: false,
+            model_provider: None,
+            base_url: None,
+            has_backup: backup_path.exists(),
+        });
+    }
+
+    let text = read_config_text(&cfg_path)?;
+    if text.trim().is_empty() {
+        return Ok(CodexSwitchStatus {
+            enabled: false,
+            model_provider: None,
+            base_url: None,
+            has_backup: backup_path.exists(),
+        });
+    }
+
+    let value: Value = match text.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            return Ok(CodexSwitchStatus {
+                enabled: false,
+                model_provider: None,
+                base_url: None,
+                has_backup: backup_path.exists(),
+            });
+        }
+    };
+    let table = match value.as_table() {
+        Some(t) => t,
+        None => {
+            return Ok(CodexSwitchStatus {
+                enabled: false,
+                model_provider: None,
+                base_url: None,
+                has_backup: backup_path.exists(),
+            });
+        }
+    };
+
+    let model_provider = table
+        .get("model_provider")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if model_provider.as_deref() != Some("codex_proxy") {
+        return Ok(CodexSwitchStatus {
+            enabled: false,
+            model_provider,
+            base_url: None,
+            has_backup: backup_path.exists(),
+        });
+    }
+
+    let empty_map = toml::map::Map::new();
+    let providers_table = table
+        .get("model_providers")
+        .and_then(|v| v.as_table())
+        .unwrap_or(&empty_map);
+    let empty_provider = toml::map::Map::new();
+    let proxy_table = providers_table
+        .get("codex_proxy")
+        .and_then(|v| v.as_table())
+        .unwrap_or(&empty_provider);
+
+    let base_url = proxy_table
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let name = proxy_table
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let is_local = base_url
+        .as_deref()
+        .is_some_and(|u| u.contains("127.0.0.1") || u.contains("localhost"));
+    let is_helper_name = name == "codex-helper";
+
+    Ok(CodexSwitchStatus {
+        enabled: is_local || is_helper_name,
+        model_provider,
+        base_url,
+        has_backup: backup_path.exists(),
+    })
+}
+
 /// Switch Codex to use the local codex-helper model provider.
 pub fn switch_on(port: u16) -> Result<()> {
     let cfg_path = codex_config_path();
@@ -125,6 +230,75 @@ pub fn switch_off() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeSwitchStatus {
+    /// Whether Claude Code currently appears to be configured to use the local codex-helper proxy.
+    pub enabled: bool,
+    /// Current `env.ANTHROPIC_BASE_URL` value (if any).
+    pub base_url: Option<String>,
+    /// Whether a backup file exists for safe restore.
+    pub has_backup: bool,
+    /// The resolved settings file path (settings.json or legacy claude.json).
+    pub settings_path: PathBuf,
+}
+
+pub fn claude_switch_status() -> Result<ClaudeSwitchStatus> {
+    let settings_path = claude_settings_path();
+    let backup_path = claude_settings_backup_path(&settings_path);
+
+    if !settings_path.exists() {
+        return Ok(ClaudeSwitchStatus {
+            enabled: false,
+            base_url: None,
+            has_backup: backup_path.exists(),
+            settings_path,
+        });
+    }
+
+    let text = read_settings_text(&settings_path)?;
+    if text.trim().is_empty() {
+        return Ok(ClaudeSwitchStatus {
+            enabled: false,
+            base_url: None,
+            has_backup: backup_path.exists(),
+            settings_path,
+        });
+    }
+
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => {
+            return Ok(ClaudeSwitchStatus {
+                enabled: false,
+                base_url: None,
+                has_backup: backup_path.exists(),
+                settings_path,
+            });
+        }
+    };
+
+    let env_obj = value
+        .as_object()
+        .and_then(|o| o.get("env"))
+        .and_then(|v| v.as_object());
+
+    let base_url = env_obj
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let enabled = base_url
+        .as_deref()
+        .is_some_and(|u| u.contains("127.0.0.1") || u.contains("localhost"));
+
+    Ok(ClaudeSwitchStatus {
+        enabled,
+        base_url,
+        has_backup: backup_path.exists(),
+        settings_path,
+    })
 }
 
 /// 在再次切换到本地代理之前，对 Codex 配置做一次守护性检查：
