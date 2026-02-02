@@ -6,7 +6,10 @@ use super::autostart;
 use super::config::GuiConfig;
 use super::i18n::{Language, pick};
 use super::proxy_control::{PortInUseAction, ProxyModeKind};
-use super::util::{open_in_file_manager, spawn_windows_terminal_wt_new_tab};
+use super::util::{
+    open_in_file_manager, spawn_windows_terminal_wt_new_tab,
+    spawn_windows_terminal_wt_tabs_in_one_window,
+};
 use crate::dashboard_core::ConfigOption;
 use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::{SessionDayDir, SessionIndexItem, SessionSummary, SessionTranscriptMessage};
@@ -131,6 +134,7 @@ pub struct HistoryViewState {
     pub shell: String,
     pub keep_open: bool,
     pub wt_window: i32,
+    pub batch_selected_ids: HashSet<String>,
     pub all_days_limit: usize,
     pub all_dates: Vec<SessionDayDir>,
     pub all_selected_date: Option<String>,
@@ -180,6 +184,7 @@ impl Default for HistoryViewState {
             shell: "pwsh".to_string(),
             keep_open: true,
             wt_window: -1,
+            batch_selected_ids: HashSet::new(),
             all_days_limit: 120,
             all_dates: Vec::new(),
             all_selected_date: None,
@@ -2706,7 +2711,21 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.columns(2, |cols| {
         cols[0].heading(pick(ctx.lang, "会话列表", "Sessions"));
         cols[0].add_space(4.0);
+        let mut action_batch_select_visible = false;
+        let mut action_batch_clear = false;
         let mut pending_select: Option<(usize, String)> = None;
+        cols[0].horizontal(|ui| {
+            if ui
+                .button(pick(ctx.lang, "全选可见", "Select visible"))
+                .clicked()
+            {
+                action_batch_select_visible = true;
+            }
+            if ui.button(pick(ctx.lang, "清空选择", "Clear")).clicked() {
+                action_batch_clear = true;
+            }
+        });
+        cols[0].add_space(4.0);
         egui::ScrollArea::vertical()
             .max_height(520.0)
             .show(&mut cols[0], |ui| {
@@ -2769,11 +2788,32 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             )
                         }
                     };
-                    if ui.selectable_label(selected, label).clicked() {
-                        pending_select = Some((idx, s.id.clone()));
-                    }
+                    let sid = s.id.clone();
+                    ui.horizontal(|ui| {
+                        let mut checked = ctx.view.history.batch_selected_ids.contains(&sid);
+                        if ui.checkbox(&mut checked, "").changed() {
+                            if checked {
+                                ctx.view.history.batch_selected_ids.insert(sid.clone());
+                            } else {
+                                ctx.view.history.batch_selected_ids.remove(&sid);
+                            }
+                        }
+
+                        if ui.selectable_label(selected, label).clicked() {
+                            pending_select = Some((idx, sid.clone()));
+                        }
+                    });
                 }
             });
+
+        if action_batch_clear {
+            ctx.view.history.batch_selected_ids.clear();
+        }
+        if action_batch_select_visible {
+            for s in ctx.view.history.sessions.iter() {
+                ctx.view.history.batch_selected_ids.insert(s.id.clone());
+            }
+        }
 
         if let Some((idx, id)) = pending_select.take() {
             ctx.view.history.selected_idx = idx;
@@ -2835,6 +2875,137 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     &mut ctx.view.history.keep_open,
                     pick(ctx.lang, "保持打开", "Keep open"),
                 );
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(pick(ctx.lang, "批量打开", "Batch open"));
+
+                let mut mode = ctx
+                    .gui_cfg
+                    .history
+                    .wt_batch_mode
+                    .trim()
+                    .to_ascii_lowercase();
+                if mode != "tabs" && mode != "windows" {
+                    mode = "tabs".to_string();
+                }
+                let mut selected_mode = mode.clone();
+                egui::ComboBox::from_id_salt("history_wt_batch_mode")
+                    .selected_text(match selected_mode.as_str() {
+                        "windows" => pick(ctx.lang, "每会话新窗口", "Window per session"),
+                        _ => pick(ctx.lang, "单窗口多标签", "One window (tabs)"),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut selected_mode,
+                            "tabs".to_string(),
+                            pick(ctx.lang, "单窗口多标签", "One window (tabs)"),
+                        );
+                        ui.selectable_value(
+                            &mut selected_mode,
+                            "windows".to_string(),
+                            pick(ctx.lang, "每会话新窗口", "Window per session"),
+                        );
+                    });
+                if selected_mode != mode {
+                    ctx.gui_cfg.history.wt_batch_mode = selected_mode;
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
+
+                let n = ctx.view.history.batch_selected_ids.len();
+                let label = match ctx.lang {
+                    Language::Zh => format!("在 wt 中打开选中({n})"),
+                    Language::En => format!("Open selected in wt ({n})"),
+                };
+                let can_open = cfg!(windows) && n > 0;
+                if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
+                    let items = ctx
+                        .view
+                        .history
+                        .sessions
+                        .iter()
+                        .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id))
+                        .filter_map(|s| {
+                            let cwd = s.cwd.as_deref()?.trim().to_string();
+                            if cwd.is_empty() || cwd == "-" {
+                                return None;
+                            }
+                            if !std::path::Path::new(cwd.as_str()).exists() {
+                                return None;
+                            }
+                            let sid = s.id.clone();
+                            let cmd = {
+                                let t = ctx.view.history.resume_cmd.trim();
+                                if t.is_empty() {
+                                    format!("codex resume {sid}")
+                                } else if t.contains("{id}") {
+                                    t.replace("{id}", &sid)
+                                } else {
+                                    format!("{t} {sid}")
+                                }
+                            };
+                            Some((cwd, cmd))
+                        })
+                        .collect::<Vec<_>>();
+
+                    if items.is_empty() {
+                        *ctx.last_error = Some(
+                            pick(
+                                ctx.lang,
+                                "没有可打开的会话（cwd 不可用或目录不存在）",
+                                "No sessions to open (cwd unavailable or missing)",
+                            )
+                            .to_string(),
+                        );
+                    } else {
+                        let mode = ctx
+                            .gui_cfg
+                            .history
+                            .wt_batch_mode
+                            .trim()
+                            .to_ascii_lowercase();
+                        let shell = ctx.view.history.shell.trim();
+                        let keep_open = ctx.view.history.keep_open;
+
+                        let result = if mode == "windows" {
+                            let mut last_err: Option<anyhow::Error> = None;
+                            for (cwd, cmd) in items.iter() {
+                                if let Err(e) = spawn_windows_terminal_wt_new_tab(
+                                    -1,
+                                    cwd.as_str(),
+                                    shell,
+                                    keep_open,
+                                    cmd.as_str(),
+                                ) {
+                                    last_err = Some(e);
+                                    break;
+                                }
+                            }
+                            match last_err {
+                                Some(e) => Err(e),
+                                None => Ok(()),
+                            }
+                        } else {
+                            spawn_windows_terminal_wt_tabs_in_one_window(&items, shell, keep_open)
+                        };
+
+                        match result {
+                            Ok(()) => {
+                                *ctx.last_info = Some(
+                                    pick(
+                                        ctx.lang,
+                                        "已启动 Windows Terminal",
+                                        "Started Windows Terminal",
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                            Err(e) => *ctx.last_error = Some(format!("spawn wt failed: {e}")),
+                        }
+                    }
+                }
             });
 
             ui.horizontal(|ui| {
@@ -3183,6 +3354,20 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         cols[1].heading(pick(ctx.lang, "会话", "Sessions"));
         cols[1].add_space(4.0);
+        let mut action_batch_select_visible = false;
+        let mut action_batch_clear = false;
+        cols[1].horizontal(|ui| {
+            if ui
+                .button(pick(ctx.lang, "全选可见", "Select visible"))
+                .clicked()
+            {
+                action_batch_select_visible = true;
+            }
+            if ui.button(pick(ctx.lang, "清空选择", "Clear")).clicked() {
+                action_batch_clear = true;
+            }
+        });
+        cols[1].add_space(4.0);
 
         let mut visible_indices: Vec<usize> = Vec::new();
         for (idx, s) in ctx.view.history.all_day_sessions.iter().enumerate() {
@@ -3245,20 +3430,43 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             shorten(t, 19),
                             shorten(first, 40)
                         );
-                        if ui.selectable_label(selected, label).clicked() {
-                            ctx.view.history.selected_id = Some(s.id.clone());
-                            ctx.view.history.selected_idx = idx;
-                            ctx.view.history.loaded_for = None;
-                            cancel_transcript_load(&mut ctx.view.history);
-                            ctx.view.history.transcript_raw_messages.clear();
-                            ctx.view.history.transcript_messages.clear();
-                            ctx.view.history.transcript_error = None;
-                            ctx.view.history.transcript_plain_key = None;
-                            ctx.view.history.transcript_plain_text.clear();
-                        }
+                        let sid = s.id.clone();
+                        ui.horizontal(|ui| {
+                            let mut checked = ctx.view.history.batch_selected_ids.contains(&sid);
+                            if ui.checkbox(&mut checked, "").changed() {
+                                if checked {
+                                    ctx.view.history.batch_selected_ids.insert(sid.clone());
+                                } else {
+                                    ctx.view.history.batch_selected_ids.remove(&sid);
+                                }
+                            }
+
+                            if ui.selectable_label(selected, label).clicked() {
+                                ctx.view.history.selected_id = Some(sid.clone());
+                                ctx.view.history.selected_idx = idx;
+                                ctx.view.history.loaded_for = None;
+                                cancel_transcript_load(&mut ctx.view.history);
+                                ctx.view.history.transcript_raw_messages.clear();
+                                ctx.view.history.transcript_messages.clear();
+                                ctx.view.history.transcript_error = None;
+                                ctx.view.history.transcript_plain_key = None;
+                                ctx.view.history.transcript_plain_text.clear();
+                            }
+                        });
                     }
                 },
             );
+        }
+
+        if action_batch_clear {
+            ctx.view.history.batch_selected_ids.clear();
+        }
+        if action_batch_select_visible {
+            for &idx in visible_indices.iter() {
+                if let Some(s) = ctx.view.history.all_day_sessions.get(idx) {
+                    ctx.view.history.batch_selected_ids.insert(s.id.clone());
+                }
+            }
         }
 
         cols[2].heading(pick(ctx.lang, "对话记录", "Transcript"));
@@ -3329,6 +3537,137 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     &mut ctx.view.history.keep_open,
                     pick(ctx.lang, "保持打开", "Keep open"),
                 );
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(pick(ctx.lang, "批量打开", "Batch open"));
+
+                let mut mode = ctx
+                    .gui_cfg
+                    .history
+                    .wt_batch_mode
+                    .trim()
+                    .to_ascii_lowercase();
+                if mode != "tabs" && mode != "windows" {
+                    mode = "tabs".to_string();
+                }
+                let mut selected_mode = mode.clone();
+                egui::ComboBox::from_id_salt("history_wt_batch_mode_all_by_date")
+                    .selected_text(match selected_mode.as_str() {
+                        "windows" => pick(ctx.lang, "每会话新窗口", "Window per session"),
+                        _ => pick(ctx.lang, "单窗口多标签", "One window (tabs)"),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut selected_mode,
+                            "tabs".to_string(),
+                            pick(ctx.lang, "单窗口多标签", "One window (tabs)"),
+                        );
+                        ui.selectable_value(
+                            &mut selected_mode,
+                            "windows".to_string(),
+                            pick(ctx.lang, "每会话新窗口", "Window per session"),
+                        );
+                    });
+                if selected_mode != mode {
+                    ctx.gui_cfg.history.wt_batch_mode = selected_mode;
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
+
+                let n = ctx.view.history.batch_selected_ids.len();
+                let label = match ctx.lang {
+                    Language::Zh => format!("在 wt 中打开选中({n})"),
+                    Language::En => format!("Open selected in wt ({n})"),
+                };
+                let can_open = cfg!(windows) && n > 0;
+                if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
+                    let items = ctx
+                        .view
+                        .history
+                        .all_day_sessions
+                        .iter()
+                        .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id))
+                        .filter_map(|s| {
+                            let cwd = s.cwd.as_deref()?.trim().to_string();
+                            if cwd.is_empty() || cwd == "-" {
+                                return None;
+                            }
+                            if !std::path::Path::new(cwd.as_str()).exists() {
+                                return None;
+                            }
+                            let sid = s.id.clone();
+                            let cmd = {
+                                let t = ctx.view.history.resume_cmd.trim();
+                                if t.is_empty() {
+                                    format!("codex resume {sid}")
+                                } else if t.contains("{id}") {
+                                    t.replace("{id}", &sid)
+                                } else {
+                                    format!("{t} {sid}")
+                                }
+                            };
+                            Some((cwd, cmd))
+                        })
+                        .collect::<Vec<_>>();
+
+                    if items.is_empty() {
+                        *ctx.last_error = Some(
+                            pick(
+                                ctx.lang,
+                                "没有可打开的会话（cwd 不可用或目录不存在）",
+                                "No sessions to open (cwd unavailable or missing)",
+                            )
+                            .to_string(),
+                        );
+                    } else {
+                        let mode = ctx
+                            .gui_cfg
+                            .history
+                            .wt_batch_mode
+                            .trim()
+                            .to_ascii_lowercase();
+                        let shell = ctx.view.history.shell.trim();
+                        let keep_open = ctx.view.history.keep_open;
+
+                        let result = if mode == "windows" {
+                            let mut last_err: Option<anyhow::Error> = None;
+                            for (cwd, cmd) in items.iter() {
+                                if let Err(e) = spawn_windows_terminal_wt_new_tab(
+                                    -1,
+                                    cwd.as_str(),
+                                    shell,
+                                    keep_open,
+                                    cmd.as_str(),
+                                ) {
+                                    last_err = Some(e);
+                                    break;
+                                }
+                            }
+                            match last_err {
+                                Some(e) => Err(e),
+                                None => Ok(()),
+                            }
+                        } else {
+                            spawn_windows_terminal_wt_tabs_in_one_window(&items, shell, keep_open)
+                        };
+
+                        match result {
+                            Ok(()) => {
+                                *ctx.last_info = Some(
+                                    pick(
+                                        ctx.lang,
+                                        "已启动 Windows Terminal",
+                                        "Started Windows Terminal",
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                            Err(e) => *ctx.last_error = Some(format!("spawn wt failed: {e}")),
+                        }
+                    }
+                }
             });
 
             ui.horizontal(|ui| {

@@ -13,6 +13,8 @@ pub struct GuiConfig {
     #[serde(default)]
     pub attach: AttachConfig,
     #[serde(default)]
+    pub history: HistoryConfig,
+    #[serde(default)]
     pub window: WindowConfig,
     #[serde(default)]
     pub tray: TrayConfig,
@@ -26,6 +28,7 @@ impl Default for GuiConfig {
             ui: UiConfig::default(),
             proxy: ProxyUiConfig::default(),
             attach: AttachConfig::default(),
+            history: HistoryConfig::default(),
             window: WindowConfig::default(),
             tray: TrayConfig::default(),
             autostart: AutostartConfig::default(),
@@ -89,6 +92,21 @@ impl Default for AttachConfig {
             on_port_in_use: default_on_port_in_use(),
             remember_choice: false,
             last_port: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryConfig {
+    /// How to spawn Windows Terminal for batch resume: `tabs` or `windows`.
+    #[serde(default = "default_wt_batch_mode")]
+    pub wt_batch_mode: String,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            wt_batch_mode: default_wt_batch_mode(),
         }
     }
 }
@@ -162,6 +180,10 @@ fn default_port() -> u16 {
 
 fn default_on_port_in_use() -> String {
     "ask".to_string()
+}
+
+fn default_wt_batch_mode() -> String {
+    "tabs".to_string()
 }
 
 fn default_close_behavior() -> String {
