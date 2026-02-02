@@ -494,6 +494,9 @@ async fn find_recent_codex_sessions_in_dir(
     if limit == 0 {
         return Ok(Vec::new());
     }
+    if since.is_zero() {
+        return Ok(Vec::new());
+    }
     if !sessions_dir.exists() {
         return Ok(Vec::new());
     }
