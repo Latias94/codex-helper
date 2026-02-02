@@ -3,7 +3,6 @@ pub use codex_helper_core::{
     notify, proxy, sessions, state, usage, usage_providers,
 };
 
-#[path = "../../../src/gui/mod.rs"]
 pub mod gui;
 
 pub fn run() -> anyhow::Result<()> {

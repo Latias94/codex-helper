@@ -3,5 +3,4 @@ pub use codex_helper_core::{
     notify, proxy, sessions, state, usage, usage_providers,
 };
 
-#[path = "../../../src/tui/mod.rs"]
 pub mod tui;
