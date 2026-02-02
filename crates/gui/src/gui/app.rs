@@ -7,7 +7,7 @@ use super::i18n::{Language, pick};
 use super::pages::{Page, PageCtx, ViewState};
 use super::proxy_control::ProxyController;
 use super::single_instance::{AcquireResult, SingleInstance};
-use super::tray::{TrayAction, TrayController};
+use super::tray::{TrayAction, TrayController, TrayMenuModel};
 use super::util::open_in_file_manager;
 
 type LogGuard = tracing_appender::non_blocking::WorkerGuard;
@@ -329,10 +329,9 @@ impl eframe::App for GuiApp {
             self.tray = None;
         }
 
-        // Auto attach-or-start:
-        // 1) Probe configured port; attach if proxy exists.
-        // 2) If probe fails and fallback enabled, scan 3210-3220; attach best candidate if any.
-        // 3) Otherwise start proxy (honors on-port-in-use setting, may prompt).
+        // Auto start (and optionally prompt/attach on port-in-use).
+        // NOTE: Do NOT auto-attach by default. If a proxy is already running, we prefer to
+        // show the standard "port in use" prompt (or follow user's configured action).
         if !self.did_auto_connect
             && self.gui_cfg.proxy.auto_attach_or_start
             && matches!(
@@ -349,57 +348,20 @@ impl eframe::App for GuiApp {
                 .or_else(|| infer_port_from_client_config(&self.gui_cfg))
                 .unwrap_or(self.gui_cfg.proxy.default_port);
 
-            let mut attach_port: Option<u16> = None;
-            if self
-                .proxy
-                .probe_local_proxy(&self.rt, preferred_port)
-                .is_some()
-            {
-                attach_port = Some(preferred_port);
-            } else if self.gui_cfg.proxy.discovery_scan_fallback {
-                if self.proxy.scan_local_proxies(&self.rt, 3210..=3220).is_ok() {
-                    let discovered = self.proxy.discovered_proxies();
-                    if !discovered.is_empty() {
-                        // Best-effort selection:
-                        // - prefer last_port
-                        // - prefer matching service
-                        // - prefer api v1
-                        // - lowest port
-                        let desired_service = match self.gui_cfg.service_kind() {
-                            crate::config::ServiceKind::Codex => "codex",
-                            crate::config::ServiceKind::Claude => "claude",
-                        };
-                        attach_port = discovered
-                            .iter()
-                            .find(|p| p.port == preferred_port)
-                            .or_else(|| {
-                                discovered
-                                    .iter()
-                                    .find(|p| p.service_name.as_deref() == Some(desired_service))
-                            })
-                            .or_else(|| discovered.iter().find(|p| p.api_version == Some(1)))
-                            .or_else(|| discovered.iter().min_by_key(|p| p.port))
-                            .map(|p| p.port);
-                    }
-                }
+            self.proxy.set_desired_port(preferred_port);
+            self.proxy.set_desired_service(self.gui_cfg.service_kind());
+
+            if self.gui_cfg.proxy.discovery_scan_fallback {
+                let _ = self.proxy.scan_local_proxies(&self.rt, 3210..=3220);
             }
 
-            if let Some(port) = attach_port {
-                self.proxy.request_attach(port);
-                self.gui_cfg.attach.last_port = Some(port);
-                let _ = self.gui_cfg.save();
-                self.last_info =
-                    Some(pick(lang, "自动附着到已运行代理", "Auto-attached to proxy").to_string());
-            } else {
-                let action = super::proxy_control::PortInUseAction::parse(
-                    &self.gui_cfg.attach.on_port_in_use,
-                );
-                self.proxy.request_start_or_prompt(
-                    &self.rt,
-                    action,
-                    self.gui_cfg.attach.remember_choice,
-                );
-            }
+            let action =
+                super::proxy_control::PortInUseAction::parse(&self.gui_cfg.attach.on_port_in_use);
+            self.proxy.request_start_or_prompt(
+                &self.rt,
+                action,
+                self.gui_cfg.attach.remember_choice,
+            );
         }
 
         if let Some(behavior) = self.pending_startup.take() {
@@ -414,7 +376,11 @@ impl eframe::App for GuiApp {
             }
         }
 
-        if let Some(tray) = self.tray.as_ref() {
+        if let Some(tray) = self.tray.as_mut() {
+            let model = tray_menu_model(&self.proxy, &self.gui_cfg);
+            if let Err(e) = tray.update_menu(lang, model) {
+                self.last_error = Some(format!("tray menu update failed: {e}"));
+            }
             for action in tray.drain_actions() {
                 match action {
                     TrayAction::Show => {
@@ -467,6 +433,159 @@ impl eframe::App for GuiApp {
                         } else {
                             self.last_info =
                                 Some(pick(lang, "已重载配置", "Config reloaded").to_string());
+                        }
+                    }
+                    TrayAction::SetActiveConfig { service, name } => {
+                        let save_res = self.rt.block_on(async {
+                            let mut cfg = crate::config::load_config().await?;
+                            match service {
+                                crate::config::ServiceKind::Claude => {
+                                    cfg.claude.active = Some(name.clone());
+                                }
+                                crate::config::ServiceKind::Codex => {
+                                    cfg.codex.active = Some(name.clone());
+                                }
+                            }
+                            crate::config::save_config(&cfg).await?;
+                            Ok::<(), anyhow::Error>(())
+                        });
+                        if let Err(e) = save_res {
+                            self.last_error = Some(format!("save active failed: {e}"));
+                            continue;
+                        }
+
+                        if matches!(
+                            self.proxy.kind(),
+                            super::proxy_control::ProxyModeKind::Running
+                                | super::proxy_control::ProxyModeKind::Attached
+                        ) {
+                            match self.proxy.reload_runtime_config(&self.rt) {
+                                Ok(()) => {
+                                    self.last_info = Some(
+                                        pick(
+                                            lang,
+                                            "已切换默认配置并应用",
+                                            "Active config changed and applied",
+                                        )
+                                        .to_string(),
+                                    );
+                                }
+                                Err(e) => {
+                                    self.last_error = Some(format!("reload config failed: {e}"));
+                                }
+                            }
+                        } else {
+                            self.last_info = Some(
+                                pick(lang, "已保存默认配置", "Active config saved").to_string(),
+                            );
+                        }
+                    }
+                    TrayAction::ApplyPinnedConfig { name } => {
+                        match self
+                            .proxy
+                            .apply_global_config_override(&self.rt, name.clone())
+                        {
+                            Ok(()) => {
+                                self.proxy.refresh_current_if_due(
+                                    &self.rt,
+                                    std::time::Duration::from_secs(0),
+                                );
+                                self.last_info =
+                                    Some(pick(lang, "已应用 Pinned", "Pinned applied").to_string());
+                            }
+                            Err(e) => {
+                                self.last_error = Some(format!("apply pinned failed: {e}"));
+                            }
+                        }
+                    }
+                    TrayAction::ApplyRoutingProfile { name } => {
+                        let Some(profile) = self
+                            .gui_cfg
+                            .routing
+                            .profiles
+                            .iter()
+                            .find(|p| p.name == name)
+                            .cloned()
+                        else {
+                            self.last_error = Some(format!("routing profile not found: {name}"));
+                            continue;
+                        };
+
+                        self.gui_cfg.routing.selected_profile = Some(name.clone());
+                        if let Err(e) = self.gui_cfg.save() {
+                            self.last_error = Some(format!("save gui config failed: {e}"));
+                            continue;
+                        }
+
+                        if let Some(svc) = parse_service_kind(profile.service.as_str()) {
+                            self.gui_cfg.set_service_kind(svc);
+                            self.proxy.set_desired_service(svc);
+                        }
+                        if let Some(port) = profile.port {
+                            self.gui_cfg.proxy.default_port = port;
+                            self.proxy.set_desired_port(port);
+                        }
+
+                        let _ = self.gui_cfg.save();
+
+                        let snapshot = self.proxy.snapshot();
+                        let supports_v1 = snapshot.as_ref().is_some_and(|s| s.supports_v1);
+                        let current_svc = snapshot
+                            .as_ref()
+                            .and_then(|s| s.service_name.clone())
+                            .unwrap_or_default()
+                            .trim()
+                            .to_ascii_lowercase();
+
+                        if matches!(
+                            self.proxy.kind(),
+                            super::proxy_control::ProxyModeKind::Running
+                                | super::proxy_control::ProxyModeKind::Attached
+                        ) && supports_v1
+                        {
+                            let profile_svc = profile.service.trim().to_ascii_lowercase();
+                            if !profile_svc.is_empty()
+                                && !current_svc.is_empty()
+                                && profile_svc != current_svc
+                            {
+                                self.last_info = Some(
+                                    pick(
+                                        lang,
+                                        "已选中路由预设，但服务不匹配：已跳过应用 Pinned。",
+                                        "Preset selected but service mismatch; skipped pinned apply.",
+                                    )
+                                    .to_string(),
+                                );
+                                continue;
+                            }
+
+                            match self.proxy.apply_global_config_override(
+                                &self.rt,
+                                profile.pinned_config.clone(),
+                            ) {
+                                Ok(()) => {
+                                    self.proxy.refresh_current_if_due(
+                                        &self.rt,
+                                        std::time::Duration::from_secs(0),
+                                    );
+                                    self.last_info = Some(
+                                        pick(
+                                            lang,
+                                            "已应用路由预设（Pinned）",
+                                            "Routing preset applied (pinned)",
+                                        )
+                                        .to_string(),
+                                    );
+                                }
+                                Err(e) => {
+                                    self.last_error =
+                                        Some(format!("apply routing preset pinned failed: {e}"));
+                                }
+                            }
+                        } else {
+                            self.last_info = Some(
+                                pick(lang, "已选中路由预设", "Routing preset selected").to_string(),
+                            );
                         }
                     }
                     TrayAction::SwitchOn => {
@@ -650,6 +769,56 @@ impl eframe::App for GuiApp {
         if let Some(next) = self.view.requested_page.take() {
             self.page = next;
         }
+    }
+}
+
+fn parse_service_kind(s: &str) -> Option<crate::config::ServiceKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some(crate::config::ServiceKind::Codex),
+        "claude" => Some(crate::config::ServiceKind::Claude),
+        _ => None,
+    }
+}
+
+fn tray_menu_model(proxy: &ProxyController, gui_cfg: &GuiConfig) -> TrayMenuModel {
+    let kind = proxy.kind();
+    let snapshot = proxy.snapshot();
+
+    let mut configs = snapshot
+        .as_ref()
+        .map(|s| s.configs.clone())
+        .unwrap_or_default();
+    configs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let active_display = if kind == super::proxy_control::ProxyModeKind::Running {
+        proxy.running().map(|r| {
+            let active_name = match r.service_name {
+                "claude" => r.cfg.claude.active.clone(),
+                _ => r.cfg.codex.active.clone(),
+            };
+            let active_fallback = match r.service_name {
+                "claude" => r.cfg.claude.active_config().map(|c| c.name.clone()),
+                _ => r.cfg.codex.active_config().map(|c| c.name.clone()),
+            };
+            active_name
+                .or(active_fallback)
+                .unwrap_or_else(|| "-".to_string())
+        })
+    } else {
+        None
+    };
+
+    TrayMenuModel {
+        proxy_kind: kind,
+        base_url: snapshot.as_ref().and_then(|s| s.base_url.clone()),
+        service_name: snapshot.as_ref().and_then(|s| s.service_name.clone()),
+        port: snapshot.as_ref().and_then(|s| s.port),
+        supports_v1: snapshot.as_ref().is_some_and(|s| s.supports_v1),
+        active_display,
+        configs,
+        global_override: snapshot.as_ref().and_then(|s| s.global_override.clone()),
+        routing_profiles: gui_cfg.routing.profiles.clone(),
+        selected_routing_profile: gui_cfg.routing.selected_profile.clone(),
     }
 }
 
