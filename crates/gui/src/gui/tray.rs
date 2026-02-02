@@ -161,9 +161,8 @@ impl TrayController {
             let Ok(event) = TrayIconEvent::receiver().try_recv() else {
                 break;
             };
-            match event {
-                TrayIconEvent::DoubleClick { .. } => out.push(TrayAction::Show),
-                _ => {}
+            if let TrayIconEvent::DoubleClick { .. } = event {
+                out.push(TrayAction::Show);
             }
         }
         loop {
@@ -220,6 +219,8 @@ fn compute_menu_sig(m: &TrayMenuModel) -> String {
     s.push_str(m.service_name.as_deref().unwrap_or("-"));
     s.push_str("|port=");
     s.push_str(&m.port.unwrap_or(0).to_string());
+    s.push_str("|url=");
+    s.push_str(m.base_url.as_deref().unwrap_or("-"));
     s.push_str("|v1=");
     s.push_str(if m.supports_v1 { "1" } else { "0" });
     s.push_str("|active=");
@@ -244,7 +245,7 @@ fn compute_menu_sig(m: &TrayMenuModel) -> String {
         if let Some(port) = p.port {
             s.push_str(&port.to_string());
         } else {
-            s.push_str("-");
+            s.push('-');
         }
         s.push('|');
     }

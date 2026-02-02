@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::i18n::Language;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GuiConfig {
     #[serde(default)]
     pub ui: UiConfig,
@@ -22,21 +22,6 @@ pub struct GuiConfig {
     pub tray: TrayConfig,
     #[serde(default)]
     pub autostart: AutostartConfig,
-}
-
-impl Default for GuiConfig {
-    fn default() -> Self {
-        Self {
-            ui: UiConfig::default(),
-            proxy: ProxyUiConfig::default(),
-            attach: AttachConfig::default(),
-            history: HistoryConfig::default(),
-            routing: RoutingConfig::default(),
-            window: WindowConfig::default(),
-            tray: TrayConfig::default(),
-            autostart: AutostartConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,16 +187,10 @@ impl Default for TrayConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AutostartConfig {
     #[serde(default)]
     pub enabled: bool,
-}
-
-impl Default for AutostartConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 fn default_true() -> bool {
@@ -317,10 +296,7 @@ impl GuiConfig {
             Err(_) => return Self::default(),
         };
         let parsed = toml::from_str::<Self>(&text);
-        match parsed {
-            Ok(v) => v,
-            Err(_) => Self::default(),
-        }
+        parsed.unwrap_or_default()
     }
 
     pub fn save(&self) -> anyhow::Result<()> {

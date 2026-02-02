@@ -49,13 +49,14 @@ pub fn spawn_windows_terminal_wt_new_tab(
     {
         use std::process::Command;
         let shell_base = basename_lower(shell);
-        let mut args: Vec<String> = Vec::new();
-        args.push("-w".to_string());
-        args.push(wt_window.to_string());
-        args.push("new-tab".to_string());
-        args.push("-d".to_string());
-        args.push(workdir.to_string());
-        args.push(shell.to_string());
+        let mut args: Vec<String> = vec![
+            "-w".to_string(),
+            wt_window.to_string(),
+            "new-tab".to_string(),
+            "-d".to_string(),
+            workdir.to_string(),
+            shell.to_string(),
+        ];
 
         if shell_base.contains("pwsh") || shell_base.contains("powershell") {
             args.push("-ExecutionPolicy".to_string());
@@ -80,7 +81,7 @@ pub fn spawn_windows_terminal_wt_new_tab(
                 "failed to spawn wt; is Windows Terminal installed and `wt` in PATH? ({e})"
             )
         })?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(windows))]
@@ -140,7 +141,7 @@ pub fn spawn_windows_terminal_wt_tabs_in_one_window(
                 "failed to spawn wt; is Windows Terminal installed and `wt` in PATH? ({e})"
             )
         })?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(windows))]

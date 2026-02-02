@@ -67,16 +67,11 @@ impl Default for SetupViewState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ConfigMode {
+    #[default]
     Form,
     Raw,
-}
-
-impl Default for ConfigMode {
-    fn default() -> Self {
-        Self::Form
-    }
 }
 
 #[derive(Debug)]
@@ -376,10 +371,9 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             if ui
                 .button(pick(ctx.lang, "打开配置文件", "Open config file"))
                 .clicked()
+                && let Err(e) = open_in_file_manager(&cfg_path, true)
             {
-                if let Err(e) = open_in_file_manager(&cfg_path, true) {
-                    *ctx.last_error = Some(format!("open config failed: {e}"));
-                }
+                *ctx.last_error = Some(format!("open config failed: {e}"));
             }
             if ui
                 .button(pick(ctx.lang, "前往配置页", "Go to Config page"))
@@ -1198,8 +1192,22 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                     ui.label(pick(ctx.lang, "状态", "Status"));
                                     ui.end_row();
 
+                                    let now = now_ms();
                                     for p in discovered {
-                                        ui.label(p.port.to_string());
+                                        let mut hover = format!("base_url: {}", p.base_url);
+                                        if !p.endpoints.is_empty() {
+                                            hover.push_str(&format!(
+                                                "\nendpoints: {}",
+                                                p.endpoints.len()
+                                            ));
+                                        }
+                                        if let Some(ms) = p.runtime_loaded_at_ms {
+                                            hover.push_str(&format!(
+                                                "\nruntime_loaded: {}",
+                                                format_age(now, Some(ms))
+                                            ));
+                                        }
+                                        ui.label(p.port.to_string()).on_hover_text(hover);
                                         ui.label(
                                             p.service_name.as_deref().unwrap_or_else(|| {
                                                 pick(ctx.lang, "未知", "unknown")
@@ -1992,10 +2000,8 @@ fn render_routing_presets(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         });
     });
 
-    if profile_changed {
-        if let Err(e) = ctx.gui_cfg.save() {
-            *ctx.last_error = Some(format!("save gui config failed: {e}"));
-        }
+    if profile_changed && let Err(e) = ctx.gui_cfg.save() {
+        *ctx.last_error = Some(format!("save gui config failed: {e}"));
     }
 
     if action_apply_service_port {
@@ -2281,23 +2287,21 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     egui::Button::new(pick(ctx.lang, "复制 session_id", "Copy session_id")),
                 )
                 .clicked()
+                && let Some(sid) = row.session_id.as_deref()
             {
-                if let Some(sid) = row.session_id.as_deref() {
-                    ui.ctx().copy_text(sid.to_string());
-                    *ctx.last_info = Some(pick(ctx.lang, "已复制", "Copied").to_string());
-                }
+                ui.ctx().copy_text(sid.to_string());
+                *ctx.last_info = Some(pick(ctx.lang, "已复制", "Copied").to_string());
             }
 
             let can_open_cwd = row.cwd.is_some();
             if ui
                 .add_enabled(can_open_cwd, egui::Button::new(pick(ctx.lang, "打开 cwd", "Open cwd")))
                 .clicked()
+                && let Some(cwd) = row.cwd.as_deref()
             {
-                if let Some(cwd) = row.cwd.as_deref() {
-                    let path = std::path::PathBuf::from(cwd);
-                    if let Err(e) = open_in_file_manager(&path, false) {
-                        *ctx.last_error = Some(format!("open cwd failed: {e}"));
-                    }
+                let path = std::path::PathBuf::from(cwd);
+                if let Err(e) = open_in_file_manager(&path, false) {
+                    *ctx.last_error = Some(format!("open cwd failed: {e}"));
                 }
             }
 
@@ -2529,17 +2533,18 @@ fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
     if q.is_empty() {
         return true;
     }
-    for v in [
+    for s in [
         row.session_id.as_deref(),
         row.cwd.as_deref(),
         row.last_model.as_deref(),
         row.last_provider_id.as_deref(),
         row.last_config_name.as_deref(),
-    ] {
-        if let Some(s) = v {
-            if s.to_lowercase().contains(q) {
-                return true;
-            }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if s.to_lowercase().contains(q) {
+            return true;
         }
     }
     false
@@ -3279,8 +3284,7 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             .history
                             .sessions_all
                             .iter()
-                            .cloned()
-                            .filter(|s| match scope {
+                            .filter(|&s| match scope {
                                 HistoryScope::GlobalRecent => s
                                     .cwd
                                     .as_deref()
@@ -3292,6 +3296,7 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                     msg.to_lowercase().contains(q.as_str())
                                 }),
                             })
+                            .cloned()
                             .collect()
                     };
                     ctx.view.history.applied_scope = scope;
@@ -3455,7 +3460,6 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 .history
                 .sessions_all
                 .iter()
-                .cloned()
                 .filter(|s| match scope {
                     HistoryScope::GlobalRecent => {
                         s.cwd
@@ -3470,6 +3474,7 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         .as_deref()
                         .is_some_and(|msg| msg.to_lowercase().contains(q.as_str())),
                 })
+                .cloned()
                 .collect();
         }
 
@@ -3611,6 +3616,33 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
                     for g in ordered.into_iter() {
                         let key = g.key.clone();
+                        let mut ok_indices: Vec<usize> = Vec::new();
+                        let mut skipped_missing_cwd = 0usize;
+                        let mut skipped_invalid_workdir = 0usize;
+                        let mut skipped_missing_dir = 0usize;
+                        for &idx in g.indices.iter() {
+                            let reason = ctx
+                                .view
+                                .history
+                                .sessions
+                                .get(idx)
+                                .and_then(|s| {
+                                    workdir_status_from_cwd(
+                                        s.cwd.as_deref(),
+                                        ctx.view.history.infer_git_root,
+                                    )
+                                    .err()
+                                });
+                            match reason {
+                                None => ok_indices.push(idx),
+                                Some(WtItemSkipReason::MissingCwd) => skipped_missing_cwd += 1,
+                                Some(WtItemSkipReason::InvalidWorkdir) => {
+                                    skipped_invalid_workdir += 1
+                                }
+                                Some(WtItemSkipReason::WorkdirNotFound) => skipped_missing_dir += 1,
+                            }
+                        }
+                        let ok_n = ok_indices.len();
                         let collapsed = ctx.view.history.collapsed_workdirs.contains(&key);
                         let name = if key == "-" {
                             pick(ctx.lang, "<未知目录>", "<unknown>").to_string()
@@ -3633,8 +3665,17 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 }
                             }
 
-                            let header = format!("{name}  n={n}  {age}");
-                            ui.label(header).on_hover_text(key.as_str());
+                            let header = format!("{name}  ok={ok_n}/{n}  {age}");
+                            let mut hover = String::new();
+                            hover.push_str(key.as_str());
+                            if skipped_missing_cwd + skipped_invalid_workdir + skipped_missing_dir > 0
+                            {
+                                hover.push('\n');
+                                hover.push_str(&format!(
+                                    "skipped: missing_cwd={skipped_missing_cwd}, invalid_workdir={skipped_invalid_workdir}, missing_dir={skipped_missing_dir}"
+                                ));
+                            }
+                            ui.label(header).on_hover_text(hover);
 
                             if ui.small_button(pick(ctx.lang, "全选", "Select")).clicked() {
                                 for &idx in g.indices.iter() {
@@ -3651,22 +3692,19 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 }
                             }
 
-                            let can_open = cfg!(windows) && n > 0;
+                            let can_open = cfg!(windows) && ok_n > 0;
                             let label = match ctx.lang {
-                                Language::Zh => format!("打开({n})"),
-                                Language::En => format!("Open ({n})"),
+                                Language::Zh => format!("打开({ok_n})"),
+                                Language::En => format!("Open ({ok_n})"),
                             };
                             if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
-                                let mut items = Vec::new();
-                                for &idx in g.indices.iter() {
-                                    if let Some(s) = ctx.view.history.sessions.get(idx) {
-                                        items.extend(build_wt_items_from_session_summaries(
-                                            std::iter::once(s),
-                                            ctx.view.history.infer_git_root,
-                                            ctx.view.history.resume_cmd.as_str(),
-                                        ));
-                                    }
-                                }
+                                let items = build_wt_items_from_session_summaries(
+                                    ok_indices.iter().filter_map(|&idx| {
+                                        ctx.view.history.sessions.get(idx)
+                                    }),
+                                    ctx.view.history.infer_git_root,
+                                    ctx.view.history.resume_cmd.as_str(),
+                                );
                                 open_wt_items(ctx, items);
                             }
 
@@ -3681,7 +3719,7 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 }
                             }
 
-                            let open_n = open_n.min(n);
+                            let open_n = open_n.min(ok_n);
                             let label_n = match ctx.lang {
                                 Language::Zh => format!("打开最近{open_n}"),
                                 Language::En => format!("Open top {open_n}"),
@@ -3690,16 +3728,13 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 .add_enabled(can_open, egui::Button::new(label_n))
                                 .clicked()
                             {
-                                let mut items = Vec::new();
-                                for &idx in g.indices.iter().take(open_n) {
-                                    if let Some(s) = ctx.view.history.sessions.get(idx) {
-                                        items.extend(build_wt_items_from_session_summaries(
-                                            std::iter::once(s),
-                                            ctx.view.history.infer_git_root,
-                                            ctx.view.history.resume_cmd.as_str(),
-                                        ));
-                                    }
-                                }
+                                let items = build_wt_items_from_session_summaries(
+                                    ok_indices.iter().take(open_n).filter_map(|&idx| {
+                                        ctx.view.history.sessions.get(idx)
+                                    }),
+                                    ctx.view.history.infer_git_root,
+                                    ctx.view.history.resume_cmd.as_str(),
+                                );
                                 open_wt_items(ctx, items);
                             }
                         });
@@ -4333,34 +4368,34 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     }
 
     // Auto-load day sessions when date changes.
-    if let Some(date) = ctx.view.history.all_selected_date.clone() {
-        if ctx.view.history.loaded_day_for.as_deref() != Some(date.as_str()) {
-            let limit = ctx.view.history.all_day_limit;
-            let day_dir = ctx
-                .view
-                .history
-                .all_dates
-                .iter()
-                .find(|x| x.date == date)
-                .map(|x| x.path.clone());
-            if let Some(day_dir) = day_dir {
-                match ctx
-                    .rt
-                    .block_on(crate::sessions::list_codex_sessions_in_day_dir(
-                        &day_dir, limit,
-                    )) {
-                    Ok(mut list) => {
-                        list.sort_by_key(|s| std::cmp::Reverse(s.mtime_ms));
-                        ctx.view.history.all_day_sessions = list;
-                        ctx.view.history.loaded_day_for = Some(date.clone());
-                        ctx.view.history.selected_id = None;
-                        ctx.view.history.transcript_messages.clear();
-                        ctx.view.history.transcript_error = None;
-                        ctx.view.history.loaded_for = None;
-                    }
-                    Err(e) => {
-                        ctx.view.history.last_error = Some(e.to_string());
-                    }
+    if let Some(date) = ctx.view.history.all_selected_date.clone()
+        && ctx.view.history.loaded_day_for.as_deref() != Some(date.as_str())
+    {
+        let limit = ctx.view.history.all_day_limit;
+        let day_dir = ctx
+            .view
+            .history
+            .all_dates
+            .iter()
+            .find(|x| x.date == date)
+            .map(|x| x.path.clone());
+        if let Some(day_dir) = day_dir {
+            match ctx
+                .rt
+                .block_on(crate::sessions::list_codex_sessions_in_day_dir(
+                    &day_dir, limit,
+                )) {
+                Ok(mut list) => {
+                    list.sort_by_key(|s| std::cmp::Reverse(s.mtime_ms));
+                    ctx.view.history.all_day_sessions = list;
+                    ctx.view.history.loaded_day_for = Some(date.clone());
+                    ctx.view.history.selected_id = None;
+                    ctx.view.history.transcript_messages.clear();
+                    ctx.view.history.transcript_error = None;
+                    ctx.view.history.loaded_for = None;
+                }
+                Err(e) => {
+                    ctx.view.history.last_error = Some(e.to_string());
                 }
             }
         }
@@ -4788,10 +4823,10 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     }
                 }
 
-                if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked() {
-                    if let Err(e) = open_in_file_manager(&selected.path, true) {
-                        *ctx.last_error = Some(format!("open session failed: {e}"));
-                    }
+                if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked()
+                    && let Err(e) = open_in_file_manager(&selected.path, true)
+                {
+                    *ctx.last_error = Some(format!("open session failed: {e}"));
                 }
             });
 
@@ -5244,16 +5279,6 @@ fn render_transcript_body(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, max_height: 
                 });
         }
     }
-}
-
-fn render_placeholder(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, name: &str) {
-    ui.heading(pick(ctx.lang, "开发中", "In progress"));
-    ui.label(format!("{}: {}", pick(ctx.lang, "页面", "Page"), name));
-    ui.label(pick(
-        ctx.lang,
-        "后续阶段会把 TUI 的 Sessions/Requests/History 等能力逐步迁移到这里。",
-        "Next milestones will port TUI Sessions/Requests/History features here.",
-    ));
 }
 
 fn transcript_find_matches(
@@ -5856,10 +5881,9 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         ctx.proxy.kind(),
                         super::proxy_control::ProxyModeKind::Running
                             | super::proxy_control::ProxyModeKind::Attached
-                    ) {
-                        if let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt) {
-                            *ctx.last_error = Some(format!("reload runtime failed: {e}"));
-                        }
+                    ) && let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt)
+                    {
+                        *ctx.last_error = Some(format!("reload runtime failed: {e}"));
                     }
 
                     ctx.view.config.import_codex.preview = Some(report);
@@ -6275,10 +6299,9 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     ctx.proxy.kind(),
                     super::proxy_control::ProxyModeKind::Running
                         | super::proxy_control::ProxyModeKind::Attached
-                ) {
-                    if let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt) {
-                        *ctx.last_error = Some(format!("reload runtime failed: {e}"));
-                    }
+                ) && let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt)
+                {
+                    *ctx.last_error = Some(format!("reload runtime failed: {e}"));
                 }
 
                 *ctx.last_info = Some(pick(ctx.lang, "已保存", "Saved").to_string());
@@ -6351,10 +6374,9 @@ fn render_config_raw(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 ctx.proxy.kind(),
                                 super::proxy_control::ProxyModeKind::Running
                                     | super::proxy_control::ProxyModeKind::Attached
-                            ) {
-                                if let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt) {
-                                    *ctx.last_error = Some(format!("reload runtime failed: {e}"));
-                                }
+                            ) && let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt)
+                            {
+                                *ctx.last_error = Some(format!("reload runtime failed: {e}"));
                             }
                         }
                         Err(e) => {
@@ -6489,7 +6511,7 @@ fn build_session_rows(
 
         let should_update = entry
             .last_ended_at_ms
-            .map_or(true, |prev| r.ended_at_ms >= prev);
+            .is_none_or(|prev| r.ended_at_ms >= prev);
         if should_update {
             entry.last_status = Some(r.status_code);
             entry.last_duration_ms = Some(r.duration_ms);
@@ -6652,8 +6674,38 @@ fn path_mtime_ms(path: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn sort_session_summaries_by_mtime_desc(list: &mut Vec<SessionSummary>) {
+fn sort_session_summaries_by_mtime_desc(list: &mut [SessionSummary]) {
     list.sort_by_key(|s| std::cmp::Reverse(path_mtime_ms(s.path.as_path())));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WtItemSkipReason {
+    MissingCwd,
+    InvalidWorkdir,
+    WorkdirNotFound,
+}
+
+fn workdir_status_from_cwd(
+    cwd: Option<&str>,
+    infer_git_root: bool,
+) -> Result<String, WtItemSkipReason> {
+    let Some(cwd) = cwd else {
+        return Err(WtItemSkipReason::MissingCwd);
+    };
+    let cwd = cwd.trim();
+    if cwd.is_empty() || cwd == "-" {
+        return Err(WtItemSkipReason::MissingCwd);
+    }
+
+    let workdir = history_workdir_from_cwd(cwd, infer_git_root);
+    let w = workdir.trim();
+    if w.is_empty() || w == "-" {
+        return Err(WtItemSkipReason::InvalidWorkdir);
+    }
+    if !std::path::Path::new(w).exists() {
+        return Err(WtItemSkipReason::WorkdirNotFound);
+    }
+    Ok(workdir)
 }
 
 fn build_wt_items_from_session_summaries<'a, I>(
@@ -6667,21 +6719,9 @@ where
     let mut out = Vec::new();
     let t = resume_cmd_template.trim();
     for s in sessions.into_iter() {
-        let Some(cwd) = s.cwd.as_deref() else {
+        let Ok(workdir) = workdir_status_from_cwd(s.cwd.as_deref(), infer_git_root) else {
             continue;
         };
-        let cwd = cwd.trim();
-        if cwd.is_empty() || cwd == "-" {
-            continue;
-        }
-
-        let workdir = history_workdir_from_cwd(cwd, infer_git_root);
-        if workdir.trim().is_empty() || workdir == "-" {
-            continue;
-        }
-        if !std::path::Path::new(workdir.as_str()).exists() {
-            continue;
-        }
 
         let sid = s.id.as_str();
         let cmd = if t.is_empty() {
@@ -6784,11 +6824,8 @@ fn format_age(now_ms: u64, ts_ms: Option<u64>) -> String {
 }
 
 fn basename(path: &str) -> &str {
-    let trimmed = path.trim_end_matches(|c| c == '/' || c == '\\');
-    trimmed
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(trimmed)
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
 }
 
 fn shorten(s: &str, max_chars: usize) -> String {
