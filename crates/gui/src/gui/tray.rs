@@ -10,9 +10,12 @@ pub enum TrayAction {
     Show,
     Hide,
     Toggle,
+    OpenSetup,
     StartProxy,
     StopProxy,
     ReloadConfig,
+    SwitchOn,
+    SwitchOff,
     OpenConfig,
     OpenLogs,
     Quit,
@@ -23,9 +26,12 @@ pub struct TrayController {
     id_show: MenuId,
     id_hide: MenuId,
     id_toggle: MenuId,
+    id_open_setup: MenuId,
     id_start: MenuId,
     id_stop: MenuId,
     id_reload: MenuId,
+    id_switch_on: MenuId,
+    id_switch_off: MenuId,
     id_open_config: MenuId,
     id_open_logs: MenuId,
     id_quit: MenuId,
@@ -38,9 +44,12 @@ impl TrayController {
         let id_show = MenuId::new("codex-helper-gui.tray.show");
         let id_hide = MenuId::new("codex-helper-gui.tray.hide");
         let id_toggle = MenuId::new("codex-helper-gui.tray.toggle");
+        let id_open_setup = MenuId::new("codex-helper-gui.tray.open_setup");
         let id_start = MenuId::new("codex-helper-gui.tray.start_proxy");
         let id_stop = MenuId::new("codex-helper-gui.tray.stop_proxy");
         let id_reload = MenuId::new("codex-helper-gui.tray.reload_config");
+        let id_switch_on = MenuId::new("codex-helper-gui.tray.switch_on");
+        let id_switch_off = MenuId::new("codex-helper-gui.tray.switch_off");
         let id_open_config = MenuId::new("codex-helper-gui.tray.open_config");
         let id_open_logs = MenuId::new("codex-helper-gui.tray.open_logs");
         let id_quit = MenuId::new("codex-helper-gui.tray.quit");
@@ -59,6 +68,12 @@ impl TrayController {
             true,
             None,
         );
+        let open_setup = MenuItem::with_id(
+            id_open_setup.clone(),
+            pick(lang, "打开快速设置", "Open setup"),
+            true,
+            None,
+        );
         let start = MenuItem::with_id(
             id_start.clone(),
             pick(lang, "启动代理", "Start proxy"),
@@ -74,6 +89,26 @@ impl TrayController {
         let reload = MenuItem::with_id(
             id_reload.clone(),
             pick(lang, "重载配置", "Reload config"),
+            true,
+            None,
+        );
+        let switch_on = MenuItem::with_id(
+            id_switch_on.clone(),
+            pick(
+                lang,
+                "启用客户端代理 (switch on)",
+                "Enable client proxy (switch on)",
+            ),
+            true,
+            None,
+        );
+        let switch_off = MenuItem::with_id(
+            id_switch_off.clone(),
+            pick(
+                lang,
+                "恢复客户端配置 (switch off)",
+                "Restore client config (switch off)",
+            ),
             true,
             None,
         );
@@ -96,9 +131,14 @@ impl TrayController {
             &hide,
             &toggle,
             &PredefinedMenuItem::separator(),
+            &open_setup,
+            &PredefinedMenuItem::separator(),
             &start,
             &stop,
             &reload,
+            &PredefinedMenuItem::separator(),
+            &switch_on,
+            &switch_off,
             &PredefinedMenuItem::separator(),
             &open_config,
             &open_logs,
@@ -117,9 +157,12 @@ impl TrayController {
             id_show,
             id_hide,
             id_toggle,
+            id_open_setup,
             id_start,
             id_stop,
             id_reload,
+            id_switch_on,
+            id_switch_off,
             id_open_config,
             id_open_logs,
             id_quit,
@@ -154,12 +197,18 @@ impl TrayController {
             Some(TrayAction::Hide)
         } else if id == &self.id_toggle {
             Some(TrayAction::Toggle)
+        } else if id == &self.id_open_setup {
+            Some(TrayAction::OpenSetup)
         } else if id == &self.id_start {
             Some(TrayAction::StartProxy)
         } else if id == &self.id_stop {
             Some(TrayAction::StopProxy)
         } else if id == &self.id_reload {
             Some(TrayAction::ReloadConfig)
+        } else if id == &self.id_switch_on {
+            Some(TrayAction::SwitchOn)
+        } else if id == &self.id_switch_off {
+            Some(TrayAction::SwitchOff)
         } else if id == &self.id_open_config {
             Some(TrayAction::OpenConfig)
         } else if id == &self.id_open_logs {

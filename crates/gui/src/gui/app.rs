@@ -275,6 +275,12 @@ impl eframe::App for GuiApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
                     }
+                    TrayAction::OpenSetup => {
+                        self.page = Page::Setup;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                     TrayAction::StartProxy => {
                         if matches!(
                             self.proxy.kind(),
@@ -301,6 +307,55 @@ impl eframe::App for GuiApp {
                         } else {
                             self.last_info =
                                 Some(pick(lang, "已重载配置", "Config reloaded").to_string());
+                        }
+                    }
+                    TrayAction::SwitchOn => {
+                        let port = self
+                            .proxy
+                            .snapshot()
+                            .and_then(|s| s.port)
+                            .unwrap_or(self.proxy.desired_port());
+                        let svc = self.gui_cfg.service_kind();
+                        let result = match svc {
+                            crate::config::ServiceKind::Claude => {
+                                crate::codex_integration::claude_switch_on(port)
+                            }
+                            _ => crate::codex_integration::switch_on(port),
+                        };
+                        match result {
+                            Ok(()) => {
+                                self.last_info = Some(
+                                    pick(
+                                        lang,
+                                        "已启用客户端代理（switch on）",
+                                        "Client proxy enabled (switch on)",
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                            Err(e) => self.last_error = Some(format!("switch on failed: {e}")),
+                        }
+                    }
+                    TrayAction::SwitchOff => {
+                        let svc = self.gui_cfg.service_kind();
+                        let result = match svc {
+                            crate::config::ServiceKind::Claude => {
+                                crate::codex_integration::claude_switch_off()
+                            }
+                            _ => crate::codex_integration::switch_off(),
+                        };
+                        match result {
+                            Ok(()) => {
+                                self.last_info = Some(
+                                    pick(
+                                        lang,
+                                        "已恢复客户端配置（switch off）",
+                                        "Client config restored (switch off)",
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                            Err(e) => self.last_error = Some(format!("switch off failed: {e}")),
                         }
                     }
                     TrayAction::OpenConfig => {
