@@ -310,12 +310,49 @@ impl eframe::App for GuiApp {
                         }
                     }
                     TrayAction::SwitchOn => {
+                        let svc = self.gui_cfg.service_kind();
+                        match svc {
+                            crate::config::ServiceKind::Claude => {
+                                if let Ok(st) = crate::codex_integration::claude_switch_status()
+                                    && st.enabled
+                                    && !st.has_backup
+                                {
+                                    self.page = Page::Setup;
+                                    self.last_error = Some(pick(
+                                        lang,
+                                        "检测到 Claude 已指向本地代理但未找到备份文件；为避免覆盖原始配置，已打开“快速设置”。",
+                                        "Claude is already pointing to local proxy but no backup was found; opened Setup to avoid overwriting the original config.",
+                                    ).to_string());
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                if let Ok(st) = crate::codex_integration::codex_switch_status()
+                                    && st.enabled
+                                    && !st.has_backup
+                                {
+                                    self.page = Page::Setup;
+                                    self.last_error = Some(pick(
+                                        lang,
+                                        "检测到 Codex 已指向本地代理但未找到备份文件；为避免覆盖原始配置，已打开“快速设置”。",
+                                        "Codex is already pointing to local proxy but no backup was found; opened Setup to avoid overwriting the original config.",
+                                    ).to_string());
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                    continue;
+                                }
+                            }
+                        }
+
                         let port = self
                             .proxy
                             .snapshot()
                             .and_then(|s| s.port)
                             .unwrap_or(self.proxy.desired_port());
-                        let svc = self.gui_cfg.service_kind();
                         let result = match svc {
                             crate::config::ServiceKind::Claude => {
                                 crate::codex_integration::claude_switch_on(port)
@@ -338,6 +375,33 @@ impl eframe::App for GuiApp {
                     }
                     TrayAction::SwitchOff => {
                         let svc = self.gui_cfg.service_kind();
+                        match svc {
+                            crate::config::ServiceKind::Claude => {
+                                if let Ok(st) = crate::codex_integration::claude_switch_status()
+                                    && !st.has_backup
+                                {
+                                    self.last_info = Some(pick(
+                                        lang,
+                                        "未找到 Claude settings 备份文件；switch off 不会修改任何内容。",
+                                        "No Claude settings backup found; switch off will not change anything.",
+                                    ).to_string());
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                if let Ok(st) = crate::codex_integration::codex_switch_status()
+                                    && !st.has_backup
+                                {
+                                    self.last_info = Some(pick(
+                                        lang,
+                                        "未找到 Codex 配置备份文件；switch off 不会修改任何内容。",
+                                        "No Codex config backup found; switch off will not change anything.",
+                                    ).to_string());
+                                    continue;
+                                }
+                            }
+                        }
+
                         let result = match svc {
                             crate::config::ServiceKind::Claude => {
                                 crate::codex_integration::claude_switch_off()

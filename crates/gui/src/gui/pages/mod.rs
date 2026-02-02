@@ -8,6 +8,7 @@ use super::i18n::{Language, pick};
 use super::proxy_control::{PortInUseAction, ProxyModeKind};
 use super::util::{open_in_file_manager, spawn_windows_terminal_wt_new_tab};
 use crate::dashboard_core::ConfigOption;
+use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::{SessionDayDir, SessionIndexItem, SessionSummary, SessionTranscriptMessage};
 use crate::state::{ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, SessionStats};
 use crate::usage::UsageMetrics;
@@ -16,6 +17,7 @@ use crate::usage::UsageMetrics;
 pub enum Page {
     Setup,
     Overview,
+    Doctor,
     Config,
     Sessions,
     Requests,
@@ -28,10 +30,18 @@ pub enum Page {
 pub struct ViewState {
     pub requested_page: Option<Page>,
     pub setup: SetupViewState,
+    pub doctor: DoctorViewState,
     pub sessions: SessionsViewState,
     pub requests: RequestsViewState,
     pub config: ConfigViewState,
     pub history: HistoryViewState,
+}
+
+#[derive(Debug, Default)]
+pub struct DoctorViewState {
+    pub report: Option<crate::doctor::DoctorReport>,
+    pub last_error: Option<String>,
+    pub loaded_at_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -261,6 +271,7 @@ pub fn nav(ui: &mut egui::Ui, lang: Language, current: &mut Page) {
         let items = [
             (Page::Setup, pick(lang, "快速设置", "Setup")),
             (Page::Overview, pick(lang, "总览", "Overview")),
+            (Page::Doctor, pick(lang, "诊断", "Doctor")),
             (Page::Config, pick(lang, "配置", "Config")),
             (Page::Sessions, pick(lang, "会话", "Sessions")),
             (Page::Requests, pick(lang, "请求", "Requests")),
@@ -281,6 +292,7 @@ pub fn render(ui: &mut egui::Ui, page: Page, ctx: &mut PageCtx<'_>) {
     match page {
         Page::Setup => render_setup(ui, ctx),
         Page::Overview => render_overview(ui, ctx),
+        Page::Doctor => render_doctor(ui, ctx),
         Page::Config => render_config(ui, ctx),
         Page::Sessions => render_sessions(ui, ctx),
         Page::Requests => render_requests(ui, ctx),
@@ -500,6 +512,16 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 egui::Color32::from_rgb(60, 160, 90),
                                 pick(ctx.lang, "已启用（本地代理）", "Enabled (local proxy)"),
                             );
+                            if !st.has_backup {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(200, 120, 40),
+                                    pick(
+                                        ctx.lang,
+                                        "提示：当前已指向本地代理但未找到备份文件；请勿重复 switch on，否则备份可能覆盖原始配置。",
+                                        "Tip: enabled but no backup found; avoid repeated switch on (backup may not represent the original config).",
+                                    ),
+                                );
+                            }
                         } else {
                             ui.colored_label(
                                 egui::Color32::from_rgb(200, 120, 40),
@@ -580,6 +602,16 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 egui::Color32::from_rgb(60, 160, 90),
                                 pick(ctx.lang, "已启用（本地代理）", "Enabled (local proxy)"),
                             );
+                            if !st.has_backup {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(200, 120, 40),
+                                    pick(
+                                        ctx.lang,
+                                        "提示：当前已指向本地代理但未找到备份文件；请勿重复 switch on，否则备份可能覆盖原始配置。",
+                                        "Tip: enabled but no backup found; avoid repeated switch on (backup may not represent the original config).",
+                                    ),
+                                );
+                            }
                         } else {
                             ui.colored_label(
                                 egui::Color32::from_rgb(200, 120, 40),
@@ -657,6 +689,132 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .clicked()
         {
             ctx.view.requested_page = Some(Page::Overview);
+        }
+    });
+}
+
+fn render_doctor(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
+    ui.heading(pick(ctx.lang, "诊断", "Doctor"));
+    ui.label(pick(
+        ctx.lang,
+        "用于排查：配置是否可读、env 是否缺失、Codex CLI 配置/认证文件是否存在、自动导入链路是否可用、日志与用量提供商配置是否正常。",
+        "Helps diagnose: config readability, missing env vars, Codex CLI config/auth presence, auto-import viability, logs and usage providers.",
+    ));
+    ui.separator();
+
+    let lang = match ctx.lang {
+        Language::En => DoctorLang::En,
+        _ => DoctorLang::Zh,
+    };
+
+    ui.horizontal(|ui| {
+        if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
+            ctx.view.doctor.report = None;
+            ctx.view.doctor.last_error = None;
+            ctx.view.doctor.loaded_at_ms = None;
+        }
+
+        if ui
+            .button(pick(ctx.lang, "复制 JSON", "Copy JSON"))
+            .clicked()
+        {
+            if let Some(r) = ctx.view.doctor.report.as_ref() {
+                let text = serde_json::to_string_pretty(r)
+                    .unwrap_or_else(|_| "{\"checks\":[]}".to_string());
+                ui.ctx().copy_text(text);
+                *ctx.last_info = Some(pick(ctx.lang, "已复制", "Copied").to_string());
+            } else {
+                *ctx.last_error =
+                    Some(pick(ctx.lang, "尚未加载报告", "Report not loaded").to_string());
+            }
+        }
+
+        if ui
+            .button(pick(ctx.lang, "打开配置文件", "Open config file"))
+            .clicked()
+        {
+            let path = crate::config::config_file_path();
+            if let Err(e) = open_in_file_manager(&path, true) {
+                *ctx.last_error = Some(format!("open config failed: {e}"));
+            }
+        }
+
+        if ui
+            .button(pick(ctx.lang, "打开日志目录", "Open logs folder"))
+            .clicked()
+        {
+            let dir = crate::config::proxy_home_dir().join("logs");
+            if let Err(e) = open_in_file_manager(&dir, false) {
+                *ctx.last_error = Some(format!("open logs failed: {e}"));
+            }
+        }
+    });
+
+    if ctx.view.doctor.report.is_none() && ctx.view.doctor.last_error.is_none() {
+        let report = ctx.rt.block_on(crate::doctor::run_doctor(lang));
+        ctx.view.doctor.loaded_at_ms = Some(now_ms());
+        ctx.view.doctor.report = Some(report);
+    }
+
+    let Some(report) = ctx.view.doctor.report.as_ref() else {
+        if let Some(err) = ctx.view.doctor.last_error.as_deref() {
+            ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
+        } else {
+            ui.label(pick(ctx.lang, "暂无报告", "No report"));
+        }
+        return;
+    };
+
+    fn status_color(st: DoctorStatus) -> egui::Color32 {
+        match st {
+            DoctorStatus::Ok => egui::Color32::from_rgb(60, 160, 90),
+            DoctorStatus::Info => egui::Color32::from_rgb(80, 160, 200),
+            DoctorStatus::Warn => egui::Color32::from_rgb(200, 120, 40),
+            DoctorStatus::Fail => egui::Color32::from_rgb(200, 60, 60),
+        }
+    }
+
+    let mut ok = 0usize;
+    let mut info = 0usize;
+    let mut warn = 0usize;
+    let mut fail = 0usize;
+    for c in &report.checks {
+        match c.status {
+            DoctorStatus::Ok => ok += 1,
+            DoctorStatus::Info => info += 1,
+            DoctorStatus::Warn => warn += 1,
+            DoctorStatus::Fail => fail += 1,
+        }
+    }
+
+    ui.label(format!(
+        "{}: OK {ok} | INFO {info} | WARN {warn} | FAIL {fail}",
+        pick(ctx.lang, "汇总", "Summary")
+    ));
+    if let Some(ts) = ctx.view.doctor.loaded_at_ms {
+        ui.label(format!(
+            "{}: {}",
+            pick(ctx.lang, "加载时间(ms)", "Loaded at (ms)"),
+            ts
+        ));
+    }
+
+    ui.separator();
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for c in &report.checks {
+            ui.horizontal(|ui| {
+                let label = match c.status {
+                    DoctorStatus::Ok => "OK",
+                    DoctorStatus::Info => "INFO",
+                    DoctorStatus::Warn => "WARN",
+                    DoctorStatus::Fail => "FAIL",
+                };
+                ui.colored_label(status_color(c.status), label);
+                ui.label(c.id);
+            });
+            ui.label(&c.message);
+            ui.separator();
         }
     });
 }
