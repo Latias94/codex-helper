@@ -44,6 +44,7 @@ pub struct ViewState {
 #[derive(Debug, Default)]
 pub struct OverviewViewState {
     pub new_routing_profile_name: String,
+    pub active_config_selected: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -128,11 +129,14 @@ impl Default for ImportCodexModalState {
 pub struct HistoryViewState {
     pub scope: HistoryScope,
     pub query: String,
+    pub sessions_all: Vec<SessionSummary>,
     pub sessions: Vec<SessionSummary>,
     pub last_error: Option<String>,
     pub loaded_at_ms: Option<u64>,
     pub selected_idx: usize,
     pub selected_id: Option<String>,
+    applied_scope: HistoryScope,
+    applied_query: String,
     pub recent_since_hours: u32,
     pub recent_limit: usize,
     pub infer_git_root: bool,
@@ -147,6 +151,9 @@ pub struct HistoryViewState {
     pub all_day_limit: usize,
     pub all_day_sessions: Vec<SessionIndexItem>,
     loaded_day_for: Option<String>,
+    pub search_transcript_tail: bool,
+    pub search_transcript_tail_n: usize,
+    search_transcript_applied: Option<(HistoryScope, String, usize)>,
     pub hide_tool_calls: bool,
     pub transcript_view: TranscriptViewMode,
     pub transcript_selected_msg_idx: usize,
@@ -178,11 +185,14 @@ impl Default for HistoryViewState {
         Self {
             scope: HistoryScope::CurrentProject,
             query: String::new(),
+            sessions_all: Vec::new(),
             sessions: Vec::new(),
             last_error: None,
             loaded_at_ms: None,
             selected_idx: 0,
             selected_id: None,
+            applied_scope: HistoryScope::CurrentProject,
+            applied_query: String::new(),
             recent_since_hours: 12,
             recent_limit: 50,
             infer_git_root: true,
@@ -197,6 +207,9 @@ impl Default for HistoryViewState {
             all_day_limit: 500,
             all_day_sessions: Vec::new(),
             loaded_day_for: None,
+            search_transcript_tail: false,
+            search_transcript_tail_n: 80,
+            search_transcript_applied: None,
             hide_tool_calls: true,
             transcript_view: TranscriptViewMode::Messages,
             transcript_selected_msg_idx: 0,
@@ -946,6 +959,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     let mut action_scan_local_proxies = false;
     let mut action_attach_discovered: Option<u16> = None;
+    let mut action_save_active_config: Option<(String, String)> = None;
 
     // Sync defaults from GUI config (so Settings changes take effect without restart).
     // Avoid overriding the UI state while running/attached.
@@ -1337,13 +1351,107 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     "claude" => r.cfg.claude.active_config().map(|c| c.name.clone()),
                     _ => r.cfg.codex.active_config().map(|c| c.name.clone()),
                 };
+                let active_display = active_name
+                    .clone()
+                    .or(active_fallback.clone())
+                    .unwrap_or_else(|| "-".to_string());
                 ui.label(format!(
                     "{}: {}",
                     pick(ctx.lang, "当前配置(active)", "Active config"),
-                    active_name
-                        .or(active_fallback)
-                        .unwrap_or_else(|| "-".to_string())
+                    active_display
                 ));
+
+                // Quick "provider" switch: persist `active` to disk + reload runtime.
+                let mgr = match r.service_name {
+                    "claude" => &r.cfg.claude,
+                    _ => &r.cfg.codex,
+                };
+                let mut names = mgr.configs.keys().cloned().collect::<Vec<_>>();
+                names.sort_by(|a, b| {
+                    let la = mgr.configs.get(a).map(|c| c.level).unwrap_or(1);
+                    let lb = mgr.configs.get(b).map(|c| c.level).unwrap_or(1);
+                    la.cmp(&lb).then_with(|| a.cmp(b))
+                });
+
+                if !names.is_empty() {
+                    let current_active = active_name
+                        .clone()
+                        .or(active_fallback.clone())
+                        .or_else(|| names.first().cloned());
+                    if ctx
+                        .view
+                        .overview
+                        .active_config_selected
+                        .as_ref()
+                        .is_none_or(|n| !names.iter().any(|x| x == n))
+                    {
+                        ctx.view.overview.active_config_selected = current_active.clone();
+                    }
+
+                    let mut apply_active = false;
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(pick(ctx.lang, "默认配置(active)", "Default (active)"));
+                        egui::ComboBox::from_id_salt("overview_active_config_select")
+                            .selected_text(
+                                ctx.view
+                                    .overview
+                                    .active_config_selected
+                                    .as_deref()
+                                    .unwrap_or_else(|| pick(ctx.lang, "<无>", "<none>")),
+                            )
+                            .show_ui(ui, |ui| {
+                                for name in names.iter() {
+                                    let label = mgr
+                                        .configs
+                                        .get(name)
+                                        .map(|c| {
+                                            let alias = c.alias.as_deref().unwrap_or("").trim();
+                                            if alias.is_empty() {
+                                                format!("L{} {name}", c.level.clamp(1, 10))
+                                            } else {
+                                                format!(
+                                                    "L{} {name} ({alias})",
+                                                    c.level.clamp(1, 10)
+                                                )
+                                            }
+                                        })
+                                        .unwrap_or_else(|| name.clone());
+                                    ui.selectable_value(
+                                        &mut ctx.view.overview.active_config_selected,
+                                        Some(name.clone()),
+                                        label,
+                                    );
+                                }
+                            });
+
+                        if ui
+                            .button(pick(ctx.lang, "保存并应用", "Save & apply"))
+                            .clicked()
+                        {
+                            apply_active = true;
+                        }
+                    });
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 120, 120),
+                        pick(
+                            ctx.lang,
+                            "说明：这会修改本机 config.toml/config.json 的 active，并立即重载代理运行态。",
+                            "Note: This writes active to local config and reloads proxy runtime.",
+                        ),
+                    );
+
+                    if apply_active {
+                        let Some(name) = ctx.view.overview.active_config_selected.clone() else {
+                            *ctx.last_error = Some(
+                                pick(ctx.lang, "请选择一个配置", "Select a config").to_string(),
+                            );
+                            return;
+                        };
+                        action_save_active_config =
+                            Some((r.service_name.to_string(), name.to_string()));
+                    }
+                }
 
                 let warnings =
                     crate::config::model_routing_warnings(r.cfg.as_ref(), r.service_name);
@@ -1415,6 +1523,45 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         .as_deref()
                         .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
                 ));
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 120, 120),
+                    pick(
+                        ctx.lang,
+                        "提示：已附着模式下不会修改本机配置；如需切换默认(active)，请在启动该代理的机器上修改并重载，或使用上方的 Pinned/路由预设临时切换。",
+                        "Tip: attached mode won't change local config; change active on the machine that started this proxy, or use pinned/routing presets for temporary switching.",
+                    ),
+                );
+            }
+        }
+    }
+
+    if let Some((svc, name)) = action_save_active_config.take() {
+        let save_res = ctx.rt.block_on(async {
+            let mut cfg = crate::config::load_config().await?;
+            let mgr = match svc.as_str() {
+                "claude" => &mut cfg.claude,
+                _ => &mut cfg.codex,
+            };
+            mgr.active = Some(name.clone());
+            crate::config::save_config(&cfg).await?;
+            Ok::<(), anyhow::Error>(())
+        });
+        match save_res {
+            Ok(()) => {
+                let new_path = crate::config::config_file_path();
+                if let Ok(t) = std::fs::read_to_string(&new_path) {
+                    *ctx.proxy_config_text = t;
+                }
+                if let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt) {
+                    *ctx.last_error = Some(format!("reload runtime failed: {e}"));
+                } else {
+                    *ctx.last_info = Some(
+                        pick(ctx.lang, "已保存并应用 active", "Active saved & applied").to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!("save active failed: {e}"));
             }
         }
     }
@@ -2993,52 +3140,85 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 )),
         );
 
+        let mut action_apply_tail_search = false;
+        ui.checkbox(
+            &mut ctx.view.history.search_transcript_tail,
+            pick(ctx.lang, "搜对话(尾部)", "Transcript (tail)"),
+        )
+        .on_hover_text(pick(
+            ctx.lang,
+            "可选：在元信息不命中时，再扫描每个会话文件尾部的 N 条消息（更慢，但更像 cc-switch 的全文搜索）。",
+            "Optional: if metadata doesn't match, scan the last N messages (slower, closer to cc-switch full-text).",
+        ));
+        if ctx.view.history.search_transcript_tail {
+            ui.label(pick(ctx.lang, "N", "N"));
+            ui.add(
+                egui::DragValue::new(&mut ctx.view.history.search_transcript_tail_n)
+                    .range(10..=500)
+                    .speed(1),
+            );
+            if ui
+                .button(pick(ctx.lang, "应用", "Apply"))
+                .clicked()
+            {
+                action_apply_tail_search = true;
+            }
+        }
+
         if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
-            let query = ctx.view.history.query.trim().to_string();
             let scope = ctx.view.history.scope;
             let recent_since_hours = ctx.view.history.recent_since_hours;
             let recent_limit = ctx.view.history.recent_limit;
             let fut = async move {
                 match scope {
                     HistoryScope::CurrentProject => {
-                        if query.is_empty() {
-                            crate::sessions::find_codex_sessions_for_current_dir(200).await
-                        } else {
-                            crate::sessions::search_codex_sessions_for_current_dir(&query, 200)
-                                .await
-                        }
+                        crate::sessions::find_codex_sessions_for_current_dir(200).await
                     }
                     HistoryScope::GlobalRecent => {
                         let since = std::time::Duration::from_secs(
                             (recent_since_hours as u64).saturating_mul(3600),
                         );
-                        let mut list = crate::sessions::find_recent_codex_session_summaries(
-                            since,
-                            recent_limit,
-                        )
-                        .await?;
-
-                        let q = query.trim().to_lowercase();
-                        if !q.is_empty() {
-                            list.retain(|s| {
-                                s.cwd
-                                    .as_deref()
-                                    .is_some_and(|cwd| cwd.to_lowercase().contains(q.as_str()))
-                                    || s.first_user_message
-                                        .as_deref()
-                                        .is_some_and(|msg| msg.to_lowercase().contains(q.as_str()))
-                            });
-                        }
-                        Ok(list)
+                        crate::sessions::find_recent_codex_session_summaries(since, recent_limit)
+                            .await
                     }
                     HistoryScope::AllByDate => Ok(Vec::new()),
                 }
             };
             match ctx.rt.block_on(fut) {
                 Ok(list) => {
-                    ctx.view.history.sessions = list;
+                    ctx.view.history.sessions_all = list;
+                    ctx.view.history.search_transcript_applied = None;
                     ctx.view.history.loaded_at_ms = Some(now_ms());
                     ctx.view.history.last_error = None;
+
+                    // Re-apply current metadata filter without hitting disk again.
+                    let q = ctx.view.history.query.trim().to_lowercase();
+                    let scope = ctx.view.history.scope;
+                    ctx.view.history.sessions = if q.is_empty() {
+                        ctx.view.history.sessions_all.clone()
+                    } else {
+                        ctx.view
+                            .history
+                            .sessions_all
+                            .iter()
+                            .cloned()
+                            .filter(|s| match scope {
+                                HistoryScope::GlobalRecent => s
+                                    .cwd
+                                    .as_deref()
+                                    .is_some_and(|cwd| cwd.to_lowercase().contains(q.as_str()))
+                                    || s.first_user_message.as_deref().is_some_and(|msg| {
+                                        msg.to_lowercase().contains(q.as_str())
+                                    }),
+                                _ => s.first_user_message.as_deref().is_some_and(|msg| {
+                                    msg.to_lowercase().contains(q.as_str())
+                                }),
+                            })
+                            .collect()
+                    };
+                    ctx.view.history.applied_scope = scope;
+                    ctx.view.history.applied_query = ctx.view.history.query.clone();
+
                     if ctx.view.history.sessions.is_empty() {
                         ctx.view.history.selected_idx = 0;
                         ctx.view.history.selected_id = None;
@@ -3102,7 +3282,138 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             &mut ctx.view.history.auto_load_transcript,
             pick(ctx.lang, "自动加载对话", "Auto load transcript"),
         );
+
+        if action_apply_tail_search {
+            let q = ctx.view.history.query.trim().to_string();
+            if q.is_empty() {
+                *ctx.last_error = Some(pick(
+                    ctx.lang,
+                    "请输入关键词后再应用“搜对话(尾部)”",
+                    "Enter a query before applying transcript search",
+                ).to_string());
+            } else {
+                let scope = ctx.view.history.scope;
+                let tail = ctx.view.history.search_transcript_tail_n;
+                let all = ctx.view.history.sessions_all.clone();
+                let needle = q.clone();
+                let mut out: Vec<SessionSummary> = Vec::new();
+                let needle_lc = needle.to_lowercase();
+                let meta_match = |s: &SessionSummary| -> bool {
+                    match scope {
+                        HistoryScope::GlobalRecent => s
+                            .cwd
+                            .as_deref()
+                            .is_some_and(|cwd| cwd.to_lowercase().contains(needle_lc.as_str()))
+                            || s.first_user_message.as_deref().is_some_and(|msg| {
+                                msg.to_lowercase().contains(needle_lc.as_str())
+                            }),
+                        _ => s.first_user_message.as_deref().is_some_and(|msg| {
+                            msg.to_lowercase().contains(needle_lc.as_str())
+                        }),
+                    }
+                };
+
+                let fut = async move {
+                    for s in all.into_iter() {
+                        if meta_match(&s) {
+                            out.push(s);
+                            continue;
+                        }
+                        if crate::sessions::codex_session_transcript_tail_contains_query(
+                            &s.path,
+                            &needle,
+                            tail,
+                        )
+                        .await?
+                        {
+                            out.push(s);
+                        }
+                    }
+                    Ok::<Vec<SessionSummary>, anyhow::Error>(out)
+                };
+                match ctx.rt.block_on(fut) {
+                    Ok(list) => {
+                        ctx.view.history.sessions = list;
+                        ctx.view.history.search_transcript_applied = Some((scope, q, tail));
+                        ctx.view.history.applied_scope = scope;
+                        ctx.view.history.applied_query = ctx.view.history.query.clone();
+                        ctx.view.history.selected_idx = 0;
+                        ctx.view.history.selected_id =
+                            ctx.view.history.sessions.first().map(|s| s.id.clone());
+                        ctx.view.history.loaded_for = None;
+                        cancel_transcript_load(&mut ctx.view.history);
+                        ctx.view.history.transcript_raw_messages.clear();
+                        ctx.view.history.transcript_messages.clear();
+                        ctx.view.history.transcript_error = None;
+                        ctx.view.history.transcript_plain_key = None;
+                        ctx.view.history.transcript_plain_text.clear();
+                        *ctx.last_info =
+                            Some(pick(ctx.lang, "已应用全文过滤", "Applied").to_string());
+                    }
+                    Err(e) => {
+                        ctx.view.history.last_error = Some(e.to_string());
+                    }
+                }
+            }
+        }
     });
+
+    // Apply lightweight (metadata-only) filtering immediately when query/scope changes.
+    if (ctx.view.history.applied_scope != ctx.view.history.scope
+        || ctx.view.history.applied_query != ctx.view.history.query)
+        && !matches!(ctx.view.history.scope, HistoryScope::AllByDate)
+    {
+        ctx.view.history.applied_scope = ctx.view.history.scope;
+        ctx.view.history.applied_query = ctx.view.history.query.clone();
+        ctx.view.history.search_transcript_applied = None;
+
+        let q = ctx.view.history.query.trim().to_lowercase();
+        if q.is_empty() {
+            ctx.view.history.sessions = ctx.view.history.sessions_all.clone();
+        } else {
+            let scope = ctx.view.history.scope;
+            ctx.view.history.sessions = ctx
+                .view
+                .history
+                .sessions_all
+                .iter()
+                .cloned()
+                .filter(|s| match scope {
+                    HistoryScope::GlobalRecent => {
+                        s.cwd
+                            .as_deref()
+                            .is_some_and(|cwd| cwd.to_lowercase().contains(q.as_str()))
+                            || s.first_user_message
+                                .as_deref()
+                                .is_some_and(|msg| msg.to_lowercase().contains(q.as_str()))
+                    }
+                    _ => s
+                        .first_user_message
+                        .as_deref()
+                        .is_some_and(|msg| msg.to_lowercase().contains(q.as_str())),
+                })
+                .collect();
+        }
+
+        // If selection falls out, reset and clear transcript.
+        let selected_ok = ctx
+            .view
+            .history
+            .selected_id
+            .as_deref()
+            .is_some_and(|id| ctx.view.history.sessions.iter().any(|s| s.id == id));
+        if !selected_ok {
+            ctx.view.history.selected_idx = 0;
+            ctx.view.history.selected_id = ctx.view.history.sessions.first().map(|s| s.id.clone());
+            ctx.view.history.loaded_for = None;
+            cancel_transcript_load(&mut ctx.view.history);
+            ctx.view.history.transcript_raw_messages.clear();
+            ctx.view.history.transcript_messages.clear();
+            ctx.view.history.transcript_error = None;
+            ctx.view.history.transcript_plain_key = None;
+            ctx.view.history.transcript_plain_text.clear();
+        }
+    }
 
     if let Some(err) = ctx.view.history.last_error.as_deref() {
         ui.add_space(4.0);
