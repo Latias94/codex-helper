@@ -147,6 +147,7 @@ pub struct HistoryViewState {
     pub batch_selected_ids: HashSet<String>,
     pub group_by_workdir: bool,
     pub collapsed_workdirs: HashSet<String>,
+    pub group_open_recent_n: usize,
     pub all_days_limit: usize,
     pub all_dates: Vec<SessionDayDir>,
     pub all_selected_date: Option<String>,
@@ -205,6 +206,7 @@ impl Default for HistoryViewState {
             batch_selected_ids: HashSet::new(),
             group_by_workdir: true,
             collapsed_workdirs: HashSet::new(),
+            group_open_recent_n: 5,
             all_days_limit: 120,
             all_dates: Vec::new(),
             all_selected_date: None,
@@ -3668,7 +3670,18 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 open_wt_items(ctx, items);
                             }
 
-                            let open_n = 5usize.min(n);
+                            let mut open_n = ctx.view.history.group_open_recent_n.max(1);
+                            ui.label("N");
+                            ui.add(egui::DragValue::new(&mut open_n).range(1..=50).speed(1));
+                            if open_n != ctx.view.history.group_open_recent_n {
+                                ctx.view.history.group_open_recent_n = open_n;
+                                ctx.gui_cfg.history.group_open_recent_n = open_n;
+                                if let Err(e) = ctx.gui_cfg.save() {
+                                    *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                                }
+                            }
+
+                            let open_n = open_n.min(n);
                             let label_n = match ctx.lang {
                                 Language::Zh => format!("打开最近{open_n}"),
                                 Language::En => format!("Open top {open_n}"),

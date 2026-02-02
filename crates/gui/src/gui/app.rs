@@ -178,6 +178,7 @@ impl GuiApp {
         view.history.resume_cmd = gui_cfg.history.resume_cmd.clone();
         view.history.shell = gui_cfg.history.shell.clone();
         view.history.keep_open = gui_cfg.history.keep_open;
+        view.history.group_open_recent_n = gui_cfg.history.group_open_recent_n;
         view.history.infer_git_root = gui_cfg
             .history
             .workdir_mode
