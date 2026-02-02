@@ -715,6 +715,28 @@ pub async fn read_codex_session_transcript(
     }
 }
 
+/// Best-effort, case-insensitive substring search within the last `tail` transcript messages.
+///
+/// This is intended for interactive UIs (history/session manager). It trades completeness for speed:
+/// - Only scans the last N extracted messages (not the full file).
+/// - Returns `false` for empty queries or `tail == 0`.
+pub async fn codex_session_transcript_tail_contains_query(
+    path: &Path,
+    query: &str,
+    tail: usize,
+) -> Result<bool> {
+    let needle = query.trim();
+    if needle.is_empty() || tail == 0 {
+        return Ok(false);
+    }
+
+    let needle = needle.to_lowercase();
+    let msgs = read_codex_session_transcript(path, Some(tail)).await?;
+    Ok(msgs
+        .iter()
+        .any(|m| m.text.to_lowercase().contains(needle.as_str())))
+}
+
 async fn read_codex_session_transcript_full(path: &Path) -> Result<Vec<SessionTranscriptMessage>> {
     let file = fs::File::open(path)
         .await
@@ -1556,6 +1578,19 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].text, "next");
         assert_eq!(tail[1].text, "ok");
+
+        assert!(
+            codex_session_transcript_tail_contains_query(&path, "HELLO", 3)
+                .await
+                .expect("search ok"),
+            "should match case-insensitively within tail"
+        );
+        assert!(
+            !codex_session_transcript_tail_contains_query(&path, "missing", 10)
+                .await
+                .expect("search ok"),
+            "should return false when not found"
+        );
     }
 
     #[tokio::test]
