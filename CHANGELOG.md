@@ -3,7 +3,7 @@ All notable changes to this project will be documented in this file.
 
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
-## [0.12.0] - Not released
+## [0.12.0] - 2026-02-02
 ### 新增 / Added
 - 新增 `codex-helper session recent`：按会话文件最后更新时间（mtime）筛选最近会话，并支持 `text/tsv/json` 输出；可选 `--open` 通过 Windows Terminal（`wt`）或 WezTerm 打开并执行恢复命令，便于快速 `codex resume`（支持 `--since/--limit/--raw-cwd/--format/--open/--terminal/--shell/--resume-cmd`）。
   Add `codex-helper session recent`: filter recent sessions by session file mtime with `text/tsv/json` output; optionally `--open` via Windows Terminal (`wt`) or WezTerm to run a resume command for fast `codex resume` workflows (supports `--since/--limit/--raw-cwd/--format/--open/--terminal/--shell/--resume-cmd`).
@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
   Add attach-friendly API v1 `GET /__codex_helper/api/v1/snapshot`: returns a dashboard snapshot (including usage rollup and window stats) to reduce multi-call polling.
 - GUI `History` 新增“全部(按日期)”视图：按日期分组浏览全部 Codex 本地会话，并支持对话预览与复制（默认隐藏工具调用）。
   GUI `History` adds an “All (by date)” view: browse all local Codex sessions grouped by day, with transcript preview and copy (tool calls hidden by default).
+- GUI 新增托盘快速操作：支持一键显示/隐藏窗口、启动/停止/重载代理，并可通过托盘菜单快速切换 Active / Pinned / Routing Preset（best-effort 立即应用）。
+  GUI adds a tray quick-actions menu: show/hide, start/stop/reload proxy, plus quick switching Active / Pinned / Routing Preset (best-effort apply now).
 
 ### 改进 / Improved
 - 启动监听失败时，提供更友好的提示（端口占用/权限不足等），并在 Windows/Linux/macOS 下尽力显示占用端口的进程 PID/名称，便于快速定位冲突进程。
@@ -21,10 +23,18 @@ All notable changes to this project will be documented in this file.
   `codex-helper session list` now prints the full first prompt by default and provides `--truncate` for an optional compact view.
 - GUI `History` 页面新增“全局最近”范围：按 mtime（默认近 12 小时）列出最近 Codex 会话，并支持一键复制 `root id` 列表与在 Windows Terminal（`wt`）中直接执行 `codex resume`。
   GUI `History` adds a “Global recent” scope: list recent Codex sessions by mtime (default last 12 hours), copy `root id` lists, and open `codex resume` directly in Windows Terminal (`wt`).
+- GUI `History` 会话恢复流程增强：按工作目录/项目分组、组内批量打开（默认每会话新窗口）、记住终端/shell/resume 命令/工作目录模式等偏好，并展示“可打开/总数”和跳过原因摘要。
+  GUI `History` resume workflow: group by workdir/project, batch open sessions (default new window per session), persist terminal/shell/resume/workdir preferences, and show openable/total counts with skip reasons.
+- GUI 启动更安全：默认不自动附着到已有代理（避免 TUI 已运行的代理被误操作）；端口与服务选择以配置为准。
+  Safer GUI startup: do not auto-attach to an existing proxy by default (avoids interfering with a proxy started from TUI); service/port follow the config.
 - GUI `History`/Transcript 性能优化：对话加载改为后台任务（避免 UI 卡死），并将消息列表改为虚拟滚动渲染，长对话也更流畅。
   GUI `History`/Transcript performance: load transcripts in background (non-blocking UI) and render the message list via virtual scrolling for smoother long sessions.
 - 内部重构：将代码拆分为 workspace 的 `codex-helper-core` / `codex-helper-tui` / `codex-helper-gui` 三个 crate，降低耦合并提升可维护性（对外 CLI/GUI 使用方式不变）。
   Internal refactor: split into a workspace with `codex-helper-core` / `codex-helper-tui` / `codex-helper-gui` crates to reduce coupling and improve maintainability (CLI/GUI usage unchanged).
+
+### 修复 / Fixed
+- 修复 “recent sessions” 边界条件：当 `since=0` 时应返回空结果，避免 mtime 精度导致的偶发误筛选。
+  Fix a recent-sessions edge case: `since=0` now returns an empty result to avoid rare mis-filtering due to mtime precision.
 
 ## [0.11.0] - 2026-01-09
 ### 修复 / Fixed
