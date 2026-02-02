@@ -948,162 +948,348 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .set_defaults(ctx.gui_cfg.proxy.default_port, ctx.gui_cfg.service_kind());
     }
 
-    ui.horizontal(|ui| {
-        ui.label(pick(ctx.lang, "服务", "Service"));
-        let mut svc = ctx.proxy.desired_service();
-        egui::ComboBox::from_id_salt("proxy_service")
-            .selected_text(match svc {
-                crate::config::ServiceKind::Codex => "codex",
-                crate::config::ServiceKind::Claude => "claude",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut svc, crate::config::ServiceKind::Codex, "codex");
-                ui.selectable_value(&mut svc, crate::config::ServiceKind::Claude, "claude");
-            });
-        if svc != ctx.proxy.desired_service() {
-            ctx.proxy.set_desired_service(svc);
-            ctx.gui_cfg.set_service_kind(svc);
-            if let Err(e) = ctx.gui_cfg.save() {
-                *ctx.last_error = Some(format!("save gui config failed: {e}"));
+    ui.group(|ui| {
+        ui.heading(pick(ctx.lang, "连接与路由", "Connection & routing"));
+
+        let kind = ctx.proxy.kind();
+        let status_text = match kind {
+            ProxyModeKind::Running => pick(ctx.lang, "运行中", "Running"),
+            ProxyModeKind::Attached => pick(ctx.lang, "已附着", "Attached"),
+            ProxyModeKind::Starting => pick(ctx.lang, "启动中", "Starting"),
+            ProxyModeKind::Stopped => pick(ctx.lang, "未运行", "Stopped"),
+        };
+        ui.label(format!(
+            "{}: {}",
+            pick(ctx.lang, "状态", "Status"),
+            status_text
+        ));
+
+        if let Some(s) = ctx.proxy.snapshot() {
+            if let Some(base) = s.base_url.as_deref() {
+                ui.label(format!("{}: {base}", pick(ctx.lang, "地址", "Base URL")));
             }
+            if let Some(svc) = s.service_name.as_deref() {
+                ui.label(format!("{}: {svc}", pick(ctx.lang, "服务", "Service")));
+            }
+            if let Some(port) = s.port {
+                ui.label(format!("{}: {port}", pick(ctx.lang, "端口", "Port")));
+            }
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "API", "API"),
+                if s.supports_v1 { "v1" } else { "legacy" }
+            ));
         }
 
-        ui.add_space(12.0);
-        ui.label(pick(ctx.lang, "端口", "Port"));
-        let mut port = ctx.proxy.desired_port();
-        ui.add(egui::DragValue::new(&mut port).range(1..=65535));
-        if port != ctx.proxy.desired_port() {
-            ctx.proxy.set_desired_port(port);
-            ctx.gui_cfg.proxy.default_port = port;
-            if let Err(e) = ctx.gui_cfg.save() {
-                *ctx.last_error = Some(format!("save gui config failed: {e}"));
+        let can_edit = matches!(kind, ProxyModeKind::Stopped);
+        ui.horizontal(|ui| {
+            ui.label(pick(ctx.lang, "服务", "Service"));
+            ui.add_enabled_ui(can_edit, |ui| {
+                let mut svc = ctx.proxy.desired_service();
+                egui::ComboBox::from_id_salt("proxy_service")
+                    .selected_text(match svc {
+                        crate::config::ServiceKind::Codex => "codex",
+                        crate::config::ServiceKind::Claude => "claude",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut svc, crate::config::ServiceKind::Codex, "codex");
+                        ui.selectable_value(&mut svc, crate::config::ServiceKind::Claude, "claude");
+                    });
+                if svc != ctx.proxy.desired_service() {
+                    ctx.proxy.set_desired_service(svc);
+                    ctx.gui_cfg.set_service_kind(svc);
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
+            });
+
+            ui.add_space(12.0);
+            ui.label(pick(ctx.lang, "端口", "Port"));
+            ui.add_enabled_ui(can_edit, |ui| {
+                let mut port = ctx.proxy.desired_port();
+                ui.add(egui::DragValue::new(&mut port).range(1..=65535));
+                if port != ctx.proxy.desired_port() {
+                    ctx.proxy.set_desired_port(port);
+                    ctx.gui_cfg.proxy.default_port = port;
+                    if let Err(e) = ctx.gui_cfg.save() {
+                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                    }
+                }
+            });
+
+            if !can_edit {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 120, 120),
+                    pick(ctx.lang, "（停止后可修改）", "(stop to edit)"),
+                );
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            match kind {
+                ProxyModeKind::Stopped => {
+                    if ui
+                        .button(pick(ctx.lang, "启动代理", "Start proxy"))
+                        .clicked()
+                    {
+                        let action = PortInUseAction::parse(&ctx.gui_cfg.attach.on_port_in_use);
+                        ctx.proxy.request_start_or_prompt(
+                            ctx.rt,
+                            action,
+                            ctx.gui_cfg.attach.remember_choice,
+                        );
+
+                        if let Some(e) = ctx.proxy.last_start_error() {
+                            *ctx.last_error = Some(e.to_string());
+                        }
+                    }
+                }
+                ProxyModeKind::Running => {
+                    if ui
+                        .button(pick(ctx.lang, "停止代理", "Stop proxy"))
+                        .clicked()
+                    {
+                        if let Err(e) = ctx.proxy.stop(ctx.rt) {
+                            *ctx.last_error = Some(format!("stop failed: {e}"));
+                        } else {
+                            *ctx.last_info = Some(pick(ctx.lang, "已停止", "Stopped").to_string());
+                        }
+                    }
+                }
+                ProxyModeKind::Attached => {
+                    if ui.button(pick(ctx.lang, "取消附着", "Detach")).clicked() {
+                        ctx.proxy.clear_port_in_use_modal();
+                        ctx.proxy.detach();
+                        *ctx.last_info = Some(pick(ctx.lang, "已取消附着", "Detached").to_string());
+                    }
+                }
+                ProxyModeKind::Starting => {
+                    ui.spinner();
+                }
+            }
+
+            if matches!(kind, ProxyModeKind::Running | ProxyModeKind::Attached)
+                && ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked()
+            {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+            }
+
+            if matches!(kind, ProxyModeKind::Running | ProxyModeKind::Attached)
+                && ui
+                    .button(pick(ctx.lang, "重载代理运行态", "Reload proxy runtime"))
+                    .clicked()
+            {
+                if let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt) {
+                    *ctx.last_error = Some(format!("reload runtime failed: {e}"));
+                } else {
+                    *ctx.last_info = Some(pick(ctx.lang, "已重载", "Reloaded").to_string());
+                }
+            }
+
+            if ui
+                .button(pick(ctx.lang, "扫描 3210-3220", "Scan 3210-3220"))
+                .clicked()
+            {
+                action_scan_local_proxies = true;
+            }
+            if let Some(t) = ctx.proxy.last_discovery_scan() {
+                ui.label(format!(
+                    "{}: {}s",
+                    pick(ctx.lang, "上次扫描", "Last scan"),
+                    t.elapsed().as_secs()
+                ));
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.collapsing(
+            pick(
+                ctx.lang,
+                "附着到已运行的代理",
+                "Attach to an existing proxy",
+            ),
+            |ui| {
+                if !matches!(kind, ProxyModeKind::Stopped) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 120, 120),
+                        pick(
+                            ctx.lang,
+                            "提示：请先停止/取消附着，再切换到其他代理。",
+                            "Tip: stop/detach first before switching to another proxy.",
+                        ),
+                    );
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label(pick(ctx.lang, "端口", "Port"));
+                    let mut attach_port = ctx
+                        .gui_cfg
+                        .attach
+                        .last_port
+                        .unwrap_or(ctx.gui_cfg.proxy.default_port);
+                    ui.add(egui::DragValue::new(&mut attach_port).range(1..=65535));
+                    if Some(attach_port) != ctx.gui_cfg.attach.last_port {
+                        ctx.gui_cfg.attach.last_port = Some(attach_port);
+                        if let Err(e) = ctx.gui_cfg.save() {
+                            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                        }
+                    }
+
+                    if ui
+                        .add_enabled(
+                            matches!(kind, ProxyModeKind::Stopped),
+                            egui::Button::new(pick(ctx.lang, "附着", "Attach")),
+                        )
+                        .clicked()
+                    {
+                        ctx.proxy.request_attach(attach_port);
+                        ctx.gui_cfg.attach.last_port = Some(attach_port);
+                        if let Err(e) = ctx.gui_cfg.save() {
+                            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+                        } else {
+                            *ctx.last_info =
+                                Some(pick(ctx.lang, "正在附着…", "Attaching...").into());
+                        }
+                    }
+                });
+
+                let discovered = ctx.proxy.discovered_proxies().to_vec();
+                if discovered.is_empty() {
+                    ui.label(pick(ctx.lang, "（未发现可用代理）", "(no proxies found)"));
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("discovered_proxies_grid")
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.label(pick(ctx.lang, "端口", "Port"));
+                                    ui.label(pick(ctx.lang, "服务", "Service"));
+                                    ui.label(pick(ctx.lang, "API", "API"));
+                                    ui.label(pick(ctx.lang, "状态", "Status"));
+                                    ui.end_row();
+
+                                    for p in discovered {
+                                        ui.label(p.port.to_string());
+                                        ui.label(
+                                            p.service_name.as_deref().unwrap_or_else(|| {
+                                                pick(ctx.lang, "未知", "unknown")
+                                            }),
+                                        );
+                                        ui.label(match p.api_version {
+                                            Some(v) => format!("v{v}"),
+                                            None => "-".to_string(),
+                                        });
+                                        if let Some(err) = p.last_error.as_deref() {
+                                            ui.label(err);
+                                        } else {
+                                            ui.label(pick(ctx.lang, "可用", "OK"));
+                                        }
+
+                                        if ui
+                                            .add_enabled(
+                                                matches!(kind, ProxyModeKind::Stopped),
+                                                egui::Button::new(pick(ctx.lang, "附着", "Attach")),
+                                            )
+                                            .clicked()
+                                        {
+                                            action_attach_discovered = Some(p.port);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            },
+        );
+
+        if let Some(snapshot) = ctx.proxy.snapshot() {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(pick(
+                ctx.lang,
+                "路由（全局覆盖）",
+                "Routing (global override)",
+            ));
+
+            if snapshot.supports_v1 && !snapshot.configs.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(pick(ctx.lang, "固定配置", "Pinned config"));
+                    let global = snapshot.global_override.clone();
+                    let mut selected = global.clone();
+                    egui::ComboBox::from_id_salt("overview_global_cfg_override")
+                        .selected_text(match selected.as_deref() {
+                            Some(v) => v.to_string(),
+                            None => pick(ctx.lang, "<自动>", "<auto>").to_string(),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut selected,
+                                None,
+                                pick(ctx.lang, "<自动>", "<auto>"),
+                            );
+                            for cfg in snapshot.configs.iter().filter(|c| c.enabled) {
+                                let label = match cfg.alias.as_deref() {
+                                    Some(a) if !a.trim().is_empty() => {
+                                        format!("{} ({a})", cfg.name)
+                                    }
+                                    _ => cfg.name.clone(),
+                                };
+                                ui.selectable_value(&mut selected, Some(cfg.name.clone()), label);
+                            }
+                        });
+
+                    if selected != global {
+                        match ctx.proxy.apply_global_config_override(ctx.rt, selected) {
+                            Ok(()) => {
+                                *ctx.last_info =
+                                    Some(pick(ctx.lang, "已应用全局覆盖", "Applied").to_string());
+                            }
+                            Err(e) => {
+                                *ctx.last_error =
+                                    Some(format!("apply global override failed: {e}"));
+                            }
+                        }
+                    }
+
+                    if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
+                        if let Err(e) = ctx.proxy.apply_global_config_override(ctx.rt, None) {
+                            *ctx.last_error = Some(format!("clear failed: {e}"));
+                        } else {
+                            *ctx.last_info =
+                                Some(pick(ctx.lang, "已清除全局覆盖", "Cleared").to_string());
+                        }
+                    }
+                });
+            } else if !snapshot.supports_v1 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 120, 120),
+                    pick(
+                        ctx.lang,
+                        "当前代理未启用 API v1：全局覆盖不可用。",
+                        "This proxy has no API v1: global override disabled.",
+                    ),
+                );
             }
         }
     });
 
-    ui.add_space(6.0);
-
     match ctx.proxy.kind() {
         ProxyModeKind::Stopped => {
-            if ui
-                .button(pick(ctx.lang, "启动代理", "Start proxy"))
-                .clicked()
-            {
-                let action = PortInUseAction::parse(&ctx.gui_cfg.attach.on_port_in_use);
-                ctx.proxy.request_start_or_prompt(
-                    ctx.rt,
-                    action,
-                    ctx.gui_cfg.attach.remember_choice,
-                );
-
-                if let Some(e) = ctx.proxy.last_start_error() {
-                    *ctx.last_error = Some(e.to_string());
-                }
-            }
-
-            ui.add_space(10.0);
-            ui.separator();
+            ui.add_space(8.0);
             ui.label(pick(
                 ctx.lang,
-                "手动附着到已运行的代理",
-                "Attach to an existing proxy",
+                "提示：可在上方“连接与路由”面板启动或附着到代理。",
+                "Tip: use the panel above to start or attach to a proxy.",
             ));
-            ui.horizontal(|ui| {
-                ui.label(pick(ctx.lang, "端口", "Port"));
-                let mut attach_port = ctx
-                    .gui_cfg
-                    .attach
-                    .last_port
-                    .unwrap_or(ctx.gui_cfg.proxy.default_port);
-                ui.add(egui::DragValue::new(&mut attach_port).range(1..=65535));
-                if Some(attach_port) != ctx.gui_cfg.attach.last_port {
-                    ctx.gui_cfg.attach.last_port = Some(attach_port);
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-
-                if ui.button(pick(ctx.lang, "附着", "Attach")).clicked() {
-                    ctx.proxy.request_attach(attach_port);
-                    ctx.gui_cfg.attach.last_port = Some(attach_port);
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    } else {
-                        *ctx.last_info = Some(pick(ctx.lang, "正在附着…", "Attaching...").into());
-                    }
-                }
-            });
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label(pick(
-                ctx.lang,
-                "自动发现本机已运行的代理（端口 3210-3220）",
-                "Discover running local proxies (ports 3210-3220)",
-            ));
-            ui.horizontal(|ui| {
-                if ui
-                    .button(pick(ctx.lang, "扫描 3210-3220", "Scan 3210-3220"))
-                    .clicked()
-                {
-                    action_scan_local_proxies = true;
-                }
-                if let Some(t) = ctx.proxy.last_discovery_scan() {
-                    ui.label(format!(
-                        "{}: {}s",
-                        pick(ctx.lang, "上次扫描", "Last scan"),
-                        t.elapsed().as_secs()
-                    ));
-                }
-            });
-
-            let discovered = ctx.proxy.discovered_proxies().to_vec();
-            if discovered.is_empty() {
-                ui.label(pick(ctx.lang, "（未发现可用代理）", "(no proxies found)"));
-            } else {
-                egui::ScrollArea::vertical()
-                    .max_height(180.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("discovered_proxies_grid")
-                            .striped(true)
-                            .show(ui, |ui| {
-                                ui.label(pick(ctx.lang, "端口", "Port"));
-                                ui.label(pick(ctx.lang, "服务", "Service"));
-                                ui.label(pick(ctx.lang, "API", "API"));
-                                ui.label(pick(ctx.lang, "状态", "Status"));
-                                ui.end_row();
-
-                                for p in discovered {
-                                    ui.label(p.port.to_string());
-                                    ui.label(
-                                        p.service_name
-                                            .as_deref()
-                                            .unwrap_or_else(|| pick(ctx.lang, "未知", "unknown")),
-                                    );
-                                    ui.label(match p.api_version {
-                                        Some(v) => format!("v{v}"),
-                                        None => "-".to_string(),
-                                    });
-                                    if let Some(err) = p.last_error.as_deref() {
-                                        ui.label(err);
-                                    } else {
-                                        ui.label(pick(ctx.lang, "可用", "OK"));
-                                    }
-
-                                    if ui.button(pick(ctx.lang, "附着", "Attach")).clicked() {
-                                        action_attach_discovered = Some(p.port);
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                    });
-            }
         }
         ProxyModeKind::Starting => {
             ui.label(pick(ctx.lang, "正在启动…", "Starting..."));
         }
         ProxyModeKind::Running => {
-            let mut global_override_ui: Option<(Option<String>, Vec<ConfigOption>)> = None;
             if let Some(r) = ctx.proxy.running() {
                 ui.label(format!(
                     "{}: 127.0.0.1:{} ({})",
@@ -1124,6 +1310,13 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     "{}: {}",
                     pick(ctx.lang, "最近请求(<=200)", "Recent (<=200)"),
                     r.recent.len()
+                ));
+                ui.label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "全局覆盖(Pinned)", "Global override (pinned)"),
+                    r.global_override
+                        .as_deref()
+                        .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
                 ));
 
                 let active_name = match r.service_name {
@@ -1159,81 +1352,9 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             }
                         });
                 }
-                if let Some(snapshot) = ctx.proxy.snapshot() {
-                    global_override_ui = Some((snapshot.global_override, snapshot.configs));
-                }
-            }
-
-            if let Some((global, configs)) = global_override_ui {
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label(pick(
-                    ctx.lang,
-                    "全局覆盖（Pinned）",
-                    "Global override (pinned)",
-                ));
-                ui.horizontal(|ui| {
-                    ui.label(pick(ctx.lang, "固定配置", "Pinned config"));
-
-                    let mut selected = global.clone();
-                    egui::ComboBox::from_id_salt("global_cfg_override")
-                        .selected_text(match selected.as_deref() {
-                            Some(v) => v.to_string(),
-                            None => pick(ctx.lang, "<自动>", "<auto>").to_string(),
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut selected,
-                                None,
-                                pick(ctx.lang, "<自动>", "<auto>"),
-                            );
-                            for cfg in configs.iter().filter(|c| c.enabled) {
-                                let label = match cfg.alias.as_deref() {
-                                    Some(a) if !a.trim().is_empty() => {
-                                        format!("{} ({a})", cfg.name)
-                                    }
-                                    _ => cfg.name.clone(),
-                                };
-                                ui.selectable_value(&mut selected, Some(cfg.name.clone()), label);
-                            }
-                        });
-
-                    if selected != global {
-                        match ctx.proxy.apply_global_config_override(ctx.rt, selected) {
-                            Ok(()) => {
-                                *ctx.last_info =
-                                    Some(pick(ctx.lang, "已应用全局覆盖", "Applied").to_string());
-                            }
-                            Err(e) => {
-                                *ctx.last_error =
-                                    Some(format!("apply global override failed: {e}"));
-                            }
-                        }
-                    }
-
-                    if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
-                        if let Err(e) = ctx.proxy.apply_global_config_override(ctx.rt, None) {
-                            *ctx.last_error = Some(format!("clear failed: {e}"));
-                        } else {
-                            *ctx.last_info =
-                                Some(pick(ctx.lang, "已清除全局覆盖", "Cleared").to_string());
-                        }
-                    }
-                });
-            }
-            if ui
-                .button(pick(ctx.lang, "停止代理", "Stop proxy"))
-                .clicked()
-            {
-                if let Err(e) = ctx.proxy.stop(ctx.rt) {
-                    *ctx.last_error = Some(format!("stop failed: {e}"));
-                } else {
-                    *ctx.last_info = Some(pick(ctx.lang, "已停止", "Stopped").to_string());
-                }
             }
         }
         ProxyModeKind::Attached => {
-            let mut global_override_ui: Option<(Option<String>, Vec<ConfigOption>, bool)> = None;
             if let Some(att) = ctx.proxy.attached() {
                 ui.label(format!(
                     "{}: {}",
@@ -1277,95 +1398,14 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 if let Some(err) = att.last_error.as_deref() {
                     ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
                 }
-
-                global_override_ui = Some((
-                    att.global_override.clone(),
-                    att.configs.clone(),
-                    att.api_version == Some(1),
+                ui.label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "全局覆盖(Pinned)", "Global override (pinned)"),
+                    att.global_override
+                        .as_deref()
+                        .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
                 ));
             }
-
-            if let Some((global, configs, supports_v1)) = global_override_ui {
-                if supports_v1 && !configs.is_empty() {
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.label(pick(
-                        ctx.lang,
-                        "全局覆盖（Pinned）",
-                        "Global override (pinned)",
-                    ));
-                    ui.horizontal(|ui| {
-                        ui.label(pick(ctx.lang, "固定配置", "Pinned config"));
-                        let mut selected = global.clone();
-                        egui::ComboBox::from_id_salt("global_cfg_override_attached")
-                            .selected_text(match selected.as_deref() {
-                                Some(v) => v.to_string(),
-                                None => pick(ctx.lang, "<自动>", "<auto>").to_string(),
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut selected,
-                                    None,
-                                    pick(ctx.lang, "<自动>", "<auto>"),
-                                );
-                                for cfg in configs.iter().filter(|c| c.enabled) {
-                                    let label = match cfg.alias.as_deref() {
-                                        Some(a) if !a.trim().is_empty() => {
-                                            format!("{} ({a})", cfg.name)
-                                        }
-                                        _ => cfg.name.clone(),
-                                    };
-                                    ui.selectable_value(
-                                        &mut selected,
-                                        Some(cfg.name.clone()),
-                                        label,
-                                    );
-                                }
-                            });
-
-                        if selected != global {
-                            match ctx.proxy.apply_global_config_override(ctx.rt, selected) {
-                                Ok(()) => {
-                                    *ctx.last_info = Some(
-                                        pick(ctx.lang, "已应用全局覆盖", "Applied").to_string(),
-                                    );
-                                }
-                                Err(e) => {
-                                    *ctx.last_error =
-                                        Some(format!("apply global override failed: {e}"));
-                                }
-                            }
-                        }
-
-                        if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
-                            if let Err(e) = ctx.proxy.apply_global_config_override(ctx.rt, None) {
-                                *ctx.last_error = Some(format!("clear failed: {e}"));
-                            } else {
-                                *ctx.last_info =
-                                    Some(pick(ctx.lang, "已清除全局覆盖", "Cleared").to_string());
-                            }
-                        }
-                    });
-                } else if !supports_v1 {
-                    ui.add_space(6.0);
-                    ui.label(pick(
-                        ctx.lang,
-                        "附着代理未启用 API v1：全局覆盖不可用。",
-                        "Attached proxy has no API v1: global override disabled.",
-                    ));
-                }
-            }
-            ui.horizontal(|ui| {
-                if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
-                    ctx.proxy
-                        .refresh_attached_if_due(ctx.rt, std::time::Duration::from_secs(0));
-                }
-                if ui.button(pick(ctx.lang, "取消附着", "Detach")).clicked() {
-                    ctx.proxy.clear_port_in_use_modal();
-                    ctx.proxy.detach();
-                    *ctx.last_info = Some(pick(ctx.lang, "已取消附着", "Detached").to_string());
-                }
-            });
         }
     }
 
