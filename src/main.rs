@@ -1069,6 +1069,7 @@ fn port_owners(_port: u16) -> Vec<PortOwner> {
     Vec::new()
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn run_cmd_stdout(program: &str, args: &[&str]) -> Option<String> {
     let output = ProcessCommand::new(program).args(args).output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
