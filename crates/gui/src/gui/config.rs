@@ -56,7 +56,7 @@ pub struct ProxyUiConfig {
     pub default_service: String,
     #[serde(default = "default_port")]
     pub default_port: u16,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub auto_attach_or_start: bool,
     #[serde(default = "default_true")]
     pub discovery_scan_fallback: bool,
@@ -67,7 +67,7 @@ impl Default for ProxyUiConfig {
         Self {
             default_service: default_service(),
             default_port: default_port(),
-            auto_attach_or_start: default_true(),
+            auto_attach_or_start: default_false(),
             discovery_scan_fallback: default_true(),
         }
     }
@@ -138,6 +138,10 @@ impl Default for AutostartConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_language() -> String {

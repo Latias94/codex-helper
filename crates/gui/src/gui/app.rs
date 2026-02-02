@@ -30,6 +30,60 @@ impl StartupBehavior {
     }
 }
 
+fn parse_port_from_base_url(base_url: &str) -> Option<u16> {
+    let input = base_url.trim();
+    if input.is_empty() {
+        return None;
+    }
+
+    let after_scheme = input
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(input);
+
+    let host_port = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
+        .trim();
+
+    if host_port.is_empty() {
+        return None;
+    }
+
+    // Support `[::1]:3211` as well as `127.0.0.1:3211`.
+    let port_str = if let Some(rest) = host_port.strip_prefix('[') {
+        let (_, after) = rest.split_once(']')?;
+        after.strip_prefix(':')?
+    } else {
+        let (_, port) = host_port.rsplit_once(':')?;
+        port
+    };
+
+    port_str.trim().parse::<u16>().ok()
+}
+
+fn infer_port_from_client_config(gui_cfg: &GuiConfig) -> Option<u16> {
+    match gui_cfg.service_kind() {
+        crate::config::ServiceKind::Claude => {
+            let st = crate::codex_integration::claude_switch_status().ok()?;
+            if !st.enabled {
+                return None;
+            }
+            let base_url = st.base_url.as_deref()?;
+            parse_port_from_base_url(base_url)
+        }
+        _ => {
+            let st = crate::codex_integration::codex_switch_status().ok()?;
+            if !st.enabled {
+                return None;
+            }
+            let base_url = st.base_url.as_deref()?;
+            parse_port_from_base_url(base_url)
+        }
+    }
+}
+
 pub fn run() -> eframe::Result<()> {
     let log_guard = init_gui_tracing();
 
@@ -187,6 +241,7 @@ impl eframe::App for GuiApp {
                 .gui_cfg
                 .attach
                 .last_port
+                .or_else(|| infer_port_from_client_config(&self.gui_cfg))
                 .unwrap_or(self.gui_cfg.proxy.default_port);
 
             let mut attach_port: Option<u16> = None;
