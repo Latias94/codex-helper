@@ -15,6 +15,8 @@ pub struct GuiConfig {
     #[serde(default)]
     pub history: HistoryConfig,
     #[serde(default)]
+    pub routing: RoutingConfig,
+    #[serde(default)]
     pub window: WindowConfig,
     #[serde(default)]
     pub tray: TrayConfig,
@@ -29,6 +31,7 @@ impl Default for GuiConfig {
             proxy: ProxyUiConfig::default(),
             attach: AttachConfig::default(),
             history: HistoryConfig::default(),
+            routing: RoutingConfig::default(),
             window: WindowConfig::default(),
             tray: TrayConfig::default(),
             autostart: AutostartConfig::default(),
@@ -109,6 +112,43 @@ impl Default for HistoryConfig {
             wt_batch_mode: default_wt_batch_mode(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    /// Saved presets for proxy routing (service/port/pinned config).
+    #[serde(default)]
+    pub profiles: Vec<RoutingProfile>,
+    /// Selected preset name (if any).
+    #[serde(default)]
+    pub selected_profile: Option<String>,
+    /// Apply the selected profile automatically after start/attach.
+    #[serde(default = "default_true")]
+    pub apply_on_connect: bool,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            profiles: Vec::new(),
+            selected_profile: None,
+            apply_on_connect: default_true(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingProfile {
+    pub name: String,
+    /// `codex` or `claude`
+    #[serde(default = "default_service")]
+    pub service: String,
+    /// Preferred port to start/attach (optional).
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Pinned config name for API v1 (optional). `None` means auto.
+    #[serde(default)]
+    pub pinned_config: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

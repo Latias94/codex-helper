@@ -33,11 +33,17 @@ pub enum Page {
 pub struct ViewState {
     pub requested_page: Option<Page>,
     pub setup: SetupViewState,
+    pub overview: OverviewViewState,
     pub doctor: DoctorViewState,
     pub sessions: SessionsViewState,
     pub requests: RequestsViewState,
     pub config: ConfigViewState,
     pub history: HistoryViewState,
+}
+
+#[derive(Debug, Default)]
+pub struct OverviewViewState {
+    pub new_routing_profile_name: String,
 }
 
 #[derive(Debug, Default)]
@@ -1206,6 +1212,10 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             },
         );
 
+        ui.add_space(8.0);
+        ui.separator();
+        render_routing_presets(ui, ctx);
+
         if let Some(snapshot) = ctx.proxy.snapshot() {
             ui.add_space(8.0);
             ui.separator();
@@ -1508,6 +1518,397 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         if !open {
             ctx.proxy.clear_port_in_use_modal();
+        }
+    }
+}
+
+fn render_routing_presets(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
+    ui.label(pick(ctx.lang, "路由预设", "Routing presets"));
+    ui.colored_label(
+        egui::Color32::from_rgb(120, 120, 120),
+        pick(
+            ctx.lang,
+            "提示：全局覆盖(Pinned)影响所有会话/客户端，仅对当前代理进程有效。",
+            "Tip: Global override (pinned) affects all sessions/clients and is runtime-only.",
+        ),
+    );
+
+    let snapshot = ctx.proxy.snapshot();
+
+    // Select preset (persisted).
+    let old_selected = ctx.gui_cfg.routing.selected_profile.clone();
+    let mut selected = old_selected.clone();
+    ui.horizontal(|ui| {
+        ui.label(pick(ctx.lang, "选择预设", "Preset"));
+        egui::ComboBox::from_id_salt("routing_profile_select")
+            .selected_text(match selected.as_deref() {
+                Some(v) => v.to_string(),
+                None => pick(ctx.lang, "<无>", "<none>").to_string(),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selected, None, pick(ctx.lang, "<无>", "<none>"));
+                for p in ctx.gui_cfg.routing.profiles.iter() {
+                    let mut label = p.name.clone();
+                    if !p.service.trim().is_empty() {
+                        label.push_str(&format!(" [{}]", p.service));
+                    }
+                    if let Some(port) = p.port {
+                        label.push_str(&format!(":{port}"));
+                    }
+                    ui.selectable_value(&mut selected, Some(p.name.clone()), label);
+                }
+            });
+    });
+    if selected != old_selected {
+        ctx.gui_cfg.routing.selected_profile = selected.clone();
+        if let Err(e) = ctx.gui_cfg.save() {
+            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+        }
+    }
+
+    // Apply-on-connect (persisted).
+    let old_apply = ctx.gui_cfg.routing.apply_on_connect;
+    let mut apply_on_connect = old_apply;
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut apply_on_connect,
+            pick(
+                ctx.lang,
+                "连接后自动应用选中预设（仅 pinned）",
+                "Auto-apply selected preset after connect (pinned only)",
+            ),
+        );
+    });
+    if apply_on_connect != old_apply {
+        ctx.gui_cfg.routing.apply_on_connect = apply_on_connect;
+        if let Err(e) = ctx.gui_cfg.save() {
+            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+        }
+    }
+
+    ui.add_space(6.0);
+
+    // Save current routing as a preset.
+    ui.horizontal(|ui| {
+        ui.label(pick(ctx.lang, "新预设名", "New preset"));
+        ui.text_edit_singleline(&mut ctx.view.overview.new_routing_profile_name);
+        if ui
+            .button(pick(ctx.lang, "保存当前为预设", "Save current"))
+            .clicked()
+        {
+            let name = ctx
+                .view
+                .overview
+                .new_routing_profile_name
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                *ctx.last_error =
+                    Some(pick(ctx.lang, "预设名不能为空", "Preset name is empty").to_string());
+                return;
+            }
+
+            let svc = match ctx.proxy.desired_service() {
+                crate::config::ServiceKind::Claude => "claude".to_string(),
+                crate::config::ServiceKind::Codex => "codex".to_string(),
+            };
+            let port = Some(ctx.proxy.desired_port());
+            let pinned = snapshot.as_ref().and_then(|s| s.global_override.clone());
+
+            let mut overwritten = false;
+            if let Some(p) = ctx
+                .gui_cfg
+                .routing
+                .profiles
+                .iter_mut()
+                .find(|p| p.name == name)
+            {
+                p.service = svc;
+                p.port = port;
+                p.pinned_config = pinned;
+                overwritten = true;
+            } else {
+                ctx.gui_cfg
+                    .routing
+                    .profiles
+                    .push(super::config::RoutingProfile {
+                        name: name.clone(),
+                        service: svc,
+                        port,
+                        pinned_config: pinned,
+                    });
+            }
+
+            ctx.gui_cfg.routing.selected_profile = Some(name.clone());
+            if let Err(e) = ctx.gui_cfg.save() {
+                *ctx.last_error = Some(format!("save gui config failed: {e}"));
+            } else {
+                *ctx.last_info = Some(
+                    if overwritten {
+                        pick(ctx.lang, "已覆盖预设", "Preset overwritten")
+                    } else {
+                        pick(ctx.lang, "已保存预设", "Preset saved")
+                    }
+                    .to_string(),
+                );
+                ctx.view.overview.new_routing_profile_name.clear();
+            }
+        }
+    });
+
+    let selected_name = ctx.gui_cfg.routing.selected_profile.clone();
+    let selected_idx = selected_name.as_ref().and_then(|n| {
+        ctx.gui_cfg
+            .routing
+            .profiles
+            .iter()
+            .position(|p| &p.name == n)
+    });
+    if selected_idx.is_none() && selected_name.is_some() {
+        // Selected preset was deleted/renamed; clean it up.
+        ctx.gui_cfg.routing.selected_profile = None;
+        let _ = ctx.gui_cfg.save();
+    }
+
+    let Some(selected_idx) = selected_idx else {
+        return;
+    };
+
+    let kind = ctx.proxy.kind();
+    let can_apply_service_port = matches!(kind, ProxyModeKind::Stopped);
+
+    let snapshot_service = snapshot
+        .as_ref()
+        .and_then(|s| s.service_name.as_deref())
+        .unwrap_or("");
+    let snapshot_supports_v1 = snapshot.as_ref().is_some_and(|s| s.supports_v1);
+
+    let mut delete_selected = false;
+    let mut profile_changed = false;
+    let mut action_apply_service_port = false;
+    let mut action_apply_pinned_now = false;
+
+    ui.add_space(6.0);
+    ui.group(|ui| {
+        ui.label(pick(ctx.lang, "预设详情", "Preset details"));
+
+        let profile = &mut ctx.gui_cfg.routing.profiles[selected_idx];
+
+        ui.horizontal(|ui| {
+            ui.label(pick(ctx.lang, "服务", "Service"));
+            let mut svc = if profile.service.trim().eq_ignore_ascii_case("claude") {
+                crate::config::ServiceKind::Claude
+            } else {
+                crate::config::ServiceKind::Codex
+            };
+            egui::ComboBox::from_id_salt(format!("routing_profile_service_{selected_idx}"))
+                .selected_text(match svc {
+                    crate::config::ServiceKind::Codex => "codex",
+                    crate::config::ServiceKind::Claude => "claude",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut svc, crate::config::ServiceKind::Codex, "codex");
+                    ui.selectable_value(&mut svc, crate::config::ServiceKind::Claude, "claude");
+                });
+            let next = match svc {
+                crate::config::ServiceKind::Claude => "claude".to_string(),
+                crate::config::ServiceKind::Codex => "codex".to_string(),
+            };
+            if next != profile.service {
+                profile.service = next;
+                profile_changed = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            let mut use_port = profile.port.is_some();
+            ui.checkbox(&mut use_port, pick(ctx.lang, "包含端口", "Include port"));
+            let next_port = if use_port {
+                let mut port = profile.port.unwrap_or(ctx.gui_cfg.proxy.default_port);
+                ui.label(pick(ctx.lang, "端口", "Port"));
+                ui.add(egui::DragValue::new(&mut port).range(1..=65535));
+                Some(port)
+            } else {
+                None
+            };
+            if next_port != profile.port {
+                profile.port = next_port;
+                profile_changed = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(pick(ctx.lang, "固定配置(Pinned)", "Pinned config"));
+
+            let service_matches_snapshot =
+                !snapshot_service.is_empty() && snapshot_service == profile.service;
+            let can_use_combo = snapshot_supports_v1
+                && service_matches_snapshot
+                && snapshot.as_ref().is_some_and(|s| !s.configs.is_empty());
+
+            if can_use_combo {
+                let snapshot = snapshot.as_ref().expect("checked above");
+                let current = profile.pinned_config.clone();
+                let mut selected = current.clone();
+                egui::ComboBox::from_id_salt(format!("routing_profile_pinned_{selected_idx}"))
+                    .selected_text(match selected.as_deref() {
+                        Some(v) => v.to_string(),
+                        None => pick(ctx.lang, "<自动>", "<auto>").to_string(),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut selected,
+                            None,
+                            pick(ctx.lang, "<自动>", "<auto>"),
+                        );
+                        for cfg in snapshot.configs.iter().filter(|c| c.enabled) {
+                            let label = match cfg.alias.as_deref() {
+                                Some(a) if !a.trim().is_empty() => format!("{} ({a})", cfg.name),
+                                _ => cfg.name.clone(),
+                            };
+                            ui.selectable_value(&mut selected, Some(cfg.name.clone()), label);
+                        }
+                    });
+                if selected != current {
+                    profile.pinned_config = selected;
+                    profile_changed = true;
+                }
+            } else {
+                let mut text = profile.pinned_config.clone().unwrap_or_default();
+                ui.text_edit_singleline(&mut text);
+                let next = if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text.trim().to_string())
+                };
+                if next != profile.pinned_config {
+                    profile.pinned_config = next;
+                    profile_changed = true;
+                }
+
+                if snapshot.is_some() && !snapshot_supports_v1 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 120, 120),
+                        pick(
+                            ctx.lang,
+                            "当前代理未启用 API v1：Pinned 不可应用。",
+                            "This proxy has no API v1: pinned cannot be applied.",
+                        ),
+                    );
+                } else if snapshot.is_some() && snapshot_supports_v1 && !service_matches_snapshot {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 120, 120),
+                        pick(
+                            ctx.lang,
+                            "提示：预设服务与当前代理服务不一致，为避免误操作，将禁用“立即应用”。",
+                            "Tip: preset service != current proxy service; Apply is disabled.",
+                        ),
+                    );
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    can_apply_service_port,
+                    egui::Button::new(pick(ctx.lang, "填入服务/端口", "Apply service/port")),
+                )
+                .clicked()
+            {
+                action_apply_service_port = true;
+            }
+
+            let can_apply_pinned_now =
+                matches!(kind, ProxyModeKind::Running | ProxyModeKind::Attached)
+                    && snapshot_supports_v1
+                    && snapshot_service == profile.service.as_str();
+            if ui
+                .add_enabled(
+                    can_apply_pinned_now,
+                    egui::Button::new(pick(ctx.lang, "立即应用 Pinned", "Apply pinned now")),
+                )
+                .clicked()
+            {
+                action_apply_pinned_now = true;
+            }
+
+            if ui.button(pick(ctx.lang, "删除预设", "Delete")).clicked() {
+                delete_selected = true;
+            }
+        });
+    });
+
+    if profile_changed {
+        if let Err(e) = ctx.gui_cfg.save() {
+            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+        }
+    }
+
+    if action_apply_service_port {
+        let profile = ctx.gui_cfg.routing.profiles[selected_idx].clone();
+        let svc = if profile.service.trim().eq_ignore_ascii_case("claude") {
+            crate::config::ServiceKind::Claude
+        } else {
+            crate::config::ServiceKind::Codex
+        };
+        ctx.proxy.set_desired_service(svc);
+        ctx.gui_cfg.set_service_kind(svc);
+        if let Some(port) = profile.port {
+            ctx.proxy.set_desired_port(port);
+            ctx.gui_cfg.proxy.default_port = port;
+            ctx.gui_cfg.attach.last_port = Some(port);
+        }
+        if let Err(e) = ctx.gui_cfg.save() {
+            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+        } else {
+            *ctx.last_info =
+                Some(pick(ctx.lang, "已应用服务/端口", "Applied service/port").to_string());
+        }
+    }
+
+    if action_apply_pinned_now {
+        let profile = ctx.gui_cfg.routing.profiles[selected_idx].clone();
+        let target_service = snapshot
+            .as_ref()
+            .and_then(|s| s.service_name.clone())
+            .unwrap_or_default();
+        if !target_service.is_empty() && target_service != profile.service {
+            *ctx.last_error = Some(
+                pick(
+                    ctx.lang,
+                    "预设服务与当前代理服务不一致，已取消应用。",
+                    "Preset service != current proxy service; aborted.",
+                )
+                .to_string(),
+            );
+        } else {
+            match ctx
+                .proxy
+                .apply_global_config_override(ctx.rt, profile.pinned_config.clone())
+            {
+                Ok(()) => {
+                    ctx.proxy
+                        .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                    *ctx.last_info = Some(pick(ctx.lang, "已应用全局覆盖", "Applied").to_string());
+                }
+                Err(e) => {
+                    *ctx.last_error = Some(format!("apply global override failed: {e}"));
+                }
+            }
+        }
+    }
+
+    if delete_selected {
+        let name = ctx.gui_cfg.routing.profiles[selected_idx].name.clone();
+        ctx.gui_cfg.routing.profiles.remove(selected_idx);
+        if ctx.gui_cfg.routing.selected_profile.as_deref() == Some(name.as_str()) {
+            ctx.gui_cfg.routing.selected_profile = None;
+        }
+        if let Err(e) = ctx.gui_cfg.save() {
+            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+        } else {
+            *ctx.last_info = Some(pick(ctx.lang, "已删除预设", "Preset deleted").to_string());
         }
     }
 }

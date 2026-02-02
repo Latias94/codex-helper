@@ -30,6 +30,14 @@ impl StartupBehavior {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutingAutoApplyKey {
+    target: String,
+    profile: String,
+    target_service: String,
+    supports_v1: bool,
+}
+
 fn parse_port_from_base_url(base_url: &str) -> Option<u16> {
     let input = base_url.trim();
     if input.is_empty() {
@@ -120,6 +128,7 @@ struct GuiApp {
     single_instance: Option<SingleInstance>,
     did_auto_connect: bool,
     did_load_fonts: bool,
+    last_routing_auto_apply: Option<RoutingAutoApplyKey>,
     _log_guard: Option<LogGuard>,
 }
 
@@ -180,7 +189,103 @@ impl GuiApp {
             single_instance,
             did_auto_connect: false,
             did_load_fonts: false,
+            last_routing_auto_apply: None,
             _log_guard: log_guard,
+        }
+    }
+
+    fn maybe_auto_apply_routing_profile(&mut self, lang: Language) {
+        if !self.gui_cfg.routing.apply_on_connect {
+            self.last_routing_auto_apply = None;
+            return;
+        }
+
+        let Some(selected_name) = self.gui_cfg.routing.selected_profile.clone() else {
+            self.last_routing_auto_apply = None;
+            return;
+        };
+        let Some(profile) = self
+            .gui_cfg
+            .routing
+            .profiles
+            .iter()
+            .find(|p| p.name == selected_name)
+            .cloned()
+        else {
+            self.last_routing_auto_apply = None;
+            return;
+        };
+
+        let Some(snapshot) = self.proxy.snapshot() else {
+            self.last_routing_auto_apply = None;
+            return;
+        };
+
+        if !matches!(
+            snapshot.kind,
+            super::proxy_control::ProxyModeKind::Running
+                | super::proxy_control::ProxyModeKind::Attached
+        ) {
+            self.last_routing_auto_apply = None;
+            return;
+        }
+
+        let target = snapshot
+            .base_url
+            .clone()
+            .or_else(|| snapshot.port.map(|p| format!("http://127.0.0.1:{p}")))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let target_service = snapshot.service_name.clone().unwrap_or_default();
+        let target_service_norm = target_service.trim().to_ascii_lowercase();
+        let profile_service_norm = profile.service.trim().to_ascii_lowercase();
+        let next_key = RoutingAutoApplyKey {
+            target,
+            profile: profile.name.clone(),
+            target_service: target_service_norm.clone(),
+            supports_v1: snapshot.supports_v1,
+        };
+        if self.last_routing_auto_apply.as_ref() == Some(&next_key) {
+            return;
+        }
+        self.last_routing_auto_apply = Some(next_key);
+
+        if !snapshot.supports_v1 {
+            self.last_info = Some(pick(
+                lang,
+                "已选中路由预设，但当前代理未启用 API v1：无法自动应用 Pinned。",
+                "Selected routing preset, but this proxy has no API v1: cannot auto-apply pinned.",
+            ).to_string());
+            return;
+        }
+
+        if !target_service_norm.is_empty() && target_service_norm != profile_service_norm {
+            self.last_info = Some(pick(
+                lang,
+                "已选中路由预设，但预设服务与当前代理服务不一致：已跳过自动应用。",
+                "Selected routing preset, but preset service != current proxy service; skipped auto-apply.",
+            ).to_string());
+            return;
+        }
+
+        match self
+            .proxy
+            .apply_global_config_override(&self.rt, profile.pinned_config.clone())
+        {
+            Ok(()) => {
+                self.proxy
+                    .refresh_current_if_due(&self.rt, std::time::Duration::from_secs(0));
+                self.last_info = Some(
+                    pick(
+                        lang,
+                        "已自动应用路由预设（Pinned）",
+                        "Auto-applied routing preset (pinned)",
+                    )
+                    .to_string(),
+                );
+            }
+            Err(e) => {
+                self.last_error = Some(format!("auto apply routing preset failed: {e}"));
+            }
         }
     }
 }
@@ -511,6 +616,7 @@ impl eframe::App for GuiApp {
         // Keep attach status fresh (read-only mode).
         self.proxy.refresh_attached_if_due(&self.rt, refresh);
         self.proxy.refresh_running_if_due(&self.rt, refresh);
+        self.maybe_auto_apply_routing_profile(lang);
 
         egui::TopBottomPanel::top("top_nav").show(ctx, |ui| {
             super::pages::nav(ui, lang, &mut self.page);
