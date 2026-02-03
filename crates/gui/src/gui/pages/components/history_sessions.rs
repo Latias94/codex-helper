@@ -347,7 +347,7 @@ pub(in super::super) fn render_sessions_panel_vertical(
 
     let list_max_h = ui.available_height().max(200.0);
     egui::ScrollArea::vertical()
-        .id_salt("history_sessions_scroll_vertical")
+        .id_salt("history_sessions_scroll")
         .max_height(list_max_h)
         .show(ui, |ui| {
             let group_enabled = ctx.view.history.scope == HistoryScope::GlobalRecent

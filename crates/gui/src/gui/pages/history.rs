@@ -4,7 +4,10 @@ use std::collections::HashSet;
 use super::super::i18n::pick;
 use super::PageCtx;
 use super::components::{history_controls, history_sessions, history_transcript};
-use super::{history_workdir_from_cwd, now_ms, sort_session_summaries_by_mtime_desc};
+use super::{
+    build_wt_items_from_session_summaries, history_workdir_from_cwd, now_ms, open_wt_items,
+    sort_session_summaries_by_mtime_desc,
+};
 
 use crate::sessions::{SessionDayDir, SessionIndexItem, SessionSummary, SessionTranscriptMessage};
 
@@ -660,13 +663,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         if !selected_ok {
             ctx.view.history.selected_idx = 0;
             ctx.view.history.selected_id = ctx.view.history.sessions.first().map(|s| s.id.clone());
-            ctx.view.history.loaded_for = None;
-            cancel_transcript_load(&mut ctx.view.history);
-            ctx.view.history.transcript_raw_messages.clear();
-            ctx.view.history.transcript_messages.clear();
-            ctx.view.history.transcript_error = None;
-            ctx.view.history.transcript_plain_key = None;
-            ctx.view.history.transcript_plain_text.clear();
+            reset_transcript_view_after_session_switch(ctx);
         }
     }
 
@@ -736,22 +733,22 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .history
             .selected_idx
             .min(ctx.view.history.sessions.len().saturating_sub(1));
-        let selected = &ctx.view.history.sessions[selected_idx];
-        let selected_id = selected.id.clone();
-        let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
-        let selected_path = selected.path.clone();
-        let selected_first = selected.first_user_message.clone();
+        let (selected_id, selected_cwd, selected_path, selected_first) = {
+            let selected = &ctx.view.history.sessions[selected_idx];
+            (
+                selected.id.clone(),
+                selected.cwd.clone().unwrap_or_else(|| "-".to_string()),
+                selected.path.clone(),
+                selected.first_user_message.clone(),
+            )
+        };
         let workdir =
             history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
-        let sessions_snapshot = ctx.view.history.sessions.clone();
+        let mut open_selected_clicked = false;
 
         cols[1].group(|ui| {
-            history_controls::render_resume_group(
-                ui,
-                ctx,
-                history_controls::BatchOpenSource::Summaries(&sessions_snapshot),
-                "history_wt_batch_mode",
-            );
+            open_selected_clicked =
+                history_controls::render_resume_group(ui, ctx, "history_wt_batch_mode");
 
             ui.horizontal(|ui| {
                 history_controls::render_selected_session_actions(
@@ -776,6 +773,22 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 );
             }
         });
+
+        if open_selected_clicked {
+            let selected_ids = ctx.view.history.batch_selected_ids.clone();
+            let infer_git_root = ctx.view.history.infer_git_root;
+            let resume_cmd = ctx.view.history.resume_cmd.clone();
+            let items = build_wt_items_from_session_summaries(
+                ctx.view
+                    .history
+                    .sessions
+                    .iter()
+                    .filter(|s| selected_ids.contains(&s.id)),
+                infer_git_root,
+                resume_cmd.as_str(),
+            );
+            open_wt_items(ctx, items);
+        }
 
         history_transcript::render_transcript_toolbar(&mut cols[1], ctx, "history_transcript_view");
 
@@ -851,12 +864,16 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         .history
         .selected_idx
         .min(ctx.view.history.sessions.len().saturating_sub(1));
-    let selected = &ctx.view.history.sessions[selected_idx];
-    let selected_id = selected.id.clone();
-    let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
-    let selected_path = selected.path.clone();
+    let (selected_id, selected_cwd, selected_path) = {
+        let selected = &ctx.view.history.sessions[selected_idx];
+        (
+            selected.id.clone(),
+            selected.cwd.clone().unwrap_or_else(|| "-".to_string()),
+            selected.path.clone(),
+        )
+    };
     let workdir = history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
-    let sessions_snapshot = ctx.view.history.sessions.clone();
+    let mut open_selected_clicked = false;
 
     ui.horizontal(|ui| {
         history_controls::render_selected_session_actions(
@@ -866,17 +883,29 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             workdir.as_str(),
             selected_path.as_path(),
         );
-        history_controls::render_open_selected_in_wt_button(
-            ui,
-            ctx,
-            history_controls::BatchOpenSource::Summaries(&sessions_snapshot),
-        );
+        open_selected_clicked = history_controls::render_open_selected_in_wt_button(ui, ctx);
     });
+
+    if open_selected_clicked {
+        let selected_ids = ctx.view.history.batch_selected_ids.clone();
+        let infer_git_root = ctx.view.history.infer_git_root;
+        let resume_cmd = ctx.view.history.resume_cmd.clone();
+        let items = build_wt_items_from_session_summaries(
+            ctx.view
+                .history
+                .sessions
+                .iter()
+                .filter(|s| selected_ids.contains(&s.id)),
+            infer_git_root,
+            resume_cmd.as_str(),
+        );
+        open_wt_items(ctx, items);
+    }
 
     ui.label(format!("id: {}", selected_id));
     ui.label(format!("dir: {}", workdir));
 
-    history_transcript::render_transcript_toolbar(ui, ctx, "history_transcript_view_vertical");
+    history_transcript::render_transcript_toolbar(ui, ctx, "history_transcript_view");
     let transcript_max_h = ui.available_height();
     history_transcript::render_transcript_body(
         ui,
@@ -1060,23 +1089,23 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ));
             return;
         }
-        let selected = selected.unwrap();
-        let selected_id = selected.id.clone();
-        let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
-        let selected_path = selected.path.clone();
-        let selected_first = selected.first_user_message.clone();
+        let (selected_id, selected_cwd, selected_path, selected_first) = {
+            let selected = selected.unwrap();
+            (
+                selected.id.clone(),
+                selected.cwd.clone().unwrap_or_else(|| "-".to_string()),
+                selected.path.clone(),
+                selected.first_user_message.clone(),
+            )
+        };
 
         let workdir =
             history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
-        let all_day_sessions_snapshot = ctx.view.history.all_day_sessions.clone();
+        let mut open_selected_clicked = false;
 
         cols[2].group(|ui| {
-            history_controls::render_resume_group(
-                ui,
-                ctx,
-                history_controls::BatchOpenSource::DaySessions(&all_day_sessions_snapshot),
-                "history_wt_batch_mode_all_by_date",
-            );
+            open_selected_clicked =
+                history_controls::render_resume_group(ui, ctx, "history_wt_batch_mode_all_by_date");
 
             ui.horizontal(|ui| {
                 history_controls::render_selected_session_actions(
@@ -1101,6 +1130,22 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 );
             }
         });
+
+        if open_selected_clicked {
+            let selected_ids = ctx.view.history.batch_selected_ids.clone();
+            let infer_git_root = ctx.view.history.infer_git_root;
+            let resume_cmd = ctx.view.history.resume_cmd.clone();
+            let items = history_controls::build_wt_items_from_day_sessions(
+                ctx.view
+                    .history
+                    .all_day_sessions
+                    .iter()
+                    .filter(|s| selected_ids.contains(&s.id)),
+                infer_git_root,
+                resume_cmd.as_str(),
+            );
+            open_wt_items(ctx, items);
+        }
 
         if ctx.view.history.auto_load_transcript {
             let tail = if ctx.view.history.transcript_full {
@@ -1151,7 +1196,7 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
                     &mut cols[0],
                     ctx,
                     max_h,
-                    "history_all_by_date_dates_scroll_vertical",
+                    "history_all_by_date_dates_scroll",
                 );
 
                 let max_h = cols[1].available_height().max(160.0);
@@ -1160,7 +1205,7 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
                     ctx,
                     q,
                     max_h,
-                    "history_all_by_date_sessions_scroll_vertical",
+                    "history_all_by_date_sessions_scroll",
                 );
             });
         });
@@ -1223,7 +1268,7 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
         ensure_transcript_loading(ctx, selected_path.clone(), key);
     }
 
-    let all_day_sessions_snapshot = ctx.view.history.all_day_sessions.clone();
+    let mut open_selected_clicked = false;
     ui.horizontal(|ui| {
         history_controls::render_selected_session_actions(
             ui,
@@ -1232,17 +1277,29 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
             workdir.as_str(),
             selected_path.as_path(),
         );
-        history_controls::render_open_selected_in_wt_button(
-            ui,
-            ctx,
-            history_controls::BatchOpenSource::DaySessions(&all_day_sessions_snapshot),
-        );
+        open_selected_clicked = history_controls::render_open_selected_in_wt_button(ui, ctx);
     });
+
+    if open_selected_clicked {
+        let selected_ids = ctx.view.history.batch_selected_ids.clone();
+        let infer_git_root = ctx.view.history.infer_git_root;
+        let resume_cmd = ctx.view.history.resume_cmd.clone();
+        let items = history_controls::build_wt_items_from_day_sessions(
+            ctx.view
+                .history
+                .all_day_sessions
+                .iter()
+                .filter(|s| selected_ids.contains(&s.id)),
+            infer_git_root,
+            resume_cmd.as_str(),
+        );
+        open_wt_items(ctx, items);
+    }
 
     ui.label(format!("id: {}", selected_id));
     ui.label(format!("dir: {}", workdir));
 
-    history_transcript::render_transcript_toolbar(ui, ctx, "history_transcript_view_all_vertical");
+    history_transcript::render_transcript_toolbar(ui, ctx, "history_transcript_view_all");
 
     let transcript_max_h = ui.available_height();
     history_transcript::render_transcript_body(
@@ -1308,7 +1365,19 @@ fn poll_transcript_loader(ctx: &mut PageCtx<'_>) {
 fn select_session_and_reset_transcript(ctx: &mut PageCtx<'_>, idx: usize, id: String) {
     ctx.view.history.selected_idx = idx;
     ctx.view.history.selected_id = Some(id);
-    history_controls::reset_transcript_view_after_session_switch(ctx);
+    reset_transcript_view_after_session_switch(ctx);
+}
+
+fn reset_transcript_view_after_session_switch(ctx: &mut PageCtx<'_>) {
+    ctx.view.history.loaded_for = None;
+    cancel_transcript_load(&mut ctx.view.history);
+    ctx.view.history.transcript_raw_messages.clear();
+    ctx.view.history.transcript_messages.clear();
+    ctx.view.history.transcript_error = None;
+    ctx.view.history.transcript_plain_key = None;
+    ctx.view.history.transcript_plain_text.clear();
+    ctx.view.history.transcript_selected_msg_idx = 0;
+    ctx.view.history.transcript_scroll_to_msg_idx = None;
 }
 
 fn ensure_transcript_loading(

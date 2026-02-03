@@ -2,17 +2,9 @@ use eframe::egui;
 
 use super::super::super::i18n::{Language, pick};
 use super::super::super::util::{open_in_file_manager, spawn_windows_terminal_wt_new_tab};
-use super::super::history::cancel_transcript_load;
-use super::super::{
-    PageCtx, build_wt_items_from_session_summaries, open_wt_items, workdir_status_from_cwd,
-};
+use super::super::{PageCtx, workdir_status_from_cwd};
 
-use crate::sessions::{SessionIndexItem, SessionSummary};
-
-pub(in super::super) enum BatchOpenSource<'a> {
-    Summaries(&'a [SessionSummary]),
-    DaySessions(&'a [SessionIndexItem]),
-}
+use crate::sessions::SessionIndexItem;
 
 fn resume_cmd_for_id(template: &str, selected_id: &str) -> String {
     let t = template.trim();
@@ -25,7 +17,7 @@ fn resume_cmd_for_id(template: &str, selected_id: &str) -> String {
     }
 }
 
-fn build_wt_items_from_day_sessions<'a, I>(
+pub(in super::super) fn build_wt_items_from_day_sessions<'a, I>(
     sessions: I,
     infer_git_root: bool,
     resume_cmd_template: &str,
@@ -56,9 +48,10 @@ where
 pub(in super::super) fn render_resume_group(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
-    source: BatchOpenSource<'_>,
     batch_mode_id_salt: &'static str,
-) {
+) -> bool {
+    let mut open_selected_clicked = false;
+
     ui.label(pick(ctx.lang, "恢复", "Resume"));
 
     ui.horizontal(|ui| {
@@ -142,41 +135,23 @@ pub(in super::super) fn render_resume_group(
             }
         }
 
-        render_open_selected_in_wt_button(ui, ctx, source);
+        open_selected_clicked = render_open_selected_in_wt_button(ui, ctx);
     });
+
+    open_selected_clicked
 }
 
 pub(in super::super) fn render_open_selected_in_wt_button(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
-    source: BatchOpenSource<'_>,
-) {
+) -> bool {
     let n = ctx.view.history.batch_selected_ids.len();
     let label = match ctx.lang {
         Language::Zh => format!("在 wt 中打开选中({n})"),
         Language::En => format!("Open selected in wt ({n})"),
     };
     let can_open = cfg!(windows) && n > 0;
-    if !ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
-        return;
-    }
-
-    let items = match source {
-        BatchOpenSource::Summaries(list) => build_wt_items_from_session_summaries(
-            list.iter()
-                .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id)),
-            ctx.view.history.infer_git_root,
-            ctx.view.history.resume_cmd.as_str(),
-        ),
-        BatchOpenSource::DaySessions(list) => build_wt_items_from_day_sessions(
-            list.iter()
-                .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id)),
-            ctx.view.history.infer_git_root,
-            ctx.view.history.resume_cmd.as_str(),
-        ),
-    };
-
-    open_wt_items(ctx, items);
+    ui.add_enabled(can_open, egui::Button::new(label)).clicked()
 }
 
 pub(in super::super) fn render_selected_session_actions(
@@ -238,16 +213,4 @@ pub(in super::super) fn render_selected_session_actions(
     {
         *ctx.last_error = Some(format!("open session failed: {e}"));
     }
-}
-
-pub(in super::super) fn reset_transcript_view_after_session_switch(ctx: &mut PageCtx<'_>) {
-    ctx.view.history.loaded_for = None;
-    cancel_transcript_load(&mut ctx.view.history);
-    ctx.view.history.transcript_raw_messages.clear();
-    ctx.view.history.transcript_messages.clear();
-    ctx.view.history.transcript_error = None;
-    ctx.view.history.transcript_plain_key = None;
-    ctx.view.history.transcript_plain_text.clear();
-    ctx.view.history.transcript_selected_msg_idx = 0;
-    ctx.view.history.transcript_scroll_to_msg_idx = None;
 }
