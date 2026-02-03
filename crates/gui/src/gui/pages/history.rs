@@ -9,8 +9,7 @@ use super::super::util::{
 use super::PageCtx;
 use super::components::{history_sessions, history_transcript};
 use super::{
-    history_workdir_from_cwd, now_ms, open_wt_items, short_sid, shorten,
-    sort_session_summaries_by_mtime_desc,
+    history_workdir_from_cwd, now_ms, open_wt_items, sort_session_summaries_by_mtime_desc,
 };
 
 use crate::sessions::{SessionDayDir, SessionIndexItem, SessionSummary, SessionTranscriptMessage};
@@ -45,7 +44,7 @@ pub struct HistoryViewState {
     pub all_selected_date: Option<String>,
     pub all_day_limit: usize,
     pub all_day_sessions: Vec<SessionIndexItem>,
-    loaded_day_for: Option<String>,
+    pub(super) loaded_day_for: Option<String>,
     pub search_transcript_tail: bool,
     pub search_transcript_tail_n: usize,
     search_transcript_applied: Option<(HistoryScope, String, usize)>,
@@ -732,16 +731,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let pending_select = history_sessions::render_sessions_panel_horizontal(&mut cols[0], ctx);
 
         if let Some((idx, id)) = pending_select {
-            ctx.view.history.selected_idx = idx;
-            ctx.view.history.selected_id = Some(id);
-            ctx.view.history.loaded_for = None;
-            cancel_transcript_load(&mut ctx.view.history);
-            ctx.view.history.transcript_raw_messages.clear();
-            ctx.view.history.transcript_messages.clear();
-            ctx.view.history.transcript_error = None;
-            ctx.view.history.transcript_plain_key = None;
-            ctx.view.history.transcript_plain_text.clear();
-            ctx.view.history.transcript_selected_msg_idx = 0;
+            select_session_and_reset_transcript(ctx, idx, id);
         }
 
         cols[1].heading(pick(ctx.lang, "对话记录", "Transcript"));
@@ -1182,16 +1172,7 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     }
 
     if let Some((idx, id)) = pending_select.take() {
-        ctx.view.history.selected_idx = idx;
-        ctx.view.history.selected_id = Some(id);
-        ctx.view.history.loaded_for = None;
-        cancel_transcript_load(&mut ctx.view.history);
-        ctx.view.history.transcript_raw_messages.clear();
-        ctx.view.history.transcript_messages.clear();
-        ctx.view.history.transcript_error = None;
-        ctx.view.history.transcript_plain_key = None;
-        ctx.view.history.transcript_plain_text.clear();
-        ctx.view.history.transcript_selected_msg_idx = 0;
+        select_session_and_reset_transcript(ctx, idx, id);
     }
 
     if ctx.view.history.auto_load_transcript
@@ -1604,144 +1585,21 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         return;
     }
     ui.columns(3, |cols| {
-        cols[0].heading(pick(ctx.lang, "日期", "Dates"));
-        cols[0].add_space(4.0);
-        {
-            let total = ctx.view.history.all_dates.len();
-            let row_h = 22.0;
-            egui::ScrollArea::vertical()
-                .id_salt("history_all_by_date_dates_scroll")
-                .max_height(520.0)
-                .show_rows(&mut cols[0], row_h, total, |ui, range| {
-                    for row in range {
-                        let d = &ctx.view.history.all_dates[row];
-                        let selected = ctx
-                            .view
-                            .history
-                            .all_selected_date
-                            .as_deref()
-                            .is_some_and(|x| x == d.date);
-                        if ui.selectable_label(selected, d.date.as_str()).clicked() {
-                            ctx.view.history.all_selected_date = Some(d.date.clone());
-                            ctx.view.history.loaded_day_for = None;
-                        }
-                    }
-                });
-        }
-
-        cols[1].heading(pick(ctx.lang, "会话", "Sessions"));
-        cols[1].add_space(4.0);
-        let mut action_batch_select_visible = false;
-        let mut action_batch_clear = false;
-        cols[1].horizontal(|ui| {
-            if ui
-                .button(pick(ctx.lang, "全选可见", "Select visible"))
-                .clicked()
-            {
-                action_batch_select_visible = true;
-            }
-            if ui.button(pick(ctx.lang, "清空选择", "Clear")).clicked() {
-                action_batch_clear = true;
-            }
-        });
-        cols[1].add_space(4.0);
-
-        let mut visible_indices: Vec<usize> = Vec::new();
-        for (idx, s) in ctx.view.history.all_day_sessions.iter().enumerate() {
-            if q.is_empty() {
-                visible_indices.push(idx);
-                continue;
-            }
-            let mut matched = false;
-            if let Some(cwd) = s.cwd.as_deref() {
-                matched |= cwd.to_lowercase().contains(q.as_str());
-            }
-            if let Some(msg) = s.first_user_message.as_deref() {
-                matched |= msg.to_lowercase().contains(q.as_str());
-            }
-            if matched {
-                visible_indices.push(idx);
-            }
-        }
-
-        {
-            let total = visible_indices.len();
-            let row_h = 22.0;
-            egui::ScrollArea::vertical()
-                .id_salt("history_all_by_date_sessions_scroll")
-                .max_height(520.0)
-                .show_rows(&mut cols[1], row_h, total, |ui, range| {
-                    for row in range {
-                        let idx = visible_indices[row];
-                        let s = &ctx.view.history.all_day_sessions[idx];
-                        let selected = ctx
-                            .view
-                            .history
-                            .selected_id
-                            .as_deref()
-                            .is_some_and(|id| id == s.id);
-
-                        let id_short = short_sid(&s.id, 16);
-                        let t = s
-                            .updated_hint
-                            .as_deref()
-                            .or(s.created_at.as_deref())
-                            .unwrap_or("-");
-                        let root_or_cwd = s
-                            .cwd
-                            .as_deref()
-                            .map(|cwd| {
-                                if ctx.view.history.infer_git_root {
-                                    crate::sessions::infer_project_root_from_cwd(cwd)
-                                } else {
-                                    cwd.to_string()
-                                }
-                            })
-                            .unwrap_or_else(|| "-".to_string());
-                        let first = s.first_user_message.as_deref().unwrap_or("-");
-                        let label = format!(
-                            "{}  {}  {}  {}",
-                            shorten(&root_or_cwd, 36),
-                            id_short,
-                            shorten(t, 19),
-                            shorten(first, 40)
-                        );
-                        let sid = s.id.clone();
-                        ui.horizontal(|ui| {
-                            let mut checked = ctx.view.history.batch_selected_ids.contains(&sid);
-                            if ui.checkbox(&mut checked, "").changed() {
-                                if checked {
-                                    ctx.view.history.batch_selected_ids.insert(sid.clone());
-                                } else {
-                                    ctx.view.history.batch_selected_ids.remove(&sid);
-                                }
-                            }
-
-                            if ui.selectable_label(selected, label).clicked() {
-                                ctx.view.history.selected_id = Some(sid.clone());
-                                ctx.view.history.selected_idx = idx;
-                                ctx.view.history.loaded_for = None;
-                                cancel_transcript_load(&mut ctx.view.history);
-                                ctx.view.history.transcript_raw_messages.clear();
-                                ctx.view.history.transcript_messages.clear();
-                                ctx.view.history.transcript_error = None;
-                                ctx.view.history.transcript_plain_key = None;
-                                ctx.view.history.transcript_plain_text.clear();
-                            }
-                        });
-                    }
-                });
-        }
-
-        if action_batch_clear {
-            ctx.view.history.batch_selected_ids.clear();
-        }
-        if action_batch_select_visible {
-            for &idx in visible_indices.iter() {
-                if let Some(s) = ctx.view.history.all_day_sessions.get(idx) {
-                    ctx.view.history.batch_selected_ids.insert(s.id.clone());
-                }
-            }
+        history_sessions::render_all_by_date_dates_panel(
+            &mut cols[0],
+            ctx,
+            520.0,
+            "history_all_by_date_dates_scroll",
+        );
+        let pending_select = history_sessions::render_all_by_date_sessions_panel(
+            &mut cols[1],
+            ctx,
+            q.as_str(),
+            520.0,
+            "history_all_by_date_sessions_scroll",
+        );
+        if let Some((idx, id)) = pending_select {
+            select_session_and_reset_transcript(ctx, idx, id);
         }
 
         cols[2].heading(pick(ctx.lang, "对话记录", "Transcript"));
@@ -2180,26 +2038,7 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
         .clamp(200.0, max_h * 0.55);
 
     let q = q.trim();
-    let mut visible_indices: Vec<usize> = Vec::new();
-    for (idx, s) in ctx.view.history.all_day_sessions.iter().enumerate() {
-        if q.is_empty() {
-            visible_indices.push(idx);
-            continue;
-        }
-        let mut matched = false;
-        if let Some(cwd) = s.cwd.as_deref() {
-            matched |= cwd.to_lowercase().contains(q);
-        }
-        if let Some(msg) = s.first_user_message.as_deref() {
-            matched |= msg.to_lowercase().contains(q);
-        }
-        if matched {
-            visible_indices.push(idx);
-        }
-    }
-
-    let mut action_batch_select_visible = false;
-    let mut action_batch_clear = false;
+    let mut pending_select: Option<(usize, String)> = None;
 
     let resp = egui::TopBottomPanel::top("history_all_vertical_nav_panel")
         .resizable(true)
@@ -2208,116 +2047,22 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
         .max_height(max_h * 0.8)
         .show_inside(ui, |ui| {
             ui.columns(2, |cols| {
-                cols[0].heading(pick(ctx.lang, "日期", "Dates"));
-                cols[0].add_space(4.0);
-                {
-                    let total = ctx.view.history.all_dates.len();
-                    let row_h = 22.0;
-                    let max_h = cols[0].available_height().max(160.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("history_all_by_date_dates_scroll_vertical")
-                        .max_height(max_h)
-                        .show_rows(&mut cols[0], row_h, total, |ui, range| {
-                            for row in range {
-                                let d = &ctx.view.history.all_dates[row];
-                                let selected = ctx
-                                    .view
-                                    .history
-                                    .all_selected_date
-                                    .as_deref()
-                                    .is_some_and(|x| x == d.date);
-                                if ui.selectable_label(selected, d.date.as_str()).clicked() {
-                                    ctx.view.history.all_selected_date = Some(d.date.clone());
-                                    ctx.view.history.loaded_day_for = None;
-                                }
-                            }
-                        });
-                }
+                let max_h = cols[0].available_height().max(160.0);
+                history_sessions::render_all_by_date_dates_panel(
+                    &mut cols[0],
+                    ctx,
+                    max_h,
+                    "history_all_by_date_dates_scroll_vertical",
+                );
 
-                cols[1].heading(pick(ctx.lang, "会话", "Sessions"));
-                cols[1].add_space(4.0);
-                cols[1].horizontal(|ui| {
-                    if ui
-                        .button(pick(ctx.lang, "全选可见", "Select visible"))
-                        .clicked()
-                    {
-                        action_batch_select_visible = true;
-                    }
-                    if ui.button(pick(ctx.lang, "清空选择", "Clear")).clicked() {
-                        action_batch_clear = true;
-                    }
-                });
-                cols[1].add_space(4.0);
-
-                let total = visible_indices.len();
-                let row_h = 22.0;
                 let max_h = cols[1].available_height().max(160.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("history_all_by_date_sessions_scroll_vertical")
-                    .max_height(max_h)
-                    .show_rows(&mut cols[1], row_h, total, |ui, range| {
-                        for row in range {
-                            let idx = visible_indices[row];
-                            let s = &ctx.view.history.all_day_sessions[idx];
-                            let selected = ctx
-                                .view
-                                .history
-                                .selected_id
-                                .as_deref()
-                                .is_some_and(|id| id == s.id);
-
-                            let id_short = short_sid(&s.id, 16);
-                            let t = s
-                                .updated_hint
-                                .as_deref()
-                                .or(s.created_at.as_deref())
-                                .unwrap_or("-");
-                            let root_or_cwd = s
-                                .cwd
-                                .as_deref()
-                                .map(|cwd| {
-                                    if ctx.view.history.infer_git_root {
-                                        crate::sessions::infer_project_root_from_cwd(cwd)
-                                    } else {
-                                        cwd.to_string()
-                                    }
-                                })
-                                .unwrap_or_else(|| "-".to_string());
-                            let first = s.first_user_message.as_deref().unwrap_or("-");
-                            let label = format!(
-                                "{}  {}  {}  {}",
-                                shorten(&root_or_cwd, 32),
-                                id_short,
-                                shorten(t, 19),
-                                shorten(first, 40)
-                            );
-
-                            let sid = s.id.clone();
-                            ui.horizontal(|ui| {
-                                let mut checked =
-                                    ctx.view.history.batch_selected_ids.contains(&sid);
-                                if ui.checkbox(&mut checked, "").changed() {
-                                    if checked {
-                                        ctx.view.history.batch_selected_ids.insert(sid.clone());
-                                    } else {
-                                        ctx.view.history.batch_selected_ids.remove(&sid);
-                                    }
-                                }
-
-                                if ui.selectable_label(selected, label).clicked() {
-                                    ctx.view.history.selected_id = Some(sid.clone());
-                                    cancel_transcript_load(&mut ctx.view.history);
-                                    ctx.view.history.transcript_raw_messages.clear();
-                                    ctx.view.history.transcript_messages.clear();
-                                    ctx.view.history.transcript_error = None;
-                                    ctx.view.history.loaded_for = None;
-                                    ctx.view.history.transcript_plain_key = None;
-                                    ctx.view.history.transcript_plain_text.clear();
-                                    ctx.view.history.transcript_selected_msg_idx = 0;
-                                }
-                            });
-                        }
-                    });
+                pending_select = history_sessions::render_all_by_date_sessions_panel(
+                    &mut cols[1],
+                    ctx,
+                    q,
+                    max_h,
+                    "history_all_by_date_sessions_scroll_vertical",
+                );
             });
         });
 
@@ -2334,15 +2079,8 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
         }
     }
 
-    if action_batch_clear {
-        ctx.view.history.batch_selected_ids.clear();
-    }
-    if action_batch_select_visible {
-        for &idx in visible_indices.iter() {
-            if let Some(s) = ctx.view.history.all_day_sessions.get(idx) {
-                ctx.view.history.batch_selected_ids.insert(s.id.clone());
-            }
-        }
+    if let Some((idx, id)) = pending_select {
+        select_session_and_reset_transcript(ctx, idx, id);
     }
 
     ui.add_space(6.0);
@@ -2718,6 +2456,20 @@ fn poll_transcript_loader(ctx: &mut PageCtx<'_>) {
             ctx.view.history.transcript_load = None;
         }
     }
+}
+
+fn select_session_and_reset_transcript(ctx: &mut PageCtx<'_>, idx: usize, id: String) {
+    ctx.view.history.selected_idx = idx;
+    ctx.view.history.selected_id = Some(id);
+    ctx.view.history.loaded_for = None;
+    cancel_transcript_load(&mut ctx.view.history);
+    ctx.view.history.transcript_raw_messages.clear();
+    ctx.view.history.transcript_messages.clear();
+    ctx.view.history.transcript_error = None;
+    ctx.view.history.transcript_plain_key = None;
+    ctx.view.history.transcript_plain_text.clear();
+    ctx.view.history.transcript_selected_msg_idx = 0;
+    ctx.view.history.transcript_scroll_to_msg_idx = None;
 }
 
 fn ensure_transcript_loading(
