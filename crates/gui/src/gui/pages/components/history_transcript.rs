@@ -1,9 +1,127 @@
 use eframe::egui;
 
 use super::super::super::i18n::{Language, pick};
-use super::super::history::{HistoryViewState, TranscriptViewMode};
+use super::super::PageCtx;
+use super::super::history::{HistoryViewState, TranscriptViewMode, cancel_transcript_load};
 use super::super::shorten;
 use crate::sessions::SessionTranscriptMessage;
+
+pub(in super::super) fn render_transcript_toolbar(
+    ui: &mut egui::Ui,
+    ctx: &mut PageCtx<'_>,
+    view_mode_combo_id_salt: &'static str,
+) {
+    ui.horizontal(|ui| {
+        let mut hide = ctx.view.history.hide_tool_calls;
+        ui.checkbox(&mut hide, pick(ctx.lang, "隐藏工具调用", "Hide tool calls"));
+        if hide != ctx.view.history.hide_tool_calls {
+            ctx.view.history.hide_tool_calls = hide;
+            ctx.view.history.transcript_messages =
+                filter_tool_calls(ctx.view.history.transcript_raw_messages.clone(), hide);
+            ctx.view.history.transcript_plain_key = None;
+            ctx.view.history.transcript_plain_text.clear();
+        }
+
+        ui.label(pick(ctx.lang, "显示", "View"));
+        egui::ComboBox::from_id_salt(view_mode_combo_id_salt)
+            .selected_text(match ctx.view.history.transcript_view {
+                TranscriptViewMode::Messages => pick(ctx.lang, "消息列表", "Messages"),
+                TranscriptViewMode::PlainText => pick(ctx.lang, "纯文本", "Plain text"),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut ctx.view.history.transcript_view,
+                    TranscriptViewMode::Messages,
+                    pick(ctx.lang, "消息列表", "Messages"),
+                );
+                ui.selectable_value(
+                    &mut ctx.view.history.transcript_view,
+                    TranscriptViewMode::PlainText,
+                    pick(ctx.lang, "纯文本", "Plain text"),
+                );
+            });
+
+        let mut full = ctx.view.history.transcript_full;
+        ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
+        if full != ctx.view.history.transcript_full {
+            ctx.view.history.transcript_full = full;
+            ctx.view.history.loaded_for = None;
+            cancel_transcript_load(&mut ctx.view.history);
+        }
+
+        ui.label(pick(ctx.lang, "尾部条数", "Tail"));
+        ui.add_enabled(
+            !ctx.view.history.transcript_full,
+            egui::DragValue::new(&mut ctx.view.history.transcript_tail)
+                .range(10..=500)
+                .speed(1),
+        );
+        if ctx.view.history.transcript_full {
+            ui.label(pick(ctx.lang, "（忽略尾部设置）", "(tail ignored)"));
+        }
+
+        if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
+            ctx.view.history.loaded_for = None;
+            cancel_transcript_load(&mut ctx.view.history);
+            if !ctx.view.history.auto_load_transcript {
+                ctx.view.history.auto_load_transcript = true;
+            }
+        }
+
+        if ui.button(pick(ctx.lang, "复制全部", "Copy all")).clicked() {
+            let mut out = String::new();
+            for msg in ctx.view.history.transcript_messages.iter() {
+                let ts = msg.timestamp.as_deref().unwrap_or("-");
+                let role = msg.role.as_str();
+                out.push_str(&format!("[{ts}] {role}:\n"));
+                out.push_str(msg.text.as_str());
+                out.push_str("\n\n");
+            }
+            ui.ctx().copy_text(out);
+            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+        }
+
+        if ui
+            .button(pick(ctx.lang, "复制当前消息", "Copy selected"))
+            .clicked()
+        {
+            let total = ctx.view.history.transcript_messages.len();
+            if total > 0 {
+                let idx = ctx
+                    .view
+                    .history
+                    .transcript_selected_msg_idx
+                    .min(total.saturating_sub(1));
+                let msg = &ctx.view.history.transcript_messages[idx];
+                let ts = msg.timestamp.as_deref().unwrap_or("-");
+                let role = msg.role.as_str();
+                let out = format!("[{ts}] {role}:\n{}\n", msg.text);
+                ui.ctx().copy_text(out);
+                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+            }
+        }
+
+        if ui.button(pick(ctx.lang, "首条", "First")).clicked() {
+            ctx.view.history.transcript_view = TranscriptViewMode::Messages;
+            ctx.view.history.transcript_selected_msg_idx = 0;
+            ctx.view.history.transcript_scroll_to_msg_idx = Some(0);
+        }
+
+        if ui.button(pick(ctx.lang, "末条", "Last")).clicked() {
+            let total = ctx.view.history.transcript_messages.len();
+            if total > 0 {
+                let last = total.saturating_sub(1);
+                ctx.view.history.transcript_view = TranscriptViewMode::Messages;
+                ctx.view.history.transcript_selected_msg_idx = last;
+                ctx.view.history.transcript_scroll_to_msg_idx = Some(last);
+            }
+        }
+    });
+
+    if let Some(err) = ctx.view.history.transcript_error.as_deref() {
+        ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
+    }
+}
 
 pub(in super::super) fn render_transcript_body(
     ui: &mut egui::Ui,

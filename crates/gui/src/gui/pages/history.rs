@@ -1,16 +1,10 @@
 use eframe::egui;
 use std::collections::HashSet;
 
-use super::super::i18n::{Language, pick};
-use super::super::util::{
-    open_in_file_manager, spawn_windows_terminal_wt_new_tab,
-    spawn_windows_terminal_wt_tabs_in_one_window,
-};
+use super::super::i18n::pick;
 use super::PageCtx;
-use super::components::{history_sessions, history_transcript};
-use super::{
-    history_workdir_from_cwd, now_ms, open_wt_items, sort_session_summaries_by_mtime_desc,
-};
+use super::components::{history_controls, history_sessions, history_transcript};
+use super::{history_workdir_from_cwd, now_ms, sort_session_summaries_by_mtime_desc};
 
 use crate::sessions::{SessionDayDir, SessionIndexItem, SessionSummary, SessionTranscriptMessage};
 
@@ -745,260 +739,34 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let selected = &ctx.view.history.sessions[selected_idx];
         let selected_id = selected.id.clone();
         let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
+        let selected_path = selected.path.clone();
+        let selected_first = selected.first_user_message.clone();
         let workdir =
             history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
-        let resume_cmd = {
-            let t = ctx.view.history.resume_cmd.trim();
-            if t.is_empty() {
-                format!("codex resume {selected_id}")
-            } else if t.contains("{id}") {
-                t.replace("{id}", &selected_id)
-            } else {
-                format!("{t} {selected_id}")
-            }
-        };
+        let sessions_snapshot = ctx.view.history.sessions.clone();
 
         cols[1].group(|ui| {
-            ui.label(pick(ctx.lang, "恢复", "Resume"));
+            history_controls::render_resume_group(
+                ui,
+                ctx,
+                history_controls::BatchOpenSource::Summaries(&sessions_snapshot),
+                "history_wt_batch_mode",
+            );
 
             ui.horizontal(|ui| {
-                ui.label(pick(ctx.lang, "命令模板", "Template"));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut ctx.view.history.resume_cmd)
-                        .desired_width(260.0),
+                history_controls::render_selected_session_actions(
+                    ui,
+                    ctx,
+                    selected_id.as_str(),
+                    workdir.as_str(),
+                    selected_path.as_path(),
                 );
-                if resp.lost_focus()
-                    && ctx.gui_cfg.history.resume_cmd != ctx.view.history.resume_cmd
-                {
-                    ctx.gui_cfg.history.resume_cmd = ctx.view.history.resume_cmd.clone();
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-                if ui
-                    .button(pick(ctx.lang, "用 bypass", "Use bypass"))
-                    .clicked()
-                {
-                    ctx.view.history.resume_cmd =
-                        "codex --dangerously-bypass-approvals-and-sandbox resume {id}".to_string();
-                    ctx.gui_cfg.history.resume_cmd = ctx.view.history.resume_cmd.clone();
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label(pick(ctx.lang, "Shell", "Shell"));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut ctx.view.history.shell).desired_width(140.0),
-                );
-                if resp.lost_focus() && ctx.gui_cfg.history.shell != ctx.view.history.shell {
-                    ctx.gui_cfg.history.shell = ctx.view.history.shell.clone();
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-                let mut keep_open = ctx.view.history.keep_open;
-                ui.checkbox(&mut keep_open, pick(ctx.lang, "保持打开", "Keep open"));
-                if keep_open != ctx.view.history.keep_open {
-                    ctx.view.history.keep_open = keep_open;
-                    ctx.gui_cfg.history.keep_open = keep_open;
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label(pick(ctx.lang, "批量打开", "Batch open"));
-
-                let mut mode = ctx
-                    .gui_cfg
-                    .history
-                    .wt_batch_mode
-                    .trim()
-                    .to_ascii_lowercase();
-                if mode != "tabs" && mode != "windows" {
-                    mode = "tabs".to_string();
-                }
-                let mut selected_mode = mode.clone();
-                egui::ComboBox::from_id_salt("history_wt_batch_mode")
-                    .selected_text(match selected_mode.as_str() {
-                        "windows" => pick(ctx.lang, "每会话新窗口", "Window per session"),
-                        _ => pick(ctx.lang, "单窗口多标签", "One window (tabs)"),
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut selected_mode,
-                            "tabs".to_string(),
-                            pick(ctx.lang, "单窗口多标签", "One window (tabs)"),
-                        );
-                        ui.selectable_value(
-                            &mut selected_mode,
-                            "windows".to_string(),
-                            pick(ctx.lang, "每会话新窗口", "Window per session"),
-                        );
-                    });
-                if selected_mode != mode {
-                    ctx.gui_cfg.history.wt_batch_mode = selected_mode;
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-
-                let n = ctx.view.history.batch_selected_ids.len();
-                let label = match ctx.lang {
-                    Language::Zh => format!("在 wt 中打开选中({n})"),
-                    Language::En => format!("Open selected in wt ({n})"),
-                };
-                let can_open = cfg!(windows) && n > 0;
-                if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
-                    let items = ctx
-                        .view
-                        .history
-                        .sessions
-                        .iter()
-                        .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id))
-                        .filter_map(|s| {
-                            let cwd = s.cwd.as_deref()?.trim().to_string();
-                            if cwd.is_empty() || cwd == "-" {
-                                return None;
-                            }
-                            let workdir = history_workdir_from_cwd(
-                                cwd.as_str(),
-                                ctx.view.history.infer_git_root,
-                            );
-                            if !std::path::Path::new(workdir.as_str()).exists() {
-                                return None;
-                            }
-                            let sid = s.id.clone();
-                            let cmd = {
-                                let t = ctx.view.history.resume_cmd.trim();
-                                if t.is_empty() {
-                                    format!("codex resume {sid}")
-                                } else if t.contains("{id}") {
-                                    t.replace("{id}", &sid)
-                                } else {
-                                    format!("{t} {sid}")
-                                }
-                            };
-                            Some((workdir, cmd))
-                        })
-                        .collect::<Vec<_>>();
-
-                    if items.is_empty() {
-                        *ctx.last_error = Some(
-                            pick(
-                                ctx.lang,
-                                "没有可打开的会话（cwd 不可用或目录不存在）",
-                                "No sessions to open (cwd unavailable or missing)",
-                            )
-                            .to_string(),
-                        );
-                    } else {
-                        let mode = ctx
-                            .gui_cfg
-                            .history
-                            .wt_batch_mode
-                            .trim()
-                            .to_ascii_lowercase();
-                        let shell = ctx.view.history.shell.trim();
-                        let keep_open = ctx.view.history.keep_open;
-
-                        let result = if mode == "windows" {
-                            let mut last_err: Option<anyhow::Error> = None;
-                            for (cwd, cmd) in items.iter() {
-                                if let Err(e) = spawn_windows_terminal_wt_new_tab(
-                                    -1,
-                                    cwd.as_str(),
-                                    shell,
-                                    keep_open,
-                                    cmd.as_str(),
-                                ) {
-                                    last_err = Some(e);
-                                    break;
-                                }
-                            }
-                            match last_err {
-                                Some(e) => Err(e),
-                                None => Ok(()),
-                            }
-                        } else {
-                            spawn_windows_terminal_wt_tabs_in_one_window(&items, shell, keep_open)
-                        };
-
-                        match result {
-                            Ok(()) => {
-                                *ctx.last_info = Some(
-                                    pick(
-                                        ctx.lang,
-                                        "已启动 Windows Terminal",
-                                        "Started Windows Terminal",
-                                    )
-                                    .to_string(),
-                                );
-                            }
-                            Err(e) => *ctx.last_error = Some(format!("spawn wt failed: {e}")),
-                        }
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                if ui
-                    .button(pick(ctx.lang, "复制 root+id", "Copy root+id"))
-                    .clicked()
-                {
-                    if workdir.trim().is_empty() || workdir == "-" {
-                        *ctx.last_error =
-                            Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
-                    } else {
-                        ui.ctx()
-                            .copy_text(format!("{} {}", workdir.trim(), selected_id));
-                        *ctx.last_info =
-                            Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-                    }
-                }
-
-                if ui
-                    .button(pick(ctx.lang, "复制 resume", "Copy resume"))
-                    .clicked()
-                {
-                    ui.ctx().copy_text(resume_cmd.clone());
-                    *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-                }
-
-                if cfg!(windows)
-                    && ui
-                        .button(pick(ctx.lang, "在 wt 中恢复", "Open in wt"))
-                        .clicked()
-                {
-                    if workdir.trim().is_empty() || workdir == "-" {
-                        *ctx.last_error =
-                            Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
-                    } else if !std::path::Path::new(workdir.trim()).exists() {
-                        *ctx.last_error = Some(format!(
-                            "{}: {}",
-                            pick(ctx.lang, "目录不存在", "Directory not found"),
-                            workdir.trim()
-                        ));
-                    } else if let Err(e) = spawn_windows_terminal_wt_new_tab(
-                        ctx.view.history.wt_window,
-                        workdir.trim(),
-                        ctx.view.history.shell.trim(),
-                        ctx.view.history.keep_open,
-                        &resume_cmd,
-                    ) {
-                        *ctx.last_error = Some(format!("spawn wt failed: {e}"));
-                    }
-                }
             });
 
             ui.label(format!("id: {}", selected_id));
             ui.label(format!("dir: {}", workdir));
 
-            if let Some(first) = selected.first_user_message.as_deref() {
+            if let Some(first) = selected_first.as_deref() {
                 let mut text = first.to_string();
                 ui.add(
                     egui::TextEdit::multiline(&mut text)
@@ -1009,126 +777,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
         });
 
-        cols[1].horizontal(|ui| {
-            let mut hide = ctx.view.history.hide_tool_calls;
-            ui.checkbox(&mut hide, pick(ctx.lang, "隐藏工具调用", "Hide tool calls"));
-            if hide != ctx.view.history.hide_tool_calls {
-                ctx.view.history.hide_tool_calls = hide;
-                ctx.view.history.transcript_messages = history_transcript::filter_tool_calls(
-                    ctx.view.history.transcript_raw_messages.clone(),
-                    hide,
-                );
-                ctx.view.history.transcript_plain_key = None;
-                ctx.view.history.transcript_plain_text.clear();
-            }
-
-            ui.label(pick(ctx.lang, "显示", "View"));
-            egui::ComboBox::from_id_salt("history_transcript_view")
-                .selected_text(match ctx.view.history.transcript_view {
-                    TranscriptViewMode::Messages => pick(ctx.lang, "消息列表", "Messages"),
-                    TranscriptViewMode::PlainText => pick(ctx.lang, "纯文本", "Plain text"),
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut ctx.view.history.transcript_view,
-                        TranscriptViewMode::Messages,
-                        pick(ctx.lang, "消息列表", "Messages"),
-                    );
-                    ui.selectable_value(
-                        &mut ctx.view.history.transcript_view,
-                        TranscriptViewMode::PlainText,
-                        pick(ctx.lang, "纯文本", "Plain text"),
-                    );
-                });
-
-            let mut full = ctx.view.history.transcript_full;
-            ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
-            if full != ctx.view.history.transcript_full {
-                ctx.view.history.transcript_full = full;
-                ctx.view.history.loaded_for = None;
-                cancel_transcript_load(&mut ctx.view.history);
-            }
-
-            ui.label(pick(ctx.lang, "尾部条数", "Tail"));
-            ui.add_enabled(
-                !ctx.view.history.transcript_full,
-                egui::DragValue::new(&mut ctx.view.history.transcript_tail)
-                    .range(10..=500)
-                    .speed(1),
-            );
-            if ctx.view.history.transcript_full {
-                ui.label(pick(ctx.lang, "（忽略尾部设置）", "(tail ignored)"));
-            }
-
-            if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
-                ctx.view.history.loaded_for = None;
-                cancel_transcript_load(&mut ctx.view.history);
-                // Next frame will load (auto_load_transcript=true) or user can click again.
-                if !ctx.view.history.auto_load_transcript {
-                    ctx.view.history.auto_load_transcript = true;
-                }
-            }
-
-            if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked() {
-                let path = ctx.view.history.sessions[selected_idx].path.clone();
-                if let Err(e) = open_in_file_manager(&path, true) {
-                    *ctx.last_error = Some(format!("open session failed: {e}"));
-                }
-            }
-
-            if ui.button(pick(ctx.lang, "复制全部", "Copy all")).clicked() {
-                let mut out = String::new();
-                for msg in ctx.view.history.transcript_messages.iter() {
-                    let ts = msg.timestamp.as_deref().unwrap_or("-");
-                    let role = msg.role.as_str();
-                    out.push_str(&format!("[{ts}] {role}:\n"));
-                    out.push_str(msg.text.as_str());
-                    out.push_str("\n\n");
-                }
-                ui.ctx().copy_text(out);
-                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-            }
-
-            if ui
-                .button(pick(ctx.lang, "复制当前消息", "Copy selected"))
-                .clicked()
-            {
-                let total = ctx.view.history.transcript_messages.len();
-                if total > 0 {
-                    let idx = ctx
-                        .view
-                        .history
-                        .transcript_selected_msg_idx
-                        .min(total.saturating_sub(1));
-                    let msg = &ctx.view.history.transcript_messages[idx];
-                    let ts = msg.timestamp.as_deref().unwrap_or("-");
-                    let role = msg.role.as_str();
-                    let out = format!("[{ts}] {role}:\n{}\n", msg.text);
-                    ui.ctx().copy_text(out);
-                    *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-                }
-            }
-
-            if ui.button(pick(ctx.lang, "首条", "First")).clicked() {
-                ctx.view.history.transcript_view = TranscriptViewMode::Messages;
-                ctx.view.history.transcript_selected_msg_idx = 0;
-                ctx.view.history.transcript_scroll_to_msg_idx = Some(0);
-            }
-
-            if ui.button(pick(ctx.lang, "末条", "Last")).clicked() {
-                let total = ctx.view.history.transcript_messages.len();
-                if total > 0 {
-                    let last = total.saturating_sub(1);
-                    ctx.view.history.transcript_view = TranscriptViewMode::Messages;
-                    ctx.view.history.transcript_selected_msg_idx = last;
-                    ctx.view.history.transcript_scroll_to_msg_idx = Some(last);
-                }
-            }
-        });
-
-        if let Some(err) = ctx.view.history.transcript_error.as_deref() {
-            cols[1].colored_label(egui::Color32::from_rgb(200, 120, 40), err);
-        }
+        history_transcript::render_transcript_toolbar(&mut cols[1], ctx, "history_transcript_view");
 
         history_transcript::render_transcript_body(
             &mut cols[1],
@@ -1207,238 +856,27 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
     let selected_path = selected.path.clone();
     let workdir = history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
-    let resume_cmd = {
-        let t = ctx.view.history.resume_cmd.trim();
-        if t.is_empty() {
-            format!("codex resume {selected_id}")
-        } else if t.contains("{id}") {
-            t.replace("{id}", &selected_id)
-        } else {
-            format!("{t} {selected_id}")
-        }
-    };
+    let sessions_snapshot = ctx.view.history.sessions.clone();
 
     ui.horizontal(|ui| {
-        if ui
-            .button(pick(ctx.lang, "复制 root+id", "Copy root+id"))
-            .clicked()
-        {
-            if workdir.trim().is_empty() || workdir == "-" {
-                *ctx.last_error = Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
-            } else {
-                ui.ctx()
-                    .copy_text(format!("{} {}", workdir.trim(), selected_id));
-                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-            }
-        }
-
-        if ui
-            .button(pick(ctx.lang, "复制 resume", "Copy resume"))
-            .clicked()
-        {
-            ui.ctx().copy_text(resume_cmd.clone());
-            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-        }
-
-        if cfg!(windows)
-            && ui
-                .button(pick(ctx.lang, "在 wt 中恢复", "Open in wt"))
-                .clicked()
-        {
-            if workdir.trim().is_empty() || workdir == "-" {
-                *ctx.last_error = Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
-            } else if !std::path::Path::new(workdir.trim()).exists() {
-                *ctx.last_error = Some(format!(
-                    "{}: {}",
-                    pick(ctx.lang, "目录不存在", "Directory not found"),
-                    workdir.trim()
-                ));
-            } else if let Err(e) = spawn_windows_terminal_wt_new_tab(
-                ctx.view.history.wt_window,
-                workdir.trim(),
-                ctx.view.history.shell.trim(),
-                ctx.view.history.keep_open,
-                &resume_cmd,
-            ) {
-                *ctx.last_error = Some(format!("spawn wt failed: {e}"));
-            }
-        }
-
-        if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked()
-            && let Err(e) = open_in_file_manager(&selected_path, true)
-        {
-            *ctx.last_error = Some(format!("open session failed: {e}"));
-        }
-
-        let n = ctx.view.history.batch_selected_ids.len();
-        let label = match ctx.lang {
-            Language::Zh => format!("在 wt 中打开选中({n})"),
-            Language::En => format!("Open selected in wt ({n})"),
-        };
-        let can_open = cfg!(windows) && n > 0;
-        if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
-            let items = ctx
-                .view
-                .history
-                .sessions
-                .iter()
-                .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id))
-                .filter_map(|s| {
-                    let cwd = s.cwd.as_deref()?.trim().to_string();
-                    if cwd.is_empty() || cwd == "-" {
-                        return None;
-                    }
-                    let workdir =
-                        history_workdir_from_cwd(cwd.as_str(), ctx.view.history.infer_git_root);
-                    if !std::path::Path::new(workdir.as_str()).exists() {
-                        return None;
-                    }
-                    let sid = s.id.clone();
-                    let cmd = {
-                        let t = ctx.view.history.resume_cmd.trim();
-                        if t.is_empty() {
-                            format!("codex resume {sid}")
-                        } else if t.contains("{id}") {
-                            t.replace("{id}", &sid)
-                        } else {
-                            format!("{t} {sid}")
-                        }
-                    };
-                    Some((workdir, cmd))
-                })
-                .collect::<Vec<_>>();
-
-            if items.is_empty() {
-                *ctx.last_error = Some(
-                    pick(
-                        ctx.lang,
-                        "没有可打开的会话（cwd 不可用或目录不存在）",
-                        "No sessions to open (cwd unavailable or missing)",
-                    )
-                    .to_string(),
-                );
-            } else {
-                open_wt_items(ctx, items);
-            }
-        }
+        history_controls::render_selected_session_actions(
+            ui,
+            ctx,
+            selected_id.as_str(),
+            workdir.as_str(),
+            selected_path.as_path(),
+        );
+        history_controls::render_open_selected_in_wt_button(
+            ui,
+            ctx,
+            history_controls::BatchOpenSource::Summaries(&sessions_snapshot),
+        );
     });
 
     ui.label(format!("id: {}", selected_id));
     ui.label(format!("dir: {}", workdir));
 
-    ui.horizontal(|ui| {
-        let mut hide = ctx.view.history.hide_tool_calls;
-        ui.checkbox(&mut hide, pick(ctx.lang, "隐藏工具调用", "Hide tool calls"));
-        if hide != ctx.view.history.hide_tool_calls {
-            ctx.view.history.hide_tool_calls = hide;
-            ctx.view.history.transcript_messages = history_transcript::filter_tool_calls(
-                ctx.view.history.transcript_raw_messages.clone(),
-                hide,
-            );
-            ctx.view.history.transcript_plain_key = None;
-            ctx.view.history.transcript_plain_text.clear();
-        }
-
-        ui.label(pick(ctx.lang, "显示", "View"));
-        egui::ComboBox::from_id_salt("history_transcript_view_vertical")
-            .selected_text(match ctx.view.history.transcript_view {
-                TranscriptViewMode::Messages => pick(ctx.lang, "消息列表", "Messages"),
-                TranscriptViewMode::PlainText => pick(ctx.lang, "纯文本", "Plain text"),
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut ctx.view.history.transcript_view,
-                    TranscriptViewMode::Messages,
-                    pick(ctx.lang, "消息列表", "Messages"),
-                );
-                ui.selectable_value(
-                    &mut ctx.view.history.transcript_view,
-                    TranscriptViewMode::PlainText,
-                    pick(ctx.lang, "纯文本", "Plain text"),
-                );
-            });
-
-        let mut full = ctx.view.history.transcript_full;
-        ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
-        if full != ctx.view.history.transcript_full {
-            ctx.view.history.transcript_full = full;
-            ctx.view.history.loaded_for = None;
-            cancel_transcript_load(&mut ctx.view.history);
-        }
-
-        ui.label(pick(ctx.lang, "尾部条数", "Tail"));
-        ui.add_enabled(
-            !ctx.view.history.transcript_full,
-            egui::DragValue::new(&mut ctx.view.history.transcript_tail)
-                .range(10..=500)
-                .speed(1),
-        );
-        if ctx.view.history.transcript_full {
-            ui.label(pick(ctx.lang, "（忽略尾部设置）", "(tail ignored)"));
-        }
-
-        if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
-            ctx.view.history.loaded_for = None;
-            cancel_transcript_load(&mut ctx.view.history);
-            if !ctx.view.history.auto_load_transcript {
-                ctx.view.history.auto_load_transcript = true;
-            }
-        }
-
-        if ui.button(pick(ctx.lang, "复制全部", "Copy all")).clicked() {
-            let mut out = String::new();
-            for msg in ctx.view.history.transcript_messages.iter() {
-                let ts = msg.timestamp.as_deref().unwrap_or("-");
-                let role = msg.role.as_str();
-                out.push_str(&format!("[{ts}] {role}:\n"));
-                out.push_str(msg.text.as_str());
-                out.push_str("\n\n");
-            }
-            ui.ctx().copy_text(out);
-            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-        }
-
-        if ui
-            .button(pick(ctx.lang, "复制当前消息", "Copy selected"))
-            .clicked()
-        {
-            let total = ctx.view.history.transcript_messages.len();
-            if total > 0 {
-                let idx = ctx
-                    .view
-                    .history
-                    .transcript_selected_msg_idx
-                    .min(total.saturating_sub(1));
-                let msg = &ctx.view.history.transcript_messages[idx];
-                let ts = msg.timestamp.as_deref().unwrap_or("-");
-                let role = msg.role.as_str();
-                let out = format!("[{ts}] {role}:\n{}\n", msg.text);
-                ui.ctx().copy_text(out);
-                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-            }
-        }
-
-        if ui.button(pick(ctx.lang, "首条", "First")).clicked() {
-            ctx.view.history.transcript_view = TranscriptViewMode::Messages;
-            ctx.view.history.transcript_selected_msg_idx = 0;
-            ctx.view.history.transcript_scroll_to_msg_idx = Some(0);
-        }
-
-        if ui.button(pick(ctx.lang, "末条", "Last")).clicked() {
-            let total = ctx.view.history.transcript_messages.len();
-            if total > 0 {
-                let last = total.saturating_sub(1);
-                ctx.view.history.transcript_view = TranscriptViewMode::Messages;
-                ctx.view.history.transcript_selected_msg_idx = last;
-                ctx.view.history.transcript_scroll_to_msg_idx = Some(last);
-            }
-        }
-    });
-
-    if let Some(err) = ctx.view.history.transcript_error.as_deref() {
-        ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
-    }
-
+    history_transcript::render_transcript_toolbar(ui, ctx, "history_transcript_view_vertical");
     let transcript_max_h = ui.available_height();
     history_transcript::render_transcript_body(
         ui,
@@ -1625,268 +1063,35 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let selected = selected.unwrap();
         let selected_id = selected.id.clone();
         let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
+        let selected_path = selected.path.clone();
+        let selected_first = selected.first_user_message.clone();
 
         let workdir =
             history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
-
-        let resume_cmd = {
-            let t = ctx.view.history.resume_cmd.trim();
-            if t.is_empty() {
-                format!("codex resume {selected_id}")
-            } else if t.contains("{id}") {
-                t.replace("{id}", &selected_id)
-            } else {
-                format!("{t} {selected_id}")
-            }
-        };
+        let all_day_sessions_snapshot = ctx.view.history.all_day_sessions.clone();
 
         cols[2].group(|ui| {
-            ui.label(pick(ctx.lang, "恢复", "Resume"));
+            history_controls::render_resume_group(
+                ui,
+                ctx,
+                history_controls::BatchOpenSource::DaySessions(&all_day_sessions_snapshot),
+                "history_wt_batch_mode_all_by_date",
+            );
 
             ui.horizontal(|ui| {
-                ui.label(pick(ctx.lang, "命令模板", "Template"));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut ctx.view.history.resume_cmd)
-                        .desired_width(260.0),
+                history_controls::render_selected_session_actions(
+                    ui,
+                    ctx,
+                    selected_id.as_str(),
+                    workdir.as_str(),
+                    selected_path.as_path(),
                 );
-                if resp.lost_focus()
-                    && ctx.gui_cfg.history.resume_cmd != ctx.view.history.resume_cmd
-                {
-                    ctx.gui_cfg.history.resume_cmd = ctx.view.history.resume_cmd.clone();
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-                if ui
-                    .button(pick(ctx.lang, "用 bypass", "Use bypass"))
-                    .clicked()
-                {
-                    ctx.view.history.resume_cmd =
-                        "codex --dangerously-bypass-approvals-and-sandbox resume {id}".to_string();
-                    ctx.gui_cfg.history.resume_cmd = ctx.view.history.resume_cmd.clone();
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label(pick(ctx.lang, "Shell", "Shell"));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut ctx.view.history.shell).desired_width(140.0),
-                );
-                if resp.lost_focus() && ctx.gui_cfg.history.shell != ctx.view.history.shell {
-                    ctx.gui_cfg.history.shell = ctx.view.history.shell.clone();
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-                let mut keep_open = ctx.view.history.keep_open;
-                ui.checkbox(&mut keep_open, pick(ctx.lang, "保持打开", "Keep open"));
-                if keep_open != ctx.view.history.keep_open {
-                    ctx.view.history.keep_open = keep_open;
-                    ctx.gui_cfg.history.keep_open = keep_open;
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label(pick(ctx.lang, "批量打开", "Batch open"));
-
-                let mut mode = ctx
-                    .gui_cfg
-                    .history
-                    .wt_batch_mode
-                    .trim()
-                    .to_ascii_lowercase();
-                if mode != "tabs" && mode != "windows" {
-                    mode = "tabs".to_string();
-                }
-                let mut selected_mode = mode.clone();
-                egui::ComboBox::from_id_salt("history_wt_batch_mode_all_by_date")
-                    .selected_text(match selected_mode.as_str() {
-                        "windows" => pick(ctx.lang, "每会话新窗口", "Window per session"),
-                        _ => pick(ctx.lang, "单窗口多标签", "One window (tabs)"),
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut selected_mode,
-                            "tabs".to_string(),
-                            pick(ctx.lang, "单窗口多标签", "One window (tabs)"),
-                        );
-                        ui.selectable_value(
-                            &mut selected_mode,
-                            "windows".to_string(),
-                            pick(ctx.lang, "每会话新窗口", "Window per session"),
-                        );
-                    });
-                if selected_mode != mode {
-                    ctx.gui_cfg.history.wt_batch_mode = selected_mode;
-                    if let Err(e) = ctx.gui_cfg.save() {
-                        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-                    }
-                }
-
-                let n = ctx.view.history.batch_selected_ids.len();
-                let label = match ctx.lang {
-                    Language::Zh => format!("在 wt 中打开选中({n})"),
-                    Language::En => format!("Open selected in wt ({n})"),
-                };
-                let can_open = cfg!(windows) && n > 0;
-                if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
-                    let items = ctx
-                        .view
-                        .history
-                        .all_day_sessions
-                        .iter()
-                        .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id))
-                        .filter_map(|s| {
-                            let cwd = s.cwd.as_deref()?.trim().to_string();
-                            if cwd.is_empty() || cwd == "-" {
-                                return None;
-                            }
-                            let workdir = history_workdir_from_cwd(
-                                cwd.as_str(),
-                                ctx.view.history.infer_git_root,
-                            );
-                            if !std::path::Path::new(workdir.as_str()).exists() {
-                                return None;
-                            }
-                            let sid = s.id.clone();
-                            let cmd = {
-                                let t = ctx.view.history.resume_cmd.trim();
-                                if t.is_empty() {
-                                    format!("codex resume {sid}")
-                                } else if t.contains("{id}") {
-                                    t.replace("{id}", &sid)
-                                } else {
-                                    format!("{t} {sid}")
-                                }
-                            };
-                            Some((workdir, cmd))
-                        })
-                        .collect::<Vec<_>>();
-
-                    if items.is_empty() {
-                        *ctx.last_error = Some(
-                            pick(
-                                ctx.lang,
-                                "没有可打开的会话（cwd 不可用或目录不存在）",
-                                "No sessions to open (cwd unavailable or missing)",
-                            )
-                            .to_string(),
-                        );
-                    } else {
-                        let mode = ctx
-                            .gui_cfg
-                            .history
-                            .wt_batch_mode
-                            .trim()
-                            .to_ascii_lowercase();
-                        let shell = ctx.view.history.shell.trim();
-                        let keep_open = ctx.view.history.keep_open;
-
-                        let result = if mode == "windows" {
-                            let mut last_err: Option<anyhow::Error> = None;
-                            for (cwd, cmd) in items.iter() {
-                                if let Err(e) = spawn_windows_terminal_wt_new_tab(
-                                    -1,
-                                    cwd.as_str(),
-                                    shell,
-                                    keep_open,
-                                    cmd.as_str(),
-                                ) {
-                                    last_err = Some(e);
-                                    break;
-                                }
-                            }
-                            match last_err {
-                                Some(e) => Err(e),
-                                None => Ok(()),
-                            }
-                        } else {
-                            spawn_windows_terminal_wt_tabs_in_one_window(&items, shell, keep_open)
-                        };
-
-                        match result {
-                            Ok(()) => {
-                                *ctx.last_info = Some(
-                                    pick(
-                                        ctx.lang,
-                                        "已启动 Windows Terminal",
-                                        "Started Windows Terminal",
-                                    )
-                                    .to_string(),
-                                );
-                            }
-                            Err(e) => *ctx.last_error = Some(format!("spawn wt failed: {e}")),
-                        }
-                    }
-                }
-            });
-
-            ui.horizontal(|ui| {
-                if ui
-                    .button(pick(ctx.lang, "复制 root+id", "Copy root+id"))
-                    .clicked()
-                {
-                    if workdir.trim().is_empty() || workdir == "-" {
-                        *ctx.last_error =
-                            Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
-                    } else {
-                        ui.ctx()
-                            .copy_text(format!("{} {}", workdir.trim(), selected_id));
-                        *ctx.last_info =
-                            Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-                    }
-                }
-
-                if ui
-                    .button(pick(ctx.lang, "复制 resume", "Copy resume"))
-                    .clicked()
-                {
-                    ui.ctx().copy_text(resume_cmd.clone());
-                    *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-                }
-
-                if cfg!(windows)
-                    && ui
-                        .button(pick(ctx.lang, "在 wt 中恢复", "Open in wt"))
-                        .clicked()
-                {
-                    if workdir.trim().is_empty() || workdir == "-" {
-                        *ctx.last_error =
-                            Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
-                    } else if !std::path::Path::new(workdir.trim()).exists() {
-                        *ctx.last_error = Some(format!(
-                            "{}: {}",
-                            pick(ctx.lang, "目录不存在", "Directory not found"),
-                            workdir.trim()
-                        ));
-                    } else if let Err(e) = spawn_windows_terminal_wt_new_tab(
-                        ctx.view.history.wt_window,
-                        workdir.trim(),
-                        ctx.view.history.shell.trim(),
-                        ctx.view.history.keep_open,
-                        &resume_cmd,
-                    ) {
-                        *ctx.last_error = Some(format!("spawn wt failed: {e}"));
-                    }
-                }
-
-                if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked()
-                    && let Err(e) = open_in_file_manager(&selected.path, true)
-                {
-                    *ctx.last_error = Some(format!("open session failed: {e}"));
-                }
             });
 
             ui.label(format!("id: {}", selected_id));
             ui.label(format!("dir: {}", workdir));
 
-            if let Some(first) = selected.first_user_message.as_deref() {
+            if let Some(first) = selected_first.as_deref() {
                 let mut text = first.to_string();
                 ui.add(
                     egui::TextEdit::multiline(&mut text)
@@ -1904,121 +1109,15 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 Some(ctx.view.history.transcript_tail)
             };
             let key = (selected_id.clone(), tail);
-            ensure_transcript_loading(ctx, selected.path.clone(), key);
+            ensure_transcript_loading(ctx, selected_path.clone(), key);
         }
 
         cols[2].add_space(6.0);
-        cols[2].horizontal(|ui| {
-            let mut hide = ctx.view.history.hide_tool_calls;
-            ui.checkbox(&mut hide, pick(ctx.lang, "隐藏工具调用", "Hide tool calls"));
-            if hide != ctx.view.history.hide_tool_calls {
-                ctx.view.history.hide_tool_calls = hide;
-                ctx.view.history.transcript_messages = history_transcript::filter_tool_calls(
-                    ctx.view.history.transcript_raw_messages.clone(),
-                    hide,
-                );
-                ctx.view.history.transcript_plain_key = None;
-                ctx.view.history.transcript_plain_text.clear();
-            }
-
-            ui.label(pick(ctx.lang, "显示", "View"));
-            egui::ComboBox::from_id_salt("history_transcript_view_all")
-                .selected_text(match ctx.view.history.transcript_view {
-                    TranscriptViewMode::Messages => pick(ctx.lang, "消息列表", "Messages"),
-                    TranscriptViewMode::PlainText => pick(ctx.lang, "纯文本", "Plain text"),
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut ctx.view.history.transcript_view,
-                        TranscriptViewMode::Messages,
-                        pick(ctx.lang, "消息列表", "Messages"),
-                    );
-                    ui.selectable_value(
-                        &mut ctx.view.history.transcript_view,
-                        TranscriptViewMode::PlainText,
-                        pick(ctx.lang, "纯文本", "Plain text"),
-                    );
-                });
-            let mut full = ctx.view.history.transcript_full;
-            ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
-            if full != ctx.view.history.transcript_full {
-                ctx.view.history.transcript_full = full;
-                ctx.view.history.loaded_for = None;
-                cancel_transcript_load(&mut ctx.view.history);
-            }
-
-            ui.label(pick(ctx.lang, "尾部条数", "Tail"));
-            ui.add_enabled(
-                !ctx.view.history.transcript_full,
-                egui::DragValue::new(&mut ctx.view.history.transcript_tail)
-                    .range(10..=500)
-                    .speed(1),
-            );
-            if ctx.view.history.transcript_full {
-                ui.label(pick(ctx.lang, "（忽略尾部设置）", "(tail ignored)"));
-            }
-
-            if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
-                ctx.view.history.loaded_for = None;
-                cancel_transcript_load(&mut ctx.view.history);
-                if !ctx.view.history.auto_load_transcript {
-                    ctx.view.history.auto_load_transcript = true;
-                }
-            }
-
-            if ui.button(pick(ctx.lang, "复制全部", "Copy all")).clicked() {
-                let mut out = String::new();
-                for msg in ctx.view.history.transcript_messages.iter() {
-                    let ts = msg.timestamp.as_deref().unwrap_or("-");
-                    let role = msg.role.as_str();
-                    out.push_str(&format!("[{ts}] {role}:\n"));
-                    out.push_str(msg.text.as_str());
-                    out.push_str("\n\n");
-                }
-                ui.ctx().copy_text(out);
-                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-            }
-
-            if ui
-                .button(pick(ctx.lang, "复制当前消息", "Copy selected"))
-                .clicked()
-            {
-                let total = ctx.view.history.transcript_messages.len();
-                if total > 0 {
-                    let idx = ctx
-                        .view
-                        .history
-                        .transcript_selected_msg_idx
-                        .min(total.saturating_sub(1));
-                    let msg = &ctx.view.history.transcript_messages[idx];
-                    let ts = msg.timestamp.as_deref().unwrap_or("-");
-                    let role = msg.role.as_str();
-                    let out = format!("[{ts}] {role}:\n{}\n", msg.text);
-                    ui.ctx().copy_text(out);
-                    *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-                }
-            }
-
-            if ui.button(pick(ctx.lang, "首条", "First")).clicked() {
-                ctx.view.history.transcript_view = TranscriptViewMode::Messages;
-                ctx.view.history.transcript_selected_msg_idx = 0;
-                ctx.view.history.transcript_scroll_to_msg_idx = Some(0);
-            }
-
-            if ui.button(pick(ctx.lang, "末条", "Last")).clicked() {
-                let total = ctx.view.history.transcript_messages.len();
-                if total > 0 {
-                    let last = total.saturating_sub(1);
-                    ctx.view.history.transcript_view = TranscriptViewMode::Messages;
-                    ctx.view.history.transcript_selected_msg_idx = last;
-                    ctx.view.history.transcript_scroll_to_msg_idx = Some(last);
-                }
-            }
-        });
-
-        if let Some(err) = ctx.view.history.transcript_error.as_deref() {
-            cols[2].colored_label(egui::Color32::from_rgb(200, 120, 40), err);
-        }
+        history_transcript::render_transcript_toolbar(
+            &mut cols[2],
+            ctx,
+            "history_transcript_view_all",
+        );
 
         history_transcript::render_transcript_body(
             &mut cols[2],
@@ -2113,16 +1212,6 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
     };
 
     let workdir = history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
-    let resume_cmd = {
-        let t = ctx.view.history.resume_cmd.trim();
-        if t.is_empty() {
-            format!("codex resume {selected_id}")
-        } else if t.contains("{id}") {
-            t.replace("{id}", &selected_id)
-        } else {
-            format!("{t} {selected_id}")
-        }
-    };
 
     if ctx.view.history.auto_load_transcript {
         let tail = if ctx.view.history.transcript_full {
@@ -2134,268 +1223,26 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
         ensure_transcript_loading(ctx, selected_path.clone(), key);
     }
 
+    let all_day_sessions_snapshot = ctx.view.history.all_day_sessions.clone();
     ui.horizontal(|ui| {
-        if ui
-            .button(pick(ctx.lang, "复制 root+id", "Copy root+id"))
-            .clicked()
-        {
-            if workdir.trim().is_empty() || workdir == "-" {
-                *ctx.last_error = Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
-            } else {
-                ui.ctx()
-                    .copy_text(format!("{} {}", workdir.trim(), selected_id));
-                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-            }
-        }
-
-        if ui
-            .button(pick(ctx.lang, "复制 resume", "Copy resume"))
-            .clicked()
-        {
-            ui.ctx().copy_text(resume_cmd.clone());
-            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-        }
-
-        if cfg!(windows)
-            && ui
-                .button(pick(ctx.lang, "在 wt 中恢复", "Open in wt"))
-                .clicked()
-        {
-            if workdir.trim().is_empty() || workdir == "-" {
-                *ctx.last_error = Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
-            } else if !std::path::Path::new(workdir.trim()).exists() {
-                *ctx.last_error = Some(format!(
-                    "{}: {}",
-                    pick(ctx.lang, "目录不存在", "Directory not found"),
-                    workdir.trim()
-                ));
-            } else if let Err(e) = spawn_windows_terminal_wt_new_tab(
-                ctx.view.history.wt_window,
-                workdir.trim(),
-                ctx.view.history.shell.trim(),
-                ctx.view.history.keep_open,
-                &resume_cmd,
-            ) {
-                *ctx.last_error = Some(format!("spawn wt failed: {e}"));
-            }
-        }
-
-        if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked()
-            && let Err(e) = open_in_file_manager(&selected_path, true)
-        {
-            *ctx.last_error = Some(format!("open session failed: {e}"));
-        }
-
-        let n = ctx.view.history.batch_selected_ids.len();
-        let label = match ctx.lang {
-            Language::Zh => format!("在 wt 中打开选中({n})"),
-            Language::En => format!("Open selected in wt ({n})"),
-        };
-        let can_open = cfg!(windows) && n > 0;
-        if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
-            let items = ctx
-                .view
-                .history
-                .all_day_sessions
-                .iter()
-                .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id))
-                .filter_map(|s| {
-                    let cwd = s.cwd.as_deref()?.trim().to_string();
-                    if cwd.is_empty() || cwd == "-" {
-                        return None;
-                    }
-                    let workdir =
-                        history_workdir_from_cwd(cwd.as_str(), ctx.view.history.infer_git_root);
-                    if !std::path::Path::new(workdir.as_str()).exists() {
-                        return None;
-                    }
-                    let sid = s.id.clone();
-                    let cmd = {
-                        let t = ctx.view.history.resume_cmd.trim();
-                        if t.is_empty() {
-                            format!("codex resume {sid}")
-                        } else if t.contains("{id}") {
-                            t.replace("{id}", &sid)
-                        } else {
-                            format!("{t} {sid}")
-                        }
-                    };
-                    Some((workdir, cmd))
-                })
-                .collect::<Vec<_>>();
-
-            if items.is_empty() {
-                *ctx.last_error = Some(
-                    pick(
-                        ctx.lang,
-                        "没有可打开的会话（cwd 不可用或目录不存在）",
-                        "No sessions to open (cwd unavailable or missing)",
-                    )
-                    .to_string(),
-                );
-            } else {
-                let mode = ctx
-                    .gui_cfg
-                    .history
-                    .wt_batch_mode
-                    .trim()
-                    .to_ascii_lowercase();
-                let shell = ctx.view.history.shell.trim();
-                let keep_open = ctx.view.history.keep_open;
-
-                let result = if mode == "windows" {
-                    let mut last_err: Option<anyhow::Error> = None;
-                    for (cwd, cmd) in items.iter() {
-                        if let Err(e) = spawn_windows_terminal_wt_new_tab(
-                            -1,
-                            cwd.as_str(),
-                            shell,
-                            keep_open,
-                            cmd.as_str(),
-                        ) {
-                            last_err = Some(e);
-                            break;
-                        }
-                    }
-                    match last_err {
-                        Some(e) => Err(e),
-                        None => Ok(()),
-                    }
-                } else {
-                    spawn_windows_terminal_wt_tabs_in_one_window(&items, shell, keep_open)
-                };
-
-                match result {
-                    Ok(()) => {
-                        *ctx.last_info = Some(
-                            pick(
-                                ctx.lang,
-                                "已启动 Windows Terminal",
-                                "Started Windows Terminal",
-                            )
-                            .to_string(),
-                        );
-                    }
-                    Err(e) => *ctx.last_error = Some(format!("spawn wt failed: {e}")),
-                }
-            }
-        }
+        history_controls::render_selected_session_actions(
+            ui,
+            ctx,
+            selected_id.as_str(),
+            workdir.as_str(),
+            selected_path.as_path(),
+        );
+        history_controls::render_open_selected_in_wt_button(
+            ui,
+            ctx,
+            history_controls::BatchOpenSource::DaySessions(&all_day_sessions_snapshot),
+        );
     });
 
     ui.label(format!("id: {}", selected_id));
     ui.label(format!("dir: {}", workdir));
 
-    ui.horizontal(|ui| {
-        let mut hide = ctx.view.history.hide_tool_calls;
-        ui.checkbox(&mut hide, pick(ctx.lang, "隐藏工具调用", "Hide tool calls"));
-        if hide != ctx.view.history.hide_tool_calls {
-            ctx.view.history.hide_tool_calls = hide;
-            ctx.view.history.transcript_messages = history_transcript::filter_tool_calls(
-                ctx.view.history.transcript_raw_messages.clone(),
-                hide,
-            );
-            ctx.view.history.transcript_plain_key = None;
-            ctx.view.history.transcript_plain_text.clear();
-        }
-
-        ui.label(pick(ctx.lang, "显示", "View"));
-        egui::ComboBox::from_id_salt("history_transcript_view_all_vertical")
-            .selected_text(match ctx.view.history.transcript_view {
-                TranscriptViewMode::Messages => pick(ctx.lang, "消息列表", "Messages"),
-                TranscriptViewMode::PlainText => pick(ctx.lang, "纯文本", "Plain text"),
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut ctx.view.history.transcript_view,
-                    TranscriptViewMode::Messages,
-                    pick(ctx.lang, "消息列表", "Messages"),
-                );
-                ui.selectable_value(
-                    &mut ctx.view.history.transcript_view,
-                    TranscriptViewMode::PlainText,
-                    pick(ctx.lang, "纯文本", "Plain text"),
-                );
-            });
-        let mut full = ctx.view.history.transcript_full;
-        ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
-        if full != ctx.view.history.transcript_full {
-            ctx.view.history.transcript_full = full;
-            ctx.view.history.loaded_for = None;
-            cancel_transcript_load(&mut ctx.view.history);
-        }
-
-        ui.label(pick(ctx.lang, "尾部条数", "Tail"));
-        ui.add_enabled(
-            !ctx.view.history.transcript_full,
-            egui::DragValue::new(&mut ctx.view.history.transcript_tail)
-                .range(10..=500)
-                .speed(1),
-        );
-        if ctx.view.history.transcript_full {
-            ui.label(pick(ctx.lang, "（忽略尾部设置）", "(tail ignored)"));
-        }
-
-        if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
-            ctx.view.history.loaded_for = None;
-            cancel_transcript_load(&mut ctx.view.history);
-            if !ctx.view.history.auto_load_transcript {
-                ctx.view.history.auto_load_transcript = true;
-            }
-        }
-
-        if ui.button(pick(ctx.lang, "复制全部", "Copy all")).clicked() {
-            let mut out = String::new();
-            for msg in ctx.view.history.transcript_messages.iter() {
-                let ts = msg.timestamp.as_deref().unwrap_or("-");
-                let role = msg.role.as_str();
-                out.push_str(&format!("[{ts}] {role}:\n"));
-                out.push_str(msg.text.as_str());
-                out.push_str("\n\n");
-            }
-            ui.ctx().copy_text(out);
-            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-        }
-
-        if ui
-            .button(pick(ctx.lang, "复制当前消息", "Copy selected"))
-            .clicked()
-        {
-            let total = ctx.view.history.transcript_messages.len();
-            if total > 0 {
-                let idx = ctx
-                    .view
-                    .history
-                    .transcript_selected_msg_idx
-                    .min(total.saturating_sub(1));
-                let msg = &ctx.view.history.transcript_messages[idx];
-                let ts = msg.timestamp.as_deref().unwrap_or("-");
-                let role = msg.role.as_str();
-                let out = format!("[{ts}] {role}:\n{}\n", msg.text);
-                ui.ctx().copy_text(out);
-                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
-            }
-        }
-
-        if ui.button(pick(ctx.lang, "首条", "First")).clicked() {
-            ctx.view.history.transcript_view = TranscriptViewMode::Messages;
-            ctx.view.history.transcript_selected_msg_idx = 0;
-            ctx.view.history.transcript_scroll_to_msg_idx = Some(0);
-        }
-
-        if ui.button(pick(ctx.lang, "末条", "Last")).clicked() {
-            let total = ctx.view.history.transcript_messages.len();
-            if total > 0 {
-                let last = total.saturating_sub(1);
-                ctx.view.history.transcript_view = TranscriptViewMode::Messages;
-                ctx.view.history.transcript_selected_msg_idx = last;
-                ctx.view.history.transcript_scroll_to_msg_idx = Some(last);
-            }
-        }
-    });
-
-    if let Some(err) = ctx.view.history.transcript_error.as_deref() {
-        ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
-    }
+    history_transcript::render_transcript_toolbar(ui, ctx, "history_transcript_view_all_vertical");
 
     let transcript_max_h = ui.available_height();
     history_transcript::render_transcript_body(
@@ -2406,7 +1253,7 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
     );
 }
 
-fn cancel_transcript_load(state: &mut HistoryViewState) {
+pub(in crate::gui::pages) fn cancel_transcript_load(state: &mut HistoryViewState) {
     if let Some(load) = state.transcript_load.take() {
         load.join.abort();
     }
@@ -2461,15 +1308,7 @@ fn poll_transcript_loader(ctx: &mut PageCtx<'_>) {
 fn select_session_and_reset_transcript(ctx: &mut PageCtx<'_>, idx: usize, id: String) {
     ctx.view.history.selected_idx = idx;
     ctx.view.history.selected_id = Some(id);
-    ctx.view.history.loaded_for = None;
-    cancel_transcript_load(&mut ctx.view.history);
-    ctx.view.history.transcript_raw_messages.clear();
-    ctx.view.history.transcript_messages.clear();
-    ctx.view.history.transcript_error = None;
-    ctx.view.history.transcript_plain_key = None;
-    ctx.view.history.transcript_plain_text.clear();
-    ctx.view.history.transcript_selected_msg_idx = 0;
-    ctx.view.history.transcript_scroll_to_msg_idx = None;
+    history_controls::reset_transcript_view_after_session_switch(ctx);
 }
 
 fn ensure_transcript_loading(
