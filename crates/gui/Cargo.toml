@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 codex-helper-core = { path = "../core", features = ["gui"] }
-eframe = "0.29.1"
-tray-icon = "0.20.1"
+eframe = "0.33.3"
+tray-icon = "0.21.3"
 fontdb = "0.16.2"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "fs"] }
 serde = { version = "1.0.228", features = ["derive"] }

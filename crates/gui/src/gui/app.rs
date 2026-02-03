@@ -856,7 +856,7 @@ fn install_fonts(ctx: &egui::Context) {
     #[cfg(windows)]
     {
         if let Some((name, data)) = load_windows_cjk_font() {
-            fonts.font_data.insert(name.clone(), data);
+            fonts.font_data.insert(name.clone(), data.into());
             if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                 list.insert(0, name.clone());
             }
@@ -878,7 +878,7 @@ fn install_fonts(ctx: &egui::Context) {
     #[cfg(not(windows))]
     {
         if let Some((name, data)) = load_system_cjk_font() {
-            fonts.font_data.insert(name.clone(), data);
+            fonts.font_data.insert(name.clone(), data.into());
             if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                 list.insert(0, name.clone());
             }

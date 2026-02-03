@@ -544,6 +544,7 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ui.label(pick(ctx.lang, "（未发现可用代理）", "(no proxies found)"));
         } else {
             egui::ScrollArea::vertical()
+                .id_salt("setup_discovered_proxies_scroll")
                 .max_height(160.0)
                 .show(ui, |ui| {
                     egui::Grid::new("setup_discovered_proxies_grid")
@@ -934,22 +935,24 @@ fn render_doctor(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     ui.separator();
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for c in &report.checks {
-            ui.horizontal(|ui| {
-                let label = match c.status {
-                    DoctorStatus::Ok => "OK",
-                    DoctorStatus::Info => "INFO",
-                    DoctorStatus::Warn => "WARN",
-                    DoctorStatus::Fail => "FAIL",
-                };
-                ui.colored_label(status_color(c.status), label);
-                ui.label(c.id);
-            });
-            ui.label(&c.message);
-            ui.separator();
-        }
-    });
+    egui::ScrollArea::vertical()
+        .id_salt("doctor_report_scroll")
+        .show(ui, |ui| {
+            for c in &report.checks {
+                ui.horizontal(|ui| {
+                    let label = match c.status {
+                        DoctorStatus::Ok => "OK",
+                        DoctorStatus::Info => "INFO",
+                        DoctorStatus::Warn => "WARN",
+                        DoctorStatus::Fail => "FAIL",
+                    };
+                    ui.colored_label(status_color(c.status), label);
+                    ui.label(c.id);
+                });
+                ui.label(&c.message);
+                ui.separator();
+            }
+        });
 }
 
 fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
@@ -1181,6 +1184,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     ui.label(pick(ctx.lang, "（未发现可用代理）", "(no proxies found)"));
                 } else {
                     egui::ScrollArea::vertical()
+                        .id_salt("overview_discovered_proxies_scroll")
                         .max_height(180.0)
                         .show(ui, |ui| {
                             egui::Grid::new("discovered_proxies_grid")
@@ -1477,6 +1481,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         "Model routing warnings (recommended to fix):",
                     ));
                     egui::ScrollArea::vertical()
+                        .id_salt("overview_model_routing_warnings_scroll")
                         .max_height(120.0)
                         .show(ui, |ui| {
                             for w in warnings {
@@ -2217,6 +2222,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[0].heading(pick(ctx.lang, "列表", "List"));
         cols[0].add_space(4.0);
         egui::ScrollArea::vertical()
+            .id_salt("sessions_list_scroll")
             .max_height(520.0)
             .show(&mut cols[0], |ui| {
                 let now = now_ms();
@@ -2699,6 +2705,7 @@ fn render_requests(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[0].add_space(4.0);
 
         egui::ScrollArea::vertical()
+            .id_salt("requests_list_scroll")
             .max_height(520.0)
             .show(&mut cols[0], |ui| {
                 let now = now_ms();
@@ -3020,6 +3027,7 @@ fn render_stats(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.columns(2, |cols| {
         cols[0].label(pick(ctx.lang, "Configs", "Configs"));
         egui::ScrollArea::vertical()
+            .id_salt("stats_top_configs_scroll")
             .max_height(220.0)
             .show(&mut cols[0], |ui| {
                 for (name, b) in rollup.by_config.iter().take(30) {
@@ -3035,6 +3043,7 @@ fn render_stats(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         cols[1].label(pick(ctx.lang, "Providers", "Providers"));
         egui::ScrollArea::vertical()
+            .id_salt("stats_top_providers_scroll")
             .max_height(220.0)
             .show(&mut cols[1], |ui| {
                 for (name, b) in rollup.by_provider.iter().take(30) {
@@ -3563,6 +3572,7 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[0].add_space(4.0);
         let mut visible_ids: Vec<String> = Vec::new();
         egui::ScrollArea::vertical()
+            .id_salt("history_sessions_scroll")
             .max_height(520.0)
             .show(&mut cols[0], |ui| {
                 let group_enabled = ctx.view.history.scope == HistoryScope::GlobalRecent
@@ -4410,11 +4420,10 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         {
             let total = ctx.view.history.all_dates.len();
             let row_h = 22.0;
-            egui::ScrollArea::vertical().max_height(520.0).show_rows(
-                &mut cols[0],
-                row_h,
-                total,
-                |ui, range| {
+            egui::ScrollArea::vertical()
+                .id_salt("history_all_by_date_dates_scroll")
+                .max_height(520.0)
+                .show_rows(&mut cols[0], row_h, total, |ui, range| {
                     for row in range {
                         let d = &ctx.view.history.all_dates[row];
                         let selected = ctx
@@ -4428,8 +4437,7 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             ctx.view.history.loaded_day_for = None;
                         }
                     }
-                },
-            );
+                });
         }
 
         cols[1].heading(pick(ctx.lang, "会话", "Sessions"));
@@ -4470,11 +4478,10 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         {
             let total = visible_indices.len();
             let row_h = 22.0;
-            egui::ScrollArea::vertical().max_height(520.0).show_rows(
-                &mut cols[1],
-                row_h,
-                total,
-                |ui, range| {
+            egui::ScrollArea::vertical()
+                .id_salt("history_all_by_date_sessions_scroll")
+                .max_height(520.0)
+                .show_rows(&mut cols[1], row_h, total, |ui, range| {
                     for row in range {
                         let idx = visible_indices[row];
                         let s = &ctx.view.history.all_day_sessions[idx];
@@ -4534,8 +4541,7 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             }
                         });
                     }
-                },
-            );
+                });
         }
 
         if action_batch_clear {
@@ -5180,7 +5186,9 @@ fn render_transcript_body(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, max_height: 
             let total = ctx.view.history.transcript_messages.len();
             let row_h = 22.0;
 
-            let mut scroll = egui::ScrollArea::vertical().max_height(list_h);
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt("history_transcript_messages_scroll")
+                .max_height(list_h);
             if let Some(target) = ctx.view.history.transcript_scroll_to_msg_idx.take() {
                 let offset = (row_h * target as f32 - list_h * 0.5).max(0.0);
                 scroll = scroll.vertical_scroll_offset(offset);
@@ -5268,6 +5276,7 @@ fn render_transcript_body(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, max_height: 
             }
 
             egui::ScrollArea::vertical()
+                .id_salt("history_transcript_plain_scroll")
                 .max_height(max_height)
                 .show(ui, |ui| {
                     ui.add(
@@ -5980,6 +5989,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             cols[0].heading(pick(ctx.lang, "配置列表", "Configs"));
             cols[0].add_space(4.0);
             egui::ScrollArea::vertical()
+                .id_salt("config_configs_scroll")
                 .max_height(520.0)
                 .show(&mut cols[0], |ui| {
                     for name in names.iter() {
@@ -6185,6 +6195,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         h.upstreams.len()
                     ));
                     egui::ScrollArea::vertical()
+                        .id_salt("config_health_upstreams_scroll")
                         .max_height(160.0)
                         .show(&mut cols[1], |ui| {
                             let max = 12usize;
