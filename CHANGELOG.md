@@ -29,6 +29,10 @@ All notable changes to this project will be documented in this file.
   Safer GUI startup: do not auto-attach to an existing proxy by default (avoids interfering with a proxy started from TUI); service/port follow the config.
 - GUI `History`/Transcript 性能优化：对话加载改为后台任务（避免 UI 卡死），并将消息列表改为虚拟滚动渲染，长对话也更流畅。
   GUI `History`/Transcript performance: load transcripts in background (non-blocking UI) and render the message list via virtual scrolling for smoother long sessions.
+- GUI `History` 内部重构：拆分组件并减少不必要的会话列表 clone，避免为绕过 borrow-checker 引入的额外内存开销。
+  GUI `History` internal refactor: componentized UI and removed unnecessary session list clones to avoid extra allocations used as a borrow-checker workaround.
+- GUI `History` 滚动体验更稳定：统一跨布局的 ScrollArea 标识，使窗口大小变化时更容易保留滚动/选择状态。
+  GUI `History` scrolling is more stable: unify ScrollArea IDs across layouts to better preserve scroll/selection state while resizing.
 - 内部重构：将代码拆分为 workspace 的 `codex-helper-core` / `codex-helper-tui` / `codex-helper-gui` 三个 crate，降低耦合并提升可维护性（对外 CLI/GUI 使用方式不变）。
   Internal refactor: split into a workspace with `codex-helper-core` / `codex-helper-tui` / `codex-helper-gui` crates to reduce coupling and improve maintainability (CLI/GUI usage unchanged).
 
