@@ -101,6 +101,15 @@ pub struct HistoryConfig {
     /// Workdir mode for "copy root+id" and "open in wt": `cwd` or `git_root`.
     #[serde(default = "default_history_workdir_mode")]
     pub workdir_mode: String,
+    /// Layout mode for history page: `auto` / `horizontal` / `vertical`.
+    #[serde(default = "default_history_layout_mode")]
+    pub layout_mode: String,
+    /// Default width for the sessions panel (when layout is horizontal).
+    #[serde(default = "default_history_sessions_panel_width")]
+    pub sessions_panel_width: f32,
+    /// Default height for the sessions panel (when layout is vertical).
+    #[serde(default = "default_history_sessions_panel_height")]
+    pub sessions_panel_height: f32,
     /// When grouped by project: open the most recent N sessions in that group.
     #[serde(default = "default_history_group_open_recent_n")]
     pub group_open_recent_n: usize,
@@ -114,6 +123,9 @@ impl Default for HistoryConfig {
             keep_open: default_true(),
             resume_cmd: default_history_resume_cmd(),
             workdir_mode: default_history_workdir_mode(),
+            layout_mode: default_history_layout_mode(),
+            sessions_panel_width: default_history_sessions_panel_width(),
+            sessions_panel_height: default_history_sessions_panel_height(),
             group_open_recent_n: default_history_group_open_recent_n(),
         }
     }
@@ -235,6 +247,18 @@ fn default_history_resume_cmd() -> String {
 
 fn default_history_workdir_mode() -> String {
     "cwd".to_string()
+}
+
+fn default_history_layout_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_history_sessions_panel_width() -> f32 {
+    420.0
+}
+
+fn default_history_sessions_panel_height() -> f32 {
+    280.0
 }
 
 fn default_history_group_open_recent_n() -> usize {

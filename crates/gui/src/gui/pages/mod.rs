@@ -138,6 +138,9 @@ pub struct HistoryViewState {
     pub resume_cmd: String,
     pub shell: String,
     pub keep_open: bool,
+    pub layout_mode: String,
+    pub sessions_panel_width: f32,
+    pub sessions_panel_height: f32,
     pub wt_window: i32,
     pub batch_selected_ids: HashSet<String>,
     pub group_by_workdir: bool,
@@ -178,6 +181,33 @@ pub enum HistoryScope {
     AllByDate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedHistoryLayout {
+    Horizontal,
+    Vertical,
+}
+
+fn resolve_history_layout(layout_mode: &str, available_width: f32) -> ResolvedHistoryLayout {
+    match layout_mode.trim().to_ascii_lowercase().as_str() {
+        "horizontal" | "h" => ResolvedHistoryLayout::Horizontal,
+        "vertical" | "v" => ResolvedHistoryLayout::Vertical,
+        "auto" | "" => {
+            if available_width < 980.0 {
+                ResolvedHistoryLayout::Vertical
+            } else {
+                ResolvedHistoryLayout::Horizontal
+            }
+        }
+        _ => {
+            if available_width < 980.0 {
+                ResolvedHistoryLayout::Vertical
+            } else {
+                ResolvedHistoryLayout::Horizontal
+            }
+        }
+    }
+}
+
 impl Default for HistoryViewState {
     fn default() -> Self {
         Self {
@@ -197,6 +227,9 @@ impl Default for HistoryViewState {
             resume_cmd: "codex resume {id}".to_string(),
             shell: "pwsh".to_string(),
             keep_open: true,
+            layout_mode: "auto".to_string(),
+            sessions_panel_width: 420.0,
+            sessions_panel_height: 280.0,
             wt_window: -1,
             batch_selected_ids: HashSet::new(),
             group_by_workdir: true,
@@ -3204,6 +3237,44 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
             }
         }
+
+        ui.separator();
+        ui.label(pick(ctx.lang, "布局", "Layout"));
+        let mut mode = ctx.view.history.layout_mode.trim().to_ascii_lowercase();
+        if mode != "auto" && mode != "horizontal" && mode != "vertical" {
+            mode = "auto".to_string();
+        }
+        let mut selected_mode = mode.clone();
+        egui::ComboBox::from_id_salt("history_layout_mode")
+            .selected_text(match selected_mode.as_str() {
+                "horizontal" => pick(ctx.lang, "左右", "Horizontal"),
+                "vertical" => pick(ctx.lang, "上下", "Vertical"),
+                _ => pick(ctx.lang, "自动", "Auto"),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut selected_mode,
+                    "auto".to_string(),
+                    pick(ctx.lang, "自动", "Auto"),
+                );
+                ui.selectable_value(
+                    &mut selected_mode,
+                    "horizontal".to_string(),
+                    pick(ctx.lang, "左右", "Horizontal"),
+                );
+                ui.selectable_value(
+                    &mut selected_mode,
+                    "vertical".to_string(),
+                    pick(ctx.lang, "上下", "Vertical"),
+                );
+            });
+        if selected_mode != mode {
+            ctx.view.history.layout_mode = selected_mode.clone();
+            ctx.gui_cfg.history.layout_mode = selected_mode;
+            if let Err(e) = ctx.gui_cfg.save() {
+                *ctx.last_error = Some(format!("save gui config failed: {e}"));
+            }
+        }
     });
 
     if ctx.view.history.scope == HistoryScope::AllByDate {
@@ -3552,6 +3623,12 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     }
 
     ui.add_space(6.0);
+    let layout =
+        resolve_history_layout(ctx.view.history.layout_mode.as_str(), ui.available_width());
+    if layout == ResolvedHistoryLayout::Vertical {
+        render_history_vertical(ui, ctx);
+        return;
+    }
     ui.columns(2, |cols| {
         cols[0].heading(pick(ctx.lang, "会话列表", "Sessions"));
         cols[0].add_space(4.0);
@@ -4284,6 +4361,539 @@ fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     });
 }
 
+fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
+    let max_h = ui.available_height();
+    let desired_h = ctx
+        .view
+        .history
+        .sessions_panel_height
+        .clamp(160.0, max_h * 0.55);
+
+    let mut action_batch_select_visible = false;
+    let mut action_batch_clear = false;
+    let mut pending_select: Option<(usize, String)> = None;
+    let mut visible_ids: Vec<String> = Vec::new();
+
+    let resp = egui::TopBottomPanel::top("history_vertical_sessions_panel")
+        .resizable(true)
+        .default_height(desired_h)
+        .min_height(160.0)
+        .max_height(max_h * 0.8)
+        .show_inside(ui, |ui| {
+            ui.heading(pick(ctx.lang, "会话列表", "Sessions"));
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button(pick(ctx.lang, "全选可见", "Select visible"))
+                    .clicked()
+                {
+                    action_batch_select_visible = true;
+                }
+                if ui.button(pick(ctx.lang, "清空选择", "Clear")).clicked() {
+                    action_batch_clear = true;
+                }
+            });
+            ui.add_space(4.0);
+
+            let list_max_h = ui.available_height().max(200.0);
+            egui::ScrollArea::vertical()
+                .id_salt("history_sessions_scroll_vertical")
+                .max_height(list_max_h)
+                .show(ui, |ui| {
+                    let group_enabled = ctx.view.history.scope == HistoryScope::GlobalRecent
+                        && ctx.view.history.group_by_workdir;
+
+                    if group_enabled {
+                        #[derive(Debug)]
+                        struct WorkdirGroup {
+                            key: String,
+                            indices: Vec<usize>,
+                            last_mtime_ms: u64,
+                        }
+
+                        let now = now_ms();
+                        let mut order: Vec<String> = Vec::new();
+                        let mut groups: std::collections::HashMap<String, WorkdirGroup> =
+                            std::collections::HashMap::new();
+
+                        for (idx, s) in ctx.view.history.sessions.iter().enumerate() {
+                            let key = s
+                                .cwd
+                                .as_deref()
+                                .map(|cwd| {
+                                    history_workdir_from_cwd(cwd, ctx.view.history.infer_git_root)
+                                })
+                                .unwrap_or_else(|| "-".to_string());
+                            let mtime_ms = path_mtime_ms(s.path.as_path());
+
+                            if !groups.contains_key(key.as_str()) {
+                                order.push(key.clone());
+                                groups.insert(
+                                    key.clone(),
+                                    WorkdirGroup {
+                                        key: key.clone(),
+                                        indices: Vec::new(),
+                                        last_mtime_ms: mtime_ms,
+                                    },
+                                );
+                            }
+                            if let Some(g) = groups.get_mut(key.as_str()) {
+                                g.indices.push(idx);
+                                g.last_mtime_ms = g.last_mtime_ms.max(mtime_ms);
+                            }
+                        }
+
+                        let mut ordered = order
+                            .into_iter()
+                            .filter_map(|k| groups.remove(k.as_str()))
+                            .collect::<Vec<_>>();
+                        ordered.sort_by_key(|g| std::cmp::Reverse(g.last_mtime_ms));
+
+                        for g in ordered.into_iter() {
+                            let key = g.key.clone();
+                            let ok_n = g.indices.len();
+
+                            let header = match ctx.lang {
+                                Language::Zh => format!("{}  ({})", shorten(&key, 44), ok_n),
+                                Language::En => format!("{}  ({})", shorten(&key, 44), ok_n),
+                            };
+
+                            let mut collapsed =
+                                ctx.view.history.collapsed_workdirs.contains(key.as_str());
+
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(!collapsed, header.as_str()).clicked() {
+                                    collapsed = !collapsed;
+                                    if collapsed {
+                                        ctx.view.history.collapsed_workdirs.insert(key.clone());
+                                    } else {
+                                        ctx.view.history.collapsed_workdirs.remove(key.as_str());
+                                    }
+                                }
+
+                                ui.add_space(6.0);
+                                ui.colored_label(
+                                    egui::Color32::from_gray(120),
+                                    format!(
+                                        "{}{}",
+                                        pick(ctx.lang, "更新", "Updated"),
+                                        format_age(now, Some(g.last_mtime_ms))
+                                    ),
+                                );
+                            });
+
+                            if collapsed {
+                                ui.add_space(4.0);
+                                continue;
+                            }
+
+                            for &idx in g.indices.iter() {
+                                let Some(s) = ctx.view.history.sessions.get(idx) else {
+                                    continue;
+                                };
+                                visible_ids.push(s.id.clone());
+
+                                let selected = idx == ctx.view.history.selected_idx;
+                                let id_short = short_sid(&s.id, 16);
+                                let rounds = s.rounds;
+                                let last = s
+                                    .last_response_at
+                                    .as_deref()
+                                    .or(s.updated_at.as_deref())
+                                    .unwrap_or("-");
+                                let first = s.first_user_message.as_deref().unwrap_or("-");
+                                let label = format!(
+                                    "{id_short}  r={rounds}  {last}  {}",
+                                    shorten(first, 46)
+                                );
+
+                                let sid = s.id.clone();
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    let mut checked =
+                                        ctx.view.history.batch_selected_ids.contains(&sid);
+                                    if ui.checkbox(&mut checked, "").changed() {
+                                        if checked {
+                                            ctx.view.history.batch_selected_ids.insert(sid.clone());
+                                        } else {
+                                            ctx.view.history.batch_selected_ids.remove(&sid);
+                                        }
+                                    }
+
+                                    if ui.selectable_label(selected, label).clicked() {
+                                        pending_select = Some((idx, sid.clone()));
+                                    }
+                                });
+                            }
+                            ui.add_space(6.0);
+                        }
+                    } else {
+                        for (idx, s) in ctx.view.history.sessions.iter().enumerate() {
+                            visible_ids.push(s.id.clone());
+
+                            let selected = idx == ctx.view.history.selected_idx;
+                            let id_short = short_sid(&s.id, 16);
+                            let rounds = s.rounds;
+                            let last = s
+                                .last_response_at
+                                .as_deref()
+                                .or(s.updated_at.as_deref())
+                                .unwrap_or("-");
+                            let first = s.first_user_message.as_deref().unwrap_or("-");
+                            let label = match ctx.view.history.scope {
+                                HistoryScope::CurrentProject => {
+                                    let cwd = s
+                                        .cwd
+                                        .as_deref()
+                                        .map(|v| shorten(basename(v), 22))
+                                        .unwrap_or_else(|| "-".to_string());
+                                    format!(
+                                        "{id_short}  r={rounds}  {cwd}  {last}  {}",
+                                        shorten(first, 40)
+                                    )
+                                }
+                                _ => {
+                                    let root = s
+                                        .cwd
+                                        .as_deref()
+                                        .map(|cwd| {
+                                            history_workdir_from_cwd(
+                                                cwd,
+                                                ctx.view.history.infer_git_root,
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "-".to_string());
+                                    format!(
+                                        "{}  {id_short}  r={rounds}  {last}  {}",
+                                        shorten(&root, 44),
+                                        shorten(first, 36)
+                                    )
+                                }
+                            };
+
+                            let sid = s.id.clone();
+                            ui.horizontal(|ui| {
+                                let mut checked =
+                                    ctx.view.history.batch_selected_ids.contains(&sid);
+                                if ui.checkbox(&mut checked, "").changed() {
+                                    if checked {
+                                        ctx.view.history.batch_selected_ids.insert(sid.clone());
+                                    } else {
+                                        ctx.view.history.batch_selected_ids.remove(&sid);
+                                    }
+                                }
+
+                                if ui.selectable_label(selected, label).clicked() {
+                                    pending_select = Some((idx, sid.clone()));
+                                }
+                            });
+                        }
+                    }
+                });
+        });
+
+    ctx.view.history.sessions_panel_height = resp.response.rect.height();
+    let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
+    if !pointer_down
+        && (ctx.gui_cfg.history.sessions_panel_height - ctx.view.history.sessions_panel_height)
+            .abs()
+            > 2.0
+    {
+        ctx.gui_cfg.history.sessions_panel_height = ctx.view.history.sessions_panel_height;
+        if let Err(e) = ctx.gui_cfg.save() {
+            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+        }
+    }
+
+    if action_batch_clear {
+        ctx.view.history.batch_selected_ids.clear();
+    }
+    if action_batch_select_visible {
+        for sid in visible_ids.iter() {
+            ctx.view.history.batch_selected_ids.insert(sid.clone());
+        }
+    }
+
+    if let Some((idx, id)) = pending_select.take() {
+        ctx.view.history.selected_idx = idx;
+        ctx.view.history.selected_id = Some(id);
+        ctx.view.history.loaded_for = None;
+        cancel_transcript_load(&mut ctx.view.history);
+        ctx.view.history.transcript_raw_messages.clear();
+        ctx.view.history.transcript_messages.clear();
+        ctx.view.history.transcript_error = None;
+        ctx.view.history.transcript_plain_key = None;
+        ctx.view.history.transcript_plain_text.clear();
+        ctx.view.history.transcript_selected_msg_idx = 0;
+    }
+
+    if ctx.view.history.auto_load_transcript
+        && let Some(id) = ctx.view.history.selected_id.clone()
+    {
+        let selected_idx = ctx
+            .view
+            .history
+            .selected_idx
+            .min(ctx.view.history.sessions.len().saturating_sub(1));
+        let path = ctx.view.history.sessions[selected_idx].path.clone();
+        let tail = if ctx.view.history.transcript_full {
+            None
+        } else {
+            Some(ctx.view.history.transcript_tail)
+        };
+        ensure_transcript_loading(ctx, path, (id, tail));
+    }
+
+    ui.add_space(6.0);
+
+    ui.heading(pick(ctx.lang, "对话记录", "Transcript"));
+    ui.add_space(4.0);
+
+    let selected_idx = ctx
+        .view
+        .history
+        .selected_idx
+        .min(ctx.view.history.sessions.len().saturating_sub(1));
+    let selected = &ctx.view.history.sessions[selected_idx];
+    let selected_id = selected.id.clone();
+    let selected_cwd = selected.cwd.clone().unwrap_or_else(|| "-".to_string());
+    let selected_path = selected.path.clone();
+    let workdir = history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
+    let resume_cmd = {
+        let t = ctx.view.history.resume_cmd.trim();
+        if t.is_empty() {
+            format!("codex resume {selected_id}")
+        } else if t.contains("{id}") {
+            t.replace("{id}", &selected_id)
+        } else {
+            format!("{t} {selected_id}")
+        }
+    };
+
+    ui.horizontal(|ui| {
+        if ui
+            .button(pick(ctx.lang, "复制 root+id", "Copy root+id"))
+            .clicked()
+        {
+            if workdir.trim().is_empty() || workdir == "-" {
+                *ctx.last_error = Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
+            } else {
+                ui.ctx()
+                    .copy_text(format!("{} {}", workdir.trim(), selected_id));
+                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+            }
+        }
+
+        if ui
+            .button(pick(ctx.lang, "复制 resume", "Copy resume"))
+            .clicked()
+        {
+            ui.ctx().copy_text(resume_cmd.clone());
+            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+        }
+
+        if cfg!(windows)
+            && ui
+                .button(pick(ctx.lang, "在 wt 中恢复", "Open in wt"))
+                .clicked()
+        {
+            if workdir.trim().is_empty() || workdir == "-" {
+                *ctx.last_error = Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
+            } else if !std::path::Path::new(workdir.trim()).exists() {
+                *ctx.last_error = Some(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "目录不存在", "Directory not found"),
+                    workdir.trim()
+                ));
+            } else if let Err(e) = spawn_windows_terminal_wt_new_tab(
+                ctx.view.history.wt_window,
+                workdir.trim(),
+                ctx.view.history.shell.trim(),
+                ctx.view.history.keep_open,
+                &resume_cmd,
+            ) {
+                *ctx.last_error = Some(format!("spawn wt failed: {e}"));
+            }
+        }
+
+        if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked()
+            && let Err(e) = open_in_file_manager(&selected_path, true)
+        {
+            *ctx.last_error = Some(format!("open session failed: {e}"));
+        }
+
+        let n = ctx.view.history.batch_selected_ids.len();
+        let label = match ctx.lang {
+            Language::Zh => format!("在 wt 中打开选中({n})"),
+            Language::En => format!("Open selected in wt ({n})"),
+        };
+        let can_open = cfg!(windows) && n > 0;
+        if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
+            let items = ctx
+                .view
+                .history
+                .sessions
+                .iter()
+                .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id))
+                .filter_map(|s| {
+                    let cwd = s.cwd.as_deref()?.trim().to_string();
+                    if cwd.is_empty() || cwd == "-" {
+                        return None;
+                    }
+                    let workdir =
+                        history_workdir_from_cwd(cwd.as_str(), ctx.view.history.infer_git_root);
+                    if !std::path::Path::new(workdir.as_str()).exists() {
+                        return None;
+                    }
+                    let sid = s.id.clone();
+                    let cmd = {
+                        let t = ctx.view.history.resume_cmd.trim();
+                        if t.is_empty() {
+                            format!("codex resume {sid}")
+                        } else if t.contains("{id}") {
+                            t.replace("{id}", &sid)
+                        } else {
+                            format!("{t} {sid}")
+                        }
+                    };
+                    Some((workdir, cmd))
+                })
+                .collect::<Vec<_>>();
+
+            if items.is_empty() {
+                *ctx.last_error = Some(
+                    pick(
+                        ctx.lang,
+                        "没有可打开的会话（cwd 不可用或目录不存在）",
+                        "No sessions to open (cwd unavailable or missing)",
+                    )
+                    .to_string(),
+                );
+            } else {
+                open_wt_items(ctx, items);
+            }
+        }
+    });
+
+    ui.label(format!("id: {}", selected_id));
+    ui.label(format!("dir: {}", workdir));
+
+    ui.horizontal(|ui| {
+        let mut hide = ctx.view.history.hide_tool_calls;
+        ui.checkbox(&mut hide, pick(ctx.lang, "隐藏工具调用", "Hide tool calls"));
+        if hide != ctx.view.history.hide_tool_calls {
+            ctx.view.history.hide_tool_calls = hide;
+            ctx.view.history.transcript_messages =
+                filter_tool_calls(ctx.view.history.transcript_raw_messages.clone(), hide);
+            ctx.view.history.transcript_plain_key = None;
+            ctx.view.history.transcript_plain_text.clear();
+        }
+
+        ui.label(pick(ctx.lang, "显示", "View"));
+        egui::ComboBox::from_id_salt("history_transcript_view_vertical")
+            .selected_text(match ctx.view.history.transcript_view {
+                TranscriptViewMode::Messages => pick(ctx.lang, "消息列表", "Messages"),
+                TranscriptViewMode::PlainText => pick(ctx.lang, "纯文本", "Plain text"),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut ctx.view.history.transcript_view,
+                    TranscriptViewMode::Messages,
+                    pick(ctx.lang, "消息列表", "Messages"),
+                );
+                ui.selectable_value(
+                    &mut ctx.view.history.transcript_view,
+                    TranscriptViewMode::PlainText,
+                    pick(ctx.lang, "纯文本", "Plain text"),
+                );
+            });
+
+        let mut full = ctx.view.history.transcript_full;
+        ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
+        if full != ctx.view.history.transcript_full {
+            ctx.view.history.transcript_full = full;
+            ctx.view.history.loaded_for = None;
+            cancel_transcript_load(&mut ctx.view.history);
+        }
+
+        ui.label(pick(ctx.lang, "尾部条数", "Tail"));
+        ui.add_enabled(
+            !ctx.view.history.transcript_full,
+            egui::DragValue::new(&mut ctx.view.history.transcript_tail)
+                .range(10..=500)
+                .speed(1),
+        );
+        if ctx.view.history.transcript_full {
+            ui.label(pick(ctx.lang, "（忽略尾部设置）", "(tail ignored)"));
+        }
+
+        if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
+            ctx.view.history.loaded_for = None;
+            cancel_transcript_load(&mut ctx.view.history);
+            if !ctx.view.history.auto_load_transcript {
+                ctx.view.history.auto_load_transcript = true;
+            }
+        }
+
+        if ui.button(pick(ctx.lang, "复制全部", "Copy all")).clicked() {
+            let mut out = String::new();
+            for msg in ctx.view.history.transcript_messages.iter() {
+                let ts = msg.timestamp.as_deref().unwrap_or("-");
+                let role = msg.role.as_str();
+                out.push_str(&format!("[{ts}] {role}:\n"));
+                out.push_str(msg.text.as_str());
+                out.push_str("\n\n");
+            }
+            ui.ctx().copy_text(out);
+            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+        }
+
+        if ui
+            .button(pick(ctx.lang, "复制当前消息", "Copy selected"))
+            .clicked()
+        {
+            let total = ctx.view.history.transcript_messages.len();
+            if total > 0 {
+                let idx = ctx
+                    .view
+                    .history
+                    .transcript_selected_msg_idx
+                    .min(total.saturating_sub(1));
+                let msg = &ctx.view.history.transcript_messages[idx];
+                let ts = msg.timestamp.as_deref().unwrap_or("-");
+                let role = msg.role.as_str();
+                let out = format!("[{ts}] {role}:\n{}\n", msg.text);
+                ui.ctx().copy_text(out);
+                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+            }
+        }
+
+        if ui.button(pick(ctx.lang, "首条", "First")).clicked() {
+            ctx.view.history.transcript_view = TranscriptViewMode::Messages;
+            ctx.view.history.transcript_selected_msg_idx = 0;
+            ctx.view.history.transcript_scroll_to_msg_idx = Some(0);
+        }
+
+        if ui.button(pick(ctx.lang, "末条", "Last")).clicked() {
+            let total = ctx.view.history.transcript_messages.len();
+            if total > 0 {
+                let last = total.saturating_sub(1);
+                ctx.view.history.transcript_view = TranscriptViewMode::Messages;
+                ctx.view.history.transcript_selected_msg_idx = last;
+                ctx.view.history.transcript_scroll_to_msg_idx = Some(last);
+            }
+        }
+    });
+
+    if let Some(err) = ctx.view.history.transcript_error.as_deref() {
+        ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
+    }
+
+    let transcript_max_h = ui.available_height();
+    render_transcript_body(ui, ctx, transcript_max_h);
+}
+
 fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.add_space(6.0);
 
@@ -4414,6 +5024,12 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let q = ctx.view.history.query.trim().to_lowercase();
 
     ui.add_space(6.0);
+    let layout =
+        resolve_history_layout(ctx.view.history.layout_mode.as_str(), ui.available_width());
+    if layout == ResolvedHistoryLayout::Vertical {
+        render_history_all_by_date_vertical(ui, ctx, q.as_str());
+        return;
+    }
     ui.columns(3, |cols| {
         cols[0].heading(pick(ctx.lang, "日期", "Dates"));
         cols[0].add_space(4.0);
@@ -4973,6 +5589,496 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         render_transcript_body(&mut cols[2], ctx, 360.0);
     });
+}
+
+fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, q: &str) {
+    let max_h = ui.available_height();
+    let desired_h = ctx
+        .view
+        .history
+        .sessions_panel_height
+        .clamp(200.0, max_h * 0.55);
+
+    let q = q.trim();
+    let mut visible_indices: Vec<usize> = Vec::new();
+    for (idx, s) in ctx.view.history.all_day_sessions.iter().enumerate() {
+        if q.is_empty() {
+            visible_indices.push(idx);
+            continue;
+        }
+        let mut matched = false;
+        if let Some(cwd) = s.cwd.as_deref() {
+            matched |= cwd.to_lowercase().contains(q);
+        }
+        if let Some(msg) = s.first_user_message.as_deref() {
+            matched |= msg.to_lowercase().contains(q);
+        }
+        if matched {
+            visible_indices.push(idx);
+        }
+    }
+
+    let mut action_batch_select_visible = false;
+    let mut action_batch_clear = false;
+
+    let resp = egui::TopBottomPanel::top("history_all_vertical_nav_panel")
+        .resizable(true)
+        .default_height(desired_h)
+        .min_height(200.0)
+        .max_height(max_h * 0.8)
+        .show_inside(ui, |ui| {
+            ui.columns(2, |cols| {
+                cols[0].heading(pick(ctx.lang, "日期", "Dates"));
+                cols[0].add_space(4.0);
+                {
+                    let total = ctx.view.history.all_dates.len();
+                    let row_h = 22.0;
+                    let max_h = cols[0].available_height().max(160.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("history_all_by_date_dates_scroll_vertical")
+                        .max_height(max_h)
+                        .show_rows(&mut cols[0], row_h, total, |ui, range| {
+                            for row in range {
+                                let d = &ctx.view.history.all_dates[row];
+                                let selected = ctx
+                                    .view
+                                    .history
+                                    .all_selected_date
+                                    .as_deref()
+                                    .is_some_and(|x| x == d.date);
+                                if ui.selectable_label(selected, d.date.as_str()).clicked() {
+                                    ctx.view.history.all_selected_date = Some(d.date.clone());
+                                    ctx.view.history.loaded_day_for = None;
+                                }
+                            }
+                        });
+                }
+
+                cols[1].heading(pick(ctx.lang, "会话", "Sessions"));
+                cols[1].add_space(4.0);
+                cols[1].horizontal(|ui| {
+                    if ui
+                        .button(pick(ctx.lang, "全选可见", "Select visible"))
+                        .clicked()
+                    {
+                        action_batch_select_visible = true;
+                    }
+                    if ui.button(pick(ctx.lang, "清空选择", "Clear")).clicked() {
+                        action_batch_clear = true;
+                    }
+                });
+                cols[1].add_space(4.0);
+
+                let total = visible_indices.len();
+                let row_h = 22.0;
+                let max_h = cols[1].available_height().max(160.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("history_all_by_date_sessions_scroll_vertical")
+                    .max_height(max_h)
+                    .show_rows(&mut cols[1], row_h, total, |ui, range| {
+                        for row in range {
+                            let idx = visible_indices[row];
+                            let s = &ctx.view.history.all_day_sessions[idx];
+                            let selected = ctx
+                                .view
+                                .history
+                                .selected_id
+                                .as_deref()
+                                .is_some_and(|id| id == s.id);
+
+                            let id_short = short_sid(&s.id, 16);
+                            let t = s
+                                .updated_hint
+                                .as_deref()
+                                .or(s.created_at.as_deref())
+                                .unwrap_or("-");
+                            let root_or_cwd = s
+                                .cwd
+                                .as_deref()
+                                .map(|cwd| {
+                                    if ctx.view.history.infer_git_root {
+                                        crate::sessions::infer_project_root_from_cwd(cwd)
+                                    } else {
+                                        cwd.to_string()
+                                    }
+                                })
+                                .unwrap_or_else(|| "-".to_string());
+                            let first = s.first_user_message.as_deref().unwrap_or("-");
+                            let label = format!(
+                                "{}  {}  {}  {}",
+                                shorten(&root_or_cwd, 32),
+                                id_short,
+                                shorten(t, 19),
+                                shorten(first, 40)
+                            );
+
+                            let sid = s.id.clone();
+                            ui.horizontal(|ui| {
+                                let mut checked =
+                                    ctx.view.history.batch_selected_ids.contains(&sid);
+                                if ui.checkbox(&mut checked, "").changed() {
+                                    if checked {
+                                        ctx.view.history.batch_selected_ids.insert(sid.clone());
+                                    } else {
+                                        ctx.view.history.batch_selected_ids.remove(&sid);
+                                    }
+                                }
+
+                                if ui.selectable_label(selected, label).clicked() {
+                                    ctx.view.history.selected_id = Some(sid.clone());
+                                    cancel_transcript_load(&mut ctx.view.history);
+                                    ctx.view.history.transcript_raw_messages.clear();
+                                    ctx.view.history.transcript_messages.clear();
+                                    ctx.view.history.transcript_error = None;
+                                    ctx.view.history.loaded_for = None;
+                                    ctx.view.history.transcript_plain_key = None;
+                                    ctx.view.history.transcript_plain_text.clear();
+                                    ctx.view.history.transcript_selected_msg_idx = 0;
+                                }
+                            });
+                        }
+                    });
+            });
+        });
+
+    ctx.view.history.sessions_panel_height = resp.response.rect.height();
+    let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
+    if !pointer_down
+        && (ctx.gui_cfg.history.sessions_panel_height - ctx.view.history.sessions_panel_height)
+            .abs()
+            > 2.0
+    {
+        ctx.gui_cfg.history.sessions_panel_height = ctx.view.history.sessions_panel_height;
+        if let Err(e) = ctx.gui_cfg.save() {
+            *ctx.last_error = Some(format!("save gui config failed: {e}"));
+        }
+    }
+
+    if action_batch_clear {
+        ctx.view.history.batch_selected_ids.clear();
+    }
+    if action_batch_select_visible {
+        for &idx in visible_indices.iter() {
+            if let Some(s) = ctx.view.history.all_day_sessions.get(idx) {
+                ctx.view.history.batch_selected_ids.insert(s.id.clone());
+            }
+        }
+    }
+
+    ui.add_space(6.0);
+    ui.heading(pick(ctx.lang, "对话记录", "Transcript"));
+    ui.add_space(4.0);
+
+    let selected_idx = ctx.view.history.selected_id.as_deref().and_then(|id| {
+        ctx.view
+            .history
+            .all_day_sessions
+            .iter()
+            .position(|s| s.id == id)
+    });
+    let selected = selected_idx.and_then(|idx| ctx.view.history.all_day_sessions.get(idx));
+    if selected.is_none() {
+        ui.label(pick(
+            ctx.lang,
+            "选择一个会话以预览对话。",
+            "Select a session to preview.",
+        ));
+        return;
+    }
+    let (selected_id, selected_cwd, selected_path) = {
+        let s = selected.unwrap();
+        (
+            s.id.clone(),
+            s.cwd.clone().unwrap_or_else(|| "-".to_string()),
+            s.path.clone(),
+        )
+    };
+
+    let workdir = history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
+    let resume_cmd = {
+        let t = ctx.view.history.resume_cmd.trim();
+        if t.is_empty() {
+            format!("codex resume {selected_id}")
+        } else if t.contains("{id}") {
+            t.replace("{id}", &selected_id)
+        } else {
+            format!("{t} {selected_id}")
+        }
+    };
+
+    if ctx.view.history.auto_load_transcript {
+        let tail = if ctx.view.history.transcript_full {
+            None
+        } else {
+            Some(ctx.view.history.transcript_tail)
+        };
+        let key = (selected_id.clone(), tail);
+        ensure_transcript_loading(ctx, selected_path.clone(), key);
+    }
+
+    ui.horizontal(|ui| {
+        if ui
+            .button(pick(ctx.lang, "复制 root+id", "Copy root+id"))
+            .clicked()
+        {
+            if workdir.trim().is_empty() || workdir == "-" {
+                *ctx.last_error = Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
+            } else {
+                ui.ctx()
+                    .copy_text(format!("{} {}", workdir.trim(), selected_id));
+                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+            }
+        }
+
+        if ui
+            .button(pick(ctx.lang, "复制 resume", "Copy resume"))
+            .clicked()
+        {
+            ui.ctx().copy_text(resume_cmd.clone());
+            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+        }
+
+        if cfg!(windows)
+            && ui
+                .button(pick(ctx.lang, "在 wt 中恢复", "Open in wt"))
+                .clicked()
+        {
+            if workdir.trim().is_empty() || workdir == "-" {
+                *ctx.last_error = Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
+            } else if !std::path::Path::new(workdir.trim()).exists() {
+                *ctx.last_error = Some(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "目录不存在", "Directory not found"),
+                    workdir.trim()
+                ));
+            } else if let Err(e) = spawn_windows_terminal_wt_new_tab(
+                ctx.view.history.wt_window,
+                workdir.trim(),
+                ctx.view.history.shell.trim(),
+                ctx.view.history.keep_open,
+                &resume_cmd,
+            ) {
+                *ctx.last_error = Some(format!("spawn wt failed: {e}"));
+            }
+        }
+
+        if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked()
+            && let Err(e) = open_in_file_manager(&selected_path, true)
+        {
+            *ctx.last_error = Some(format!("open session failed: {e}"));
+        }
+
+        let n = ctx.view.history.batch_selected_ids.len();
+        let label = match ctx.lang {
+            Language::Zh => format!("在 wt 中打开选中({n})"),
+            Language::En => format!("Open selected in wt ({n})"),
+        };
+        let can_open = cfg!(windows) && n > 0;
+        if ui.add_enabled(can_open, egui::Button::new(label)).clicked() {
+            let items = ctx
+                .view
+                .history
+                .all_day_sessions
+                .iter()
+                .filter(|s| ctx.view.history.batch_selected_ids.contains(&s.id))
+                .filter_map(|s| {
+                    let cwd = s.cwd.as_deref()?.trim().to_string();
+                    if cwd.is_empty() || cwd == "-" {
+                        return None;
+                    }
+                    let workdir =
+                        history_workdir_from_cwd(cwd.as_str(), ctx.view.history.infer_git_root);
+                    if !std::path::Path::new(workdir.as_str()).exists() {
+                        return None;
+                    }
+                    let sid = s.id.clone();
+                    let cmd = {
+                        let t = ctx.view.history.resume_cmd.trim();
+                        if t.is_empty() {
+                            format!("codex resume {sid}")
+                        } else if t.contains("{id}") {
+                            t.replace("{id}", &sid)
+                        } else {
+                            format!("{t} {sid}")
+                        }
+                    };
+                    Some((workdir, cmd))
+                })
+                .collect::<Vec<_>>();
+
+            if items.is_empty() {
+                *ctx.last_error = Some(
+                    pick(
+                        ctx.lang,
+                        "没有可打开的会话（cwd 不可用或目录不存在）",
+                        "No sessions to open (cwd unavailable or missing)",
+                    )
+                    .to_string(),
+                );
+            } else {
+                let mode = ctx
+                    .gui_cfg
+                    .history
+                    .wt_batch_mode
+                    .trim()
+                    .to_ascii_lowercase();
+                let shell = ctx.view.history.shell.trim();
+                let keep_open = ctx.view.history.keep_open;
+
+                let result = if mode == "windows" {
+                    let mut last_err: Option<anyhow::Error> = None;
+                    for (cwd, cmd) in items.iter() {
+                        if let Err(e) = spawn_windows_terminal_wt_new_tab(
+                            -1,
+                            cwd.as_str(),
+                            shell,
+                            keep_open,
+                            cmd.as_str(),
+                        ) {
+                            last_err = Some(e);
+                            break;
+                        }
+                    }
+                    match last_err {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    }
+                } else {
+                    spawn_windows_terminal_wt_tabs_in_one_window(&items, shell, keep_open)
+                };
+
+                match result {
+                    Ok(()) => {
+                        *ctx.last_info = Some(
+                            pick(
+                                ctx.lang,
+                                "已启动 Windows Terminal",
+                                "Started Windows Terminal",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Err(e) => *ctx.last_error = Some(format!("spawn wt failed: {e}")),
+                }
+            }
+        }
+    });
+
+    ui.label(format!("id: {}", selected_id));
+    ui.label(format!("dir: {}", workdir));
+
+    ui.horizontal(|ui| {
+        let mut hide = ctx.view.history.hide_tool_calls;
+        ui.checkbox(&mut hide, pick(ctx.lang, "隐藏工具调用", "Hide tool calls"));
+        if hide != ctx.view.history.hide_tool_calls {
+            ctx.view.history.hide_tool_calls = hide;
+            ctx.view.history.transcript_messages =
+                filter_tool_calls(ctx.view.history.transcript_raw_messages.clone(), hide);
+            ctx.view.history.transcript_plain_key = None;
+            ctx.view.history.transcript_plain_text.clear();
+        }
+
+        ui.label(pick(ctx.lang, "显示", "View"));
+        egui::ComboBox::from_id_salt("history_transcript_view_all_vertical")
+            .selected_text(match ctx.view.history.transcript_view {
+                TranscriptViewMode::Messages => pick(ctx.lang, "消息列表", "Messages"),
+                TranscriptViewMode::PlainText => pick(ctx.lang, "纯文本", "Plain text"),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut ctx.view.history.transcript_view,
+                    TranscriptViewMode::Messages,
+                    pick(ctx.lang, "消息列表", "Messages"),
+                );
+                ui.selectable_value(
+                    &mut ctx.view.history.transcript_view,
+                    TranscriptViewMode::PlainText,
+                    pick(ctx.lang, "纯文本", "Plain text"),
+                );
+            });
+        let mut full = ctx.view.history.transcript_full;
+        ui.checkbox(&mut full, pick(ctx.lang, "全量", "All"));
+        if full != ctx.view.history.transcript_full {
+            ctx.view.history.transcript_full = full;
+            ctx.view.history.loaded_for = None;
+            cancel_transcript_load(&mut ctx.view.history);
+        }
+
+        ui.label(pick(ctx.lang, "尾部条数", "Tail"));
+        ui.add_enabled(
+            !ctx.view.history.transcript_full,
+            egui::DragValue::new(&mut ctx.view.history.transcript_tail)
+                .range(10..=500)
+                .speed(1),
+        );
+        if ctx.view.history.transcript_full {
+            ui.label(pick(ctx.lang, "（忽略尾部设置）", "(tail ignored)"));
+        }
+
+        if ui.button(pick(ctx.lang, "手动加载", "Load")).clicked() {
+            ctx.view.history.loaded_for = None;
+            cancel_transcript_load(&mut ctx.view.history);
+            if !ctx.view.history.auto_load_transcript {
+                ctx.view.history.auto_load_transcript = true;
+            }
+        }
+
+        if ui.button(pick(ctx.lang, "复制全部", "Copy all")).clicked() {
+            let mut out = String::new();
+            for msg in ctx.view.history.transcript_messages.iter() {
+                let ts = msg.timestamp.as_deref().unwrap_or("-");
+                let role = msg.role.as_str();
+                out.push_str(&format!("[{ts}] {role}:\n"));
+                out.push_str(msg.text.as_str());
+                out.push_str("\n\n");
+            }
+            ui.ctx().copy_text(out);
+            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+        }
+
+        if ui
+            .button(pick(ctx.lang, "复制当前消息", "Copy selected"))
+            .clicked()
+        {
+            let total = ctx.view.history.transcript_messages.len();
+            if total > 0 {
+                let idx = ctx
+                    .view
+                    .history
+                    .transcript_selected_msg_idx
+                    .min(total.saturating_sub(1));
+                let msg = &ctx.view.history.transcript_messages[idx];
+                let ts = msg.timestamp.as_deref().unwrap_or("-");
+                let role = msg.role.as_str();
+                let out = format!("[{ts}] {role}:\n{}\n", msg.text);
+                ui.ctx().copy_text(out);
+                *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+            }
+        }
+
+        if ui.button(pick(ctx.lang, "首条", "First")).clicked() {
+            ctx.view.history.transcript_view = TranscriptViewMode::Messages;
+            ctx.view.history.transcript_selected_msg_idx = 0;
+            ctx.view.history.transcript_scroll_to_msg_idx = Some(0);
+        }
+
+        if ui.button(pick(ctx.lang, "末条", "Last")).clicked() {
+            let total = ctx.view.history.transcript_messages.len();
+            if total > 0 {
+                let last = total.saturating_sub(1);
+                ctx.view.history.transcript_view = TranscriptViewMode::Messages;
+                ctx.view.history.transcript_selected_msg_idx = last;
+                ctx.view.history.transcript_scroll_to_msg_idx = Some(last);
+            }
+        }
+    });
+
+    if let Some(err) = ctx.view.history.transcript_error.as_deref() {
+        ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
+    }
+
+    let transcript_max_h = ui.available_height();
+    render_transcript_body(ui, ctx, transcript_max_h);
 }
 
 fn cancel_transcript_load(state: &mut HistoryViewState) {
