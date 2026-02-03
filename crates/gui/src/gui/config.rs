@@ -104,9 +104,6 @@ pub struct HistoryConfig {
     /// Layout mode for history page: `auto` / `horizontal` / `vertical`.
     #[serde(default = "default_history_layout_mode")]
     pub layout_mode: String,
-    /// Default width for the sessions panel (when layout is horizontal).
-    #[serde(default = "default_history_sessions_panel_width")]
-    pub sessions_panel_width: f32,
     /// Default height for the sessions panel (when layout is vertical).
     #[serde(default = "default_history_sessions_panel_height")]
     pub sessions_panel_height: f32,
@@ -124,7 +121,6 @@ impl Default for HistoryConfig {
             resume_cmd: default_history_resume_cmd(),
             workdir_mode: default_history_workdir_mode(),
             layout_mode: default_history_layout_mode(),
-            sessions_panel_width: default_history_sessions_panel_width(),
             sessions_panel_height: default_history_sessions_panel_height(),
             group_open_recent_n: default_history_group_open_recent_n(),
         }
@@ -251,10 +247,6 @@ fn default_history_workdir_mode() -> String {
 
 fn default_history_layout_mode() -> String {
     "auto".to_string()
-}
-
-fn default_history_sessions_panel_width() -> f32 {
-    420.0
 }
 
 fn default_history_sessions_panel_height() -> f32 {

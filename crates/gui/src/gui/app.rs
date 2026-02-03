@@ -180,7 +180,6 @@ impl GuiApp {
         view.history.keep_open = gui_cfg.history.keep_open;
         view.history.group_open_recent_n = gui_cfg.history.group_open_recent_n;
         view.history.layout_mode = gui_cfg.history.layout_mode.clone();
-        view.history.sessions_panel_width = gui_cfg.history.sessions_panel_width;
         view.history.sessions_panel_height = gui_cfg.history.sessions_panel_height;
         view.history.infer_git_root = gui_cfg
             .history
