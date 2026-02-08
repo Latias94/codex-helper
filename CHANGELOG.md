@@ -4,18 +4,11 @@ All notable changes to this project will be documented in this file.
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
 ## [未发布 / Unreleased]
+
+## [0.12.0] - 2026-02-08
 ### 新增 / Added
 - `codex-helper serve` 新增 `--host` 参数：支持绑定到 `0.0.0.0` 等非 loopback 地址（默认仍为 `127.0.0.1`）。
   Add `--host` to `codex-helper serve`: supports binding to non-loopback addresses like `0.0.0.0` (default remains `127.0.0.1`).
-
-### 改进 / Improved
-- 上游连接更稳健：为代理的 HTTP client 增加 `connect_timeout`/`tcp_keepalive`/`pool_idle_timeout`，降低长时间运行后连接“半死不活”导致的请求挂起概率。
-  More robust upstream connections: add `connect_timeout`/`tcp_keepalive`/`pool_idle_timeout` to the proxy HTTP client to reduce hung requests caused by stale connections over long runs.
-- 诊断信息更清晰：上游 `transport_error` 现在会记录更完整的错误链（caused-by/source）与关键标志（如 timeout/connect），便于区分 DNS/TLS/连接超时等问题。
-  Clearer diagnostics: upstream `transport_error` now logs a richer error chain (caused-by/source) plus key flags (timeout/connect) to help distinguish DNS/TLS/connect timeouts, etc.
-
-## [0.12.0] - 2026-02-02
-### 新增 / Added
 - 新增 `codex-helper session recent`：按会话文件最后更新时间（mtime）筛选最近会话，并支持 `text/tsv/json` 输出；可选 `--open` 通过 Windows Terminal（`wt`）或 WezTerm 打开并执行恢复命令，便于快速 `codex resume`（支持 `--since/--limit/--raw-cwd/--format/--open/--terminal/--shell/--resume-cmd`）。
   Add `codex-helper session recent`: filter recent sessions by session file mtime with `text/tsv/json` output; optionally `--open` via Windows Terminal (`wt`) or WezTerm to run a resume command for fast `codex resume` workflows (supports `--since/--limit/--raw-cwd/--format/--open/--terminal/--shell/--resume-cmd`).
 - GUI 新增 `Stats` 页面：展示 requests/tokens KPI、按天 rollup、Top configs/providers，并支持基于 `CODEX_HELPER_PRICE_*` 的成本估算（如配置）。
@@ -28,6 +21,10 @@ All notable changes to this project will be documented in this file.
   GUI adds a tray quick-actions menu: show/hide, start/stop/reload proxy, plus quick switching Active / Pinned / Routing Preset (best-effort apply now).
 
 ### 改进 / Improved
+- 上游连接更稳健：为代理的 HTTP client 增加 `connect_timeout`/`tcp_keepalive`/`pool_idle_timeout`，降低长时间运行后连接“半死不活”导致的请求挂起概率。
+  More robust upstream connections: add `connect_timeout`/`tcp_keepalive`/`pool_idle_timeout` to the proxy HTTP client to reduce hung requests caused by stale connections over long runs.
+- 诊断信息更清晰：上游 `transport_error` 现在会记录更完整的错误链（caused-by/source）与关键标志（如 timeout/connect），便于区分 DNS/TLS/连接超时等问题。
+  Clearer diagnostics: upstream `transport_error` now logs a richer error chain (caused-by/source) plus key flags (timeout/connect) to help distinguish DNS/TLS/connect timeouts, etc.
 - 启动监听失败时，提供更友好的提示（端口占用/权限不足等），并在 Windows/Linux/macOS 下尽力显示占用端口的进程 PID/名称，便于快速定位冲突进程。
   Provide friendlier bind/listen failure messages (port in use / permission denied, etc.) and best-effort show the PID/process holding the port on Windows/Linux/macOS for faster troubleshooting.
 - `codex-helper session list` 默认完整展示 first prompt，并提供 `--truncate` 以按需截断输出。
