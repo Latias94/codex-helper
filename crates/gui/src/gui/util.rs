@@ -15,14 +15,29 @@ pub fn open_in_file_manager(path: &std::path::Path, select_file: bool) -> anyhow
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
-        let _ = Command::new("open").arg(path).spawn()?;
+        if select_file {
+            let _ = Command::new("open").arg("-R").arg(path).spawn()?;
+            return Ok(());
+        }
+        let target = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let _ = Command::new("open").arg(target).spawn()?;
         return Ok(());
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::process::Command;
-        let _ = Command::new("xdg-open").arg(path).spawn()?;
+        let _ = select_file;
+        let target = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let _ = Command::new("xdg-open").arg(target).spawn()?;
         return Ok(());
     }
 

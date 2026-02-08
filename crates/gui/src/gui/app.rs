@@ -935,7 +935,6 @@ fn load_system_cjk_font() -> Option<(String, egui::FontData)> {
                 let bytes = data.as_ref().as_ref().to_vec();
                 Some((family.to_string(), egui::FontData::from_owned(bytes)))
             }
-            #[cfg(feature = "fs")]
             fontdb::Source::File(path) => {
                 let ext = path
                     .extension()
@@ -948,7 +947,6 @@ fn load_system_cjk_font() -> Option<(String, egui::FontData)> {
                 let bytes = std::fs::read(path).ok()?;
                 Some((family.to_string(), egui::FontData::from_owned(bytes)))
             }
-            #[cfg(all(feature = "fs", feature = "memmap"))]
             fontdb::Source::SharedFile(path, data) => {
                 let ext = path
                     .extension()
@@ -961,6 +959,7 @@ fn load_system_cjk_font() -> Option<(String, egui::FontData)> {
                 let bytes = data.as_ref().as_ref().to_vec();
                 Some((family.to_string(), egui::FontData::from_owned(bytes)))
             }
+            _ => None,
         }
     }
 
