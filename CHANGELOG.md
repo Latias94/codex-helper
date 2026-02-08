@@ -45,6 +45,14 @@ All notable changes to this project will be documented in this file.
   Internal refactor: split into a workspace with `codex-helper-core` / `codex-helper-tui` / `codex-helper-gui` crates to reduce coupling and improve maintainability (CLI/GUI usage unchanged).
 
 ### 修复 / Fixed
+- 修复 GUI 在部分平台/工具链上因 `fontdb` `Source` 变更导致的编译失败，并移除无效的本地 `cfg(feature = "fs"/"memmap")` 条件分支。
+  Fix GUI build failures caused by `fontdb` `Source` changes and remove invalid local `cfg(feature = "fs"/"memmap")` guards.
+- 修复 Linux release 构建中 GUI 依赖缺失导致的打包失败：通过 `cargo-dist` 声明 `pango/gtk/appindicator/pkg-config` 等原生依赖，确保 CI 自动安装所需包。
+  Fix Linux release packaging failures due to missing GUI native deps by declaring required `pango/gtk/appindicator/pkg-config` packages via `cargo-dist` so CI installs them automatically.
+- 修复 Linux GUI 链接失败：补齐 `libxdo` 原生依赖，避免 `-lxdo` 找不到导致的构建失败。
+  Fix Linux GUI link failures by adding the missing `libxdo` system dependency (avoids `-lxdo` not found at link time).
+- macOS 下 `open_in_file_manager(..., select_file=true)` 改为使用 `open -R` 以在 Finder 中定位文件。
+  On macOS, use `open -R` for `open_in_file_manager(..., select_file=true)` to reveal the file in Finder.
 - 修复 “recent sessions” 边界条件：当 `since=0` 时应返回空结果，避免 mtime 精度导致的偶发误筛选。
   Fix a recent-sessions edge case: `since=0` now returns an empty result to avoid rare mis-filtering due to mtime precision.
 

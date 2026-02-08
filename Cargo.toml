@@ -33,9 +33,9 @@ path = "src/bin/codex-helper-gui.rs"
 required-features = ["gui"]
 
 [dependencies]
-codex-helper-core = { path = "crates/core" }
-codex-helper-tui = { path = "crates/tui" }
-codex-helper-gui = { path = "crates/gui", optional = true }
+codex-helper-core = { path = "crates/core", version = "0.12.0" }
+codex-helper-tui = { path = "crates/tui", version = "0.12.0" }
+codex-helper-gui = { path = "crates/gui", version = "0.12.0", optional = true }
 anyhow = "1.0.100"
 base64 = "0.22.1"
 serde = { version = "1.0.228", features = ["derive"] }

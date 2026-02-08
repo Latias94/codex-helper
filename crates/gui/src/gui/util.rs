@@ -45,6 +45,7 @@ pub fn open_in_file_manager(path: &std::path::Path, select_file: bool) -> anyhow
     Ok(())
 }
 
+#[cfg(windows)]
 fn basename_lower(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()

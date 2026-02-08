@@ -95,6 +95,7 @@ pub use windows_impl::*;
 #[derive(Debug)]
 pub enum AcquireResult {
     Primary(SingleInstance),
+    #[allow(dead_code)]
     SecondaryNotified,
 }
 

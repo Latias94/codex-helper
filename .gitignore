@@ -3,3 +3,5 @@
 /.codex-helper
 /repo-ref
 /.lspi/
+.dist-plan.json
+plan-dist-manifest.json

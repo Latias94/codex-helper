@@ -2,6 +2,9 @@
 name = "codex-helper-core"
 version = "0.12.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Core library for codex-helper."
+repository = "https://github.com/Latias94/codex-helper"
 
 [features]
 # UI-specific helper APIs (used by the GUI crate).

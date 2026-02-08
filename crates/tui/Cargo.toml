@@ -2,9 +2,12 @@
 name = "codex-helper-tui"
 version = "0.12.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Terminal UI crate for codex-helper."
+repository = "https://github.com/Latias94/codex-helper"
 
 [dependencies]
-codex-helper-core = { path = "../core" }
+codex-helper-core = { path = "../core", version = "0.12.0" }
 anyhow = "1.0.100"
 ratatui = "0.30.0"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
