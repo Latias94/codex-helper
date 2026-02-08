@@ -269,6 +269,7 @@ codex-helper config set-level openai 2
 - 显式启动 Codex 代理：
   - `codex-helper serve`（默认端口 3211）
   - `codex-helper serve --no-tui`（关闭内置 TUI 面板）
+  - `codex-helper serve --host 0.0.0.0`（监听所有网卡；注意安全风险）
 
 ### 开关 Codex
 

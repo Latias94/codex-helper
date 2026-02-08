@@ -40,6 +40,52 @@ use self::retry::{
 use self::runtime_config::RuntimeConfig;
 use self::stream::{SseSuccessMeta, build_sse_success_response};
 
+fn format_reqwest_error_for_retry_chain(e: &reqwest::Error) -> String {
+    use std::error::Error as _;
+
+    let mut parts: Vec<String> = Vec::new();
+    let first = e.to_string();
+    if !first.trim().is_empty() {
+        parts.push(first);
+    }
+
+    let mut cur = e.source();
+    for _ in 0..4 {
+        let Some(src) = cur else { break };
+        let msg = src.to_string();
+        if !msg.trim().is_empty() && !parts.iter().any(|x| x == &msg) {
+            parts.push(msg);
+        }
+        cur = src.source();
+    }
+
+    let mut flags: Vec<&'static str> = Vec::new();
+    if e.is_timeout() {
+        flags.push("timeout");
+    }
+    if e.is_connect() {
+        flags.push("connect");
+    }
+
+    let mut out = if parts.is_empty() {
+        "reqwest error".to_string()
+    } else {
+        parts.join(" | caused_by: ")
+    };
+    if !flags.is_empty() {
+        out.push_str(" (flags: ");
+        out.push_str(&flags.join(","));
+        out.push(')');
+    }
+    out = out.replace(['\r', '\n'], " ");
+    const MAX_LEN: usize = 360;
+    if out.len() > MAX_LEN {
+        out.truncate(MAX_LEN);
+        out.push_str("…");
+    }
+    out
+}
+
 #[allow(dead_code)]
 fn lb_state_snapshot_json(lb: &LoadBalancer) -> Option<serde_json::Value> {
     let map = match lb.states.lock() {
@@ -1224,7 +1270,7 @@ pub async fn handle_proxy(
                 let resp = match builder.send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        let err_str = e.to_string();
+                        let err_str = format_reqwest_error_for_retry_chain(&e);
                         upstream_chain.push(format!(
                             "{}:{} (idx={}) transport_error={} model={}",
                             selected.config_name,
@@ -1304,7 +1350,7 @@ pub async fn handle_proxy(
                 let bytes = match resp.bytes().await {
                     Ok(b) => b,
                     Err(e) => {
-                        let err_str = e.to_string();
+                        let err_str = format_reqwest_error_for_retry_chain(&e);
                         upstream_chain.push(format!(
                             "{}:{} (idx={}) body_read_error={} model={}",
                             selected.config_name,
@@ -1964,7 +2010,7 @@ pub async fn handle_proxy(
                         "upstream_index": selected.index,
                         "upstream_base_url": selected.upstream.base_url.as_str(),
                         "provider_id": provider_id.as_deref(),
-                        "error": e.to_string(),
+                        "error": format_reqwest_error_for_retry_chain(&e),
                     }));
                     if retry_failover {
                         lb.record_result_with_backoff(
@@ -1974,7 +2020,7 @@ pub async fn handle_proxy(
                             cooldown_backoff,
                         );
                     }
-                    let err_str = e.to_string();
+                    let err_str = format_reqwest_error_for_retry_chain(&e);
                     upstream_chain.push(format!(
                         "{}:{} (idx={}) transport_error={} model={}",
                         selected.config_name,
@@ -2184,7 +2230,7 @@ pub async fn handle_proxy(
                             "upstream_index": selected.index,
                             "upstream_base_url": selected.upstream.base_url.as_str(),
                             "provider_id": provider_id.as_deref(),
-                            "error": e.to_string(),
+                            "error": format_reqwest_error_for_retry_chain(&e),
                         }));
                         if retry_failover {
                             lb.record_result_with_backoff(
@@ -2194,7 +2240,7 @@ pub async fn handle_proxy(
                                 cooldown_backoff,
                             );
                         }
-                        let err_str = e.to_string();
+                        let err_str = format_reqwest_error_for_retry_chain(&e);
                         upstream_chain.push(format!(
                             "{}:{} (idx={}) body_read_error={} model={}",
                             selected.config_name,

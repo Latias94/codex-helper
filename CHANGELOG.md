@@ -3,6 +3,17 @@ All notable changes to this project will be documented in this file.
 
 > Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
 
+## [未发布 / Unreleased]
+### 新增 / Added
+- `codex-helper serve` 新增 `--host` 参数：支持绑定到 `0.0.0.0` 等非 loopback 地址（默认仍为 `127.0.0.1`）。
+  Add `--host` to `codex-helper serve`: supports binding to non-loopback addresses like `0.0.0.0` (default remains `127.0.0.1`).
+
+### 改进 / Improved
+- 上游连接更稳健：为代理的 HTTP client 增加 `connect_timeout`/`tcp_keepalive`/`pool_idle_timeout`，降低长时间运行后连接“半死不活”导致的请求挂起概率。
+  More robust upstream connections: add `connect_timeout`/`tcp_keepalive`/`pool_idle_timeout` to the proxy HTTP client to reduce hung requests caused by stale connections over long runs.
+- 诊断信息更清晰：上游 `transport_error` 现在会记录更完整的错误链（caused-by/source）与关键标志（如 timeout/connect），便于区分 DNS/TLS/连接超时等问题。
+  Clearer diagnostics: upstream `transport_error` now logs a richer error chain (caused-by/source) plus key flags (timeout/connect) to help distinguish DNS/TLS/connect timeouts, etc.
+
 ## [0.12.0] - 2026-02-02
 ### 新增 / Added
 - 新增 `codex-helper session recent`：按会话文件最后更新时间（mtime）筛选最近会话，并支持 `text/tsv/json` 输出；可选 `--open` 通过 Windows Terminal（`wt`）或 WezTerm 打开并执行恢复命令，便于快速 `codex resume`（支持 `--since/--limit/--raw-cwd/--format/--open/--terminal/--shell/--resume-cmd`）。

@@ -292,6 +292,7 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
 - Explicit Codex proxy:
   - `codex-helper serve` (default port 3211)
   - `codex-helper serve --no-tui` (disable the built-in TUI dashboard)
+  - `codex-helper serve --host 0.0.0.0` (bind all interfaces; security risk)
 
 ### Turn Codex on/off via local proxy
 

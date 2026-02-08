@@ -12,7 +12,7 @@ use owo_colors::OwoColorize;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -76,6 +76,9 @@ enum Command {
         /// Target Claude service (experimental)
         #[arg(long)]
         claude: bool,
+        /// Listen host (127.0.0.1 by default; use 0.0.0.0 to expose on LAN at your own risk)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
         /// Listen port (3211 for Codex, 3210 for Claude by default)
         #[arg(long)]
         port: Option<u16>,
@@ -494,6 +497,7 @@ async fn real_main() -> CliResult<()> {
         port: None,
         codex: false,
         claude: false,
+        host: IpAddr::from([127, 0, 0, 1]),
         no_tui: false,
     }) {
         Command::Default { codex, claude } => {
@@ -567,6 +571,7 @@ async fn real_main() -> CliResult<()> {
             port,
             codex,
             claude,
+            host,
             no_tui,
         } => {
             if codex && claude {
@@ -596,7 +601,7 @@ async fn real_main() -> CliResult<()> {
                 }
             };
             let port = port.unwrap_or_else(|| if service_name == "codex" { 3211 } else { 3210 });
-            run_server(service_name, port, !no_tui)
+            run_server(service_name, host, port, !no_tui)
                 .await
                 .map_err(|e| CliError::Other(e.to_string()))?;
         }
@@ -698,7 +703,12 @@ fn rotate_runtime_log_if_needed(log_dir: &std::path::Path) {
     }
 }
 
-async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> anyhow::Result<()> {
+async fn run_server(
+    service_name: &'static str,
+    host: IpAddr,
+    port: u16,
+    enable_tui: bool,
+) -> anyhow::Result<()> {
     let interactive = enable_tui && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
 
     struct AutoRestoreGuard {
@@ -818,7 +828,14 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
 或在 ~/.codex-helper/config.toml（或 config.json）的 `claude` 段下手动添加上游配置"
         );
     }
-    let client = Client::builder().build()?;
+    // NOTE: We intentionally avoid a global request timeout because SSE streaming requests may
+    // legitimately run for a long time. We do set connection-level timeouts/keepalives to reduce
+    // long hangs and stale connection issues on some networks.
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .build()?;
 
     // Shared LB state (failure counters, cooldowns, usage flags).
     let lb_states = Arc::new(Mutex::new(HashMap::new()));
@@ -828,7 +845,13 @@ async fn run_server(service_name: &'static str, port: u16, enable_tui: bool) -> 
     let state = proxy.state_handle();
     let app: Router = proxy_router(proxy);
 
-    let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
+    if !host.is_loopback() {
+        tracing::warn!(
+            "Binding to non-loopback address {}. This may expose your proxy to other machines. Consider using 127.0.0.1 + SSH port forwarding instead.",
+            host
+        );
+    }
+    let addr: SocketAddr = SocketAddr::from((host, port));
     let listener = bind_local_listener_or_explain(addr, service_name).await?;
     tracing::info!(
         "codex-helper listening on http://{} (service: {})",
