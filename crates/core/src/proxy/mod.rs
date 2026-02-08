@@ -81,7 +81,7 @@ fn format_reqwest_error_for_retry_chain(e: &reqwest::Error) -> String {
     const MAX_LEN: usize = 360;
     if out.len() > MAX_LEN {
         out.truncate(MAX_LEN);
-        out.push_str("…");
+        out.push('…');
     }
     out
 }
