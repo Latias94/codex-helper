@@ -20,6 +20,7 @@ pub(in crate::tui) enum Page {
     Stats,
     Settings,
     History,
+    Recent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +65,7 @@ impl EffortChoice {
     }
 }
 
-pub(in crate::tui) fn page_titles(lang: Language) -> [&'static str; 7] {
+pub(in crate::tui) fn page_titles(lang: Language) -> [&'static str; 8] {
     [
         crate::tui::i18n::pick(lang, "1 总览", "1 Dashboard"),
         crate::tui::i18n::pick(lang, "2 配置", "2 Configs"),
@@ -73,6 +74,7 @@ pub(in crate::tui) fn page_titles(lang: Language) -> [&'static str; 7] {
         crate::tui::i18n::pick(lang, "5 统计", "5 Stats"),
         crate::tui::i18n::pick(lang, "6 设置", "6 Settings"),
         crate::tui::i18n::pick(lang, "7 历史", "7 History"),
+        crate::tui::i18n::pick(lang, "8 最近", "8 Recent"),
     ]
 }
 
@@ -85,6 +87,7 @@ pub(in crate::tui) fn page_index(page: Page) -> usize {
         Page::Stats => 4,
         Page::Settings => 5,
         Page::History => 6,
+        Page::Recent => 7,
     }
 }
 use crate::tui::Language;

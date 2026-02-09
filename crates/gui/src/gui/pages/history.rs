@@ -1,5 +1,5 @@
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::super::i18n::pick;
 use super::PageCtx;
@@ -23,7 +23,7 @@ pub struct HistoryViewState {
     pub selected_id: Option<String>,
     applied_scope: HistoryScope,
     applied_query: String,
-    pub recent_since_hours: u32,
+    pub recent_since_minutes: u32,
     pub recent_limit: usize,
     pub infer_git_root: bool,
     pub resume_cmd: String,
@@ -62,6 +62,7 @@ pub struct HistoryViewState {
     pub transcript_messages: Vec<SessionTranscriptMessage>,
     pub transcript_error: Option<String>,
     pub(super) loaded_for: Option<(String, Option<usize>)>,
+    pub branch_by_workdir: HashMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,16 @@ fn resolve_history_layout(layout_mode: &str, available_width: f32) -> ResolvedHi
     }
 }
 
+const RECENT_WINDOWS: &[(u32, &str)] = &[
+    (30, "30m"),
+    (60, "1h"),
+    (3 * 60, "3h"),
+    (8 * 60, "8h"),
+    (12 * 60, "12h"),
+    (24 * 60, "24h"),
+    (7 * 24 * 60, "7d"),
+];
+
 impl Default for HistoryViewState {
     fn default() -> Self {
         Self {
@@ -111,7 +122,7 @@ impl Default for HistoryViewState {
             selected_id: None,
             applied_scope: HistoryScope::CurrentProject,
             applied_query: String::new(),
-            recent_since_hours: 12,
+            recent_since_minutes: 12 * 60,
             recent_limit: 50,
             infer_git_root: false,
             resume_cmd: "codex resume {id}".to_string(),
@@ -150,7 +161,112 @@ impl Default for HistoryViewState {
             transcript_messages: Vec::new(),
             transcript_error: None,
             loaded_for: None,
+            branch_by_workdir: HashMap::new(),
         }
+    }
+}
+
+fn find_git_root_upward(workdir: &str) -> Option<std::path::PathBuf> {
+    let trimmed = workdir.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return None;
+    }
+    let path = std::path::PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return None;
+    }
+    if !path.exists() {
+        return None;
+    }
+
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    let mut cur = canonical.clone();
+    loop {
+        if cur.join(".git").exists() {
+            return Some(cur);
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn read_git_branch_shallow(workdir: &str) -> Option<String> {
+    let root = find_git_root_upward(workdir)?;
+    let dot_git = root.join(".git");
+    if !dot_git.exists() {
+        return None;
+    }
+
+    let gitdir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let content = std::fs::read_to_string(&dot_git).ok()?;
+        let first = content.lines().next()?.trim();
+        let path = first.strip_prefix("gitdir:")?.trim();
+        let mut p = std::path::PathBuf::from(path);
+        if p.is_relative() {
+            p = root.join(p);
+        }
+        p
+    };
+
+    let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    let head = head.lines().next().unwrap_or("").trim();
+    if let Some(r) = head.strip_prefix("ref:") {
+        let r = r.trim();
+        return Some(r.rsplit('/').next().unwrap_or(r).to_string());
+    }
+    if head.len() >= 8 {
+        Some(head[..8].to_string())
+    } else if head.is_empty() {
+        None
+    } else {
+        Some(head.to_string())
+    }
+}
+
+fn refresh_branch_cache_for_sessions(
+    branch_by_workdir: &mut HashMap<String, Option<String>>,
+    infer_git_root: bool,
+    sessions: &[SessionSummary],
+) {
+    branch_by_workdir.clear();
+    for s in sessions {
+        let Some(cwd) = s.cwd.as_deref() else {
+            continue;
+        };
+        let workdir = history_workdir_from_cwd(cwd, infer_git_root);
+        if workdir == "-" || workdir.trim().is_empty() {
+            continue;
+        }
+        if branch_by_workdir.contains_key(workdir.as_str()) {
+            continue;
+        }
+        let b = read_git_branch_shallow(workdir.as_str());
+        branch_by_workdir.insert(workdir, b);
+    }
+}
+
+fn refresh_branch_cache_for_day_items(
+    branch_by_workdir: &mut HashMap<String, Option<String>>,
+    infer_git_root: bool,
+    items: &[SessionIndexItem],
+) {
+    for s in items {
+        let Some(cwd) = s.cwd.as_deref() else {
+            continue;
+        };
+        let workdir = history_workdir_from_cwd(cwd, infer_git_root);
+        if workdir == "-" || workdir.trim().is_empty() {
+            continue;
+        }
+        if branch_by_workdir.contains_key(workdir.as_str()) {
+            continue;
+        }
+        let b = read_git_branch_shallow(workdir.as_str());
+        branch_by_workdir.insert(workdir, b);
     }
 }
 
@@ -189,6 +305,7 @@ pub(in crate::gui::pages) struct TranscriptLoad {
 
 pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     poll_transcript_loader(ctx);
+    let mut refresh_requested = false;
 
     ui.heading(pick(ctx.lang, "历史会话", "History"));
     ui.label(pick(
@@ -198,6 +315,53 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ));
 
     ui.add_space(6.0);
+
+    // Shortcuts (Global recent only):
+    // - Ctrl+Y: copy visible root+id list
+    // - Ctrl+Enter: copy selected root+id
+    if ctx.view.history.scope == HistoryScope::GlobalRecent {
+        let copy_list = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Y);
+        if ui.ctx().input_mut(|i| i.consume_shortcut(&copy_list)) {
+            let mut out = String::new();
+            for s in ctx.view.history.sessions.iter() {
+                let cwd = s.cwd.as_deref().unwrap_or("-");
+                if cwd == "-" {
+                    continue;
+                }
+                let root = history_workdir_from_cwd(cwd, ctx.view.history.infer_git_root);
+                out.push_str(root.trim());
+                out.push(' ');
+                out.push_str(s.id.as_str());
+                out.push('\n');
+            }
+            ui.ctx().copy_text(out);
+            *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+        }
+
+        let copy_selected = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Enter);
+        if ui.ctx().input_mut(|i| i.consume_shortcut(&copy_selected)) {
+            if let Some(s) = ctx
+                .view
+                .history
+                .selected_id
+                .as_deref()
+                .and_then(|id| ctx.view.history.sessions.iter().find(|s| s.id == id))
+            {
+                let cwd = s.cwd.as_deref().unwrap_or("-");
+                if cwd == "-" {
+                    *ctx.last_error =
+                        Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
+                } else {
+                    let workdir = history_workdir_from_cwd(cwd, ctx.view.history.infer_git_root);
+                    ui.ctx().copy_text(format!("{} {}", workdir.trim(), s.id));
+                    *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
+                }
+            } else {
+                *ctx.last_error =
+                    Some(pick(ctx.lang, "未选中任何会话", "No session selected").to_string());
+            }
+        }
+    }
 
     ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "范围", "Scope"));
@@ -226,12 +390,33 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             });
 
         if ctx.view.history.scope == HistoryScope::GlobalRecent {
-            ui.label(pick(ctx.lang, "最近(小时)", "Since (hours)"));
+            let mut window_changed = false;
+            ui.label(pick(ctx.lang, "窗口", "Window"));
+            for (mins, label) in RECENT_WINDOWS.iter().copied() {
+                let selected = ctx.view.history.recent_since_minutes == mins;
+                if ui.selectable_label(selected, label).clicked() {
+                    ctx.view.history.recent_since_minutes = mins;
+                    window_changed = true;
+                }
+            }
+
+            ui.label(pick(ctx.lang, "最近(分钟)", "Since (minutes)"));
+            let before = ctx.view.history.recent_since_minutes;
             ui.add(
-                egui::DragValue::new(&mut ctx.view.history.recent_since_hours)
-                    .range(1..=168)
-                    .speed(1),
-            );
+                egui::DragValue::new(&mut ctx.view.history.recent_since_minutes)
+                    .range(5..=10_080)
+                    .speed(5),
+            )
+            .on_hover_text(pick(
+                ctx.lang,
+                "建议优先用“窗口”快速切换；这里用于精确自定义。",
+                "Prefer Window presets; use this for fine-grained customization.",
+            ));
+            if ctx.view.history.recent_since_minutes != before {
+                window_changed = true;
+            }
+            let approx_h = (ctx.view.history.recent_since_minutes as f32) / 60.0;
+            ui.label(format!("≈{approx_h:.1}h"));
             ui.label(pick(ctx.lang, "条数", "Limit"));
             ui.add(
                 egui::DragValue::new(&mut ctx.view.history.recent_limit)
@@ -274,9 +459,17 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             if selected_mode != mode {
                 ctx.gui_cfg.history.workdir_mode = selected_mode.clone();
                 ctx.view.history.infer_git_root = selected_mode == "git_root";
+                let infer_git_root = ctx.view.history.infer_git_root;
+                let sessions = ctx.view.history.sessions_all.as_slice();
+                refresh_branch_cache_for_sessions(
+                    &mut ctx.view.history.branch_by_workdir,
+                    infer_git_root,
+                    sessions,
+                );
                 if let Err(e) = ctx.gui_cfg.save() {
                     *ctx.last_error = Some(format!("save gui config failed: {e}"));
                 }
+                window_changed = true;
             }
 
             ui.checkbox(
@@ -288,6 +481,18 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 "按工作目录分组并折叠，适合“第二天继续昨天的一堆会话”的批量恢复。",
                 "Group by workdir with collapsible headers; great for batch resume next day.",
             ));
+
+            if window_changed {
+                refresh_requested = true;
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "窗口已更新（将影响下次刷新）",
+                        "Window updated (affects next refresh)",
+                    )
+                    .to_string(),
+                );
+            }
         } else if ctx.view.history.scope == HistoryScope::AllByDate {
             ui.label(pick(ctx.lang, "最近天数", "Recent days"));
             ui.add(
@@ -327,6 +532,14 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             if selected_mode != mode {
                 ctx.gui_cfg.history.workdir_mode = selected_mode.clone();
                 ctx.view.history.infer_git_root = selected_mode == "git_root";
+                ctx.view.history.branch_by_workdir.clear();
+                let infer_git_root = ctx.view.history.infer_git_root;
+                let items = ctx.view.history.all_day_sessions.as_slice();
+                refresh_branch_cache_for_day_items(
+                    &mut ctx.view.history.branch_by_workdir,
+                    infer_git_root,
+                    items,
+                );
                 if let Err(e) = ctx.gui_cfg.save() {
                     *ctx.last_error = Some(format!("save gui config failed: {e}"));
                 }
@@ -422,9 +635,9 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
         }
 
-        if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
+        if refresh_requested || ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
             let scope = ctx.view.history.scope;
-            let recent_since_hours = ctx.view.history.recent_since_hours;
+            let recent_since_minutes = ctx.view.history.recent_since_minutes;
             let recent_limit = ctx.view.history.recent_limit;
             let fut = async move {
                 match scope {
@@ -433,7 +646,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     }
                     HistoryScope::GlobalRecent => {
                         let since = std::time::Duration::from_secs(
-                            (recent_since_hours as u64).saturating_mul(3600),
+                            (recent_since_minutes as u64).saturating_mul(60),
                         );
                         crate::sessions::find_recent_codex_session_summaries(since, recent_limit)
                             .await
@@ -445,6 +658,13 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 Ok(mut list) => {
                     sort_session_summaries_by_mtime_desc(&mut list);
                     ctx.view.history.sessions_all = list;
+                    let infer_git_root = ctx.view.history.infer_git_root;
+                    let sessions = ctx.view.history.sessions_all.as_slice();
+                    refresh_branch_cache_for_sessions(
+                        &mut ctx.view.history.branch_by_workdir,
+                        infer_git_root,
+                        sessions,
+                    );
                     ctx.view.history.search_transcript_applied = None;
                     ctx.view.history.loaded_at_ms = Some(now_ms());
                     ctx.view.history.last_error = None;
@@ -1029,6 +1249,13 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 Ok(mut list) => {
                     list.sort_by_key(|s| std::cmp::Reverse(s.mtime_ms));
                     ctx.view.history.all_day_sessions = list;
+                    let infer_git_root = ctx.view.history.infer_git_root;
+                    let items = ctx.view.history.all_day_sessions.as_slice();
+                    refresh_branch_cache_for_day_items(
+                        &mut ctx.view.history.branch_by_workdir,
+                        infer_git_root,
+                        items,
+                    );
                     ctx.view.history.loaded_day_for = Some(date.clone());
                     ctx.view.history.selected_id = None;
                     ctx.view.history.transcript_messages.clear();

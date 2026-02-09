@@ -5,7 +5,7 @@ use super::super::history::HistoryScope;
 use super::super::{
     PageCtx, WtItemSkipReason, basename, build_wt_items_from_session_summaries, format_age,
     history_workdir_from_cwd, now_ms, open_wt_items, path_mtime_ms, short_sid, shorten,
-    workdir_status_from_cwd,
+    shorten_middle, workdir_status_from_cwd,
 };
 
 pub(in super::super) fn render_sessions_panel_horizontal(
@@ -133,7 +133,18 @@ pub(in super::super) fn render_sessions_panel_horizontal(
                             }
                         }
 
-                        let header = format!("{name}  ok={ok_n}/{n}  {age}");
+                        let branch = ctx
+                            .view
+                            .history
+                            .branch_by_workdir
+                            .get(key.as_str())
+                            .and_then(|v| v.as_deref())
+                            .unwrap_or("-");
+                        let header = if branch == "-" {
+                            format!("{name}  ok={ok_n}/{n}  {age}")
+                        } else {
+                            format!("{name}  [{branch}]  ok={ok_n}/{n}  {age}")
+                        };
                         let mut hover = String::new();
                         hover.push_str(key.as_str());
                         if skipped_missing_cwd + skipped_invalid_workdir + skipped_missing_dir > 0 {
@@ -226,8 +237,9 @@ pub(in super::super) fn render_sessions_panel_horizontal(
                             .unwrap_or("-");
                         let first = s.first_user_message.as_deref().unwrap_or("-");
                         let label = format!(
-                            "{id_short}  r={rounds}  {last}  {}",
-                            shorten(first, 46)
+                            "{id_short}  r={rounds}  {last}  {}\n{}",
+                            shorten(first, 46),
+                            s.id
                         );
 
                         let sid = s.id.clone();
@@ -254,7 +266,6 @@ pub(in super::super) fn render_sessions_panel_horizontal(
                     visible_ids.push(s.id.clone());
 
                     let selected = idx == ctx.view.history.selected_idx;
-                    let id_short = short_sid(&s.id, 16);
                     let rounds = s.rounds;
                     let last = s
                         .last_response_at
@@ -269,10 +280,23 @@ pub(in super::super) fn render_sessions_panel_horizontal(
                                 .as_deref()
                                 .map(|v| shorten(basename(v), 22))
                                 .unwrap_or_else(|| "-".to_string());
-                            format!(
-                                "{id_short}  r={rounds}  {cwd}  {last}  {}",
-                                shorten(first, 40)
-                            )
+                            let workdir = s.cwd.as_deref().unwrap_or("-").to_string();
+                            let branch = ctx
+                                .view
+                                .history
+                                .branch_by_workdir
+                                .get(workdir.as_str())
+                                .and_then(|v| v.as_deref())
+                                .unwrap_or("-");
+                            if branch == "-" {
+                                format!("{cwd}  r={rounds}  {last}\n{}  {}", s.id, shorten(first, 44))
+                            } else {
+                                format!(
+                                    "{cwd}  [{branch}]  r={rounds}  {last}\n{}  {}",
+                                    s.id,
+                                    shorten(first, 44)
+                                )
+                            }
                         }
                         HistoryScope::GlobalRecent | HistoryScope::AllByDate => {
                             let root = s
@@ -282,11 +306,23 @@ pub(in super::super) fn render_sessions_panel_horizontal(
                                     history_workdir_from_cwd(cwd, ctx.view.history.infer_git_root)
                                 })
                                 .unwrap_or_else(|| "-".to_string());
-                            format!(
-                                "{}  {id_short}  r={rounds}  {last}  {}",
-                                shorten(&root, 44),
-                                shorten(first, 36)
-                            )
+                            let branch = ctx
+                                .view
+                                .history
+                                .branch_by_workdir
+                                .get(root.as_str())
+                                .and_then(|v| v.as_deref())
+                                .unwrap_or("-");
+                            let root_short = shorten_middle(root.as_str(), 60);
+                            if branch == "-" {
+                                format!("{root_short}  r={rounds}  {last}\n{}  {}", s.id, shorten(first, 44))
+                            } else {
+                                format!(
+                                    "{root_short}  [{branch}]  r={rounds}  {last}\n{}  {}",
+                                    s.id,
+                                    shorten(first, 44)
+                                )
+                            }
                         }
                     };
                     let sid = s.id.clone();
@@ -401,9 +437,28 @@ pub(in super::super) fn render_sessions_panel_vertical(
                     let key = g.key.clone();
                     let ok_n = g.indices.len();
 
+                    let branch = ctx
+                        .view
+                        .history
+                        .branch_by_workdir
+                        .get(key.as_str())
+                        .and_then(|v| v.as_deref())
+                        .unwrap_or("-");
                     let header = match ctx.lang {
-                        Language::Zh => format!("{}  ({})", shorten(&key, 44), ok_n),
-                        Language::En => format!("{}  ({})", shorten(&key, 44), ok_n),
+                        Language::Zh => {
+                            if branch == "-" {
+                                format!("{}  ({})", shorten(&key, 44), ok_n)
+                            } else {
+                                format!("{}  [{branch}]  ({})", shorten(&key, 44), ok_n)
+                            }
+                        }
+                        Language::En => {
+                            if branch == "-" {
+                                format!("{}  ({})", shorten(&key, 44), ok_n)
+                            } else {
+                                format!("{}  [{branch}]  ({})", shorten(&key, 44), ok_n)
+                            }
+                        }
                     };
 
                     let mut collapsed = ctx.view.history.collapsed_workdirs.contains(key.as_str());
@@ -449,8 +504,11 @@ pub(in super::super) fn render_sessions_panel_vertical(
                             .or(s.updated_at.as_deref())
                             .unwrap_or("-");
                         let first = s.first_user_message.as_deref().unwrap_or("-");
-                        let label =
-                            format!("{id_short}  r={rounds}  {last}  {}", shorten(first, 46));
+                        let label = format!(
+                            "{id_short}  r={rounds}  {last}  {}\n{}",
+                            shorten(first, 46),
+                            s.id
+                        );
 
                         let sid = s.id.clone();
                         ui.horizontal(|ui| {
@@ -476,7 +534,6 @@ pub(in super::super) fn render_sessions_panel_vertical(
                     visible_ids.push(s.id.clone());
 
                     let selected = idx == ctx.view.history.selected_idx;
-                    let id_short = short_sid(&s.id, 16);
                     let rounds = s.rounds;
                     let last = s
                         .last_response_at
@@ -491,10 +548,27 @@ pub(in super::super) fn render_sessions_panel_vertical(
                                 .as_deref()
                                 .map(|v| shorten(basename(v), 22))
                                 .unwrap_or_else(|| "-".to_string());
-                            format!(
-                                "{id_short}  r={rounds}  {cwd}  {last}  {}",
-                                shorten(first, 40)
-                            )
+                            let workdir = s.cwd.as_deref().unwrap_or("-").to_string();
+                            let branch = ctx
+                                .view
+                                .history
+                                .branch_by_workdir
+                                .get(workdir.as_str())
+                                .and_then(|v| v.as_deref())
+                                .unwrap_or("-");
+                            if branch == "-" {
+                                format!(
+                                    "{cwd}  r={rounds}  {last}\n{}  {}",
+                                    s.id,
+                                    shorten(first, 44)
+                                )
+                            } else {
+                                format!(
+                                    "{cwd}  [{branch}]  r={rounds}  {last}\n{}  {}",
+                                    s.id,
+                                    shorten(first, 44)
+                                )
+                            }
                         }
                         HistoryScope::GlobalRecent | HistoryScope::AllByDate => {
                             let root = s
@@ -504,11 +578,27 @@ pub(in super::super) fn render_sessions_panel_vertical(
                                     history_workdir_from_cwd(cwd, ctx.view.history.infer_git_root)
                                 })
                                 .unwrap_or_else(|| "-".to_string());
-                            format!(
-                                "{}  {id_short}  r={rounds}  {last}  {}",
-                                shorten(&root, 44),
-                                shorten(first, 36)
-                            )
+                            let branch = ctx
+                                .view
+                                .history
+                                .branch_by_workdir
+                                .get(root.as_str())
+                                .and_then(|v| v.as_deref())
+                                .unwrap_or("-");
+                            let root_short = shorten_middle(root.as_str(), 60);
+                            if branch == "-" {
+                                format!(
+                                    "{root_short}  r={rounds}  {last}\n{}  {}",
+                                    s.id,
+                                    shorten(first, 44)
+                                )
+                            } else {
+                                format!(
+                                    "{root_short}  [{branch}]  r={rounds}  {last}\n{}  {}",
+                                    s.id,
+                                    shorten(first, 44)
+                                )
+                            }
                         }
                     };
 
@@ -621,7 +711,7 @@ pub(in super::super) fn render_all_by_date_sessions_panel(
     let mut pending_select: Option<(usize, String)> = None;
     {
         let total = visible_indices.len();
-        let row_h = 22.0;
+        let row_h = 42.0;
         egui::ScrollArea::vertical()
             .id_salt(scroll_id_salt)
             .max_height(max_height)
@@ -636,7 +726,6 @@ pub(in super::super) fn render_all_by_date_sessions_panel(
                         .as_deref()
                         .is_some_and(|id| id == s.id);
 
-                    let id_short = short_sid(&s.id, 16);
                     let t = s
                         .updated_hint
                         .as_deref()
@@ -654,13 +743,22 @@ pub(in super::super) fn render_all_by_date_sessions_panel(
                         })
                         .unwrap_or_else(|| "-".to_string());
                     let first = s.first_user_message.as_deref().unwrap_or("-");
-                    let label = format!(
-                        "{}  {}  {}  {}",
-                        shorten(&root_or_cwd, 36),
-                        id_short,
-                        shorten(t, 19),
-                        shorten(first, 40)
-                    );
+                    let branch = ctx
+                        .view
+                        .history
+                        .branch_by_workdir
+                        .get(root_or_cwd.as_str())
+                        .and_then(|v| v.as_deref())
+                        .unwrap_or("-");
+                    let root_short = shorten_middle(root_or_cwd.as_str(), 64);
+                    let t_short = shorten(t, 19);
+                    let first_short = shorten(first, 58);
+                    let line1 = if branch == "-" {
+                        format!("{root_short}  {t_short}")
+                    } else {
+                        format!("{root_short}  [{branch}]  {t_short}")
+                    };
+                    let label = format!("{line1}\n{}  {first_short}", s.id);
                     let sid = s.id.clone();
                     ui.horizontal(|ui| {
                         let mut checked = ctx.view.history.batch_selected_ids.contains(&sid);

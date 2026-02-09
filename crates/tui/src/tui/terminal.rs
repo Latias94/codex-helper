@@ -1,4 +1,5 @@
 use std::io;
+use std::io::IsTerminal;
 
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -10,8 +11,16 @@ pub(in crate::tui) struct TerminalGuard {
 
 impl TerminalGuard {
     pub(in crate::tui) fn enter() -> anyhow::Result<Self> {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Err(anyhow::anyhow!(
+                "TUI requires an interactive terminal (stdin/stdout must be a TTY)"
+            ));
+        }
         enable_raw_mode()?;
-        crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+        if let Err(e) = crossterm::execute!(io::stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e.into());
+        }
         Ok(Self { disarmed: false })
     }
 

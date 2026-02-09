@@ -219,7 +219,7 @@ pub(super) fn render_sessions_page(
         lines.push(kv_line(
             p,
             "session",
-            short_sid(sid_full, 28),
+            sid_full.to_string(),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ));
         lines.push(kv_line(p, "cwd", cwd_full, Style::default().fg(p.text)));

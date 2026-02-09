@@ -263,46 +263,51 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
         Overlay::None => match ui.page {
             Page::Dashboard => crate::tui::i18n::pick(
                 ui.language,
-                "1-7 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  Enter effort  l/m/h/X 设置  x 清除  p 会话配置  P 全局配置  ? 帮助",
-                "1-7 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set  x clear  p session cfg  P global cfg  ? help",
+                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  Enter effort  l/m/h/X 设置  x 清除  p 会话配置  P 全局配置  ? 帮助",
+                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set  x clear  p session cfg  P global cfg  ? help",
             ),
             Page::Configs => crate::tui::i18n::pick(
                 ui.language,
-                "1-7 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 设为 active  Backspace 自动  o 会话 override  O 清除  ? 帮助",
-                "1-7 pages  q quit  L language  ↑/↓ select  i details  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter set active  Backspace auto  o session override  O clear  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 设为 active  Backspace 自动  o 会话 override  O 清除  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  i details  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter set active  Backspace auto  o session override  O clear  ? help",
             ),
             Page::Requests => crate::tui::i18n::pick(
                 ui.language,
-                "1-7 页面  q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  ? 帮助",
-                "1-7 pages  q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
             ),
             Page::Sessions => crate::tui::i18n::pick(
                 ui.language,
-                "1-7 页面  q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  ? 帮助",
-                "1-7 pages  q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  t transcript  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  t transcript  ? help",
             ),
             Page::Stats => crate::tui::i18n::pick(
                 ui.language,
-                "1-7 页面  q 退出  L 语言  Tab 焦点(config/provider)  ↑/↓ 选择  d 天数(7/21/60)  e 仅看错误(recent)  y 复制+导出报告  ? 帮助",
-                "1-7 pages  q quit  L language  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  y copy+export report  ? help",
+                "1-8 页面  q 退出  L 语言  Tab 焦点(config/provider)  ↑/↓ 选择  d 天数(7/21/60)  e 仅看错误(recent)  y 复制+导出报告  ? 帮助",
+                "1-8 pages  q quit  L language  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  y copy+export report  ? help",
             ),
             Page::Settings => crate::tui::i18n::pick(
                 ui.language,
                 if ui.service_name == "codex" {
-                    "1-7 页面  q 退出  L 语言  R 重载配置  O 覆盖导入(~/.codex，二次确认)  ? 帮助"
+                    "1-8 页面  q 退出  L 语言  R 重载配置  O 覆盖导入(~/.codex，二次确认)  ? 帮助"
                 } else {
-                    "1-7 页面  q 退出  L 语言  R 重载配置  ? 帮助"
+                    "1-8 页面  q 退出  L 语言  R 重载配置  ? 帮助"
                 },
                 if ui.service_name == "codex" {
-                    "1-7 pages  q quit  L language  R reload  O overwrite(~/.codex, confirm)  ? help"
+                    "1-8 pages  q quit  L language  R reload  O overwrite(~/.codex, confirm)  ? help"
                 } else {
-                    "1-7 pages  q quit  L language  R reload  ? help"
+                    "1-8 pages  q quit  L language  R reload  ? help"
                 },
             ),
             Page::History => crate::tui::i18n::pick(
                 ui.language,
-                "1-7 页面  q 退出  L 语言  ↑/↓ 选择  r 刷新  t/Enter 对话记录  ? 帮助",
-                "1-7 pages  q quit  L language  ↑/↓ select  r refresh  t/Enter transcript  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r 刷新  t/Enter 对话记录  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  r refresh  t/Enter transcript  ? help",
+            ),
+            Page::Recent => crate::tui::i18n::pick(
+                ui.language,
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  [] 切换时间  r 刷新  Enter 复制选中  y 复制全部(可见)  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  [] window  r refresh  Enter copy selected  y copy all(visible)  ? help",
             ),
         },
         Overlay::Help => crate::tui::i18n::pick(

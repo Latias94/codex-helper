@@ -3,9 +3,7 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::tui::ProviderOption;
-use crate::tui::model::{
-    Palette, Snapshot, compute_window_stats, now_ms, short_sid, shorten, shorten_middle,
-};
+use crate::tui::model::{Palette, Snapshot, compute_window_stats, now_ms, shorten, shorten_middle};
 use crate::tui::state::UiState;
 use crate::tui::types::{EffortChoice, Overlay};
 
@@ -60,7 +58,7 @@ pub(super) fn render_config_info_modal(
             crate::tui::i18n::pick(ui.language, "会话：", "session: "),
             Style::default().fg(p.muted),
         ),
-        Span::styled(short_sid(selected_session, 28), Style::default().fg(p.text)),
+        Span::styled(selected_session.to_string(), Style::default().fg(p.text)),
         Span::raw("   "),
         Span::styled(
             crate::tui::i18n::pick(ui.language, "固定：", "pinned: "),
@@ -822,7 +820,7 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
     let title = format!(
         "{}: {}  [{mode}]",
         crate::tui::i18n::pick(ui.language, "会话对话记录", "Session transcript"),
-        short_sid(sid, 28)
+        sid
     );
 
     let block = Block::default()
@@ -837,7 +835,7 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("sid: ", Style::default().fg(p.muted)),
-        Span::styled(short_sid(sid, 36), Style::default().fg(p.text)),
+        Span::styled(sid.to_string(), Style::default().fg(p.text)),
         Span::raw("   "),
         Span::styled(
             crate::tui::i18n::pick(ui.language, "按键：", "keys: "),

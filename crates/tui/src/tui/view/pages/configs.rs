@@ -4,9 +4,7 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap};
 
 use crate::tui::ProviderOption;
-use crate::tui::model::{
-    Palette, Snapshot, format_age, now_ms, short_sid, shorten, shorten_middle,
-};
+use crate::tui::model::{Palette, Snapshot, format_age, now_ms, shorten, shorten_middle};
 use crate::tui::state::UiState;
 
 pub(super) fn render_configs_page(
@@ -35,7 +33,7 @@ pub(super) fn render_configs_page(
 
     let left_block = Block::default()
         .title(Span::styled(
-            format!("Configs  (session: {})", short_sid(selected_session, 20)),
+            format!("Configs  (session: {selected_session})"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)

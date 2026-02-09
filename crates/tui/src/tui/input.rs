@@ -18,7 +18,10 @@ use crate::sessions::{
 use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
 
 use super::Language;
-use super::model::{ProviderOption, Snapshot, filtered_requests_len, now_ms};
+use super::model::{
+    CODEX_RECENT_WINDOWS, ProviderOption, Snapshot, codex_recent_window_label,
+    codex_recent_window_threshold_ms, filtered_requests_len, now_ms,
+};
 use super::report::build_stats_report;
 use super::state::{UiState, adjust_table_selection};
 use super::types::{EffortChoice, Focus, Overlay, Page, StatsFocus};
@@ -186,6 +189,7 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         KeyCode::Char('5') => Some(Page::Stats),
         KeyCode::Char('6') => Some(Page::Settings),
         KeyCode::Char('7') => Some(Page::History),
+        KeyCode::Char('8') => Some(Page::Recent),
         _ => None,
     };
     if let Some(p) = page {
@@ -196,6 +200,7 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
             ui.focus = Focus::Requests;
         } else if ui.page == Page::Sessions
             || ui.page == Page::History
+            || ui.page == Page::Recent
             || (ui.page == Page::Dashboard && ui.focus == Focus::Configs)
         {
             ui.focus = Focus::Sessions;
@@ -204,6 +209,12 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
             ui.needs_codex_history_refresh = true;
             ui.selected_codex_history_idx = 0;
             ui.codex_history_table.select(None);
+        }
+        if ui.page == Page::Recent {
+            ui.needs_codex_recent_refresh = true;
+            ui.codex_recent_selected_idx = 0;
+            ui.codex_recent_selected_id = None;
+            ui.codex_recent_table.select(None);
         }
         return true;
     }
@@ -1329,6 +1340,48 @@ async fn handle_key_normal(
             ));
             true
         }
+        KeyCode::Char('r') if ui.page == Page::Recent => {
+            ui.needs_codex_recent_refresh = true;
+            ui.toast = Some((
+                crate::tui::i18n::pick(ui.language, "recent: 刷新中…", "recent: refreshing…")
+                    .to_string(),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('[') if ui.page == Page::Recent => {
+            if ui.codex_recent_window_idx == 0 {
+                ui.codex_recent_window_idx = CODEX_RECENT_WINDOWS.len().saturating_sub(1);
+            } else {
+                ui.codex_recent_window_idx = ui.codex_recent_window_idx.saturating_sub(1);
+            }
+            ui.codex_recent_selected_idx = 0;
+            ui.codex_recent_selected_id = None;
+            ui.codex_recent_table.select(None);
+            ui.toast = Some((
+                format!(
+                    "recent window: {}",
+                    codex_recent_window_label(ui.codex_recent_window_idx)
+                ),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char(']') if ui.page == Page::Recent => {
+            ui.codex_recent_window_idx =
+                (ui.codex_recent_window_idx + 1) % CODEX_RECENT_WINDOWS.len().max(1);
+            ui.codex_recent_selected_idx = 0;
+            ui.codex_recent_selected_id = None;
+            ui.codex_recent_table.select(None);
+            ui.toast = Some((
+                format!(
+                    "recent window: {}",
+                    codex_recent_window_label(ui.codex_recent_window_idx)
+                ),
+                Instant::now(),
+            ));
+            true
+        }
         KeyCode::Char('t') if ui.page == Page::Sessions => {
             let Some(sid) = ui.selected_session_id.clone() else {
                 ui.toast = Some(("no session selected".to_string(), Instant::now()));
@@ -1348,6 +1401,77 @@ async fn handle_key_normal(
                 }
                 Err(e) => {
                     ui.toast = Some((format!("failed to load transcript: {e}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Enter if ui.page == Page::Recent => {
+            let now = now_ms();
+            let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
+            let selected = ui
+                .codex_recent_rows
+                .iter()
+                .filter(|r| r.mtime_ms >= threshold_ms)
+                .nth(ui.codex_recent_selected_idx);
+            let Some(r) = selected else {
+                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            let line = format!("{} {}", r.root, r.session_id);
+            match try_copy_to_clipboard(&line) {
+                Ok(()) => {
+                    ui.toast = Some((
+                        crate::tui::i18n::pick(
+                            ui.language,
+                            "recent: 已复制选中条目",
+                            "recent: copied selected",
+                        )
+                        .to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    ui.toast = Some((format!("clipboard failed: {e}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Char('y') if ui.page == Page::Recent => {
+            let now = now_ms();
+            let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
+            let mut out = String::new();
+            for r in ui
+                .codex_recent_rows
+                .iter()
+                .filter(|r| r.mtime_ms >= threshold_ms)
+            {
+                let root = r.root.trim();
+                if root.is_empty() || root == "-" {
+                    continue;
+                }
+                out.push_str(root);
+                out.push(' ');
+                out.push_str(r.session_id.as_str());
+                out.push('\n');
+            }
+            if out.trim().is_empty() {
+                ui.toast = Some(("recent: nothing to copy".to_string(), Instant::now()));
+                return true;
+            }
+            match try_copy_to_clipboard(&out) {
+                Ok(()) => {
+                    ui.toast = Some((
+                        crate::tui::i18n::pick(
+                            ui.language,
+                            "recent: 已复制可见列表",
+                            "recent: copied visible list",
+                        )
+                        .to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    ui.toast = Some((format!("clipboard failed: {e}"), Instant::now()));
                 }
             }
             true
@@ -1376,6 +1500,46 @@ async fn handle_key_normal(
             let len = ui.codex_history_sessions.len();
             if let Some(next) = adjust_table_selection(&mut ui.codex_history_table, 1, len) {
                 ui.selected_codex_history_idx = next;
+                return true;
+            }
+            false
+        }
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Recent => {
+            let now = now_ms();
+            let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
+            let len = ui
+                .codex_recent_rows
+                .iter()
+                .filter(|r| r.mtime_ms >= threshold_ms)
+                .count();
+            if let Some(next) = adjust_table_selection(&mut ui.codex_recent_table, -1, len) {
+                ui.codex_recent_selected_idx = next;
+                ui.codex_recent_selected_id = ui
+                    .codex_recent_rows
+                    .iter()
+                    .filter(|r| r.mtime_ms >= threshold_ms)
+                    .nth(next)
+                    .map(|r| r.session_id.clone());
+                return true;
+            }
+            false
+        }
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Recent => {
+            let now = now_ms();
+            let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
+            let len = ui
+                .codex_recent_rows
+                .iter()
+                .filter(|r| r.mtime_ms >= threshold_ms)
+                .count();
+            if let Some(next) = adjust_table_selection(&mut ui.codex_recent_table, 1, len) {
+                ui.codex_recent_selected_idx = next;
+                ui.codex_recent_selected_id = ui
+                    .codex_recent_rows
+                    .iter()
+                    .filter(|r| r.mtime_ms >= threshold_ms)
+                    .nth(next)
+                    .map(|r| r.session_id.clone());
                 return true;
             }
             false

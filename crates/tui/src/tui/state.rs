@@ -2,10 +2,20 @@ use ratatui::widgets::{ListState, TableState};
 
 use crate::config::ResolvedRetryConfig;
 use crate::sessions::{SessionMeta, SessionSummary, SessionTranscriptMessage};
+use std::collections::HashMap;
 
 use super::Language;
 use super::model::{Snapshot, filtered_requests_len};
 use super::types::{Focus, Overlay, Page, StatsFocus};
+
+#[derive(Debug, Clone)]
+pub(in crate::tui) struct RecentCodexRow {
+    pub(in crate::tui) root: String,
+    pub(in crate::tui) branch: Option<String>,
+    pub(in crate::tui) session_id: String,
+    pub(in crate::tui) cwd: Option<String>,
+    pub(in crate::tui) mtime_ms: u64,
+}
 
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
@@ -41,6 +51,15 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) codex_history_loaded_at_ms: Option<u64>,
     pub(in crate::tui) needs_codex_history_refresh: bool,
     pub(in crate::tui) selected_codex_history_idx: usize,
+    pub(in crate::tui) codex_recent_rows: Vec<RecentCodexRow>,
+    pub(in crate::tui) codex_recent_error: Option<String>,
+    pub(in crate::tui) codex_recent_loaded_at_ms: Option<u64>,
+    pub(in crate::tui) needs_codex_recent_refresh: bool,
+    pub(in crate::tui) codex_recent_window_idx: usize,
+    pub(in crate::tui) codex_recent_selected_idx: usize,
+    pub(in crate::tui) codex_recent_selected_id: Option<String>,
+    pub(in crate::tui) codex_recent_raw_cwd: bool,
+    pub(in crate::tui) codex_recent_branch_cache: HashMap<String, Option<String>>,
     pub(in crate::tui) session_transcript_meta: Option<SessionMeta>,
     pub(in crate::tui) session_transcript_sid: Option<String>,
     pub(in crate::tui) session_transcript_file: Option<String>,
@@ -60,6 +79,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) request_page_table: TableState,
     pub(in crate::tui) sessions_page_table: TableState,
     pub(in crate::tui) codex_history_table: TableState,
+    pub(in crate::tui) codex_recent_table: TableState,
     pub(in crate::tui) stats_configs_table: TableState,
     pub(in crate::tui) stats_providers_table: TableState,
     pub(in crate::tui) menu_list: ListState,
@@ -101,6 +121,15 @@ impl Default for UiState {
             codex_history_loaded_at_ms: None,
             needs_codex_history_refresh: false,
             selected_codex_history_idx: 0,
+            codex_recent_rows: Vec::new(),
+            codex_recent_error: None,
+            codex_recent_loaded_at_ms: None,
+            needs_codex_recent_refresh: false,
+            codex_recent_window_idx: 1,
+            codex_recent_selected_idx: 0,
+            codex_recent_selected_id: None,
+            codex_recent_raw_cwd: false,
+            codex_recent_branch_cache: HashMap::new(),
             session_transcript_meta: None,
             session_transcript_sid: None,
             session_transcript_file: None,
@@ -120,6 +149,7 @@ impl Default for UiState {
             request_page_table: TableState::default(),
             sessions_page_table: TableState::default(),
             codex_history_table: TableState::default(),
+            codex_recent_table: TableState::default(),
             stats_configs_table: TableState::default(),
             stats_providers_table: TableState::default(),
             menu_list: ListState::default(),

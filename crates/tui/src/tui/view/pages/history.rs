@@ -117,7 +117,7 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
     } else if let Some(s) = ui.codex_history_sessions.get(ui.selected_codex_history_idx) {
         lines.push(Line::from(vec![
             Span::styled("sid: ", Style::default().fg(p.muted)),
-            Span::styled(short_sid(s.id.as_str(), 32), Style::default().fg(p.text)),
+            Span::styled(s.id.clone(), Style::default().fg(p.text)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("cwd: ", Style::default().fg(p.muted)),

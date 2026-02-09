@@ -197,6 +197,77 @@ pub async fn run_dashboard(
                                 }
                                 ui.needs_codex_history_refresh = false;
                             }
+                            if ui.needs_codex_recent_refresh {
+                                ui.codex_recent_error = None;
+                                let since = Duration::from_secs(24 * 60 * 60);
+                                match crate::sessions::find_recent_codex_sessions(since, 500).await {
+                                    Ok(list) => {
+                                        let mut rows = Vec::with_capacity(list.len());
+                                        for s in list {
+                                            let cwd_opt = s.cwd.clone();
+                                            let cwd = cwd_opt.as_deref().unwrap_or("-");
+                                            let root = if ui.codex_recent_raw_cwd {
+                                                cwd.to_string()
+                                            } else {
+                                                crate::sessions::infer_project_root_from_cwd(cwd)
+                                            };
+                                            let branch = if root.trim().is_empty()
+                                                || root == "-"
+                                                || !std::path::Path::new(&root).exists()
+                                            {
+                                                None
+                                            } else if let Some(v) = ui.codex_recent_branch_cache.get(&root) {
+                                                v.clone()
+                                            } else {
+                                                let v = read_git_branch_shallow(&root).await;
+                                                ui.codex_recent_branch_cache
+                                                    .insert(root.clone(), v.clone());
+                                                v
+                                            };
+                                            rows.push(crate::tui::state::RecentCodexRow {
+                                                root,
+                                                branch,
+                                                session_id: s.id,
+                                                cwd: cwd_opt,
+                                                mtime_ms: s.mtime_ms,
+                                            });
+                                        }
+                                        ui.codex_recent_rows = rows;
+                                        ui.codex_recent_loaded_at_ms = Some(now_ms());
+                                        ui.codex_recent_selected_idx = 0;
+                                        ui.codex_recent_selected_id = ui
+                                            .codex_recent_rows
+                                            .first()
+                                            .map(|r| r.session_id.clone());
+                                        ui.codex_recent_table.select(if ui.codex_recent_rows.is_empty() {
+                                            None
+                                        } else {
+                                            Some(0)
+                                        });
+                                        let count = ui.codex_recent_rows.len();
+                                        let zh = format!("recent: 已加载 {count} 个会话");
+                                        let en = format!("recent: loaded {count} sessions");
+                                        ui.toast = Some((
+                                            crate::tui::i18n::pick(ui.language, &zh, &en)
+                                                .to_string(),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        ui.codex_recent_rows.clear();
+                                        ui.codex_recent_loaded_at_ms = Some(now_ms());
+                                        ui.codex_recent_error = Some(e.to_string());
+                                        let zh = format!("recent: 加载失败：{e}");
+                                        let en = format!("recent: load failed: {e}");
+                                        ui.toast = Some((
+                                            crate::tui::i18n::pick(ui.language, &zh, &en)
+                                                .to_string(),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
+                                ui.needs_codex_recent_refresh = false;
+                            }
                             should_redraw = true;
                         }
                     }
@@ -214,4 +285,45 @@ pub async fn run_dashboard(
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     term_guard.disarm();
     Ok(())
+}
+
+async fn read_git_branch_shallow(workdir: &str) -> Option<String> {
+    use tokio::fs;
+
+    let root = std::path::PathBuf::from(workdir);
+    if !root.is_absolute() {
+        return None;
+    }
+
+    let dot_git = root.join(".git");
+    if !dot_git.exists() {
+        return None;
+    }
+
+    let gitdir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let content = fs::read_to_string(&dot_git).await.ok()?;
+        let first = content.lines().next()?.trim();
+        let path = first.strip_prefix("gitdir:")?.trim();
+        let mut p = std::path::PathBuf::from(path);
+        if p.is_relative() {
+            p = root.join(p);
+        }
+        p
+    };
+
+    let head = fs::read_to_string(gitdir.join("HEAD")).await.ok()?;
+    let head = head.lines().next().unwrap_or("").trim();
+    if let Some(r) = head.strip_prefix("ref:") {
+        let r = r.trim();
+        return Some(r.rsplit('/').next().unwrap_or(r).to_string());
+    }
+    if head.len() >= 8 {
+        Some(head[..8].to_string())
+    } else if head.is_empty() {
+        None
+    } else {
+        Some(head.to_string())
+    }
 }

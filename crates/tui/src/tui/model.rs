@@ -110,6 +110,24 @@ pub(in crate::tui) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+pub(in crate::tui) const CODEX_RECENT_WINDOWS: [(u64, &str); 6] = [
+    (30 * 60, "30m"),
+    (60 * 60, "1h"),
+    (3 * 60 * 60, "3h"),
+    (8 * 60 * 60, "8h"),
+    (12 * 60 * 60, "12h"),
+    (24 * 60 * 60, "24h"),
+];
+
+pub(in crate::tui) fn codex_recent_window_label(idx: usize) -> &'static str {
+    CODEX_RECENT_WINDOWS[idx.min(CODEX_RECENT_WINDOWS.len() - 1)].1
+}
+
+pub(in crate::tui) fn codex_recent_window_threshold_ms(now_ms: u64, idx: usize) -> u64 {
+    let secs = CODEX_RECENT_WINDOWS[idx.min(CODEX_RECENT_WINDOWS.len() - 1)].0;
+    now_ms.saturating_sub(secs.saturating_mul(1000))
+}
+
 pub(in crate::tui) fn basename(path: &str) -> &str {
     let path = path.trim_end_matches(['/', '\\']);
     let slash = path.rfind('/');
@@ -202,16 +220,9 @@ fn suffix_by_width(s: &str, max_width: usize) -> &str {
 }
 
 pub(in crate::tui) fn short_sid(sid: &str, max: usize) -> String {
-    if sid.chars().count() <= max {
-        return sid.to_string();
-    }
-    let max = max.max(8);
-    let head_len = ((max / 2).saturating_sub(1)).max(3);
-    let tail_len = (max.saturating_sub(head_len + 1)).max(3);
-    let head = sid.chars().take(head_len).collect::<String>();
-    let tail = sid.chars().rev().take(tail_len).collect::<Vec<_>>();
-    let tail = tail.into_iter().rev().collect::<String>();
-    format!("{head}…{tail}")
+    // Prefer head truncation (end ellipsis) over middle truncation so the string stays readable
+    // and copy/paste friendly in terminals.
+    shorten_head(sid, max)
 }
 
 pub fn build_provider_options(

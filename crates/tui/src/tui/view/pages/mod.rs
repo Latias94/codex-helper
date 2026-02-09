@@ -9,6 +9,7 @@ use crate::tui::types::Page;
 mod configs;
 mod dashboard;
 mod history;
+mod recent;
 mod requests;
 mod sessions;
 mod settings;
@@ -34,5 +35,6 @@ pub(super) fn render_body(
         Page::Stats => super::stats::render_stats_page(f, p, ui, snapshot, providers, area),
         Page::Settings => settings::render_settings_page(f, p, ui, snapshot, area),
         Page::History => history::render_history_page(f, p, ui, area),
+        Page::Recent => recent::render_recent_page(f, p, ui, area),
     }
 }

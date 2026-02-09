@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
+## [0.12.1] - 2026-02-09
+### 新增 / Added
+- TUI 新增 `8 最近 / 8 Recent` 页面：按时间窗口（30m/1h/3h/8h/12h/24h）筛选本机 Codex 最近会话；列表两行展示（root + 分支 / session_id），并支持一键复制 `root session_id`（选中/全部可见）。
+  TUI adds an `8 Recent` page: filter local Codex sessions by time windows (30m/1h/3h/8h/12h/24h); two-line rows (root + branch / session_id), with one-key copy of `root session_id` (selected / all visible).
+- GUI `History -> 全局最近 / Global recent` 增强：新增时间窗口预设与分钟级自定义；会话列表两行展示并显示分支名；新增快捷键 `Ctrl+Y` 复制可见 `root id` 列表、`Ctrl+Enter` 复制选中条目。
+  GUI `History -> Global recent` enhancements: time-window presets + minute-level customization; two-line rows with branch name; shortcuts `Ctrl+Y` to copy visible `root id` list and `Ctrl+Enter` to copy selected.
+
+### 改进 / Improved
+- TUI 会话 ID 展示更友好：详情/弹窗完整显示 `session_id`；短展示改为尾部省略（避免中间隐藏导致难以辨认/复制）。
+  Friendlier TUI session id display: show full `session_id` in details/modals; short display now uses end-ellipsis (avoids mid-hidden ids that are harder to recognize/copy).
+
+### 修复 / Fixed
+- TUI 在非交互终端（非 TTY）环境下会自动退出；进入 alternate screen 失败时会回滚 raw mode，避免终端状态残留。
+  TUI now exits automatically in non-interactive (non-TTY) environments; entering alternate screen failure rolls back raw mode to avoid leaving the terminal in a bad state.
+
 ## [0.12.0] - 2026-02-08
 ### 新增 / Added
 - `codex-helper serve` 新增 `--host` 参数：支持绑定到 `0.0.0.0` 等非 loopback 地址（默认仍为 `127.0.0.1`）。
