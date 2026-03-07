@@ -1,11 +1,16 @@
+use crate::cli_types::ConfigSchemaTarget;
 use crate::config::{
-    RetryConfig, RetryProfileName, ServiceConfig, ServiceKind, UpstreamAuth, UpstreamConfig,
+    ProxyConfig, ProxyConfigV2, RetryConfig, RetryProfileName, ServiceConfig, ServiceConfigManager,
+    ServiceKind, ServiceRoutingExplanation, UpstreamAuth, UpstreamConfig,
     bootstrap::{
         import_codex_config_from_codex_cli, overwrite_codex_config_from_codex_cli_in_place,
     },
-    storage::{config_file_path, init_config_toml, load_config, save_config},
+    compact_v2_config, compile_v2_to_runtime, explain_service_routing, migrate_legacy_to_v2,
+    storage::{config_file_path, init_config_toml, load_config, save_config, save_config_v2},
 };
 use crate::{CliError, CliResult, ConfigCommand, RetryProfile};
+use serde::Serialize;
+use tokio::fs;
 
 async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result<&'static str> {
     if codex && claude {
@@ -25,6 +30,184 @@ async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result<&'static s
             _ => Ok("codex"),
         },
         Err(_) => Ok("codex"),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ConfigDocument {
+    Legacy(ProxyConfig),
+    V2(ProxyConfigV2),
+}
+
+impl ConfigDocument {
+    fn schema_version(&self) -> u32 {
+        match self {
+            Self::Legacy(cfg) => cfg.version.unwrap_or(1),
+            Self::V2(cfg) => cfg.version,
+        }
+    }
+
+    fn runtime(&self) -> anyhow::Result<ProxyConfig> {
+        match self {
+            Self::Legacy(cfg) => Ok(cfg.clone()),
+            Self::V2(cfg) => compile_v2_to_runtime(cfg),
+        }
+    }
+
+    fn v2_view(&self) -> ProxyConfigV2 {
+        match self {
+            Self::Legacy(cfg) => migrate_legacy_to_v2(cfg),
+            Self::V2(cfg) => cfg.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigExplainGroup {
+    name: String,
+    alias: Option<String>,
+    enabled: bool,
+    level: u8,
+    upstreams: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigExplainPayload {
+    schema_version: u32,
+    service: String,
+    active_group: Option<String>,
+    routing: ServiceRoutingExplanation,
+    group: Option<ConfigExplainGroup>,
+}
+
+async fn load_config_document() -> anyhow::Result<ConfigDocument> {
+    let path = config_file_path();
+    if !path.exists() {
+        return Ok(ConfigDocument::Legacy(load_config().await?));
+    }
+
+    let is_toml = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+    if !is_toml {
+        return Ok(ConfigDocument::Legacy(load_config().await?));
+    }
+
+    let text = fs::read_to_string(&path).await?;
+    let version = toml::from_str::<toml::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("version").and_then(|v| v.as_integer()))
+        .map(|value| value as u32);
+
+    if version == Some(2) {
+        let cfg = toml::from_str::<ProxyConfigV2>(&text)?;
+        compile_v2_to_runtime(&cfg)?;
+        Ok(ConfigDocument::V2(cfg))
+    } else {
+        Ok(ConfigDocument::Legacy(load_config().await?))
+    }
+}
+
+fn select_service_manager<'a>(
+    cfg: &'a ProxyConfig,
+    service: &str,
+) -> (&'a ServiceConfigManager, &'static str) {
+    if service == "claude" {
+        (&cfg.claude, "Claude")
+    } else {
+        (&cfg.codex, "Codex")
+    }
+}
+
+fn build_group_explain(
+    mgr: &ServiceConfigManager,
+    group_name: Option<&str>,
+) -> anyhow::Result<Option<ConfigExplainGroup>> {
+    let Some(group_name) = group_name else {
+        return Ok(None);
+    };
+
+    let svc = mgr
+        .configs
+        .get(group_name)
+        .ok_or_else(|| anyhow::anyhow!("group/config '{}' not found", group_name))?;
+    Ok(Some(ConfigExplainGroup {
+        name: group_name.to_string(),
+        alias: svc.alias.clone(),
+        enabled: svc.enabled,
+        level: svc.level.clamp(1, 10),
+        upstreams: svc.upstreams.iter().map(|up| up.base_url.clone()).collect(),
+    }))
+}
+
+fn print_explain_text(
+    label: &str,
+    schema_version: u32,
+    routing: &ServiceRoutingExplanation,
+    group: Option<&ConfigExplainGroup>,
+) {
+    println!("Schema version: v{}", schema_version);
+    println!("Service: {}", label);
+    println!(
+        "Active group: {}",
+        routing.active_config.as_deref().unwrap_or("<none>")
+    );
+    println!("Routing mode: {}", routing.mode);
+
+    if routing.eligible_configs.is_empty() {
+        println!("Candidate order: <empty>");
+    } else {
+        println!("Candidate order:");
+        for (idx, candidate) in routing.eligible_configs.iter().enumerate() {
+            let active = if candidate.active { " active" } else { "" };
+            if let Some(alias) = candidate.alias.as_deref() {
+                println!(
+                    "  {}. {}{} (alias={}, level={}, enabled={}, upstreams={})",
+                    idx + 1,
+                    candidate.name,
+                    active,
+                    alias,
+                    candidate.level,
+                    candidate.enabled,
+                    candidate.upstreams
+                );
+            } else {
+                println!(
+                    "  {}. {}{} (level={}, enabled={}, upstreams={})",
+                    idx + 1,
+                    candidate.name,
+                    active,
+                    candidate.level,
+                    candidate.enabled,
+                    candidate.upstreams
+                );
+            }
+        }
+    }
+
+    if let Some(fallback) = &routing.fallback_config {
+        println!(
+            "Fallback: {} (level={}, enabled={}, upstreams={})",
+            fallback.name, fallback.level, fallback.enabled, fallback.upstreams
+        );
+    }
+
+    if let Some(group) = group {
+        println!(
+            "Group '{}': level={} enabled={} upstreams={}",
+            group.name,
+            group.level,
+            group.enabled,
+            group.upstreams.len()
+        );
+        if group.upstreams.is_empty() {
+            println!("  <no upstreams>");
+        } else {
+            for (idx, upstream) in group.upstreams.iter().enumerate() {
+                println!("  [{}] {}", idx, upstream);
+            }
+        }
     }
 }
 
@@ -95,6 +278,47 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                         );
                     }
                 }
+            }
+        }
+
+        ConfigCommand::Explain {
+            codex,
+            claude,
+            json,
+            group,
+        } => {
+            let service = resolve_service(codex, claude)
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let document = load_config_document()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let runtime = document
+                .runtime()
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let (mgr, label) = select_service_manager(&runtime, service);
+            let routing = explain_service_routing(mgr);
+            let group_detail = build_group_explain(mgr, group.as_deref())
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+
+            if json {
+                let payload = ConfigExplainPayload {
+                    schema_version: document.schema_version(),
+                    service: service.to_string(),
+                    active_group: mgr.active.clone(),
+                    routing,
+                    group: group_detail,
+                };
+                let text = serde_json::to_string_pretty(&payload)
+                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                println!("{text}");
+            } else {
+                print_explain_text(
+                    label,
+                    document.schema_version(),
+                    &routing,
+                    group_detail.as_ref(),
+                );
             }
         }
         ConfigCommand::Add {
@@ -427,6 +651,46 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 "Overwrote Codex configs from ~/.codex (dry_run = {}): {:?}",
                 dry_run, names
             );
+        }
+        ConfigCommand::Migrate {
+            to,
+            dry_run,
+            write,
+            compact,
+            yes,
+        } => {
+            if write && !yes {
+                return Err(CliError::ProxyConfig(
+                    "This will overwrite ~/.codex-helper/config.toml; use --yes to confirm."
+                        .to_string(),
+                ));
+            }
+
+            let preview = dry_run || !write;
+            match to {
+                ConfigSchemaTarget::V2 => {
+                    let document = load_config_document()
+                        .await
+                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                    let migrated = if compact {
+                        compact_v2_config(&document.v2_view())
+                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?
+                    } else {
+                        document.v2_view()
+                    };
+
+                    if preview {
+                        let text = toml::to_string_pretty(&migrated)
+                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                        println!("{text}");
+                    } else {
+                        let path = save_config_v2(&migrated)
+                            .await
+                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                        println!("Migrated config written to {:?}", path);
+                    }
+                }
+            }
         }
     }
 

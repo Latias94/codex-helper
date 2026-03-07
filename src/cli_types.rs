@@ -205,6 +205,22 @@ pub enum ConfigCommand {
         #[arg(long)]
         claude: bool,
     },
+
+    /// Explain effective routing order for a service
+    Explain {
+        /// Target Codex configs (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude configs
+        #[arg(long)]
+        claude: bool,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+        /// Show details for a single group/config
+        #[arg(long)]
+        group: Option<String>,
+    },
     /// Add a new config
     Add {
         name: String,
@@ -303,6 +319,25 @@ pub enum ConfigCommand {
         #[arg(long)]
         yes: bool,
     },
+
+    /// Preview migration output for a target schema
+    Migrate {
+        /// Target schema version
+        #[arg(long, value_enum)]
+        to: ConfigSchemaTarget,
+        /// Preview only; print migrated TOML to stdout
+        #[arg(long, conflicts_with = "write")]
+        dry_run: bool,
+        /// Write migrated TOML to ~/.codex-helper/config.toml
+        #[arg(long, conflicts_with = "dry_run")]
+        write: bool,
+        /// Merge same-provider endpoints into a cleaner v2 layout
+        #[arg(long)]
+        compact: bool,
+        /// Confirm writing migrated config to disk
+        #[arg(long, requires = "write")]
+        yes: bool,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +351,12 @@ pub enum RetryProfile {
     AggressiveFailover,
     /// Cost-optimized primary/backup: enable cooldown exponential backoff for probe-back.
     CostPrimary,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub enum ConfigSchemaTarget {
+    V2,
 }
 
 #[derive(Subcommand, Debug)]

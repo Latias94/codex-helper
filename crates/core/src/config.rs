@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs as stdfs;
 use std::path::{Path, PathBuf};
@@ -36,13 +36,17 @@ pub use bootstrap_impl::{
     load_or_bootstrap_from_claude, load_or_bootstrap_from_codex,
     overwrite_codex_config_from_codex_cli_in_place, probe_codex_bootstrap_from_cli,
 };
-pub use storage_impl::{config_file_path, init_config_toml, load_config, save_config};
+pub use storage_impl::{
+    config_file_path, init_config_toml, load_config, save_config, save_config_v2,
+};
 
 #[cfg(test)]
 use bootstrap_impl::bootstrap_from_codex;
 
 pub mod storage {
-    pub use super::storage_impl::{config_file_path, init_config_toml, load_config, save_config};
+    pub use super::storage_impl::{
+        config_file_path, init_config_toml, load_config, save_config, save_config_v2,
+    };
 }
 
 pub mod bootstrap {
@@ -645,6 +649,1078 @@ pub struct ProxyConfig {
     /// UI settings (mainly for the built-in TUI).
     #[serde(default)]
     pub ui: UiConfig,
+}
+
+fn default_proxy_config_v2_version() -> u32 {
+    2
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfigV2 {
+    #[serde(default = "default_proxy_config_v2_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub codex: ServiceViewV2,
+    #[serde(default)]
+    pub claude: ServiceViewV2,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub notify: NotifyConfig,
+    #[serde(default)]
+    pub default_service: Option<ServiceKind>,
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+impl Default for ProxyConfigV2 {
+    fn default() -> Self {
+        Self {
+            version: default_proxy_config_v2_version(),
+            codex: ServiceViewV2::default(),
+            claude: ServiceViewV2::default(),
+            retry: RetryConfig::default(),
+            notify: NotifyConfig::default(),
+            default_service: None,
+            ui: UiConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceViewV2 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_group: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderConfigV2>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<String, GroupConfigV2>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfigV2 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auth: UpstreamAuth,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "supportedModels"
+    )]
+    pub supported_models: BTreeMap<String, bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "modelMapping"
+    )]
+    pub model_mapping: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, ProviderEndpointV2>,
+}
+
+impl Default for ProviderConfigV2 {
+    fn default() -> Self {
+        Self {
+            alias: None,
+            enabled: default_service_config_enabled(),
+            auth: UpstreamAuth::default(),
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEndpointV2 {
+    pub base_url: String,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "supportedModels"
+    )]
+    pub supported_models: BTreeMap<String, bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "modelMapping"
+    )]
+    pub model_mapping: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupConfigV2 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_service_config_level")]
+    pub level: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<GroupMemberRefV2>,
+}
+
+impl Default for GroupConfigV2 {
+    fn default() -> Self {
+        Self {
+            alias: None,
+            enabled: default_service_config_enabled(),
+            level: default_service_config_level(),
+            members: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GroupMemberRefV2 {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "endpoints")]
+    pub endpoint_names: Vec<String>,
+    #[serde(default)]
+    pub preferred: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutingCandidate {
+    pub name: String,
+    pub alias: Option<String>,
+    pub level: u8,
+    pub enabled: bool,
+    pub active: bool,
+    pub upstreams: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServiceRoutingExplanation {
+    pub active_config: Option<String>,
+    pub mode: &'static str,
+    pub eligible_configs: Vec<RoutingCandidate>,
+    pub fallback_config: Option<RoutingCandidate>,
+}
+
+fn merge_string_maps(
+    provider_values: &BTreeMap<String, String>,
+    endpoint_values: &BTreeMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = provider_values
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<HashMap<_, _>>();
+    for (key, value) in endpoint_values {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
+}
+
+fn merge_bool_maps(
+    provider_values: &BTreeMap<String, bool>,
+    endpoint_values: &BTreeMap<String, bool>,
+) -> HashMap<String, bool> {
+    let mut merged = provider_values
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect::<HashMap<_, _>>();
+    for (key, value) in endpoint_values {
+        merged.insert(key.clone(), *value);
+    }
+    merged
+}
+
+fn compile_service_view_v2(
+    service_name: &str,
+    view: &ServiceViewV2,
+) -> Result<ServiceConfigManager> {
+    if let Some(active_group) = view.active_group.as_deref()
+        && !view.groups.contains_key(active_group)
+    {
+        anyhow::bail!(
+            "[{service_name}] active_group '{}' does not exist in groups",
+            active_group
+        );
+    }
+
+    let mut configs = HashMap::new();
+    for (group_name, group) in &view.groups {
+        let mut members = group.members.iter().enumerate().collect::<Vec<_>>();
+        members.sort_by_key(|(idx, member)| (!member.preferred, *idx));
+
+        let mut upstreams = Vec::new();
+        for (_, member) in members {
+            let provider = view.providers.get(&member.provider).with_context(|| {
+                format!(
+                    "[{service_name}] group '{}' references missing provider '{}'",
+                    group_name, member.provider
+                )
+            })?;
+
+            if !provider.enabled {
+                continue;
+            }
+            if provider.endpoints.is_empty() {
+                anyhow::bail!(
+                    "[{service_name}] provider '{}' has no endpoints",
+                    member.provider
+                );
+            }
+
+            let endpoint_names = if member.endpoint_names.is_empty() {
+                provider.endpoints.keys().cloned().collect::<Vec<_>>()
+            } else {
+                member.endpoint_names.clone()
+            };
+
+            for endpoint_name in endpoint_names {
+                let endpoint = provider.endpoints.get(&endpoint_name).with_context(|| {
+                    format!(
+                        "[{service_name}] group '{}' references missing endpoint '{}.{}'",
+                        group_name, member.provider, endpoint_name
+                    )
+                })?;
+                if !endpoint.enabled {
+                    continue;
+                }
+
+                upstreams.push(UpstreamConfig {
+                    base_url: endpoint.base_url.clone(),
+                    auth: provider.auth.clone(),
+                    tags: merge_string_maps(&provider.tags, &endpoint.tags),
+                    supported_models: merge_bool_maps(
+                        &provider.supported_models,
+                        &endpoint.supported_models,
+                    ),
+                    model_mapping: merge_string_maps(
+                        &provider.model_mapping,
+                        &endpoint.model_mapping,
+                    ),
+                });
+            }
+        }
+
+        configs.insert(
+            group_name.clone(),
+            ServiceConfig {
+                name: group_name.clone(),
+                alias: group.alias.clone(),
+                enabled: group.enabled,
+                level: group.level.clamp(1, 10),
+                upstreams,
+            },
+        );
+    }
+
+    Ok(ServiceConfigManager {
+        active: view.active_group.clone(),
+        configs,
+    })
+}
+
+pub fn compile_v2_to_runtime(v2: &ProxyConfigV2) -> Result<ProxyConfig> {
+    if v2.version != 2 {
+        anyhow::bail!("unsupported v2 config version: {}", v2.version);
+    }
+
+    Ok(ProxyConfig {
+        version: Some(v2.version),
+        codex: compile_service_view_v2("codex", &v2.codex)?,
+        claude: compile_service_view_v2("claude", &v2.claude)?,
+        retry: v2.retry.clone(),
+        notify: v2.notify.clone(),
+        default_service: v2.default_service,
+        ui: v2.ui.clone(),
+    })
+}
+
+fn migrate_service_manager_to_v2(mgr: &ServiceConfigManager) -> ServiceViewV2 {
+    let mut providers = BTreeMap::new();
+    let mut groups = BTreeMap::new();
+
+    let mut group_names = mgr.configs.keys().cloned().collect::<Vec<_>>();
+    group_names.sort();
+
+    for group_name in group_names {
+        let Some(svc) = mgr.configs.get(&group_name) else {
+            continue;
+        };
+
+        let mut members: Vec<GroupMemberRefV2> = Vec::new();
+        for (idx, upstream) in svc.upstreams.iter().enumerate() {
+            let provider_name = format!("{}__u{:02}", group_name, idx + 1);
+            let endpoint_name = "default".to_string();
+
+            let mut endpoints = BTreeMap::new();
+            endpoints.insert(
+                endpoint_name.clone(),
+                ProviderEndpointV2 {
+                    base_url: upstream.base_url.clone(),
+                    enabled: true,
+                    tags: upstream
+                        .tags
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    supported_models: upstream
+                        .supported_models
+                        .iter()
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect(),
+                    model_mapping: upstream
+                        .model_mapping
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                },
+            );
+
+            providers.insert(
+                provider_name.clone(),
+                ProviderConfigV2 {
+                    alias: upstream.tags.get("provider_id").cloned(),
+                    enabled: true,
+                    auth: upstream.auth.clone(),
+                    tags: BTreeMap::new(),
+                    supported_models: BTreeMap::new(),
+                    model_mapping: BTreeMap::new(),
+                    endpoints,
+                },
+            );
+
+            members.push(GroupMemberRefV2 {
+                provider: provider_name,
+                endpoint_names: vec![endpoint_name],
+                preferred: false,
+            });
+        }
+
+        groups.insert(
+            group_name.clone(),
+            GroupConfigV2 {
+                alias: svc.alias.clone(),
+                enabled: svc.enabled,
+                level: svc.level,
+                members,
+            },
+        );
+    }
+
+    ServiceViewV2 {
+        active_group: mgr.active.clone(),
+        providers,
+        groups,
+    }
+}
+
+pub fn migrate_legacy_to_v2(old: &ProxyConfig) -> ProxyConfigV2 {
+    ProxyConfigV2 {
+        version: 2,
+        codex: migrate_service_manager_to_v2(&old.codex),
+        claude: migrate_service_manager_to_v2(&old.claude),
+        retry: old.retry.clone(),
+        notify: old.notify.clone(),
+        default_service: old.default_service,
+        ui: old.ui.clone(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderBucketKey {
+    hint: String,
+    auth_token: Option<String>,
+    auth_token_env: Option<String>,
+    api_key: Option<String>,
+    api_key_env: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EndpointBucketKey {
+    enabled: bool,
+    base_url: String,
+    tags: Vec<(String, String)>,
+    supported_models: Vec<(String, bool)>,
+    model_mapping: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct EndpointCompactBuild {
+    key: EndpointBucketKey,
+    upstream: UpstreamConfig,
+    original_names: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderCompactBuild {
+    alias: Option<String>,
+    auth: UpstreamAuth,
+    enabled: bool,
+    empty_provider_tags: BTreeMap<String, String>,
+    empty_provider_supported_models: BTreeMap<String, bool>,
+    empty_provider_model_mapping: BTreeMap<String, String>,
+    endpoints: Vec<EndpointCompactBuild>,
+    endpoint_index: HashMap<EndpointBucketKey, usize>,
+    endpoint_names: HashMap<EndpointBucketKey, String>,
+}
+
+#[derive(Debug, Clone)]
+struct GroupOccurrence {
+    provider: String,
+    endpoint_name: String,
+    preferred: bool,
+}
+
+fn hash_string_map_to_btree(values: &HashMap<String, String>) -> BTreeMap<String, String> {
+    values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+fn hash_bool_map_to_btree(values: &HashMap<String, bool>) -> BTreeMap<String, bool> {
+    values.iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
+
+fn string_map_without_common(
+    values: &HashMap<String, String>,
+    common: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .filter(|(key, value)| common.get(*key) != Some(*value))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+fn bool_map_without_common(
+    values: &HashMap<String, bool>,
+    common: &BTreeMap<String, bool>,
+) -> BTreeMap<String, bool> {
+    values
+        .iter()
+        .filter(|(key, value)| common.get(*key) != Some(*value))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
+fn common_string_entries(
+    upstreams: &[UpstreamConfig],
+    selector: fn(&UpstreamConfig) -> &HashMap<String, String>,
+) -> BTreeMap<String, String> {
+    let Some(first) = upstreams.first() else {
+        return BTreeMap::new();
+    };
+    let mut common = hash_string_map_to_btree(selector(first));
+    common.retain(|key, value| {
+        upstreams
+            .iter()
+            .skip(1)
+            .all(|upstream| selector(upstream).get(key) == Some(value))
+    });
+    common
+}
+
+fn common_bool_entries(
+    upstreams: &[UpstreamConfig],
+    selector: fn(&UpstreamConfig) -> &HashMap<String, bool>,
+) -> BTreeMap<String, bool> {
+    let Some(first) = upstreams.first() else {
+        return BTreeMap::new();
+    };
+    let mut common = hash_bool_map_to_btree(selector(first));
+    common.retain(|key, value| {
+        upstreams
+            .iter()
+            .skip(1)
+            .all(|upstream| selector(upstream).get(key) == Some(value))
+    });
+    common
+}
+
+fn sanitize_schema_key(raw: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in raw.trim().chars() {
+        let normalized = ch.to_ascii_lowercase();
+        if normalized.is_ascii_alphanumeric() {
+            out.push(normalized);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        fallback.to_string()
+    } else {
+        out
+    }
+}
+
+fn looks_generated_provider_name(name: &str) -> bool {
+    if let Some((prefix, suffix)) = name.rsplit_once("__u") {
+        !prefix.is_empty() && suffix.len() == 2 && suffix.chars().all(|ch| ch.is_ascii_digit())
+    } else {
+        false
+    }
+}
+
+fn looks_default_endpoint_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower == "default" {
+        return true;
+    }
+    lower
+        .strip_prefix("default-")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn env_provider_hint(auth: &UpstreamAuth) -> Option<String> {
+    let raw = auth
+        .auth_token_env
+        .as_deref()
+        .or(auth.api_key_env.as_deref())?
+        .trim()
+        .to_ascii_lowercase();
+    let mut hint = raw;
+    for suffix in ["_auth_token", "_api_key", "_token", "_key"] {
+        if let Some(stripped) = hint.strip_suffix(suffix) {
+            hint = stripped.to_string();
+            break;
+        }
+    }
+    Some(sanitize_schema_key(&hint, "provider"))
+}
+
+fn host_provider_hint(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let host = url.host_str()?;
+    let labels = host.split('.').collect::<Vec<_>>();
+    let raw = if labels.len() >= 2 {
+        labels[labels.len() - 2]
+    } else {
+        host
+    };
+    Some(sanitize_schema_key(raw, "provider"))
+}
+
+fn subdomain_or_host_hint(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let host = url.host_str()?;
+    let labels = host.split('.').collect::<Vec<_>>();
+    if labels.len() >= 3 {
+        let first = labels[0].to_ascii_lowercase();
+        if !matches!(first.as_str(), "api" | "www" | "gateway") {
+            return Some(sanitize_schema_key(&first, "endpoint"));
+        }
+    }
+    host_provider_hint(base_url).map(|hint| sanitize_schema_key(&hint, "endpoint"))
+}
+
+fn path_endpoint_hint(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let segment = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .filter(|segment| !matches!(*segment, "v1" | "v2" | "api"))
+        .next_back()?;
+    Some(sanitize_schema_key(segment, "endpoint"))
+}
+
+fn allocate_unique_name(base: &str, counters: &mut HashMap<String, usize>) -> String {
+    let entry = counters.entry(base.to_string()).or_insert(0);
+    *entry += 1;
+    if *entry == 1 {
+        base.to_string()
+    } else {
+        format!("{base}-{}", *entry)
+    }
+}
+
+fn provider_name_hint(
+    original_name: &str,
+    provider: &ProviderConfigV2,
+) -> (String, Option<String>) {
+    let mut raw_hint = None;
+    if !original_name.trim().is_empty() && !looks_generated_provider_name(original_name) {
+        raw_hint = Some(original_name.trim().to_string());
+    }
+    if raw_hint.is_none() {
+        raw_hint = provider
+            .alias
+            .clone()
+            .filter(|alias| !alias.trim().is_empty());
+    }
+    if raw_hint.is_none() {
+        raw_hint = provider
+            .tags
+            .get("provider_id")
+            .cloned()
+            .filter(|value| !value.trim().is_empty());
+    }
+    if raw_hint.is_none() {
+        raw_hint = provider
+            .endpoints
+            .values()
+            .find_map(|endpoint| endpoint.tags.get("provider_id").cloned())
+            .filter(|value| !value.trim().is_empty());
+    }
+    if raw_hint.is_none() {
+        raw_hint = env_provider_hint(&provider.auth);
+    }
+    if raw_hint.is_none() {
+        raw_hint = provider
+            .endpoints
+            .values()
+            .find_map(|endpoint| host_provider_hint(&endpoint.base_url));
+    }
+
+    let raw_hint = raw_hint.unwrap_or_else(|| "provider".to_string());
+    let slug = sanitize_schema_key(&raw_hint, "provider");
+    let alias = if raw_hint == slug {
+        None
+    } else {
+        Some(raw_hint)
+    };
+    (slug, alias)
+}
+
+fn endpoint_name_hint(endpoint: &EndpointCompactBuild, total: usize) -> String {
+    if total == 1 {
+        return "default".to_string();
+    }
+
+    if let Some(name) = endpoint
+        .original_names
+        .iter()
+        .find(|name| !name.trim().is_empty() && !looks_default_endpoint_name(name))
+    {
+        return sanitize_schema_key(name, "endpoint");
+    }
+    if let Some(region) = endpoint.upstream.tags.get("region") {
+        return sanitize_schema_key(region, "endpoint");
+    }
+    if let Some(hint) = subdomain_or_host_hint(&endpoint.upstream.base_url) {
+        return hint;
+    }
+    if let Some(hint) = path_endpoint_hint(&endpoint.upstream.base_url) {
+        return hint;
+    }
+    "endpoint".to_string()
+}
+
+fn endpoint_bucket_key(
+    endpoint: &ProviderEndpointV2,
+    effective: &UpstreamConfig,
+) -> EndpointBucketKey {
+    let mut tags = effective
+        .tags
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<Vec<_>>();
+    tags.sort();
+    let mut supported_models = effective
+        .supported_models
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect::<Vec<_>>();
+    supported_models.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut model_mapping = effective
+        .model_mapping
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<Vec<_>>();
+    model_mapping.sort_by(|a, b| a.0.cmp(&b.0));
+
+    EndpointBucketKey {
+        enabled: endpoint.enabled,
+        base_url: effective.base_url.clone(),
+        tags,
+        supported_models,
+        model_mapping,
+    }
+}
+
+fn effective_upstream_for_endpoint(
+    provider: &ProviderConfigV2,
+    endpoint: &ProviderEndpointV2,
+) -> UpstreamConfig {
+    UpstreamConfig {
+        base_url: endpoint.base_url.clone(),
+        auth: provider.auth.clone(),
+        tags: merge_string_maps(&provider.tags, &endpoint.tags),
+        supported_models: merge_bool_maps(&provider.supported_models, &endpoint.supported_models),
+        model_mapping: merge_string_maps(&provider.model_mapping, &endpoint.model_mapping),
+    }
+}
+
+fn compact_service_view_v2(view: &ServiceViewV2) -> Result<ServiceViewV2> {
+    let mut provider_name_counters = HashMap::new();
+    let mut bucket_lookup = HashMap::<ProviderBucketKey, String>::new();
+    let mut provider_lookup = HashMap::<String, String>::new();
+    let mut endpoint_lookup = HashMap::<(String, String), (String, EndpointBucketKey)>::new();
+    let mut builds = BTreeMap::<String, ProviderCompactBuild>::new();
+
+    for (original_provider_name, provider) in &view.providers {
+        let (hint, alias) = provider_name_hint(original_provider_name, provider);
+        let bucket_key = ProviderBucketKey {
+            hint: hint.clone(),
+            auth_token: provider.auth.auth_token.clone(),
+            auth_token_env: provider.auth.auth_token_env.clone(),
+            api_key: provider.auth.api_key.clone(),
+            api_key_env: provider.auth.api_key_env.clone(),
+            enabled: provider.enabled,
+        };
+
+        let canonical_provider_name = if let Some(existing) = bucket_lookup.get(&bucket_key) {
+            existing.clone()
+        } else {
+            let allocated = allocate_unique_name(&hint, &mut provider_name_counters);
+            bucket_lookup.insert(bucket_key, allocated.clone());
+            allocated
+        };
+        provider_lookup.insert(
+            original_provider_name.clone(),
+            canonical_provider_name.clone(),
+        );
+
+        let build = builds
+            .entry(canonical_provider_name.clone())
+            .or_insert_with(|| ProviderCompactBuild {
+                alias: alias.clone(),
+                auth: provider.auth.clone(),
+                enabled: provider.enabled,
+                empty_provider_tags: provider.tags.clone(),
+                empty_provider_supported_models: provider.supported_models.clone(),
+                empty_provider_model_mapping: provider.model_mapping.clone(),
+                endpoints: Vec::new(),
+                endpoint_index: HashMap::new(),
+                endpoint_names: HashMap::new(),
+            });
+        if build.alias.is_none() {
+            build.alias = alias;
+        }
+
+        if provider.endpoints.is_empty() {
+            continue;
+        }
+
+        for (original_endpoint_name, endpoint) in &provider.endpoints {
+            let effective = effective_upstream_for_endpoint(provider, endpoint);
+            let key = endpoint_bucket_key(endpoint, &effective);
+            let index = if let Some(index) = build.endpoint_index.get(&key) {
+                *index
+            } else {
+                let index = build.endpoints.len();
+                build.endpoints.push(EndpointCompactBuild {
+                    key: key.clone(),
+                    upstream: effective.clone(),
+                    original_names: Vec::new(),
+                });
+                build.endpoint_index.insert(key.clone(), index);
+                index
+            };
+            build.endpoints[index]
+                .original_names
+                .push(original_endpoint_name.clone());
+            endpoint_lookup.insert(
+                (
+                    original_provider_name.clone(),
+                    original_endpoint_name.clone(),
+                ),
+                (canonical_provider_name.clone(), key),
+            );
+        }
+    }
+
+    for build in builds.values_mut() {
+        let mut counters = HashMap::new();
+        let total = build.endpoints.len();
+        for endpoint in &build.endpoints {
+            let base = endpoint_name_hint(endpoint, total);
+            let name = allocate_unique_name(&base, &mut counters);
+            build.endpoint_names.insert(endpoint.key.clone(), name);
+        }
+    }
+
+    let mut providers = BTreeMap::new();
+    for (provider_name, build) in &builds {
+        if build.endpoints.is_empty() {
+            providers.insert(
+                provider_name.clone(),
+                ProviderConfigV2 {
+                    alias: build
+                        .alias
+                        .clone()
+                        .filter(|alias| sanitize_schema_key(alias, "provider") != *provider_name),
+                    enabled: build.enabled,
+                    auth: build.auth.clone(),
+                    tags: build.empty_provider_tags.clone(),
+                    supported_models: build.empty_provider_supported_models.clone(),
+                    model_mapping: build.empty_provider_model_mapping.clone(),
+                    endpoints: BTreeMap::new(),
+                },
+            );
+            continue;
+        }
+
+        let upstreams = build
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.upstream.clone())
+            .collect::<Vec<_>>();
+        let common_tags = common_string_entries(&upstreams, |upstream| &upstream.tags);
+        let common_supported_models =
+            common_bool_entries(&upstreams, |upstream| &upstream.supported_models);
+        let common_model_mapping =
+            common_string_entries(&upstreams, |upstream| &upstream.model_mapping);
+
+        let mut endpoints = BTreeMap::new();
+        for endpoint in &build.endpoints {
+            let endpoint_name = build
+                .endpoint_names
+                .get(&endpoint.key)
+                .expect("endpoint name should exist")
+                .clone();
+            endpoints.insert(
+                endpoint_name,
+                ProviderEndpointV2 {
+                    base_url: endpoint.upstream.base_url.clone(),
+                    enabled: endpoint.key.enabled,
+                    tags: string_map_without_common(&endpoint.upstream.tags, &common_tags),
+                    supported_models: bool_map_without_common(
+                        &endpoint.upstream.supported_models,
+                        &common_supported_models,
+                    ),
+                    model_mapping: string_map_without_common(
+                        &endpoint.upstream.model_mapping,
+                        &common_model_mapping,
+                    ),
+                },
+            );
+        }
+
+        providers.insert(
+            provider_name.clone(),
+            ProviderConfigV2 {
+                alias: build
+                    .alias
+                    .clone()
+                    .filter(|alias| sanitize_schema_key(alias, "provider") != *provider_name),
+                enabled: build.enabled,
+                auth: build.auth.clone(),
+                tags: common_tags,
+                supported_models: common_supported_models,
+                model_mapping: common_model_mapping,
+                endpoints,
+            },
+        );
+    }
+
+    let mut groups = BTreeMap::new();
+    for (group_name, group) in &view.groups {
+        let mut occurrences = Vec::new();
+        for member in &group.members {
+            let provider = view.providers.get(&member.provider).with_context(|| {
+                format!(
+                    "group '{}' references missing provider '{}'",
+                    group_name, member.provider
+                )
+            })?;
+            let endpoint_names = if member.endpoint_names.is_empty() {
+                provider.endpoints.keys().cloned().collect::<Vec<_>>()
+            } else {
+                member.endpoint_names.clone()
+            };
+
+            for endpoint_name in endpoint_names {
+                let (canonical_provider, endpoint_key) = endpoint_lookup
+                    .get(&(member.provider.clone(), endpoint_name.clone()))
+                    .with_context(|| {
+                        format!(
+                            "group '{}' references missing endpoint '{}.{}'",
+                            group_name, member.provider, endpoint_name
+                        )
+                    })?;
+                let mapped_endpoint_name = builds
+                    .get(canonical_provider)
+                    .and_then(|build| build.endpoint_names.get(endpoint_key))
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "group '{}' cannot map endpoint '{}.{}'",
+                            group_name, member.provider, endpoint_name
+                        )
+                    })?;
+                occurrences.push(GroupOccurrence {
+                    provider: canonical_provider.clone(),
+                    endpoint_name: mapped_endpoint_name,
+                    preferred: member.preferred,
+                });
+            }
+        }
+
+        let mut members: Vec<GroupMemberRefV2> = Vec::new();
+        for occurrence in occurrences {
+            if let Some(last) = members.last_mut()
+                && last.provider == occurrence.provider
+                && last.preferred == occurrence.preferred
+            {
+                last.endpoint_names.push(occurrence.endpoint_name);
+            } else {
+                members.push(GroupMemberRefV2 {
+                    provider: occurrence.provider,
+                    endpoint_names: vec![occurrence.endpoint_name],
+                    preferred: occurrence.preferred,
+                });
+            }
+        }
+
+        groups.insert(
+            group_name.clone(),
+            GroupConfigV2 {
+                alias: group.alias.clone(),
+                enabled: group.enabled,
+                level: group.level,
+                members,
+            },
+        );
+    }
+
+    Ok(ServiceViewV2 {
+        active_group: view.active_group.clone(),
+        providers,
+        groups,
+    })
+}
+
+pub fn compact_v2_config(v2: &ProxyConfigV2) -> Result<ProxyConfigV2> {
+    Ok(ProxyConfigV2 {
+        version: 2,
+        codex: compact_service_view_v2(&v2.codex)?,
+        claude: compact_service_view_v2(&v2.claude)?,
+        retry: v2.retry.clone(),
+        notify: v2.notify.clone(),
+        default_service: v2.default_service,
+        ui: v2.ui.clone(),
+    })
+}
+
+fn routing_candidate(
+    name: &str,
+    svc: &ServiceConfig,
+    active_name: Option<&str>,
+) -> RoutingCandidate {
+    RoutingCandidate {
+        name: name.to_string(),
+        alias: svc.alias.clone(),
+        level: svc.level.clamp(1, 10),
+        enabled: svc.enabled,
+        active: active_name.is_some_and(|active| active == name),
+        upstreams: svc.upstreams.len(),
+    }
+}
+
+fn active_or_first_config(mgr: &ServiceConfigManager) -> Option<(String, &ServiceConfig)> {
+    if let Some(active_name) = mgr.active.as_deref()
+        && let Some(svc) = mgr.configs.get(active_name)
+    {
+        return Some((active_name.to_string(), svc));
+    }
+
+    mgr.configs
+        .iter()
+        .min_by_key(|(name, _)| *name)
+        .map(|(name, svc)| (name.clone(), svc))
+}
+
+pub fn explain_service_routing(mgr: &ServiceConfigManager) -> ServiceRoutingExplanation {
+    let active_name = mgr.active.as_deref();
+    let mut eligible = mgr
+        .configs
+        .iter()
+        .filter(|(name, svc)| {
+            !svc.upstreams.is_empty()
+                && (svc.enabled || active_name.is_some_and(|active| active == name.as_str()))
+        })
+        .map(|(name, svc)| routing_candidate(name, svc, active_name))
+        .collect::<Vec<_>>();
+
+    let has_multi_level = {
+        let mut levels = eligible
+            .iter()
+            .map(|candidate| candidate.level)
+            .collect::<Vec<_>>();
+        levels.sort_unstable();
+        levels.dedup();
+        levels.len() > 1
+    };
+
+    if !has_multi_level {
+        eligible.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Some(active) = active_name
+            && let Some(pos) = eligible
+                .iter()
+                .position(|candidate| candidate.name == active)
+        {
+            let item = eligible.remove(pos);
+            eligible.insert(0, item);
+        }
+
+        if !eligible.is_empty() {
+            return ServiceRoutingExplanation {
+                active_config: mgr.active.clone(),
+                mode: "single_level_multi",
+                eligible_configs: eligible,
+                fallback_config: None,
+            };
+        }
+
+        return ServiceRoutingExplanation {
+            active_config: mgr.active.clone(),
+            mode: if active_or_first_config(mgr).is_some() {
+                "single_level_fallback_active_config"
+            } else {
+                "single_level_empty"
+            },
+            eligible_configs: Vec::new(),
+            fallback_config: active_or_first_config(mgr)
+                .map(|(name, svc)| routing_candidate(&name, svc, active_name)),
+        };
+    }
+
+    eligible.sort_by(|a, b| {
+        a.level
+            .cmp(&b.level)
+            .then_with(|| b.active.cmp(&a.active))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    if !eligible.is_empty() {
+        return ServiceRoutingExplanation {
+            active_config: mgr.active.clone(),
+            mode: "multi_level",
+            eligible_configs: eligible,
+            fallback_config: None,
+        };
+    }
+
+    ServiceRoutingExplanation {
+        active_config: mgr.active.clone(),
+        mode: if active_or_first_config(mgr).is_some() {
+            "multi_level_fallback_active_config"
+        } else {
+            "multi_level_empty"
+        },
+        eligible_configs: Vec::new(),
+        fallback_config: active_or_first_config(mgr)
+            .map(|(name, svc)| routing_candidate(&name, svc, active_name)),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1523,5 +2599,434 @@ env_key = "RIGHTCODE_API_KEY"
             svc.upstreams[0].tags.get("source").map(|s| s.as_str()),
             Some("codex-config")
         );
+    }
+
+    #[test]
+    fn compile_v2_to_runtime_orders_preferred_members() {
+        let mut openai_endpoints = BTreeMap::new();
+        openai_endpoints.insert(
+            "hk".to_string(),
+            ProviderEndpointV2 {
+                base_url: "https://hk.example.com/v1".to_string(),
+                enabled: true,
+                tags: BTreeMap::from([("region".to_string(), "hk".to_string())]),
+                supported_models: BTreeMap::new(),
+                model_mapping: BTreeMap::new(),
+            },
+        );
+        openai_endpoints.insert(
+            "us".to_string(),
+            ProviderEndpointV2 {
+                base_url: "https://us.example.com/v1".to_string(),
+                enabled: true,
+                tags: BTreeMap::from([("region".to_string(), "us".to_string())]),
+                supported_models: BTreeMap::new(),
+                model_mapping: BTreeMap::new(),
+            },
+        );
+
+        let mut backup_endpoints = BTreeMap::new();
+        backup_endpoints.insert(
+            "default".to_string(),
+            ProviderEndpointV2 {
+                base_url: "https://backup.example.com/v1".to_string(),
+                enabled: true,
+                tags: BTreeMap::new(),
+                supported_models: BTreeMap::new(),
+                model_mapping: BTreeMap::new(),
+            },
+        );
+
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfigV2 {
+                alias: Some("OpenAI".to_string()),
+                enabled: true,
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: Some("OPENAI_API_KEY".to_string()),
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: BTreeMap::from([("provider_id".to_string(), "openai".to_string())]),
+                supported_models: BTreeMap::new(),
+                model_mapping: BTreeMap::new(),
+                endpoints: openai_endpoints,
+            },
+        );
+        providers.insert(
+            "backup".to_string(),
+            ProviderConfigV2 {
+                alias: Some("Backup".to_string()),
+                enabled: true,
+                auth: UpstreamAuth::default(),
+                tags: BTreeMap::new(),
+                supported_models: BTreeMap::new(),
+                model_mapping: BTreeMap::new(),
+                endpoints: backup_endpoints,
+            },
+        );
+
+        let v2 = ProxyConfigV2 {
+            version: 2,
+            codex: ServiceViewV2 {
+                active_group: Some("primary".to_string()),
+                providers,
+                groups: BTreeMap::from([(
+                    "primary".to_string(),
+                    GroupConfigV2 {
+                        alias: Some("Primary".to_string()),
+                        enabled: true,
+                        level: 1,
+                        members: vec![
+                            GroupMemberRefV2 {
+                                provider: "backup".to_string(),
+                                endpoint_names: vec!["default".to_string()],
+                                preferred: false,
+                            },
+                            GroupMemberRefV2 {
+                                provider: "openai".to_string(),
+                                endpoint_names: vec!["hk".to_string(), "us".to_string()],
+                                preferred: true,
+                            },
+                        ],
+                    },
+                )]),
+            },
+            claude: ServiceViewV2::default(),
+            retry: RetryConfig::default(),
+            notify: NotifyConfig::default(),
+            default_service: Some(ServiceKind::Codex),
+            ui: UiConfig::default(),
+        };
+
+        let runtime = compile_v2_to_runtime(&v2).expect("compile_v2_to_runtime");
+        let svc = runtime
+            .codex
+            .configs
+            .get("primary")
+            .expect("compiled primary group");
+
+        assert_eq!(svc.upstreams.len(), 3);
+        assert_eq!(svc.upstreams[0].base_url, "https://hk.example.com/v1");
+        assert_eq!(svc.upstreams[1].base_url, "https://us.example.com/v1");
+        assert_eq!(svc.upstreams[2].base_url, "https://backup.example.com/v1");
+        assert_eq!(
+            svc.upstreams[0].auth.auth_token_env.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            svc.upstreams[0].tags.get("provider_id").map(|s| s.as_str()),
+            Some("openai")
+        );
+        assert_eq!(
+            svc.upstreams[0].tags.get("region").map(|s| s.as_str()),
+            Some("hk")
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_to_v2_creates_provider_per_upstream() {
+        let mut legacy = ProxyConfig::default();
+        legacy.codex.active = Some("team".to_string());
+        legacy.codex.configs.insert(
+            "team".to_string(),
+            ServiceConfig {
+                name: "team".to_string(),
+                alias: Some("Team".to_string()),
+                enabled: false,
+                level: 3,
+                upstreams: vec![
+                    UpstreamConfig {
+                        base_url: "https://one.example.com/v1".to_string(),
+                        auth: UpstreamAuth {
+                            auth_token: None,
+                            auth_token_env: Some("ONE_KEY".to_string()),
+                            api_key: None,
+                            api_key_env: None,
+                        },
+                        tags: HashMap::from([("provider_id".to_string(), "one".to_string())]),
+                        supported_models: HashMap::new(),
+                        model_mapping: HashMap::new(),
+                    },
+                    UpstreamConfig {
+                        base_url: "https://two.example.com/v1".to_string(),
+                        auth: UpstreamAuth::default(),
+                        tags: HashMap::new(),
+                        supported_models: HashMap::new(),
+                        model_mapping: HashMap::new(),
+                    },
+                ],
+            },
+        );
+
+        let migrated = migrate_legacy_to_v2(&legacy);
+        assert_eq!(migrated.version, 2);
+        assert_eq!(migrated.codex.active_group.as_deref(), Some("team"));
+
+        let group = migrated
+            .codex
+            .groups
+            .get("team")
+            .expect("team group should exist");
+        assert_eq!(group.alias.as_deref(), Some("Team"));
+        assert!(!group.enabled);
+        assert_eq!(group.level, 3);
+        assert_eq!(group.members.len(), 2);
+        assert_eq!(group.members[0].provider, "team__u01");
+        assert_eq!(group.members[1].provider, "team__u02");
+
+        let provider = migrated
+            .codex
+            .providers
+            .get("team__u01")
+            .expect("team__u01 provider should exist");
+        assert_eq!(provider.alias.as_deref(), Some("one"));
+        assert_eq!(provider.auth.auth_token_env.as_deref(), Some("ONE_KEY"));
+        assert_eq!(
+            provider
+                .endpoints
+                .get("default")
+                .expect("default endpoint")
+                .base_url,
+            "https://one.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn compact_v2_config_merges_same_provider_endpoints() {
+        let mut legacy = ProxyConfig::default();
+        legacy.codex.active = Some("team".to_string());
+        legacy.codex.configs.insert(
+            "team".to_string(),
+            ServiceConfig {
+                name: "team".to_string(),
+                alias: Some("Team".to_string()),
+                enabled: true,
+                level: 1,
+                upstreams: vec![
+                    UpstreamConfig {
+                        base_url: "https://hk.example.com/v1".to_string(),
+                        auth: UpstreamAuth {
+                            auth_token: None,
+                            auth_token_env: Some("OPENAI_API_KEY".to_string()),
+                            api_key: None,
+                            api_key_env: None,
+                        },
+                        tags: HashMap::from([
+                            ("provider_id".to_string(), "openai".to_string()),
+                            ("region".to_string(), "hk".to_string()),
+                        ]),
+                        supported_models: HashMap::new(),
+                        model_mapping: HashMap::new(),
+                    },
+                    UpstreamConfig {
+                        base_url: "https://us.example.com/v1".to_string(),
+                        auth: UpstreamAuth {
+                            auth_token: None,
+                            auth_token_env: Some("OPENAI_API_KEY".to_string()),
+                            api_key: None,
+                            api_key_env: None,
+                        },
+                        tags: HashMap::from([
+                            ("provider_id".to_string(), "openai".to_string()),
+                            ("region".to_string(), "us".to_string()),
+                        ]),
+                        supported_models: HashMap::new(),
+                        model_mapping: HashMap::new(),
+                    },
+                ],
+            },
+        );
+
+        let migrated = migrate_legacy_to_v2(&legacy);
+        let compact = compact_v2_config(&migrated).expect("compact_v2_config");
+
+        assert_eq!(compact.codex.providers.len(), 1);
+        let provider = compact
+            .codex
+            .providers
+            .get("openai")
+            .expect("openai provider should exist");
+        assert_eq!(
+            provider.auth.auth_token_env.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            provider.tags.get("provider_id").map(|s| s.as_str()),
+            Some("openai")
+        );
+        assert_eq!(provider.endpoints.len(), 2);
+        assert!(provider.endpoints.contains_key("hk"));
+        assert!(provider.endpoints.contains_key("us"));
+
+        let group = compact
+            .codex
+            .groups
+            .get("team")
+            .expect("team group should exist");
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(group.members[0].provider, "openai");
+        assert_eq!(
+            group.members[0].endpoint_names,
+            vec!["hk".to_string(), "us".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_config_supports_v2_schema() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 2
+
+[codex]
+active_group = "primary"
+
+[codex.providers.openai]
+[codex.providers.openai.auth]
+auth_token_env = "OPENAI_API_KEY"
+[codex.providers.openai.tags]
+provider_id = "openai"
+[codex.providers.openai.endpoints.hk]
+base_url = "https://hk.example.com/v1"
+[codex.providers.openai.endpoints.hk.tags]
+region = "hk"
+[codex.providers.openai.endpoints.us]
+base_url = "https://us.example.com/v1"
+
+[codex.groups.primary]
+level = 2
+
+[[codex.groups.primary.members]]
+provider = "openai"
+endpoint_names = ["us"]
+preferred = true
+"#,
+            );
+
+            let cfg = super::load_config().await.expect("load v2 config");
+            assert_eq!(cfg.version, Some(2));
+            assert_eq!(cfg.codex.active.as_deref(), Some("primary"));
+
+            let svc = cfg
+                .codex
+                .configs
+                .get("primary")
+                .expect("primary config should exist");
+            assert_eq!(svc.level, 2);
+            assert_eq!(svc.upstreams.len(), 1);
+            assert_eq!(svc.upstreams[0].base_url, "https://us.example.com/v1");
+            assert_eq!(
+                svc.upstreams[0].auth.auth_token_env.as_deref(),
+                Some("OPENAI_API_KEY")
+            );
+            assert_eq!(
+                svc.upstreams[0].tags.get("provider_id").map(|s| s.as_str()),
+                Some("openai")
+            );
+        });
+    }
+
+    #[test]
+    fn save_config_after_loading_v2_writes_legacy_schema() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 2
+
+[codex]
+active_group = "primary"
+
+[codex.providers.openai]
+[codex.providers.openai.auth]
+auth_token_env = "OPENAI_API_KEY"
+[codex.providers.openai.endpoints.default]
+base_url = "https://api.example.com/v1"
+
+[codex.groups.primary]
+level = 1
+
+[[codex.groups.primary.members]]
+provider = "openai"
+endpoint_names = ["default"]
+"#,
+            );
+
+            let cfg = super::load_config().await.expect("load v2 config");
+            assert_eq!(cfg.version, Some(2));
+
+            super::save_config(&cfg).await.expect("save legacy config");
+            let saved = std::fs::read_to_string(&toml_path).expect("read saved config.toml");
+            assert!(saved.contains("version = 1"));
+            assert!(saved.contains("[codex.configs.primary]"));
+            assert!(!saved.contains("[codex.groups.primary]"));
+        });
+    }
+
+    #[test]
+    fn save_config_v2_writes_v2_schema_and_backup() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            let backup_path = dir.join("config.toml.bak");
+            write_file(
+                &toml_path,
+                r#"
+version = 1
+
+[codex]
+active = "legacy"
+
+[codex.configs.legacy]
+name = "legacy"
+level = 1
+
+[[codex.configs.legacy.upstreams]]
+base_url = "https://legacy.example.com/v1"
+"#,
+            );
+
+            let legacy = super::load_config().await.expect("load legacy config");
+            let migrated = migrate_legacy_to_v2(&legacy);
+            let written_path = super::save_config_v2(&migrated)
+                .await
+                .expect("save_config_v2 should succeed");
+
+            assert_eq!(written_path, toml_path);
+            let saved = std::fs::read_to_string(&toml_path).expect("read v2 config.toml");
+            assert!(saved.contains("version = 2"));
+            assert!(saved.contains("[codex.providers.legacy__u01]"));
+            assert!(saved.contains("[codex.groups.legacy]"));
+
+            let backup = std::fs::read_to_string(&backup_path).expect("read config.toml.bak");
+            assert!(backup.contains("version = 1"));
+            assert!(backup.contains("[codex.configs.legacy]"));
+        });
     }
 }

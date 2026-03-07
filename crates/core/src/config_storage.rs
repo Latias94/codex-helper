@@ -296,8 +296,19 @@ pub async fn load_config() -> Result<ProxyConfig> {
     let toml_path = config_toml_path();
     if toml_path.exists() {
         let text = fs::read_to_string(&toml_path).await?;
-        let mut cfg = toml::from_str::<ProxyConfig>(&text)?;
-        ensure_config_version(&mut cfg);
+        let version = toml::from_str::<TomlValue>(&text)
+            .ok()
+            .and_then(|value| value.get("version").and_then(|v| v.as_integer()))
+            .map(|value| value as u32);
+
+        let mut cfg = if version == Some(2) {
+            let cfg_v2 = toml::from_str::<ProxyConfigV2>(&text)?;
+            compile_v2_to_runtime(&cfg_v2)?
+        } else {
+            let mut cfg = toml::from_str::<ProxyConfig>(&text)?;
+            ensure_config_version(&mut cfg);
+            cfg
+        };
         normalize_proxy_config(&mut cfg);
         return Ok(cfg);
     }
@@ -319,7 +330,7 @@ pub async fn load_config() -> Result<ProxyConfig> {
 
 pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
     let mut cfg = cfg.clone();
-    ensure_config_version(&mut cfg);
+    cfg.version = Some(CONFIG_VERSION);
     normalize_proxy_config(&mut cfg);
 
     let dir = config_dir();
@@ -347,6 +358,32 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
 
     write_bytes_file_async(&path, &data).await?;
     Ok(())
+}
+
+pub async fn save_config_v2(cfg: &ProxyConfigV2) -> Result<PathBuf> {
+    let runtime = compile_v2_to_runtime(cfg)?;
+    let mut normalized = migrate_legacy_to_v2(&runtime);
+    normalized.version = 2;
+
+    let dir = config_dir();
+    fs::create_dir_all(&dir).await?;
+    let path = config_toml_path();
+    let backup_path = config_toml_backup_path();
+    let body = toml::to_string_pretty(&normalized)?;
+    let text = format!(
+        "{CONFIG_TOML_DOC_HEADER}
+{body}"
+    );
+    let data = text.into_bytes();
+
+    if path.exists()
+        && let Err(err) = fs::copy(&path, &backup_path).await
+    {
+        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+    }
+
+    write_bytes_file_async(&path, &data).await?;
+    Ok(path)
 }
 
 fn normalize_proxy_config(cfg: &mut ProxyConfig) {

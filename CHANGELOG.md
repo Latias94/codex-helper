@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
+### ?? / Added
+- ?????? `v2` ?????`config.toml` ???? `version = 2` ? `service -> providers + groups` ???????????????????????????????????? provider / ? endpoint ??????? Add a clearer `v2` config view: `config.toml` now supports a `version = 2` `service -> providers + groups` layout that compiles into the existing runtime routing model, improving readability for multi-provider / multi-endpoint setups without changing current load-balancing behavior.
+- ?? `codex-helper config explain` ? `codex-helper config migrate --to v2`??? `--compact` ???????? `--write --yes` ???????? legacy ?????????? TOML? Add `codex-helper config explain` and `codex-helper config migrate --to v2`: supports compact previews via `--compact` and safe write-back via `--write --yes`, making it easier to migrate legacy configs into a more maintainable TOML format.
+
 ### 改进 / Improved
 - 配置模块内部做了一轮收口重构：把 Codex / Claude 客户端配置的路径、备份、sentinel 判断收口到 `client_config`，并在 `config` 下新增 `storage` / `bootstrap` / `auth_sync` 门面，为后续继续拆分配置管理做好边界，同时保持现有 CLI / GUI / TUI 调用方式兼容。  Internal config management refactor: consolidate Codex / Claude client-config path, backup, and sentinel handling into `client_config`, and add `storage` / `bootstrap` / `auth_sync` facades under `config` to prepare for further modularization while keeping existing CLI / GUI / TUI call sites compatible.
 - 代理主监听新增 `/.well-known/codex-helper-admin` 发现文档，GUI 的本地扫描附着与 `notify` 现在会优先发现并使用真实管理端地址，从而兼容“代理端口 / 管理端口拆分”的新拓扑。  Add `/.well-known/codex-helper-admin` discovery on the proxy listener so GUI local attach scanning and `notify` can prefer the real admin base URL when proxy and admin listeners are split.
