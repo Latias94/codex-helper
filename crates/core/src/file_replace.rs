@@ -82,3 +82,61 @@ pub async fn write_bytes_file_async(path: &Path, data: &[u8]) -> Result<()> {
 
     replace_existing_file_async(&tmp_path, path).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "codex-helper-file-replace-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .join(name)
+    }
+
+    #[test]
+    fn write_text_file_overwrites_existing_file() {
+        let path = temp_path("state.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+
+        std::fs::write(&path, "old").expect("write old file");
+        write_text_file(&path, "new").expect("overwrite file");
+
+        let text = std::fs::read_to_string(&path).expect("read new file");
+        assert_eq!(text, "new");
+        assert!(
+            !path.with_extension("tmp.codex-helper").exists(),
+            "temp file should be cleaned up"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_bytes_file_async_overwrites_existing_file() {
+        let path = temp_path("state.json");
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .expect("create parent");
+        }
+
+        tokio::fs::write(&path, b"old")
+            .await
+            .expect("write old file");
+        write_bytes_file_async(&path, b"new")
+            .await
+            .expect("overwrite file");
+
+        let text = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read new file");
+        assert_eq!(text, "new");
+        assert!(
+            !path.with_extension("tmp.codex-helper").exists(),
+            "temp file should be cleaned up"
+        );
+    }
+}

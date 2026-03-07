@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::config::{NotifyConfig, NotifyPolicyConfig, load_config, proxy_home_dir};
+use crate::file_replace::write_bytes_file_async;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -583,10 +584,8 @@ async fn save_state(state: &NotifyState) -> anyhow::Result<()> {
     let dir = proxy_home_dir();
     tokio::fs::create_dir_all(&dir).await?;
     let path = notify_state_path();
-    let tmp = dir.join("notify_state.json.tmp");
     let data = serde_json::to_vec_pretty(state)?;
-    tokio::fs::write(&tmp, &data).await?;
-    tokio::fs::rename(&tmp, &path).await?;
+    write_bytes_file_async(&path, &data).await?;
     Ok(())
 }
 

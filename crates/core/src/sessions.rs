@@ -10,6 +10,7 @@ use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 
 use crate::config::codex_sessions_dir;
+use crate::file_replace::write_bytes_file_async;
 
 /// Summary information for a Codex conversation session.
 #[derive(Debug, Clone)]
@@ -164,10 +165,8 @@ impl SessionStatsCache {
             fs::create_dir_all(parent).await.ok();
         }
 
-        let tmp = self.path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(&self.data)?;
-        fs::write(&tmp, bytes).await?;
-        fs::rename(&tmp, &self.path).await?;
+        write_bytes_file_async(&self.path, &bytes).await?;
         self.dirty = false;
         Ok(())
     }
