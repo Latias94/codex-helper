@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "ch"
-path = "src/main.rs"
+path = "src/bin/ch.rs"
 
 [features]
 # Desktop GUI (Windows-first, cross-platform best-effort).
