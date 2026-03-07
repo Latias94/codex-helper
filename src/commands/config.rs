@@ -1,7 +1,9 @@
 use crate::config::{
     RetryConfig, RetryProfileName, ServiceConfig, ServiceKind, UpstreamAuth, UpstreamConfig,
-    config_file_path, import_codex_config_from_codex_cli, init_config_toml, load_config,
-    overwrite_codex_config_from_codex_cli_in_place, save_config,
+    bootstrap::{
+        import_codex_config_from_codex_cli, overwrite_codex_config_from_codex_cli_in_place,
+    },
+    storage::{config_file_path, init_config_toml, load_config, save_config},
 };
 use crate::{CliError, CliResult, ConfigCommand, RetryProfile};
 

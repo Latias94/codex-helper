@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
+### 改进 / Improved
+- 配置模块内部做了一轮收口重构：把 Codex / Claude 客户端配置的路径、备份、sentinel 判断收口到 `client_config`，并在 `config` 下新增 `storage` / `bootstrap` / `auth_sync` 门面，为后续继续拆分配置管理做好边界，同时保持现有 CLI / GUI / TUI 调用方式兼容。  Internal config management refactor: consolidate Codex / Claude client-config path, backup, and sentinel handling into `client_config`, and add `storage` / `bootstrap` / `auth_sync` facades under `config` to prepare for further modularization while keeping existing CLI / GUI / TUI call sites compatible.
+
+### 修复 / Fixed
+- 修复 `switch on/off` 在重复切换时可能复用陈旧备份的问题：恢复原始配置后现在会清理旧备份，使下一次 `switch on` 能重新抓取最新的原始配置，避免用户手动修改后再次 `switch off` 被回滚到更早版本。  Fix stale backup snapshots across repeated `switch on/off` cycles: restoring from backup now removes the old backup so the next `switch on` captures the latest original config instead of rolling users back to an older pre-edit snapshot.
+
 ## [0.12.1] - 2026-02-09
 ### 新增 / Added
 - TUI 新增 `8 最近 / 8 Recent` 页面：按时间窗口（30m/1h/3h/8h/12h/24h）筛选本机 Codex 最近会话；列表两行展示（root + 分支 / session_id），并支持一键复制 `root session_id`（选中/全部可见）。

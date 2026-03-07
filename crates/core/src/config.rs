@@ -3,13 +3,38 @@ use std::env;
 use std::fs as stdfs;
 use std::path::{Path, PathBuf};
 
+use crate::client_config::{
+    codex_home, is_claude_absent_backup_sentinel, is_codex_absent_backup_sentinel,
+};
 use anyhow::{Context, Result};
-use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::fs;
 use toml::Value as TomlValue;
 use tracing::{info, warn};
+
+pub use crate::client_config::{
+    claude_settings_backup_path, claude_settings_path, codex_auth_path, codex_backup_config_path,
+    codex_config_path,
+};
+
+pub mod storage {
+    pub use super::{config_file_path, init_config_toml, load_config, save_config};
+}
+
+pub mod bootstrap {
+    pub use super::{
+        import_codex_config_from_codex_cli, load_or_bootstrap_for_service,
+        load_or_bootstrap_from_claude, load_or_bootstrap_from_codex,
+        overwrite_codex_config_from_codex_cli_in_place, probe_codex_bootstrap_from_cli,
+    };
+}
+
+pub mod auth_sync {
+    pub use super::{
+        SyncCodexAuthFromCodexOptions, SyncCodexAuthFromCodexReport, sync_codex_auth_from_codex_cli,
+    };
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpstreamAuth {
@@ -1006,63 +1031,10 @@ pub fn proxy_home_dir() -> PathBuf {
 
     #[cfg(not(test))]
     {
-        home_dir()
+        dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".codex-helper")
     }
-}
-
-fn codex_home() -> PathBuf {
-    if let Ok(dir) = env::var("CODEX_HOME") {
-        return PathBuf::from(dir);
-    }
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".codex")
-}
-
-pub fn codex_config_path() -> PathBuf {
-    codex_home().join("config.toml")
-}
-
-pub fn codex_backup_config_path() -> PathBuf {
-    codex_home().join("config.toml.codex-helper-backup")
-}
-
-pub fn codex_auth_path() -> PathBuf {
-    codex_home().join("auth.json")
-}
-
-fn claude_home() -> PathBuf {
-    if let Ok(dir) = env::var("CLAUDE_HOME") {
-        return PathBuf::from(dir);
-    }
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
-}
-
-pub fn claude_settings_path() -> PathBuf {
-    let dir = claude_home();
-    let settings = dir.join("settings.json");
-    if settings.exists() {
-        return settings;
-    }
-    let legacy = dir.join("claude.json");
-    if legacy.exists() {
-        return legacy;
-    }
-    settings
-}
-
-pub fn claude_settings_backup_path() -> PathBuf {
-    let mut path = claude_settings_path();
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "settings.json".to_string());
-    path.set_file_name(format!("{file_name}.codex-helper-backup"));
-    path
 }
 
 /// Directory where Codex stores conversation sessions: `~/.codex/sessions` (or `$CODEX_HOME/sessions`).
@@ -1084,14 +1056,6 @@ fn read_file_if_exists(path: &Path) -> Result<Option<String>> {
     }
     let s = stdfs::read_to_string(path).with_context(|| format!("failed to read {:?}", path))?;
     Ok(Some(s))
-}
-
-fn is_codex_absent_backup_sentinel(text: &str) -> bool {
-    text.trim() == "# codex-helper-backup:absent"
-}
-
-fn is_claude_absent_backup_sentinel(text: &str) -> bool {
-    text.trim() == "{\"__codex_helper_backup_absent\":true}"
 }
 
 /// Try to infer a unique API key from ~/.codex/auth.json when the provider

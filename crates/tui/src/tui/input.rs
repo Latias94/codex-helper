@@ -8,9 +8,11 @@ use reqwest::Url;
 use tokio::sync::{OnceCell, Semaphore};
 
 use crate::config::{
-    SyncCodexAuthFromCodexOptions, UpstreamConfig, load_config,
-    overwrite_codex_config_from_codex_cli_in_place, proxy_home_dir, save_config,
-    sync_codex_auth_from_codex_cli,
+    UpstreamConfig,
+    auth_sync::{SyncCodexAuthFromCodexOptions, sync_codex_auth_from_codex_cli},
+    bootstrap::overwrite_codex_config_from_codex_cli_in_place,
+    proxy_home_dir,
+    storage::{load_config, save_config},
 };
 use crate::sessions::{
     find_codex_session_file_by_id, read_codex_session_meta, read_codex_session_transcript,
