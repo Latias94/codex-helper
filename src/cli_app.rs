@@ -6,7 +6,9 @@ use crate::config::{
     codex_config_path, load_config, load_or_bootstrap_for_service, model_routing_warnings,
 };
 use crate::notify;
-use crate::proxy::{ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, ProxyService, router as proxy_router};
+use crate::proxy::{
+    ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port, proxy_only_router,
+};
 use crate::tui;
 
 use axum::Router;
@@ -376,36 +378,32 @@ async fn run_server(
     // Select service config based on service_name.
     let proxy = ProxyService::new(client, cfg.clone(), service_name, lb_states.clone());
     let state = proxy.state_handle();
-    let app: Router = proxy_router(proxy);
+    let app: Router = proxy_only_router(proxy.clone());
+    let admin_app: Router = admin_listener_router(proxy);
+
+    let addr: SocketAddr = SocketAddr::from((host, port));
+    let admin_addr = admin_loopback_addr_for_proxy_port(port);
 
     if !host.is_loopback() {
         tracing::warn!(
             "Binding to non-loopback address {}. This may expose your proxy to other machines. Consider using 127.0.0.1 + SSH port forwarding instead.",
             host
         );
-        if std::env::var(ADMIN_TOKEN_ENV_VAR)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .is_some()
-        {
-            tracing::warn!(
-                "Remote access to /__codex_helper admin routes now requires header {}.",
-                ADMIN_TOKEN_HEADER
-            );
-        } else {
-            tracing::warn!(
-                "Remote access to /__codex_helper admin routes is blocked unless {} is set and clients send header {}.",
-                ADMIN_TOKEN_ENV_VAR,
-                ADMIN_TOKEN_HEADER
-            );
-        }
+        tracing::warn!(
+            "The /__codex_helper admin API stays on loopback only at http://{}.",
+            admin_addr
+        );
     }
-    let addr: SocketAddr = SocketAddr::from((host, port));
     let listener = bind_local_listener_or_explain(addr, service_name).await?;
+    let admin_listener = bind_local_listener_or_explain(admin_addr, service_name).await?;
     tracing::info!(
-        "codex-helper listening on http://{} (service: {})",
+        "codex-helper proxy listening on http://{} (service: {})",
         addr,
+        service_name
+    );
+    tracing::info!(
+        "codex-helper admin API listening on http://{} (service: {})",
+        admin_addr,
         service_name
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -428,19 +426,32 @@ async fn run_server(
     }
 
     let result = if interactive {
-        let server_shutdown = {
+        let proxy_server_shutdown = {
+            let mut rx = shutdown_rx.clone();
+            async move {
+                let _ = rx.changed().await;
+            }
+        };
+        let admin_server_shutdown = {
             let mut rx = shutdown_rx.clone();
             async move {
                 let _ = rx.changed().await;
             }
         };
         let mut server_handle = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(server_shutdown)
-            .await
+            tokio::try_join!(
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(proxy_server_shutdown),
+                axum::serve(
+                    admin_listener,
+                    admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(admin_server_shutdown),
+            )?;
+            Ok::<(), anyhow::Error>(())
         });
 
         let providers = tui::build_provider_options(&cfg, service_name);
@@ -449,6 +460,7 @@ async fn run_server(
             state,
             service_name,
             port,
+            admin_addr.port(),
             providers,
             tui_lang,
             shutdown_tx.clone(),
@@ -485,18 +497,30 @@ async fn run_server(
             }
         }
     } else {
-        let server_shutdown = {
+        let proxy_server_shutdown = {
             let mut rx = shutdown_rx.clone();
             async move {
                 let _ = rx.changed().await;
             }
         };
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(server_shutdown)
-        .await?;
+        let admin_server_shutdown = {
+            let mut rx = shutdown_rx.clone();
+            async move {
+                let _ = rx.changed().await;
+            }
+        };
+        tokio::try_join!(
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(proxy_server_shutdown),
+            axum::serve(
+                admin_listener,
+                admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(admin_server_shutdown),
+        )?;
         Ok(())
     };
 

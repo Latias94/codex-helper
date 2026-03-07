@@ -14,7 +14,10 @@ use crate::config::{
     ProxyConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
 };
 use crate::dashboard_core::{ApiV1Snapshot, ConfigOption, WindowStats, build_dashboard_snapshot};
-use crate::proxy::ProxyService;
+use crate::proxy::{
+    ProxyService, admin_listener_router, admin_port_for_proxy_port,
+    local_admin_base_url_for_proxy_port, local_proxy_base_url, proxy_only_router,
+};
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
     SessionStats, UsageRollupView,
@@ -58,6 +61,7 @@ pub enum ProxyModeKind {
 
 pub struct AttachedStatus {
     pub base_url: String,
+    pub admin_base_url: String,
     pub port: u16,
     pub last_refresh: Option<Instant>,
     pub last_error: Option<String>,
@@ -83,7 +87,8 @@ pub struct AttachedStatus {
 impl AttachedStatus {
     fn new(port: u16) -> Self {
         Self {
-            base_url: format!("http://127.0.0.1:{port}"),
+            base_url: local_proxy_base_url(port),
+            admin_base_url: local_admin_base_url_for_proxy_port(port),
             port,
             last_refresh: None,
             last_error: None,
@@ -131,6 +136,7 @@ pub struct GuiRuntimeSnapshot {
 pub struct RunningProxy {
     pub service_name: &'static str,
     pub port: u16,
+    pub admin_port: u16,
     pub state: Arc<ProxyState>,
     pub cfg: Arc<ProxyConfig>,
     pub last_refresh: Option<Instant>,
@@ -186,6 +192,14 @@ struct PortInUseModal {
     port: u16,
     remember_choice: bool,
     chosen_new_port: u16,
+}
+
+fn attached_management_candidates(att: &AttachedStatus) -> Vec<String> {
+    let mut out = vec![att.admin_base_url.clone()];
+    if att.base_url != att.admin_base_url {
+        out.push(att.base_url.clone());
+    }
+    out
 }
 
 impl ProxyController {
@@ -262,7 +276,7 @@ impl ProxyController {
         match &self.mode {
             ProxyMode::Running(r) => Some(GuiRuntimeSnapshot {
                 kind: ProxyModeKind::Running,
-                base_url: Some(format!("http://127.0.0.1:{}", r.port)),
+                base_url: Some(local_proxy_base_url(r.port)),
                 port: Some(r.port),
                 service_name: Some(r.service_name.to_string()),
                 last_error: r.last_error.clone(),
@@ -388,8 +402,36 @@ impl ProxyController {
         }
 
         async fn scan_port(client: Client, port: u16) -> Option<DiscoveredProxy> {
-            let base_url = format!("http://127.0.0.1:{port}");
+            let base_url = local_proxy_base_url(port);
+            let admin_base_url = local_admin_base_url_for_proxy_port(port);
             let timeout = Duration::from_millis(250);
+
+            let caps = get_json::<ApiCapabilities>(
+                &client,
+                format!("{admin_base_url}/__codex_helper/api/v1/capabilities"),
+                timeout,
+            )
+            .await;
+
+            if let Ok(c) = caps {
+                let runtime = get_json::<RuntimeConfigStatus>(
+                    &client,
+                    format!("{admin_base_url}/__codex_helper/api/v1/config/runtime"),
+                    timeout,
+                )
+                .await
+                .ok();
+
+                return Some(DiscoveredProxy {
+                    port,
+                    base_url,
+                    api_version: Some(c.api_version),
+                    service_name: Some(c.service_name),
+                    endpoints: c.endpoints,
+                    runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
+                    last_error: None,
+                });
+            }
 
             let caps = get_json::<ApiCapabilities>(
                 &client,
@@ -418,12 +460,23 @@ impl ProxyController {
                 });
             }
 
-            let runtime = get_json::<RuntimeConfigStatus>(
+            let runtime = match get_json::<RuntimeConfigStatus>(
                 &client,
-                format!("{base_url}/__codex_helper/config/runtime"),
+                format!("{admin_base_url}/__codex_helper/config/runtime"),
                 timeout,
             )
-            .await;
+            .await
+            {
+                Ok(runtime) => Ok(runtime),
+                Err(_) => {
+                    get_json::<RuntimeConfigStatus>(
+                        &client,
+                        format!("{base_url}/__codex_helper/config/runtime"),
+                        timeout,
+                    )
+                    .await
+                }
+            };
             match runtime {
                 Ok(r) => Some(DiscoveredProxy {
                     port,
@@ -471,7 +524,7 @@ impl ProxyController {
         refresh_every: Duration,
     ) {
         let refresh_every = refresh_every.max(Duration::from_secs(1));
-        let base = match &mut self.mode {
+        let base_candidates = match &mut self.mode {
             ProxyMode::Attached(att) => {
                 if let Some(t) = att.last_refresh
                     && t.elapsed() < refresh_every
@@ -479,7 +532,7 @@ impl ProxyController {
                     return;
                 }
                 att.last_refresh = Some(Instant::now());
-                att.base_url.clone()
+                attached_management_candidates(att)
             }
             _ => return,
         };
@@ -519,6 +572,7 @@ impl ProxyController {
 
             #[derive(Default)]
             struct RefreshResult {
+                management_base_url: String,
                 api_version: Option<u32>,
                 service_name: Option<String>,
                 active: Vec<ActiveRequest>,
@@ -538,189 +592,209 @@ impl ProxyController {
                 runtime_source_mtime_ms: Option<u64>,
             }
 
-            let caps = get_json::<ApiCapabilities>(
-                &client,
-                format!("{base}/__codex_helper/api/v1/capabilities"),
-                req_timeout,
-            )
-            .await;
-            let supports_v1 = matches!(caps.as_ref(), Ok(c) if c.api_version == 1);
+            async fn refresh_from_base(
+                client: &Client,
+                base: &str,
+                req_timeout: Duration,
+            ) -> anyhow::Result<RefreshResult> {
+                let caps = get_json::<ApiCapabilities>(
+                    client,
+                    format!("{base}/__codex_helper/api/v1/capabilities"),
+                    req_timeout,
+                )
+                .await;
+                let supports_v1 = matches!(caps.as_ref(), Ok(c) if c.api_version == 1);
 
-            if supports_v1 {
-                let caps = caps.expect("checked ok above");
-                let supports_snapshot = caps
-                    .endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/snapshot");
+                if supports_v1 {
+                    let caps = caps.expect("checked ok above");
+                    let supports_snapshot = caps
+                        .endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/snapshot");
 
-                if supports_snapshot {
-                    let api = get_json::<ApiV1Snapshot>(
-                        &client,
-                        format!(
-                            "{base}/__codex_helper/api/v1/snapshot?recent_limit=600&stats_days=21"
+                    if supports_snapshot {
+                        let api = get_json::<ApiV1Snapshot>(
+                            client,
+                            format!(
+                                "{base}/__codex_helper/api/v1/snapshot?recent_limit=600&stats_days=21"
+                            ),
+                            req_timeout,
+                        )
+                        .await?;
+
+                        return Ok(RefreshResult {
+                            management_base_url: base.to_string(),
+                            api_version: Some(api.api_version),
+                            service_name: Some(api.service_name),
+                            active: api.snapshot.active,
+                            recent: api.snapshot.recent,
+                            global_override: api.snapshot.global_override,
+                            session_cfg: api.snapshot.session_config_overrides,
+                            session_effort: api.snapshot.session_effort_overrides,
+                            session_stats: api.snapshot.session_stats,
+                            configs: api.configs,
+                            config_health: api.snapshot.config_health,
+                            health_checks: api.snapshot.health_checks,
+                            usage_rollup: api.snapshot.usage_rollup,
+                            stats_5m: api.snapshot.stats_5m,
+                            stats_1h: api.snapshot.stats_1h,
+                            lb_view: api.snapshot.lb_view,
+                            runtime_loaded_at_ms: api.runtime_loaded_at_ms,
+                            runtime_source_mtime_ms: api.runtime_source_mtime_ms,
+                        });
+                    }
+
+                    let (
+                        active,
+                        recent,
+                        runtime,
+                        global_override,
+                        session_cfg,
+                        session_effort,
+                        stats,
+                        configs,
+                        config_health,
+                        health_checks,
+                    ) = tokio::try_join!(
+                        get_json::<Vec<ActiveRequest>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/status/active"),
+                            req_timeout,
                         ),
-                        req_timeout,
-                    )
-                    .await?;
+                        get_json::<Vec<FinishedRequest>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/status/recent?limit=200"),
+                            req_timeout,
+                        ),
+                        get_json::<RuntimeConfigStatus>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/config/runtime"),
+                            req_timeout,
+                        ),
+                        get_json::<Option<String>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/overrides/global-config"),
+                            req_timeout,
+                        ),
+                        get_json::<HashMap<String, String>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/overrides/session/config"),
+                            req_timeout,
+                        ),
+                        get_json::<HashMap<String, String>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/overrides/session/effort"),
+                            req_timeout,
+                        ),
+                        get_json::<HashMap<String, SessionStats>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/status/session-stats"),
+                            req_timeout,
+                        ),
+                        get_json::<Vec<ConfigOption>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/configs"),
+                            req_timeout,
+                        ),
+                        get_json::<HashMap<String, ConfigHealth>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/status/config-health"),
+                            req_timeout,
+                        ),
+                        get_json::<HashMap<String, HealthCheckStatus>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/status/health-checks"),
+                            req_timeout,
+                        ),
+                    )?;
 
-                    return Ok::<_, anyhow::Error>(RefreshResult {
-                        api_version: Some(api.api_version),
-                        service_name: Some(api.service_name),
-                        active: api.snapshot.active,
-                        recent: api.snapshot.recent,
-                        global_override: api.snapshot.global_override,
-                        session_cfg: api.snapshot.session_config_overrides,
-                        session_effort: api.snapshot.session_effort_overrides,
-                        session_stats: api.snapshot.session_stats,
-                        configs: api.configs,
-                        config_health: api.snapshot.config_health,
-                        health_checks: api.snapshot.health_checks,
-                        usage_rollup: api.snapshot.usage_rollup,
-                        stats_5m: api.snapshot.stats_5m,
-                        stats_1h: api.snapshot.stats_1h,
-                        lb_view: api.snapshot.lb_view,
-                        runtime_loaded_at_ms: api.runtime_loaded_at_ms,
-                        runtime_source_mtime_ms: api.runtime_source_mtime_ms,
+                    return Ok(RefreshResult {
+                        management_base_url: base.to_string(),
+                        api_version: Some(caps.api_version),
+                        service_name: Some(caps.service_name),
+                        active,
+                        recent,
+                        global_override,
+                        session_cfg,
+                        session_effort,
+                        session_stats: stats,
+                        configs,
+                        config_health,
+                        health_checks,
+                        usage_rollup: UsageRollupView::default(),
+                        stats_5m: WindowStats::default(),
+                        stats_1h: WindowStats::default(),
+                        lb_view: HashMap::new(),
+                        runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
+                        runtime_source_mtime_ms: runtime.source_mtime_ms,
                     });
                 }
 
-                let (
-                    active,
-                    recent,
-                    runtime,
-                    global_override,
-                    session_cfg,
-                    session_effort,
-                    stats,
-                    configs,
-                    config_health,
-                    health_checks,
-                ) = tokio::try_join!(
+                let (active, recent, runtime) = tokio::try_join!(
                     get_json::<Vec<ActiveRequest>>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/status/active"),
+                        client,
+                        format!("{base}/__codex_helper/status/active"),
                         req_timeout,
                     ),
                     get_json::<Vec<FinishedRequest>>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/status/recent?limit=200"),
+                        client,
+                        format!("{base}/__codex_helper/status/recent?limit=200"),
                         req_timeout,
                     ),
                     get_json::<RuntimeConfigStatus>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/config/runtime"),
-                        req_timeout,
-                    ),
-                    get_json::<Option<String>>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/overrides/global-config"),
-                        req_timeout,
-                    ),
-                    get_json::<HashMap<String, String>>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/overrides/session/config"),
-                        req_timeout,
-                    ),
-                    get_json::<HashMap<String, String>>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/overrides/session/effort"),
-                        req_timeout,
-                    ),
-                    get_json::<HashMap<String, SessionStats>>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/status/session-stats"),
-                        req_timeout,
-                    ),
-                    get_json::<Vec<ConfigOption>>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/configs"),
-                        req_timeout,
-                    ),
-                    get_json::<HashMap<String, ConfigHealth>>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/status/config-health"),
-                        req_timeout,
-                    ),
-                    get_json::<HashMap<String, HealthCheckStatus>>(
-                        &client,
-                        format!("{base}/__codex_helper/api/v1/status/health-checks"),
+                        client,
+                        format!("{base}/__codex_helper/config/runtime"),
                         req_timeout,
                     ),
                 )?;
 
-                return Ok::<_, anyhow::Error>(RefreshResult {
-                    api_version: Some(caps.api_version),
-                    service_name: Some(caps.service_name),
+                let session_effort = get_json::<HashMap<String, String>>(
+                    client,
+                    format!("{base}/__codex_helper/override/session"),
+                    req_timeout,
+                )
+                .await
+                .ok()
+                .unwrap_or_default();
+
+                Ok(RefreshResult {
+                    management_base_url: base.to_string(),
+                    api_version: None,
+                    service_name: None,
                     active,
                     recent,
-                    global_override,
-                    session_cfg,
+                    global_override: None,
+                    session_cfg: HashMap::new(),
                     session_effort,
-                    session_stats: stats,
-                    configs,
-                    config_health,
-                    health_checks,
+                    session_stats: HashMap::new(),
+                    configs: Vec::new(),
+                    config_health: HashMap::new(),
+                    health_checks: HashMap::new(),
                     usage_rollup: UsageRollupView::default(),
                     stats_5m: WindowStats::default(),
                     stats_1h: WindowStats::default(),
                     lb_view: HashMap::new(),
                     runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                     runtime_source_mtime_ms: runtime.source_mtime_ms,
-                });
+                })
             }
 
-            let (active, recent, runtime) = tokio::try_join!(
-                get_json::<Vec<ActiveRequest>>(
-                    &client,
-                    format!("{base}/__codex_helper/status/active"),
-                    req_timeout,
-                ),
-                get_json::<Vec<FinishedRequest>>(
-                    &client,
-                    format!("{base}/__codex_helper/status/recent?limit=200"),
-                    req_timeout,
-                ),
-                get_json::<RuntimeConfigStatus>(
-                    &client,
-                    format!("{base}/__codex_helper/config/runtime"),
-                    req_timeout,
-                ),
-            )?;
+            let mut last_err: Option<anyhow::Error> = None;
+            for base in base_candidates {
+                match refresh_from_base(&client, &base, req_timeout).await {
+                    Ok(result) => return Ok::<_, anyhow::Error>(result),
+                    Err(err) => last_err = Some(err),
+                }
+            }
 
-            let session_effort = get_json::<HashMap<String, String>>(
-                &client,
-                format!("{base}/__codex_helper/override/session"),
-                req_timeout,
-            )
-            .await
-            .ok()
-            .unwrap_or_default();
-
-            Ok::<_, anyhow::Error>(RefreshResult {
-                api_version: None,
-                service_name: None,
-                active,
-                recent,
-                global_override: None,
-                session_cfg: HashMap::new(),
-                session_effort,
-                session_stats: HashMap::new(),
-                configs: Vec::new(),
-                config_health: HashMap::new(),
-                health_checks: HashMap::new(),
-                usage_rollup: UsageRollupView::default(),
-                stats_5m: WindowStats::default(),
-                stats_1h: WindowStats::default(),
-                lb_view: HashMap::new(),
-                runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
-                runtime_source_mtime_ms: runtime.source_mtime_ms,
-            })
+            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("attach refresh failed")))
         };
 
         match rt.block_on(fut) {
             Ok(result) => {
                 if let ProxyMode::Attached(att) = &mut self.mode {
                     att.last_error = None;
+                    att.admin_base_url = result.management_base_url;
                     att.api_version = result.api_version;
                     att.service_name = result.service_name;
                     att.active = result.active;
@@ -771,7 +845,7 @@ impl ProxyController {
                 Ok(())
             }
             ProxyMode::Attached(att) => {
-                let base = att.base_url.clone();
+                let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
                 let supports_v1 = att.api_version == Some(1);
                 let fut = async move {
@@ -825,7 +899,7 @@ impl ProxyController {
                 if att.api_version != Some(1) {
                     bail!("attached proxy does not support session config overrides (need api v1)");
                 }
-                let base = att.base_url.clone();
+                let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
                 let fut = async move {
                     client
@@ -870,7 +944,7 @@ impl ProxyController {
                 if att.api_version != Some(1) {
                     bail!("attached proxy does not support global config override (need api v1)");
                 }
-                let base = att.base_url.clone();
+                let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
                 let fut = async move {
                     client
@@ -893,8 +967,8 @@ impl ProxyController {
 
     pub fn reload_runtime_config(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         let (base, supports_v1) = match &self.mode {
-            ProxyMode::Running(r) => (format!("http://127.0.0.1:{}", r.port), true),
-            ProxyMode::Attached(a) => (a.base_url.clone(), a.api_version == Some(1)),
+            ProxyMode::Running(r) => (local_proxy_base_url(r.admin_port), true),
+            ProxyMode::Attached(a) => (a.admin_base_url.clone(), a.api_version == Some(1)),
             _ => bail!("proxy is not running/attached"),
         };
 
@@ -925,12 +999,12 @@ impl ProxyController {
         config_names: Vec<String>,
     ) -> anyhow::Result<()> {
         let base = match &self.mode {
-            ProxyMode::Running(r) => format!("http://127.0.0.1:{}", r.port),
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
             ProxyMode::Attached(a) => {
                 if a.api_version != Some(1) {
                     bail!("attached proxy does not support health checks (need api v1)");
                 }
-                a.base_url.clone()
+                a.admin_base_url.clone()
             }
             _ => bail!("proxy is not running/attached"),
         };
@@ -958,12 +1032,12 @@ impl ProxyController {
         config_names: Vec<String>,
     ) -> anyhow::Result<()> {
         let base = match &self.mode {
-            ProxyMode::Running(r) => format!("http://127.0.0.1:{}", r.port),
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
             ProxyMode::Attached(a) => {
                 if a.api_version != Some(1) {
                     bail!("attached proxy does not support health checks (need api v1)");
                 }
-                a.base_url.clone()
+                a.admin_base_url.clone()
             }
             _ => bail!("proxy is not running/attached"),
         };
@@ -1142,6 +1216,7 @@ impl ProxyController {
 
         let task = async move {
             let cfg = Arc::new(load_or_bootstrap_for_service(service).await?);
+            let admin_port = admin_port_for_proxy_port(port);
 
             if service_name == "codex" {
                 if cfg.codex.configs.is_empty() || cfg.codex.active_config().is_none() {
@@ -1168,15 +1243,26 @@ impl ProxyController {
             let lb_states = Arc::new(Mutex::new(std::collections::HashMap::new()));
             let proxy = ProxyService::new(client, cfg.clone(), service_name, lb_states);
             let state = proxy.state_handle();
-            let app = crate::proxy::router(proxy);
+            let app = proxy_only_router(proxy.clone());
+            let admin_app = admin_listener_router(proxy);
 
             let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("bind {}", addr))?;
+            let admin_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], admin_port));
+            let admin_listener = tokio::net::TcpListener::bind(admin_addr)
+                .await
+                .with_context(|| format!("bind {}", admin_addr))?;
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let server_shutdown = {
+            let proxy_server_shutdown = {
+                let mut rx = shutdown_rx.clone();
+                async move {
+                    let _ = rx.changed().await;
+                }
+            };
+            let admin_server_shutdown = {
                 let mut rx = shutdown_rx.clone();
                 async move {
                     let _ = rx.changed().await;
@@ -1184,10 +1270,19 @@ impl ProxyController {
             };
 
             let handle = tokio::spawn(async move {
-                axum::serve(listener, app.into_make_service())
-                    .with_graceful_shutdown(server_shutdown)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("serve error: {e}"))?;
+                tokio::try_join!(
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(proxy_server_shutdown),
+                    axum::serve(
+                        admin_listener,
+                        admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(admin_server_shutdown),
+                )
+                .map_err(|e| anyhow::anyhow!("serve error: {e}"))?;
                 Ok::<(), anyhow::Error>(())
             });
 
@@ -1207,6 +1302,7 @@ impl ProxyController {
         self.mode = ProxyMode::Running(RunningProxy {
             service_name,
             port,
+            admin_port: admin_port_for_proxy_port(port),
             state,
             cfg,
             last_refresh: None,

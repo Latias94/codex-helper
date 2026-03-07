@@ -35,6 +35,7 @@ pub async fn run_dashboard(
     state: Arc<ProxyState>,
     service_name: &'static str,
     port: u16,
+    admin_port: u16,
     providers: Vec<ProviderOption>,
     language: Language,
     shutdown: watch::Sender<bool>,
@@ -58,7 +59,7 @@ pub async fn run_dashboard(
 
     let mut ui = UiState {
         service_name,
-        port,
+        admin_port,
         language,
         refresh_ms,
         ..Default::default()
@@ -118,7 +119,7 @@ pub async fn run_dashboard(
                         .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
                 {
                     let url =
-                        format!("http://127.0.0.1:{}/__codex_helper/config/runtime", ui.port);
+                        format!("http://127.0.0.1:{}/__codex_helper/config/runtime", ui.admin_port);
                     let fetch = async {
                         let client = reqwest::Client::new();
                         client

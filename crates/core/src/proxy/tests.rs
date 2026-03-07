@@ -432,6 +432,77 @@ async fn proxy_admin_routes_require_loopback_or_token_for_remote_access() {
 }
 
 #[tokio::test]
+async fn proxy_split_listeners_isolate_admin_routes_from_proxy_traffic() {
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let proxy_app = crate::proxy::proxy_only_router(proxy.clone());
+    let admin_app = crate::proxy::admin_listener_router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(proxy_app);
+    let (admin_addr, admin_handle) = spawn_axum_server(admin_app);
+
+    let client = reqwest::Client::new();
+
+    let proxy_admin = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/capabilities",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("proxy admin send");
+    assert_eq!(proxy_admin.status(), StatusCode::NOT_FOUND);
+
+    let admin_caps = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/capabilities",
+            admin_addr
+        ))
+        .send()
+        .await
+        .expect("admin caps send")
+        .error_for_status()
+        .expect("admin caps status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("admin caps json");
+    assert_eq!(
+        admin_caps.get("service_name").and_then(|v| v.as_str()),
+        Some("codex")
+    );
+
+    let admin_proxy = client
+        .post(format!("http://{}/v1/responses", admin_addr))
+        .body("{}")
+        .send()
+        .await
+        .expect("admin proxy send");
+    assert_eq!(admin_proxy.status(), StatusCode::NOT_FOUND);
+
+    proxy_handle.abort();
+    admin_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_failover_retries_502_then_uses_second_upstream() {
     let upstream1_hits = Arc::new(AtomicUsize::new(0));
     let upstream2_hits = Arc::new(AtomicUsize::new(0));

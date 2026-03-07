@@ -293,7 +293,7 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
   - `codex-helper serve` (default port 3211)
   - `codex-helper serve --no-tui` (disable the built-in TUI dashboard)
   - `codex-helper serve --host 0.0.0.0` (bind all interfaces; security risk)
-  - When bound to a non-loopback address, `__codex_helper` admin routes remain loopback-only unless `CODEX_HELPER_ADMIN_TOKEN` is set and clients send `x-codex-helper-admin-token`.
+  - codex-helper also starts a loopback-only admin API on `proxy_port + 1000` (for example `3211 -> 4211`); local GUI/TUI/notify flows use it automatically.
 
 ### Turn Codex on/off via local proxy
 

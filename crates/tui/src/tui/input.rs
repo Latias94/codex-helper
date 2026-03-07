@@ -298,7 +298,10 @@ async fn apply_global_active_config(
     save_config(&cfg).await?;
 
     // Best-effort: ask the running server to reload immediately.
-    let url = format!("http://127.0.0.1:{}/__codex_helper/config/reload", ui.port);
+    let url = format!(
+        "http://127.0.0.1:{}/__codex_helper/config/reload",
+        ui.admin_port
+    );
     let _ = reqwest::Client::new().post(&url).send().await;
 
     *providers = crate::tui::build_provider_options(&cfg, ui.service_name);
@@ -764,7 +767,10 @@ async fn handle_key_normal(
         }
         KeyCode::Char('R') if ui.page == Page::Settings => {
             let now = Instant::now();
-            let url = format!("http://127.0.0.1:{}/__codex_helper/config/reload", ui.port);
+            let url = format!(
+                "http://127.0.0.1:{}/__codex_helper/config/reload",
+                ui.admin_port
+            );
             let res = async {
                 let client = reqwest::Client::new();
                 client

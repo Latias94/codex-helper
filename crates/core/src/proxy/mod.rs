@@ -44,6 +44,7 @@ use self::stream::{SseSuccessMeta, build_sse_success_response};
 
 pub const ADMIN_TOKEN_ENV_VAR: &str = "CODEX_HELPER_ADMIN_TOKEN";
 pub const ADMIN_TOKEN_HEADER: &str = "x-codex-helper-admin-token";
+pub const ADMIN_PORT_OFFSET: u16 = 1000;
 
 #[cfg(test)]
 const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(20);
@@ -71,6 +72,39 @@ impl AdminAccessConfig {
             .filter(|value| !value.is_empty());
         Self { token }
     }
+}
+
+pub fn admin_port_for_proxy_port(proxy_port: u16) -> u16 {
+    if proxy_port <= u16::MAX - ADMIN_PORT_OFFSET {
+        proxy_port + ADMIN_PORT_OFFSET
+    } else if proxy_port > ADMIN_PORT_OFFSET {
+        proxy_port - ADMIN_PORT_OFFSET
+    } else {
+        1
+    }
+}
+
+pub fn local_proxy_base_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+pub fn local_admin_base_url_for_proxy_port(proxy_port: u16) -> String {
+    local_proxy_base_url(admin_port_for_proxy_port(proxy_port))
+}
+
+pub fn admin_base_url_from_proxy_base_url(proxy_base_url: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(proxy_base_url).ok()?;
+    let port = url.port_or_known_default()?;
+    url.set_port(Some(admin_port_for_proxy_port(port))).ok()?;
+    Some(url.to_string().trim_end_matches('/').to_string())
+}
+
+pub fn admin_loopback_addr_for_proxy_port(proxy_port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], admin_port_for_proxy_port(proxy_port)))
+}
+
+fn is_admin_path(path: &str) -> bool {
+    path == "/__codex_helper" || path.starts_with("/__codex_helper/")
 }
 
 fn cached_json_file_value(
@@ -139,6 +173,26 @@ async fn require_admin_access(
             "admin routes are loopback-only; set {ADMIN_TOKEN_ENV_VAR} and send {ADMIN_TOKEN_HEADER} to allow remote access"
         ),
     ))
+}
+
+async fn require_admin_path_only(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response<Body>, StatusCode> {
+    if is_admin_path(req.uri().path()) {
+        return Ok(next.run(req).await);
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
+async fn reject_admin_paths_from_proxy(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response<Body>, StatusCode> {
+    if is_admin_path(req.uri().path()) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(next.run(req).await)
 }
 
 fn format_reqwest_error_for_retry_chain(e: &reqwest::Error) -> String {
@@ -3459,5 +3513,15 @@ pub fn router(proxy: ProxyService) -> Router {
 
     Router::new()
         .merge(admin_routes)
-        .route("/{*path}", any(move |req| handle_proxy(p2.clone(), req)))
+        .merge(proxy_only_router(p2))
+}
+
+pub fn proxy_only_router(proxy: ProxyService) -> Router {
+    Router::new()
+        .route("/{*path}", any(move |req| handle_proxy(proxy.clone(), req)))
+        .layer(middleware::from_fn(reject_admin_paths_from_proxy))
+}
+
+pub fn admin_listener_router(proxy: ProxyService) -> Router {
+    router(proxy).layer(middleware::from_fn(require_admin_path_only))
 }

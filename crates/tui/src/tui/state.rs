@@ -1,6 +1,7 @@
 use ratatui::widgets::{ListState, TableState};
 
 use crate::config::ResolvedRetryConfig;
+use crate::proxy::admin_port_for_proxy_port;
 use crate::sessions::{SessionMeta, SessionSummary, SessionTranscriptMessage};
 use std::collections::HashMap;
 
@@ -20,7 +21,7 @@ pub(in crate::tui) struct RecentCodexRow {
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
-    pub(in crate::tui) port: u16,
+    pub(in crate::tui) admin_port: u16,
     pub(in crate::tui) language: Language,
     pub(in crate::tui) refresh_ms: u64,
     pub(in crate::tui) page: Page,
@@ -90,7 +91,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             service_name: "codex",
-            port: 3211,
+            admin_port: admin_port_for_proxy_port(3211),
             language: Language::En,
             refresh_ms: 500,
             page: Page::Dashboard,

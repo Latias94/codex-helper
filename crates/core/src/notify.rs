@@ -190,20 +190,42 @@ async fn fetch_recent_finished(
     proxy_base_url: &str,
     timeout_ms: u64,
 ) -> anyhow::Result<Vec<FinishedRequestLite>> {
-    let url = format!(
-        "{}/__codex_helper/status/recent?limit=200",
-        proxy_base_url.trim_end_matches('/')
-    );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()?;
-    let resp = client.get(url).send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("proxy status/recent returned {}", status.as_u16());
+
+    let mut base_candidates = Vec::new();
+    if let Some(admin_base_url) = crate::proxy::admin_base_url_from_proxy_base_url(proxy_base_url) {
+        base_candidates.push(admin_base_url);
     }
-    let items = resp.json::<Vec<FinishedRequestLite>>().await?;
-    Ok(items)
+    let proxy_base_url = proxy_base_url.trim_end_matches('/').to_string();
+    if !base_candidates.iter().any(|base| base == &proxy_base_url) {
+        base_candidates.push(proxy_base_url);
+    }
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for base_url in base_candidates {
+        let url = format!("{base_url}/__codex_helper/status/recent?limit=200");
+        match client.get(url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    last_err = Some(anyhow::anyhow!(
+                        "proxy status/recent returned {}",
+                        status.as_u16()
+                    ));
+                    continue;
+                }
+                let items = resp.json::<Vec<FinishedRequestLite>>().await?;
+                return Ok(items);
+            }
+            Err(err) => {
+                last_err = Some(err.into());
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("proxy status/recent unavailable")))
 }
 
 async fn queue_event_and_spawn_flush(

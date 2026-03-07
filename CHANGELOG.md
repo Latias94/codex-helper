@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### 修复 / Fixed
 - 修复 `switch on/off` 在重复切换时可能复用陈旧备份的问题：恢复原始配置后现在会清理旧备份，使下一次 `switch on` 能重新抓取最新的原始配置，避免用户手动修改后再次 `switch off` 被回滚到更早版本。  Fix stale backup snapshots across repeated `switch on/off` cycles: restoring from backup now removes the old backup so the next `switch on` captures the latest original config instead of rolling users back to an older pre-edit snapshot.
 - 修复代理对 `~/.codex/auth.json` / `~/.claude/settings.json` 的鉴权缓存不会刷新的问题；同时为 `__codex_helper` 管理 API 增加默认 loopback 限制，非 loopback 访问需要 `CODEX_HELPER_ADMIN_TOKEN` + `x-codex-helper-admin-token`。  Fix stale auth-file caching for `~/.codex/auth.json` / `~/.claude/settings.json`, and protect `__codex_helper` admin routes by defaulting them to loopback-only access unless `CODEX_HELPER_ADMIN_TOKEN` and `x-codex-helper-admin-token` are provided for remote requests.
+- 进一步将 `__codex_helper` 管理 API 从主代理 listener 拆分到独立 loopback 管理端口（默认 `proxy_port + 1000`），让 GUI/TUI/notify 走本地管理面而不与主代理流量混用。  Further split `__codex_helper` admin routes onto a dedicated loopback-only admin port (default `proxy_port + 1000`) so local GUI/TUI/notify management traffic no longer shares the main proxy listener.
 
 ## [0.12.1] - 2026-02-09
 ### 新增 / Added
