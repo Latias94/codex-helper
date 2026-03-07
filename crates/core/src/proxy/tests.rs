@@ -1,17 +1,21 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use axum::Json;
-use axum::body::{Body, Bytes};
-use axum::http::HeaderValue;
+use axum::body::{Body, Bytes, to_bytes};
+use axum::extract::ConnectInfo;
 use axum::http::StatusCode;
+use axum::http::{HeaderValue, Request};
 use axum::response::Response;
 use axum::routing::post;
 use futures_util::stream;
 use reqwest::Client;
 use tokio::time::{Duration, sleep};
+use tower::util::ServiceExt;
 
 use crate::config::{
     ProxyConfig, RetryConfig, RetryProfileName, RetryStrategy, ServiceConfig, ServiceConfigManager,
@@ -25,9 +29,72 @@ fn spawn_axum_server(app: axum::Router) -> (std::net::SocketAddr, tokio::task::J
     listener.set_nonblocking(true).expect("nonblocking");
     let listener = tokio::net::TcpListener::from_std(listener).expect("to tokio listener");
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("serve");
     });
     (addr, handle)
+}
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Default)]
+struct ScopedEnv {
+    saved: Vec<(String, Option<String>)>,
+}
+
+impl ScopedEnv {
+    unsafe fn set(&mut self, key: &str, value: &str) {
+        if !self.saved.iter().any(|(saved_key, _)| saved_key == key) {
+            self.saved.push((key.to_string(), std::env::var(key).ok()));
+        }
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    unsafe fn set_path(&mut self, key: &str, value: &Path) {
+        unsafe {
+            self.set(key, value.to_string_lossy().as_ref());
+        }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.iter().rev() {
+            match value {
+                Some(value) => unsafe {
+                    std::env::set_var(key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(key);
+                },
+            }
+        }
+    }
+}
+
+fn make_temp_test_dir() -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("codex-helper-proxy-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("create temp test dir");
+    dir
+}
+
+fn write_text_file(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dirs");
+    }
+    std::fs::write(path, content).expect("write test file");
 }
 
 fn make_proxy_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> ProxyConfig {
@@ -253,6 +320,115 @@ async fn proxy_api_v1_snapshot_works() {
     assert!(snap.get("configs").is_some(), "should include configs list");
 
     proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_auth_file_cache_refreshes_after_source_change() {
+    let _env_lock = env_lock();
+    let mut scoped = ScopedEnv::default();
+    let base = make_temp_test_dir();
+    let codex_home = base.join("codex-home");
+    let claude_home = base.join("claude-home");
+    let codex_auth = codex_home.join("auth.json");
+    let claude_settings = claude_home.join("settings.json");
+
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+        scoped.set_path("CLAUDE_HOME", &claude_home);
+    }
+
+    write_text_file(&codex_auth, r#"{"OPENAI_API_KEY":"sk-first"}"#);
+    write_text_file(
+        &claude_settings,
+        r#"{"env":{"ANTHROPIC_API_KEY":"claude-first"}}"#,
+    );
+
+    assert_eq!(
+        super::codex_auth_json_value("OPENAI_API_KEY"),
+        Some("sk-first".to_string())
+    );
+    assert_eq!(
+        super::claude_settings_env_value("ANTHROPIC_API_KEY"),
+        Some("claude-first".to_string())
+    );
+
+    sleep(Duration::from_millis(30)).await;
+    write_text_file(&codex_auth, r#"{"OPENAI_API_KEY":"sk-second"}"#);
+    write_text_file(
+        &claude_settings,
+        r#"{"env":{"ANTHROPIC_API_KEY":"claude-second"}}"#,
+    );
+    sleep(Duration::from_millis(30)).await;
+
+    assert_eq!(
+        super::codex_auth_json_value("OPENAI_API_KEY"),
+        Some("sk-second".to_string())
+    );
+    assert_eq!(
+        super::claude_settings_env_value("ANTHROPIC_API_KEY"),
+        Some("claude-second".to_string())
+    );
+}
+
+#[tokio::test]
+async fn proxy_admin_routes_require_loopback_or_token_for_remote_access() {
+    let _env_lock = env_lock();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set(super::ADMIN_TOKEN_ENV_VAR, "remote-secret");
+    }
+
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let remote_addr = std::net::SocketAddr::from(([203, 0, 113, 7], 43123));
+
+    let mut denied_req = Request::builder()
+        .uri("/__codex_helper/api/v1/capabilities")
+        .body(Body::empty())
+        .expect("build denied request");
+    denied_req.extensions_mut().insert(ConnectInfo(remote_addr));
+    let denied = app
+        .clone()
+        .oneshot(denied_req)
+        .await
+        .expect("denied response");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied_body = to_bytes(denied.into_body(), usize::MAX)
+        .await
+        .expect("denied body");
+    let denied_text = String::from_utf8_lossy(&denied_body);
+    assert!(denied_text.contains(super::ADMIN_TOKEN_HEADER));
+
+    let mut allowed_req = Request::builder()
+        .uri("/__codex_helper/api/v1/capabilities")
+        .header(super::ADMIN_TOKEN_HEADER, "remote-secret")
+        .body(Body::empty())
+        .expect("build allowed request");
+    allowed_req
+        .extensions_mut()
+        .insert(ConnectInfo(remote_addr));
+    let allowed = app.oneshot(allowed_req).await.expect("allowed response");
+    assert_eq!(allowed.status(), StatusCode::OK);
 }
 
 #[tokio::test]

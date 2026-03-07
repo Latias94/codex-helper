@@ -6,7 +6,7 @@ use crate::config::{
     codex_config_path, load_config, load_or_bootstrap_for_service, model_routing_warnings,
 };
 use crate::notify;
-use crate::proxy::{ProxyService, router as proxy_router};
+use crate::proxy::{ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, ProxyService, router as proxy_router};
 use crate::tui;
 
 use axum::Router;
@@ -383,6 +383,23 @@ async fn run_server(
             "Binding to non-loopback address {}. This may expose your proxy to other machines. Consider using 127.0.0.1 + SSH port forwarding instead.",
             host
         );
+        if std::env::var(ADMIN_TOKEN_ENV_VAR)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            tracing::warn!(
+                "Remote access to /__codex_helper admin routes now requires header {}.",
+                ADMIN_TOKEN_HEADER
+            );
+        } else {
+            tracing::warn!(
+                "Remote access to /__codex_helper admin routes is blocked unless {} is set and clients send header {}.",
+                ADMIN_TOKEN_ENV_VAR,
+                ADMIN_TOKEN_HEADER
+            );
+        }
     }
     let addr: SocketAddr = SocketAddr::from((host, port));
     let listener = bind_local_listener_or_explain(addr, service_name).await?;
@@ -418,9 +435,12 @@ async fn run_server(
             }
         };
         let mut server_handle = tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(server_shutdown)
-                .await
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(server_shutdown)
+            .await
         });
 
         let providers = tui::build_provider_options(&cfg, service_name);
@@ -471,9 +491,12 @@ async fn run_server(
                 let _ = rx.changed().await;
             }
         };
-        axum::serve(listener, app.into_make_service())
-            .with_graceful_shutdown(server_shutdown)
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(server_shutdown)
+        .await?;
         Ok(())
     };
 

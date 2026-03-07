@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::Query;
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::routing::{any, get, post};
 use reqwest::Client;
 use std::sync::OnceLock;
@@ -39,6 +41,105 @@ use self::retry::{
 };
 use self::runtime_config::RuntimeConfig;
 use self::stream::{SseSuccessMeta, build_sse_success_response};
+
+pub const ADMIN_TOKEN_ENV_VAR: &str = "CODEX_HELPER_ADMIN_TOKEN";
+pub const ADMIN_TOKEN_HEADER: &str = "x-codex-helper-admin-token";
+
+#[cfg(test)]
+const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
+const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(800);
+
+#[derive(Default)]
+struct JsonFileCache {
+    last_check_at: Option<Instant>,
+    last_path: Option<std::path::PathBuf>,
+    last_mtime: Option<std::time::SystemTime>,
+    value: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Default)]
+struct AdminAccessConfig {
+    token: Option<String>,
+}
+
+impl AdminAccessConfig {
+    fn from_env() -> Self {
+        let token = std::env::var(ADMIN_TOKEN_ENV_VAR)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Self { token }
+    }
+}
+
+fn cached_json_file_value(
+    cache: &'static OnceLock<Mutex<JsonFileCache>>,
+    path: std::path::PathBuf,
+) -> Option<serde_json::Value> {
+    let cache = cache.get_or_init(|| Mutex::new(JsonFileCache::default()));
+    let now = Instant::now();
+    let mut state = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let path_changed = state.last_path.as_ref() != Some(&path);
+    let should_check = path_changed
+        || state
+            .last_check_at
+            .map(|last| now.saturating_duration_since(last) >= AUTH_FILE_CACHE_MIN_CHECK_INTERVAL)
+            .unwrap_or(true);
+    if !should_check {
+        return state.value.clone();
+    }
+
+    let mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    if !path_changed && mtime == state.last_mtime {
+        state.last_check_at = Some(now);
+        return state.value.clone();
+    }
+
+    let value = read_json_file(&path);
+    state.last_check_at = Some(now);
+    state.last_path = Some(path);
+    state.last_mtime = mtime;
+    state.value = value.clone();
+    value
+}
+
+async fn require_admin_access(
+    State(access): State<AdminAccessConfig>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    if peer_addr.ip().is_loopback() {
+        return Ok(next.run(req).await);
+    }
+
+    let provided = req
+        .headers()
+        .get(ADMIN_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let remote_allowed = access
+        .token
+        .as_deref()
+        .is_some_and(|expected| Some(expected) == provided);
+    if remote_allowed {
+        return Ok(next.run(req).await);
+    }
+
+    Err((
+        StatusCode::FORBIDDEN,
+        format!(
+            "admin routes are loopback-only; set {ADMIN_TOKEN_ENV_VAR} and send {ADMIN_TOKEN_HEADER} to allow remote access"
+        ),
+    ))
+}
 
 fn format_reqwest_error_for_retry_chain(e: &reqwest::Error) -> String {
     use std::error::Error as _;
@@ -127,15 +228,15 @@ fn read_json_file(path: &std::path::Path) -> Option<serde_json::Value> {
 }
 
 fn codex_auth_json_value(key: &str) -> Option<String> {
-    static CACHE: std::sync::OnceLock<Option<serde_json::Value>> = std::sync::OnceLock::new();
-    let v = CACHE.get_or_init(|| read_json_file(&crate::config::codex_auth_path()));
+    static CACHE: OnceLock<Mutex<JsonFileCache>> = OnceLock::new();
+    let v = cached_json_file_value(&CACHE, crate::config::codex_auth_path());
     let obj = v.as_ref()?.as_object()?;
     obj.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
 fn claude_settings_env_value(key: &str) -> Option<String> {
-    static CACHE: std::sync::OnceLock<Option<serde_json::Value>> = std::sync::OnceLock::new();
-    let v = CACHE.get_or_init(|| read_json_file(&crate::config::claude_settings_path()));
+    static CACHE: OnceLock<Mutex<JsonFileCache>> = OnceLock::new();
+    let v = cached_json_file_value(&CACHE, crate::config::claude_settings_path());
     let obj = v.as_ref()?.as_object()?;
     let env_obj = obj.get("env")?.as_object()?;
     env_obj
@@ -3235,6 +3336,8 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(Json(out))
     }
 
+    let admin_access = AdminAccessConfig::from_env();
+
     let p0 = proxy.clone();
     let p1 = proxy.clone();
     let p2 = proxy.clone();
@@ -3262,7 +3365,7 @@ pub fn router(proxy: ProxyService) -> Router {
     let p24 = proxy.clone();
     let p25 = proxy.clone();
 
-    Router::new()
+    let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
         .route(
             "/__codex_helper/api/v1/capabilities",
@@ -3349,5 +3452,12 @@ pub fn router(proxy: ProxyService) -> Router {
             "/__codex_helper/status/recent",
             get(move |q| list_recent_finished(p4.clone(), q)),
         )
+        .layer(middleware::from_fn_with_state(
+            admin_access,
+            require_admin_access,
+        ));
+
+    Router::new()
+        .merge(admin_routes)
         .route("/{*path}", any(move |req| handle_proxy(p2.clone(), req)))
 }
