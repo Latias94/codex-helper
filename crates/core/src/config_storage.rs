@@ -1,4 +1,4 @@
-use super::bootstrap_from_codex;
+use super::bootstrap_impl::bootstrap_from_codex;
 use super::*;
 
 fn config_dir() -> PathBuf {
