@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::client_config::{
@@ -7,6 +7,7 @@ use crate::client_config::{
     claude_settings_backup_path_for as claude_settings_backup_path, claude_settings_path,
     codex_backup_config_path as codex_config_backup_path, codex_config_path,
 };
+use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
 use toml::Value;
 
@@ -22,18 +23,7 @@ fn read_config_text(path: &Path) -> Result<String> {
 }
 
 fn atomic_write(path: &Path, data: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create_dir_all {:?}", parent))?;
-    }
-    let tmp = path.with_extension("tmp.codex-helper");
-    {
-        let mut f = fs::File::create(&tmp).with_context(|| format!("create {:?}", tmp))?;
-        f.write_all(data.as_bytes())
-            .with_context(|| format!("write {:?}", tmp))?;
-        f.sync_all().ok();
-    }
-    fs::rename(&tmp, path).with_context(|| format!("rename {:?} -> {:?}", tmp, path))?;
-    Ok(())
+    write_text_file(path, data)
 }
 
 #[derive(Debug, Clone)]
@@ -449,18 +439,8 @@ pub fn claude_switch_on(port: u16) -> Result<()> {
     );
 
     let new_text = serde_json::to_string_pretty(&value)?;
-    if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create_dir_all {:?}", parent))?;
-    }
-    let tmp = settings_path.with_extension("tmp.codex-helper");
-    {
-        let mut f = fs::File::create(&tmp).with_context(|| format!("create {:?}", tmp))?;
-        f.write_all(new_text.as_bytes())
-            .with_context(|| format!("write {:?}", tmp))?;
-        f.sync_all().ok();
-    }
-    fs::rename(&tmp, &settings_path)
-        .with_context(|| format!("rename {:?} -> {:?}", tmp, settings_path))?;
+    write_text_file(&settings_path, &new_text)
+        .with_context(|| format!("write {:?}", settings_path))?;
 
     eprintln!(
         "[EXPERIMENTAL] Updated {:?} to use local Claude proxy via codex-helper",

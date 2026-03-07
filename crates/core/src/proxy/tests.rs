@@ -503,6 +503,61 @@ async fn proxy_split_listeners_isolate_admin_routes_from_proxy_traffic() {
 }
 
 #[tokio::test]
+async fn proxy_only_router_exposes_admin_discovery_document() {
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::proxy_only_router_with_admin_base_url(
+        proxy,
+        Some("http://127.0.0.1:4100".to_string()),
+    );
+
+    let discovery = app
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/codex-helper-admin")
+                .body(Body::empty())
+                .expect("build discovery request"),
+        )
+        .await
+        .expect("discovery response");
+
+    assert_eq!(discovery.status(), StatusCode::OK);
+    let body = to_bytes(discovery.into_body(), usize::MAX)
+        .await
+        .expect("discovery body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("discovery json");
+    assert_eq!(json.get("api_version").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(
+        json.get("service_name").and_then(|v| v.as_str()),
+        Some("codex")
+    );
+    assert_eq!(
+        json.get("admin_base_url").and_then(|v| v.as_str()),
+        Some("http://127.0.0.1:4100")
+    );
+}
+
+#[tokio::test]
 async fn proxy_failover_retries_502_then_uses_second_upstream() {
     let upstream1_hits = Arc::new(AtomicUsize::new(0));
     let upstream2_hits = Arc::new(AtomicUsize::new(0));

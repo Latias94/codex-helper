@@ -107,6 +107,13 @@ fn is_admin_path(path: &str) -> bool {
     path == "/__codex_helper" || path.starts_with("/__codex_helper/")
 }
 
+#[derive(Clone, serde::Serialize)]
+struct ProxyAdminDiscovery {
+    api_version: u32,
+    service_name: &'static str,
+    admin_base_url: String,
+}
+
 fn cached_json_file_value(
     cache: &'static OnceLock<Mutex<JsonFileCache>>,
     path: std::path::PathBuf,
@@ -3517,7 +3524,34 @@ pub fn router(proxy: ProxyService) -> Router {
 }
 
 pub fn proxy_only_router(proxy: ProxyService) -> Router {
-    Router::new()
+    proxy_only_router_with_admin_base_url(proxy, None)
+}
+
+pub fn proxy_only_router_with_admin_base_url(
+    proxy: ProxyService,
+    admin_base_url: Option<String>,
+) -> Router {
+    let service_name = proxy.service_name;
+    let discovery = admin_base_url.map(|admin_base_url| {
+        Json(ProxyAdminDiscovery {
+            api_version: 1,
+            service_name,
+            admin_base_url,
+        })
+    });
+
+    let mut router = Router::new();
+    if let Some(discovery) = discovery {
+        router = router.route(
+            "/.well-known/codex-helper-admin",
+            get(move || {
+                let discovery = discovery.clone();
+                async move { discovery }
+            }),
+        );
+    }
+
+    router
         .route("/{*path}", any(move |req| handle_proxy(proxy.clone(), req)))
         .layer(middleware::from_fn(reject_admin_paths_from_proxy))
 }

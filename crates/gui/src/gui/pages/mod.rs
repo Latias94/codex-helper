@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use super::autostart;
 use super::config::GuiConfig;
 use super::i18n::{Language, pick};
-use super::proxy_control::{PortInUseAction, ProxyModeKind};
+use super::proxy_control::{DiscoveredProxy, PortInUseAction, ProxyModeKind};
 use super::util::{
     open_in_file_manager, spawn_windows_terminal_wt_new_tab,
     spawn_windows_terminal_wt_tabs_in_one_window,
@@ -304,7 +304,7 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.add_space(10.0);
 
     let mut action_scan_local_proxies = false;
-    let mut action_attach_discovered: Option<u16> = None;
+    let mut action_attach_discovered: Option<DiscoveredProxy> = None;
 
     // Step 2: start proxy
     ui.group(|ui| {
@@ -453,7 +453,7 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 }
 
                                 if ui.button(pick(ctx.lang, "附着", "Attach")).clicked() {
-                                    action_attach_discovered = Some(p.port);
+                                    action_attach_discovered = Some(p.clone());
                                 }
                                 ui.end_row();
                             }
@@ -693,11 +693,12 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
     }
 
-    if let Some(port) = action_attach_discovered {
-        ctx.proxy.request_attach(port);
-        ctx.proxy.set_desired_port(port);
-        ctx.gui_cfg.attach.last_port = Some(port);
-        ctx.gui_cfg.proxy.default_port = port;
+    if let Some(proxy) = action_attach_discovered {
+        ctx.proxy
+            .request_attach_with_admin_base(proxy.port, Some(proxy.admin_base_url.clone()));
+        ctx.proxy.set_desired_port(proxy.port);
+        ctx.gui_cfg.attach.last_port = Some(proxy.port);
+        ctx.gui_cfg.proxy.default_port = proxy.port;
         if let Err(e) = ctx.gui_cfg.save() {
             *ctx.last_error = Some(format!("save gui config failed: {e}"));
         } else {
@@ -840,7 +841,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.separator();
 
     let mut action_scan_local_proxies = false;
-    let mut action_attach_discovered: Option<u16> = None;
+    let mut action_attach_discovered: Option<DiscoveredProxy> = None;
     let mut action_save_active_config: Option<(String, String)> = None;
 
     // Sync defaults from GUI config (so Settings changes take effect without restart).
@@ -1113,7 +1114,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                             )
                                             .clicked()
                                         {
-                                            action_attach_discovered = Some(p.port);
+                                            action_attach_discovered = Some(p.clone());
                                         }
                                         ui.end_row();
                                     }
@@ -1476,9 +1477,10 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
     }
 
-    if let Some(port) = action_attach_discovered {
-        ctx.proxy.request_attach(port);
-        ctx.gui_cfg.attach.last_port = Some(port);
+    if let Some(proxy) = action_attach_discovered {
+        ctx.proxy
+            .request_attach_with_admin_base(proxy.port, Some(proxy.admin_base_url.clone()));
+        ctx.gui_cfg.attach.last_port = Some(proxy.port);
         if let Err(e) = ctx.gui_cfg.save() {
             *ctx.last_error = Some(format!("save gui config failed: {e}"));
         } else {

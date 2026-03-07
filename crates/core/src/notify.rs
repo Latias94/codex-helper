@@ -190,6 +190,11 @@ async fn fetch_recent_finished(
     proxy_base_url: &str,
     timeout_ms: u64,
 ) -> anyhow::Result<Vec<FinishedRequestLite>> {
+    #[derive(serde::Deserialize)]
+    struct AdminDiscovery {
+        admin_base_url: String,
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()?;
@@ -200,7 +205,24 @@ async fn fetch_recent_finished(
     }
     let proxy_base_url = proxy_base_url.trim_end_matches('/').to_string();
     if !base_candidates.iter().any(|base| base == &proxy_base_url) {
-        base_candidates.push(proxy_base_url);
+        base_candidates.push(proxy_base_url.clone());
+    }
+
+    if let Ok(resp) = client
+        .get(format!(
+            "{}/.well-known/codex-helper-admin",
+            proxy_base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        && resp.status().is_success()
+        && let Ok(discovery) = resp.json::<AdminDiscovery>().await
+    {
+        let admin_base_url = discovery.admin_base_url.trim_end_matches('/').to_string();
+        if !admin_base_url.is_empty() && !base_candidates.iter().any(|base| base == &admin_base_url)
+        {
+            base_candidates.insert(0, admin_base_url);
+        }
     }
 
     let mut last_err: Option<anyhow::Error> = None;

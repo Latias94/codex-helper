@@ -7,7 +7,8 @@ use crate::config::{
 };
 use crate::notify;
 use crate::proxy::{
-    ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port, proxy_only_router,
+    ProxyService, admin_listener_router, admin_loopback_addr_for_proxy_port, local_proxy_base_url,
+    proxy_only_router_with_admin_base_url,
 };
 use crate::tui;
 
@@ -374,15 +375,17 @@ async fn run_server(
 
     // Shared LB state (failure counters, cooldowns, usage flags).
     let lb_states = Arc::new(Mutex::new(HashMap::new()));
+    let addr: SocketAddr = SocketAddr::from((host, port));
+    let admin_addr = admin_loopback_addr_for_proxy_port(port);
 
     // Select service config based on service_name.
     let proxy = ProxyService::new(client, cfg.clone(), service_name, lb_states.clone());
     let state = proxy.state_handle();
-    let app: Router = proxy_only_router(proxy.clone());
+    let app: Router = proxy_only_router_with_admin_base_url(
+        proxy.clone(),
+        Some(local_proxy_base_url(admin_addr.port())),
+    );
     let admin_app: Router = admin_listener_router(proxy);
-
-    let addr: SocketAddr = SocketAddr::from((host, port));
-    let admin_addr = admin_loopback_addr_for_proxy_port(port);
 
     if !host.is_loopback() {
         tracing::warn!(

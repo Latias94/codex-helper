@@ -16,7 +16,8 @@ use crate::config::{
 use crate::dashboard_core::{ApiV1Snapshot, ConfigOption, WindowStats, build_dashboard_snapshot};
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_port_for_proxy_port,
-    local_admin_base_url_for_proxy_port, local_proxy_base_url, proxy_only_router,
+    local_admin_base_url_for_proxy_port, local_proxy_base_url,
+    proxy_only_router_with_admin_base_url,
 };
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
@@ -181,6 +182,7 @@ pub struct ProxyController {
 pub struct DiscoveredProxy {
     pub port: u16,
     pub base_url: String,
+    pub admin_base_url: String,
     pub api_version: Option<u32>,
     pub service_name: Option<String>,
     pub endpoints: Vec<String>,
@@ -363,7 +365,15 @@ impl ProxyController {
     }
 
     pub fn request_attach(&mut self, port: u16) {
-        self.mode = ProxyMode::Attached(AttachedStatus::new(port));
+        self.request_attach_with_admin_base(port, None);
+    }
+
+    pub fn request_attach_with_admin_base(&mut self, port: u16, admin_base_url: Option<String>) {
+        let mut attached = AttachedStatus::new(port);
+        if let Some(admin_base_url) = admin_base_url {
+            attached.admin_base_url = admin_base_url;
+        }
+        self.mode = ProxyMode::Attached(attached);
         self.last_start_error = None;
         self.port_in_use_modal = None;
     }
@@ -384,6 +394,11 @@ impl ProxyController {
         #[derive(Debug, serde::Deserialize)]
         struct RuntimeConfigStatus {
             loaded_at_ms: u64,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct AdminDiscovery {
+            admin_base_url: String,
         }
 
         async fn get_json<T: serde::de::DeserializeOwned>(
@@ -425,6 +440,7 @@ impl ProxyController {
                 return Some(DiscoveredProxy {
                     port,
                     base_url,
+                    admin_base_url,
                     api_version: Some(c.api_version),
                     service_name: Some(c.service_name),
                     endpoints: c.endpoints,
@@ -451,13 +467,75 @@ impl ProxyController {
 
                 return Some(DiscoveredProxy {
                     port,
-                    base_url,
+                    base_url: base_url.clone(),
+                    admin_base_url: base_url,
                     api_version: Some(c.api_version),
                     service_name: Some(c.service_name),
                     endpoints: c.endpoints,
                     runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
                     last_error: None,
                 });
+            }
+
+            let discovered_admin_base = get_json::<AdminDiscovery>(
+                &client,
+                format!("{base_url}/.well-known/codex-helper-admin"),
+                timeout,
+            )
+            .await
+            .ok()
+            .map(|d| d.admin_base_url.trim_end_matches('/').to_string());
+
+            if let Some(discovered_admin_base) = discovered_admin_base
+                && discovered_admin_base != admin_base_url
+                && discovered_admin_base != base_url
+            {
+                let caps = get_json::<ApiCapabilities>(
+                    &client,
+                    format!("{discovered_admin_base}/__codex_helper/api/v1/capabilities"),
+                    timeout,
+                )
+                .await;
+
+                if let Ok(c) = caps {
+                    let runtime = get_json::<RuntimeConfigStatus>(
+                        &client,
+                        format!("{discovered_admin_base}/__codex_helper/api/v1/config/runtime"),
+                        timeout,
+                    )
+                    .await
+                    .ok();
+
+                    return Some(DiscoveredProxy {
+                        port,
+                        base_url,
+                        admin_base_url: discovered_admin_base,
+                        api_version: Some(c.api_version),
+                        service_name: Some(c.service_name),
+                        endpoints: c.endpoints,
+                        runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
+                        last_error: None,
+                    });
+                }
+
+                if let Ok(runtime) = get_json::<RuntimeConfigStatus>(
+                    &client,
+                    format!("{discovered_admin_base}/__codex_helper/config/runtime"),
+                    timeout,
+                )
+                .await
+                {
+                    return Some(DiscoveredProxy {
+                        port,
+                        base_url,
+                        admin_base_url: discovered_admin_base,
+                        api_version: None,
+                        service_name: None,
+                        endpoints: Vec::new(),
+                        runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
+                        last_error: None,
+                    });
+                }
             }
 
             let runtime = match get_json::<RuntimeConfigStatus>(
@@ -481,6 +559,7 @@ impl ProxyController {
                 Ok(r) => Some(DiscoveredProxy {
                     port,
                     base_url,
+                    admin_base_url,
                     api_version: None,
                     service_name: None,
                     endpoints: Vec::new(),
@@ -1243,7 +1322,10 @@ impl ProxyController {
             let lb_states = Arc::new(Mutex::new(std::collections::HashMap::new()));
             let proxy = ProxyService::new(client, cfg.clone(), service_name, lb_states);
             let state = proxy.state_handle();
-            let app = proxy_only_router(proxy.clone());
+            let app = proxy_only_router_with_admin_base_url(
+                proxy.clone(),
+                Some(local_proxy_base_url(admin_port)),
+            );
             let admin_app = admin_listener_router(proxy);
 
             let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));

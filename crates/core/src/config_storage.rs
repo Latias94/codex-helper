@@ -1,5 +1,6 @@
 use super::bootstrap_impl::bootstrap_from_codex;
 use super::*;
+use crate::file_replace::write_bytes_file_async;
 
 fn config_dir() -> PathBuf {
     proxy_home_dir()
@@ -283,14 +284,11 @@ pub async fn init_config_toml(force: bool, import_codex: bool) -> Result<PathBuf
         warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
     }
 
-    let tmp_path = dir.join("config.toml.tmp");
-
     let mut text = CONFIG_TOML_TEMPLATE.to_string();
     if import_codex && let Some(snippet) = codex_bootstrap_snippet()? {
         text = insert_after_version_block(&text, snippet.as_str());
     }
-    fs::write(&tmp_path, text.as_bytes()).await?;
-    fs::rename(&tmp_path, &path).await?;
+    write_bytes_file_async(&path, text.as_bytes()).await?;
     Ok(path)
 }
 
@@ -347,9 +345,7 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
         warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
     }
 
-    let tmp_path = dir.join("config.tmp");
-    fs::write(&tmp_path, &data).await?;
-    fs::rename(&tmp_path, &path).await?;
+    write_bytes_file_async(&path, &data).await?;
     Ok(())
 }
 

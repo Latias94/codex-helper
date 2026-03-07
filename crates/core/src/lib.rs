@@ -3,6 +3,7 @@ pub mod codex_integration;
 pub mod config;
 pub mod dashboard_core;
 pub mod doctor;
+mod file_replace;
 pub mod filter;
 pub mod healthcheck;
 pub mod lb;

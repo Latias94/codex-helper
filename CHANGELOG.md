@@ -7,11 +7,13 @@ All notable changes to this project will be documented in this file.
 
 ### 改进 / Improved
 - 配置模块内部做了一轮收口重构：把 Codex / Claude 客户端配置的路径、备份、sentinel 判断收口到 `client_config`，并在 `config` 下新增 `storage` / `bootstrap` / `auth_sync` 门面，为后续继续拆分配置管理做好边界，同时保持现有 CLI / GUI / TUI 调用方式兼容。  Internal config management refactor: consolidate Codex / Claude client-config path, backup, and sentinel handling into `client_config`, and add `storage` / `bootstrap` / `auth_sync` facades under `config` to prepare for further modularization while keeping existing CLI / GUI / TUI call sites compatible.
+- 代理主监听新增 `/.well-known/codex-helper-admin` 发现文档，GUI 的本地扫描附着与 `notify` 现在会优先发现并使用真实管理端地址，从而兼容“代理端口 / 管理端口拆分”的新拓扑。  Add `/.well-known/codex-helper-admin` discovery on the proxy listener so GUI local attach scanning and `notify` can prefer the real admin base URL when proxy and admin listeners are split.
 
 ### 修复 / Fixed
 - 修复 `switch on/off` 在重复切换时可能复用陈旧备份的问题：恢复原始配置后现在会清理旧备份，使下一次 `switch on` 能重新抓取最新的原始配置，避免用户手动修改后再次 `switch off` 被回滚到更早版本。  Fix stale backup snapshots across repeated `switch on/off` cycles: restoring from backup now removes the old backup so the next `switch on` captures the latest original config instead of rolling users back to an older pre-edit snapshot.
 - 修复代理对 `~/.codex/auth.json` / `~/.claude/settings.json` 的鉴权缓存不会刷新的问题；同时为 `__codex_helper` 管理 API 增加默认 loopback 限制，非 loopback 访问需要 `CODEX_HELPER_ADMIN_TOKEN` + `x-codex-helper-admin-token`。  Fix stale auth-file caching for `~/.codex/auth.json` / `~/.claude/settings.json`, and protect `__codex_helper` admin routes by defaulting them to loopback-only access unless `CODEX_HELPER_ADMIN_TOKEN` and `x-codex-helper-admin-token` are provided for remote requests.
 - 进一步将 `__codex_helper` 管理 API 从主代理 listener 拆分到独立 loopback 管理端口（默认 `proxy_port + 1000`），让 GUI/TUI/notify 走本地管理面而不与主代理流量混用。  Further split `__codex_helper` admin routes onto a dedicated loopback-only admin port (default `proxy_port + 1000`) so local GUI/TUI/notify management traffic no longer shares the main proxy listener.
+- 修复 Windows 下配置覆盖写入会因目标文件已存在而失败的问题：`config init` / `save_config` / `switch on/off` / Claude settings 更新现在统一通过同目录临时文件 + 替换写入，重复保存时也会正确刷新 `.bak` 备份。  Fix Windows overwrite failures when the target config file already exists: `config init`, `save_config`, `switch on/off`, and Claude settings updates now use same-directory temp writes plus replacement, and repeated saves correctly refresh `.bak` backups.
 
 ## [0.12.1] - 2026-02-09
 ### 新增 / Added
