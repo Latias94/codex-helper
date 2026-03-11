@@ -89,6 +89,7 @@ pub enum HistoryDataSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExternalHistoryOrigin {
     Sessions,
+    Requests,
 }
 
 #[derive(Debug, Clone)]
@@ -613,6 +614,7 @@ fn history_summary_source_label(source: SessionSummarySource, lang: Language) ->
 fn external_history_origin_label(origin: ExternalHistoryOrigin, lang: Language) -> &'static str {
     match origin {
         ExternalHistoryOrigin::Sessions => pick(lang, "来自 Sessions", "Opened from Sessions"),
+        ExternalHistoryOrigin::Requests => pick(lang, "来自 Requests", "Opened from Requests"),
     }
 }
 
@@ -675,13 +677,32 @@ fn render_open_in_sessions_button(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, sele
         .button(pick(ctx.lang, "在 Sessions 查看", "Open in Sessions"))
         .clicked()
     {
-        super::prepare_select_session_from_history(&mut ctx.view.sessions, selected_id.to_string());
+        super::focus_session_in_sessions(&mut ctx.view.sessions, selected_id.to_string());
         ctx.view.requested_page = Some(Page::Sessions);
         *ctx.last_info = Some(
             pick(
                 ctx.lang,
                 "已切到 Sessions 并定位到当前 session",
                 "Opened in Sessions and focused the current session",
+            )
+            .to_string(),
+        );
+    }
+}
+
+fn render_open_in_requests_button(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, selected_id: &str) {
+    if ui
+        .button(pick(ctx.lang, "在 Requests 查看", "Open in Requests"))
+        .clicked()
+    {
+        super::focus_session_in_sessions(&mut ctx.view.sessions, selected_id.to_string());
+        super::prepare_select_requests_for_session(&mut ctx.view.requests, selected_id.to_string());
+        ctx.view.requested_page = Some(Page::Requests);
+        *ctx.last_info = Some(
+            pick(
+                ctx.lang,
+                "已切到 Requests 并限定到当前 session",
+                "Opened in Requests and scoped to the current session",
             )
             .to_string(),
         );
@@ -1614,6 +1635,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     selected_source,
                 );
                 render_open_in_sessions_button(ui, ctx, selected_id.as_str());
+                render_open_in_requests_button(ui, ctx, selected_id.as_str());
             });
 
             render_history_selection_context(ui, ctx.lang, &ctx.view.history, &selected);
@@ -1754,6 +1776,7 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             selected_source,
         );
         render_open_in_sessions_button(ui, ctx, selected_id.as_str());
+        render_open_in_requests_button(ui, ctx, selected_id.as_str());
         open_selected_clicked = history_controls::render_open_selected_in_wt_button(ui, ctx);
     });
 
@@ -2000,6 +2023,7 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     SessionSummarySource::LocalFile,
                 );
                 render_open_in_sessions_button(ui, ctx, selected_id.as_str());
+                render_open_in_requests_button(ui, ctx, selected_id.as_str());
             });
 
             ui.label(format!("id: {}", selected_id));
@@ -2164,6 +2188,7 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
             SessionSummarySource::LocalFile,
         );
         render_open_in_sessions_button(ui, ctx, selected_id.as_str());
+        render_open_in_requests_button(ui, ctx, selected_id.as_str());
         open_selected_clicked = history_controls::render_open_selected_in_wt_button(ui, ctx);
     });
 

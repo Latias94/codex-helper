@@ -233,6 +233,7 @@ pub struct SessionsViewState {
 pub struct RequestsViewState {
     pub errors_only: bool,
     pub scope_session: bool,
+    pub focused_session_id: Option<String>,
     pub selected_idx: usize,
 }
 
@@ -241,6 +242,7 @@ impl Default for RequestsViewState {
         Self {
             errors_only: false,
             scope_session: true,
+            focused_session_id: None,
             selected_idx: 0,
         }
     }
@@ -3844,6 +3846,34 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
             }
 
+            let can_open_requests = row.session_id.is_some();
+            let mut open_requests = ui.add_enabled(
+                can_open_requests,
+                egui::Button::new(pick(ctx.lang, "在 Requests 查看", "Open in Requests")),
+            );
+            if row.session_id.is_none() {
+                open_requests = open_requests.on_disabled_hover_text(pick(
+                    ctx.lang,
+                    "当前会话没有 session_id。",
+                    "The current session has no session_id.",
+                ));
+            }
+            if open_requests.clicked() {
+                let Some(sid) = row.session_id.clone() else {
+                    return;
+                };
+                prepare_select_requests_for_session(&mut ctx.view.requests, sid);
+                ctx.view.requested_page = Some(Page::Requests);
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "已切到 Requests 并限定到当前 session",
+                        "Opened in Requests and scoped to the current session",
+                    )
+                    .to_string(),
+                );
+            }
+
             let can_open_history = row.session_id.is_some();
             let mut open_history = ui.add_enabled(
                 can_open_history,
@@ -5275,12 +5305,75 @@ fn session_history_summary_from_row(
     })
 }
 
-pub(super) fn prepare_select_session_from_history(state: &mut SessionsViewState, sid: String) {
+fn request_history_bridge_summary(request: &FinishedRequest, lang: Language) -> String {
+    let mut parts = vec![
+        format!(
+            "station={}",
+            request.config_name.as_deref().unwrap_or("auto")
+        ),
+        format!("model={}", request.model.as_deref().unwrap_or("auto")),
+        format!("tier={}", request.service_tier.as_deref().unwrap_or("auto")),
+    ];
+    if let Some(provider) = request.provider_id.as_deref() {
+        parts.push(format!("provider={provider}"));
+    }
+    if let Some(client) = format_observed_client_identity(
+        request.client_name.as_deref(),
+        request.client_addr.as_deref(),
+    ) {
+        parts.push(format!("client={client}"));
+    }
+    parts.push(format!("status={}", request.status_code));
+    parts.push(format!("path={}", request.path));
+    format!(
+        "{}: {}",
+        pick(lang, "来自 Requests", "From Requests"),
+        parts.join(", ")
+    )
+}
+
+fn request_history_summary_from_request(
+    request: &FinishedRequest,
+    path: Option<std::path::PathBuf>,
+    lang: Language,
+) -> Option<SessionSummary> {
+    let sid = request.session_id.clone()?;
+    let updated_at = Some(format_age(now_ms(), Some(request.ended_at_ms)));
+    let turns = 1usize;
+    let source = if path.is_some() {
+        SessionSummarySource::LocalFile
+    } else {
+        SessionSummarySource::ObservedOnly
+    };
+    Some(SessionSummary {
+        id: sid,
+        path: path.unwrap_or_default(),
+        cwd: request.cwd.clone(),
+        created_at: None,
+        updated_at: updated_at.clone(),
+        last_response_at: updated_at,
+        user_turns: turns,
+        assistant_turns: turns,
+        rounds: turns,
+        first_user_message: Some(request_history_bridge_summary(request, lang)),
+        source,
+        sort_hint_ms: Some(request.ended_at_ms),
+    })
+}
+
+pub(super) fn focus_session_in_sessions(state: &mut SessionsViewState, sid: String) {
     state.active_only = false;
     state.errors_only = false;
     state.overrides_only = false;
     state.search = sid.clone();
     state.selected_session_id = Some(sid);
+    state.selected_idx = 0;
+}
+
+pub(super) fn prepare_select_requests_for_session(state: &mut RequestsViewState, sid: String) {
+    state.errors_only = false;
+    state.scope_session = true;
+    state.focused_session_id = Some(sid);
     state.selected_idx = 0;
 }
 
@@ -5483,7 +5576,13 @@ fn render_requests(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ui.add_space(4.0);
     }
 
-    let selected_sid = ctx.view.sessions.selected_session_id.as_deref();
+    let selected_sid = ctx
+        .view
+        .requests
+        .focused_session_id
+        .clone()
+        .or_else(|| ctx.view.sessions.selected_session_id.clone());
+    let selected_sid_ref = selected_sid.as_deref();
 
     ui.horizontal(|ui| {
         ui.checkbox(
@@ -5500,6 +5599,35 @@ fn render_requests(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
     });
 
+    if ctx.view.requests.scope_session {
+        ui.horizontal_wrapped(|ui| {
+            if let Some(sid) = selected_sid_ref {
+                ui.small(format!("session: {sid}"));
+                if ctx.view.requests.focused_session_id.is_some() {
+                    ui.small(pick(
+                        ctx.lang,
+                        "（显式聚焦）",
+                        "(explicit focus)",
+                    ));
+                    if ui
+                        .button(pick(ctx.lang, "改为跟随 Sessions", "Follow Sessions instead"))
+                        .clicked()
+                    {
+                        ctx.view.requests.focused_session_id = None;
+                    }
+                } else {
+                    ui.small(pick(ctx.lang, "（跟随 Sessions）", "(following Sessions)"));
+                }
+            } else {
+                ui.small(pick(
+                    ctx.lang,
+                    "当前没有可用于限定的 session_id；显示全部请求。",
+                    "No session_id is available for scoping right now; all requests remain visible.",
+                ));
+            }
+        });
+    }
+
     ui.add_space(6.0);
 
     let filtered = recent
@@ -5509,7 +5637,7 @@ fn render_requests(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 return false;
             }
             if ctx.view.requests.scope_session {
-                match (selected_sid, r.session_id.as_deref()) {
+                match (selected_sid_ref, r.session_id.as_deref()) {
                     (Some(sid), Some(rid)) => sid == rid,
                     (Some(_), None) => false,
                     (None, _) => true,
@@ -5568,11 +5696,32 @@ fn render_requests(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].add_space(4.0);
 
         let Some(r) = filtered.get(ctx.view.requests.selected_idx).copied() else {
-            cols[1].label(pick(
-                ctx.lang,
-                "无请求数据。",
-                "No requests match current filters.",
-            ));
+            cols[1].label(if ctx.view.requests.scope_session {
+                if let Some(sid) = selected_sid_ref {
+                    format!(
+                        "{} {sid}",
+                        pick(
+                            ctx.lang,
+                            "当前没有匹配这个 session 的请求：",
+                            "No requests currently match session:",
+                        )
+                    )
+                } else {
+                    pick(
+                        ctx.lang,
+                        "当前没有可匹配的请求。",
+                        "No requests match the current filters.",
+                    )
+                    .to_string()
+                }
+            } else {
+                pick(
+                    ctx.lang,
+                    "无请求数据。",
+                    "No requests match current filters.",
+                )
+                .to_string()
+            });
             return;
         };
 
@@ -5591,6 +5740,76 @@ fn render_requests(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
         if let Some(cwd) = r.cwd.as_deref() {
             cols[1].label(format!("cwd: {cwd}"));
+        }
+
+        if let Some(sid) = r.session_id.as_deref() {
+            cols[1].horizontal_wrapped(|ui| {
+                if ui
+                    .button(pick(ctx.lang, "限定到此 session", "Focus this session"))
+                    .clicked()
+                {
+                    prepare_select_requests_for_session(&mut ctx.view.requests, sid.to_string());
+                }
+
+                if ui
+                    .button(pick(ctx.lang, "在 Sessions 查看", "Open in Sessions"))
+                    .clicked()
+                {
+                    focus_session_in_sessions(&mut ctx.view.sessions, sid.to_string());
+                    prepare_select_requests_for_session(&mut ctx.view.requests, sid.to_string());
+                    ctx.view.requested_page = Some(Page::Sessions);
+                    *ctx.last_info = Some(
+                        pick(
+                            ctx.lang,
+                            "已切到 Sessions 并定位到当前 session",
+                            "Opened in Sessions and focused the current session",
+                        )
+                        .to_string(),
+                    );
+                }
+
+                if ui
+                    .button(pick(ctx.lang, "在 History 查看", "Open in History"))
+                    .clicked()
+                {
+                    match ctx
+                        .rt
+                        .block_on(crate::sessions::find_codex_session_file_by_id(sid))
+                    {
+                        Ok(path) => {
+                            if let Some(summary) =
+                                request_history_summary_from_request(r, path.clone(), ctx.lang)
+                            {
+                                history::prepare_select_session_from_external(
+                                    &mut ctx.view.history,
+                                    summary,
+                                    history::ExternalHistoryOrigin::Requests,
+                                );
+                                ctx.view.requested_page = Some(Page::History);
+                                *ctx.last_info = Some(
+                                    if path.is_some() {
+                                        pick(
+                                            ctx.lang,
+                                            "已切到 History（本地 transcript）",
+                                            "Opened in History (local transcript)",
+                                        )
+                                    } else {
+                                        pick(
+                                            ctx.lang,
+                                            "已切到 History（共享观测摘要）",
+                                            "Opened in History (observed summary)",
+                                        )
+                                    }
+                                    .to_string(),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            *ctx.last_error = Some(format!("find session file failed: {e}"));
+                        }
+                    }
+                }
+            });
         }
 
         cols[1].label(format!("model: {}", r.model.as_deref().unwrap_or("-")));
@@ -11672,7 +11891,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_select_session_from_history_resets_filters_and_focuses_sid() {
+    fn focus_session_in_sessions_resets_filters_and_focuses_sid() {
         let mut state = SessionsViewState {
             active_only: true,
             errors_only: true,
@@ -11687,7 +11906,7 @@ mod tests {
             editor: SessionOverrideEditor::default(),
         };
 
-        prepare_select_session_from_history(&mut state, "sid-history".to_string());
+        focus_session_in_sessions(&mut state, "sid-history".to_string());
 
         assert!(!state.active_only);
         assert!(!state.errors_only);
@@ -11696,6 +11915,61 @@ mod tests {
         assert_eq!(state.selected_session_id.as_deref(), Some("sid-history"));
         assert_eq!(state.selected_idx, 0);
         assert!(state.lock_order);
+    }
+
+    #[test]
+    fn prepare_select_requests_for_session_sets_explicit_focus() {
+        let mut state = RequestsViewState {
+            errors_only: true,
+            scope_session: false,
+            focused_session_id: None,
+            selected_idx: 7,
+        };
+
+        prepare_select_requests_for_session(&mut state, "sid-req".to_string());
+
+        assert!(!state.errors_only);
+        assert!(state.scope_session);
+        assert_eq!(state.focused_session_id.as_deref(), Some("sid-req"));
+        assert_eq!(state.selected_idx, 0);
+    }
+
+    #[test]
+    fn request_history_summary_from_request_builds_observed_bridge() {
+        let request = FinishedRequest {
+            id: 7,
+            session_id: Some("sid-req".to_string()),
+            client_name: Some("Tablet".to_string()),
+            client_addr: Some("100.64.0.13".to_string()),
+            cwd: Some("/remote/recent".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: Some("priority".to_string()),
+            config_name: Some("vibe".to_string()),
+            provider_id: Some("vibe".to_string()),
+            upstream_base_url: Some("https://api.example.com/v1".to_string()),
+            usage: None,
+            retry: None,
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 500,
+            ttfb_ms: Some(120),
+            ended_at_ms: 9_000,
+        };
+
+        let summary =
+            request_history_summary_from_request(&request, None, Language::En).expect("summary");
+
+        assert_eq!(summary.id, "sid-req");
+        assert_eq!(summary.source, SessionSummarySource::ObservedOnly);
+        assert_eq!(summary.sort_hint_ms, Some(9_000));
+        assert!(
+            summary.first_user_message.as_deref().is_some_and(
+                |msg| msg.contains("station=vibe") && msg.contains("path=/v1/responses")
+            )
+        );
     }
 
     #[test]
