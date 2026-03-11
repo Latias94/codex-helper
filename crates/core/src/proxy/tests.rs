@@ -362,7 +362,7 @@ async fn proxy_api_v1_snapshot_works() {
                 t
             },
             supported_models: HashMap::new(),
-            model_mapping: HashMap::new(),
+            model_mapping: HashMap::from([("gpt-5.4".to_string(), "gpt-5.4-fast".to_string())]),
         }],
         RetryConfig::default(),
     );
@@ -373,6 +373,38 @@ async fn proxy_api_v1_snapshot_works() {
         "codex",
         Arc::new(std::sync::Mutex::new(HashMap::new())),
     );
+    proxy
+        .state
+        .set_session_config_override("sid-1".to_string(), "test".to_string(), 1)
+        .await;
+    proxy
+        .state
+        .set_session_service_tier_override("sid-1".to_string(), "priority".to_string(), 1)
+        .await;
+    let req_id = proxy
+        .state
+        .begin_request(
+            "codex",
+            "POST",
+            "/v1/responses",
+            Some("sid-1".to_string()),
+            Some("G:/codes/demo".to_string()),
+            Some("gpt-5.4".to_string()),
+            Some("medium".to_string()),
+            Some("priority".to_string()),
+            1,
+        )
+        .await;
+    proxy
+        .state
+        .update_request_route(
+            req_id,
+            "test".to_string(),
+            Some("u1".to_string()),
+            "http://127.0.0.1:9/v1".to_string(),
+        )
+        .await;
+
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -401,6 +433,22 @@ async fn proxy_api_v1_snapshot_works() {
         "should include snapshot object"
     );
     assert!(snap.get("configs").is_some(), "should include configs list");
+    assert_eq!(
+        snap["snapshot"]["session_cards"][0]["effective_config_name"]["source"].as_str(),
+        Some("session_override")
+    );
+    assert_eq!(
+        snap["snapshot"]["session_cards"][0]["effective_model"]["value"].as_str(),
+        Some("gpt-5.4-fast")
+    );
+    assert_eq!(
+        snap["snapshot"]["session_cards"][0]["effective_model"]["source"].as_str(),
+        Some("station_mapping")
+    );
+    assert_eq!(
+        snap["snapshot"]["session_cards"][0]["effective_service_tier"]["source"].as_str(),
+        Some("session_override")
+    );
 
     proxy_handle.abort();
 }

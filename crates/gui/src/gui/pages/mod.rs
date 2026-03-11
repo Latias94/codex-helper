@@ -14,8 +14,8 @@ use crate::dashboard_core::{ConfigOption, ControlProfileOption};
 use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::SessionSummary;
 use crate::state::{
-    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, SessionIdentityCard,
-    SessionStats,
+    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, ResolvedRouteValue,
+    RouteValueSource, SessionIdentityCard, SessionStats,
 };
 use crate::usage::UsageMetrics;
 
@@ -2046,6 +2046,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             &session_effort_overrides,
             &session_config_overrides,
             &session_service_tier_overrides,
+            global_override.as_deref(),
             &session_stats,
         )
     };
@@ -2184,21 +2185,39 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         let sid_full = row.session_id.as_deref().unwrap_or("-");
         let cwd_full = row.cwd.as_deref().unwrap_or("-");
-        let model = row.last_model.as_deref().unwrap_or("-");
         let provider = row.last_provider_id.as_deref().unwrap_or("-");
-        let last_cfg = row.last_config_name.as_deref().unwrap_or("-");
-        let upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
-        let effort_last = row.last_reasoning_effort.as_deref().unwrap_or("-");
-        let service_tier_last = row.last_service_tier.as_deref().unwrap_or("-");
+        let observed_model = row.last_model.as_deref().unwrap_or("-");
+        let observed_cfg = row.last_config_name.as_deref().unwrap_or("-");
+        let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
+        let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");
+        let observed_service_tier = row.last_service_tier.as_deref().unwrap_or("-");
+        let effective_model = format_resolved_route_value(row.effective_model.as_ref(), ctx.lang);
+        let effective_cfg =
+            format_resolved_route_value(row.effective_config_name.as_ref(), ctx.lang);
+        let effective_upstream =
+            format_resolved_route_value(row.effective_upstream_base_url.as_ref(), ctx.lang);
+        let effective_effort =
+            format_resolved_route_value(row.effective_reasoning_effort.as_ref(), ctx.lang);
+        let effective_service_tier =
+            format_resolved_route_value(row.effective_service_tier.as_ref(), ctx.lang);
 
         cols[1].label(format!("session: {sid_full}"));
         cols[1].label(format!("cwd: {cwd_full}"));
-        cols[1].label(format!("model: {model}"));
         cols[1].label(format!("provider: {provider}"));
-        cols[1].label(format!("config(last): {last_cfg}"));
-        cols[1].label(format!("upstream(last): {upstream}"));
-        cols[1].label(format!("effort(last): {effort_last}"));
-        cols[1].label(format!("service_tier(last): {service_tier_last}"));
+        cols[1].separator();
+        cols[1].label(pick(ctx.lang, "观测到的最近路由", "Observed route"));
+        cols[1].label(format!("model(last): {observed_model}"));
+        cols[1].label(format!("config(last): {observed_cfg}"));
+        cols[1].label(format!("upstream(last): {observed_upstream}"));
+        cols[1].label(format!("effort(last): {observed_effort}"));
+        cols[1].label(format!("service_tier(last): {observed_service_tier}"));
+        cols[1].separator();
+        cols[1].label(pick(ctx.lang, "当前生效控制", "Effective route"));
+        cols[1].label(format!("model: {effective_model}"));
+        cols[1].label(format!("config: {effective_cfg}"));
+        cols[1].label(format!("upstream: {effective_upstream}"));
+        cols[1].label(format!("effort: {effective_effort}"));
+        cols[1].label(format!("service_tier: {effective_service_tier}"));
 
         cols[1].horizontal(|ui| {
             let can_copy = row.session_id.is_some();
@@ -2659,6 +2678,17 @@ fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
         row.last_provider_id.as_deref(),
         row.last_config_name.as_deref(),
         row.last_upstream_base_url.as_deref(),
+        row.effective_model.as_ref().map(|v| v.value.as_str()),
+        row.effective_reasoning_effort
+            .as_ref()
+            .map(|v| v.value.as_str()),
+        row.effective_service_tier
+            .as_ref()
+            .map(|v| v.value.as_str()),
+        row.effective_config_name.as_ref().map(|v| v.value.as_str()),
+        row.effective_upstream_base_url
+            .as_ref()
+            .map(|v| v.value.as_str()),
         row.override_model.as_deref(),
         row.override_effort.as_deref(),
         row.override_config_name.as_deref(),
@@ -4306,6 +4336,11 @@ struct SessionRow {
     total_usage: Option<UsageMetrics>,
     turns_total: Option<u64>,
     turns_with_usage: Option<u64>,
+    effective_model: Option<ResolvedRouteValue>,
+    effective_reasoning_effort: Option<ResolvedRouteValue>,
+    effective_service_tier: Option<ResolvedRouteValue>,
+    effective_config_name: Option<ResolvedRouteValue>,
+    effective_upstream_base_url: Option<ResolvedRouteValue>,
     override_model: Option<String>,
     override_effort: Option<String>,
     override_config_name: Option<String>,
@@ -4333,6 +4368,11 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
             total_usage: card.total_usage.clone(),
             turns_total: card.turns_total,
             turns_with_usage: card.turns_with_usage,
+            effective_model: card.effective_model.clone(),
+            effective_reasoning_effort: card.effective_reasoning_effort.clone(),
+            effective_service_tier: card.effective_service_tier.clone(),
+            effective_config_name: card.effective_config_name.clone(),
+            effective_upstream_base_url: card.effective_upstream_base_url.clone(),
             override_model: card.override_model.clone(),
             override_effort: card.override_effort.clone(),
             override_config_name: card.override_config_name.clone(),
@@ -4350,6 +4390,7 @@ fn build_session_rows(
     overrides: &HashMap<String, String>,
     config_overrides: &HashMap<String, String>,
     service_tier_overrides: &HashMap<String, String>,
+    global_override: Option<&str>,
     stats: &HashMap<String, SessionStats>,
 ) -> Vec<SessionRow> {
     use std::collections::HashMap as StdHashMap;
@@ -4376,6 +4417,11 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_config_name: None,
+            effective_upstream_base_url: None,
             override_model: None,
             override_effort: None,
             override_config_name: None,
@@ -4432,6 +4478,11 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_config_name: None,
+            effective_upstream_base_url: None,
             override_model: None,
             override_effort: None,
             override_config_name: None,
@@ -4484,6 +4535,11 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_config_name: None,
+            effective_upstream_base_url: None,
             override_model: None,
             override_effort: None,
             override_config_name: None,
@@ -4548,6 +4604,11 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_config_name: None,
+            effective_upstream_base_url: None,
             override_model: None,
             override_effort: None,
             override_config_name: None,
@@ -4576,6 +4637,11 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_config_name: None,
+            effective_upstream_base_url: None,
             override_model: None,
             override_effort: None,
             override_config_name: None,
@@ -4604,6 +4670,11 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_config_name: None,
+            effective_upstream_base_url: None,
             override_model: None,
             override_effort: None,
             override_config_name: None,
@@ -4632,6 +4703,11 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_config_name: None,
+            effective_upstream_base_url: None,
             override_model: None,
             override_effort: None,
             override_config_name: None,
@@ -4641,6 +4717,9 @@ fn build_session_rows(
     }
 
     let mut rows = map.into_values().collect::<Vec<_>>();
+    for row in &mut rows {
+        apply_effective_route_to_row(row, global_override);
+    }
     rows.sort_by_key(|r| std::cmp::Reverse(session_sort_key(r)));
     rows
 }
@@ -4649,6 +4728,94 @@ fn session_sort_key(row: &SessionRow) -> u64 {
     row.last_ended_at_ms
         .unwrap_or(0)
         .max(row.active_started_at_ms_min.unwrap_or(0))
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_effective_observed_value(
+    override_value: Option<&str>,
+    observed_value: Option<&str>,
+) -> Option<ResolvedRouteValue> {
+    if let Some(value) = non_empty_trimmed(override_value) {
+        return Some(ResolvedRouteValue {
+            value,
+            source: RouteValueSource::SessionOverride,
+        });
+    }
+    non_empty_trimmed(observed_value).map(|value| ResolvedRouteValue {
+        value,
+        source: RouteValueSource::RequestPayload,
+    })
+}
+
+fn apply_effective_route_to_row(row: &mut SessionRow, global_override: Option<&str>) {
+    row.effective_model =
+        resolve_effective_observed_value(row.override_model.as_deref(), row.last_model.as_deref());
+    row.effective_reasoning_effort = resolve_effective_observed_value(
+        row.override_effort.as_deref(),
+        row.last_reasoning_effort.as_deref(),
+    );
+    row.effective_service_tier = resolve_effective_observed_value(
+        row.override_service_tier.as_deref(),
+        row.last_service_tier.as_deref(),
+    );
+    row.effective_config_name =
+        if let Some(value) = non_empty_trimmed(row.override_config_name.as_deref()) {
+            Some(ResolvedRouteValue {
+                value,
+                source: RouteValueSource::SessionOverride,
+            })
+        } else if let Some(value) = non_empty_trimmed(global_override) {
+            Some(ResolvedRouteValue {
+                value,
+                source: RouteValueSource::GlobalOverride,
+            })
+        } else {
+            non_empty_trimmed(row.last_config_name.as_deref()).map(|value| ResolvedRouteValue {
+                value,
+                source: RouteValueSource::RuntimeFallback,
+            })
+        };
+    row.effective_upstream_base_url = match (
+        row.effective_config_name.as_ref(),
+        non_empty_trimmed(row.last_config_name.as_deref()),
+        non_empty_trimmed(row.last_upstream_base_url.as_deref()),
+    ) {
+        (Some(config), Some(last_config), Some(upstream)) if config.value == last_config => {
+            Some(ResolvedRouteValue {
+                value: upstream,
+                source: RouteValueSource::RuntimeFallback,
+            })
+        }
+        _ => None,
+    };
+}
+
+fn route_value_source_label(source: RouteValueSource, lang: Language) -> &'static str {
+    match source {
+        RouteValueSource::RequestPayload => pick(lang, "请求体", "request payload"),
+        RouteValueSource::SessionOverride => pick(lang, "会话覆盖", "session override"),
+        RouteValueSource::GlobalOverride => pick(lang, "全局覆盖", "global override"),
+        RouteValueSource::ProfileDefault => pick(lang, "profile 默认", "profile default"),
+        RouteValueSource::StationMapping => pick(lang, "站点映射", "station mapping"),
+        RouteValueSource::RuntimeFallback => pick(lang, "运行时兜底", "runtime fallback"),
+    }
+}
+
+fn format_resolved_route_value(value: Option<&ResolvedRouteValue>, lang: Language) -> String {
+    match value {
+        Some(value) => format!(
+            "{} [{}]",
+            value.value,
+            route_value_source_label(value.source, lang)
+        ),
+        None => "-".to_string(),
+    }
 }
 
 fn now_ms() -> u64 {

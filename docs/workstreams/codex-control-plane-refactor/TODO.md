@@ -44,7 +44,7 @@
 ## WS1 - Session Identity and Effective Route
 
 - [ ] CP-101 Add a first-class `SessionBinding` model in core state
-- [ ] CP-102 Add `effective route` resolution output:
+- [x] CP-102 Add `effective route` resolution output:
   - station
   - upstream
   - model
@@ -141,7 +141,7 @@
 - [x] SLICE-001 Surface current session identity card using existing observed data
 - [x] SLICE-002 Add session override for `model`
 - [x] SLICE-003 Add session override for `service_tier`
-- [ ] SLICE-004 Add explicit source attribution for effective route values
+- [x] SLICE-004 Add explicit source attribution for effective route values
 - [x] SLICE-005 Add default profile skeleton without removing legacy config handling
 
 ## Definition of Ready for Implementation

@@ -11,6 +11,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
+use crate::config::ServiceConfigManager;
 use crate::lb::LbState;
 use crate::logging::RetryInfo;
 use crate::sessions;
@@ -237,6 +238,32 @@ pub struct SessionStats {
     pub last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteValueSource {
+    RequestPayload,
+    SessionOverride,
+    GlobalOverride,
+    ProfileDefault,
+    StationMapping,
+    RuntimeFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedRouteValue {
+    pub value: String,
+    pub source: RouteValueSource,
+}
+
+impl ResolvedRouteValue {
+    fn new(value: impl Into<String>, source: RouteValueSource) -> Self {
+        Self {
+            value: value.into(),
+            source,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionIdentityCard {
     pub session_id: Option<String>,
@@ -271,6 +298,16 @@ pub struct SessionIdentityCard {
     pub turns_total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turns_with_usage: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<ResolvedRouteValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_effort: Option<ResolvedRouteValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_service_tier: Option<ResolvedRouteValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_config_name: Option<ResolvedRouteValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_upstream_base_url: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub override_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1336,6 +1373,7 @@ impl ProxyState {
             config_overrides,
             model_overrides,
             service_tier_overrides,
+            global_override,
             stats,
         ) = tokio::join!(
             self.list_active_requests(),
@@ -1344,6 +1382,7 @@ impl ProxyState {
             self.list_session_config_overrides(),
             self.list_session_model_overrides(),
             self.list_session_service_tier_overrides(),
+            self.get_global_config_override(),
             self.list_session_stats(),
         );
         build_session_identity_cards_from_parts(
@@ -1353,6 +1392,7 @@ impl ProxyState {
             &config_overrides,
             &model_overrides,
             &service_tier_overrides,
+            global_override.as_deref(),
             &stats,
         )
     }
@@ -1518,10 +1558,154 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         total_usage: None,
         turns_total: None,
         turns_with_usage: None,
+        effective_model: None,
+        effective_reasoning_effort: None,
+        effective_service_tier: None,
+        effective_config_name: None,
+        effective_upstream_base_url: None,
         override_effort: None,
         override_config_name: None,
         override_model: None,
         override_service_tier: None,
+    }
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_effective_observed_value(
+    override_value: Option<&str>,
+    observed_value: Option<&str>,
+) -> Option<ResolvedRouteValue> {
+    if let Some(value) = non_empty_trimmed(override_value) {
+        return Some(ResolvedRouteValue::new(
+            value,
+            RouteValueSource::SessionOverride,
+        ));
+    }
+    non_empty_trimmed(observed_value)
+        .map(|value| ResolvedRouteValue::new(value, RouteValueSource::RequestPayload))
+}
+
+fn resolve_effective_config_value(
+    card: &SessionIdentityCard,
+    global_config_override: Option<&str>,
+) -> Option<ResolvedRouteValue> {
+    if let Some(value) = non_empty_trimmed(card.override_config_name.as_deref()) {
+        return Some(ResolvedRouteValue::new(
+            value,
+            RouteValueSource::SessionOverride,
+        ));
+    }
+    if let Some(value) = non_empty_trimmed(global_config_override) {
+        return Some(ResolvedRouteValue::new(
+            value,
+            RouteValueSource::GlobalOverride,
+        ));
+    }
+    non_empty_trimmed(card.last_config_name.as_deref())
+        .map(|value| ResolvedRouteValue::new(value, RouteValueSource::RuntimeFallback))
+}
+
+fn apply_basic_effective_route(
+    card: &mut SessionIdentityCard,
+    global_config_override: Option<&str>,
+) {
+    card.effective_model = resolve_effective_observed_value(
+        card.override_model.as_deref(),
+        card.last_model.as_deref(),
+    );
+    card.effective_reasoning_effort = resolve_effective_observed_value(
+        card.override_effort.as_deref(),
+        card.last_reasoning_effort.as_deref(),
+    );
+    card.effective_service_tier = resolve_effective_observed_value(
+        card.override_service_tier.as_deref(),
+        card.last_service_tier.as_deref(),
+    );
+    card.effective_config_name = resolve_effective_config_value(card, global_config_override);
+    card.effective_upstream_base_url = match (
+        card.effective_config_name.as_ref(),
+        non_empty_trimmed(card.last_config_name.as_deref()),
+        non_empty_trimmed(card.last_upstream_base_url.as_deref()),
+    ) {
+        (Some(config), Some(last_config), Some(upstream)) if config.value == last_config => Some(
+            ResolvedRouteValue::new(upstream, RouteValueSource::RuntimeFallback),
+        ),
+        _ => None,
+    };
+}
+
+pub fn enrich_session_identity_cards_with_runtime(
+    cards: &mut [SessionIdentityCard],
+    mgr: &ServiceConfigManager,
+) {
+    for card in cards {
+        if card.effective_config_name.is_none()
+            && let Some(active) = mgr.active_config()
+        {
+            card.effective_config_name = Some(ResolvedRouteValue::new(
+                active.name.clone(),
+                RouteValueSource::RuntimeFallback,
+            ));
+        }
+
+        let effective_config_name = card
+            .effective_config_name
+            .as_ref()
+            .map(|value| value.value.as_str());
+        if card.effective_upstream_base_url.is_none()
+            && let Some(config_name) = effective_config_name
+            && let Some(config) = mgr.configs.get(config_name)
+            && config.upstreams.len() == 1
+        {
+            card.effective_upstream_base_url = Some(ResolvedRouteValue::new(
+                config.upstreams[0].base_url.clone(),
+                RouteValueSource::RuntimeFallback,
+            ));
+        }
+
+        let Some(model) = card
+            .effective_model
+            .as_ref()
+            .map(|value| value.value.clone())
+        else {
+            continue;
+        };
+        let Some(config_name) = effective_config_name else {
+            continue;
+        };
+        let Some(last_config_name) = card.last_config_name.as_deref() else {
+            continue;
+        };
+        if last_config_name != config_name {
+            continue;
+        }
+        let Some(last_upstream_base_url) = card.last_upstream_base_url.as_deref() else {
+            continue;
+        };
+        let Some(config) = mgr.configs.get(config_name) else {
+            continue;
+        };
+        let Some(upstream) = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.base_url == last_upstream_base_url)
+        else {
+            continue;
+        };
+
+        let mapped = crate::model_routing::effective_model(&upstream.model_mapping, model.as_str());
+        if mapped != model {
+            card.effective_model = Some(ResolvedRouteValue::new(
+                mapped,
+                RouteValueSource::StationMapping,
+            ));
+        }
     }
 }
 
@@ -1538,6 +1722,7 @@ pub fn build_session_identity_cards_from_parts(
     config_overrides: &HashMap<String, String>,
     model_overrides: &HashMap<String, String>,
     service_tier_overrides: &HashMap<String, String>,
+    global_config_override: Option<&str>,
     stats: &HashMap<String, SessionStats>,
 ) -> Vec<SessionIdentityCard> {
     use std::collections::HashMap as StdHashMap;
@@ -1689,6 +1874,9 @@ pub fn build_session_identity_cards_from_parts(
     }
 
     let mut cards = map.into_values().collect::<Vec<_>>();
+    for card in &mut cards {
+        apply_basic_effective_route(card, global_config_override);
+    }
     cards.sort_by_key(|card| std::cmp::Reverse(session_identity_sort_key(card)));
     cards
 }
@@ -1696,6 +1884,8 @@ pub fn build_session_identity_cards_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamAuth, UpstreamConfig};
 
     #[test]
     fn build_session_identity_cards_merges_sources_and_sorts_newest_first() {
@@ -1798,6 +1988,7 @@ mod tests {
             &config_overrides,
             &model_overrides,
             &service_tier_overrides,
+            None,
             &stats,
         );
 
@@ -1811,6 +2002,39 @@ mod tests {
         assert_eq!(cards[1].override_model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(cards[1].override_service_tier.as_deref(), Some("priority"));
         assert_eq!(
+            cards[1]
+                .effective_model
+                .as_ref()
+                .map(|value| value.value.as_str()),
+            Some("gpt-5.4-mini")
+        );
+        assert_eq!(
+            cards[1].effective_model.as_ref().map(|value| value.source),
+            Some(RouteValueSource::SessionOverride)
+        );
+        assert_eq!(
+            cards[1]
+                .effective_reasoning_effort
+                .as_ref()
+                .map(|value| value.source),
+            Some(RouteValueSource::SessionOverride)
+        );
+        assert_eq!(
+            cards[1]
+                .effective_service_tier
+                .as_ref()
+                .map(|value| value.source),
+            Some(RouteValueSource::SessionOverride)
+        );
+        assert_eq!(
+            cards[1]
+                .effective_config_name
+                .as_ref()
+                .map(|value| value.source),
+            Some(RouteValueSource::SessionOverride)
+        );
+        assert!(cards[1].effective_upstream_base_url.is_none());
+        assert_eq!(
             cards[1].last_upstream_base_url.as_deref(),
             Some("https://right.example/v1")
         );
@@ -1819,6 +2043,70 @@ mod tests {
         assert_eq!(
             cards[1].total_usage.as_ref().map(|u| u.total_tokens),
             Some(35)
+        );
+    }
+
+    #[test]
+    fn enrich_session_identity_cards_with_runtime_applies_station_mapping_and_single_upstream() {
+        let mut cards = vec![SessionIdentityCard {
+            session_id: Some("sid-1".to_string()),
+            last_model: Some("gpt-5.4".to_string()),
+            last_config_name: Some("right".to_string()),
+            last_upstream_base_url: Some("https://right.example/v1".to_string()),
+            effective_model: Some(ResolvedRouteValue::new(
+                "gpt-5.4",
+                RouteValueSource::RequestPayload,
+            )),
+            effective_config_name: Some(ResolvedRouteValue::new(
+                "right",
+                RouteValueSource::RuntimeFallback,
+            )),
+            ..SessionIdentityCard::default()
+        }];
+
+        let mut mgr = ServiceConfigManager {
+            active: Some("right".to_string()),
+            ..ServiceConfigManager::default()
+        };
+        mgr.configs.insert(
+            "right".to_string(),
+            ServiceConfig {
+                name: "right".to_string(),
+                alias: None,
+                enabled: true,
+                level: 1,
+                upstreams: vec![UpstreamConfig {
+                    base_url: "https://right.example/v1".to_string(),
+                    auth: UpstreamAuth::default(),
+                    tags: HashMap::new(),
+                    supported_models: HashMap::new(),
+                    model_mapping: HashMap::from([(
+                        "gpt-5.4".to_string(),
+                        "gpt-5.4-fast".to_string(),
+                    )]),
+                }],
+            },
+        );
+
+        enrich_session_identity_cards_with_runtime(&mut cards, &mgr);
+
+        assert_eq!(
+            cards[0]
+                .effective_model
+                .as_ref()
+                .map(|value| value.value.as_str()),
+            Some("gpt-5.4-fast")
+        );
+        assert_eq!(
+            cards[0].effective_model.as_ref().map(|value| value.source),
+            Some(RouteValueSource::StationMapping)
+        );
+        assert_eq!(
+            cards[0]
+                .effective_upstream_base_url
+                .as_ref()
+                .map(|value| value.value.as_str()),
+            Some("https://right.example/v1")
         );
     }
 }

@@ -102,6 +102,7 @@ pub async fn build_dashboard_snapshot(
         &session_cfg,
         &session_model,
         &session_service_tier,
+        global_override.as_deref(),
         &session_stats,
     );
 

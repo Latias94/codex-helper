@@ -1465,10 +1465,19 @@ impl ProxyController {
 
         let state = r.state.clone();
         let service_name = r.service_name.to_string();
+        let cfg = r.cfg.clone();
         let fut = async move {
-            Ok::<_, anyhow::Error>(
-                build_dashboard_snapshot(&state, service_name.as_str(), 600, 21).await,
-            )
+            let mut snapshot =
+                build_dashboard_snapshot(&state, service_name.as_str(), 600, 21).await;
+            let mgr = match service_name.as_str() {
+                "claude" => &cfg.claude,
+                _ => &cfg.codex,
+            };
+            crate::state::enrich_session_identity_cards_with_runtime(
+                &mut snapshot.session_cards,
+                mgr,
+            );
+            Ok::<_, anyhow::Error>(snapshot)
         };
 
         match rt.block_on(fut) {

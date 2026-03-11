@@ -3389,7 +3389,13 @@ pub fn router(proxy: ProxyService) -> Router {
     async fn list_session_identity_cards(
         proxy: ProxyService,
     ) -> Result<Json<Vec<crate::state::SessionIdentityCard>>, (StatusCode, String)> {
-        let cards = proxy.state.list_session_identity_cards(2_000).await;
+        let mut cards = proxy.state.list_session_identity_cards(2_000).await;
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+        crate::state::enrich_session_identity_cards_with_runtime(&mut cards, mgr);
         Ok(Json(cards))
     }
 
@@ -3458,13 +3464,14 @@ pub fn router(proxy: ProxyService) -> Router {
         };
         let configs = list_config_options_from_mgr(mgr);
 
-        let snapshot = crate::dashboard_core::build_dashboard_snapshot(
+        let mut snapshot = crate::dashboard_core::build_dashboard_snapshot(
             &proxy.state,
             proxy.service_name,
             recent_limit,
             stats_days,
         )
         .await;
+        crate::state::enrich_session_identity_cards_with_runtime(&mut snapshot.session_cards, mgr);
 
         Ok(Json(crate::dashboard_core::ApiV1Snapshot {
             api_version: 1,
