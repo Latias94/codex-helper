@@ -129,7 +129,7 @@
   - [x] dedicated station-focused page for health / drain / breaker / quick switch
 - [x] CP-604 Add "effective route source" explanation UI
 - [x] CP-605 Add remote-safe capability gating in GUI
-- [ ] CP-606 Keep transcript/history UI usable even when only observed-session data exists
+- [x] CP-606 Keep transcript/history UI usable even when only observed-session data exists
 
 ## WS7 - Tests, Migration, and Docs
 

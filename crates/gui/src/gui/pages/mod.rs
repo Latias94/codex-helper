@@ -15,7 +15,7 @@ use crate::dashboard_core::{
     ModelCatalogKind,
 };
 use crate::doctor::{DoctorLang, DoctorStatus};
-use crate::sessions::SessionSummary;
+use crate::sessions::{SessionSummary, SessionSummarySource};
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView,
     ResolvedRouteValue, RouteValueSource, RuntimeConfigState, SessionIdentityCard, SessionStats,
@@ -3274,6 +3274,8 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                         pick(ctx.lang, "（来自 Sessions）", "(from Sessions)")
                                             .to_string(),
                                     ),
+                                    source: SessionSummarySource::LocalFile,
+                                    sort_hint_ms: None,
                                 },
                             );
                             0
@@ -6847,12 +6849,19 @@ fn path_mtime_ms(path: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+pub(super) fn session_summary_sort_key_ms(summary: &SessionSummary) -> u64 {
+    summary
+        .sort_hint_ms
+        .unwrap_or_else(|| path_mtime_ms(summary.path.as_path()))
+}
+
 fn sort_session_summaries_by_mtime_desc(list: &mut [SessionSummary]) {
-    list.sort_by_key(|s| std::cmp::Reverse(path_mtime_ms(s.path.as_path())));
+    list.sort_by_key(|s| std::cmp::Reverse(session_summary_sort_key_ms(s)));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WtItemSkipReason {
+pub(super) enum WtItemSkipReason {
+    ObservedOnly,
     MissingCwd,
     InvalidWorkdir,
     WorkdirNotFound,
@@ -6881,6 +6890,16 @@ fn workdir_status_from_cwd(
     Ok(workdir)
 }
 
+pub(super) fn workdir_status_from_summary(
+    summary: &SessionSummary,
+    infer_git_root: bool,
+) -> Result<String, WtItemSkipReason> {
+    if !matches!(summary.source, SessionSummarySource::LocalFile) {
+        return Err(WtItemSkipReason::ObservedOnly);
+    }
+    workdir_status_from_cwd(summary.cwd.as_deref(), infer_git_root)
+}
+
 fn build_wt_items_from_session_summaries<'a, I>(
     sessions: I,
     infer_git_root: bool,
@@ -6892,7 +6911,7 @@ where
     let mut out = Vec::new();
     let t = resume_cmd_template.trim();
     for s in sessions.into_iter() {
-        let Ok(workdir) = workdir_status_from_cwd(s.cwd.as_deref(), infer_git_root) else {
+        let Ok(workdir) = workdir_status_from_summary(s, infer_git_root) else {
             continue;
         };
 

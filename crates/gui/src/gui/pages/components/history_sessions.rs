@@ -4,8 +4,8 @@ use super::super::super::i18n::{Language, pick};
 use super::super::history::HistoryScope;
 use super::super::{
     PageCtx, WtItemSkipReason, basename, build_wt_items_from_session_summaries, format_age,
-    history_workdir_from_cwd, now_ms, open_wt_items, path_mtime_ms, short_sid, shorten,
-    shorten_middle, workdir_status_from_cwd,
+    history_workdir_from_cwd, now_ms, open_wt_items, session_summary_sort_key_ms, short_sid,
+    shorten, shorten_middle, workdir_status_from_summary,
 };
 
 pub(in super::super) fn render_sessions_panel_horizontal(
@@ -59,7 +59,7 @@ pub(in super::super) fn render_sessions_panel_horizontal(
                         .as_deref()
                         .map(|cwd| history_workdir_from_cwd(cwd, ctx.view.history.infer_git_root))
                         .unwrap_or_else(|| "-".to_string());
-                    let mtime_ms = path_mtime_ms(s.path.as_path());
+                    let mtime_ms = session_summary_sort_key_ms(s);
 
                     if !groups.contains_key(key.as_str()) {
                         order.push(key.clone());
@@ -87,6 +87,7 @@ pub(in super::super) fn render_sessions_panel_horizontal(
                 for g in ordered.into_iter() {
                     let key = g.key.clone();
                     let mut ok_indices: Vec<usize> = Vec::new();
+                    let mut skipped_observed_only = 0usize;
                     let mut skipped_missing_cwd = 0usize;
                     let mut skipped_invalid_workdir = 0usize;
                     let mut skipped_missing_dir = 0usize;
@@ -96,15 +97,10 @@ pub(in super::super) fn render_sessions_panel_horizontal(
                             .history
                             .sessions
                             .get(idx)
-                            .and_then(|s| {
-                                workdir_status_from_cwd(
-                                    s.cwd.as_deref(),
-                                    ctx.view.history.infer_git_root,
-                                )
-                                .err()
-                            });
+                            .and_then(|s| workdir_status_from_summary(s, ctx.view.history.infer_git_root).err());
                         match reason {
                             None => ok_indices.push(idx),
+                            Some(WtItemSkipReason::ObservedOnly) => skipped_observed_only += 1,
                             Some(WtItemSkipReason::MissingCwd) => skipped_missing_cwd += 1,
                             Some(WtItemSkipReason::InvalidWorkdir) => skipped_invalid_workdir += 1,
                             Some(WtItemSkipReason::WorkdirNotFound) => skipped_missing_dir += 1,
@@ -147,10 +143,15 @@ pub(in super::super) fn render_sessions_panel_horizontal(
                         };
                         let mut hover = String::new();
                         hover.push_str(key.as_str());
-                        if skipped_missing_cwd + skipped_invalid_workdir + skipped_missing_dir > 0 {
+                        if skipped_observed_only
+                            + skipped_missing_cwd
+                            + skipped_invalid_workdir
+                            + skipped_missing_dir
+                            > 0
+                        {
                             hover.push('\n');
                             hover.push_str(&format!(
-                                "skipped: missing_cwd={skipped_missing_cwd}, invalid_workdir={skipped_invalid_workdir}, missing_dir={skipped_missing_dir}"
+                                "skipped: observed_only={skipped_observed_only}, missing_cwd={skipped_missing_cwd}, invalid_workdir={skipped_invalid_workdir}, missing_dir={skipped_missing_dir}"
                             ));
                         }
                         ui.label(header).on_hover_text(hover);
@@ -408,7 +409,7 @@ pub(in super::super) fn render_sessions_panel_vertical(
                         .as_deref()
                         .map(|cwd| history_workdir_from_cwd(cwd, ctx.view.history.infer_git_root))
                         .unwrap_or_else(|| "-".to_string());
-                    let mtime_ms = path_mtime_ms(s.path.as_path());
+                    let mtime_ms = session_summary_sort_key_ms(s);
 
                     if !groups.contains_key(key.as_str()) {
                         order.push(key.clone());

@@ -2,9 +2,10 @@ use eframe::egui;
 
 use super::super::super::i18n::{Language, pick};
 use super::super::super::util::{open_in_file_manager, spawn_windows_terminal_wt_new_tab};
-use super::super::{PageCtx, workdir_status_from_cwd};
+use super::super::history::HistoryScope;
+use super::super::{PageCtx, workdir_status_from_cwd, workdir_status_from_summary};
 
-use crate::sessions::SessionIndexItem;
+use crate::sessions::{SessionIndexItem, SessionSummarySource};
 
 fn resume_cmd_for_id(template: &str, selected_id: &str) -> String {
     let t = template.trim();
@@ -145,7 +146,32 @@ pub(in super::super) fn render_open_selected_in_wt_button(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
 ) -> bool {
-    let n = ctx.view.history.batch_selected_ids.len();
+    let n = match ctx.view.history.scope {
+        HistoryScope::AllByDate => ctx
+            .view
+            .history
+            .all_day_sessions
+            .iter()
+            .filter(|session| {
+                ctx.view.history.batch_selected_ids.contains(&session.id)
+                    && workdir_status_from_cwd(
+                        session.cwd.as_deref(),
+                        ctx.view.history.infer_git_root,
+                    )
+                    .is_ok()
+            })
+            .count(),
+        _ => ctx
+            .view
+            .history
+            .sessions
+            .iter()
+            .filter(|session| {
+                ctx.view.history.batch_selected_ids.contains(&session.id)
+                    && workdir_status_from_summary(session, ctx.view.history.infer_git_root).is_ok()
+            })
+            .count(),
+    };
     let label = match ctx.lang {
         Language::Zh => format!("在 wt 中打开选中({n})"),
         Language::En => format!("Open selected in wt ({n})"),
@@ -160,8 +186,10 @@ pub(in super::super) fn render_selected_session_actions(
     selected_id: &str,
     workdir: &str,
     selected_path: &std::path::Path,
+    selected_source: SessionSummarySource,
 ) {
     let resume_cmd = resume_cmd_for_id(ctx.view.history.resume_cmd.as_str(), selected_id);
+    let host_local_available = matches!(selected_source, SessionSummarySource::LocalFile);
 
     if ui
         .button(pick(ctx.lang, "复制 root+id", "Copy root+id"))
@@ -176,19 +204,34 @@ pub(in super::super) fn render_selected_session_actions(
         }
     }
 
-    if ui
-        .button(pick(ctx.lang, "复制 resume", "Copy resume"))
-        .clicked()
-    {
+    let mut copy_resume = ui.add_enabled(
+        host_local_available,
+        egui::Button::new(pick(ctx.lang, "复制 resume", "Copy resume")),
+    );
+    if !host_local_available {
+        copy_resume = copy_resume.on_disabled_hover_text(pick(
+            ctx.lang,
+            "当前条目只有共享观测摘要，没有本地会话文件，因此不能生成可直接恢复的 resume 命令。",
+            "This item has only shared observed metadata and no local session file, so a directly resumable command is unavailable.",
+        ));
+    }
+    if copy_resume.clicked() {
         ui.ctx().copy_text(resume_cmd.clone());
         *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
     }
 
-    if cfg!(windows)
-        && ui
-            .button(pick(ctx.lang, "在 wt 中恢复", "Open in wt"))
-            .clicked()
-    {
+    let mut open_in_wt = ui.add_enabled(
+        cfg!(windows) && host_local_available,
+        egui::Button::new(pick(ctx.lang, "在 wt 中恢复", "Open in wt")),
+    );
+    if !host_local_available {
+        open_in_wt = open_in_wt.on_disabled_hover_text(pick(
+            ctx.lang,
+            "当前条目来自共享观测，不保证这台设备存在对应 cwd 或本地 transcript。",
+            "This item came from shared observed data, so the corresponding cwd/transcript is not guaranteed to exist on this device.",
+        ));
+    }
+    if open_in_wt.clicked() {
         if workdir.trim().is_empty() || workdir == "-" {
             *ctx.last_error = Some(pick(ctx.lang, "cwd 不可用", "cwd unavailable").to_string());
         } else if !std::path::Path::new(workdir.trim()).exists() {
@@ -208,7 +251,18 @@ pub(in super::super) fn render_selected_session_actions(
         }
     }
 
-    if ui.button(pick(ctx.lang, "打开文件", "Open file")).clicked()
+    let mut open_file = ui.add_enabled(
+        host_local_available,
+        egui::Button::new(pick(ctx.lang, "打开文件", "Open file")),
+    );
+    if !host_local_available {
+        open_file = open_file.on_disabled_hover_text(pick(
+            ctx.lang,
+            "当前条目没有本地 session 文件可打开。",
+            "This item has no local session file to open.",
+        ));
+    }
+    if open_file.clicked()
         && let Err(e) = open_in_file_manager(selected_path, true)
     {
         *ctx.last_error = Some(format!("open session failed: {e}"));

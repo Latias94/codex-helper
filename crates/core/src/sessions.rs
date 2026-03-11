@@ -13,6 +13,13 @@ use crate::config::codex_sessions_dir;
 use crate::file_replace::write_bytes_file_async;
 
 /// Summary information for a Codex conversation session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionSummarySource {
+    #[default]
+    LocalFile,
+    ObservedOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
@@ -29,6 +36,8 @@ pub struct SessionSummary {
     /// Conversation rounds (best-effort; currently `min(user_turns, assistant_turns)`).
     pub rounds: usize,
     pub first_user_message: Option<String>,
+    pub source: SessionSummarySource,
+    pub sort_hint_ms: Option<u64>,
 }
 
 /// Basic metadata for a Codex session (best-effort parsed from JSONL).
@@ -1153,6 +1162,8 @@ fn build_summary_from_stats(
         assistant_turns,
         rounds,
         first_user_message: Some(header.first_user_message),
+        source: SessionSummarySource::LocalFile,
+        sort_hint_ms: None,
     }
 }
 

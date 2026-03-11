@@ -1,15 +1,20 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
-use super::super::i18n::pick;
+use super::super::i18n::{Language, pick};
 use super::components::{history_controls, history_sessions, history_transcript};
 use super::{Page, PageCtx, remote_attached_proxy_active};
 use super::{
-    build_wt_items_from_session_summaries, history_workdir_from_cwd, now_ms, open_wt_items,
-    sort_session_summaries_by_mtime_desc,
+    build_wt_items_from_session_summaries, format_age, history_workdir_from_cwd, now_ms,
+    open_wt_items, sort_session_summaries_by_mtime_desc,
 };
 
-use crate::sessions::{SessionDayDir, SessionIndexItem, SessionSummary, SessionTranscriptMessage};
+use crate::gui::proxy_control::GuiRuntimeSnapshot;
+use crate::sessions::{
+    SessionDayDir, SessionIndexItem, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
+};
+use crate::state::SessionIdentityCard;
 
 #[derive(Debug)]
 pub struct HistoryViewState {
@@ -63,6 +68,7 @@ pub struct HistoryViewState {
     pub transcript_error: Option<String>,
     pub(super) loaded_for: Option<(String, Option<usize>)>,
     pub branch_by_workdir: HashMap<String, Option<String>>,
+    pub data_source: HistoryDataSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +76,13 @@ pub enum HistoryScope {
     CurrentProject,
     GlobalRecent,
     AllByDate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistoryDataSource {
+    #[default]
+    LocalFiles,
+    ObservedFallback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +175,7 @@ impl Default for HistoryViewState {
             transcript_error: None,
             loaded_for: None,
             branch_by_workdir: HashMap::new(),
+            data_source: HistoryDataSource::LocalFiles,
         }
     }
 }
@@ -289,6 +303,293 @@ pub(super) fn prepare_select_session_from_external(
     state.transcript_selected_msg_idx = 0;
 }
 
+pub(super) fn history_session_supports_local_actions(summary: &SessionSummary) -> bool {
+    matches!(summary.source, SessionSummarySource::LocalFile)
+}
+
+fn observed_summary_sort_ms(card: &SessionIdentityCard) -> Option<u64> {
+    card.last_ended_at_ms.or(card.active_started_at_ms_min)
+}
+
+fn observed_route_summary_from_card(card: &SessionIdentityCard, lang: Language) -> String {
+    let station = card
+        .effective_config_name
+        .as_ref()
+        .map(|value| value.value.as_str())
+        .or(card.last_config_name.as_deref())
+        .unwrap_or("auto");
+    let model = card
+        .effective_model
+        .as_ref()
+        .map(|value| value.value.as_str())
+        .or(card.last_model.as_deref())
+        .unwrap_or("auto");
+    let tier = card
+        .effective_service_tier
+        .as_ref()
+        .map(|value| value.value.as_str())
+        .or(card.last_service_tier.as_deref())
+        .unwrap_or("auto");
+
+    let mut parts = vec![
+        format!("station={station}"),
+        format!("model={model}"),
+        format!("tier={tier}"),
+    ];
+    if let Some(provider) = card.last_provider_id.as_deref() {
+        parts.push(format!("provider={provider}"));
+    }
+    if let Some(profile) = card.binding_profile_name.as_deref() {
+        parts.push(format!("profile={profile}"));
+    }
+    if let Some(status) = card.last_status {
+        parts.push(format!("status={status}"));
+    }
+    if card.active_count > 0 {
+        parts.push(format!("active={}", card.active_count));
+    }
+    format!(
+        "{}: {}",
+        pick(lang, "共享观测", "Observed"),
+        parts.join(", ")
+    )
+}
+
+fn build_observed_summary_from_card(
+    card: &SessionIdentityCard,
+    lang: Language,
+    now: u64,
+) -> Option<SessionSummary> {
+    let sid = card.session_id.clone()?;
+    let sort_hint_ms = observed_summary_sort_ms(card);
+    let updated_at = sort_hint_ms.map(|ms| format_age(now, Some(ms)));
+    let turns = card.turns_total.unwrap_or(0).min(usize::MAX as u64) as usize;
+    Some(SessionSummary {
+        id: sid,
+        path: PathBuf::new(),
+        cwd: card.cwd.clone(),
+        created_at: None,
+        updated_at: updated_at.clone(),
+        last_response_at: updated_at,
+        user_turns: turns,
+        assistant_turns: turns,
+        rounds: turns,
+        first_user_message: Some(observed_route_summary_from_card(card, lang)),
+        source: SessionSummarySource::ObservedOnly,
+        sort_hint_ms,
+    })
+}
+
+fn build_observed_history_summaries(
+    snapshot: &GuiRuntimeSnapshot,
+    lang: Language,
+) -> Vec<SessionSummary> {
+    let now = now_ms();
+    if !snapshot.session_cards.is_empty() {
+        let mut out = snapshot
+            .session_cards
+            .iter()
+            .filter_map(|card| build_observed_summary_from_card(card, lang, now))
+            .collect::<Vec<_>>();
+        sort_session_summaries_by_mtime_desc(&mut out);
+        return out;
+    }
+
+    #[derive(Debug, Default)]
+    struct ObservedAggregate {
+        cwd: Option<String>,
+        sort_hint_ms: Option<u64>,
+        model: Option<String>,
+        tier: Option<String>,
+        station: Option<String>,
+        provider: Option<String>,
+        status: Option<u16>,
+        active_count: u64,
+    }
+
+    let mut map: HashMap<String, ObservedAggregate> = HashMap::new();
+    for req in snapshot.active.iter() {
+        let Some(sid) = req.session_id.as_deref().map(str::to_owned) else {
+            continue;
+        };
+        let entry = map.entry(sid).or_default();
+        if entry.cwd.is_none() {
+            entry.cwd = req.cwd.clone();
+        }
+        entry.sort_hint_ms = Some(
+            entry
+                .sort_hint_ms
+                .unwrap_or(req.started_at_ms)
+                .max(req.started_at_ms),
+        );
+        if entry.model.is_none() {
+            entry.model = req.model.clone();
+        }
+        if entry.tier.is_none() {
+            entry.tier = req.service_tier.clone();
+        }
+        if entry.station.is_none() {
+            entry.station = req.config_name.clone();
+        }
+        if entry.provider.is_none() {
+            entry.provider = req.provider_id.clone();
+        }
+        entry.active_count = entry.active_count.saturating_add(1);
+    }
+
+    for req in snapshot.recent.iter() {
+        let Some(sid) = req.session_id.as_deref().map(str::to_owned) else {
+            continue;
+        };
+        let entry = map.entry(sid).or_default();
+        if entry.cwd.is_none() {
+            entry.cwd = req.cwd.clone();
+        }
+        entry.sort_hint_ms = Some(
+            entry
+                .sort_hint_ms
+                .unwrap_or(req.ended_at_ms)
+                .max(req.ended_at_ms),
+        );
+        entry.model = req.model.clone().or(entry.model.clone());
+        entry.tier = req.service_tier.clone().or(entry.tier.clone());
+        entry.station = req.config_name.clone().or(entry.station.clone());
+        entry.provider = req.provider_id.clone().or(entry.provider.clone());
+        entry.status = Some(req.status_code);
+    }
+
+    let mut out = map
+        .into_iter()
+        .map(|(sid, aggregate)| {
+            let updated_at = aggregate.sort_hint_ms.map(|ms| format_age(now, Some(ms)));
+            let mut parts = vec![
+                format!("station={}", aggregate.station.as_deref().unwrap_or("auto")),
+                format!("model={}", aggregate.model.as_deref().unwrap_or("auto")),
+                format!("tier={}", aggregate.tier.as_deref().unwrap_or("auto")),
+            ];
+            if let Some(provider) = aggregate.provider.as_deref() {
+                parts.push(format!("provider={provider}"));
+            }
+            if let Some(status) = aggregate.status {
+                parts.push(format!("status={status}"));
+            }
+            if aggregate.active_count > 0 {
+                parts.push(format!("active={}", aggregate.active_count));
+            }
+
+            SessionSummary {
+                id: sid,
+                path: PathBuf::new(),
+                cwd: aggregate.cwd,
+                created_at: None,
+                updated_at: updated_at.clone(),
+                last_response_at: updated_at,
+                user_turns: 0,
+                assistant_turns: 0,
+                rounds: 0,
+                first_user_message: Some(format!(
+                    "{}: {}",
+                    pick(lang, "共享观测", "Observed"),
+                    parts.join(", ")
+                )),
+                source: SessionSummarySource::ObservedOnly,
+                sort_hint_ms: aggregate.sort_hint_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+    sort_session_summaries_by_mtime_desc(&mut out);
+    out
+}
+
+fn refresh_history_sessions_with_fallback(
+    ctx: &mut PageCtx<'_>,
+    scope: HistoryScope,
+    remote_attached: bool,
+) -> anyhow::Result<(Vec<SessionSummary>, HistoryDataSource)> {
+    let recent_since_minutes = ctx.view.history.recent_since_minutes;
+    let recent_limit = ctx.view.history.recent_limit;
+    let local_result = ctx.rt.block_on(async move {
+        match scope {
+            HistoryScope::CurrentProject => {
+                crate::sessions::find_codex_sessions_for_current_dir(200).await
+            }
+            HistoryScope::GlobalRecent => {
+                let since = std::time::Duration::from_secs(
+                    (recent_since_minutes as u64).saturating_mul(60),
+                );
+                crate::sessions::find_recent_codex_session_summaries(since, recent_limit).await
+            }
+            HistoryScope::AllByDate => Ok(Vec::new()),
+        }
+    });
+
+    match local_result {
+        Ok(mut list) => {
+            if !list.is_empty() || !remote_attached {
+                sort_session_summaries_by_mtime_desc(&mut list);
+                return Ok((list, HistoryDataSource::LocalFiles));
+            }
+
+            let observed = ctx
+                .proxy
+                .snapshot()
+                .map(|snapshot| build_observed_history_summaries(&snapshot, ctx.lang))
+                .unwrap_or_default();
+            if !observed.is_empty() {
+                Ok((observed, HistoryDataSource::ObservedFallback))
+            } else {
+                sort_session_summaries_by_mtime_desc(&mut list);
+                Ok((list, HistoryDataSource::LocalFiles))
+            }
+        }
+        Err(err) => {
+            let observed = ctx
+                .proxy
+                .snapshot()
+                .map(|snapshot| build_observed_history_summaries(&snapshot, ctx.lang))
+                .unwrap_or_default();
+            if !observed.is_empty() {
+                Ok((observed, HistoryDataSource::ObservedFallback))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn render_observed_session_placeholder(
+    ui: &mut egui::Ui,
+    lang: Language,
+    summary: &SessionSummary,
+) {
+    ui.colored_label(
+        egui::Color32::from_rgb(200, 120, 40),
+        pick(
+            lang,
+            "当前会话只有共享观测摘要，没有可直接读取的 host-local transcript 文件。",
+            "This session currently has only shared observed metadata; no host-local transcript file is available to read directly.",
+        ),
+    );
+    ui.small(pick(
+        lang,
+        "你仍然可以在这里查看 session 标识、cwd 和最近路由摘要；需要更完整控制时请回到 Sessions / Requests。",
+        "You can still inspect the session identity, cwd, and recent route summary here; return to Sessions / Requests for broader control data.",
+    ));
+    ui.add_space(6.0);
+
+    if let Some(summary_line) = summary.first_user_message.as_deref() {
+        let mut text = summary_line.to_string();
+        ui.add(
+            egui::TextEdit::multiline(&mut text)
+                .desired_rows(4)
+                .font(egui::TextStyle::Monospace)
+                .interactive(false),
+        );
+    } else {
+        ui.label(pick(lang, "（无可用摘要）", "(no summary available)"));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptViewMode {
     Messages,
@@ -321,14 +622,14 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 egui::Color32::from_rgb(200, 120, 40),
                 pick(
                     ctx.lang,
-                    "当前附着的是远端代理。本页仍然只浏览这台设备自己的 ~/.codex/sessions，不代表远端 relay 或其他设备的 host-local 会话文件。",
-                    "A remote proxy is attached. This page still browses only this device's ~/.codex/sessions and does not represent host-local session files on the remote relay or other devices.",
+                    "当前附着的是远端代理。本页优先读取这台设备自己的 ~/.codex/sessions；若本机 history 为空，会退到共享观测摘要，但那仍不代表远端 host 的原始 transcript 文件。",
+                    "A remote proxy is attached. This page prefers this device's ~/.codex/sessions; if local history is empty it falls back to shared observed summaries, which still do not represent the remote host's raw transcript files.",
                 ),
             );
             ui.small(pick(
                 ctx.lang,
-                "共享的 session / route / request 观测请转到 Sessions 或 Requests；后续再补远端安全的历史视图。",
-                "Use Sessions or Requests for shared session/route/request observability; a remote-safe history view will be added separately.",
+                "当本机 history 为空时，本页会退到共享观测摘要；更完整的 session / route / request 观测仍建议看 Sessions 或 Requests。",
+                "When local history is empty, this page falls back to shared observed summaries; use Sessions or Requests for fuller session/route/request observability.",
             ));
             ui.horizontal(|ui| {
                 if ui.button(pick(ctx.lang, "转到会话", "Go to Sessions")).clicked() {
@@ -339,6 +640,14 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
             });
         });
+    }
+
+    if remote_attached
+        && ctx.view.history.scope != HistoryScope::AllByDate
+        && ctx.view.history.loaded_at_ms.is_none()
+        && ctx.view.history.sessions_all.is_empty()
+    {
+        refresh_requested = true;
     }
 
     ui.add_space(6.0);
@@ -638,16 +947,27 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         );
 
         let mut action_apply_tail_search = false;
-        ui.checkbox(
-            &mut ctx.view.history.search_transcript_tail,
-            pick(ctx.lang, "搜对话(尾部)", "Transcript (tail)"),
-        )
-        .on_hover_text(pick(
-            ctx.lang,
-            "可选：在元信息不命中时，再扫描每个会话文件尾部的 N 条消息（更慢，但更像 cc-switch 的全文搜索）。",
-            "Optional: if metadata doesn't match, scan the last N messages (slower, closer to cc-switch full-text).",
-        ));
-        if ctx.view.history.search_transcript_tail {
+        let observed_fallback_active =
+            ctx.view.history.data_source == HistoryDataSource::ObservedFallback;
+        ui.add_enabled_ui(!observed_fallback_active, |ui| {
+            ui.checkbox(
+                &mut ctx.view.history.search_transcript_tail,
+                pick(ctx.lang, "搜对话(尾部)", "Transcript (tail)"),
+            )
+            .on_hover_text(pick(
+                ctx.lang,
+                "可选：在元信息不命中时，再扫描每个会话文件尾部的 N 条消息（更慢，但更像 cc-switch 的全文搜索）。",
+                "Optional: if metadata doesn't match, scan the last N messages (slower, closer to cc-switch full-text).",
+            ));
+        });
+        if observed_fallback_active {
+            ui.small(pick(
+                ctx.lang,
+                "共享观测模式下没有本地 transcript 文件，因此这里只做元信息过滤。",
+                "Observed mode has no local transcript files, so only metadata filtering is available here.",
+            ));
+        }
+        if ctx.view.history.search_transcript_tail && !observed_fallback_active {
             ui.label(pick(ctx.lang, "N", "N"));
             ui.add(
                 egui::DragValue::new(&mut ctx.view.history.search_transcript_tail_n)
@@ -664,27 +984,10 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         if refresh_requested || ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
             let scope = ctx.view.history.scope;
-            let recent_since_minutes = ctx.view.history.recent_since_minutes;
-            let recent_limit = ctx.view.history.recent_limit;
-            let fut = async move {
-                match scope {
-                    HistoryScope::CurrentProject => {
-                        crate::sessions::find_codex_sessions_for_current_dir(200).await
-                    }
-                    HistoryScope::GlobalRecent => {
-                        let since = std::time::Duration::from_secs(
-                            (recent_since_minutes as u64).saturating_mul(60),
-                        );
-                        crate::sessions::find_recent_codex_session_summaries(since, recent_limit)
-                            .await
-                    }
-                    HistoryScope::AllByDate => Ok(Vec::new()),
-                }
-            };
-            match ctx.rt.block_on(fut) {
-                Ok(mut list) => {
-                    sort_session_summaries_by_mtime_desc(&mut list);
+            match refresh_history_sessions_with_fallback(ctx, scope, remote_attached) {
+                Ok((list, data_source)) => {
                     ctx.view.history.sessions_all = list;
+                    ctx.view.history.data_source = data_source;
                     let infer_git_root = ctx.view.history.infer_git_root;
                     let sessions = ctx.view.history.sessions_all.as_slice();
                     refresh_branch_cache_for_sessions(
@@ -732,6 +1035,8 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         ctx.view.history.transcript_messages.clear();
                         ctx.view.history.transcript_error = None;
                         ctx.view.history.loaded_for = None;
+                        ctx.view.history.transcript_plain_key = None;
+                        ctx.view.history.transcript_plain_text.clear();
                     } else if ctx
                         .view
                         .history
@@ -750,7 +1055,13 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         ctx.view.history.transcript_plain_key = None;
                         ctx.view.history.transcript_plain_text.clear();
                     }
-                    *ctx.last_info = Some(pick(ctx.lang, "已刷新", "Refreshed").to_string());
+                    *ctx.last_info = Some(
+                        if data_source == HistoryDataSource::ObservedFallback {
+                            pick(ctx.lang, "已刷新（共享观测）", "Refreshed (observed)").to_string()
+                        } else {
+                            pick(ctx.lang, "已刷新", "Refreshed").to_string()
+                        },
+                    );
                 }
                 Err(e) => {
                     ctx.view.history.last_error = Some(e.to_string());
@@ -783,80 +1094,93 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             *ctx.last_info = Some(pick(ctx.lang, "已复制到剪贴板", "Copied").to_string());
         }
 
-        ui.checkbox(
-            &mut ctx.view.history.auto_load_transcript,
-            pick(ctx.lang, "自动加载对话", "Auto load transcript"),
+        ui.add_enabled_ui(
+            ctx.view.history.data_source == HistoryDataSource::LocalFiles,
+            |ui| {
+                ui.checkbox(
+                    &mut ctx.view.history.auto_load_transcript,
+                    pick(ctx.lang, "自动加载对话", "Auto load transcript"),
+                );
+            },
         );
 
         if action_apply_tail_search {
-            let q = ctx.view.history.query.trim().to_string();
-            if q.is_empty() {
+            if ctx.view.history.data_source == HistoryDataSource::ObservedFallback {
                 *ctx.last_error = Some(pick(
                     ctx.lang,
-                    "请输入关键词后再应用“搜对话(尾部)”",
-                    "Enter a query before applying transcript search",
+                    "共享观测模式下没有本地 transcript 文件，不能执行尾部对话搜索。",
+                    "Observed mode has no local transcript files, so transcript tail search is unavailable.",
                 ).to_string());
             } else {
-                let scope = ctx.view.history.scope;
-                let tail = ctx.view.history.search_transcript_tail_n;
-                let all = ctx.view.history.sessions_all.clone();
-                let needle = q.clone();
-                let mut out: Vec<SessionSummary> = Vec::new();
-                let needle_lc = needle.to_lowercase();
-                let meta_match = |s: &SessionSummary| -> bool {
-                    match scope {
-                        HistoryScope::GlobalRecent => s
-                            .cwd
-                            .as_deref()
-                            .is_some_and(|cwd| cwd.to_lowercase().contains(needle_lc.as_str()))
-                            || s.first_user_message.as_deref().is_some_and(|msg| {
+                let q = ctx.view.history.query.trim().to_string();
+                if q.is_empty() {
+                    *ctx.last_error = Some(pick(
+                        ctx.lang,
+                        "请输入关键词后再应用“搜对话(尾部)”",
+                        "Enter a query before applying transcript search",
+                    ).to_string());
+                } else {
+                    let scope = ctx.view.history.scope;
+                    let tail = ctx.view.history.search_transcript_tail_n;
+                    let all = ctx.view.history.sessions_all.clone();
+                    let needle = q.clone();
+                    let mut out: Vec<SessionSummary> = Vec::new();
+                    let needle_lc = needle.to_lowercase();
+                    let meta_match = |s: &SessionSummary| -> bool {
+                        match scope {
+                            HistoryScope::GlobalRecent => s
+                                .cwd
+                                .as_deref()
+                                .is_some_and(|cwd| cwd.to_lowercase().contains(needle_lc.as_str()))
+                                || s.first_user_message.as_deref().is_some_and(|msg| {
+                                    msg.to_lowercase().contains(needle_lc.as_str())
+                                }),
+                            _ => s.first_user_message.as_deref().is_some_and(|msg| {
                                 msg.to_lowercase().contains(needle_lc.as_str())
                             }),
-                        _ => s.first_user_message.as_deref().is_some_and(|msg| {
-                            msg.to_lowercase().contains(needle_lc.as_str())
-                        }),
-                    }
-                };
+                        }
+                    };
 
-                let fut = async move {
-                    for s in all.into_iter() {
-                        if meta_match(&s) {
-                            out.push(s);
-                            continue;
+                    let fut = async move {
+                        for s in all.into_iter() {
+                            if meta_match(&s) {
+                                out.push(s);
+                                continue;
+                            }
+                            if crate::sessions::codex_session_transcript_tail_contains_query(
+                                &s.path,
+                                &needle,
+                                tail,
+                            )
+                            .await?
+                            {
+                                out.push(s);
+                            }
                         }
-                        if crate::sessions::codex_session_transcript_tail_contains_query(
-                            &s.path,
-                            &needle,
-                            tail,
-                        )
-                        .await?
-                        {
-                            out.push(s);
+                        Ok::<Vec<SessionSummary>, anyhow::Error>(out)
+                    };
+                    match ctx.rt.block_on(fut) {
+                        Ok(list) => {
+                            ctx.view.history.sessions = list;
+                            ctx.view.history.search_transcript_applied = Some((scope, q, tail));
+                            ctx.view.history.applied_scope = scope;
+                            ctx.view.history.applied_query = ctx.view.history.query.clone();
+                            ctx.view.history.selected_idx = 0;
+                            ctx.view.history.selected_id =
+                                ctx.view.history.sessions.first().map(|s| s.id.clone());
+                            ctx.view.history.loaded_for = None;
+                            cancel_transcript_load(&mut ctx.view.history);
+                            ctx.view.history.transcript_raw_messages.clear();
+                            ctx.view.history.transcript_messages.clear();
+                            ctx.view.history.transcript_error = None;
+                            ctx.view.history.transcript_plain_key = None;
+                            ctx.view.history.transcript_plain_text.clear();
+                            *ctx.last_info =
+                                Some(pick(ctx.lang, "已应用全文过滤", "Applied").to_string());
                         }
-                    }
-                    Ok::<Vec<SessionSummary>, anyhow::Error>(out)
-                };
-                match ctx.rt.block_on(fut) {
-                    Ok(list) => {
-                        ctx.view.history.sessions = list;
-                        ctx.view.history.search_transcript_applied = Some((scope, q, tail));
-                        ctx.view.history.applied_scope = scope;
-                        ctx.view.history.applied_query = ctx.view.history.query.clone();
-                        ctx.view.history.selected_idx = 0;
-                        ctx.view.history.selected_id =
-                            ctx.view.history.sessions.first().map(|s| s.id.clone());
-                        ctx.view.history.loaded_for = None;
-                        cancel_transcript_load(&mut ctx.view.history);
-                        ctx.view.history.transcript_raw_messages.clear();
-                        ctx.view.history.transcript_messages.clear();
-                        ctx.view.history.transcript_error = None;
-                        ctx.view.history.transcript_plain_key = None;
-                        ctx.view.history.transcript_plain_text.clear();
-                        *ctx.last_info =
-                            Some(pick(ctx.lang, "已应用全文过滤", "Applied").to_string());
-                    }
-                    Err(e) => {
-                        ctx.view.history.last_error = Some(e.to_string());
+                        Err(e) => {
+                            ctx.view.history.last_error = Some(e.to_string());
+                        }
                     }
                 }
             }
@@ -914,6 +1238,25 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
     }
 
+    if ctx.view.history.data_source == HistoryDataSource::ObservedFallback {
+        ui.add_space(4.0);
+        ui.group(|ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 40),
+                pick(
+                    ctx.lang,
+                    "当前显示的是共享观测会话摘要，不是本机 ~/.codex/sessions 文件列表。",
+                    "The current list is built from shared observed sessions, not this device's ~/.codex/sessions files.",
+                ),
+            );
+            ui.small(pick(
+                ctx.lang,
+                "可用：筛选、选择、查看 route 摘要。不可用：transcript、resume、open file 这类 host-local 文件动作。",
+                "Available: filtering, selection, and route summary browsing. Unavailable: transcript, resume, and open-file actions that require host-local files.",
+            ));
+        });
+    }
+
     if let Some(err) = ctx.view.history.last_error.as_deref() {
         ui.add_space(4.0);
         ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
@@ -946,6 +1289,12 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ctx.view.history.selected_id = Some(ctx.view.history.sessions[selected_idx].id.clone());
 
     if ctx.view.history.auto_load_transcript
+        && ctx
+            .view
+            .history
+            .sessions
+            .get(selected_idx)
+            .is_some_and(history_session_supports_local_actions)
         && let Some(id) = ctx.view.history.selected_id.clone()
     {
         let tail = if ctx.view.history.transcript_full {
@@ -980,13 +1329,14 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .history
             .selected_idx
             .min(ctx.view.history.sessions.len().saturating_sub(1));
-        let (selected_id, selected_cwd, selected_path, selected_first) = {
+        let (selected_id, selected_cwd, selected_path, selected_first, selected_source) = {
             let selected = &ctx.view.history.sessions[selected_idx];
             (
                 selected.id.clone(),
                 selected.cwd.clone().unwrap_or_else(|| "-".to_string()),
                 selected.path.clone(),
                 selected.first_user_message.clone(),
+                selected.source,
             )
         };
         let workdir =
@@ -1004,6 +1354,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     selected_id.as_str(),
                     workdir.as_str(),
                     selected_path.as_path(),
+                    selected_source,
                 );
             });
 
@@ -1037,14 +1388,26 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             open_wt_items(ctx, items);
         }
 
-        history_transcript::render_transcript_toolbar(&mut cols[1], ctx, "history_transcript_view");
+        if matches!(selected_source, SessionSummarySource::LocalFile) {
+            history_transcript::render_transcript_toolbar(
+                &mut cols[1],
+                ctx,
+                "history_transcript_view",
+            );
 
-        history_transcript::render_transcript_body(
-            &mut cols[1],
-            ctx.lang,
-            &mut ctx.view.history,
-            480.0,
-        );
+            history_transcript::render_transcript_body(
+                &mut cols[1],
+                ctx.lang,
+                &mut ctx.view.history,
+                480.0,
+            );
+        } else {
+            render_observed_session_placeholder(
+                &mut cols[1],
+                ctx.lang,
+                &ctx.view.history.sessions[selected_idx],
+            );
+        }
     });
 }
 
@@ -1084,14 +1447,20 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         select_session_and_reset_transcript(ctx, idx, id);
     }
 
+    let selected_idx = ctx
+        .view
+        .history
+        .selected_idx
+        .min(ctx.view.history.sessions.len().saturating_sub(1));
     if ctx.view.history.auto_load_transcript
-        && let Some(id) = ctx.view.history.selected_id.clone()
-    {
-        let selected_idx = ctx
+        && ctx
             .view
             .history
-            .selected_idx
-            .min(ctx.view.history.sessions.len().saturating_sub(1));
+            .sessions
+            .get(selected_idx)
+            .is_some_and(history_session_supports_local_actions)
+        && let Some(id) = ctx.view.history.selected_id.clone()
+    {
         let path = ctx.view.history.sessions[selected_idx].path.clone();
         let tail = if ctx.view.history.transcript_full {
             None
@@ -1111,12 +1480,13 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         .history
         .selected_idx
         .min(ctx.view.history.sessions.len().saturating_sub(1));
-    let (selected_id, selected_cwd, selected_path) = {
+    let (selected_id, selected_cwd, selected_path, selected_source) = {
         let selected = &ctx.view.history.sessions[selected_idx];
         (
             selected.id.clone(),
             selected.cwd.clone().unwrap_or_else(|| "-".to_string()),
             selected.path.clone(),
+            selected.source,
         )
     };
     let workdir = history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
@@ -1129,6 +1499,7 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             selected_id.as_str(),
             workdir.as_str(),
             selected_path.as_path(),
+            selected_source,
         );
         open_selected_clicked = history_controls::render_open_selected_in_wt_button(ui, ctx);
     });
@@ -1152,14 +1523,19 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.label(format!("id: {}", selected_id));
     ui.label(format!("dir: {}", workdir));
 
-    history_transcript::render_transcript_toolbar(ui, ctx, "history_transcript_view");
-    let transcript_max_h = ui.available_height();
-    history_transcript::render_transcript_body(
-        ui,
-        ctx.lang,
-        &mut ctx.view.history,
-        transcript_max_h,
-    );
+    if matches!(selected_source, SessionSummarySource::LocalFile) {
+        history_transcript::render_transcript_toolbar(ui, ctx, "history_transcript_view");
+        let transcript_max_h = ui.available_height();
+        history_transcript::render_transcript_body(
+            ui,
+            ctx.lang,
+            &mut ctx.view.history,
+            transcript_max_h,
+        );
+    } else {
+        let selected = &ctx.view.history.sessions[selected_idx];
+        render_observed_session_placeholder(ui, ctx.lang, selected);
+    }
 }
 
 fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
@@ -1368,6 +1744,7 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     selected_id.as_str(),
                     workdir.as_str(),
                     selected_path.as_path(),
+                    SessionSummarySource::LocalFile,
                 );
             });
 
@@ -1530,6 +1907,7 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
             selected_id.as_str(),
             workdir.as_str(),
             selected_path.as_path(),
+            SessionSummarySource::LocalFile,
         );
         open_selected_clicked = history_controls::render_open_selected_in_wt_button(ui, ctx);
     });
@@ -1669,4 +2047,119 @@ fn start_transcript_load(
     });
 
     ctx.view.history.transcript_load = Some(TranscriptLoad { seq, key, rx, join });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dashboard_core::{ConfigOption, ControlProfileOption, WindowStats};
+    use crate::state::{FinishedRequest, ResolvedRouteValue, RouteValueSource, UsageRollupView};
+
+    fn empty_snapshot() -> GuiRuntimeSnapshot {
+        GuiRuntimeSnapshot {
+            kind: crate::gui::proxy_control::ProxyModeKind::Attached,
+            base_url: Some("http://127.0.0.1:3210".to_string()),
+            port: Some(3210),
+            service_name: Some("codex".to_string()),
+            last_error: None,
+            active: Vec::new(),
+            recent: Vec::new(),
+            session_cards: Vec::new(),
+            global_override: None,
+            default_profile: None,
+            profiles: Vec::<ControlProfileOption>::new(),
+            session_model_overrides: HashMap::new(),
+            session_config_overrides: HashMap::new(),
+            session_effort_overrides: HashMap::new(),
+            session_service_tier_overrides: HashMap::new(),
+            session_stats: HashMap::new(),
+            configs: Vec::<ConfigOption>::new(),
+            usage_rollup: UsageRollupView::default(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            supports_v1: true,
+            supports_default_profile_override: true,
+            supports_config_runtime_override: true,
+        }
+    }
+
+    #[test]
+    fn observed_history_summaries_from_cards_are_marked_observed_only() {
+        let mut snapshot = empty_snapshot();
+        snapshot.session_cards = vec![SessionIdentityCard {
+            session_id: Some("sid-card".to_string()),
+            cwd: Some("/remote/workdir".to_string()),
+            last_ended_at_ms: Some(2_000),
+            last_status: Some(200),
+            last_provider_id: Some("right".to_string()),
+            binding_profile_name: Some("fast".to_string()),
+            effective_model: Some(ResolvedRouteValue {
+                value: "gpt-5.4-fast".to_string(),
+                source: RouteValueSource::StationMapping,
+            }),
+            effective_config_name: Some(ResolvedRouteValue {
+                value: "right".to_string(),
+                source: RouteValueSource::RuntimeFallback,
+            }),
+            effective_service_tier: Some(ResolvedRouteValue {
+                value: "priority".to_string(),
+                source: RouteValueSource::ProfileDefault,
+            }),
+            ..SessionIdentityCard::default()
+        }];
+
+        let summaries = build_observed_history_summaries(&snapshot, Language::Zh);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "sid-card");
+        assert_eq!(summaries[0].source, SessionSummarySource::ObservedOnly);
+        assert_eq!(summaries[0].sort_hint_ms, Some(2_000));
+        assert!(
+            summaries[0]
+                .first_user_message
+                .as_deref()
+                .is_some_and(
+                    |msg| msg.contains("station=right") && msg.contains("model=gpt-5.4-fast")
+                )
+        );
+        assert!(!history_session_supports_local_actions(&summaries[0]));
+    }
+
+    #[test]
+    fn observed_history_summaries_fall_back_to_recent_requests() {
+        let mut snapshot = empty_snapshot();
+        snapshot.recent = vec![FinishedRequest {
+            id: 1,
+            session_id: Some("sid-recent".to_string()),
+            cwd: Some("/remote/recent".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: None,
+            service_tier: Some("priority".to_string()),
+            config_name: Some("vibe".to_string()),
+            provider_id: Some("vibe".to_string()),
+            upstream_base_url: None,
+            usage: None,
+            retry: None,
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 500,
+            ttfb_ms: None,
+            ended_at_ms: 9_000,
+        }];
+
+        let summaries = build_observed_history_summaries(&snapshot, Language::En);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "sid-recent");
+        assert_eq!(summaries[0].source, SessionSummarySource::ObservedOnly);
+        assert_eq!(summaries[0].sort_hint_ms, Some(9_000));
+        assert!(
+            summaries[0]
+                .first_user_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("station=vibe") && msg.contains("provider=vibe"))
+        );
+    }
 }
