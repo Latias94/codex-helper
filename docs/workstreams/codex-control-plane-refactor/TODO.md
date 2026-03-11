@@ -127,7 +127,7 @@
 - [x] CP-603 Add Stations page with:
   - [x] expose station quick switch and common station metadata in Overview / Config forms
   - [x] dedicated station-focused page for health / drain / breaker / quick switch
-- [ ] CP-604 Add "effective route source" explanation UI
+- [x] CP-604 Add "effective route source" explanation UI
 - [ ] CP-605 Add remote-safe capability gating in GUI
 - [ ] CP-606 Keep transcript/history UI usable even when only observed-session data exists
 

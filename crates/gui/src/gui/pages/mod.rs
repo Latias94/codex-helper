@@ -2903,7 +2903,8 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     ui.add_space(6.0);
 
-    let rows = if !snapshot.session_cards.is_empty() {
+    let has_session_cards = !snapshot.session_cards.is_empty();
+    let rows = if has_session_cards {
         build_session_rows_from_cards(&snapshot.session_cards)
     } else {
         build_session_rows(
@@ -3090,6 +3091,36 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].label(format!("upstream: {effective_upstream}"));
         cols[1].label(format!("effort: {effective_effort}"));
         cols[1].label(format!("service_tier: {effective_service_tier}"));
+        cols[1].separator();
+        cols[1].label(pick(ctx.lang, "来源解释", "Source explanation"));
+        egui::Grid::new("sessions_effective_route_explanation_grid")
+            .num_columns(3)
+            .spacing([12.0, 6.0])
+            .striped(true)
+            .show(&mut cols[1], |ui| {
+                ui.strong(pick(ctx.lang, "字段", "Field"));
+                ui.strong(pick(ctx.lang, "当前值 / 来源", "Value / source"));
+                ui.strong(pick(ctx.lang, "为什么", "Why"));
+                ui.end_row();
+
+                for field in EffectiveRouteField::ALL {
+                    let explanation = explain_effective_route_field(row, field, ctx.lang);
+                    ui.label(effective_route_field_label(field, ctx.lang));
+                    ui.vertical(|ui| {
+                        ui.monospace(explanation.value);
+                        ui.small(format!("[{}]", explanation.source_label));
+                    });
+                    ui.small(explanation.reason);
+                    ui.end_row();
+                }
+            });
+        if !has_session_cards {
+            cols[1].small(pick(
+                ctx.lang,
+                "当前附着数据来自旧接口回退，这里的来源解释是 best effort 推导。",
+                "Current attach data came from legacy fallback endpoints, so this explanation is best effort.",
+            ));
+        }
 
         cols[1].horizontal(|ui| {
             let can_copy = row.session_id.is_some();
@@ -5860,6 +5891,32 @@ struct SessionRow {
     override_service_tier: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveRouteField {
+    Model,
+    Station,
+    Upstream,
+    Effort,
+    ServiceTier,
+}
+
+impl EffectiveRouteField {
+    const ALL: [Self; 5] = [
+        Self::Model,
+        Self::Station,
+        Self::Upstream,
+        Self::Effort,
+        Self::ServiceTier,
+    ];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveRouteExplanation {
+    value: String,
+    source_label: String,
+    reason: String,
+}
+
 fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRow> {
     let mut rows = cards
         .iter()
@@ -6344,6 +6401,325 @@ fn format_resolved_route_value(value: Option<&ResolvedRouteValue>, lang: Languag
             route_value_source_label(value.source, lang)
         ),
         None => "-".to_string(),
+    }
+}
+
+fn unresolved_route_source_label(lang: Language) -> &'static str {
+    pick(lang, "未解析", "unresolved")
+}
+
+fn effective_route_field_label(field: EffectiveRouteField, lang: Language) -> &'static str {
+    match field {
+        EffectiveRouteField::Model => pick(lang, "模型", "model"),
+        EffectiveRouteField::Station => pick(lang, "站点", "station"),
+        EffectiveRouteField::Upstream => "upstream",
+        EffectiveRouteField::Effort => pick(lang, "思考强度", "effort"),
+        EffectiveRouteField::ServiceTier => "service_tier",
+    }
+}
+
+fn effective_route_field_value(
+    row: &SessionRow,
+    field: EffectiveRouteField,
+) -> Option<&ResolvedRouteValue> {
+    match field {
+        EffectiveRouteField::Model => row.effective_model.as_ref(),
+        EffectiveRouteField::Station => row.effective_config_name.as_ref(),
+        EffectiveRouteField::Upstream => row.effective_upstream_base_url.as_ref(),
+        EffectiveRouteField::Effort => row.effective_reasoning_effort.as_ref(),
+        EffectiveRouteField::ServiceTier => row.effective_service_tier.as_ref(),
+    }
+}
+
+fn binding_profile_reference(row: &SessionRow, lang: Language) -> String {
+    match row.binding_profile_name.as_deref() {
+        Some(name) => format!("profile {name}"),
+        None => pick(lang, "当前绑定 profile", "the bound profile").to_string(),
+    }
+}
+
+fn runtime_fallback_explanation(
+    row: &SessionRow,
+    field: EffectiveRouteField,
+    value: &ResolvedRouteValue,
+    lang: Language,
+) -> String {
+    match field {
+        EffectiveRouteField::Station => match row.last_config_name.as_deref() {
+            Some(last_config) if last_config == value.value => pick(
+                lang,
+                "当前没有 session pin、global pin 或 profile 默认，沿用最近观测到的站点。",
+                "No session pin, global pin, or profile default applies, so the station falls back to the most recently observed value.",
+            )
+            .to_string(),
+            Some(last_config) => format!(
+                "{} {}；{} {}。",
+                pick(
+                    lang,
+                    "当前没有 session pin、global pin 或 profile 默认，运行态把站点回填为",
+                    "No session pin, global pin, or profile default applies, so runtime filled the station as",
+                ),
+                value.value,
+                pick(
+                    lang,
+                    "最近观测到的站点仍是",
+                    "while the most recently observed station is still",
+                ),
+                last_config
+            ),
+            None => format!(
+                "{} {}。",
+                pick(
+                    lang,
+                    "当前没有更明确的站点来源，运行态回填为",
+                    "No more explicit station source is available, so runtime filled it as",
+                ),
+                value.value
+            ),
+        },
+        EffectiveRouteField::Upstream => {
+            let effective_station = row
+                .effective_config_name
+                .as_ref()
+                .map(|resolved| resolved.value.as_str());
+            match (
+                effective_station,
+                row.last_config_name.as_deref(),
+                row.last_upstream_base_url.as_deref(),
+            ) {
+                (Some(station), Some(last_config), Some(last_upstream))
+                    if station == last_config && last_upstream == value.value =>
+                {
+                    format!(
+                        "{} {}，{} {}。",
+                        pick(
+                            lang,
+                            "当前生效站点与最近观测一致，沿用该站点最近命中的 upstream",
+                            "The effective station matches the last observed station, so the upstream falls back to the most recently observed target",
+                        ),
+                        value.value,
+                        pick(lang, "所属站点", "for station"),
+                        station
+                    )
+                }
+                (Some(station), _, _) => format!(
+                    "{} {}，{} {}。",
+                    pick(
+                        lang,
+                        "当前站点可在运行态唯一补全 upstream",
+                        "The current station can be completed to a single upstream at runtime",
+                    ),
+                    value.value,
+                    pick(lang, "所属站点", "for station"),
+                    station
+                ),
+                _ => format!(
+                    "{} {}。",
+                    pick(
+                        lang,
+                        "运行态补全了当前 upstream",
+                        "Runtime completed the current upstream as",
+                    ),
+                    value.value
+                ),
+            }
+        }
+        _ => format!(
+            "{} {}，{}。",
+            pick(
+                lang,
+                "当前没有更高优先级的覆盖或默认值，沿用最近观测到的",
+                "No higher-priority override or default applies, so the field falls back to the most recently observed",
+            ),
+            effective_route_field_label(field, lang),
+            value.value
+        ),
+    }
+}
+
+fn unresolved_effective_route_reason(
+    row: &SessionRow,
+    field: EffectiveRouteField,
+    lang: Language,
+) -> String {
+    match field {
+        EffectiveRouteField::Station => pick(
+            lang,
+            "当前没有 session pin、global pin、profile 默认，也没有最近可用的站点记录。",
+            "There is no session pin, global pin, profile default, or recent station observation to resolve the current station.",
+        )
+        .to_string(),
+        EffectiveRouteField::Upstream => {
+            let effective_station = row
+                .effective_config_name
+                .as_ref()
+                .map(|resolved| resolved.value.as_str());
+            match (effective_station, row.last_config_name.as_deref()) {
+                (Some(station), Some(last_station))
+                    if station != last_station && row.last_upstream_base_url.is_some() =>
+                {
+                    format!(
+                        "{} {}，{} {}，{}。",
+                        pick(
+                            lang,
+                            "当前生效站点已经切到",
+                            "The effective station has already switched to",
+                        ),
+                        station,
+                        pick(
+                            lang,
+                            "但最近观测到的 upstream 仍属于站点",
+                            "but the most recently observed upstream still belongs to station",
+                        ),
+                        last_station,
+                        pick(
+                            lang,
+                            "所以不能直接把它当成当前 upstream",
+                            "so it cannot be treated as the current upstream",
+                        )
+                    )
+                }
+                (Some(station), _) => format!(
+                    "{} {}，{}。",
+                    pick(
+                        lang,
+                        "当前站点是",
+                        "The current station is",
+                    ),
+                    station,
+                    pick(
+                        lang,
+                        "但缺少最近 upstream 观测或唯一映射，因此暂时无法解释 upstream",
+                        "but there is no recent upstream observation or unique mapping, so the upstream cannot be explained yet",
+                    )
+                ),
+                (None, _) => pick(
+                    lang,
+                    "当前连 effective station 都还没有判定，因此无法解释 upstream。",
+                    "The effective station itself is still unresolved, so the upstream cannot be explained.",
+                )
+                .to_string(),
+            }
+        }
+        _ => format!(
+            "{} {}。",
+            pick(
+                lang,
+                "当前既没有覆盖、profile 默认，也没有最近请求值，无法判定",
+                "There is no override, profile default, or recent request value to resolve",
+            ),
+            effective_route_field_label(field, lang)
+        ),
+    }
+}
+
+fn explain_effective_route_field(
+    row: &SessionRow,
+    field: EffectiveRouteField,
+    lang: Language,
+) -> EffectiveRouteExplanation {
+    let value = effective_route_field_value(row, field);
+    let value_label = value
+        .map(|resolved| resolved.value.clone())
+        .unwrap_or_else(|| "-".to_string());
+    let source_label = value
+        .map(|resolved| route_value_source_label(resolved.source, lang).to_string())
+        .unwrap_or_else(|| unresolved_route_source_label(lang).to_string());
+    let field_label = effective_route_field_label(field, lang);
+
+    let reason = match value {
+        Some(resolved) => match resolved.source {
+            RouteValueSource::SessionOverride => format!(
+                "{} {}={}，{}。",
+                pick(
+                    lang,
+                    "当前 session 显式覆盖了",
+                    "The current session explicitly overrides",
+                ),
+                field_label,
+                resolved.value,
+                pick(
+                    lang,
+                    "因此它优先于其他来源生效",
+                    "so it takes priority over every other source",
+                )
+            ),
+            RouteValueSource::GlobalOverride => format!(
+                "{} {}，{}。",
+                pick(
+                    lang,
+                    "当前 session 没有单独站点覆盖，命中了全局 pin，当前站点固定为",
+                    "The current session has no dedicated station override and therefore follows the global pin to",
+                ),
+                resolved.value,
+                pick(
+                    lang,
+                    "所以这里以全局结果为准",
+                    "so the global choice is authoritative here",
+                )
+            ),
+            RouteValueSource::ProfileDefault => format!(
+                "{} {}，{} {}={}。",
+                pick(
+                    lang,
+                    "当前 session 绑定到",
+                    "The current session is bound to",
+                ),
+                binding_profile_reference(row, lang),
+                pick(lang, "其默认", "whose default",),
+                field_label,
+                resolved.value
+            ),
+            RouteValueSource::RequestPayload => format!(
+                "{} {}，{}。",
+                pick(
+                    lang,
+                    "当前没有 session override 或 profile 默认，沿用最近请求体里的",
+                    "There is no session override or profile default, so the field follows the latest request payload for",
+                ),
+                field_label,
+                resolved.value
+            ),
+            RouteValueSource::StationMapping => {
+                let requested_model = row.last_model.as_deref().unwrap_or("-");
+                let station = row
+                    .effective_config_name
+                    .as_ref()
+                    .map(|resolved| resolved.value.as_str())
+                    .or(row.last_config_name.as_deref())
+                    .unwrap_or("-");
+                let upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
+                format!(
+                    "{} {}，{} {} / {} {}，{} {}。",
+                    pick(
+                        lang,
+                        "最近请求提交的模型是",
+                        "The most recent request submitted model",
+                    ),
+                    requested_model,
+                    pick(lang, "但站点", "but station"),
+                    station,
+                    pick(lang, "upstream", "upstream"),
+                    upstream,
+                    pick(
+                        lang,
+                        "的 model mapping 将实际模型改写为",
+                        "rewrote the effective model through model mapping to",
+                    ),
+                    resolved.value
+                )
+            }
+            RouteValueSource::RuntimeFallback => {
+                runtime_fallback_explanation(row, field, resolved, lang)
+            }
+        },
+        None => unresolved_effective_route_reason(row, field, lang),
+    };
+
+    EffectiveRouteExplanation {
+        value: value_label,
+        source_label,
+        reason,
     }
 }
 
@@ -6886,4 +7262,103 @@ fn config_options_from_gui_configs(configs: &[ConfigOption]) -> Vec<(String, Str
         .collect::<Vec<_>>();
     out.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
     out.into_iter().map(|(n, l, _)| (n, l)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_session_row() -> SessionRow {
+        SessionRow {
+            session_id: Some("sid-1".to_string()),
+            cwd: Some("G:/codes/rust/codex-helper".to_string()),
+            active_count: 0,
+            active_started_at_ms_min: None,
+            last_status: None,
+            last_duration_ms: None,
+            last_ended_at_ms: None,
+            last_model: None,
+            last_reasoning_effort: None,
+            last_service_tier: None,
+            last_provider_id: None,
+            last_config_name: None,
+            last_upstream_base_url: None,
+            last_usage: None,
+            total_usage: None,
+            turns_total: None,
+            turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_config_name: None,
+            effective_upstream_base_url: None,
+            override_model: None,
+            override_effort: None,
+            override_config_name: None,
+            override_service_tier: None,
+        }
+    }
+
+    #[test]
+    fn explain_effective_route_uses_profile_context() {
+        let mut row = sample_session_row();
+        row.binding_profile_name = Some("fast".to_string());
+        row.effective_service_tier = Some(ResolvedRouteValue {
+            value: "priority".to_string(),
+            source: RouteValueSource::ProfileDefault,
+        });
+
+        let explanation =
+            explain_effective_route_field(&row, EffectiveRouteField::ServiceTier, Language::Zh);
+
+        assert_eq!(explanation.value, "priority");
+        assert_eq!(explanation.source_label, "profile 默认");
+        assert!(explanation.reason.contains("profile fast"));
+        assert!(explanation.reason.contains("service_tier"));
+    }
+
+    #[test]
+    fn explain_effective_route_handles_station_mapping_for_model() {
+        let mut row = sample_session_row();
+        row.last_model = Some("gpt-5.4".to_string());
+        row.last_config_name = Some("right".to_string());
+        row.last_upstream_base_url = Some("https://www.right.codes/codex/v1".to_string());
+        row.effective_config_name = Some(ResolvedRouteValue {
+            value: "right".to_string(),
+            source: RouteValueSource::RuntimeFallback,
+        });
+        row.effective_model = Some(ResolvedRouteValue {
+            value: "gpt-5.4-fast".to_string(),
+            source: RouteValueSource::StationMapping,
+        });
+
+        let explanation =
+            explain_effective_route_field(&row, EffectiveRouteField::Model, Language::Zh);
+
+        assert_eq!(explanation.source_label, "站点映射");
+        assert!(explanation.reason.contains("gpt-5.4"));
+        assert!(explanation.reason.contains("right"));
+        assert!(explanation.reason.contains("gpt-5.4-fast"));
+    }
+
+    #[test]
+    fn explain_effective_route_marks_upstream_unresolved_after_station_switch() {
+        let mut row = sample_session_row();
+        row.last_config_name = Some("right".to_string());
+        row.last_upstream_base_url = Some("https://www.right.codes/codex/v1".to_string());
+        row.effective_config_name = Some(ResolvedRouteValue {
+            value: "vibe".to_string(),
+            source: RouteValueSource::GlobalOverride,
+        });
+
+        let explanation =
+            explain_effective_route_field(&row, EffectiveRouteField::Upstream, Language::Zh);
+
+        assert_eq!(explanation.value, "-");
+        assert_eq!(explanation.source_label, "未解析");
+        assert!(explanation.reason.contains("vibe"));
+        assert!(explanation.reason.contains("right"));
+    }
 }
