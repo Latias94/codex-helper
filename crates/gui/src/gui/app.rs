@@ -444,8 +444,9 @@ impl eframe::App for GuiApp {
                         if let Err(e) = self.proxy.reload_runtime_config(&self.rt) {
                             self.last_error = Some(format!("reload config failed: {e}"));
                         } else {
-                            self.last_info =
-                                Some(pick(lang, "已重载配置", "Config reloaded").to_string());
+                            self.last_info = Some(
+                                pick(lang, "已重载站点配置", "Station config reloaded").to_string(),
+                            );
                         }
                     }
                     TrayAction::SetActiveConfig { service, name } => {
@@ -477,8 +478,8 @@ impl eframe::App for GuiApp {
                                     self.last_info = Some(
                                         pick(
                                             lang,
-                                            "已切换默认配置并应用",
-                                            "Active config changed and applied",
+                                            "已切换默认站点并应用",
+                                            "Active station changed and applied",
                                         )
                                         .to_string(),
                                     );
@@ -489,7 +490,7 @@ impl eframe::App for GuiApp {
                             }
                         } else {
                             self.last_info = Some(
-                                pick(lang, "已保存默认配置", "Active config saved").to_string(),
+                                pick(lang, "已保存默认站点", "Active station saved").to_string(),
                             );
                         }
                     }

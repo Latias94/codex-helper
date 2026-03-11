@@ -313,7 +313,10 @@ fn build_menu_base(
 
         if let Some(active) = model.active_display.as_deref() {
             menu.append(&MenuItem::new(
-                format!("{}: {active}", pick(lang, "active", "active")),
+                format!(
+                    "{}: {active}",
+                    pick(lang, "active_station", "active_station")
+                ),
                 false,
                 None,
             ))?;
@@ -325,7 +328,10 @@ fn build_menu_base(
                 .as_deref()
                 .unwrap_or_else(|| pick(lang, "<自动>", "<auto>"));
             menu.append(&MenuItem::new(
-                format!("{}: {pinned}", pick(lang, "Pinned", "Pinned")),
+                format!(
+                    "{}: {pinned}",
+                    pick(lang, "Pinned station", "Pinned station")
+                ),
                 false,
                 None,
             ))?;
@@ -335,7 +341,7 @@ fn build_menu_base(
 
         let quick = Submenu::new(pick(lang, "快速切换", "Quick switch"), true);
 
-        // Active config quick switch (persistent).
+        // Active station quick switch (persistent).
         let can_set_active = matches!(
             model.proxy_kind,
             super::proxy_control::ProxyModeKind::Running
@@ -345,7 +351,7 @@ fn build_menu_base(
             .is_some_and(|s| s == "codex" || s == "claude")
             && !model.configs.is_empty();
         let active_menu = Submenu::new(
-            pick(lang, "默认配置(active)", "Default (active)"),
+            pick(lang, "默认站点(active)", "Default station (active)"),
             can_set_active,
         );
         if can_set_active {
@@ -379,7 +385,7 @@ fn build_menu_base(
         }
         quick.append(&active_menu)?;
 
-        // Pinned (runtime-only).
+        // Pinned station (runtime-only).
         let can_pinned = (matches!(
             model.proxy_kind,
             super::proxy_control::ProxyModeKind::Running
@@ -387,7 +393,11 @@ fn build_menu_base(
         )) && model.supports_v1
             && !model.configs.is_empty();
         let pinned_menu = Submenu::new(
-            pick(lang, "全局覆盖(Pinned)", "Global override (pinned)"),
+            pick(
+                lang,
+                "全局站点覆盖(Pinned)",
+                "Global station override (pinned)",
+            ),
             can_pinned,
         );
         if can_pinned {
