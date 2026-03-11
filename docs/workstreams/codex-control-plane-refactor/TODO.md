@@ -130,6 +130,7 @@
 
 - [ ] CP-601 Redesign Sessions page around session identity card
 - [x] CP-602 Add Profiles page or Profiles section under provider management
+- [x] CP-610 Add profile linked preview for station/provider resolution and fast/reasoning capability hints
 - [x] CP-603 Add Stations page with:
   - [x] expose station quick switch and common station metadata in Overview / Config forms
   - [x] dedicated station-focused page for health / drain / breaker / quick switch

@@ -4333,6 +4333,346 @@ fn service_profile_from_option(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfilePreviewStationSource {
+    Profile,
+    ConfiguredActive,
+    Auto,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfilePreviewMemberRoute {
+    provider_name: String,
+    provider_alias: Option<String>,
+    provider_enabled: Option<bool>,
+    provider_missing: bool,
+    endpoint_names: Vec<String>,
+    uses_all_endpoints: bool,
+    preferred: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileRoutePreview {
+    station_source: ProfilePreviewStationSource,
+    resolved_station_name: Option<String>,
+    station_exists: bool,
+    structure_available: bool,
+    station_alias: Option<String>,
+    station_enabled: Option<bool>,
+    station_level: Option<u8>,
+    members: Vec<ProfilePreviewMemberRoute>,
+    capabilities: Option<ConfigCapabilitySummary>,
+    model_supported: Option<bool>,
+    service_tier_supported: Option<bool>,
+    reasoning_supported: Option<bool>,
+}
+
+fn build_profile_route_preview(
+    profile: &crate::config::ServiceControlProfile,
+    configured_active_station: Option<&str>,
+    auto_station: Option<&str>,
+    station_specs: Option<&BTreeMap<String, PersistedStationSpec>>,
+    provider_catalog: Option<&BTreeMap<String, PersistedStationProviderRef>>,
+    runtime_station_catalog: Option<&BTreeMap<String, ConfigOption>>,
+) -> ProfileRoutePreview {
+    let explicit_station = non_empty_trimmed(profile.station.as_deref());
+    let configured_active_station = non_empty_trimmed(configured_active_station);
+    let auto_station = non_empty_trimmed(auto_station);
+
+    let (station_source, resolved_station_name) = if let Some(name) = explicit_station {
+        (ProfilePreviewStationSource::Profile, Some(name))
+    } else if let Some(name) = configured_active_station {
+        (ProfilePreviewStationSource::ConfiguredActive, Some(name))
+    } else if let Some(name) = auto_station {
+        (ProfilePreviewStationSource::Auto, Some(name))
+    } else {
+        (ProfilePreviewStationSource::Unresolved, None)
+    };
+
+    let station_spec = resolved_station_name
+        .as_deref()
+        .and_then(|name| station_specs.and_then(|specs| specs.get(name)));
+    let runtime_station = resolved_station_name
+        .as_deref()
+        .and_then(|name| runtime_station_catalog.and_then(|catalog| catalog.get(name)));
+    let capabilities = runtime_station.map(|station| station.capabilities.clone());
+
+    let members = station_spec
+        .map(|station| {
+            station
+                .members
+                .iter()
+                .map(|member| {
+                    let provider =
+                        provider_catalog.and_then(|providers| providers.get(&member.provider));
+                    let endpoint_names = if member.endpoint_names.is_empty() {
+                        provider
+                            .map(|provider| {
+                                provider
+                                    .endpoints
+                                    .iter()
+                                    .map(|endpoint| endpoint.name.clone())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        member.endpoint_names.clone()
+                    };
+                    ProfilePreviewMemberRoute {
+                        provider_name: member.provider.clone(),
+                        provider_alias: provider.and_then(|provider| provider.alias.clone()),
+                        provider_enabled: provider.map(|provider| provider.enabled),
+                        provider_missing: provider.is_none(),
+                        endpoint_names,
+                        uses_all_endpoints: member.endpoint_names.is_empty(),
+                        preferred: member.preferred,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let model_supported = profile
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+        .and_then(|model| {
+            capabilities.as_ref().and_then(|capabilities| {
+                if capabilities.supported_models.is_empty() {
+                    None
+                } else {
+                    Some(
+                        capabilities
+                            .supported_models
+                            .iter()
+                            .any(|item| item == model),
+                    )
+                }
+            })
+        });
+    let service_tier_supported = profile
+        .service_tier
+        .as_deref()
+        .filter(|tier| !tier.trim().is_empty())
+        .and_then(|_| {
+            capabilities.as_ref().and_then(|capabilities| {
+                capability_support_truthy(capabilities.supports_service_tier)
+            })
+        });
+    let reasoning_supported = profile
+        .reasoning_effort
+        .as_deref()
+        .filter(|effort| !effort.trim().is_empty())
+        .and_then(|_| {
+            capabilities.as_ref().and_then(|capabilities| {
+                capability_support_truthy(capabilities.supports_reasoning_effort)
+            })
+        });
+
+    ProfileRoutePreview {
+        station_source,
+        station_exists: station_spec.is_some() || runtime_station.is_some(),
+        structure_available: station_spec.is_some(),
+        resolved_station_name,
+        station_alias: station_spec
+            .and_then(|station| station.alias.clone())
+            .or_else(|| runtime_station.and_then(|station| station.alias.clone())),
+        station_enabled: station_spec
+            .map(|station| station.enabled)
+            .or_else(|| runtime_station.map(|station| station.enabled)),
+        station_level: station_spec
+            .map(|station| station.level)
+            .or_else(|| runtime_station.map(|station| station.level)),
+        members,
+        capabilities,
+        model_supported,
+        service_tier_supported,
+        reasoning_supported,
+    }
+}
+
+fn capability_support_truthy(support: CapabilitySupport) -> Option<bool> {
+    match support {
+        CapabilitySupport::Supported => Some(true),
+        CapabilitySupport::Unsupported => Some(false),
+        CapabilitySupport::Unknown => None,
+    }
+}
+
+fn render_profile_route_preview(
+    ui: &mut egui::Ui,
+    lang: Language,
+    profile: &crate::config::ServiceControlProfile,
+    preview: &ProfileRoutePreview,
+) {
+    ui.add_space(6.0);
+    ui.group(|ui| {
+        ui.label(pick(lang, "联动预览", "Linked preview"));
+
+        let station_source = match preview.station_source {
+            ProfilePreviewStationSource::Profile => pick(lang, "profile.station", "profile.station"),
+            ProfilePreviewStationSource::ConfiguredActive => {
+                pick(lang, "active_station", "active_station")
+            }
+            ProfilePreviewStationSource::Auto => pick(lang, "自动候选", "auto candidate"),
+            ProfilePreviewStationSource::Unresolved => pick(lang, "未解析", "unresolved"),
+        };
+        ui.small(format!(
+            "{}: {} ({})",
+            pick(lang, "目标站点", "Target station"),
+            preview
+                .resolved_station_name
+                .as_deref()
+                .unwrap_or_else(|| pick(lang, "<未确定>", "<unresolved>")),
+            station_source
+        ));
+
+        if let Some(enabled) = preview.station_enabled {
+            ui.small(format!(
+                "{}: {}  {}: {}",
+                pick(lang, "启用", "Enabled"),
+                enabled,
+                pick(lang, "等级", "Level"),
+                preview.station_level.unwrap_or(1)
+            ));
+        }
+        if let Some(alias) = preview.station_alias.as_deref()
+            && !alias.trim().is_empty()
+        {
+            ui.small(format!("alias: {alias}"));
+        }
+
+        if preview.resolved_station_name.is_some() && !preview.station_exists {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 40),
+                pick(
+                    lang,
+                    "当前预览目标站点不存在，profile 落地后会失效或被校验拒绝。",
+                    "The previewed target station does not exist; this profile would be invalid or rejected.",
+                ),
+            );
+        }
+
+        if let Some(capabilities) = preview.capabilities.as_ref() {
+            ui.small(format!(
+                "{}: {}  {}: {}",
+                pick(lang, "支持 service tier", "Supports service tier"),
+                capability_support_label(lang, capabilities.supports_service_tier),
+                pick(lang, "支持 reasoning", "Supports reasoning"),
+                capability_support_label(lang, capabilities.supports_reasoning_effort)
+            ));
+            if !capabilities.supported_models.is_empty() {
+                ui.small(format!(
+                    "{}: {}",
+                    pick(lang, "支持模型", "Supported models"),
+                    capabilities.supported_models.join(", ")
+                ));
+            }
+        }
+
+        if profile.service_tier.as_deref() == Some("priority") {
+            ui.small(pick(
+                lang,
+                "fast mode 提示：当前 profile 使用 service_tier=priority。",
+                "Fast mode hint: this profile uses service_tier=priority.",
+            ));
+        }
+        if let Some(false) = preview.model_supported {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 40),
+                pick(
+                    lang,
+                    "当前 model 不在该站点已知支持模型列表内。",
+                    "The current model is not in the station's known supported model list.",
+                ),
+            );
+        }
+        if let Some(false) = preview.service_tier_supported {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 40),
+                pick(
+                    lang,
+                    "当前 service_tier 与该站点能力摘要不匹配。",
+                    "The current service_tier does not match the station capability summary.",
+                ),
+            );
+        }
+        if let Some(false) = preview.reasoning_supported {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 40),
+                pick(
+                    lang,
+                    "当前 reasoning_effort 与该站点能力摘要不匹配。",
+                    "The current reasoning_effort does not match the station capability summary.",
+                ),
+            );
+        }
+
+        if !preview.structure_available {
+            ui.small(pick(
+                lang,
+                "当前没有可见的 station/provider 结构，因此这里只能预览到站点层。",
+                "No visible station/provider structure is available, so this preview is limited to the station layer.",
+            ));
+        } else if preview.members.is_empty() {
+            ui.small(pick(
+                lang,
+                "当前站点还没有 member/provider 引用。",
+                "The current station does not have any member/provider refs yet.",
+            ));
+        } else {
+            ui.small(format!(
+                "{}: {}",
+                pick(lang, "成员路由", "Member routes"),
+                preview.members.len()
+            ));
+            for (index, member) in preview.members.iter().enumerate() {
+                let endpoint_scope = if member.uses_all_endpoints {
+                    if member.endpoint_names.is_empty() {
+                        pick(lang, "<全部 endpoint>", "<all endpoints>").to_string()
+                    } else {
+                        format!(
+                            "{} ({})",
+                            pick(lang, "全部 endpoint", "all endpoints"),
+                            member.endpoint_names.join(", ")
+                        )
+                    }
+                } else if member.endpoint_names.is_empty() {
+                    pick(lang, "<未指定 endpoint>", "<no endpoints>").to_string()
+                } else {
+                    member.endpoint_names.join(", ")
+                };
+                let alias = member.provider_alias.as_deref().unwrap_or("-");
+                let preferred = if member.preferred {
+                    pick(lang, " preferred", " preferred")
+                } else {
+                    ""
+                };
+                let enabled_suffix = match member.provider_enabled {
+                    Some(false) => " [off]",
+                    _ => "",
+                };
+                let missing_suffix = if member.provider_missing {
+                    pick(lang, " [missing]", " [missing]")
+                } else {
+                    ""
+                };
+                ui.small(format!(
+                    "#{} {} ({}){}{}{} -> {}",
+                    index + 1,
+                    member.provider_name,
+                    alias,
+                    preferred,
+                    enabled_suffix,
+                    missing_suffix,
+                    endpoint_scope
+                ));
+            }
+        }
+    });
+}
+
 fn sync_session_order(state: &mut SessionsViewState, rows: &[SessionRow]) {
     let mut current_set: HashSet<Option<String>> = HashSet::new();
     let mut active_set: HashSet<Option<String>> = HashSet::new();
@@ -6225,6 +6565,24 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .cloned()
             .map(|provider| (provider.name.clone(), provider))
             .collect::<BTreeMap<_, _>>();
+        let attached_mode = matches!(ctx.proxy.kind(), ProxyModeKind::Attached);
+        let preview_station_specs = if station_structure_control_plane_enabled {
+            attached_station_specs.as_ref().map(|specs| &specs.0)
+        } else if attached_mode {
+            None
+        } else {
+            Some(&local_station_spec_catalog)
+        };
+        let preview_provider_catalog = if station_structure_control_plane_enabled {
+            attached_station_specs.as_ref().map(|specs| &specs.1)
+        } else if attached_mode {
+            None
+        } else {
+            Some(&local_provider_ref_catalog)
+        };
+        let preview_runtime_station_catalog = station_control_plane_snapshot
+            .as_ref()
+            .map(|_| &station_control_plane_catalog);
         if !matches!(ctx.proxy.kind(), ProxyModeKind::Attached)
             && station_editor_name.as_deref() != selected_name.as_deref()
         {
@@ -7415,6 +7773,11 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     &mut action_profile_set_persisted_default_remote,
                     matches!(ctx.proxy.kind(), ProxyModeKind::Attached),
                     station_control_plane_enabled,
+                    station_control_plane_configured_active.as_deref(),
+                    station_control_plane_effective_active.as_deref(),
+                    preview_station_specs,
+                    preview_provider_catalog,
+                    preview_runtime_station_catalog,
                 );
             } else {
             ui.horizontal(|ui| {
@@ -7655,6 +8018,15 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     "提示：service_tier=priority 通常可视为 fast mode；reasoning_effort 可表达思考模式。",
                     "Tip: service_tier=priority usually maps to fast mode; reasoning_effort expresses reasoning mode.",
                 ));
+                let profile_preview = build_profile_route_preview(
+                    profile,
+                    configured_active_name.as_deref(),
+                    effective_active_name.as_deref(),
+                    preview_station_specs,
+                    preview_provider_catalog,
+                    preview_runtime_station_catalog,
+                );
+                render_profile_route_preview(&mut cols[1], ctx.lang, profile, &profile_preview);
 
                 if delete_selected {
                     view.profiles.remove(profile_name.as_str());
@@ -8447,6 +8819,11 @@ fn render_config_v2_profiles_control_plane(
     action_profile_set_persisted_default_remote: &mut Option<Option<String>>,
     attached_mode: bool,
     station_control_plane_enabled: bool,
+    configured_active_station: Option<&str>,
+    effective_active_station: Option<&str>,
+    preview_station_specs: Option<&BTreeMap<String, PersistedStationSpec>>,
+    preview_provider_catalog: Option<&BTreeMap<String, PersistedStationProviderRef>>,
+    preview_runtime_station_catalog: Option<&BTreeMap<String, ConfigOption>>,
 ) {
     ui.colored_label(
         egui::Color32::from_rgb(120, 120, 120),
@@ -8673,6 +9050,21 @@ fn render_config_v2_profiles_control_plane(
             "提示：service_tier=priority 通常可视为 fast mode；reasoning_effort 可表达思考模式。",
             "Tip: service_tier=priority usually maps to fast mode; reasoning_effort expresses reasoning mode.",
         ));
+        let preview_profile = crate::config::ServiceControlProfile {
+            station: editor_station.clone(),
+            model: non_empty_trimmed(Some(editor_model.as_str())),
+            reasoning_effort: non_empty_trimmed(Some(editor_reasoning_effort.as_str())),
+            service_tier: non_empty_trimmed(Some(editor_service_tier.as_str())),
+        };
+        let profile_preview = build_profile_route_preview(
+            &preview_profile,
+            configured_active_station,
+            effective_active_station,
+            preview_station_specs,
+            preview_provider_catalog,
+            preview_runtime_station_catalog,
+        );
+        render_profile_route_preview(&mut cols[1], lang, &preview_profile, &profile_preview);
         if editor_station != &profile.station
             || non_empty_trimmed(Some(editor_model.as_str())) != profile.model
             || non_empty_trimmed(Some(editor_reasoning_effort.as_str()))
@@ -10527,5 +10919,134 @@ mod tests {
         assert!(warning.contains("cwd / transcript"));
         assert!(warning.contains("session history / cwd enrichment"));
         assert!(warning.contains("proxy host"));
+    }
+
+    #[test]
+    fn build_profile_route_preview_resolves_station_source_in_order() {
+        let explicit = build_profile_route_preview(
+            &crate::config::ServiceControlProfile {
+                station: Some("beta".to_string()),
+                ..Default::default()
+            },
+            Some("alpha"),
+            Some("gamma"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            explicit.station_source,
+            ProfilePreviewStationSource::Profile
+        );
+        assert_eq!(explicit.resolved_station_name.as_deref(), Some("beta"));
+
+        let configured = build_profile_route_preview(
+            &crate::config::ServiceControlProfile::default(),
+            Some("alpha"),
+            Some("gamma"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            configured.station_source,
+            ProfilePreviewStationSource::ConfiguredActive
+        );
+        assert_eq!(configured.resolved_station_name.as_deref(), Some("alpha"));
+
+        let auto = build_profile_route_preview(
+            &crate::config::ServiceControlProfile::default(),
+            None,
+            Some("gamma"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(auto.station_source, ProfilePreviewStationSource::Auto);
+        assert_eq!(auto.resolved_station_name.as_deref(), Some("gamma"));
+    }
+
+    #[test]
+    fn build_profile_route_preview_collects_member_routes_and_capability_checks() {
+        let station_specs = BTreeMap::from([(
+            "primary".to_string(),
+            PersistedStationSpec {
+                name: "primary".to_string(),
+                alias: Some("Primary".to_string()),
+                enabled: true,
+                level: 2,
+                members: vec![GroupMemberRefV2 {
+                    provider: "right".to_string(),
+                    endpoint_names: Vec::new(),
+                    preferred: true,
+                }],
+            },
+        )]);
+        let provider_catalog = BTreeMap::from([(
+            "right".to_string(),
+            PersistedStationProviderRef {
+                name: "right".to_string(),
+                alias: Some("Right".to_string()),
+                enabled: true,
+                endpoints: vec![
+                    crate::config::PersistedStationProviderEndpointRef {
+                        name: "hk".to_string(),
+                        base_url: "https://hk.example.com/v1".to_string(),
+                        enabled: true,
+                    },
+                    crate::config::PersistedStationProviderEndpointRef {
+                        name: "us".to_string(),
+                        base_url: "https://us.example.com/v1".to_string(),
+                        enabled: true,
+                    },
+                ],
+            },
+        )]);
+        let runtime_catalog = BTreeMap::from([(
+            "primary".to_string(),
+            ConfigOption {
+                name: "primary".to_string(),
+                alias: Some("Primary".to_string()),
+                enabled: true,
+                level: 2,
+                configured_enabled: true,
+                configured_level: 2,
+                runtime_enabled_override: None,
+                runtime_level_override: None,
+                runtime_state: RuntimeConfigState::Normal,
+                runtime_state_override: None,
+                capabilities: ConfigCapabilitySummary {
+                    model_catalog_kind: ModelCatalogKind::Declared,
+                    supported_models: vec!["gpt-5.4".to_string()],
+                    supports_service_tier: CapabilitySupport::Supported,
+                    supports_reasoning_effort: CapabilitySupport::Unsupported,
+                },
+            },
+        )]);
+        let preview = build_profile_route_preview(
+            &crate::config::ServiceControlProfile {
+                station: Some("primary".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                service_tier: Some("priority".to_string()),
+            },
+            None,
+            None,
+            Some(&station_specs),
+            Some(&provider_catalog),
+            Some(&runtime_catalog),
+        );
+
+        assert!(preview.station_exists);
+        assert_eq!(preview.station_alias.as_deref(), Some("Primary"));
+        assert_eq!(preview.members.len(), 1);
+        assert!(preview.members[0].uses_all_endpoints);
+        assert_eq!(
+            preview.members[0].endpoint_names,
+            vec!["hk".to_string(), "us".to_string()]
+        );
+        assert_eq!(preview.model_supported, Some(true));
+        assert_eq!(preview.service_tier_supported, Some(true));
+        assert_eq!(preview.reasoning_supported, Some(false));
     }
 }
