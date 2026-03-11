@@ -124,9 +124,9 @@
 
 - [ ] CP-601 Redesign Sessions page around session identity card
 - [ ] CP-602 Add Profiles page or Profiles section under provider management
-- [~] CP-603 Add Stations page with:
+- [x] CP-603 Add Stations page with:
   - [x] expose station quick switch and common station metadata in Overview / Config forms
-  - [ ] dedicated station-focused page for health / drain / breaker / quick switch
+  - [x] dedicated station-focused page for health / drain / breaker / quick switch
 - [ ] CP-604 Add "effective route source" explanation UI
 - [ ] CP-605 Add remote-safe capability gating in GUI
 - [ ] CP-606 Keep transcript/history UI usable even when only observed-session data exists
