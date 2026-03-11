@@ -3108,6 +3108,13 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(Json(map))
     }
 
+    async fn list_session_identity_cards(
+        proxy: ProxyService,
+    ) -> Result<Json<Vec<crate::state::SessionIdentityCard>>, (StatusCode, String)> {
+        let cards = proxy.state.list_session_identity_cards(2_000).await;
+        Ok(Json(cards))
+    }
+
     #[derive(serde::Deserialize)]
     struct RecentQuery {
         limit: Option<usize>,
@@ -3131,6 +3138,7 @@ pub fn router(proxy: ProxyService) -> Router {
             endpoints: vec![
                 "/__codex_helper/api/v1/capabilities",
                 "/__codex_helper/api/v1/snapshot",
+                "/__codex_helper/api/v1/sessions",
                 "/__codex_helper/api/v1/status/active",
                 "/__codex_helper/api/v1/status/recent",
                 "/__codex_helper/api/v1/status/session-stats",
@@ -3425,6 +3433,7 @@ pub fn router(proxy: ProxyService) -> Router {
     let p23 = proxy.clone();
     let p24 = proxy.clone();
     let p25 = proxy.clone();
+    let p26 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -3435,6 +3444,10 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/snapshot",
             get(move |q| api_v1_snapshot(p25.clone(), q)),
+        )
+        .route(
+            "/__codex_helper/api/v1/sessions",
+            get(move || list_session_identity_cards(p26.clone())),
         )
         .route(
             "/__codex_helper/api/v1/status/active",

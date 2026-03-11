@@ -21,7 +21,7 @@ use crate::proxy::{
 };
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
-    SessionStats, UsageRollupView,
+    SessionIdentityCard, SessionStats, UsageRollupView,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,7 @@ pub struct AttachedStatus {
     pub service_name: Option<String>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<FinishedRequest>,
+    pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
@@ -97,6 +98,7 @@ impl AttachedStatus {
             service_name: None,
             active: Vec::new(),
             recent: Vec::new(),
+            session_cards: Vec::new(),
             global_override: None,
             session_config_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),
@@ -123,6 +125,7 @@ pub struct GuiRuntimeSnapshot {
     pub last_error: Option<String>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<FinishedRequest>,
+    pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
@@ -144,6 +147,7 @@ pub struct RunningProxy {
     pub last_error: Option<String>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<FinishedRequest>,
+    pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
@@ -284,6 +288,7 @@ impl ProxyController {
                 last_error: r.last_error.clone(),
                 active: r.active.clone(),
                 recent: r.recent.clone(),
+                session_cards: r.session_cards.clone(),
                 global_override: r.global_override.clone(),
                 session_config_overrides: r.session_config_overrides.clone(),
                 session_effort_overrides: r.session_effort_overrides.clone(),
@@ -302,6 +307,7 @@ impl ProxyController {
                 last_error: a.last_error.clone(),
                 active: a.active.clone(),
                 recent: a.recent.clone(),
+                session_cards: a.session_cards.clone(),
                 global_override: a.global_override.clone(),
                 session_config_overrides: a.session_config_overrides.clone(),
                 session_effort_overrides: a.session_effort_overrides.clone(),
@@ -656,6 +662,7 @@ impl ProxyController {
                 service_name: Option<String>,
                 active: Vec<ActiveRequest>,
                 recent: Vec<FinishedRequest>,
+                session_cards: Vec<SessionIdentityCard>,
                 global_override: Option<String>,
                 session_cfg: HashMap<String, String>,
                 session_effort: HashMap<String, String>,
@@ -707,6 +714,7 @@ impl ProxyController {
                             service_name: Some(api.service_name),
                             active: api.snapshot.active,
                             recent: api.snapshot.recent,
+                            session_cards: api.snapshot.session_cards,
                             global_override: api.snapshot.global_override,
                             session_cfg: api.snapshot.session_config_overrides,
                             session_effort: api.snapshot.session_effort_overrides,
@@ -793,6 +801,7 @@ impl ProxyController {
                         service_name: Some(caps.service_name),
                         active,
                         recent,
+                        session_cards: Vec::new(),
                         global_override,
                         session_cfg,
                         session_effort,
@@ -842,6 +851,7 @@ impl ProxyController {
                     service_name: None,
                     active,
                     recent,
+                    session_cards: Vec::new(),
                     global_override: None,
                     session_cfg: HashMap::new(),
                     session_effort,
@@ -878,6 +888,7 @@ impl ProxyController {
                     att.service_name = result.service_name;
                     att.active = result.active;
                     att.recent = result.recent;
+                    att.session_cards = result.session_cards;
                     att.global_override = result.global_override;
                     att.session_config_overrides = result.session_cfg;
                     att.session_effort_overrides = result.session_effort;
@@ -1165,6 +1176,7 @@ impl ProxyController {
                 r.last_error = None;
                 r.active = snap.active;
                 r.recent = snap.recent;
+                r.session_cards = snap.session_cards;
                 r.global_override = snap.global_override;
                 r.session_config_overrides = snap.session_config_overrides;
                 r.session_effort_overrides = snap.session_effort_overrides;
@@ -1391,6 +1403,7 @@ impl ProxyController {
             last_error: None,
             active: Vec::new(),
             recent: Vec::new(),
+            session_cards: Vec::new(),
             global_override: None,
             session_config_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),

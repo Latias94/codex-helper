@@ -13,7 +13,10 @@ use super::util::{
 use crate::dashboard_core::ConfigOption;
 use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::SessionSummary;
-use crate::state::{ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, SessionStats};
+use crate::state::{
+    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, SessionIdentityCard,
+    SessionStats,
+};
 use crate::usage::UsageMetrics;
 
 mod components;
@@ -2025,13 +2028,17 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     ui.add_space(6.0);
 
-    let rows = build_session_rows(
-        active,
-        &recent,
-        &session_effort_overrides,
-        &session_config_overrides,
-        &session_stats,
-    );
+    let rows = if !snapshot.session_cards.is_empty() {
+        build_session_rows_from_cards(&snapshot.session_cards)
+    } else {
+        build_session_rows(
+            active,
+            &recent,
+            &session_effort_overrides,
+            &session_config_overrides,
+            &session_stats,
+        )
+    };
 
     let mut row_index_by_id = HashMap::new();
     for (idx, row) in rows.iter().enumerate() {
@@ -2157,6 +2164,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let model = row.last_model.as_deref().unwrap_or("-");
         let provider = row.last_provider_id.as_deref().unwrap_or("-");
         let last_cfg = row.last_config_name.as_deref().unwrap_or("-");
+        let upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
         let effort_last = row.last_reasoning_effort.as_deref().unwrap_or("-");
 
         cols[1].label(format!("session: {sid_full}"));
@@ -2164,6 +2172,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].label(format!("model: {model}"));
         cols[1].label(format!("provider: {provider}"));
         cols[1].label(format!("config(last): {last_cfg}"));
+        cols[1].label(format!("upstream(last): {upstream}"));
         cols[1].label(format!("effort(last): {effort_last}"));
 
         cols[1].horizontal(|ui| {
@@ -2427,6 +2436,7 @@ fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
         row.last_model.as_deref(),
         row.last_provider_id.as_deref(),
         row.last_config_name.as_deref(),
+        row.last_upstream_base_url.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -4045,12 +4055,41 @@ struct SessionRow {
     last_reasoning_effort: Option<String>,
     last_provider_id: Option<String>,
     last_config_name: Option<String>,
+    last_upstream_base_url: Option<String>,
     last_usage: Option<UsageMetrics>,
     total_usage: Option<UsageMetrics>,
     turns_total: Option<u64>,
     turns_with_usage: Option<u64>,
     override_effort: Option<String>,
     override_config_name: Option<String>,
+}
+
+fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRow> {
+    let mut rows = cards
+        .iter()
+        .map(|card| SessionRow {
+            session_id: card.session_id.clone(),
+            cwd: card.cwd.clone(),
+            active_count: card.active_count,
+            active_started_at_ms_min: card.active_started_at_ms_min,
+            last_status: card.last_status,
+            last_duration_ms: card.last_duration_ms,
+            last_ended_at_ms: card.last_ended_at_ms,
+            last_model: card.last_model.clone(),
+            last_reasoning_effort: card.last_reasoning_effort.clone(),
+            last_provider_id: card.last_provider_id.clone(),
+            last_config_name: card.last_config_name.clone(),
+            last_upstream_base_url: card.last_upstream_base_url.clone(),
+            last_usage: card.last_usage.clone(),
+            total_usage: card.total_usage.clone(),
+            turns_total: card.turns_total,
+            turns_with_usage: card.turns_with_usage,
+            override_effort: card.override_effort.clone(),
+            override_config_name: card.override_config_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|r| std::cmp::Reverse(session_sort_key(r)));
+    rows
 }
 
 fn build_session_rows(
@@ -4078,6 +4117,7 @@ fn build_session_rows(
             last_reasoning_effort: req.reasoning_effort.clone(),
             last_provider_id: req.provider_id.clone(),
             last_config_name: req.config_name.clone(),
+            last_upstream_base_url: req.upstream_base_url.clone(),
             last_usage: None,
             total_usage: None,
             turns_total: None,
@@ -4108,6 +4148,9 @@ fn build_session_rows(
         if entry.last_config_name.is_none() {
             entry.last_config_name = req.config_name;
         }
+        if entry.last_upstream_base_url.is_none() {
+            entry.last_upstream_base_url = req.upstream_base_url;
+        }
     }
 
     for r in recent {
@@ -4124,6 +4167,7 @@ fn build_session_rows(
             last_reasoning_effort: r.reasoning_effort.clone(),
             last_provider_id: r.provider_id.clone(),
             last_config_name: r.config_name.clone(),
+            last_upstream_base_url: r.upstream_base_url.clone(),
             last_usage: r.usage.clone(),
             total_usage: None,
             turns_total: None,
@@ -4146,6 +4190,10 @@ fn build_session_rows(
                 .or(entry.last_reasoning_effort.clone());
             entry.last_provider_id = r.provider_id.clone().or(entry.last_provider_id.clone());
             entry.last_config_name = r.config_name.clone().or(entry.last_config_name.clone());
+            entry.last_upstream_base_url = r
+                .upstream_base_url
+                .clone()
+                .or(entry.last_upstream_base_url.clone());
             entry.last_usage = r.usage.clone().or(entry.last_usage.clone());
         }
         if entry.cwd.is_none() {
@@ -4167,6 +4215,7 @@ fn build_session_rows(
             last_reasoning_effort: None,
             last_provider_id: None,
             last_config_name: None,
+            last_upstream_base_url: None,
             last_usage: None,
             total_usage: None,
             turns_total: None,
@@ -4224,6 +4273,7 @@ fn build_session_rows(
             last_reasoning_effort: None,
             last_provider_id: None,
             last_config_name: None,
+            last_upstream_base_url: None,
             last_usage: None,
             total_usage: None,
             turns_total: None,
@@ -4248,6 +4298,7 @@ fn build_session_rows(
             last_reasoning_effort: None,
             last_provider_id: None,
             last_config_name: None,
+            last_upstream_base_url: None,
             last_usage: None,
             total_usage: None,
             turns_total: None,

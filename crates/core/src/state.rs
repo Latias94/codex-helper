@@ -231,6 +231,44 @@ pub struct SessionStats {
     pub last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SessionIdentityCard {
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub active_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_started_at_ms_min: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_ended_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_config_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_upstream_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_usage: Option<UsageMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_usage: Option<UsageMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns_with_usage: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_config_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct SessionEffortOverride {
     effort: String,
@@ -1168,6 +1206,24 @@ impl ProxyState {
         guard.clone()
     }
 
+    pub async fn list_session_identity_cards(&self, recent_limit: usize) -> Vec<SessionIdentityCard> {
+        let recent_limit = recent_limit.clamp(1, recent_finished_max());
+        let (active, recent, overrides, config_overrides, stats) = tokio::join!(
+            self.list_active_requests(),
+            self.list_recent_finished(recent_limit),
+            self.list_session_effort_overrides(),
+            self.list_session_config_overrides(),
+            self.list_session_stats(),
+        );
+        build_session_identity_cards_from_parts(
+            &active,
+            &recent,
+            &overrides,
+            &config_overrides,
+            &stats,
+        )
+    }
+
     pub fn spawn_cleanup_task(state: Arc<Self>) {
         // Run periodically; no need to be super frequent.
         tokio::spawn(async move {
@@ -1285,5 +1341,283 @@ impl ProxyState {
         for (sid, _) in keys.into_iter().take(remove_count) {
             cache.remove(&sid);
         }
+    }
+}
+
+fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCard {
+    SessionIdentityCard {
+        session_id,
+        cwd: None,
+        active_count: 0,
+        active_started_at_ms_min: None,
+        last_status: None,
+        last_duration_ms: None,
+        last_ended_at_ms: None,
+        last_model: None,
+        last_reasoning_effort: None,
+        last_provider_id: None,
+        last_config_name: None,
+        last_upstream_base_url: None,
+        last_usage: None,
+        total_usage: None,
+        turns_total: None,
+        turns_with_usage: None,
+        override_effort: None,
+        override_config_name: None,
+    }
+}
+
+fn session_identity_sort_key(card: &SessionIdentityCard) -> u64 {
+    card.last_ended_at_ms
+        .unwrap_or(0)
+        .max(card.active_started_at_ms_min.unwrap_or(0))
+}
+
+pub fn build_session_identity_cards_from_parts(
+    active: &[ActiveRequest],
+    recent: &[FinishedRequest],
+    overrides: &HashMap<String, String>,
+    config_overrides: &HashMap<String, String>,
+    stats: &HashMap<String, SessionStats>,
+) -> Vec<SessionIdentityCard> {
+    use std::collections::HashMap as StdHashMap;
+
+    let mut map: StdHashMap<Option<String>, SessionIdentityCard> = StdHashMap::new();
+
+    for req in active {
+        let key = req.session_id.clone();
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| empty_session_identity_card(key));
+
+        entry.active_count = entry.active_count.saturating_add(1);
+        entry.active_started_at_ms_min = Some(
+            entry
+                .active_started_at_ms_min
+                .unwrap_or(req.started_at_ms)
+                .min(req.started_at_ms),
+        );
+        if entry.cwd.is_none() {
+            entry.cwd = req.cwd.clone();
+        }
+        if let Some(effort) = req.reasoning_effort.as_ref() {
+            entry.last_reasoning_effort = Some(effort.clone());
+        }
+        if entry.last_model.is_none() {
+            entry.last_model = req.model.clone();
+        }
+        if entry.last_provider_id.is_none() {
+            entry.last_provider_id = req.provider_id.clone();
+        }
+        if entry.last_config_name.is_none() {
+            entry.last_config_name = req.config_name.clone();
+        }
+        if entry.last_upstream_base_url.is_none() {
+            entry.last_upstream_base_url = req.upstream_base_url.clone();
+        }
+    }
+
+    for r in recent {
+        let key = r.session_id.clone();
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| empty_session_identity_card(key));
+
+        let should_update = entry.last_ended_at_ms.is_none_or(|prev| r.ended_at_ms >= prev);
+        if should_update {
+            entry.last_status = Some(r.status_code);
+            entry.last_duration_ms = Some(r.duration_ms);
+            entry.last_ended_at_ms = Some(r.ended_at_ms);
+            entry.last_model = r.model.clone().or(entry.last_model.clone());
+            entry.last_reasoning_effort = r
+                .reasoning_effort
+                .clone()
+                .or(entry.last_reasoning_effort.clone());
+            entry.last_provider_id = r.provider_id.clone().or(entry.last_provider_id.clone());
+            entry.last_config_name = r.config_name.clone().or(entry.last_config_name.clone());
+            entry.last_upstream_base_url = r
+                .upstream_base_url
+                .clone()
+                .or(entry.last_upstream_base_url.clone());
+            entry.last_usage = r.usage.clone().or(entry.last_usage.clone());
+        }
+        if entry.cwd.is_none() {
+            entry.cwd = r.cwd.clone();
+        }
+    }
+
+    for (sid, st) in stats {
+        let key = Some(sid.clone());
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| empty_session_identity_card(key));
+
+        if entry.turns_total.is_none() {
+            entry.turns_total = Some(st.turns_total);
+        }
+        if entry.last_status.is_none() {
+            entry.last_status = st.last_status;
+        }
+        if entry.last_duration_ms.is_none() {
+            entry.last_duration_ms = st.last_duration_ms;
+        }
+        if entry.last_ended_at_ms.is_none() {
+            entry.last_ended_at_ms = st.last_ended_at_ms;
+        }
+        if entry.last_model.is_none() {
+            entry.last_model = st.last_model.clone();
+        }
+        if entry.last_reasoning_effort.is_none() {
+            entry.last_reasoning_effort = st.last_reasoning_effort.clone();
+        }
+        if entry.last_provider_id.is_none() {
+            entry.last_provider_id = st.last_provider_id.clone();
+        }
+        if entry.last_config_name.is_none() {
+            entry.last_config_name = st.last_config_name.clone();
+        }
+        if entry.last_usage.is_none() {
+            entry.last_usage = st.last_usage.clone();
+        }
+        if entry.total_usage.is_none() {
+            entry.total_usage = Some(st.total_usage.clone());
+        }
+        if entry.turns_with_usage.is_none() {
+            entry.turns_with_usage = Some(st.turns_with_usage);
+        }
+    }
+
+    for (sid, eff) in overrides {
+        let key = Some(sid.clone());
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| empty_session_identity_card(key));
+        entry.override_effort = Some(eff.clone());
+    }
+
+    for (sid, cfg_name) in config_overrides {
+        let key = Some(sid.clone());
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| empty_session_identity_card(key));
+        entry.override_config_name = Some(cfg_name.clone());
+    }
+
+    let mut cards = map.into_values().collect::<Vec<_>>();
+    cards.sort_by_key(|card| std::cmp::Reverse(session_identity_sort_key(card)));
+    cards
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_session_identity_cards_merges_sources_and_sorts_newest_first() {
+        let active = vec![ActiveRequest {
+            id: 1,
+            session_id: Some("sid-active".to_string()),
+            cwd: Some("G:/codes/project".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            config_name: Some("right".to_string()),
+            provider_id: Some("right".to_string()),
+            upstream_base_url: Some("https://right.example/v1".to_string()),
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            started_at_ms: 500,
+        }];
+        let recent = vec![
+            FinishedRequest {
+                id: 2,
+                session_id: Some("sid-recent".to_string()),
+                cwd: Some("G:/codes/other".to_string()),
+                model: Some("gpt-5.3".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                config_name: Some("vibe".to_string()),
+                provider_id: Some("vibe".to_string()),
+                upstream_base_url: Some("https://vibe.example/v1".to_string()),
+                usage: Some(UsageMetrics {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    reasoning_tokens: 3,
+                    total_tokens: 6,
+                }),
+                retry: None,
+                service: "codex".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                status_code: 200,
+                duration_ms: 1200,
+                ttfb_ms: Some(100),
+                ended_at_ms: 2_000,
+            },
+            FinishedRequest {
+                id: 3,
+                session_id: Some("sid-active".to_string()),
+                cwd: Some("G:/codes/project".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                reasoning_effort: Some("low".to_string()),
+                config_name: Some("right".to_string()),
+                provider_id: Some("right".to_string()),
+                upstream_base_url: Some("https://right.example/v1".to_string()),
+                usage: None,
+                retry: None,
+                service: "codex".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                status_code: 429,
+                duration_ms: 900,
+                ttfb_ms: None,
+                ended_at_ms: 1_000,
+            },
+        ];
+        let overrides = HashMap::from([("sid-active".to_string(), "xhigh".to_string())]);
+        let config_overrides = HashMap::from([("sid-active".to_string(), "temp".to_string())]);
+        let stats = HashMap::from([(
+            "sid-active".to_string(),
+            SessionStats {
+                turns_total: 3,
+                last_model: Some("gpt-5.4".to_string()),
+                last_reasoning_effort: Some("low".to_string()),
+                last_provider_id: Some("right".to_string()),
+                last_config_name: Some("right".to_string()),
+                last_usage: None,
+                total_usage: UsageMetrics {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    reasoning_tokens: 5,
+                    total_tokens: 35,
+                },
+                turns_with_usage: 2,
+                last_status: Some(429),
+                last_duration_ms: Some(900),
+                last_ended_at_ms: Some(1_000),
+                last_seen_ms: 1_000,
+            },
+        )]);
+
+        let cards = build_session_identity_cards_from_parts(
+            &active,
+            &recent,
+            &overrides,
+            &config_overrides,
+            &stats,
+        );
+
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].session_id.as_deref(), Some("sid-recent"));
+        assert_eq!(cards[1].session_id.as_deref(), Some("sid-active"));
+        assert_eq!(cards[1].active_count, 1);
+        assert_eq!(cards[1].last_status, Some(429));
+        assert_eq!(cards[1].override_effort.as_deref(), Some("xhigh"));
+        assert_eq!(cards[1].override_config_name.as_deref(), Some("temp"));
+        assert_eq!(
+            cards[1].last_upstream_base_url.as_deref(),
+            Some("https://right.example/v1")
+        );
+        assert_eq!(cards[1].turns_total, Some(3));
+        assert_eq!(cards[1].total_usage.as_ref().map(|u| u.total_tokens), Some(35));
     }
 }

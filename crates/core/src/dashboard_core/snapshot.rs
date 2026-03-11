@@ -7,7 +7,7 @@ use crate::dashboard_core::types::ConfigOption;
 use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
-    SessionStats, UsageRollupView,
+    SessionIdentityCard, SessionStats, UsageRollupView, build_session_identity_cards_from_parts,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +15,8 @@ pub struct DashboardSnapshot {
     pub refreshed_at_ms: u64,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<FinishedRequest>,
+    #[serde(default)]
+    pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
@@ -80,6 +82,13 @@ pub async fn build_dashboard_snapshot(
 
     let stats_5m = compute_window_stats(&recent_all, now, 5 * 60_000, |_| true);
     let stats_1h = compute_window_stats(&recent_all, now, 60 * 60_000, |_| true);
+    let session_cards = build_session_identity_cards_from_parts(
+        &active,
+        &recent_all,
+        &session_effort,
+        &session_cfg,
+        &session_stats,
+    );
 
     if recent_all.len() > recent_limit {
         recent_all.truncate(recent_limit);
@@ -89,6 +98,7 @@ pub async fn build_dashboard_snapshot(
         refreshed_at_ms: now,
         active,
         recent: recent_all,
+        session_cards,
         global_override,
         session_config_overrides: session_cfg,
         session_effort_overrides: session_effort,
