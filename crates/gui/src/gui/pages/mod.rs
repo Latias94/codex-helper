@@ -23,8 +23,8 @@ use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::{SessionSummary, SessionSummarySource};
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView,
-    ResolvedRouteValue, RouteValueSource, RuntimeConfigState, SessionIdentityCard,
-    SessionObservationScope, SessionStats,
+    ResolvedRouteValue, RouteValueSource, RuntimeConfigState, SessionContinuityMode,
+    SessionIdentityCard, SessionObservationScope, SessionStats,
 };
 use crate::usage::UsageMetrics;
 
@@ -3710,11 +3710,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "-".to_string());
                     let last = format_age(now, row.last_ended_at_ms);
-                    let pin = row
-                        .override_config_name
-                        .as_deref()
-                        .map(|s| shorten(s, 12))
-                        .unwrap_or_else(|| "-".to_string());
+                    let control = session_list_control_label(row);
                     let client = format_observed_client_identity(
                         row.last_client_name.as_deref(),
                         row.last_client_addr.as_deref(),
@@ -3723,7 +3719,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     .unwrap_or_else(|| "-".to_string());
                     let scope = session_observation_scope_short_label(ctx.lang, row.observation_scope);
                     let label = format!(
-                        "{sid}  {cwd}  {active}  st={st}  last={last}  pin={pin}  src={client}  {scope}"
+                        "{sid}  {cwd}  {active}  st={st}  last={last}  ctl={control}  src={client}  {scope}"
                     );
                     if ui.selectable_label(selected, label).clicked() {
                         ctx.view.sessions.selected_idx = pos;
@@ -3740,25 +3736,11 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             return;
         };
 
-        let sid_full = row.session_id.as_deref().unwrap_or("-");
-        let client_full = format_observed_client_identity(
-            row.last_client_name.as_deref(),
-            row.last_client_addr.as_deref(),
-        )
-        .unwrap_or_else(|| "-".to_string());
-        let observation_scope = session_observation_scope_label(ctx.lang, row.observation_scope);
-        let cwd_full = row.cwd.as_deref().unwrap_or("-");
-        let provider = row.last_provider_id.as_deref().unwrap_or("-");
         let observed_model = row.last_model.as_deref().unwrap_or("-");
         let observed_cfg = row.last_config_name.as_deref().unwrap_or("-");
         let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
         let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");
         let observed_service_tier = row.last_service_tier.as_deref().unwrap_or("-");
-        let binding_profile = row.binding_profile_name.as_deref().unwrap_or("-");
-        let binding_mode = row
-            .binding_continuity_mode
-            .map(|mode| format!("{mode:?}").to_ascii_lowercase())
-            .unwrap_or_else(|| "-".to_string());
         let effective_model = format_resolved_route_value(row.effective_model.as_ref(), ctx.lang);
         let effective_cfg =
             format_resolved_route_value(row.effective_config_name.as_ref(), ctx.lang);
@@ -3769,12 +3751,13 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let effective_service_tier =
             format_resolved_route_value(row.effective_service_tier.as_ref(), ctx.lang);
 
-        cols[1].label(format!("session: {sid_full}"));
-        cols[1].label(format!("scope: {observation_scope}"));
-        cols[1].label(format!("client(last): {client_full}"));
-        cols[1].label(format!("cwd: {cwd_full}"));
-        cols[1].label(format!("provider: {provider}"));
-        cols[1].label(format!("binding: {binding_profile} ({binding_mode})"));
+        render_session_identity_card(
+            &mut cols[1],
+            ctx.lang,
+            row,
+            &profiles,
+            host_local_session_features,
+        );
         cols[1].separator();
         cols[1].label(pick(ctx.lang, "观测到的最近路由", "Observed route"));
         cols[1].label(format!("model(last): {observed_model}"));
@@ -4847,10 +4830,7 @@ fn render_session_profile_apply_preview(
     profile: &crate::config::ServiceControlProfile,
     preview: &ProfileRoutePreview,
 ) {
-    let has_manual_overrides = row.override_model.is_some()
-        || row.override_config_name.is_some()
-        || row.override_effort.is_some()
-        || row.override_service_tier.is_some();
+    let has_manual_overrides = session_has_manual_overrides(row);
 
     ui.add_space(6.0);
     ui.group(|ui| {
@@ -4920,6 +4900,398 @@ fn render_session_profile_apply_preview(
     });
 
     render_profile_route_preview(ui, lang, profile, preview);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionControlTone {
+    Positive,
+    Neutral,
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionControlPosture {
+    headline: String,
+    detail: String,
+    tone: SessionControlTone,
+}
+
+fn session_has_manual_overrides(row: &SessionRow) -> bool {
+    row.override_model.is_some()
+        || row.override_config_name.is_some()
+        || row.override_effort.is_some()
+        || row.override_service_tier.is_some()
+}
+
+fn session_override_field_labels(row: &SessionRow, lang: Language) -> Vec<String> {
+    let mut fields = Vec::new();
+    if row.override_config_name.is_some() {
+        fields.push(pick(lang, "station", "station").to_string());
+    }
+    if row.override_model.is_some() {
+        fields.push("model".to_string());
+    }
+    if row.override_effort.is_some() {
+        fields.push(pick(lang, "reasoning", "reasoning").to_string());
+    }
+    if row.override_service_tier.is_some() {
+        fields.push("service_tier".to_string());
+    }
+    fields
+}
+
+fn session_binding_mode_label(mode: Option<SessionContinuityMode>, lang: Language) -> String {
+    match mode {
+        Some(SessionContinuityMode::DefaultProfile) => {
+            pick(lang, "default_profile 继承", "default_profile inherited").to_string()
+        }
+        Some(SessionContinuityMode::ManualProfile) => {
+            pick(lang, "手动应用", "manual apply").to_string()
+        }
+        None => pick(lang, "<无>", "<none>").to_string(),
+    }
+}
+
+fn session_control_posture(
+    row: &SessionRow,
+    profiles: &[ControlProfileOption],
+    lang: Language,
+) -> SessionControlPosture {
+    if row.session_id.is_none() {
+        return SessionControlPosture {
+            headline: pick(
+                lang,
+                "这是没有 session_id 的聚合观测条目",
+                "This is an aggregated entry without a session_id",
+            )
+            .to_string(),
+            detail: pick(
+                lang,
+                "它只能展示观测到的请求路由，不能建立真正的 session binding 或单会话 overrides。",
+                "It can only show observed request routing, and cannot own a real session binding or per-session overrides.",
+            )
+            .to_string(),
+            tone: SessionControlTone::Warning,
+        };
+    }
+
+    let override_fields = session_override_field_labels(row, lang);
+    let override_summary = override_fields.join(", ");
+    let bound_profile_exists = row
+        .binding_profile_name
+        .as_deref()
+        .is_some_and(|name| profiles.iter().any(|profile| profile.name.as_str() == name));
+
+    if let Some(profile_name) = row.binding_profile_name.as_deref() {
+        if bound_profile_exists {
+            let headline = match row.binding_continuity_mode {
+                Some(SessionContinuityMode::ManualProfile) => format!(
+                    "{} {profile_name}",
+                    pick(
+                        lang,
+                        "当前由 profile 手动绑定:",
+                        "Currently manually bound to profile:"
+                    )
+                ),
+                _ => format!(
+                    "{} {profile_name}",
+                    pick(
+                        lang,
+                        "当前由 profile 继承绑定:",
+                        "Currently inherited from profile:",
+                    )
+                ),
+            };
+            let detail = if override_fields.is_empty() {
+                match row.binding_continuity_mode {
+                    Some(SessionContinuityMode::ManualProfile) => pick(
+                        lang,
+                        "这是显式 apply 到该 session 的 binding；除非重新应用别的 profile 或设置 session overrides，它会继续沿用。",
+                        "This binding was explicitly applied to the session; it keeps applying until another profile is reapplied or session overrides replace part of it.",
+                    )
+                    .to_string(),
+                    _ => pick(
+                        lang,
+                        "这是会话创建或恢复时继承的 binding；切换“新会话默认 profile”不会自动改写它。",
+                        "This binding was inherited when the session was created or restored; switching the new-session default profile does not rewrite it automatically.",
+                    )
+                    .to_string(),
+                }
+            } else {
+                format!(
+                    "{} {}。{}",
+                    pick(
+                        lang,
+                        "当前还有 session overrides 覆盖这些字段:",
+                        "This session also has overrides on:",
+                    ),
+                    override_summary,
+                    pick(
+                        lang,
+                        "这些字段优先于 binding / profile 默认。",
+                        "Those fields take priority over the binding and profile defaults.",
+                    )
+                )
+            };
+            return SessionControlPosture {
+                headline,
+                detail,
+                tone: SessionControlTone::Positive,
+            };
+        }
+
+        return SessionControlPosture {
+            headline: format!(
+                "{} {profile_name}",
+                pick(
+                    lang,
+                    "当前仍绑定到已缺失的 profile:",
+                    "Still bound to a missing profile:",
+                )
+            ),
+            detail: if override_fields.is_empty() {
+                pick(
+                    lang,
+                    "当前配置里已经找不到这个 profile；effective route 只能依赖 binding 快照和运行态结果继续解释。",
+                    "The current config no longer contains this profile; the effective route can only be explained from the stored binding snapshot and runtime results.",
+                )
+                .to_string()
+            } else {
+                format!(
+                    "{} {}。{}",
+                    pick(
+                        lang,
+                        "当前配置里已经找不到这个 profile；另外还有 session overrides:",
+                        "The current config no longer contains this profile; there are also session overrides on:",
+                    ),
+                    override_summary,
+                    pick(
+                        lang,
+                        "这些字段仍会覆盖 binding 快照里的默认值。",
+                        "Those fields still override the defaults stored in the binding snapshot.",
+                    )
+                )
+            },
+            tone: SessionControlTone::Warning,
+        };
+    }
+
+    if !override_fields.is_empty() {
+        return SessionControlPosture {
+            headline: pick(
+                lang,
+                "当前没有 profile binding，靠 session overrides 控制",
+                "There is no profile binding; this session is controlled by session overrides",
+            )
+            .to_string(),
+            detail: format!(
+                "{} {}。{}",
+                pick(
+                    lang,
+                    "当前 session 显式覆盖了",
+                    "This session explicitly overrides",
+                ),
+                override_summary,
+                pick(
+                    lang,
+                    "这些字段优先于 profile 默认、global pin 和请求默认。",
+                    "Those fields take priority over profile defaults, the global pin, and request defaults.",
+                )
+            ),
+            tone: SessionControlTone::Neutral,
+        };
+    }
+
+    if let Some(station) = row
+        .effective_config_name
+        .as_ref()
+        .filter(|value| value.source == RouteValueSource::GlobalOverride)
+        .map(|value| value.value.as_str())
+    {
+        return SessionControlPosture {
+            headline: format!(
+                "{} {station}",
+                pick(
+                    lang,
+                    "当前没有 profile binding，站点跟随全局 pin:",
+                    "There is no profile binding; station follows the global pin:",
+                )
+            ),
+            detail: pick(
+                lang,
+                "如果全局 pin 切换，这个 session 的 effective station 也会一起变化。",
+                "If the global pin changes, this session's effective station changes with it.",
+            )
+            .to_string(),
+            tone: SessionControlTone::Neutral,
+        };
+    }
+
+    SessionControlPosture {
+        headline: pick(
+            lang,
+            "当前没有固定 binding",
+            "This session has no fixed binding",
+        )
+        .to_string(),
+        detail: pick(
+            lang,
+            "effective route 主要由最近请求值、active/default station 与运行态回填共同决定。",
+            "The effective route is currently determined mostly by recent request values, the active/default station, and runtime fallback.",
+        )
+        .to_string(),
+        tone: SessionControlTone::Neutral,
+    }
+}
+
+fn session_control_tone_color(tone: SessionControlTone) -> egui::Color32 {
+    match tone {
+        SessionControlTone::Positive => egui::Color32::from_rgb(60, 160, 90),
+        SessionControlTone::Neutral => egui::Color32::from_rgb(120, 120, 120),
+        SessionControlTone::Warning => egui::Color32::from_rgb(200, 120, 40),
+    }
+}
+
+fn session_effective_route_inline_summary(row: &SessionRow, lang: Language) -> String {
+    format!(
+        "station={}, model={}, reasoning={}, service_tier={}",
+        session_route_preview_value(
+            row.effective_config_name.as_ref(),
+            row.last_config_name.as_deref(),
+            lang,
+        ),
+        session_route_preview_value(
+            row.effective_model.as_ref(),
+            row.last_model.as_deref(),
+            lang
+        ),
+        session_route_preview_value(
+            row.effective_reasoning_effort.as_ref(),
+            row.last_reasoning_effort.as_deref(),
+            lang,
+        ),
+        session_route_preview_value(
+            row.effective_service_tier.as_ref(),
+            row.last_service_tier.as_deref(),
+            lang,
+        )
+    )
+}
+
+fn session_last_activity_summary(row: &SessionRow) -> String {
+    let status = row
+        .last_status
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let duration = row
+        .last_duration_ms
+        .map(|duration| format!("{duration} ms"))
+        .unwrap_or_else(|| "-".to_string());
+    let last = format_age(now_ms(), row.last_ended_at_ms);
+    format!("status={status}, duration={duration}, last={last}")
+}
+
+fn session_list_control_label(row: &SessionRow) -> String {
+    if let Some(profile_name) = row.binding_profile_name.as_deref() {
+        return format!("pf:{}", shorten(profile_name, 10));
+    }
+    if let Some(station_name) = row.override_config_name.as_deref() {
+        return format!("pin:{}", shorten(station_name, 10));
+    }
+    let override_count = usize::from(row.override_model.is_some())
+        + usize::from(row.override_effort.is_some())
+        + usize::from(row.override_service_tier.is_some());
+    if override_count > 0 {
+        return format!("ovr:{override_count}");
+    }
+    if row
+        .effective_config_name
+        .as_ref()
+        .is_some_and(|value| value.source == RouteValueSource::GlobalOverride)
+    {
+        return "global".to_string();
+    }
+    "-".to_string()
+}
+
+fn render_session_identity_card(
+    ui: &mut egui::Ui,
+    lang: Language,
+    row: &SessionRow,
+    profiles: &[ControlProfileOption],
+    host_local_session_features: bool,
+) {
+    let posture = session_control_posture(row, profiles, lang);
+    let sid_full = row
+        .session_id
+        .as_deref()
+        .unwrap_or_else(|| pick(lang, "<未知>", "<unknown>"));
+    let client_full = format_observed_client_identity(
+        row.last_client_name.as_deref(),
+        row.last_client_addr.as_deref(),
+    )
+    .unwrap_or_else(|| "-".to_string());
+    let observation_scope = session_observation_scope_label(lang, row.observation_scope);
+    let cwd_full = row.cwd.as_deref().unwrap_or("-");
+    let provider = row.last_provider_id.as_deref().unwrap_or("-");
+    let binding_mode = session_binding_mode_label(row.binding_continuity_mode, lang);
+
+    ui.group(|ui| {
+        ui.label(pick(lang, "会话身份卡", "Session identity"));
+        ui.monospace(format!("session_id: {sid_full}"));
+        ui.small(format!("scope: {observation_scope}"));
+        ui.small(format!("client(last): {client_full}"));
+        ui.small(format!("cwd: {cwd_full}"));
+        ui.small(format!("provider(last): {provider}"));
+        if row.binding_profile_name.is_some() || row.binding_continuity_mode.is_some() {
+            ui.small(format!("binding mode: {binding_mode}"));
+        }
+        ui.colored_label(session_control_tone_color(posture.tone), posture.headline);
+        ui.small(posture.detail);
+        ui.small(format!(
+            "{}: {}",
+            pick(lang, "当前 effective route", "Current effective route"),
+            session_effective_route_inline_summary(row, lang)
+        ));
+        if row.active_count > 0 {
+            ui.small(format!(
+                "{}: {}",
+                pick(lang, "活跃请求数", "Active requests"),
+                row.active_count
+            ));
+        } else if row.last_status.is_some()
+            || row.last_duration_ms.is_some()
+            || row.last_ended_at_ms.is_some()
+        {
+            ui.small(format!(
+                "{}: {}",
+                pick(lang, "最近活动", "Last activity"),
+                session_last_activity_summary(row)
+            ));
+        }
+        if row.session_id.is_some() {
+            ui.small(if host_local_session_features {
+                match row.observation_scope {
+                    SessionObservationScope::HostLocalEnriched => pick(
+                        lang,
+                        "这台设备可直接尝试打开本地 cwd / transcript。",
+                        "This device can attempt local cwd / transcript access directly.",
+                    ),
+                    SessionObservationScope::ObservedOnly => pick(
+                        lang,
+                        "这台设备具备 host-local 能力，但当前记录仍主要来自共享观测。",
+                        "This device has host-local capabilities, but this record still comes primarily from shared observation data.",
+                    ),
+                }
+            } else {
+                pick(
+                    lang,
+                    "当前是远端附着或非本机 host 视角；只能共享观测与控制，不能假设本地有 transcript / cwd。",
+                    "This is a remote-attached or non-local host view; observability and control are shared, but local transcript / cwd cannot be assumed.",
+                )
+            });
+        }
+    });
 }
 
 fn sync_session_order(state: &mut SessionsViewState, rows: &[SessionRow]) {
@@ -11168,6 +11540,42 @@ mod tests {
         assert!(warning.contains("cwd / transcript"));
         assert!(warning.contains("session history / cwd enrichment"));
         assert!(warning.contains("proxy host"));
+    }
+
+    #[test]
+    fn session_control_posture_warns_when_bound_profile_is_missing() {
+        let mut row = sample_session_row();
+        row.binding_profile_name = Some("fast".to_string());
+        row.binding_continuity_mode = Some(SessionContinuityMode::ManualProfile);
+
+        let posture = session_control_posture(&row, &[], Language::Zh);
+
+        assert_eq!(posture.tone, SessionControlTone::Warning);
+        assert!(posture.headline.contains("已缺失"));
+        assert!(posture.detail.contains("找不到这个 profile"));
+    }
+
+    #[test]
+    fn session_control_posture_describes_session_overrides_without_binding() {
+        let mut row = sample_session_row();
+        row.override_config_name = Some("right".to_string());
+        row.override_service_tier = Some("priority".to_string());
+
+        let posture = session_control_posture(&row, &[], Language::En);
+
+        assert_eq!(posture.tone, SessionControlTone::Neutral);
+        assert!(posture.headline.contains("no profile binding"));
+        assert!(posture.detail.contains("station"));
+        assert!(posture.detail.contains("service_tier"));
+    }
+
+    #[test]
+    fn session_list_control_label_prefers_profile_binding() {
+        let mut row = sample_session_row();
+        row.binding_profile_name = Some("fast".to_string());
+        row.override_config_name = Some("right".to_string());
+
+        assert_eq!(session_list_control_label(&row), "pf:fast");
     }
 
     #[test]
