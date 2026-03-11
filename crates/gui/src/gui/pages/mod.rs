@@ -3336,7 +3336,51 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let session_config_overrides = snapshot.session_config_overrides.clone();
     let session_service_tier_overrides = snapshot.session_service_tier_overrides.clone();
     let session_stats = snapshot.session_stats.clone();
+    let configured_active_station = snapshot.configured_active_station.clone();
+    let effective_active_station = snapshot.effective_active_station.clone();
     let mut force_refresh = false;
+    let runtime_station_catalog = snapshot
+        .configs
+        .iter()
+        .cloned()
+        .map(|config| (config.name.clone(), config))
+        .collect::<BTreeMap<_, _>>();
+    let session_preview_service_name =
+        snapshot
+            .service_name
+            .as_deref()
+            .unwrap_or(match ctx.view.config.service {
+                crate::config::ServiceKind::Claude => "claude",
+                crate::config::ServiceKind::Codex => "codex",
+            });
+    let session_preview_catalogs = ctx
+        .proxy
+        .attached()
+        .and_then(|att| {
+            att.supports_station_spec_api.then(|| {
+                (
+                    att.persisted_stations.clone(),
+                    att.persisted_station_providers.clone(),
+                )
+            })
+        })
+        .or_else(|| {
+            if matches!(ctx.proxy.kind(), ProxyModeKind::Attached) {
+                None
+            } else {
+                local_profile_preview_catalogs_from_text(
+                    ctx.proxy_config_text,
+                    session_preview_service_name,
+                )
+            }
+        });
+    let session_preview_station_specs = session_preview_catalogs
+        .as_ref()
+        .map(|(stations, _)| stations);
+    let session_preview_provider_catalog = session_preview_catalogs
+        .as_ref()
+        .map(|(_, providers)| providers);
+    let session_preview_runtime_station_catalog = Some(&runtime_station_catalog);
 
     if ctx
         .view
@@ -3611,8 +3655,10 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     // Sync editor to the selected session, but do not clobber while editing the same session.
     if ctx.view.sessions.editor.sid != ctx.view.sessions.selected_session_id {
         ctx.view.sessions.editor.sid = ctx.view.sessions.selected_session_id.clone();
-        ctx.view.sessions.editor.profile_selection = default_profile
-            .clone()
+        ctx.view.sessions.editor.profile_selection = selected
+            .and_then(|row| row.binding_profile_name.clone())
+            .filter(|name| profiles.iter().any(|profile| profile.name == *name))
+            .or_else(|| default_profile.clone())
             .or_else(|| profiles.first().map(|profile| profile.name.clone()));
         ctx.view.sessions.editor.model_override = selected
             .and_then(|r| r.override_model.clone())
@@ -3629,6 +3675,8 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .and_then(|r| r.override_service_tier.clone())
             .unwrap_or_default();
     }
+
+    let mut action_apply_session_profile: Option<(String, String)> = None;
 
     ui.columns(2, |cols| {
         cols[0].heading(pick(ctx.lang, "列表", "List"));
@@ -3954,6 +4002,27 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 "No control profiles loaded; define them in config.toml [codex.profiles.*].",
             ));
         } else {
+            cols[1].horizontal_wrapped(|ui| {
+                ui.label(pick(ctx.lang, "快捷应用", "Quick apply"));
+                for profile in profiles.iter() {
+                    let mut label =
+                        format_profile_display(profile.name.as_str(), Some(profile));
+                    if row.binding_profile_name.as_deref() == Some(profile.name.as_str()) {
+                        label.push_str(match ctx.lang {
+                            Language::Zh => " [当前绑定]",
+                            Language::En => " [bound]",
+                        });
+                    }
+                    let response =
+                        ui.button(label).on_hover_text(format_profile_summary(profile));
+                    if response.clicked() {
+                        ctx.view.sessions.editor.profile_selection = Some(profile.name.clone());
+                        action_apply_session_profile =
+                            Some((sid.clone(), profile.name.clone()));
+                    }
+                }
+            });
+
             cols[1].horizontal(|ui| {
                 ui.label(pick(ctx.lang, "应用 profile", "Apply profile"));
 
@@ -3981,17 +4050,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
                 if ui.button(pick(ctx.lang, "应用", "Apply")).clicked() {
                     if let Some(profile_name) = ctx.view.sessions.editor.profile_selection.clone() {
-                        match ctx.proxy.apply_session_profile(ctx.rt, sid.clone(), profile_name) {
-                            Ok(()) => {
-                                force_refresh = true;
-                                *ctx.last_info = Some(
-                                    pick(ctx.lang, "已应用 profile", "Profile applied").to_string(),
-                                );
-                            }
-                            Err(e) => {
-                                *ctx.last_error = Some(format!("apply profile failed: {e}"));
-                            }
-                        }
+                        action_apply_session_profile = Some((sid.clone(), profile_name));
                     } else {
                         *ctx.last_error = Some(
                             pick(
@@ -4013,6 +4072,23 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     pick(ctx.lang, "Profile 详情", "Profile details"),
                     format_profile_summary(profile)
                 ));
+                let preview_profile = service_profile_from_option(profile);
+                let preview = build_profile_route_preview(
+                    &preview_profile,
+                    configured_active_station.as_deref(),
+                    effective_active_station.as_deref(),
+                    session_preview_station_specs,
+                    session_preview_provider_catalog,
+                    session_preview_runtime_station_catalog,
+                );
+                render_session_profile_apply_preview(
+                    &mut cols[1],
+                    ctx.lang,
+                    row,
+                    profile_name,
+                    &preview_profile,
+                    &preview,
+                );
             }
         }
 
@@ -4260,6 +4336,24 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         });
     });
 
+    if let Some((sid, profile_name)) = action_apply_session_profile {
+        match ctx
+            .proxy
+            .apply_session_profile(ctx.rt, sid, profile_name.clone())
+        {
+            Ok(()) => {
+                force_refresh = true;
+                *ctx.last_info = Some(format!(
+                    "{}: {profile_name}",
+                    pick(ctx.lang, "已应用 profile", "Profile applied")
+                ));
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!("apply profile failed: {e}"));
+            }
+        }
+    }
+
     if force_refresh {
         ctx.proxy
             .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
@@ -4492,6 +4586,35 @@ fn build_profile_route_preview(
     }
 }
 
+fn local_profile_preview_catalogs_from_text(
+    text: &str,
+    service_name: &str,
+) -> Option<(
+    BTreeMap<String, PersistedStationSpec>,
+    BTreeMap<String, PersistedStationProviderRef>,
+)> {
+    let ConfigWorkingDocument::V2(cfg) = parse_proxy_config_document(text).ok()? else {
+        return None;
+    };
+    let view = match service_name {
+        "claude" => &cfg.claude,
+        _ => &cfg.codex,
+    };
+    let catalog = crate::config::build_persisted_station_catalog(view);
+    Some((
+        catalog
+            .stations
+            .into_iter()
+            .map(|station| (station.name.clone(), station))
+            .collect(),
+        catalog
+            .providers
+            .into_iter()
+            .map(|provider| (provider.name.clone(), provider))
+            .collect(),
+    ))
+}
+
 fn capability_support_truthy(support: CapabilitySupport) -> Option<bool> {
     match support {
         CapabilitySupport::Supported => Some(true),
@@ -4671,6 +4794,132 @@ fn render_profile_route_preview(
             }
         }
     });
+}
+
+fn session_route_preview_value(
+    resolved: Option<&ResolvedRouteValue>,
+    fallback: Option<&str>,
+    lang: Language,
+) -> String {
+    resolved
+        .map(|value| value.value.clone())
+        .or_else(|| {
+            fallback
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| pick(lang, "<未解析>", "<unresolved>").to_string())
+}
+
+fn session_profile_target_value(raw: Option<&str>, lang: Language) -> String {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| pick(lang, "<自动>", "<auto>").to_string())
+}
+
+fn session_profile_target_station_value(preview: &ProfileRoutePreview, lang: Language) -> String {
+    match preview.resolved_station_name.as_deref() {
+        Some(name) => {
+            let source = match preview.station_source {
+                ProfilePreviewStationSource::Profile => "profile.station",
+                ProfilePreviewStationSource::ConfiguredActive => "active_station",
+                ProfilePreviewStationSource::Auto => "auto",
+                ProfilePreviewStationSource::Unresolved => "unresolved",
+            };
+            format!("{name} ({source})")
+        }
+        None => match preview.station_source {
+            ProfilePreviewStationSource::Unresolved => {
+                pick(lang, "<未解析>", "<unresolved>").to_string()
+            }
+            _ => pick(lang, "<自动>", "<auto>").to_string(),
+        },
+    }
+}
+
+fn render_session_profile_apply_preview(
+    ui: &mut egui::Ui,
+    lang: Language,
+    row: &SessionRow,
+    profile_name: &str,
+    profile: &crate::config::ServiceControlProfile,
+    preview: &ProfileRoutePreview,
+) {
+    let has_manual_overrides = row.override_model.is_some()
+        || row.override_config_name.is_some()
+        || row.override_effort.is_some()
+        || row.override_service_tier.is_some();
+
+    ui.add_space(6.0);
+    ui.group(|ui| {
+        ui.label(pick(lang, "应用预览", "Apply preview"));
+        ui.small(pick(
+            lang,
+            "应用 profile 会重写当前 session binding，并清空当前会话的 station / model / reasoning / service_tier overrides。",
+            "Applying a profile rewrites the current session binding and clears the session's station / model / reasoning / service_tier overrides.",
+        ));
+
+        if row.binding_profile_name.as_deref() == Some(profile_name) {
+            ui.small(if has_manual_overrides {
+                pick(
+                    lang,
+                    "该会话已经绑定到这个 profile，但重新应用仍会清空手动 session overrides。",
+                    "This session is already bound to this profile, but reapplying it will still clear manual session overrides.",
+                )
+            } else {
+                pick(
+                    lang,
+                    "该会话已经绑定到这个 profile；重新应用通常只会刷新同一份绑定。",
+                    "This session is already bound to this profile; reapplying it usually just refreshes the same binding.",
+                )
+            });
+        }
+
+        ui.small(format!(
+            "{}: {} -> {}",
+            pick(lang, "binding profile", "binding profile"),
+            row.binding_profile_name
+                .as_deref()
+                .unwrap_or_else(|| pick(lang, "<无>", "<none>")),
+            profile_name
+        ));
+        ui.small(format!(
+            "station: {} -> {}",
+            session_route_preview_value(
+                row.effective_config_name.as_ref(),
+                row.last_config_name.as_deref(),
+                lang,
+            ),
+            session_profile_target_station_value(preview, lang)
+        ));
+        ui.small(format!(
+            "model: {} -> {}",
+            session_route_preview_value(row.effective_model.as_ref(), row.last_model.as_deref(), lang),
+            session_profile_target_value(profile.model.as_deref(), lang)
+        ));
+        ui.small(format!(
+            "reasoning: {} -> {}",
+            session_route_preview_value(
+                row.effective_reasoning_effort.as_ref(),
+                row.last_reasoning_effort.as_deref(),
+                lang,
+            ),
+            session_profile_target_value(profile.reasoning_effort.as_deref(), lang)
+        ));
+        ui.small(format!(
+            "service_tier: {} -> {}",
+            session_route_preview_value(
+                row.effective_service_tier.as_ref(),
+                row.last_service_tier.as_deref(),
+                lang,
+            ),
+            session_profile_target_value(profile.service_tier.as_deref(), lang)
+        ));
+    });
+
+    render_profile_route_preview(ui, lang, profile, preview);
 }
 
 fn sync_session_order(state: &mut SessionsViewState, rows: &[SessionRow]) {
@@ -10919,6 +11168,45 @@ mod tests {
         assert!(warning.contains("cwd / transcript"));
         assert!(warning.contains("session history / cwd enrichment"));
         assert!(warning.contains("proxy host"));
+    }
+
+    #[test]
+    fn local_profile_preview_catalogs_from_text_extracts_v2_station_provider_structure() {
+        let text = r#"
+version = 2
+
+[codex]
+active_station = "primary"
+
+[codex.providers.right]
+alias = "Right"
+[codex.providers.right.auth]
+auth_token_env = "RIGHT_API_KEY"
+[codex.providers.right.endpoints.main]
+base_url = "https://right.example.com/v1"
+
+[codex.stations.primary]
+alias = "Primary"
+level = 3
+
+[[codex.stations.primary.members]]
+provider = "right"
+preferred = true
+"#;
+
+        let (stations, providers) =
+            local_profile_preview_catalogs_from_text(text, "codex").expect("catalog");
+
+        let station = stations.get("primary").expect("primary station");
+        assert_eq!(station.alias.as_deref(), Some("Primary"));
+        assert_eq!(station.level, 3);
+        assert_eq!(station.members.len(), 1);
+        assert_eq!(station.members[0].provider, "right");
+
+        let provider = providers.get("right").expect("right provider");
+        assert_eq!(provider.alias.as_deref(), Some("Right"));
+        assert_eq!(provider.endpoints.len(), 1);
+        assert_eq!(provider.endpoints[0].name, "main");
     }
 
     #[test]
