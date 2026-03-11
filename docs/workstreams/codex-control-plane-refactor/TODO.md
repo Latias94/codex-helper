@@ -92,6 +92,7 @@
 - [~] CP-401 Introduce explicit `Station` runtime model
   - [x] add explicit `/api/v1/stations` and `/api/v1/stations/runtime` aliases
   - [x] prefer station API in attach mode with legacy `configs` fallback
+  - [x] align operator-facing GUI/tray labels with station terminology where semantics are already station-first
   - [ ] rename internal runtime/public UI model from `config` to `station`
 - [x] CP-402 Add capability summary per station:
   - [x] supported models
@@ -123,11 +124,9 @@
 
 - [ ] CP-601 Redesign Sessions page around session identity card
 - [ ] CP-602 Add Profiles page or Profiles section under provider management
-- [ ] CP-603 Add Stations page with:
-  - health
-  - drain
-  - breaker
-  - quick switch
+- [~] CP-603 Add Stations page with:
+  - [x] expose station quick switch and common station metadata in Overview / Config forms
+  - [ ] dedicated station-focused page for health / drain / breaker / quick switch
 - [ ] CP-604 Add "effective route source" explanation UI
 - [ ] CP-605 Add remote-safe capability gating in GUI
 - [ ] CP-606 Keep transcript/history UI usable even when only observed-session data exists
