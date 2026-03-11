@@ -1174,7 +1174,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
             if snapshot.supports_v1 && !snapshot.configs.is_empty() {
                 ui.horizontal(|ui| {
-                    ui.label(pick(ctx.lang, "固定配置", "Pinned config"));
+                    ui.label(pick(ctx.lang, "固定站点", "Pinned station"));
                     let global = snapshot.global_override.clone();
                     let mut selected = global.clone();
                     egui::ComboBox::from_id_salt("overview_global_cfg_override")
@@ -1553,7 +1553,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     .unwrap_or_else(|| "-".to_string());
                 ui.label(format!(
                     "{}: {}",
-                    pick(ctx.lang, "当前配置(active)", "Active config"),
+                    pick(ctx.lang, "当前站点(active)", "Active station"),
                     active_display
                 ));
 
@@ -1587,7 +1587,11 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     let mut apply_active = false;
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        ui.label(pick(ctx.lang, "默认配置(active)", "Default (active)"));
+                        ui.label(pick(
+                            ctx.lang,
+                            "默认站点(active)",
+                            "Default station (active)",
+                        ));
                         egui::ComboBox::from_id_salt("overview_active_config_select")
                             .selected_text(
                                 ctx.view
@@ -1632,15 +1636,15 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         egui::Color32::from_rgb(120, 120, 120),
                         pick(
                             ctx.lang,
-                            "说明：这会修改本机 config.toml/config.json 的 active，并立即重载代理运行态。",
-                            "Note: This writes active to local config and reloads proxy runtime.",
+                            "说明：这会修改本机配置中的 active_station/active，并立即重载代理运行态。",
+                            "Note: This writes local active_station/active and reloads proxy runtime.",
                         ),
                     );
 
                     if apply_active {
                         let Some(name) = ctx.view.overview.active_config_selected.clone() else {
                             *ctx.last_error = Some(
-                                pick(ctx.lang, "请选择一个配置", "Select a config").to_string(),
+                                pick(ctx.lang, "请选择一个站点", "Select a station").to_string(),
                             );
                             return;
                         };
@@ -2083,7 +2087,7 @@ fn render_routing_presets(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         });
 
         ui.horizontal(|ui| {
-            ui.label(pick(ctx.lang, "固定配置(Pinned)", "Pinned config"));
+            ui.label(pick(ctx.lang, "固定站点(Pinned)", "Pinned station"));
 
             let service_matches_snapshot =
                 !snapshot_service.is_empty() && snapshot_service == profile.service;
@@ -2457,8 +2461,8 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             [320.0, 20.0],
             egui::TextEdit::singleline(&mut ctx.view.sessions.search).hint_text(pick(
                 ctx.lang,
-                "按 session_id / cwd / model / config 过滤…",
-                "Filter by session_id / cwd / model / config...",
+                "按 session_id / cwd / model / station / config 过滤…",
+                "Filter by session_id / cwd / model / station / config...",
             )),
         );
         if ui.button(pick(ctx.lang, "清空", "Clear")).clicked() {
@@ -2644,14 +2648,14 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].separator();
         cols[1].label(pick(ctx.lang, "观测到的最近路由", "Observed route"));
         cols[1].label(format!("model(last): {observed_model}"));
-        cols[1].label(format!("config(last): {observed_cfg}"));
+        cols[1].label(format!("station(last): {observed_cfg}"));
         cols[1].label(format!("upstream(last): {observed_upstream}"));
         cols[1].label(format!("effort(last): {observed_effort}"));
         cols[1].label(format!("service_tier(last): {observed_service_tier}"));
         cols[1].separator();
         cols[1].label(pick(ctx.lang, "当前生效控制", "Effective route"));
         cols[1].label(format!("model: {effective_model}"));
-        cols[1].label(format!("config: {effective_cfg}"));
+        cols[1].label(format!("station: {effective_cfg}"));
         cols[1].label(format!("upstream: {effective_upstream}"));
         cols[1].label(format!("effort: {effective_effort}"));
         cols[1].label(format!("service_tier: {effective_service_tier}"));
@@ -2766,7 +2770,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
         let global_cfg = global_override.as_deref().unwrap_or("-");
         cols[1].label(format!(
-            "{}: model={override_model}, effort={override_eff}, cfg={override_cfg}, tier={override_service_tier}, global={global_cfg}",
+            "{}: model={override_model}, effort={override_eff}, station={override_cfg}, tier={override_service_tier}, global_station={global_cfg}",
             pick(ctx.lang, "覆盖", "Overrides")
         ));
 
@@ -2892,7 +2896,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         });
 
         cols[1].horizontal(|ui| {
-            ui.label(pick(ctx.lang, "固定配置", "Pinned config"));
+            ui.label(pick(ctx.lang, "固定站点", "Pinned station"));
 
             let mut selected_name = ctx.view.sessions.editor.config_override.clone();
             egui::ComboBox::from_id_salt(("session_cfg_override", sid.as_str()))
@@ -2921,8 +2925,8 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     *ctx.last_error = Some(
                         pick(
                             ctx.lang,
-                            "附着到的代理不支持会话固定配置（需要 API v1）。",
-                            "Attached proxy does not support pinned session config (need API v1).",
+                            "附着到的代理不支持会话固定站点（需要 API v1）。",
+                            "Attached proxy does not support pinned session station (need API v1).",
                         )
                         .to_string(),
                     );
@@ -3373,7 +3377,7 @@ fn render_requests(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             r.service_tier.as_deref().unwrap_or("-")
         ));
         cols[1].label(format!(
-            "config: {}",
+            "station: {}",
             r.config_name.as_deref().unwrap_or("-")
         ));
         cols[1].label(format!(
