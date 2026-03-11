@@ -90,7 +90,7 @@ pub struct ConfigViewState {
     mode: ConfigMode,
     service: crate::config::ServiceKind,
     selected_name: Option<String>,
-    working: Option<crate::config::ProxyConfig>,
+    working: Option<ConfigWorkingDocument>,
     load_error: Option<String>,
     import_codex: ImportCodexModalState,
 }
@@ -106,6 +106,12 @@ impl Default for ConfigViewState {
             import_codex: ImportCodexModalState::default(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum ConfigWorkingDocument {
+    Legacy(crate::config::ProxyConfig),
+    V2(crate::config::ProxyConfigV2),
 }
 
 #[derive(Debug)]
@@ -3991,7 +3997,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     if needs_load {
         match std::fs::read_to_string(ctx.proxy_config_path) {
-            Ok(t) => match parse_proxy_config(&t) {
+            Ok(t) => match parse_proxy_config_document(&t) {
                 Ok(cfg) => {
                     ctx.view.config.working = Some(cfg);
                     ctx.view.config.load_error = None;
@@ -4113,7 +4119,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             Some(cfg.clone())
         } else {
             match std::fs::read_to_string(ctx.proxy_config_path) {
-                Ok(t) => match parse_proxy_config(&t) {
+                Ok(t) => match parse_proxy_config_document(&t) {
                     Ok(cfg) => Some(cfg),
                     Err(e) => {
                         ctx.view.config.import_codex.last_error =
@@ -4130,7 +4136,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         };
 
         if let Some(mut tmp) = tmp_opt {
-            match crate::config::sync_codex_auth_from_codex_cli(&mut tmp, options) {
+            match sync_codex_auth_into_document(&mut tmp, options) {
                 Ok(report) => {
                     ctx.view.config.import_codex.preview = Some(report);
                     ctx.view.config.import_codex.last_error = None;
@@ -4157,7 +4163,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let mut can_apply = true;
         if ctx.view.config.working.is_none() {
             match std::fs::read_to_string(ctx.proxy_config_path) {
-                Ok(t) => match parse_proxy_config(&t) {
+                Ok(t) => match parse_proxy_config_document(&t) {
                     Ok(cfg) => {
                         ctx.view.config.working = Some(cfg);
                         ctx.view.config.load_error = None;
@@ -4177,7 +4183,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
 
         let report = if can_apply {
-            match crate::config::sync_codex_auth_from_codex_cli(
+            match sync_codex_auth_into_document(
                 ctx.view.config.working.as_mut().expect("loaded above"),
                 options,
             ) {
@@ -4200,7 +4206,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
             let save_res = {
                 let cfg = ctx.view.config.working.as_ref().expect("checked above");
-                ctx.rt.block_on(crate::config::save_config(cfg))
+                save_proxy_config_document(ctx.rt, cfg)
             };
 
             match save_res {
@@ -4210,7 +4216,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         *ctx.proxy_config_text = t;
                     }
                     if let Ok(t) = std::fs::read_to_string(&new_path)
-                        && let Ok(parsed) = parse_proxy_config(&t)
+                        && let Ok(parsed) = parse_proxy_config_document(&t)
                     {
                         ctx.view.config.working = Some(parsed);
                     }
@@ -4250,6 +4256,14 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         return;
     }
 
+    if matches!(
+        ctx.view.config.working.as_ref(),
+        Some(ConfigWorkingDocument::V2(_))
+    ) {
+        render_config_form_v2(ui, ctx);
+        return;
+    }
+
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "服务", "Service"));
@@ -4267,7 +4281,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     });
 
     let (active_name, active_fallback, names) = {
-        let cfg = ctx.view.config.working.as_ref().expect("checked above");
+        let cfg = working_legacy_config(&ctx.view.config).expect("legacy branch");
         let mgr = match ctx.view.config.service {
             crate::config::ServiceKind::Claude => &cfg.claude,
             crate::config::ServiceKind::Codex => &cfg.codex,
@@ -4305,7 +4319,8 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ctx.view.config.selected_name = names.first().cloned();
     }
 
-    let selected_name = ctx.view.config.selected_name.clone();
+    let selected_service_kind = ctx.view.config.service;
+    let mut selected_name = ctx.view.config.selected_name.clone();
     let mut action_set_active: Option<String> = None;
     let mut action_clear_active = false;
     let mut action_health_start: Option<(bool, Vec<String>)> = None;
@@ -4313,7 +4328,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let mut action_save_apply = false;
 
     {
-        let cfg = ctx.view.config.working.as_mut().expect("checked above");
+        let cfg = working_legacy_config_mut(&mut ctx.view.config).expect("legacy branch");
         ui.columns(2, |cols| {
             cols[0].heading(pick(ctx.lang, "配置列表", "Configs"));
             cols[0].add_space(4.0);
@@ -4327,7 +4342,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             && active_fallback.as_deref() == Some(name.as_str());
                         let is_selected = selected_name.as_deref() == Some(name.as_str());
 
-                        let svc = match ctx.view.config.service {
+                        let svc = match selected_service_kind {
                             crate::config::ServiceKind::Claude => cfg.claude.configs.get(name),
                             crate::config::ServiceKind::Codex => cfg.codex.configs.get(name),
                         };
@@ -4358,7 +4373,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         }
 
                         if ui.selectable_label(is_selected, label).clicked() {
-                            ctx.view.config.selected_name = Some(name.clone());
+                            selected_name = Some(name.clone());
                         }
                     }
                 });
@@ -4366,12 +4381,12 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             cols[1].heading(pick(ctx.lang, "详情", "Details"));
             cols[1].add_space(4.0);
 
-            let Some(name) = ctx.view.config.selected_name.clone() else {
+            let Some(name) = selected_name.clone() else {
                 cols[1].label(pick(ctx.lang, "未选择配置。", "No config selected."));
                 return;
             };
 
-            let mgr = match ctx.view.config.service {
+            let mgr = match selected_service_kind {
                 crate::config::ServiceKind::Claude => &mut cfg.claude,
                 crate::config::ServiceKind::Codex => &mut cfg.codex,
             };
@@ -4415,7 +4430,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             cols[1].separator();
             cols[1].label(pick(ctx.lang, "健康检查", "Health check"));
 
-            let selected_service = match ctx.view.config.service {
+            let selected_service = match selected_service_kind {
                 crate::config::ServiceKind::Claude => "claude",
                 crate::config::ServiceKind::Codex => "codex",
             };
@@ -4581,9 +4596,12 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         });
     }
 
+    ctx.view.config.selected_name = selected_name;
+
     if let Some(name) = action_set_active {
-        let cfg = ctx.view.config.working.as_mut().expect("checked above");
-        let mgr = match ctx.view.config.service {
+        let selected_service_kind = ctx.view.config.service;
+        let cfg = working_legacy_config_mut(&mut ctx.view.config).expect("legacy branch");
+        let mgr = match selected_service_kind {
             crate::config::ServiceKind::Claude => &mut cfg.claude,
             crate::config::ServiceKind::Codex => &mut cfg.codex,
         };
@@ -4592,8 +4610,9 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     }
 
     if action_clear_active {
-        let cfg = ctx.view.config.working.as_mut().expect("checked above");
-        let mgr = match ctx.view.config.service {
+        let selected_service_kind = ctx.view.config.service;
+        let cfg = working_legacy_config_mut(&mut ctx.view.config).expect("legacy branch");
+        let mgr = match selected_service_kind {
             crate::config::ServiceKind::Claude => &mut cfg.claude,
             crate::config::ServiceKind::Codex => &mut cfg.codex,
         };
@@ -4621,7 +4640,7 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     if action_save_apply {
         let save_res = {
             let cfg = ctx.view.config.working.as_ref().expect("checked above");
-            ctx.rt.block_on(crate::config::save_config(cfg))
+            save_proxy_config_document(ctx.rt, cfg)
         };
         match save_res {
             Ok(()) => {
@@ -4630,7 +4649,547 @@ fn render_config_form(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     *ctx.proxy_config_text = t;
                 }
                 if let Ok(t) = std::fs::read_to_string(&new_path)
-                    && let Ok(parsed) = parse_proxy_config(&t)
+                    && let Ok(parsed) = parse_proxy_config_document(&t)
+                {
+                    ctx.view.config.working = Some(parsed);
+                }
+
+                if matches!(
+                    ctx.proxy.kind(),
+                    super::proxy_control::ProxyModeKind::Running
+                        | super::proxy_control::ProxyModeKind::Attached
+                ) && let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt)
+                {
+                    *ctx.last_error = Some(format!("reload runtime failed: {e}"));
+                }
+
+                *ctx.last_info = Some(pick(ctx.lang, "已保存", "Saved").to_string());
+                *ctx.last_error = None;
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!("save failed: {e}"));
+            }
+        }
+    }
+}
+
+fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
+    ui.add_space(6.0);
+    ui.label(pick(
+        ctx.lang,
+        "当前文件是 v2 station/provider 布局。表单视图优先支持常用站点字段（active_station / enabled / level）；provider、endpoint、profile 的复杂编辑仍建议用“原始”视图。",
+        "This file uses the v2 station/provider schema. Form view focuses on common station fields (active_station / enabled / level); use Raw view for advanced provider, endpoint, and profile edits.",
+    ));
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(pick(ctx.lang, "服务", "Service"));
+        let mut svc = ctx.view.config.service;
+        egui::ComboBox::from_id_salt("config_form_v2_service")
+            .selected_text(match svc {
+                crate::config::ServiceKind::Codex => "codex",
+                crate::config::ServiceKind::Claude => "claude",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut svc, crate::config::ServiceKind::Codex, "codex");
+                ui.selectable_value(&mut svc, crate::config::ServiceKind::Claude, "claude");
+            });
+        ctx.view.config.service = svc;
+    });
+
+    let (schema_version, active_name, active_fallback, default_profile, station_names) = {
+        let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_ref() else {
+            return;
+        };
+        let runtime = crate::config::compile_v2_to_runtime(cfg).ok();
+        let (view, runtime_mgr) = match ctx.view.config.service {
+            crate::config::ServiceKind::Claude => {
+                (&cfg.claude, runtime.as_ref().map(|r| &r.claude))
+            }
+            crate::config::ServiceKind::Codex => (&cfg.codex, runtime.as_ref().map(|r| &r.codex)),
+        };
+        let mut names = view.groups.keys().cloned().collect::<Vec<_>>();
+        names.sort_by(|a, b| {
+            let la = view.groups.get(a).map(|c| c.level).unwrap_or(1);
+            let lb = view.groups.get(b).map(|c| c.level).unwrap_or(1);
+            la.cmp(&lb).then_with(|| a.cmp(b))
+        });
+        (
+            cfg.version,
+            view.active_group.clone(),
+            runtime_mgr.and_then(|mgr| mgr.active_config().map(|cfg| cfg.name.clone())),
+            view.default_profile.clone(),
+            names,
+        )
+    };
+
+    if station_names.is_empty() {
+        ui.add_space(6.0);
+        ui.label(pick(
+            ctx.lang,
+            "该服务下没有任何 station。请先在“原始”视图中添加 provider/station。",
+            "No stations found for this service. Add providers/stations via Raw view first.",
+        ));
+        return;
+    }
+
+    if ctx
+        .view
+        .config
+        .selected_name
+        .as_ref()
+        .is_none_or(|n| !station_names.iter().any(|x| x == n))
+    {
+        ctx.view.config.selected_name = station_names.first().cloned();
+    }
+
+    let selected_name = ctx.view.config.selected_name.clone();
+    let selected_service = match ctx.view.config.service {
+        crate::config::ServiceKind::Claude => "claude",
+        crate::config::ServiceKind::Codex => "codex",
+    };
+    let selected_station_name = selected_name.clone().unwrap_or_default();
+    let (runtime_service, supports_v1, cfg_health, hc_status): (
+        Option<String>,
+        bool,
+        Option<ConfigHealth>,
+        Option<HealthCheckStatus>,
+    ) = match ctx.proxy.kind() {
+        ProxyModeKind::Running => {
+            if let Some(r) = ctx.proxy.running() {
+                let state = r.state.clone();
+                let (health, checks) = ctx.rt.block_on(async {
+                    tokio::join!(
+                        state.get_config_health(r.service_name),
+                        state.list_health_checks(r.service_name)
+                    )
+                });
+                (
+                    Some(r.service_name.to_string()),
+                    true,
+                    health.get(&selected_station_name).cloned(),
+                    checks.get(&selected_station_name).cloned(),
+                )
+            } else {
+                (None, false, None, None)
+            }
+        }
+        ProxyModeKind::Attached => {
+            if let Some(att) = ctx.proxy.attached() {
+                (
+                    att.service_name.clone(),
+                    att.api_version == Some(1),
+                    att.config_health.get(&selected_station_name).cloned(),
+                    att.health_checks.get(&selected_station_name).cloned(),
+                )
+            } else {
+                (None, false, None, None)
+            }
+        }
+        _ => (None, false, None, None),
+    };
+
+    let mut action_set_active: Option<String> = None;
+    let mut action_clear_active = false;
+    let mut action_health_start: Option<(bool, Vec<String>)> = None;
+    let mut action_health_cancel: Option<(bool, Vec<String>)> = None;
+    let mut action_save_apply = false;
+
+    {
+        let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_mut() else {
+            return;
+        };
+        let view = match ctx.view.config.service {
+            crate::config::ServiceKind::Claude => &mut cfg.claude,
+            crate::config::ServiceKind::Codex => &mut cfg.codex,
+        };
+        let provider_catalog = view.providers.clone();
+        let profile_catalog = view.profiles.clone();
+
+        ui.columns(2, |cols| {
+            cols[0].heading(pick(ctx.lang, "站点列表", "Stations"));
+            cols[0].add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_salt("config_v2_stations_scroll")
+                .max_height(520.0)
+                .show(&mut cols[0], |ui| {
+                    for name in station_names.iter() {
+                        let is_active = active_name.as_deref() == Some(name.as_str());
+                        let is_fallback_active = active_name.is_none()
+                            && active_fallback.as_deref() == Some(name.as_str());
+                        let is_selected = selected_name.as_deref() == Some(name.as_str());
+
+                        let station = view.groups.get(name);
+                        let (enabled, level, alias, members, endpoint_refs) = station
+                            .map(|station| {
+                                let endpoint_refs = station
+                                    .members
+                                    .iter()
+                                    .map(|member| {
+                                        provider_catalog
+                                            .get(&member.provider)
+                                            .map(|provider| {
+                                                if member.endpoint_names.is_empty() {
+                                                    provider.endpoints.len()
+                                                } else {
+                                                    member.endpoint_names.len()
+                                                }
+                                            })
+                                            .unwrap_or(0)
+                                    })
+                                    .sum::<usize>();
+                                (
+                                    station.enabled,
+                                    station.level.clamp(1, 10),
+                                    station.alias.as_deref().unwrap_or(""),
+                                    station.members.len(),
+                                    endpoint_refs,
+                                )
+                            })
+                            .unwrap_or((false, 1, "", 0, 0));
+
+                        let mut label = format!("L{level} {name}");
+                        if !alias.trim().is_empty() {
+                            label.push_str(&format!(" ({alias})"));
+                        }
+                        label.push_str(&format!("  members={members} refs={endpoint_refs}"));
+                        if !enabled {
+                            label.push_str("  [off]");
+                        }
+                        if is_active {
+                            label = format!("★ {label}");
+                        } else if is_fallback_active {
+                            label = format!("◇ {label}");
+                        }
+
+                        if ui.selectable_label(is_selected, label).clicked() {
+                            ctx.view.config.selected_name = Some(name.clone());
+                        }
+                    }
+                });
+
+            cols[1].heading(pick(ctx.lang, "站点详情", "Station Details"));
+            cols[1].add_space(4.0);
+
+            let Some(name) = ctx.view.config.selected_name.clone() else {
+                cols[1].label(pick(ctx.lang, "未选择站点。", "No station selected."));
+                return;
+            };
+
+            let active_label = if active_name.as_deref() == Some(name.as_str()) {
+                pick(ctx.lang, "是", "yes")
+            } else {
+                pick(ctx.lang, "否", "no")
+            };
+            let effective_label = if active_name.is_some() {
+                active_name.as_deref().unwrap_or("-").to_string()
+            } else {
+                active_fallback
+                    .clone()
+                    .unwrap_or_else(|| pick(ctx.lang, "(无)", "(none)").to_string())
+            };
+
+            cols[1].label(format!("schema: v{schema_version}"));
+            cols[1].label(format!("active_station: {active_label}"));
+            cols[1].label(format!(
+                "{}: {effective_label}",
+                pick(ctx.lang, "生效站点", "Effective station")
+            ));
+            cols[1].label(format!(
+                "default_profile: {}",
+                default_profile.as_deref().unwrap_or("-")
+            ));
+            cols[1].add_space(6.0);
+
+            let Some(station_snapshot) = view.groups.get(&name).cloned() else {
+                cols[1].label(pick(
+                    ctx.lang,
+                    "站点不存在（可能已被删除）。",
+                    "Station missing.",
+                ));
+                return;
+            };
+
+            cols[1].label(format!("name: {}", name));
+            cols[1].label(format!(
+                "alias: {}",
+                station_snapshot.alias.as_deref().unwrap_or("-")
+            ));
+            cols[1].label(format!("members: {}", station_snapshot.members.len()));
+            let referencing_profiles = profile_catalog
+                .iter()
+                .filter_map(|(profile_name, profile)| {
+                    (profile.station.as_deref() == Some(name.as_str()))
+                        .then_some(profile_name.clone())
+                })
+                .collect::<Vec<_>>();
+            cols[1].label(format!(
+                "profiles: {}",
+                if referencing_profiles.is_empty() {
+                    "-".to_string()
+                } else {
+                    referencing_profiles.join(", ")
+                }
+            ));
+            cols[1].add_space(6.0);
+
+            cols[1].horizontal(|ui| {
+                if let Some(station) = view.groups.get_mut(&name) {
+                    ui.checkbox(&mut station.enabled, pick(ctx.lang, "启用", "Enabled"));
+                    ui.label(pick(ctx.lang, "等级", "Level"));
+                    ui.add(egui::DragValue::new(&mut station.level).range(1..=10));
+                }
+            });
+
+            cols[1].add_space(8.0);
+            cols[1].separator();
+            cols[1].label(pick(ctx.lang, "成员引用", "Members"));
+            egui::ScrollArea::vertical()
+                .id_salt("config_v2_station_members_scroll")
+                .max_height(160.0)
+                .show(&mut cols[1], |ui| {
+                    if station_snapshot.members.is_empty() {
+                        ui.label(pick(ctx.lang, "(无成员)", "(no members)"));
+                    } else {
+                        for member in &station_snapshot.members {
+                            let preferred = if member.preferred {
+                                pick(ctx.lang, "preferred", "preferred")
+                            } else {
+                                pick(ctx.lang, "normal", "normal")
+                            };
+                            if let Some(provider) = provider_catalog.get(&member.provider) {
+                                let endpoint_names = if member.endpoint_names.is_empty() {
+                                    provider.endpoints.keys().cloned().collect::<Vec<_>>()
+                                } else {
+                                    member.endpoint_names.clone()
+                                };
+                                let urls = endpoint_names
+                                    .iter()
+                                    .filter_map(|endpoint_name| {
+                                        provider.endpoints.get(endpoint_name).map(|endpoint| {
+                                            format!(
+                                                "{}={}",
+                                                endpoint_name,
+                                                shorten_middle(&endpoint.base_url, 52)
+                                            )
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+                                ui.label(format!(
+                                    "{}  provider={}  endpoints={}  {}",
+                                    preferred,
+                                    member.provider,
+                                    endpoint_names.join(", "),
+                                    provider.alias.as_deref().unwrap_or("-")
+                                ));
+                                if !urls.is_empty() {
+                                    ui.small(urls.join(" | "));
+                                }
+                            } else {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(200, 120, 40),
+                                    format!("missing provider: {}", member.provider),
+                                );
+                            }
+                            ui.add_space(4.0);
+                        }
+                    }
+                });
+
+            cols[1].add_space(8.0);
+            cols[1].separator();
+            cols[1].label(pick(ctx.lang, "相关 Provider", "Referenced Providers"));
+            egui::ScrollArea::vertical()
+                .id_salt("config_v2_station_providers_scroll")
+                .max_height(140.0)
+                .show(&mut cols[1], |ui| {
+                    let mut seen = HashSet::new();
+                    for member in &station_snapshot.members {
+                        if !seen.insert(member.provider.clone()) {
+                            continue;
+                        }
+                        let Some(provider) = provider_catalog.get(&member.provider) else {
+                            continue;
+                        };
+                        let auth_ref = provider
+                            .auth
+                            .auth_token_env
+                            .as_deref()
+                            .or(provider.auth.api_key_env.as_deref())
+                            .unwrap_or("-");
+                        ui.label(format!(
+                            "{}  alias={}  endpoints={}  enabled={}  auth={}",
+                            member.provider,
+                            provider.alias.as_deref().unwrap_or("-"),
+                            provider.endpoints.len(),
+                            provider.enabled,
+                            auth_ref
+                        ));
+                    }
+                    if station_snapshot.members.is_empty() {
+                        ui.label(pick(
+                            ctx.lang,
+                            "(无相关 provider)",
+                            "(no referenced providers)",
+                        ));
+                    }
+                });
+
+            cols[1].add_space(8.0);
+            cols[1].separator();
+            cols[1].label(pick(ctx.lang, "健康检查", "Health check"));
+            if runtime_service.is_none() {
+                cols[1].label(pick(
+                    ctx.lang,
+                    "代理未运行/未附着，无法执行健康检查。",
+                    "Proxy is not running/attached; health check disabled.",
+                ));
+            } else if !supports_v1 {
+                cols[1].label(pick(
+                    ctx.lang,
+                    "附着代理未启用 API v1：健康检查不可用。",
+                    "Attached proxy has no API v1: health check disabled.",
+                ));
+            } else if runtime_service.as_deref() != Some(selected_service) {
+                cols[1].label(pick(
+                    ctx.lang,
+                    "当前代理服务与所选服务不一致：健康检查已禁用。",
+                    "Runtime service differs from selected service: health check disabled.",
+                ));
+            } else {
+                if let Some(st) = hc_status.as_ref() {
+                    cols[1].label(format!(
+                        "status: {}/{} ok={} err={} cancel={} done={}",
+                        st.completed, st.total, st.ok, st.err, st.cancel_requested, st.done
+                    ));
+                    if let Some(e) = st.last_error.as_deref() {
+                        cols[1].colored_label(egui::Color32::from_rgb(200, 120, 40), e);
+                    }
+                } else {
+                    cols[1].label(pick(ctx.lang, "(无状态)", "(no status)"));
+                }
+
+                cols[1].horizontal(|ui| {
+                    if ui
+                        .button(pick(ctx.lang, "检查当前", "Check selected"))
+                        .clicked()
+                    {
+                        action_health_start = Some((false, vec![name.clone()]));
+                    }
+                    if ui
+                        .button(pick(ctx.lang, "取消当前", "Cancel selected"))
+                        .clicked()
+                    {
+                        action_health_cancel = Some((false, vec![name.clone()]));
+                    }
+                    if ui.button(pick(ctx.lang, "检查全部", "Check all")).clicked() {
+                        action_health_start = Some((true, Vec::new()));
+                    }
+                    if ui
+                        .button(pick(ctx.lang, "取消全部", "Cancel all"))
+                        .clicked()
+                    {
+                        action_health_cancel = Some((true, Vec::new()));
+                    }
+                });
+
+                if let Some(h) = cfg_health.as_ref() {
+                    cols[1].add_space(6.0);
+                    cols[1].label(format!(
+                        "{}: {}  upstreams={}",
+                        pick(ctx.lang, "最近检查", "Last checked"),
+                        h.checked_at_ms,
+                        h.upstreams.len()
+                    ));
+                }
+            }
+
+            cols[1].add_space(6.0);
+            cols[1].horizontal(|ui| {
+                if ui
+                    .button(pick(ctx.lang, "设为 active_station", "Set active_station"))
+                    .clicked()
+                {
+                    action_set_active = Some(name.clone());
+                }
+
+                if ui
+                    .button(pick(
+                        ctx.lang,
+                        "清除 active_station",
+                        "Clear active_station",
+                    ))
+                    .clicked()
+                {
+                    action_clear_active = true;
+                }
+
+                if ui
+                    .button(pick(ctx.lang, "保存并应用", "Save & apply"))
+                    .clicked()
+                {
+                    action_save_apply = true;
+                }
+            });
+        });
+    }
+
+    if let Some(name) = action_set_active {
+        let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_mut() else {
+            return;
+        };
+        let view = match ctx.view.config.service {
+            crate::config::ServiceKind::Claude => &mut cfg.claude,
+            crate::config::ServiceKind::Codex => &mut cfg.codex,
+        };
+        view.active_group = Some(name);
+        *ctx.last_info =
+            Some(pick(ctx.lang, "已设置 active_station", "active_station set").to_string());
+    }
+
+    if action_clear_active {
+        let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_mut() else {
+            return;
+        };
+        let view = match ctx.view.config.service {
+            crate::config::ServiceKind::Claude => &mut cfg.claude,
+            crate::config::ServiceKind::Codex => &mut cfg.codex,
+        };
+        view.active_group = None;
+        *ctx.last_info =
+            Some(pick(ctx.lang, "已清除 active_station", "active_station cleared").to_string());
+    }
+
+    if let Some((all, names)) = action_health_start {
+        if let Err(e) = ctx.proxy.start_health_checks(ctx.rt, all, names) {
+            *ctx.last_error = Some(format!("health check start failed: {e}"));
+        } else {
+            *ctx.last_info =
+                Some(pick(ctx.lang, "已开始健康检查", "Health check started").to_string());
+        }
+    }
+
+    if let Some((all, names)) = action_health_cancel {
+        if let Err(e) = ctx.proxy.cancel_health_checks(ctx.rt, all, names) {
+            *ctx.last_error = Some(format!("health check cancel failed: {e}"));
+        } else {
+            *ctx.last_info = Some(pick(ctx.lang, "已请求取消", "Cancel requested").to_string());
+        }
+    }
+
+    if action_save_apply {
+        let save_res = {
+            let cfg = ctx.view.config.working.as_ref().expect("checked above");
+            save_proxy_config_document(ctx.rt, cfg)
+        };
+        match save_res {
+            Ok(()) => {
+                let new_path = crate::config::config_file_path();
+                if let Ok(t) = std::fs::read_to_string(&new_path) {
+                    *ctx.proxy_config_text = t;
+                }
+                if let Ok(t) = std::fs::read_to_string(&new_path)
+                    && let Ok(parsed) = parse_proxy_config_document(&t)
                 {
                     ctx.view.config.working = Some(parsed);
                 }
@@ -4664,9 +5223,20 @@ fn render_config_raw(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         {
             match std::fs::read_to_string(ctx.proxy_config_path) {
                 Ok(t) => {
-                    *ctx.proxy_config_text = t;
-                    *ctx.last_info = Some(pick(ctx.lang, "已重载", "Reloaded").to_string());
-                    *ctx.last_error = None;
+                    *ctx.proxy_config_text = t.clone();
+                    match parse_proxy_config_document(&t) {
+                        Ok(doc) => {
+                            ctx.view.config.working = Some(doc);
+                            ctx.view.config.load_error = None;
+                            *ctx.last_info = Some(pick(ctx.lang, "已重载", "Reloaded").to_string());
+                            *ctx.last_error = None;
+                        }
+                        Err(e) => {
+                            ctx.view.config.working = None;
+                            ctx.view.config.load_error = Some(format!("parse failed: {e}"));
+                            *ctx.last_error = Some(format!("parse failed: {e}"));
+                        }
+                    }
                 }
                 Err(e) => {
                     *ctx.last_error = Some(format!("read config failed: {e}"));
@@ -4675,7 +5245,7 @@ fn render_config_raw(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
 
         if ui.button(pick(ctx.lang, "校验", "Validate")).clicked() {
-            match parse_proxy_config(ctx.proxy_config_text) {
+            match parse_proxy_config_document(ctx.proxy_config_text) {
                 Ok(_) => {
                     *ctx.last_info = Some(pick(ctx.lang, "校验通过", "Valid").to_string());
                     *ctx.last_error = None;
@@ -4690,18 +5260,33 @@ fn render_config_raw(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .button(pick(ctx.lang, "保存并应用", "Save & apply"))
             .clicked()
         {
-            match parse_proxy_config(ctx.proxy_config_text) {
+            match parse_proxy_config_document(ctx.proxy_config_text) {
                 Ok(cfg) => {
-                    let save = ctx.rt.block_on(crate::config::save_config(&cfg));
+                    let save = save_proxy_config_document(ctx.rt, &cfg);
                     match save {
                         Ok(()) => {
                             let new_path = crate::config::config_file_path();
                             match std::fs::read_to_string(&new_path) {
                                 Ok(t) => {
-                                    *ctx.proxy_config_text = t;
-                                    *ctx.last_info =
-                                        Some(pick(ctx.lang, "已保存", "Saved").to_string());
-                                    *ctx.last_error = None;
+                                    *ctx.proxy_config_text = t.clone();
+                                    match parse_proxy_config_document(&t) {
+                                        Ok(doc) => {
+                                            ctx.view.config.working = Some(doc);
+                                            ctx.view.config.load_error = None;
+                                            *ctx.last_info =
+                                                Some(pick(ctx.lang, "已保存", "Saved").to_string());
+                                            *ctx.last_error = None;
+                                        }
+                                        Err(e) => {
+                                            ctx.view.config.working = None;
+                                            ctx.view.config.load_error =
+                                                Some(format!("parse failed: {e}"));
+                                            *ctx.last_info =
+                                                Some(pick(ctx.lang, "已保存", "Saved").to_string());
+                                            *ctx.last_error =
+                                                Some(format!("re-read parse failed: {e}"));
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     *ctx.last_info =
@@ -4740,13 +5325,72 @@ fn render_config_raw(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.add(editor);
 }
 
-fn parse_proxy_config(text: &str) -> anyhow::Result<crate::config::ProxyConfig> {
-    // Be forgiving: try TOML first, then JSON.
-    if let Ok(v) = toml::from_str::<crate::config::ProxyConfig>(text) {
-        return Ok(v);
+fn parse_proxy_config_document(text: &str) -> anyhow::Result<ConfigWorkingDocument> {
+    if let Ok(value) = toml::from_str::<toml::Value>(text) {
+        let version = value
+            .get("version")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32);
+        if version == Some(2) {
+            let cfg = toml::from_str::<crate::config::ProxyConfigV2>(text)?;
+            crate::config::compile_v2_to_runtime(&cfg)?;
+            return Ok(ConfigWorkingDocument::V2(cfg));
+        }
+
+        if let Ok(cfg) = toml::from_str::<crate::config::ProxyConfig>(text) {
+            return Ok(ConfigWorkingDocument::Legacy(cfg));
+        }
     }
+
     let v = serde_json::from_str::<crate::config::ProxyConfig>(text)?;
-    Ok(v)
+    Ok(ConfigWorkingDocument::Legacy(v))
+}
+
+fn save_proxy_config_document(
+    rt: &tokio::runtime::Runtime,
+    doc: &ConfigWorkingDocument,
+) -> anyhow::Result<()> {
+    match doc {
+        ConfigWorkingDocument::Legacy(cfg) => rt.block_on(crate::config::save_config(cfg))?,
+        ConfigWorkingDocument::V2(cfg) => {
+            rt.block_on(crate::config::save_config_v2(cfg))?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_codex_auth_into_document(
+    doc: &mut ConfigWorkingDocument,
+    options: crate::config::SyncCodexAuthFromCodexOptions,
+) -> anyhow::Result<crate::config::SyncCodexAuthFromCodexReport> {
+    match doc {
+        ConfigWorkingDocument::Legacy(cfg) => {
+            crate::config::sync_codex_auth_from_codex_cli(cfg, options)
+        }
+        ConfigWorkingDocument::V2(cfg) => {
+            let mut runtime = crate::config::compile_v2_to_runtime(cfg)?;
+            let report = crate::config::sync_codex_auth_from_codex_cli(&mut runtime, options)?;
+            *cfg =
+                crate::config::compact_v2_config(&crate::config::migrate_legacy_to_v2(&runtime))?;
+            Ok(report)
+        }
+    }
+}
+
+fn working_legacy_config(view: &ConfigViewState) -> Option<&crate::config::ProxyConfig> {
+    match view.working.as_ref()? {
+        ConfigWorkingDocument::Legacy(cfg) => Some(cfg),
+        ConfigWorkingDocument::V2(_) => None,
+    }
+}
+
+fn working_legacy_config_mut(
+    view: &mut ConfigViewState,
+) -> Option<&mut crate::config::ProxyConfig> {
+    match view.working.as_mut()? {
+        ConfigWorkingDocument::Legacy(cfg) => Some(cfg),
+        ConfigWorkingDocument::V2(_) => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
