@@ -322,10 +322,7 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         .json::<HashMap<String, String>>()
         .await
         .expect("get model json");
-    assert_eq!(
-        model_map.get("s2").map(String::as_str),
-        Some("gpt-5.4-mini")
-    );
+    assert!(!model_map.contains_key("s2"));
 
     let tier_map = client
         .get(format!(
@@ -340,7 +337,7 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         .json::<HashMap<String, String>>()
         .await
         .expect("get tier json");
-    assert_eq!(tier_map.get("s2").map(String::as_str), Some("priority"));
+    assert!(!tier_map.contains_key("s2"));
 
     proxy_handle.abort();
 }
@@ -451,6 +448,133 @@ async fn proxy_api_v1_snapshot_works() {
     );
 
     proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_default_profile_binding_applies_to_new_session() {
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(|body: Bytes| async move {
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("echo upstream json");
+            (StatusCode::OK, Json(json))
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let mut cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", upstream_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: {
+                let mut t = HashMap::new();
+                t.insert("provider_id".to_string(), "u-bind".to_string());
+                t
+            },
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    cfg.codex.default_profile = Some("daily".to_string());
+    cfg.codex.profiles.insert(
+        "daily".to_string(),
+        ServiceControlProfile {
+            station: Some("test".to_string()),
+            model: Some("gpt-5.4-fast".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            service_tier: Some("priority".to_string()),
+        },
+    );
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .header("session_id", "sid-bind")
+        .body(r#"{"input":"hi"}"#)
+        .send()
+        .await
+        .expect("send bind request")
+        .error_for_status()
+        .expect("bind request status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("bind request json");
+
+    assert_eq!(
+        resp.get("model").and_then(|v| v.as_str()),
+        Some("gpt-5.4-fast")
+    );
+    assert_eq!(
+        resp.get("service_tier").and_then(|v| v.as_str()),
+        Some("priority")
+    );
+    assert_eq!(
+        resp.get("reasoning")
+            .and_then(|v| v.get("effort"))
+            .and_then(|v| v.as_str()),
+        Some("low")
+    );
+
+    let snap = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/snapshot?recent_limit=10&stats_days=7",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("binding snapshot send")
+        .error_for_status()
+        .expect("binding snapshot status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("binding snapshot json");
+
+    let card = &snap["snapshot"]["session_cards"][0];
+    assert_eq!(
+        card.get("binding_profile_name").and_then(|v| v.as_str()),
+        Some("daily")
+    );
+    assert_eq!(
+        card.get("binding_continuity_mode").and_then(|v| v.as_str()),
+        Some("default_profile")
+    );
+    assert_eq!(
+        card["effective_model"]
+            .get("source")
+            .and_then(|v| v.as_str()),
+        Some("profile_default")
+    );
+    assert_eq!(
+        card["effective_config_name"]
+            .get("value")
+            .and_then(|v| v.as_str()),
+        Some("test")
+    );
+    assert_eq!(
+        card["effective_config_name"]
+            .get("source")
+            .and_then(|v| v.as_str()),
+        Some("profile_default")
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
 }
 
 #[tokio::test]

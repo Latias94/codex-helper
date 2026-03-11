@@ -2191,6 +2191,11 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
         let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");
         let observed_service_tier = row.last_service_tier.as_deref().unwrap_or("-");
+        let binding_profile = row.binding_profile_name.as_deref().unwrap_or("-");
+        let binding_mode = row
+            .binding_continuity_mode
+            .map(|mode| format!("{mode:?}").to_ascii_lowercase())
+            .unwrap_or_else(|| "-".to_string());
         let effective_model = format_resolved_route_value(row.effective_model.as_ref(), ctx.lang);
         let effective_cfg =
             format_resolved_route_value(row.effective_config_name.as_ref(), ctx.lang);
@@ -2204,6 +2209,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].label(format!("session: {sid_full}"));
         cols[1].label(format!("cwd: {cwd_full}"));
         cols[1].label(format!("provider: {provider}"));
+        cols[1].label(format!("binding: {binding_profile} ({binding_mode})"));
         cols[1].separator();
         cols[1].label(pick(ctx.lang, "观测到的最近路由", "Observed route"));
         cols[1].label(format!("model(last): {observed_model}"));
@@ -2678,6 +2684,7 @@ fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
         row.last_provider_id.as_deref(),
         row.last_config_name.as_deref(),
         row.last_upstream_base_url.as_deref(),
+        row.binding_profile_name.as_deref(),
         row.effective_model.as_ref().map(|v| v.value.as_str()),
         row.effective_reasoning_effort
             .as_ref()
@@ -4336,6 +4343,8 @@ struct SessionRow {
     total_usage: Option<UsageMetrics>,
     turns_total: Option<u64>,
     turns_with_usage: Option<u64>,
+    binding_profile_name: Option<String>,
+    binding_continuity_mode: Option<crate::state::SessionContinuityMode>,
     effective_model: Option<ResolvedRouteValue>,
     effective_reasoning_effort: Option<ResolvedRouteValue>,
     effective_service_tier: Option<ResolvedRouteValue>,
@@ -4368,6 +4377,8 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
             total_usage: card.total_usage.clone(),
             turns_total: card.turns_total,
             turns_with_usage: card.turns_with_usage,
+            binding_profile_name: card.binding_profile_name.clone(),
+            binding_continuity_mode: card.binding_continuity_mode,
             effective_model: card.effective_model.clone(),
             effective_reasoning_effort: card.effective_reasoning_effort.clone(),
             effective_service_tier: card.effective_service_tier.clone(),
@@ -4417,6 +4428,8 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
@@ -4478,6 +4491,8 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
@@ -4535,6 +4550,8 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
@@ -4604,6 +4621,8 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
@@ -4637,6 +4656,8 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
@@ -4670,6 +4691,8 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
@@ -4703,6 +4726,8 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,

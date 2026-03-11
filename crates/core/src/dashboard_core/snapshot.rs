@@ -73,6 +73,7 @@ pub async fn build_dashboard_snapshot(
         session_cfg,
         session_effort,
         session_service_tier,
+        session_bindings,
         session_stats,
         usage_rollup,
         config_health,
@@ -86,6 +87,7 @@ pub async fn build_dashboard_snapshot(
         state.list_session_config_overrides(),
         state.list_session_effort_overrides(),
         state.list_session_service_tier_overrides(),
+        state.list_session_bindings(),
         state.list_session_stats(),
         state.get_usage_rollup_view(service_name, 12, stats_days),
         state.get_config_health(service_name),
@@ -102,6 +104,7 @@ pub async fn build_dashboard_snapshot(
         &session_cfg,
         &session_model,
         &session_service_tier,
+        &session_bindings,
         global_override.as_deref(),
         &session_stats,
     );

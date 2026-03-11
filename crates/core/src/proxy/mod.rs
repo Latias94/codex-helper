@@ -631,7 +631,39 @@ impl ProxyService {
         }
     }
 
-    async fn pinned_config(&self, session_id: Option<&str>) -> Option<(String, &'static str)> {
+    async fn ensure_default_session_binding(
+        &self,
+        mgr: &ServiceConfigManager,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Option<crate::state::SessionBinding> {
+        if let Some(binding) = self.state.get_session_binding(session_id).await {
+            self.state.touch_session_binding(session_id, now_ms).await;
+            return Some(binding);
+        }
+
+        let (profile_name, profile) = mgr.default_profile_ref()?;
+        let binding = crate::state::SessionBinding {
+            session_id: session_id.to_string(),
+            profile_name: Some(profile_name.to_string()),
+            station_name: profile.station.clone(),
+            model: profile.model.clone(),
+            reasoning_effort: profile.reasoning_effort.clone(),
+            service_tier: profile.service_tier.clone(),
+            continuity_mode: crate::state::SessionContinuityMode::DefaultProfile,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            last_seen_ms: now_ms,
+        };
+        self.state.set_session_binding(binding.clone()).await;
+        Some(binding)
+    }
+
+    async fn pinned_config(
+        &self,
+        mgr: &ServiceConfigManager,
+        session_id: Option<&str>,
+    ) -> Option<(String, &'static str)> {
         if let Some(sid) = session_id
             && let Some(name) = self.state.get_session_config_override(sid).await
             && !name.trim().is_empty()
@@ -642,6 +674,14 @@ impl ProxyService {
             && !name.trim().is_empty()
         {
             return Some((name, "global"));
+        }
+        if let Some(sid) = session_id
+            && let Some(binding) = self.state.get_session_binding(sid).await
+            && let Some(name) = binding.station_name
+            && !name.trim().is_empty()
+            && mgr.configs.contains_key(name.as_str())
+        {
+            return Some((name, "profile_default"));
         }
         None
     }
@@ -656,7 +696,7 @@ impl ProxyService {
             .state
             .get_config_meta_overrides(self.service_name)
             .await;
-        if let Some((name, source)) = self.pinned_config(session_id).await {
+        if let Some((name, source)) = self.pinned_config(mgr, session_id).await {
             if let Some(svc) = mgr
                 .configs
                 .get(&name)
@@ -1006,6 +1046,14 @@ pub async fn handle_proxy(
 
     proxy.config.maybe_reload_from_disk().await;
     let cfg_snapshot = proxy.config.snapshot().await;
+    let mgr = proxy.service_manager(cfg_snapshot.as_ref());
+    let session_binding = if let Some(id) = session_id.as_deref() {
+        proxy
+            .ensure_default_session_binding(mgr, id, started_at_ms)
+            .await
+    } else {
+        None
+    };
     let lbs = proxy
         .lbs_for_request(cfg_snapshot.as_ref(), session_id.as_deref())
         .await;
@@ -1095,6 +1143,7 @@ pub async fn handle_proxy(
             .state
             .touch_session_service_tier_override(id, started_at_ms)
             .await;
+        proxy.state.touch_session_binding(id, started_at_ms).await;
     }
 
     // Read request body and apply filters.
@@ -1159,36 +1208,69 @@ pub async fn handle_proxy(
     } else {
         None
     };
-    let mut body_for_upstream = if let Some(ref effort) = override_effort {
-        Bytes::from(
+    let binding_effort = session_binding
+        .as_ref()
+        .and_then(|binding| binding.reasoning_effort.as_deref());
+    let mut body_for_upstream = match (override_effort.as_deref(), original_effort.as_deref()) {
+        (Some(effort), _) => Bytes::from(
             apply_reasoning_effort_override(&raw_body, effort)
                 .unwrap_or_else(|| raw_body.as_ref().to_vec()),
-        )
-    } else {
-        raw_body.clone()
+        ),
+        (None, None) => {
+            if let Some(effort) = binding_effort {
+                Bytes::from(
+                    apply_reasoning_effort_override(&raw_body, effort)
+                        .unwrap_or_else(|| raw_body.as_ref().to_vec()),
+                )
+            } else {
+                raw_body.clone()
+            }
+        }
+        (None, Some(_)) => raw_body.clone(),
     };
     let effective_effort = extract_reasoning_effort_from_request_body(body_for_upstream.as_ref())
         .or(original_effort.clone());
 
+    let original_model = extract_model_from_request_body(&raw_body);
     let override_model = if let Some(id) = session_id.as_deref() {
         proxy.state.get_session_model_override(id).await
     } else {
         None
     };
-    if let Some(ref model) = override_model {
+    let binding_model = session_binding
+        .as_ref()
+        .and_then(|binding| binding.model.as_deref());
+    if let Some(model) = override_model.as_deref() {
+        body_for_upstream = Bytes::from(
+            apply_model_override(body_for_upstream.as_ref(), model)
+                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
+        );
+    } else if original_model.is_none()
+        && let Some(model) = binding_model
+    {
         body_for_upstream = Bytes::from(
             apply_model_override(body_for_upstream.as_ref(), model)
                 .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
         );
     }
 
-    let original_service_tier = extract_service_tier_from_request_body(body_for_upstream.as_ref());
+    let original_service_tier = extract_service_tier_from_request_body(&raw_body);
     let override_service_tier = if let Some(id) = session_id.as_deref() {
         proxy.state.get_session_service_tier_override(id).await
     } else {
         None
     };
-    if let Some(ref service_tier) = override_service_tier {
+    let binding_service_tier = session_binding
+        .as_ref()
+        .and_then(|binding| binding.service_tier.as_deref());
+    if let Some(service_tier) = override_service_tier.as_deref() {
+        body_for_upstream = Bytes::from(
+            apply_service_tier_override(body_for_upstream.as_ref(), service_tier)
+                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
+        );
+    } else if original_service_tier.is_none()
+        && let Some(service_tier) = binding_service_tier
+    {
         body_for_upstream = Bytes::from(
             apply_service_tier_override(body_for_upstream.as_ref(), service_tier)
                 .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
@@ -3289,53 +3371,37 @@ pub fn router(proxy: ProxyService) -> Router {
         };
 
         let now = now_ms();
-        if let Some(station) = profile.station.clone() {
-            proxy
-                .state
-                .set_session_config_override(payload.session_id.clone(), station, now)
-                .await;
-        } else {
-            proxy
-                .state
-                .clear_session_config_override(payload.session_id.as_str())
-                .await;
-        }
-
-        if let Some(model) = profile.model.clone() {
-            proxy
-                .state
-                .set_session_model_override(payload.session_id.clone(), model, now)
-                .await;
-        } else {
-            proxy
-                .state
-                .clear_session_model_override(payload.session_id.as_str())
-                .await;
-        }
-
-        if let Some(effort) = profile.reasoning_effort.clone() {
-            proxy
-                .state
-                .set_session_effort_override(payload.session_id.clone(), effort, now)
-                .await;
-        } else {
-            proxy
-                .state
-                .clear_session_effort_override(payload.session_id.as_str())
-                .await;
-        }
-
-        if let Some(service_tier) = profile.service_tier.clone() {
-            proxy
-                .state
-                .set_session_service_tier_override(payload.session_id, service_tier, now)
-                .await;
-        } else {
-            proxy
-                .state
-                .clear_session_service_tier_override(payload.session_id.as_str())
-                .await;
-        }
+        proxy
+            .state
+            .set_session_binding(crate::state::SessionBinding {
+                session_id: payload.session_id.clone(),
+                profile_name: Some(payload.profile_name),
+                station_name: profile.station.clone(),
+                model: profile.model.clone(),
+                reasoning_effort: profile.reasoning_effort.clone(),
+                service_tier: profile.service_tier.clone(),
+                continuity_mode: crate::state::SessionContinuityMode::ManualProfile,
+                created_at_ms: now,
+                updated_at_ms: now,
+                last_seen_ms: now,
+            })
+            .await;
+        proxy
+            .state
+            .clear_session_config_override(payload.session_id.as_str())
+            .await;
+        proxy
+            .state
+            .clear_session_model_override(payload.session_id.as_str())
+            .await;
+        proxy
+            .state
+            .clear_session_effort_override(payload.session_id.as_str())
+            .await;
+        proxy
+            .state
+            .clear_session_service_tier_override(payload.session_id.as_str())
+            .await;
         Ok(StatusCode::NO_CONTENT)
     }
 

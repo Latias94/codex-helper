@@ -238,6 +238,33 @@ pub struct SessionStats {
     pub last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionContinuityMode {
+    #[default]
+    DefaultProfile,
+    ManualProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionBinding {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub station_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    pub continuity_mode: SessionContinuityMode,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub last_seen_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteValueSource {
@@ -299,6 +326,10 @@ pub struct SessionIdentityCard {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turns_with_usage: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_profile_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_continuity_mode: Option<SessionContinuityMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_model: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_reasoning_effort: Option<ResolvedRouteValue>,
@@ -351,6 +382,11 @@ struct SessionServiceTierOverride {
 }
 
 #[derive(Debug, Clone)]
+struct SessionBindingEntry {
+    binding: SessionBinding,
+}
+
+#[derive(Debug, Clone)]
 struct SessionCwdCacheEntry {
     cwd: Option<String>,
     last_seen_ms: u64,
@@ -377,6 +413,7 @@ pub struct ProxyState {
     session_config_overrides: RwLock<HashMap<String, SessionConfigOverride>>,
     session_model_overrides: RwLock<HashMap<String, SessionModelOverride>>,
     session_service_tier_overrides: RwLock<HashMap<String, SessionServiceTierOverride>>,
+    session_bindings: RwLock<HashMap<String, SessionBindingEntry>>,
     global_config_override: RwLock<Option<String>>,
     config_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
@@ -426,6 +463,7 @@ impl ProxyState {
             session_config_overrides: RwLock::new(HashMap::new()),
             session_model_overrides: RwLock::new(HashMap::new()),
             session_service_tier_overrides: RwLock::new(HashMap::new()),
+            session_bindings: RwLock::new(HashMap::new()),
             global_config_override: RwLock::new(None),
             config_meta_overrides: RwLock::new(HashMap::new()),
             session_cwd_cache: RwLock::new(HashMap::new()),
@@ -562,6 +600,44 @@ impl ProxyState {
         let mut guard = self.session_service_tier_overrides.write().await;
         if let Some(v) = guard.get_mut(session_id) {
             v.last_seen_ms = now_ms;
+        }
+    }
+
+    pub async fn get_session_binding(&self, session_id: &str) -> Option<SessionBinding> {
+        let guard = self.session_bindings.read().await;
+        guard.get(session_id).map(|entry| entry.binding.clone())
+    }
+
+    pub async fn list_session_bindings(&self) -> HashMap<String, SessionBinding> {
+        let guard = self.session_bindings.read().await;
+        guard
+            .iter()
+            .map(|(sid, entry)| (sid.clone(), entry.binding.clone()))
+            .collect()
+    }
+
+    pub async fn set_session_binding(&self, binding: SessionBinding) {
+        let mut guard = self.session_bindings.write().await;
+        let binding = if let Some(existing) = guard.get(binding.session_id.as_str()) {
+            SessionBinding {
+                created_at_ms: existing.binding.created_at_ms,
+                ..binding
+            }
+        } else {
+            binding
+        };
+        guard.insert(binding.session_id.clone(), SessionBindingEntry { binding });
+    }
+
+    pub async fn clear_session_binding(&self, session_id: &str) {
+        let mut guard = self.session_bindings.write().await;
+        guard.remove(session_id);
+    }
+
+    pub async fn touch_session_binding(&self, session_id: &str, now_ms: u64) {
+        let mut guard = self.session_bindings.write().await;
+        if let Some(entry) = guard.get_mut(session_id) {
+            entry.binding.last_seen_ms = now_ms;
         }
     }
 
@@ -1373,6 +1449,7 @@ impl ProxyState {
             config_overrides,
             model_overrides,
             service_tier_overrides,
+            bindings,
             global_override,
             stats,
         ) = tokio::join!(
@@ -1382,6 +1459,7 @@ impl ProxyState {
             self.list_session_config_overrides(),
             self.list_session_model_overrides(),
             self.list_session_service_tier_overrides(),
+            self.list_session_bindings(),
             self.get_global_config_override(),
             self.list_session_stats(),
         );
@@ -1392,6 +1470,7 @@ impl ProxyState {
             &config_overrides,
             &model_overrides,
             &service_tier_overrides,
+            &bindings,
             global_override.as_deref(),
             &stats,
         )
@@ -1464,6 +1543,17 @@ impl ProxyState {
                     return true;
                 }
                 v.last_seen_ms >= cutoff_override
+            });
+        }
+
+        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
+            let cutoff_binding = now_ms - self.session_override_ttl_ms;
+            let mut bindings = self.session_bindings.write().await;
+            bindings.retain(|sid, entry| {
+                if active_sessions.contains_key(sid) {
+                    return true;
+                }
+                entry.binding.last_seen_ms >= cutoff_binding
             });
         }
 
@@ -1558,6 +1648,8 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         total_usage: None,
         turns_total: None,
         turns_with_usage: None,
+        binding_profile_name: None,
+        binding_continuity_mode: None,
         effective_model: None,
         effective_reasoning_effort: None,
         effective_service_tier: None,
@@ -1580,6 +1672,7 @@ fn non_empty_trimmed(value: Option<&str>) -> Option<String> {
 fn resolve_effective_observed_value(
     override_value: Option<&str>,
     observed_value: Option<&str>,
+    binding_value: Option<&str>,
 ) -> Option<ResolvedRouteValue> {
     if let Some(value) = non_empty_trimmed(override_value) {
         return Some(ResolvedRouteValue::new(
@@ -1587,13 +1680,21 @@ fn resolve_effective_observed_value(
             RouteValueSource::SessionOverride,
         ));
     }
+    let binding_value = non_empty_trimmed(binding_value);
+    if let Some(binding) = binding_value {
+        return Some(ResolvedRouteValue::new(
+            binding,
+            RouteValueSource::ProfileDefault,
+        ));
+    }
     non_empty_trimmed(observed_value)
-        .map(|value| ResolvedRouteValue::new(value, RouteValueSource::RequestPayload))
+        .map(|observed| ResolvedRouteValue::new(observed, RouteValueSource::RequestPayload))
 }
 
 fn resolve_effective_config_value(
     card: &SessionIdentityCard,
     global_config_override: Option<&str>,
+    binding_station_name: Option<&str>,
 ) -> Option<ResolvedRouteValue> {
     if let Some(value) = non_empty_trimmed(card.override_config_name.as_deref()) {
         return Some(ResolvedRouteValue::new(
@@ -1607,27 +1708,44 @@ fn resolve_effective_config_value(
             RouteValueSource::GlobalOverride,
         ));
     }
+    let binding = non_empty_trimmed(binding_station_name);
+    if let Some(binding) = binding {
+        return Some(ResolvedRouteValue::new(
+            binding,
+            RouteValueSource::ProfileDefault,
+        ));
+    }
     non_empty_trimmed(card.last_config_name.as_deref())
-        .map(|value| ResolvedRouteValue::new(value, RouteValueSource::RuntimeFallback))
+        .map(|observed| ResolvedRouteValue::new(observed, RouteValueSource::RuntimeFallback))
 }
 
 fn apply_basic_effective_route(
     card: &mut SessionIdentityCard,
     global_config_override: Option<&str>,
+    binding: Option<&SessionBinding>,
 ) {
     card.effective_model = resolve_effective_observed_value(
         card.override_model.as_deref(),
         card.last_model.as_deref(),
+        binding.and_then(|binding| binding.model.as_deref()),
     );
     card.effective_reasoning_effort = resolve_effective_observed_value(
         card.override_effort.as_deref(),
         card.last_reasoning_effort.as_deref(),
+        binding.and_then(|binding| binding.reasoning_effort.as_deref()),
     );
     card.effective_service_tier = resolve_effective_observed_value(
         card.override_service_tier.as_deref(),
         card.last_service_tier.as_deref(),
+        binding.and_then(|binding| binding.service_tier.as_deref()),
     );
-    card.effective_config_name = resolve_effective_config_value(card, global_config_override);
+    card.binding_profile_name = binding.and_then(|binding| binding.profile_name.clone());
+    card.binding_continuity_mode = binding.map(|binding| binding.continuity_mode);
+    card.effective_config_name = resolve_effective_config_value(
+        card,
+        global_config_override,
+        binding.and_then(|binding| binding.station_name.as_deref()),
+    );
     card.effective_upstream_base_url = match (
         card.effective_config_name.as_ref(),
         non_empty_trimmed(card.last_config_name.as_deref()),
@@ -1722,6 +1840,7 @@ pub fn build_session_identity_cards_from_parts(
     config_overrides: &HashMap<String, String>,
     model_overrides: &HashMap<String, String>,
     service_tier_overrides: &HashMap<String, String>,
+    bindings: &HashMap<String, SessionBinding>,
     global_config_override: Option<&str>,
     stats: &HashMap<String, SessionStats>,
 ) -> Vec<SessionIdentityCard> {
@@ -1875,7 +1994,11 @@ pub fn build_session_identity_cards_from_parts(
 
     let mut cards = map.into_values().collect::<Vec<_>>();
     for card in &mut cards {
-        apply_basic_effective_route(card, global_config_override);
+        let binding = card
+            .session_id
+            .as_deref()
+            .and_then(|session_id| bindings.get(session_id));
+        apply_basic_effective_route(card, global_config_override, binding);
     }
     cards.sort_by_key(|card| std::cmp::Reverse(session_identity_sort_key(card)));
     cards
@@ -1988,6 +2111,7 @@ mod tests {
             &config_overrides,
             &model_overrides,
             &service_tier_overrides,
+            &HashMap::new(),
             None,
             &stats,
         );
@@ -2043,6 +2167,86 @@ mod tests {
         assert_eq!(
             cards[1].total_usage.as_ref().map(|u| u.total_tokens),
             Some(35)
+        );
+    }
+
+    #[test]
+    fn build_session_identity_cards_prefers_binding_defaults_for_effective_route() {
+        let active = vec![ActiveRequest {
+            id: 1,
+            session_id: Some("sid-bound".to_string()),
+            cwd: None,
+            model: Some("gpt-observed".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: Some("default".to_string()),
+            config_name: Some("right".to_string()),
+            provider_id: None,
+            upstream_base_url: None,
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            started_at_ms: 10,
+        }];
+        let bindings = HashMap::from([(
+            "sid-bound".to_string(),
+            SessionBinding {
+                session_id: "sid-bound".to_string(),
+                profile_name: Some("daily".to_string()),
+                station_name: Some("vibe".to_string()),
+                model: Some("gpt-bound".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                service_tier: Some("priority".to_string()),
+                continuity_mode: SessionContinuityMode::DefaultProfile,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                last_seen_ms: 10,
+            },
+        )]);
+
+        let cards = build_session_identity_cards_from_parts(
+            &active,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &bindings,
+            None,
+            &HashMap::new(),
+        );
+
+        assert_eq!(cards[0].binding_profile_name.as_deref(), Some("daily"));
+        assert_eq!(
+            cards[0].binding_continuity_mode,
+            Some(SessionContinuityMode::DefaultProfile)
+        );
+        assert_eq!(
+            cards[0]
+                .effective_model
+                .as_ref()
+                .map(|value| (value.value.as_str(), value.source)),
+            Some(("gpt-bound", RouteValueSource::ProfileDefault))
+        );
+        assert_eq!(
+            cards[0]
+                .effective_reasoning_effort
+                .as_ref()
+                .map(|value| (value.value.as_str(), value.source)),
+            Some(("high", RouteValueSource::ProfileDefault))
+        );
+        assert_eq!(
+            cards[0]
+                .effective_service_tier
+                .as_ref()
+                .map(|value| (value.value.as_str(), value.source)),
+            Some(("priority", RouteValueSource::ProfileDefault))
+        );
+        assert_eq!(
+            cards[0]
+                .effective_config_name
+                .as_ref()
+                .map(|value| (value.value.as_str(), value.source)),
+            Some(("vibe", RouteValueSource::ProfileDefault))
         );
     }
 

@@ -1141,43 +1141,24 @@ impl ProxyController {
                     let profile = mgr
                         .profile(profile_name.as_str())
                         .with_context(|| format!("profile not found: {profile_name}"))?;
-
-                    match profile.station.clone() {
-                        Some(station) => {
-                            state
-                                .set_session_config_override(session_id.clone(), station, now)
-                                .await
-                        }
-                        None => state.clear_session_config_override(&session_id).await,
-                    }
-                    match profile.model.clone() {
-                        Some(model) => {
-                            state
-                                .set_session_model_override(session_id.clone(), model, now)
-                                .await
-                        }
-                        None => state.clear_session_model_override(&session_id).await,
-                    }
-                    match profile.reasoning_effort.clone() {
-                        Some(effort) => {
-                            state
-                                .set_session_effort_override(session_id.clone(), effort, now)
-                                .await
-                        }
-                        None => state.clear_session_effort_override(&session_id).await,
-                    }
-                    match profile.service_tier.clone() {
-                        Some(service_tier) => {
-                            state
-                                .set_session_service_tier_override(
-                                    session_id.clone(),
-                                    service_tier,
-                                    now,
-                                )
-                                .await
-                        }
-                        None => state.clear_session_service_tier_override(&session_id).await,
-                    }
+                    state
+                        .set_session_binding(crate::state::SessionBinding {
+                            session_id: session_id.clone(),
+                            profile_name: Some(profile_name),
+                            station_name: profile.station.clone(),
+                            model: profile.model.clone(),
+                            reasoning_effort: profile.reasoning_effort.clone(),
+                            service_tier: profile.service_tier.clone(),
+                            continuity_mode: crate::state::SessionContinuityMode::ManualProfile,
+                            created_at_ms: now,
+                            updated_at_ms: now,
+                            last_seen_ms: now,
+                        })
+                        .await;
+                    state.clear_session_config_override(&session_id).await;
+                    state.clear_session_model_override(&session_id).await;
+                    state.clear_session_effort_override(&session_id).await;
+                    state.clear_session_service_tier_override(&session_id).await;
 
                     Ok::<(), anyhow::Error>(())
                 })?;

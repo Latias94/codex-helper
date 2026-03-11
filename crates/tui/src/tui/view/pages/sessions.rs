@@ -201,6 +201,11 @@ pub(super) fn render_sessions_page(
         let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
         let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");
         let observed_service_tier = row.last_service_tier.as_deref().unwrap_or("-");
+        let binding_profile = row.binding_profile_name.as_deref().unwrap_or("-");
+        let binding_mode = row
+            .binding_continuity_mode
+            .map(|mode| format!("{mode:?}").to_ascii_lowercase())
+            .unwrap_or_else(|| "-".to_string());
         let effective_model = format_resolved_route_value(row.effective_model.as_ref());
         let effective_cfg = format_resolved_route_value(row.effective_config_name.as_ref());
         let effective_upstream =
@@ -230,6 +235,12 @@ pub(super) fn render_sessions_page(
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ));
         lines.push(kv_line(p, "cwd", cwd_full, Style::default().fg(p.text)));
+        lines.push(kv_line(
+            p,
+            "binding",
+            format!("{binding_profile} ({binding_mode})"),
+            Style::default().fg(p.text),
+        ));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             "Observed route",

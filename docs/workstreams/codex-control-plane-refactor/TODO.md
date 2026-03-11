@@ -43,7 +43,7 @@
 
 ## WS1 - Session Identity and Effective Route
 
-- [ ] CP-101 Add a first-class `SessionBinding` model in core state
+- [x] CP-101 Add a first-class `SessionBinding` model in core state
 - [x] CP-102 Add `effective route` resolution output:
   - station
   - upstream
@@ -75,7 +75,7 @@
 ## WS3 - Profile System
 
 - [x] CP-301 Introduce `Profile` schema in config
-- [ ] CP-302 Define default profile semantics for new sessions
+- [x] CP-302 Define default profile semantics for new sessions
 - [ ] CP-303 Add profile inheritance / `extends`
 - [ ] CP-304 Add profile CRUD in local API
 - [ ] CP-305 Replace weak routing preset concept with profile concept in GUI config
