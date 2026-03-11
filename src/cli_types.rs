@@ -217,8 +217,8 @@ pub enum ConfigCommand {
         /// Output JSON instead of text
         #[arg(long)]
         json: bool,
-        /// Show details for a single group/config
-        #[arg(long)]
+        /// Show details for a single station/config
+        #[arg(long, visible_alias = "station")]
         group: Option<String>,
     },
     /// Add a new config

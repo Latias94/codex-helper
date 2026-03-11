@@ -876,7 +876,12 @@ impl Default for ProxyConfigV2 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServiceViewV2 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "active_station",
+        alias = "active_group"
+    )]
     pub active_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
@@ -884,7 +889,12 @@ pub struct ServiceViewV2 {
     pub profiles: BTreeMap<String, ServiceControlProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, ProviderConfigV2>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        rename = "stations",
+        alias = "groups"
+    )]
     pub groups: BTreeMap<String, GroupConfigV2>,
 }
 
@@ -1035,7 +1045,7 @@ fn compile_service_view_v2(
         && !view.groups.contains_key(active_group)
     {
         anyhow::bail!(
-            "[{service_name}] active_group '{}' does not exist in groups",
+            "[{service_name}] active_station '{}' does not exist in stations",
             active_group
         );
     }
@@ -2256,14 +2266,23 @@ env_key = "RIGHTCODE_API_KEY"
                 .await
                 .expect("init_config_toml");
             let text = std::fs::read_to_string(&path).expect("read config.toml");
+            assert!(text.contains("version = 2"), "expected v2 template");
             assert!(
                 text.contains("\n[codex]\n"),
                 "expected init to insert a real [codex] block (path={:?})",
                 path
             );
             assert!(
-                text.contains("active = \"right\""),
-                "expected imported active config to be present"
+                text.contains("active_station = \"right\""),
+                "expected imported active station to be present"
+            );
+            assert!(
+                text.contains("[codex.providers.right]"),
+                "expected imported provider block to be present"
+            );
+            assert!(
+                text.contains("[codex.stations.right]"),
+                "expected imported station block to be present"
             );
             assert!(
                 text.contains("\n[retry]\n") && text.contains("profile = \"balanced\""),
@@ -2303,6 +2322,7 @@ env_key = "RIGHTCODE_API_KEY"
                 .await
                 .expect("init_config_toml");
             let text = std::fs::read_to_string(&path).expect("read config.toml");
+            assert!(text.contains("version = 2"), "expected v2 template");
             assert!(
                 !text.contains("\n[codex]\n"),
                 "expected no_import to skip inserting a real [codex] block"
@@ -3106,7 +3126,7 @@ env_key = "RIGHTCODE_API_KEY"
 version = 2
 
 [codex]
-active_group = "primary"
+active_station = "primary"
 default_profile = "daily"
 
 [codex.profiles.daily]
@@ -3126,10 +3146,10 @@ region = "hk"
 [codex.providers.openai.endpoints.us]
 base_url = "https://us.example.com/v1"
 
-[codex.groups.primary]
+[codex.stations.primary]
 level = 2
 
-[[codex.groups.primary.members]]
+[[codex.stations.primary.members]]
 provider = "openai"
 endpoint_names = ["us"]
 preferred = true
@@ -3168,7 +3188,7 @@ preferred = true
     }
 
     #[test]
-    fn save_config_after_loading_v2_writes_legacy_schema() {
+    fn save_config_after_loading_v2_preserves_v2_schema() {
         let _env = setup_temp_codex_home();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3184,7 +3204,7 @@ preferred = true
 version = 2
 
 [codex]
-active_group = "primary"
+active_station = "primary"
 default_profile = "daily"
 
 [codex.profiles.daily]
@@ -3197,10 +3217,10 @@ auth_token_env = "OPENAI_API_KEY"
 [codex.providers.openai.endpoints.default]
 base_url = "https://api.example.com/v1"
 
-[codex.groups.primary]
+[codex.stations.primary]
 level = 1
 
-[[codex.groups.primary.members]]
+[[codex.stations.primary.members]]
 provider = "openai"
 endpoint_names = ["default"]
 "#,
@@ -3209,14 +3229,58 @@ endpoint_names = ["default"]
             let cfg = super::load_config().await.expect("load v2 config");
             assert_eq!(cfg.version, Some(2));
 
-            super::save_config(&cfg).await.expect("save legacy config");
+            super::save_config(&cfg).await.expect("save v2 config");
             let saved = std::fs::read_to_string(&toml_path).expect("read saved config.toml");
-            assert!(saved.contains("version = 1"));
-            assert!(saved.contains("[codex.configs.primary]"));
+            assert!(saved.contains("version = 2"));
+            assert!(saved.contains("active_station = \"primary\""));
+            assert!(saved.contains("[codex.stations.primary]"));
+            assert!(saved.contains("[codex.providers.openai]"));
             assert!(saved.contains("default_profile = \"daily\""));
             assert!(saved.contains("[codex.profiles.daily]"));
             assert!(saved.contains("service_tier = \"priority\""));
-            assert!(!saved.contains("[codex.groups.primary]"));
+            assert!(!saved.contains("[codex.configs.primary]"));
+        });
+    }
+
+    #[test]
+    fn load_config_supports_v2_group_aliases() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 2
+
+[codex]
+active_group = "legacy"
+
+[codex.providers.openai]
+[codex.providers.openai.auth]
+auth_token_env = "OPENAI_API_KEY"
+[codex.providers.openai.endpoints.default]
+base_url = "https://api.example.com/v1"
+
+[codex.groups.legacy]
+level = 1
+
+[[codex.groups.legacy.members]]
+provider = "openai"
+"#,
+            );
+
+            let cfg = super::load_config()
+                .await
+                .expect("load legacy-named v2 config");
+            assert_eq!(cfg.version, Some(2));
+            assert_eq!(cfg.codex.active.as_deref(), Some("legacy"));
+            assert!(cfg.codex.configs.contains_key("legacy"));
         });
     }
 
@@ -3335,8 +3399,8 @@ base_url = "https://legacy.example.com/v1"
             assert_eq!(written_path, toml_path);
             let saved = std::fs::read_to_string(&toml_path).expect("read v2 config.toml");
             assert!(saved.contains("version = 2"));
-            assert!(saved.contains("[codex.providers.legacy__u01]"));
-            assert!(saved.contains("[codex.groups.legacy]"));
+            assert!(saved.contains("[codex.stations.legacy]"));
+            assert!(saved.contains("base_url = \"https://legacy.example.com/v1\""));
 
             let backup = std::fs::read_to_string(&backup_path).expect("read config.toml.bak");
             assert!(backup.contains("version = 1"));

@@ -37,7 +37,9 @@
   - `session`
 - [ ] CP-001 Define vocabulary mapping from legacy terms to target terms:
   - legacy config -> station/profile/legacy-config bridge
-- [ ] CP-002 Decide whether `config` remains public API language or becomes compatibility-only wording
+- [~] CP-002 Decide whether `config` remains public API language or becomes compatibility-only wording
+  - [x] public attach/API surface prefers `station` naming with legacy `config` fallback
+  - [ ] internal runtime/public UI model fully renamed away from `config`
 - [ ] CP-003 Reject or migrate invalid values like `active = "true"`
 - [ ] CP-004 Add migration note for legacy TOML layout
 
@@ -132,12 +134,17 @@
 
 ## WS7 - Tests, Migration, and Docs
 
-- [ ] CP-701 Add config migration tests for legacy -> v2 shape
+- [~] CP-701 Add config migration tests for legacy -> v2 shape
+  - [x] legacy -> v2 compile/load coverage
+  - [x] v2 save preserves station/provider schema and legacy alias loading
+  - [ ] operator-facing migration guide/examples
 - [ ] CP-702 Add session binding resolution tests
 - [~] CP-703 Add breaker/failover behavior tests
   - [x] runtime station `draining` / `breaker-open` routing behavior
   - [ ] breaker threshold / cooldown transition coverage
-- [ ] CP-704 Add API compatibility tests for existing attach mode consumers
+- [~] CP-704 Add API compatibility tests for existing attach mode consumers
+  - [x] GUI attach prefers `/stations` and falls back to legacy `/configs`
+  - [ ] broader client compatibility matrix beyond built-in GUI
 - [ ] CP-705 Update README docs after the first usable milestone lands
 - [ ] CP-706 Add operator migration guide for existing `config.toml`
 

@@ -63,7 +63,7 @@ impl ConfigDocument {
 }
 
 #[derive(Debug, Serialize)]
-struct ConfigExplainGroup {
+struct ConfigExplainStation {
     name: String,
     alias: Option<String>,
     enabled: bool,
@@ -75,9 +75,9 @@ struct ConfigExplainGroup {
 struct ConfigExplainPayload {
     schema_version: u32,
     service: String,
-    active_group: Option<String>,
+    active_station: Option<String>,
     routing: ServiceRoutingExplanation,
-    group: Option<ConfigExplainGroup>,
+    station: Option<ConfigExplainStation>,
 }
 
 async fn load_config_document() -> anyhow::Result<ConfigDocument> {
@@ -123,7 +123,7 @@ fn select_service_manager<'a>(
 fn build_group_explain(
     mgr: &ServiceConfigManager,
     group_name: Option<&str>,
-) -> anyhow::Result<Option<ConfigExplainGroup>> {
+) -> anyhow::Result<Option<ConfigExplainStation>> {
     let Some(group_name) = group_name else {
         return Ok(None);
     };
@@ -131,8 +131,8 @@ fn build_group_explain(
     let svc = mgr
         .configs
         .get(group_name)
-        .ok_or_else(|| anyhow::anyhow!("group/config '{}' not found", group_name))?;
-    Ok(Some(ConfigExplainGroup {
+        .ok_or_else(|| anyhow::anyhow!("station/config '{}' not found", group_name))?;
+    Ok(Some(ConfigExplainStation {
         name: group_name.to_string(),
         alias: svc.alias.clone(),
         enabled: svc.enabled,
@@ -145,12 +145,12 @@ fn print_explain_text(
     label: &str,
     schema_version: u32,
     routing: &ServiceRoutingExplanation,
-    group: Option<&ConfigExplainGroup>,
+    station: Option<&ConfigExplainStation>,
 ) {
     println!("Schema version: v{}", schema_version);
     println!("Service: {}", label);
     println!(
-        "Active group: {}",
+        "Active station: {}",
         routing.active_config.as_deref().unwrap_or("<none>")
     );
     println!("Routing mode: {}", routing.mode);
@@ -193,18 +193,18 @@ fn print_explain_text(
         );
     }
 
-    if let Some(group) = group {
+    if let Some(station) = station {
         println!(
-            "Group '{}': level={} enabled={} upstreams={}",
-            group.name,
-            group.level,
-            group.enabled,
-            group.upstreams.len()
+            "Station '{}': level={} enabled={} upstreams={}",
+            station.name,
+            station.level,
+            station.enabled,
+            station.upstreams.len()
         );
-        if group.upstreams.is_empty() {
+        if station.upstreams.is_empty() {
             println!("  <no upstreams>");
         } else {
-            for (idx, upstream) in group.upstreams.iter().enumerate() {
+            for (idx, upstream) in station.upstreams.iter().enumerate() {
                 println!("  [{}] {}", idx, upstream);
             }
         }
@@ -305,9 +305,9 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 let payload = ConfigExplainPayload {
                     schema_version: document.schema_version(),
                     service: service.to_string(),
-                    active_group: mgr.active.clone(),
+                    active_station: mgr.active.clone(),
                     routing,
-                    group: group_detail,
+                    station: group_detail,
                 };
                 let text = serde_json::to_string_pretty(&payload)
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
