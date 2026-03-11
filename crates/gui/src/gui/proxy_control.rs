@@ -91,6 +91,7 @@ pub struct AttachedStatus {
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
     pub supports_default_profile_override: bool,
+    pub supports_config_runtime_override: bool,
 }
 
 impl AttachedStatus {
@@ -124,6 +125,7 @@ impl AttachedStatus {
             runtime_loaded_at_ms: None,
             runtime_source_mtime_ms: None,
             supports_default_profile_override: false,
+            supports_config_runtime_override: false,
         }
     }
 }
@@ -152,6 +154,7 @@ pub struct GuiRuntimeSnapshot {
     pub stats_1h: WindowStats,
     pub supports_v1: bool,
     pub supports_default_profile_override: bool,
+    pub supports_config_runtime_override: bool,
 }
 
 pub struct RunningProxy {
@@ -173,6 +176,7 @@ pub struct RunningProxy {
     pub session_effort_overrides: HashMap<String, String>,
     pub session_service_tier_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
+    pub configs: Vec<ConfigOption>,
     pub config_health: HashMap<String, ConfigHealth>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
     pub usage_rollup: UsageRollupView,
@@ -318,12 +322,13 @@ impl ProxyController {
                 session_effort_overrides: r.session_effort_overrides.clone(),
                 session_service_tier_overrides: r.session_service_tier_overrides.clone(),
                 session_stats: r.session_stats.clone(),
-                configs: list_configs_from_cfg(r.cfg.as_ref(), r.service_name),
+                configs: r.configs.clone(),
                 usage_rollup: r.usage_rollup.clone(),
                 stats_5m: r.stats_5m.clone(),
                 stats_1h: r.stats_1h.clone(),
                 supports_v1: true,
                 supports_default_profile_override: true,
+                supports_config_runtime_override: true,
             }),
             ProxyMode::Attached(a) => Some(GuiRuntimeSnapshot {
                 kind: ProxyModeKind::Attached,
@@ -348,6 +353,7 @@ impl ProxyController {
                 stats_1h: a.stats_1h.clone(),
                 supports_v1: a.api_version == Some(1),
                 supports_default_profile_override: a.supports_default_profile_override,
+                supports_config_runtime_override: a.supports_config_runtime_override,
             }),
             _ => None,
         }
@@ -712,6 +718,7 @@ impl ProxyController {
                 runtime_loaded_at_ms: Option<u64>,
                 runtime_source_mtime_ms: Option<u64>,
                 supports_default_profile_override: bool,
+                supports_config_runtime_override: bool,
             }
 
             async fn refresh_from_base(
@@ -737,6 +744,10 @@ impl ProxyController {
                         .endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/profiles/default");
+                    let supports_config_runtime_override = caps
+                        .endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/configs/runtime");
 
                     if supports_snapshot {
                         let api = get_json::<ApiV1Snapshot>(
@@ -773,6 +784,7 @@ impl ProxyController {
                             runtime_loaded_at_ms: api.runtime_loaded_at_ms,
                             runtime_source_mtime_ms: api.runtime_source_mtime_ms,
                             supports_default_profile_override,
+                            supports_config_runtime_override,
                         });
                     }
 
@@ -927,6 +939,7 @@ impl ProxyController {
                         runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                         runtime_source_mtime_ms: runtime.source_mtime_ms,
                         supports_default_profile_override,
+                        supports_config_runtime_override,
                     });
                 }
 
@@ -982,6 +995,7 @@ impl ProxyController {
                     runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                     runtime_source_mtime_ms: runtime.source_mtime_ms,
                     supports_default_profile_override: false,
+                    supports_config_runtime_override: false,
                 })
             }
 
@@ -1025,6 +1039,7 @@ impl ProxyController {
                     att.runtime_source_mtime_ms = result.runtime_source_mtime_ms;
                     att.supports_default_profile_override =
                         result.supports_default_profile_override;
+                    att.supports_config_runtime_override = result.supports_config_runtime_override;
                 }
             }
             Err(e) => {
@@ -1276,6 +1291,114 @@ impl ProxyController {
                         .timeout(Duration::from_millis(1200))
                         .json(&serde_json::json!({
                             "profile_name": profile_name,
+                        }))
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
+    pub fn set_runtime_config_meta(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        config_name: String,
+        enabled: Option<Option<bool>>,
+        level: Option<Option<u8>>,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                let state = r.state.clone();
+                let service_name = r.service_name;
+                let cfg = r.cfg.clone();
+                let now = now_ms();
+                let configs = rt.block_on(async move {
+                    let mgr = match service_name {
+                        "claude" => &cfg.claude,
+                        _ => &cfg.codex,
+                    };
+                    if !mgr.configs.contains_key(config_name.as_str()) {
+                        bail!("config not found: {config_name}");
+                    }
+
+                    if let Some(enabled) = enabled {
+                        match enabled {
+                            Some(enabled) => {
+                                state
+                                    .set_config_enabled_override(
+                                        service_name,
+                                        config_name.clone(),
+                                        enabled,
+                                        now,
+                                    )
+                                    .await;
+                            }
+                            None => {
+                                state
+                                    .clear_config_enabled_override(
+                                        service_name,
+                                        config_name.as_str(),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+
+                    if let Some(level) = level {
+                        match level {
+                            Some(level) => {
+                                state
+                                    .set_config_level_override(
+                                        service_name,
+                                        config_name.clone(),
+                                        level.clamp(1, 10),
+                                        now,
+                                    )
+                                    .await;
+                            }
+                            None => {
+                                state
+                                    .clear_config_level_override(service_name, config_name.as_str())
+                                    .await;
+                            }
+                        }
+                    }
+
+                    Ok::<_, anyhow::Error>(
+                        effective_configs_from_cfg_state(
+                            state.as_ref(),
+                            service_name,
+                            cfg.as_ref(),
+                        )
+                        .await,
+                    )
+                })?;
+                r.configs = configs;
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                if !att.supports_config_runtime_override {
+                    bail!("attached proxy does not support runtime config meta control");
+                }
+                let base = att.admin_base_url.clone();
+                let client = self.http_client.clone();
+                let fut = async move {
+                    let clear_enabled = matches!(enabled, Some(None));
+                    let clear_level = matches!(level, Some(None));
+                    client
+                        .post(format!("{base}/__codex_helper/api/v1/configs/runtime"))
+                        .timeout(Duration::from_millis(1200))
+                        .json(&serde_json::json!({
+                            "config_name": config_name,
+                            "enabled": enabled.flatten(),
+                            "level": level.flatten(),
+                            "clear_enabled": clear_enabled,
+                            "clear_level": clear_level,
                         }))
                         .send()
                         .await?
@@ -1566,14 +1689,21 @@ impl ProxyController {
                 service_name.as_str(),
                 default_profile.as_deref(),
             );
-            Ok::<_, anyhow::Error>((snapshot, default_profile, profiles))
+            let configs = effective_configs_from_cfg_state(
+                state.as_ref(),
+                service_name.as_str(),
+                cfg.as_ref(),
+            )
+            .await;
+            Ok::<_, anyhow::Error>((snapshot, default_profile, profiles, configs))
         };
 
         match rt.block_on(fut) {
-            Ok((snap, default_profile, profiles)) => {
+            Ok((snap, default_profile, profiles, configs)) => {
                 r.last_error = None;
                 r.default_profile = default_profile;
                 r.profiles = profiles;
+                r.configs = configs;
                 r.active = snap.active;
                 r.recent = snap.recent;
                 r.session_cards = snap.session_cards;
@@ -1801,6 +1931,7 @@ impl ProxyController {
         };
         let profiles =
             list_profiles_from_cfg(cfg.as_ref(), service_name, default_profile.as_deref());
+        let configs = list_configs_from_cfg(cfg.as_ref(), service_name, HashMap::new());
 
         self.mode = ProxyMode::Running(RunningProxy {
             service_name,
@@ -1821,6 +1952,7 @@ impl ProxyController {
             session_effort_overrides: HashMap::new(),
             session_service_tier_overrides: HashMap::new(),
             session_stats: HashMap::new(),
+            configs,
             config_health: HashMap::new(),
             health_checks: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
@@ -1862,7 +1994,20 @@ async fn effective_default_profile_from_cfg_state(
     mgr.default_profile.clone()
 }
 
-fn list_configs_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<ConfigOption> {
+async fn effective_configs_from_cfg_state(
+    state: &ProxyState,
+    service_name: &str,
+    cfg: &ProxyConfig,
+) -> Vec<ConfigOption> {
+    let overrides = state.get_config_meta_overrides(service_name).await;
+    list_configs_from_cfg(cfg, service_name, overrides)
+}
+
+fn list_configs_from_cfg(
+    cfg: &ProxyConfig,
+    service_name: &str,
+    meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
+) -> Vec<ConfigOption> {
     let mgr = match service_name {
         "claude" => &cfg.claude,
         _ => &cfg.codex,
@@ -1870,11 +2015,22 @@ fn list_configs_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<ConfigOpt
     let mut out = mgr
         .configs
         .iter()
-        .map(|(name, c)| ConfigOption {
-            name: name.clone(),
-            alias: c.alias.clone(),
-            enabled: c.enabled,
-            level: c.level.clamp(1, 10),
+        .map(|(name, c)| {
+            let (enabled_override, level_override) = meta_overrides
+                .get(name.as_str())
+                .copied()
+                .unwrap_or((None, None));
+            let configured_level = c.level.clamp(1, 10);
+            ConfigOption {
+                name: name.clone(),
+                alias: c.alias.clone(),
+                enabled: enabled_override.unwrap_or(c.enabled),
+                level: level_override.unwrap_or(configured_level).clamp(1, 10),
+                configured_enabled: c.enabled,
+                configured_level,
+                runtime_enabled_override: enabled_override,
+                runtime_level_override: level_override.map(|level| level.clamp(1, 10)),
+            }
         })
         .collect::<Vec<_>>();
     out.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));

@@ -9,6 +9,14 @@ pub struct ConfigOption {
     pub enabled: bool,
     #[serde(default)]
     pub level: u8,
+    #[serde(default)]
+    pub configured_enabled: bool,
+    #[serde(default)]
+    pub configured_level: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_enabled_override: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_level_override: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

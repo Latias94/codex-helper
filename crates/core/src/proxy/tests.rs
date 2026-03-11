@@ -207,6 +207,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/configs/runtime"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles/default"))
     }));
 
@@ -782,6 +787,217 @@ async fn proxy_runtime_default_profile_override_applies_to_new_session() {
 
     proxy_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_runtime_config_meta_override_controls_routing() {
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async move {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "upstream": "primary" })),
+            )
+        }),
+    );
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async move {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "upstream": "backup" })),
+            )
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let mut mgr = ServiceConfigManager {
+        active: None,
+        ..Default::default()
+    };
+    mgr.configs.insert(
+        "primary".to_string(),
+        ServiceConfig {
+            name: "primary".to_string(),
+            alias: Some("primary".to_string()),
+            enabled: true,
+            level: 1,
+            upstreams: vec![UpstreamConfig {
+                base_url: format!("http://{}/v1", primary_addr),
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: None,
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: HashMap::from([("provider_id".to_string(), "primary".to_string())]),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        },
+    );
+    mgr.configs.insert(
+        "backup".to_string(),
+        ServiceConfig {
+            name: "backup".to_string(),
+            alias: Some("backup".to_string()),
+            enabled: true,
+            level: 2,
+            upstreams: vec![UpstreamConfig {
+                base_url: format!("http://{}/v1", backup_addr),
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: None,
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: HashMap::from([("provider_id".to_string(), "backup".to_string())]),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        },
+    );
+    let cfg = ProxyConfig {
+        version: Some(1),
+        codex: mgr,
+        claude: ServiceConfigManager::default(),
+        retry: RetryConfig::default(),
+        notify: Default::default(),
+        default_service: None,
+        ui: UiConfig::default(),
+    };
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let send_request = || async {
+        client
+            .post(format!("http://{}/v1/responses", proxy_addr))
+            .header("content-type", "application/json")
+            .body(r#"{"input":"hi"}"#)
+            .send()
+            .await
+            .expect("send request")
+            .error_for_status()
+            .expect("request status")
+            .json::<serde_json::Value>()
+            .await
+            .expect("request json")
+    };
+
+    let resp = send_request().await;
+    assert_eq!(
+        resp.get("upstream").and_then(|v| v.as_str()),
+        Some("primary")
+    );
+
+    let set_disable = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/configs/runtime",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "config_name": "primary",
+            "enabled": false,
+        }))
+        .send()
+        .await
+        .expect("disable primary send");
+    assert_eq!(set_disable.status(), StatusCode::NO_CONTENT);
+
+    let configs = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/configs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get configs send")
+        .error_for_status()
+        .expect("get configs status")
+        .json::<Vec<crate::dashboard_core::ConfigOption>>()
+        .await
+        .expect("get configs json");
+    let primary_cfg = configs
+        .iter()
+        .find(|cfg| cfg.name == "primary")
+        .expect("primary config");
+    assert!(!primary_cfg.enabled);
+    assert!(primary_cfg.configured_enabled);
+    assert_eq!(primary_cfg.runtime_enabled_override, Some(false));
+
+    let resp = send_request().await;
+    assert_eq!(
+        resp.get("upstream").and_then(|v| v.as_str()),
+        Some("backup")
+    );
+
+    let clear_disable = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/configs/runtime",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "config_name": "primary",
+            "clear_enabled": true,
+        }))
+        .send()
+        .await
+        .expect("clear primary disable send");
+    assert_eq!(clear_disable.status(), StatusCode::NO_CONTENT);
+
+    let set_primary_level = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/configs/runtime",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "config_name": "primary",
+            "level": 10,
+        }))
+        .send()
+        .await
+        .expect("set primary level send");
+    assert_eq!(set_primary_level.status(), StatusCode::NO_CONTENT);
+
+    let configs = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/configs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get configs after level send")
+        .error_for_status()
+        .expect("get configs after level status")
+        .json::<Vec<crate::dashboard_core::ConfigOption>>()
+        .await
+        .expect("get configs after level json");
+    let primary_cfg = configs
+        .iter()
+        .find(|cfg| cfg.name == "primary")
+        .expect("primary config");
+    assert_eq!(primary_cfg.level, 10);
+    assert_eq!(primary_cfg.configured_level, 1);
+    assert_eq!(primary_cfg.runtime_level_override, Some(10));
+
+    let resp = send_request().await;
+    assert_eq!(
+        resp.get("upstream").and_then(|v| v.as_str()),
+        Some("backup")
+    );
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
 }
 
 #[tokio::test]

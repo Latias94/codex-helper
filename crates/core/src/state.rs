@@ -758,6 +758,40 @@ impl ProxyState {
         entry.updated_at_ms = now_ms;
     }
 
+    pub async fn clear_config_enabled_override(&self, service_name: &str, config_name: &str) {
+        let mut guard = self.config_meta_overrides.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return;
+        };
+        let Some(entry) = per_service.get_mut(config_name) else {
+            return;
+        };
+        entry.enabled = None;
+        if entry.enabled.is_none() && entry.level.is_none() {
+            per_service.remove(config_name);
+        }
+        if per_service.is_empty() {
+            guard.remove(service_name);
+        }
+    }
+
+    pub async fn clear_config_level_override(&self, service_name: &str, config_name: &str) {
+        let mut guard = self.config_meta_overrides.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return;
+        };
+        let Some(entry) = per_service.get_mut(config_name) else {
+            return;
+        };
+        entry.level = None;
+        if entry.enabled.is_none() && entry.level.is_none() {
+            per_service.remove(config_name);
+        }
+        if per_service.is_empty() {
+            guard.remove(service_name);
+        }
+    }
+
     pub async fn get_config_meta_overrides(
         &self,
         service_name: &str,

@@ -86,6 +86,7 @@
 
 ## WS4 - Station Registry and HA
 
+- [x] CP-400 Add runtime station metadata overrides for `enabled` / `level`
 - [ ] CP-401 Introduce explicit `Station` runtime model
 - [ ] CP-402 Add capability summary per station:
   - supported models

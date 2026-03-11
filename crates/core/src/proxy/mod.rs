@@ -53,15 +53,27 @@ const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(800);
 
 fn list_config_options_from_mgr(
     mgr: &ServiceConfigManager,
+    meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
 ) -> Vec<crate::dashboard_core::ConfigOption> {
     let mut configs = mgr
         .configs
         .iter()
-        .map(|(name, c)| crate::dashboard_core::ConfigOption {
-            name: name.clone(),
-            alias: c.alias.clone(),
-            enabled: c.enabled,
-            level: c.level.clamp(1, 10),
+        .map(|(name, c)| {
+            let (enabled_override, level_override) = meta_overrides
+                .get(name.as_str())
+                .copied()
+                .unwrap_or((None, None));
+            let configured_level = c.level.clamp(1, 10);
+            crate::dashboard_core::ConfigOption {
+                name: name.clone(),
+                alias: c.alias.clone(),
+                enabled: enabled_override.unwrap_or(c.enabled),
+                level: level_override.unwrap_or(configured_level).clamp(1, 10),
+                configured_enabled: c.enabled,
+                configured_level,
+                runtime_enabled_override: enabled_override,
+                runtime_level_override: level_override.map(|level| level.clamp(1, 10)),
+            }
         })
         .collect::<Vec<_>>();
     configs.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
@@ -3140,6 +3152,19 @@ pub fn router(proxy: ProxyService) -> Router {
         config_name: Option<String>,
     }
 
+    #[derive(serde::Deserialize)]
+    struct ConfigRuntimeMetaRequest {
+        config_name: String,
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        level: Option<u8>,
+        #[serde(default)]
+        clear_enabled: bool,
+        #[serde(default)]
+        clear_level: bool,
+    }
+
     #[derive(serde::Serialize)]
     struct ProfilesResponse {
         default_profile: Option<String>,
@@ -3365,6 +3390,78 @@ pub fn router(proxy: ProxyService) -> Router {
         }))
     }
 
+    async fn apply_config_runtime_meta(
+        proxy: ProxyService,
+        Json(payload): Json<ConfigRuntimeMetaRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        if payload.config_name.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "config_name is required".to_string(),
+            ));
+        }
+
+        if payload.enabled.is_none()
+            && payload.level.is_none()
+            && !payload.clear_enabled
+            && !payload.clear_level
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "at least one runtime config action must be provided".to_string(),
+            ));
+        }
+
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+        if !mgr.configs.contains_key(payload.config_name.as_str()) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("config '{}' not found", payload.config_name),
+            ));
+        }
+
+        let now = now_ms();
+        if payload.clear_enabled {
+            proxy
+                .state
+                .clear_config_enabled_override(proxy.service_name, payload.config_name.as_str())
+                .await;
+        } else if let Some(enabled) = payload.enabled {
+            proxy
+                .state
+                .set_config_enabled_override(
+                    proxy.service_name,
+                    payload.config_name.clone(),
+                    enabled,
+                    now,
+                )
+                .await;
+        }
+
+        if payload.clear_level {
+            proxy
+                .state
+                .clear_config_level_override(proxy.service_name, payload.config_name.as_str())
+                .await;
+        } else if let Some(level) = payload.level {
+            proxy
+                .state
+                .set_config_level_override(
+                    proxy.service_name,
+                    payload.config_name.clone(),
+                    level.clamp(1, 10),
+                    now,
+                )
+                .await;
+        }
+
+        Ok(StatusCode::NO_CONTENT)
+    }
+
     async fn set_default_profile(
         proxy: ProxyService,
         Json(payload): Json<DefaultProfileRequest>,
@@ -3562,6 +3659,7 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/config/runtime",
                 "/__codex_helper/api/v1/config/reload",
                 "/__codex_helper/api/v1/configs",
+                "/__codex_helper/api/v1/configs/runtime",
                 "/__codex_helper/api/v1/profiles",
                 "/__codex_helper/api/v1/profiles/default",
                 "/__codex_helper/api/v1/overrides/session/profile",
@@ -3594,7 +3692,11 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
-        let configs = list_config_options_from_mgr(mgr);
+        let meta_overrides = proxy
+            .state
+            .get_config_meta_overrides(proxy.service_name)
+            .await;
+        let configs = list_config_options_from_mgr(mgr, &meta_overrides);
         let default_profile =
             effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
 
@@ -3806,7 +3908,11 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
-        Ok(Json(list_config_options_from_mgr(mgr)))
+        let meta_overrides = proxy
+            .state
+            .get_config_meta_overrides(proxy.service_name)
+            .await;
+        Ok(Json(list_config_options_from_mgr(mgr, &meta_overrides)))
     }
 
     let admin_access = AdminAccessConfig::from_env();
@@ -3845,6 +3951,7 @@ pub fn router(proxy: ProxyService) -> Router {
     let p31 = proxy.clone();
     let p32 = proxy.clone();
     let p33 = proxy.clone();
+    let p34 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -3891,6 +3998,10 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/configs",
             get(move || list_configs(p14.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/configs/runtime",
+            post(move |payload| apply_config_runtime_meta(p34.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/profiles",
