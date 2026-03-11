@@ -79,7 +79,7 @@
 - [ ] CP-303 Add profile inheritance / `extends`
 - [ ] CP-304 Add profile CRUD in local API
 - [ ] CP-305 Replace weak routing preset concept with profile concept in GUI config
-- [ ] CP-306 Support quick switch:
+- [x] CP-306 Support quick switch:
   - set default profile
   - apply profile to selected session
 - [ ] CP-307 Add validation for profile-station compatibility

@@ -135,6 +135,7 @@ pub struct SessionsViewState {
     pub overrides_only: bool,
     pub lock_order: bool,
     pub search: String,
+    pub default_profile_selection: Option<String>,
     pub selected_session_id: Option<String>,
     pub selected_idx: usize,
     ordered_session_ids: Vec<Option<String>>,
@@ -1989,10 +1990,151 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let session_config_overrides = snapshot.session_config_overrides.clone();
     let session_service_tier_overrides = snapshot.session_service_tier_overrides.clone();
     let session_stats = snapshot.session_stats.clone();
+    let mut force_refresh = false;
+
+    if ctx
+        .view
+        .sessions
+        .default_profile_selection
+        .as_ref()
+        .is_none_or(|name| !profiles.iter().any(|profile| profile.name == *name))
+    {
+        ctx.view.sessions.default_profile_selection = default_profile
+            .clone()
+            .or_else(|| profiles.first().map(|profile| profile.name.clone()));
+    }
 
     if let Some(err) = last_error.as_deref() {
         ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
         ui.add_space(4.0);
+    }
+
+    if !profiles.is_empty() {
+        let current_default_label = match default_profile.as_deref() {
+            Some(name) => {
+                format_profile_display(name, profiles.iter().find(|profile| profile.name == name))
+            }
+            None => pick(ctx.lang, "<无>", "<none>").to_string(),
+        };
+
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(pick(ctx.lang, "新会话默认 profile", "New-session default"));
+                ui.monospace(current_default_label);
+
+                let mut selected_default = ctx.view.sessions.default_profile_selection.clone();
+                egui::ComboBox::from_id_salt("sessions_default_profile")
+                    .selected_text(match selected_default.as_deref() {
+                        Some(name) => format_profile_display(
+                            name,
+                            profiles.iter().find(|profile| profile.name == name),
+                        ),
+                        None => pick(ctx.lang, "<选择>", "<select>").to_string(),
+                    })
+                    .show_ui(ui, |ui| {
+                        for profile in profiles.iter() {
+                            ui.selectable_value(
+                                &mut selected_default,
+                                Some(profile.name.clone()),
+                                format_profile_display(profile.name.as_str(), Some(profile)),
+                            );
+                        }
+                    });
+                if selected_default != ctx.view.sessions.default_profile_selection {
+                    ctx.view.sessions.default_profile_selection = selected_default;
+                }
+
+                if ui
+                    .button(pick(ctx.lang, "设为默认", "Set default"))
+                    .clicked()
+                {
+                    if !snapshot.supports_default_profile_override {
+                        *ctx.last_error = Some(
+                            pick(
+                                ctx.lang,
+                                "当前代理不支持运行时切换默认 profile。",
+                                "Current proxy does not support runtime default profile switch.",
+                            )
+                            .to_string(),
+                        );
+                    } else if let Some(profile_name) =
+                        ctx.view.sessions.default_profile_selection.clone()
+                    {
+                        match ctx
+                            .proxy
+                            .set_default_profile(ctx.rt, Some(profile_name.clone()))
+                        {
+                            Ok(()) => {
+                                force_refresh = true;
+                                ctx.view.sessions.default_profile_selection = Some(profile_name);
+                                *ctx.last_info = Some(
+                                    pick(
+                                        ctx.lang,
+                                        "已切换新会话默认 profile",
+                                        "Default profile switched",
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                            Err(e) => {
+                                *ctx.last_error = Some(format!("set default profile failed: {e}"));
+                            }
+                        }
+                    } else {
+                        *ctx.last_error = Some(
+                            pick(
+                                ctx.lang,
+                                "请先选择一个 profile。",
+                                "Select a profile first.",
+                            )
+                            .to_string(),
+                        );
+                    }
+                }
+
+                if ui
+                    .button(pick(ctx.lang, "回到配置默认", "Use config default"))
+                    .clicked()
+                {
+                    if !snapshot.supports_default_profile_override {
+                        *ctx.last_error = Some(
+                            pick(
+                                ctx.lang,
+                                "当前代理不支持运行时切换默认 profile。",
+                                "Current proxy does not support runtime default profile switch.",
+                            )
+                            .to_string(),
+                        );
+                    } else {
+                        match ctx.proxy.set_default_profile(ctx.rt, None) {
+                            Ok(()) => {
+                                force_refresh = true;
+                                *ctx.last_info = Some(
+                                    pick(
+                                        ctx.lang,
+                                        "已恢复配置文件默认 profile",
+                                        "Fell back to config default profile",
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                            Err(e) => {
+                                *ctx.last_error =
+                                    Some(format!("clear default profile failed: {e}"));
+                            }
+                        }
+                    }
+                }
+            });
+
+            ui.small(pick(
+                ctx.lang,
+                "只影响新的 session；已经建立 binding 的会话会保持当前绑定。",
+                "Only affects new sessions; already bound sessions keep their current binding.",
+            ));
+        });
+
+        ui.add_space(6.0);
     }
 
     ui.horizontal(|ui| {
@@ -2129,7 +2271,6 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .unwrap_or_default();
     }
 
-    let mut force_refresh = false;
     ui.columns(2, |cols| {
         cols[0].heading(pick(ctx.lang, "列表", "List"));
         cols[0].add_space(4.0);

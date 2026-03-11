@@ -400,6 +400,13 @@ struct ConfigMetaOverride {
     updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeDefaultProfileOverride {
+    profile_name: String,
+    #[allow(dead_code)]
+    updated_at_ms: u64,
+}
+
 /// Runtime-only state for the proxy process.
 ///
 /// This state is intentionally not persisted across restarts.
@@ -415,6 +422,7 @@ pub struct ProxyState {
     session_service_tier_overrides: RwLock<HashMap<String, SessionServiceTierOverride>>,
     session_bindings: RwLock<HashMap<String, SessionBindingEntry>>,
     global_config_override: RwLock<Option<String>>,
+    runtime_default_profiles: RwLock<HashMap<String, RuntimeDefaultProfileOverride>>,
     config_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
     session_stats: RwLock<HashMap<String, SessionStats>>,
@@ -465,6 +473,7 @@ impl ProxyState {
             session_service_tier_overrides: RwLock::new(HashMap::new()),
             session_bindings: RwLock::new(HashMap::new()),
             global_config_override: RwLock::new(None),
+            runtime_default_profiles: RwLock::new(HashMap::new()),
             config_meta_overrides: RwLock::new(HashMap::new()),
             session_cwd_cache: RwLock::new(HashMap::new()),
             session_stats: RwLock::new(HashMap::new()),
@@ -691,6 +700,34 @@ impl ProxyState {
     pub async fn clear_global_config_override(&self) {
         let mut guard = self.global_config_override.write().await;
         *guard = None;
+    }
+
+    pub async fn get_runtime_default_profile_override(&self, service_name: &str) -> Option<String> {
+        let guard = self.runtime_default_profiles.read().await;
+        guard
+            .get(service_name)
+            .map(|entry| entry.profile_name.clone())
+    }
+
+    pub async fn set_runtime_default_profile_override(
+        &self,
+        service_name: String,
+        profile_name: String,
+        now_ms: u64,
+    ) {
+        let mut guard = self.runtime_default_profiles.write().await;
+        guard.insert(
+            service_name,
+            RuntimeDefaultProfileOverride {
+                profile_name,
+                updated_at_ms: now_ms,
+            },
+        );
+    }
+
+    pub async fn clear_runtime_default_profile_override(&self, service_name: &str) {
+        let mut guard = self.runtime_default_profiles.write().await;
+        guard.remove(service_name);
     }
 
     pub async fn set_config_enabled_override(

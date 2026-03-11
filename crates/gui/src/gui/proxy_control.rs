@@ -90,6 +90,7 @@ pub struct AttachedStatus {
     pub lb_view: HashMap<String, LbConfigView>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
+    pub supports_default_profile_override: bool,
 }
 
 impl AttachedStatus {
@@ -122,6 +123,7 @@ impl AttachedStatus {
             lb_view: HashMap::new(),
             runtime_loaded_at_ms: None,
             runtime_source_mtime_ms: None,
+            supports_default_profile_override: false,
         }
     }
 }
@@ -149,6 +151,7 @@ pub struct GuiRuntimeSnapshot {
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
     pub supports_v1: bool,
+    pub supports_default_profile_override: bool,
 }
 
 pub struct RunningProxy {
@@ -320,6 +323,7 @@ impl ProxyController {
                 stats_5m: r.stats_5m.clone(),
                 stats_1h: r.stats_1h.clone(),
                 supports_v1: true,
+                supports_default_profile_override: true,
             }),
             ProxyMode::Attached(a) => Some(GuiRuntimeSnapshot {
                 kind: ProxyModeKind::Attached,
@@ -343,6 +347,7 @@ impl ProxyController {
                 stats_5m: a.stats_5m.clone(),
                 stats_1h: a.stats_1h.clone(),
                 supports_v1: a.api_version == Some(1),
+                supports_default_profile_override: a.supports_default_profile_override,
             }),
             _ => None,
         }
@@ -706,6 +711,7 @@ impl ProxyController {
                 lb_view: HashMap<String, LbConfigView>,
                 runtime_loaded_at_ms: Option<u64>,
                 runtime_source_mtime_ms: Option<u64>,
+                supports_default_profile_override: bool,
             }
 
             async fn refresh_from_base(
@@ -727,6 +733,10 @@ impl ProxyController {
                         .endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/snapshot");
+                    let supports_default_profile_override = caps
+                        .endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/profiles/default");
 
                     if supports_snapshot {
                         let api = get_json::<ApiV1Snapshot>(
@@ -762,6 +772,7 @@ impl ProxyController {
                             lb_view: api.snapshot.lb_view,
                             runtime_loaded_at_ms: api.runtime_loaded_at_ms,
                             runtime_source_mtime_ms: api.runtime_source_mtime_ms,
+                            supports_default_profile_override,
                         });
                     }
 
@@ -915,6 +926,7 @@ impl ProxyController {
                         lb_view: HashMap::new(),
                         runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                         runtime_source_mtime_ms: runtime.source_mtime_ms,
+                        supports_default_profile_override,
                     });
                 }
 
@@ -969,6 +981,7 @@ impl ProxyController {
                     lb_view: HashMap::new(),
                     runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                     runtime_source_mtime_ms: runtime.source_mtime_ms,
+                    supports_default_profile_override: false,
                 })
             }
 
@@ -1010,6 +1023,8 @@ impl ProxyController {
                     att.lb_view = result.lb_view;
                     att.runtime_loaded_at_ms = result.runtime_loaded_at_ms;
                     att.runtime_source_mtime_ms = result.runtime_source_mtime_ms;
+                    att.supports_default_profile_override =
+                        result.supports_default_profile_override;
                 }
             }
             Err(e) => {
@@ -1178,6 +1193,88 @@ impl ProxyController {
                         .timeout(Duration::from_millis(1200))
                         .json(&serde_json::json!({
                             "session_id": session_id,
+                            "profile_name": profile_name,
+                        }))
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
+    pub fn set_default_profile(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        profile_name: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                let state = r.state.clone();
+                let service_name = r.service_name;
+                let cfg = r.cfg.clone();
+                let now = now_ms();
+                let effective_default = rt.block_on(async move {
+                    let mgr = match service_name {
+                        "claude" => &cfg.claude,
+                        _ => &cfg.codex,
+                    };
+                    match profile_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                    {
+                        Some(name) => {
+                            if mgr.profile(name).is_none() {
+                                bail!("profile not found: {name}");
+                            }
+                            state
+                                .set_runtime_default_profile_override(
+                                    service_name.to_string(),
+                                    name.to_string(),
+                                    now,
+                                )
+                                .await;
+                        }
+                        None => {
+                            state
+                                .clear_runtime_default_profile_override(service_name)
+                                .await;
+                        }
+                    }
+
+                    Ok::<_, anyhow::Error>(
+                        effective_default_profile_from_cfg_state(
+                            state.as_ref(),
+                            service_name,
+                            cfg.as_ref(),
+                        )
+                        .await,
+                    )
+                })?;
+                r.default_profile = effective_default.clone();
+                r.profiles = list_profiles_from_cfg(
+                    r.cfg.as_ref(),
+                    r.service_name,
+                    effective_default.as_deref(),
+                );
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                if !att.supports_default_profile_override {
+                    bail!("attached proxy does not support runtime default profile switch");
+                }
+                let base = att.admin_base_url.clone();
+                let client = self.http_client.clone();
+                let fut = async move {
+                    client
+                        .post(format!("{base}/__codex_helper/api/v1/profiles/default"))
+                        .timeout(Duration::from_millis(1200))
+                        .json(&serde_json::json!({
                             "profile_name": profile_name,
                         }))
                         .send()
@@ -1458,17 +1555,25 @@ impl ProxyController {
                 &mut snapshot.session_cards,
                 mgr,
             );
-            Ok::<_, anyhow::Error>(snapshot)
+            let default_profile = effective_default_profile_from_cfg_state(
+                state.as_ref(),
+                service_name.as_str(),
+                cfg.as_ref(),
+            )
+            .await;
+            let profiles = list_profiles_from_cfg(
+                cfg.as_ref(),
+                service_name.as_str(),
+                default_profile.as_deref(),
+            );
+            Ok::<_, anyhow::Error>((snapshot, default_profile, profiles))
         };
 
         match rt.block_on(fut) {
-            Ok(snap) => {
+            Ok((snap, default_profile, profiles)) => {
                 r.last_error = None;
-                r.default_profile = match r.service_name {
-                    "claude" => r.cfg.claude.default_profile.clone(),
-                    _ => r.cfg.codex.default_profile.clone(),
-                };
-                r.profiles = list_profiles_from_cfg(r.cfg.as_ref(), r.service_name);
+                r.default_profile = default_profile;
+                r.profiles = profiles;
                 r.active = snap.active;
                 r.recent = snap.recent;
                 r.session_cards = snap.session_cards;
@@ -1694,7 +1799,8 @@ impl ProxyController {
             "claude" => cfg.claude.default_profile.clone(),
             _ => cfg.codex.default_profile.clone(),
         };
-        let profiles = list_profiles_from_cfg(cfg.as_ref(), service_name);
+        let profiles =
+            list_profiles_from_cfg(cfg.as_ref(), service_name, default_profile.as_deref());
 
         self.mode = ProxyMode::Running(RunningProxy {
             service_name,
@@ -1737,6 +1843,25 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+async fn effective_default_profile_from_cfg_state(
+    state: &ProxyState,
+    service_name: &str,
+    cfg: &ProxyConfig,
+) -> Option<String> {
+    let mgr = match service_name {
+        "claude" => &cfg.claude,
+        _ => &cfg.codex,
+    };
+    if let Some(name) = state
+        .get_runtime_default_profile_override(service_name)
+        .await
+        && mgr.profiles.contains_key(name.as_str())
+    {
+        return Some(name);
+    }
+    mgr.default_profile.clone()
+}
+
 fn list_configs_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<ConfigOption> {
     let mgr = match service_name {
         "claude" => &cfg.claude,
@@ -1756,12 +1881,15 @@ fn list_configs_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<ConfigOpt
     out
 }
 
-fn list_profiles_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<ControlProfileOption> {
+fn list_profiles_from_cfg(
+    cfg: &ProxyConfig,
+    service_name: &str,
+    default_name: Option<&str>,
+) -> Vec<ControlProfileOption> {
     let mgr = match service_name {
         "claude" => &cfg.claude,
         _ => &cfg.codex,
     };
-    let default_name = mgr.default_profile.as_deref();
     let mut out = mgr
         .profiles
         .iter()

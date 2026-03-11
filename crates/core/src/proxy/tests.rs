@@ -160,6 +160,15 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             service_tier: Some("priority".to_string()),
         },
     );
+    cfg.codex.profiles.insert(
+        "steady".to_string(),
+        ServiceControlProfile {
+            station: Some("test".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: Some("default".to_string()),
+        },
+    );
 
     let proxy = ProxyService::new(
         Client::new(),
@@ -194,6 +203,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         items
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles/default"))
     }));
 
     let set_global = client
@@ -296,6 +310,64 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .get("service_tier")
             .and_then(|v| v.as_str()),
         Some("priority")
+    );
+
+    let set_default = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/profiles/default",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "profile_name": "steady" }))
+        .send()
+        .await
+        .expect("set default profile send");
+    assert_eq!(set_default.status(), StatusCode::NO_CONTENT);
+
+    let profiles = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/profiles",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get profiles after override send")
+        .error_for_status()
+        .expect("get profiles after override status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get profiles after override json");
+    assert_eq!(
+        profiles.get("default_profile").and_then(|v| v.as_str()),
+        Some("steady")
+    );
+
+    let clear_default = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/profiles/default",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "profile_name": null }))
+        .send()
+        .await
+        .expect("clear default profile send");
+    assert_eq!(clear_default.status(), StatusCode::NO_CONTENT);
+
+    let profiles = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/profiles",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get profiles after clear send")
+        .error_for_status()
+        .expect("get profiles after clear status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get profiles after clear json");
+    assert_eq!(
+        profiles.get("default_profile").and_then(|v| v.as_str()),
+        Some("fast")
     );
 
     let apply_profile = client
@@ -571,6 +643,141 @@ async fn proxy_default_profile_binding_applies_to_new_session() {
             .get("source")
             .and_then(|v| v.as_str()),
         Some("profile_default")
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_runtime_default_profile_override_applies_to_new_session() {
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(|body: Bytes| async move {
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("echo upstream json");
+            (StatusCode::OK, Json(json))
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let mut cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", upstream_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: {
+                let mut t = HashMap::new();
+                t.insert("provider_id".to_string(), "u-bind-runtime".to_string());
+                t
+            },
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    cfg.codex.default_profile = Some("daily".to_string());
+    cfg.codex.profiles.insert(
+        "daily".to_string(),
+        ServiceControlProfile {
+            station: Some("test".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: Some("default".to_string()),
+        },
+    );
+    cfg.codex.profiles.insert(
+        "fast".to_string(),
+        ServiceControlProfile {
+            station: Some("test".to_string()),
+            model: Some("gpt-5.4-fast".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            service_tier: Some("priority".to_string()),
+        },
+    );
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let set_default = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/profiles/default",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "profile_name": "fast" }))
+        .send()
+        .await
+        .expect("set runtime default profile send");
+    assert_eq!(set_default.status(), StatusCode::NO_CONTENT);
+
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .header("session_id", "sid-bind-runtime")
+        .body(r#"{"input":"hi"}"#)
+        .send()
+        .await
+        .expect("send runtime binding request")
+        .error_for_status()
+        .expect("runtime binding request status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("runtime binding request json");
+
+    assert_eq!(
+        resp.get("model").and_then(|v| v.as_str()),
+        Some("gpt-5.4-fast")
+    );
+    assert_eq!(
+        resp.get("service_tier").and_then(|v| v.as_str()),
+        Some("priority")
+    );
+    assert_eq!(
+        resp.get("reasoning")
+            .and_then(|v| v.get("effort"))
+            .and_then(|v| v.as_str()),
+        Some("low")
+    );
+
+    let snap = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/snapshot?recent_limit=10&stats_days=7",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("runtime binding snapshot send")
+        .error_for_status()
+        .expect("runtime binding snapshot status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("runtime binding snapshot json");
+
+    assert_eq!(
+        snap.get("default_profile").and_then(|v| v.as_str()),
+        Some("fast")
+    );
+    let card = &snap["snapshot"]["session_cards"][0];
+    assert_eq!(
+        card.get("binding_profile_name").and_then(|v| v.as_str()),
+        Some("fast")
+    );
+    assert_eq!(
+        card["effective_model"]
+            .get("value")
+            .and_then(|v| v.as_str()),
+        Some("gpt-5.4-fast")
     );
 
     proxy_handle.abort();

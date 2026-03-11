@@ -70,8 +70,8 @@ fn list_config_options_from_mgr(
 
 fn list_profile_options_from_mgr(
     mgr: &ServiceConfigManager,
+    default_name: Option<&str>,
 ) -> Vec<crate::dashboard_core::ControlProfileOption> {
-    let default_name = mgr.default_profile.as_deref();
     let mut profiles = mgr
         .profiles
         .iter()
@@ -88,6 +88,21 @@ fn list_profile_options_from_mgr(
         .collect::<Vec<_>>();
     profiles.sort_by(|a, b| a.name.cmp(&b.name));
     profiles
+}
+
+async fn effective_default_profile_name(
+    state: &ProxyState,
+    service_name: &str,
+    mgr: &ServiceConfigManager,
+) -> Option<String> {
+    if let Some(name) = state
+        .get_runtime_default_profile_override(service_name)
+        .await
+        && mgr.profile(name.as_str()).is_some()
+    {
+        return Some(name);
+    }
+    mgr.default_profile_ref().map(|(name, _)| name.to_string())
 }
 
 #[derive(Default)]
@@ -642,10 +657,12 @@ impl ProxyService {
             return Some(binding);
         }
 
-        let (profile_name, profile) = mgr.default_profile_ref()?;
+        let profile_name =
+            effective_default_profile_name(self.state.as_ref(), self.service_name, mgr).await?;
+        let profile = mgr.profile(profile_name.as_str())?;
         let binding = crate::state::SessionBinding {
             session_id: session_id.to_string(),
-            profile_name: Some(profile_name.to_string()),
+            profile_name: Some(profile_name),
             station_name: profile.station.clone(),
             model: profile.model.clone(),
             reasoning_effort: profile.reasoning_effort.clone(),
@@ -3114,6 +3131,11 @@ pub fn router(proxy: ProxyService) -> Router {
     }
 
     #[derive(serde::Deserialize)]
+    struct DefaultProfileRequest {
+        profile_name: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
     struct GlobalConfigOverrideRequest {
         config_name: Option<String>,
     }
@@ -3335,10 +3357,53 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
+        let default_profile =
+            effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
         Ok(Json(ProfilesResponse {
-            default_profile: mgr.default_profile.clone(),
-            profiles: list_profile_options_from_mgr(mgr),
+            default_profile: default_profile.clone(),
+            profiles: list_profile_options_from_mgr(mgr, default_profile.as_deref()),
         }))
+    }
+
+    async fn set_default_profile(
+        proxy: ProxyService,
+        Json(payload): Json<DefaultProfileRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        let profile_name = payload
+            .profile_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        if let Some(profile_name) = profile_name {
+            let cfg = proxy.config.snapshot().await;
+            let mgr = match proxy.service_name {
+                "claude" => &cfg.claude,
+                _ => &cfg.codex,
+            };
+            if mgr.profile(profile_name.as_str()).is_none() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("profile '{}' not found", profile_name),
+                ));
+            }
+            proxy
+                .state
+                .set_runtime_default_profile_override(
+                    proxy.service_name.to_string(),
+                    profile_name,
+                    now_ms(),
+                )
+                .await;
+        } else {
+            proxy
+                .state
+                .clear_runtime_default_profile_override(proxy.service_name)
+                .await;
+        }
+
+        Ok(StatusCode::NO_CONTENT)
     }
 
     async fn apply_session_profile(
@@ -3498,6 +3563,7 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/config/reload",
                 "/__codex_helper/api/v1/configs",
                 "/__codex_helper/api/v1/profiles",
+                "/__codex_helper/api/v1/profiles/default",
                 "/__codex_helper/api/v1/overrides/session/profile",
                 "/__codex_helper/api/v1/overrides/session/model",
                 "/__codex_helper/api/v1/overrides/session/effort",
@@ -3529,6 +3595,8 @@ pub fn router(proxy: ProxyService) -> Router {
             _ => &cfg.codex,
         };
         let configs = list_config_options_from_mgr(mgr);
+        let default_profile =
+            effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
 
         let mut snapshot = crate::dashboard_core::build_dashboard_snapshot(
             &proxy.state,
@@ -3545,8 +3613,8 @@ pub fn router(proxy: ProxyService) -> Router {
             runtime_loaded_at_ms: Some(proxy.config.last_loaded_at_ms()),
             runtime_source_mtime_ms: proxy.config.last_mtime_ms().await,
             configs,
-            default_profile: mgr.default_profile.clone(),
-            profiles: list_profile_options_from_mgr(mgr),
+            default_profile: default_profile.clone(),
+            profiles: list_profile_options_from_mgr(mgr, default_profile.as_deref()),
             snapshot,
         }))
     }
@@ -3776,6 +3844,7 @@ pub fn router(proxy: ProxyService) -> Router {
     let p30 = proxy.clone();
     let p31 = proxy.clone();
     let p32 = proxy.clone();
+    let p33 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -3826,6 +3895,10 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/profiles",
             get(move || list_profiles(p31.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/profiles/default",
+            post(move |payload| set_default_profile(p33.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/overrides/session/profile",
