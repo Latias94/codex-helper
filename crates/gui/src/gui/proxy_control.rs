@@ -8,11 +8,11 @@ use reqwest::Client;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::config::{
-    ProxyConfig, ResolvedRetryConfig, RetryConfig, ServiceKind, load_or_bootstrap_for_service,
-    model_routing_warnings,
+    PersistedStationProviderRef, PersistedStationSpec, ProxyConfig, ResolvedRetryConfig,
+    RetryConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
 };
 use crate::dashboard_core::{
     ApiV1Capabilities, ApiV1Snapshot, ConfigOption, ControlProfileOption,
@@ -100,6 +100,9 @@ pub struct AttachedStatus {
     pub configured_retry: Option<RetryConfig>,
     pub resolved_retry: Option<ResolvedRetryConfig>,
     pub supports_retry_config_api: bool,
+    pub persisted_stations: BTreeMap<String, PersistedStationSpec>,
+    pub persisted_station_providers: BTreeMap<String, PersistedStationProviderRef>,
+    pub supports_station_spec_api: bool,
     pub supports_persisted_station_config: bool,
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
@@ -145,6 +148,9 @@ impl AttachedStatus {
             configured_retry: None,
             resolved_retry: None,
             supports_retry_config_api: false,
+            persisted_stations: BTreeMap::new(),
+            persisted_station_providers: BTreeMap::new(),
+            supports_station_spec_api: false,
             supports_persisted_station_config: false,
             supports_default_profile_override: false,
             supports_config_runtime_override: false,
@@ -853,6 +859,9 @@ impl ProxyController {
                 configured_retry: Option<RetryConfig>,
                 resolved_retry: Option<ResolvedRetryConfig>,
                 supports_retry_config_api: bool,
+                persisted_stations: BTreeMap<String, PersistedStationSpec>,
+                persisted_station_providers: BTreeMap<String, PersistedStationProviderRef>,
+                supports_station_spec_api: bool,
                 supports_persisted_station_config: bool,
                 supports_default_profile_override: bool,
                 supports_config_runtime_override: bool,
@@ -894,6 +903,9 @@ impl ProxyController {
                     let supports_retry_config_api = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/retry/config");
+                    let supports_station_spec_api = endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/stations/specs");
                     let supports_default_profile_override = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/profiles/default");
@@ -945,6 +957,17 @@ impl ProxyController {
                         .await
                         .ok()
                         .map(|response| (response.configured, response.resolved))
+                    } else {
+                        None
+                    };
+                    let persisted_station_catalog = if supports_station_spec_api {
+                        get_json::<crate::config::PersistedStationsCatalog>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/stations/specs"),
+                            req_timeout,
+                        )
+                        .await
+                        .ok()
                     } else {
                         None
                     };
@@ -1023,6 +1046,29 @@ impl ProxyController {
                                 .as_ref()
                                 .map(|(_, resolved)| resolved.clone()),
                             supports_retry_config_api,
+                            persisted_stations: persisted_station_catalog
+                                .as_ref()
+                                .map(|catalog| {
+                                    catalog
+                                        .stations
+                                        .iter()
+                                        .cloned()
+                                        .map(|station| (station.name.clone(), station))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            persisted_station_providers: persisted_station_catalog
+                                .as_ref()
+                                .map(|catalog| {
+                                    catalog
+                                        .providers
+                                        .iter()
+                                        .cloned()
+                                        .map(|provider| (provider.name.clone(), provider))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            supports_station_spec_api,
                             supports_persisted_station_config,
                             supports_default_profile_override,
                             supports_config_runtime_override,
@@ -1182,6 +1228,29 @@ impl ProxyController {
                             .map(|(_, resolved)| resolved.clone())
                             .or(runtime.retry),
                         supports_retry_config_api,
+                        persisted_stations: persisted_station_catalog
+                            .as_ref()
+                            .map(|catalog| {
+                                catalog
+                                    .stations
+                                    .iter()
+                                    .cloned()
+                                    .map(|station| (station.name.clone(), station))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        persisted_station_providers: persisted_station_catalog
+                            .as_ref()
+                            .map(|catalog| {
+                                catalog
+                                    .providers
+                                    .iter()
+                                    .cloned()
+                                    .map(|provider| (provider.name.clone(), provider))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        supports_station_spec_api,
                         supports_persisted_station_config,
                         supports_default_profile_override,
                         supports_config_runtime_override,
@@ -1249,6 +1318,9 @@ impl ProxyController {
                     configured_retry: None,
                     resolved_retry: runtime.retry,
                     supports_retry_config_api: false,
+                    persisted_stations: BTreeMap::new(),
+                    persisted_station_providers: BTreeMap::new(),
+                    supports_station_spec_api: false,
                     supports_persisted_station_config: false,
                     supports_default_profile_override: false,
                     supports_config_runtime_override: false,
@@ -1303,6 +1375,9 @@ impl ProxyController {
                     att.configured_retry = result.configured_retry;
                     att.resolved_retry = result.resolved_retry;
                     att.supports_retry_config_api = result.supports_retry_config_api;
+                    att.persisted_stations = result.persisted_stations;
+                    att.persisted_station_providers = result.persisted_station_providers;
+                    att.supports_station_spec_api = result.supports_station_spec_api;
                     att.supports_persisted_station_config =
                         result.supports_persisted_station_config;
                     att.supports_default_profile_override =
@@ -1818,6 +1893,95 @@ impl ProxyController {
                         "enabled": enabled,
                         "level": level,
                     })),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn upsert_persisted_station_spec(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        station_name: String,
+        station: PersistedStationSpec,
+    ) -> anyhow::Result<()> {
+        if station_name.trim().is_empty() {
+            bail!("station name is required");
+        }
+
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) || !att.supports_station_spec_api {
+                    bail!(
+                        "attached proxy does not support persisted station spec API (need api v1)"
+                    );
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .put(format!(
+                        "{base}/__codex_helper/api/v1/stations/specs/{}",
+                        station_name.trim()
+                    ))
+                    .timeout(Duration::from_millis(1500))
+                    .json(&serde_json::json!({
+                        "alias": station.alias,
+                        "enabled": station.enabled,
+                        "level": station.level,
+                        "members": station.members,
+                    })),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_persisted_station_spec(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        station_name: String,
+    ) -> anyhow::Result<()> {
+        if station_name.trim().is_empty() {
+            bail!("station name is required");
+        }
+
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) || !att.supports_station_spec_api {
+                    bail!(
+                        "attached proxy does not support persisted station spec API (need api v1)"
+                    );
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .delete(format!(
+                        "{base}/__codex_helper/api/v1/stations/specs/{}",
+                        station_name.trim()
+                    ))
+                    .timeout(Duration::from_millis(1500)),
             )
             .await?;
             Ok::<(), anyhow::Error>(())
@@ -3350,6 +3514,92 @@ mod tests {
                 .map(|retry| retry.cooldown_backoff_factor),
             Some(3)
         );
+
+        handle.abort();
+    }
+
+    #[test]
+    fn attached_persisted_station_spec_uses_v1_specs_endpoints() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let observed_put_payload = Arc::new(Mutex::new(None::<Value>));
+        let delete_hits = Arc::new(Mutex::new(0usize));
+        let app = Router::new().route(
+            "/__codex_helper/api/v1/stations/specs/alpha",
+            put({
+                let observed_put_payload = observed_put_payload.clone();
+                move |Json(payload): Json<Value>| {
+                    let observed_put_payload = observed_put_payload.clone();
+                    async move {
+                        *observed_put_payload
+                            .lock()
+                            .expect("station spec payload lock") = Some(payload);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            })
+            .delete({
+                let delete_hits = delete_hits.clone();
+                move || {
+                    let delete_hits = delete_hits.clone();
+                    async move {
+                        *delete_hits.lock().expect("delete hits lock") += 1;
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4304, ServiceKind::Codex);
+        let mut attached = AttachedStatus::new(4304);
+        attached.api_version = Some(1);
+        attached.admin_base_url = base_url;
+        attached.supports_station_spec_api = true;
+        controller.mode = ProxyMode::Attached(attached);
+
+        controller
+            .upsert_persisted_station_spec(
+                &rt,
+                "alpha".to_string(),
+                PersistedStationSpec {
+                    name: "alpha".to_string(),
+                    alias: Some("Alpha".to_string()),
+                    enabled: false,
+                    level: 7,
+                    members: vec![crate::config::GroupMemberRefV2 {
+                        provider: "right".to_string(),
+                        endpoint_names: vec!["hk".to_string()],
+                        preferred: true,
+                    }],
+                },
+            )
+            .expect("upsert persisted station spec");
+        controller
+            .delete_persisted_station_spec(&rt, "alpha".to_string())
+            .expect("delete persisted station spec");
+
+        let observed_put_payload = observed_put_payload
+            .lock()
+            .expect("station spec payload lock")
+            .clone()
+            .expect("station spec payload");
+        assert_eq!(
+            observed_put_payload.get("alias"),
+            Some(&Value::String("Alpha".to_string()))
+        );
+        assert_eq!(
+            observed_put_payload.get("enabled"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(observed_put_payload.get("level"), Some(&Value::from(7)));
+        assert_eq!(
+            observed_put_payload["members"][0]
+                .get("provider")
+                .and_then(|value| value.as_str()),
+            Some("right")
+        );
+        assert_eq!(*delete_hits.lock().expect("delete hits lock"), 1);
 
         handle.abort();
     }

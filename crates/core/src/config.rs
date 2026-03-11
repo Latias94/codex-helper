@@ -982,13 +982,53 @@ impl Default for GroupConfigV2 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct GroupMemberRefV2 {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "endpoints")]
     pub endpoint_names: Vec<String>,
     #[serde(default)]
     pub preferred: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PersistedStationProviderEndpointRef {
+    pub name: String,
+    pub base_url: String,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PersistedStationProviderRef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<PersistedStationProviderEndpointRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PersistedStationSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_service_config_level")]
+    pub level: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<GroupMemberRefV2>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PersistedStationsCatalog {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stations: Vec<PersistedStationSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<PersistedStationProviderRef>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1127,6 +1167,55 @@ fn compile_service_view_v2(
     };
     validate_service_profiles(service_name, &mgr)?;
     Ok(mgr)
+}
+
+pub fn build_persisted_station_catalog(view: &ServiceViewV2) -> PersistedStationsCatalog {
+    let mut providers = view
+        .providers
+        .iter()
+        .map(|(name, provider)| PersistedStationProviderRef {
+            name: name.clone(),
+            alias: provider.alias.clone(),
+            enabled: provider.enabled,
+            endpoints: provider
+                .endpoints
+                .iter()
+                .map(
+                    |(endpoint_name, endpoint)| PersistedStationProviderEndpointRef {
+                        name: endpoint_name.clone(),
+                        base_url: endpoint.base_url.clone(),
+                        enabled: endpoint.enabled,
+                    },
+                )
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|a, b| a.name.cmp(&b.name));
+    for provider in &mut providers {
+        provider.endpoints.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.base_url.cmp(&b.base_url))
+        });
+    }
+
+    let mut stations = view
+        .groups
+        .iter()
+        .map(|(name, station)| PersistedStationSpec {
+            name: name.clone(),
+            alias: station.alias.clone(),
+            enabled: station.enabled,
+            level: station.level.clamp(1, 10),
+            members: station.members.clone(),
+        })
+        .collect::<Vec<_>>();
+    stations.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+
+    PersistedStationsCatalog {
+        stations,
+        providers,
+    }
 }
 
 pub fn compile_v2_to_runtime(v2: &ProxyConfigV2) -> Result<ProxyConfig> {

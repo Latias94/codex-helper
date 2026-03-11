@@ -92,6 +92,7 @@
 - [~] CP-401 Introduce explicit `Station` runtime model
   - [x] add explicit `/api/v1/stations` and `/api/v1/stations/runtime` aliases
   - [x] add persisted station config API for `active_station` / `enabled` / `level`
+  - [x] add persisted station structure API for alias / members / create / delete
   - [x] prefer station API in attach mode with legacy `configs` fallback
   - [x] align operator-facing GUI/tray labels with station terminology where semantics are already station-first
   - [ ] rename internal runtime/public UI model from `config` to `station`
@@ -133,6 +134,7 @@
   - [x] dedicated station-focused page for health / drain / breaker / quick switch
   - [x] Config v2 common station fields use control-plane directly when selected service matches the running/attached proxy
   - [x] Stations page persisted station controls are remote-first when the current proxy exposes station config APIs
+- [x] CP-608 Add Config v2 station structure editor with remote-safe attach fallback
 - [x] CP-604 Add "effective route source" explanation UI
 - [x] CP-605 Add remote-safe capability gating in GUI
 - [x] CP-606 Keep transcript/history UI usable even when only observed-session data exists

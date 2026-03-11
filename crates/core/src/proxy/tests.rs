@@ -18,8 +18,10 @@ use tokio::time::{Duration, sleep};
 use tower::util::ServiceExt;
 
 use crate::config::{
-    ProxyConfig, RetryConfig, RetryProfileName, RetryStrategy, ServiceConfig, ServiceConfigManager,
-    ServiceControlProfile, UiConfig, UpstreamAuth, UpstreamConfig,
+    GroupConfigV2, GroupMemberRefV2, ProviderConfigV2, ProviderEndpointV2, ProxyConfig,
+    ProxyConfigV2, RetryConfig, RetryProfileName, RetryStrategy, ServiceConfig,
+    ServiceConfigManager, ServiceControlProfile, ServiceViewV2, UiConfig, UpstreamAuth,
+    UpstreamConfig,
 };
 use crate::proxy::ProxyService;
 use crate::state::RuntimeConfigState;
@@ -264,6 +266,16 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         items
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations/{name}"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations/specs"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations/specs/{name}"))
     }));
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
@@ -1023,6 +1035,210 @@ async fn proxy_api_v1_retry_config_crud_persists_profile_and_cooldowns() {
     assert!(config_text.contains("[retry]"));
     assert!(config_text.contains("profile = \"cost-primary\""));
     assert!(config_text.contains("transport_cooldown_secs = 45"));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
+    let _env_lock = env_lock();
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let mut cfg = ProxyConfigV2 {
+        version: 2,
+        codex: ServiceViewV2::default(),
+        claude: ServiceViewV2::default(),
+        retry: RetryConfig::default(),
+        notify: Default::default(),
+        default_service: None,
+        ui: UiConfig::default(),
+    };
+    cfg.codex.active_group = Some("alpha".to_string());
+    cfg.codex.providers.insert(
+        "right".to_string(),
+        ProviderConfigV2 {
+            alias: Some("Right".to_string()),
+            enabled: true,
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: Some("RIGHT_API_KEY".to_string()),
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: Default::default(),
+            supported_models: Default::default(),
+            model_mapping: Default::default(),
+            endpoints: [
+                (
+                    "default".to_string(),
+                    ProviderEndpointV2 {
+                        base_url: "https://right.example.com/v1".to_string(),
+                        enabled: true,
+                        tags: Default::default(),
+                        supported_models: Default::default(),
+                        model_mapping: Default::default(),
+                    },
+                ),
+                (
+                    "hk".to_string(),
+                    ProviderEndpointV2 {
+                        base_url: "https://hk.right.example.com/v1".to_string(),
+                        enabled: true,
+                        tags: Default::default(),
+                        supported_models: Default::default(),
+                        model_mapping: Default::default(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        },
+    );
+    cfg.codex.groups.insert(
+        "alpha".to_string(),
+        GroupConfigV2 {
+            alias: Some("Alpha".to_string()),
+            enabled: true,
+            level: 1,
+            members: vec![GroupMemberRefV2 {
+                provider: "right".to_string(),
+                endpoint_names: vec!["default".to_string()],
+                preferred: false,
+            }],
+        },
+    );
+
+    crate::config::save_config_v2(&cfg)
+        .await
+        .expect("write initial v2 config");
+    let loaded = crate::config::load_config()
+        .await
+        .expect("load initial runtime config");
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(loaded),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let initial = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/stations/specs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get station specs send")
+        .error_for_status()
+        .expect("get station specs status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get station specs json");
+    assert_eq!(
+        initial["stations"]
+            .as_array()
+            .map(|stations| stations.len()),
+        Some(1)
+    );
+    assert_eq!(
+        initial["providers"]
+            .as_array()
+            .map(|providers| providers.len()),
+        Some(1)
+    );
+
+    let update = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/stations/specs/beta",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "alias": "Beta",
+            "enabled": false,
+            "level": 7,
+            "members": [
+                {
+                    "provider": "right",
+                    "endpoint_names": ["hk"],
+                    "preferred": true
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("upsert station spec send");
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let after_update = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/stations/specs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get station specs after update send")
+        .error_for_status()
+        .expect("get station specs after update status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get station specs after update json");
+    let beta = after_update["stations"]
+        .as_array()
+        .and_then(|stations| {
+            stations.iter().find(|station| {
+                station.get("name").and_then(|value| value.as_str()) == Some("beta")
+            })
+        })
+        .expect("beta station");
+    assert_eq!(
+        beta.get("enabled").and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(beta.get("level").and_then(|value| value.as_u64()), Some(7));
+    assert_eq!(
+        beta["members"][0]
+            .get("provider")
+            .and_then(|value| value.as_str()),
+        Some("right")
+    );
+    assert_eq!(
+        beta["members"][0]
+            .get("endpoint_names")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|value| value.as_str()),
+        Some("hk")
+    );
+
+    let delete = client
+        .delete(format!(
+            "http://{}/__codex_helper/api/v1/stations/specs/beta",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("delete station spec send");
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let reloaded_cfg = crate::config::load_config()
+        .await
+        .expect("reload config from disk after station spec CRUD");
+    assert!(reloaded_cfg.codex.configs.contains_key("alpha"));
+    assert!(!reloaded_cfg.codex.configs.contains_key("beta"));
+
+    let config_text =
+        std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
+    assert!(config_text.contains("[codex.providers.right]"));
+    assert!(config_text.contains("[codex.stations.alpha]"));
+    assert!(!config_text.contains("[codex.stations.beta]"));
 
     proxy_handle.abort();
 }

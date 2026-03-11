@@ -3239,12 +3239,32 @@ pub fn router(proxy: ProxyService) -> Router {
         service_tier: Option<String>,
     }
 
+    fn default_persisted_station_enabled() -> bool {
+        true
+    }
+
+    fn default_persisted_station_level() -> u8 {
+        1
+    }
+
     #[derive(serde::Deserialize)]
     struct PersistedStationUpdateRequest {
         #[serde(default)]
         enabled: Option<bool>,
         #[serde(default)]
         level: Option<u8>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PersistedStationSpecUpsertRequest {
+        #[serde(default)]
+        alias: Option<String>,
+        #[serde(default = "default_persisted_station_enabled")]
+        enabled: bool,
+        #[serde(default = "default_persisted_station_level")]
+        level: u8,
+        #[serde(default)]
+        members: Vec<crate::config::GroupMemberRefV2>,
     }
 
     #[derive(serde::Deserialize)]
@@ -3379,6 +3399,106 @@ pub fn router(proxy: ProxyService) -> Router {
             reasoning_effort: normalize(payload.reasoning_effort),
             service_tier: normalize(payload.service_tier),
         }
+    }
+
+    fn normalize_optional_config_string(value: Option<String>) -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn sanitize_station_spec_request(
+        payload: PersistedStationSpecUpsertRequest,
+    ) -> Result<crate::config::PersistedStationSpec, (StatusCode, String)> {
+        let mut members = Vec::new();
+        for member in payload.members {
+            let provider = member.provider.trim();
+            if provider.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "station member provider is required".to_string(),
+                ));
+            }
+
+            let mut endpoint_names = member
+                .endpoint_names
+                .into_iter()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>();
+            endpoint_names.dedup();
+
+            members.push(crate::config::GroupMemberRefV2 {
+                provider: provider.to_string(),
+                endpoint_names,
+                preferred: member.preferred,
+            });
+        }
+
+        Ok(crate::config::PersistedStationSpec {
+            name: String::new(),
+            alias: normalize_optional_config_string(payload.alias),
+            enabled: payload.enabled,
+            level: payload.level.clamp(1, 10),
+            members,
+        })
+    }
+
+    fn service_view_v2<'a>(
+        cfg: &'a crate::config::ProxyConfigV2,
+        service_name: &str,
+    ) -> &'a crate::config::ServiceViewV2 {
+        match service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        }
+    }
+
+    fn service_view_v2_mut<'a>(
+        cfg: &'a mut crate::config::ProxyConfigV2,
+        service_name: &str,
+    ) -> &'a mut crate::config::ServiceViewV2 {
+        match service_name {
+            "claude" => &mut cfg.claude,
+            _ => &mut cfg.codex,
+        }
+    }
+
+    fn validate_station_members_for_view(
+        service_name: &str,
+        station_name: &str,
+        view: &crate::config::ServiceViewV2,
+        members: &[crate::config::GroupMemberRefV2],
+    ) -> Result<(), (StatusCode, String)> {
+        for member in members {
+            let provider = view
+                .providers
+                .get(member.provider.as_str())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "[{service_name}] station '{}' references missing provider '{}'",
+                            station_name, member.provider
+                        ),
+                    )
+                })?;
+
+            for endpoint_name in &member.endpoint_names {
+                if !provider.endpoints.contains_key(endpoint_name.as_str()) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "[{service_name}] station '{}' references missing endpoint '{}.{}'",
+                            station_name, member.provider, endpoint_name
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn make_profiles_response(proxy: &ProxyService) -> ProfilesResponse {
@@ -3660,6 +3780,59 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(make_profiles_response(proxy).await)
     }
 
+    async fn load_persisted_config_v2() -> Result<crate::config::ProxyConfigV2, (StatusCode, String)>
+    {
+        let path = crate::config::config_file_path();
+        if path.exists()
+            && path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        {
+            let text = tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let version = toml::from_str::<toml::Value>(&text)
+                .ok()
+                .and_then(|value| value.get("version").and_then(|v| v.as_integer()))
+                .map(|value| value as u32);
+            if version == Some(2) {
+                return toml::from_str::<crate::config::ProxyConfigV2>(&text)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
+        }
+
+        let runtime = crate::config::load_config()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        crate::config::compact_v2_config(&crate::config::migrate_legacy_to_v2(&runtime))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    }
+
+    async fn save_proxy_config_v2_and_reload(
+        proxy: &ProxyService,
+        cfg: crate::config::ProxyConfigV2,
+    ) -> Result<(), (StatusCode, String)> {
+        crate::config::save_config_v2(&cfg)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        proxy
+            .config
+            .force_reload_from_disk()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_persisted_station_specs(
+        proxy: ProxyService,
+    ) -> Result<Json<crate::config::PersistedStationsCatalog>, (StatusCode, String)> {
+        let cfg = load_persisted_config_v2().await?;
+        Ok(Json(crate::config::build_persisted_station_catalog(
+            service_view_v2(&cfg, proxy.service_name),
+        )))
+    }
+
     async fn upsert_persisted_profile(
         proxy: ProxyService,
         Path(profile_name): Path<String>,
@@ -3786,6 +3959,82 @@ pub fn router(proxy: ProxyService) -> Router {
         mgr.active = station_name;
 
         save_proxy_config_and_reload(&proxy, cfg).await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn upsert_persisted_station_spec(
+        proxy: ProxyService,
+        Path(station_name): Path<String>,
+        Json(payload): Json<PersistedStationSpecUpsertRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        let station_name = sanitize_station_name(station_name.as_str())?;
+        let mut station = sanitize_station_spec_request(payload)?;
+        station.name = station_name.clone();
+
+        let mut cfg = load_persisted_config_v2().await?;
+        let view = service_view_v2_mut(&mut cfg, proxy.service_name);
+        validate_station_members_for_view(
+            proxy.service_name,
+            station_name.as_str(),
+            view,
+            &station.members,
+        )?;
+        view.groups.insert(
+            station_name.clone(),
+            crate::config::GroupConfigV2 {
+                alias: station.alias.clone(),
+                enabled: station.enabled,
+                level: station.level.clamp(1, 10),
+                members: station.members.clone(),
+            },
+        );
+
+        crate::config::compile_v2_to_runtime(&cfg)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        save_proxy_config_v2_and_reload(&proxy, cfg).await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn delete_persisted_station_spec(
+        proxy: ProxyService,
+        Path(station_name): Path<String>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        let station_name = sanitize_station_name(station_name.as_str())?;
+        let mut cfg = load_persisted_config_v2().await?;
+        let view = service_view_v2_mut(&mut cfg, proxy.service_name);
+
+        let referencing_profiles = view
+            .profiles
+            .iter()
+            .filter_map(|(profile_name, profile)| {
+                (profile.station.as_deref() == Some(station_name.as_str()))
+                    .then_some(profile_name.clone())
+            })
+            .collect::<Vec<_>>();
+        if !referencing_profiles.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "station '{}' is referenced by profiles: {}",
+                    station_name,
+                    referencing_profiles.join(", ")
+                ),
+            ));
+        }
+
+        if view.groups.remove(station_name.as_str()).is_none() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("station '{}' not found", station_name),
+            ));
+        }
+        if view.active_group.as_deref() == Some(station_name.as_str()) {
+            view.active_group = None;
+        }
+
+        crate::config::compile_v2_to_runtime(&cfg)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        save_proxy_config_v2_and_reload(&proxy, cfg).await?;
         Ok(StatusCode::NO_CONTENT)
     }
 
@@ -4126,6 +4375,8 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/stations/runtime",
                 "/__codex_helper/api/v1/stations/config-active",
                 "/__codex_helper/api/v1/stations/{name}",
+                "/__codex_helper/api/v1/stations/specs",
+                "/__codex_helper/api/v1/stations/specs/{name}",
                 "/__codex_helper/api/v1/profiles",
                 "/__codex_helper/api/v1/profiles/default",
                 "/__codex_helper/api/v1/profiles/config-default",
@@ -4464,6 +4715,7 @@ pub fn router(proxy: ProxyService) -> Router {
     let p34 = proxy.clone();
     let p35 = proxy.clone();
     let p36 = proxy.clone();
+    let p37 = proxy.clone();
     let p38 = proxy.clone();
     let p39 = proxy.clone();
     let p40 = proxy.clone();
@@ -4471,6 +4723,8 @@ pub fn router(proxy: ProxyService) -> Router {
     let p42 = proxy.clone();
     let p43 = proxy.clone();
     let p44 = proxy.clone();
+    let p45 = proxy.clone();
+    let p46 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -4542,6 +4796,15 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/stations/{name}",
             put(move |name, payload| update_persisted_station(p42.clone(), name, payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/stations/specs",
+            get(move || list_persisted_station_specs(p37.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/stations/specs/{name}",
+            put(move |name, payload| upsert_persisted_station_spec(p45.clone(), name, payload))
+                .delete(move |name| delete_persisted_station_spec(p46.clone(), name)),
         )
         .route(
             "/__codex_helper/api/v1/profiles",
