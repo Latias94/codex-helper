@@ -82,7 +82,7 @@
 - [x] CP-306 Support quick switch:
   - set default profile
   - apply profile to selected session
-- [ ] CP-307 Add validation for profile-station compatibility
+- [x] CP-307 Add validation for profile-station compatibility
 
 ## WS4 - Station Registry and HA
 

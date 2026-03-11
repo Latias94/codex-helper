@@ -3513,12 +3513,19 @@ pub fn router(proxy: ProxyService) -> Router {
                 "claude" => &cfg.claude,
                 _ => &cfg.codex,
             };
-            if mgr.profile(profile_name.as_str()).is_none() {
+            let Some(profile) = mgr.profile(profile_name.as_str()) else {
                 return Err((
                     StatusCode::NOT_FOUND,
                     format!("profile '{}' not found", profile_name),
                 ));
-            }
+            };
+            crate::config::validate_profile_station_compatibility(
+                proxy.service_name,
+                mgr,
+                profile_name.as_str(),
+                profile,
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
             proxy
                 .state
                 .set_runtime_default_profile_override(
@@ -3565,6 +3572,13 @@ pub fn router(proxy: ProxyService) -> Router {
                 format!("profile '{}' not found", payload.profile_name),
             ));
         };
+        crate::config::validate_profile_station_compatibility(
+            proxy.service_name,
+            mgr,
+            payload.profile_name.as_str(),
+            profile,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
         let now = now_ms();
         proxy

@@ -450,6 +450,78 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
 }
 
 #[tokio::test]
+async fn proxy_rejects_incompatible_profile_station_capabilities() {
+    let mut cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::from([
+                ("supports_fast_mode".to_string(), "false".to_string()),
+                ("supports_reasoning".to_string(), "false".to_string()),
+            ]),
+            supported_models: HashMap::from([("gpt-5.4".to_string(), true)]),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    cfg.codex.profiles.insert(
+        "strict".to_string(),
+        ServiceControlProfile {
+            station: Some("test".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            service_tier: Some("priority".to_string()),
+        },
+    );
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let set_default = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/profiles/default",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "profile_name": "strict" }))
+        .send()
+        .await
+        .expect("set incompatible default profile send");
+    assert_eq!(set_default.status(), StatusCode::BAD_REQUEST);
+    let set_default_body = set_default.text().await.expect("set default body");
+    assert!(set_default_body.contains("service_tier"));
+
+    let apply_profile = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/profile",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "session_id": "sid-incompatible-profile",
+            "profile_name": "strict",
+        }))
+        .send()
+        .await
+        .expect("apply incompatible profile send");
+    assert_eq!(apply_profile.status(), StatusCode::BAD_REQUEST);
+    let apply_profile_body = apply_profile.text().await.expect("apply profile body");
+    assert!(apply_profile_body.contains("service_tier"));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_api_v1_snapshot_works() {
     let cfg = make_proxy_config(
         vec![UpstreamConfig {

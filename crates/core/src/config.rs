@@ -279,6 +279,141 @@ pub struct ServiceControlProfile {
     pub service_tier: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplicitCapabilitySupport {
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+fn parse_boolish_capability_tag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" | "supported" => Some(true),
+        "0" | "false" | "no" | "n" | "off" | "unsupported" => Some(false),
+        _ => None,
+    }
+}
+
+fn explicit_capability_support_for_upstreams(
+    upstreams: &[UpstreamConfig],
+    tag_keys: &[&str],
+) -> ExplicitCapabilitySupport {
+    let mut saw_supported = false;
+    let mut saw_explicit_unsupported = false;
+    let mut saw_unknown = false;
+
+    for upstream in upstreams {
+        match tag_keys
+            .iter()
+            .find_map(|key| upstream.tags.get(*key))
+            .and_then(|value| parse_boolish_capability_tag(value))
+        {
+            Some(true) => saw_supported = true,
+            Some(false) => saw_explicit_unsupported = true,
+            None => saw_unknown = true,
+        }
+    }
+
+    if saw_supported {
+        ExplicitCapabilitySupport::Supported
+    } else if saw_explicit_unsupported && !saw_unknown {
+        ExplicitCapabilitySupport::Unsupported
+    } else {
+        ExplicitCapabilitySupport::Unknown
+    }
+}
+
+pub fn validate_profile_station_compatibility(
+    service_name: &str,
+    mgr: &ServiceConfigManager,
+    profile_name: &str,
+    profile: &ServiceControlProfile,
+) -> Result<()> {
+    let Some(station) = profile
+        .station
+        .as_deref()
+        .map(str::trim)
+        .filter(|station| !station.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let Some(config) = mgr.configs.get(station) else {
+        anyhow::bail!(
+            "[{service_name}] profile '{}' references missing station/config '{}'",
+            profile_name,
+            station
+        );
+    };
+
+    if let Some(model) = profile
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        let supported = config.upstreams.is_empty()
+            || config.upstreams.iter().any(|upstream| {
+                crate::model_routing::is_model_supported(
+                    &upstream.supported_models,
+                    &upstream.model_mapping,
+                    model,
+                )
+            });
+        if !supported {
+            anyhow::bail!(
+                "[{service_name}] profile '{}' model '{}' is not supported by station/config '{}'",
+                profile_name,
+                model,
+                station
+            );
+        }
+    }
+
+    if let Some(service_tier) = profile
+        .service_tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|service_tier| !service_tier.is_empty())
+        && explicit_capability_support_for_upstreams(
+            &config.upstreams,
+            &[
+                "supports_service_tier",
+                "supports_service_tiers",
+                "supports_fast_mode",
+                "supports_fast",
+            ],
+        ) == ExplicitCapabilitySupport::Unsupported
+    {
+        anyhow::bail!(
+            "[{service_name}] profile '{}' requires service_tier '{}' but station/config '{}' explicitly disables fast/service-tier support",
+            profile_name,
+            service_tier,
+            station
+        );
+    }
+
+    if let Some(reasoning_effort) = profile
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|reasoning_effort| !reasoning_effort.is_empty())
+        && explicit_capability_support_for_upstreams(
+            &config.upstreams,
+            &["supports_reasoning_effort", "supports_reasoning"],
+        ) == ExplicitCapabilitySupport::Unsupported
+    {
+        anyhow::bail!(
+            "[{service_name}] profile '{}' requires reasoning_effort '{}' but station/config '{}' explicitly disables reasoning support",
+            profile_name,
+            reasoning_effort,
+            station
+        );
+    }
+
+    Ok(())
+}
+
 fn validate_service_profiles(service_name: &str, mgr: &ServiceConfigManager) -> Result<()> {
     if let Some(default_profile) = mgr.default_profile.as_deref()
         && !mgr.profiles.contains_key(default_profile)
@@ -290,16 +425,7 @@ fn validate_service_profiles(service_name: &str, mgr: &ServiceConfigManager) -> 
     }
 
     for (profile_name, profile) in &mgr.profiles {
-        if let Some(station) = profile.station.as_deref()
-            && !station.trim().is_empty()
-            && !mgr.configs.contains_key(station)
-        {
-            anyhow::bail!(
-                "[{service_name}] profile '{}' references missing station/config '{}'",
-                profile_name,
-                station
-            );
-        }
+        validate_profile_station_compatibility(service_name, mgr, profile_name, profile)?;
     }
 
     Ok(())
@@ -3105,6 +3231,47 @@ base_url = "https://api.example.com/v1"
             let err = super::load_config().await.expect_err("load should fail");
             assert!(
                 err.to_string().contains("default_profile"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn load_config_rejects_profile_model_incompatible_with_station_capabilities() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 1
+
+[codex]
+active = "primary"
+default_profile = "fast"
+
+[codex.profiles.fast]
+station = "primary"
+model = "gpt-4.1"
+
+[codex.configs.primary]
+name = "primary"
+
+[[codex.configs.primary.upstreams]]
+base_url = "https://api.example.com/v1"
+supported_models = { "gpt-5.4" = true }
+"#,
+            );
+
+            let err = super::load_config().await.expect_err("load should fail");
+            assert!(
+                err.to_string().contains("not supported"),
                 "unexpected error: {err}"
             );
         });
