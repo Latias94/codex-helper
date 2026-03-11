@@ -5275,6 +5275,15 @@ fn session_history_summary_from_row(
     })
 }
 
+pub(super) fn prepare_select_session_from_history(state: &mut SessionsViewState, sid: String) {
+    state.active_only = false;
+    state.errors_only = false;
+    state.overrides_only = false;
+    state.search = sid.clone();
+    state.selected_session_id = Some(sid);
+    state.selected_idx = 0;
+}
+
 fn session_list_control_label(row: &SessionRow) -> String {
     if let Some(profile_name) = row.binding_profile_name.as_deref() {
         return format!("pf:{}", shorten(profile_name, 10));
@@ -11660,6 +11669,33 @@ mod tests {
         row.override_config_name = Some("right".to_string());
 
         assert_eq!(session_list_control_label(&row), "pf:fast");
+    }
+
+    #[test]
+    fn prepare_select_session_from_history_resets_filters_and_focuses_sid() {
+        let mut state = SessionsViewState {
+            active_only: true,
+            errors_only: true,
+            overrides_only: true,
+            lock_order: true,
+            search: "old".to_string(),
+            default_profile_selection: None,
+            selected_session_id: None,
+            selected_idx: 9,
+            ordered_session_ids: Vec::new(),
+            last_active_set: HashSet::new(),
+            editor: SessionOverrideEditor::default(),
+        };
+
+        prepare_select_session_from_history(&mut state, "sid-history".to_string());
+
+        assert!(!state.active_only);
+        assert!(!state.errors_only);
+        assert!(!state.overrides_only);
+        assert_eq!(state.search, "sid-history");
+        assert_eq!(state.selected_session_id.as_deref(), Some("sid-history"));
+        assert_eq!(state.selected_idx, 0);
+        assert!(state.lock_order);
     }
 
     #[test]

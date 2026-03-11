@@ -670,6 +670,24 @@ fn render_history_selection_context(
     });
 }
 
+fn render_open_in_sessions_button(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, selected_id: &str) {
+    if ui
+        .button(pick(ctx.lang, "在 Sessions 查看", "Open in Sessions"))
+        .clicked()
+    {
+        super::prepare_select_session_from_history(&mut ctx.view.sessions, selected_id.to_string());
+        ctx.view.requested_page = Some(Page::Sessions);
+        *ctx.last_info = Some(
+            pick(
+                ctx.lang,
+                "已切到 Sessions 并定位到当前 session",
+                "Opened in Sessions and focused the current session",
+            )
+            .to_string(),
+        );
+    }
+}
+
 fn refresh_history_sessions_with_fallback(
     ctx: &mut PageCtx<'_>,
     scope: HistoryScope,
@@ -1595,6 +1613,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     selected.path.as_path(),
                     selected_source,
                 );
+                render_open_in_sessions_button(ui, ctx, selected_id.as_str());
             });
 
             render_history_selection_context(ui, ctx.lang, &ctx.view.history, &selected);
@@ -1734,6 +1753,7 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             selected.path.as_path(),
             selected_source,
         );
+        render_open_in_sessions_button(ui, ctx, selected_id.as_str());
         open_selected_clicked = history_controls::render_open_selected_in_wt_button(ui, ctx);
     });
 
@@ -1979,6 +1999,7 @@ fn render_history_all_by_date(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     selected_path.as_path(),
                     SessionSummarySource::LocalFile,
                 );
+                render_open_in_sessions_button(ui, ctx, selected_id.as_str());
             });
 
             ui.label(format!("id: {}", selected_id));
@@ -2142,6 +2163,7 @@ fn render_history_all_by_date_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>,
             selected_path.as_path(),
             SessionSummarySource::LocalFile,
         );
+        render_open_in_sessions_button(ui, ctx, selected_id.as_str());
         open_selected_clicked = history_controls::render_open_selected_in_wt_button(ui, ctx);
     });
 
