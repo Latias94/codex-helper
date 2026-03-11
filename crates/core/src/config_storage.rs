@@ -121,6 +121,28 @@ version = 1
 # [codex.configs.codex-main.upstreams.tags]
 # provider_id = "backup"
 #
+# --- 会话控制模板（profiles，可选） ---
+#
+# Phase 1 先支持“定义 / 列出 / 应用到会话”，暂不自动把 default_profile 绑定到新会话。
+#
+# [codex]
+# active = "codex-main"
+# default_profile = "daily"
+#
+# [codex.profiles.daily]
+# station = "codex-main"
+# reasoning_effort = "medium"
+#
+# [codex.profiles.fast]
+# station = "codex-main"
+# service_tier = "priority"
+# reasoning_effort = "low"
+#
+# [codex.profiles.deep]
+# station = "codex-main"
+# model = "gpt-5.4"
+# reasoning_effort = "high"
+#
 # Claude 配置在 [claude] 下结构相同。
 #
 # ---
@@ -310,6 +332,7 @@ pub async fn load_config() -> Result<ProxyConfig> {
             cfg
         };
         normalize_proxy_config(&mut cfg);
+        validate_proxy_config(&cfg)?;
         return Ok(cfg);
     }
 
@@ -319,12 +342,14 @@ pub async fn load_config() -> Result<ProxyConfig> {
         let mut cfg = serde_json::from_slice::<ProxyConfig>(&bytes)?;
         ensure_config_version(&mut cfg);
         normalize_proxy_config(&mut cfg);
+        validate_proxy_config(&cfg)?;
         return Ok(cfg);
     }
 
     let mut cfg = ProxyConfig::default();
     ensure_config_version(&mut cfg);
     normalize_proxy_config(&mut cfg);
+    validate_proxy_config(&cfg)?;
     Ok(cfg)
 }
 
@@ -332,6 +357,7 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
     let mut cfg = cfg.clone();
     cfg.version = Some(CONFIG_VERSION);
     normalize_proxy_config(&mut cfg);
+    validate_proxy_config(&cfg)?;
 
     let dir = config_dir();
     fs::create_dir_all(&dir).await?;
@@ -393,8 +419,46 @@ fn normalize_proxy_config(cfg: &mut ProxyConfig) {
                 svc.name = key.clone();
             }
         }
+        mgr.active = mgr
+            .active
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        mgr.default_profile = mgr
+            .default_profile
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        for profile in mgr.profiles.values_mut() {
+            profile.station = profile
+                .station
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            profile.model = profile
+                .model
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            profile.reasoning_effort = profile
+                .reasoning_effort
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            profile.service_tier = profile
+                .service_tier
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+        }
     }
 
     normalize_mgr(&mut cfg.codex);
     normalize_mgr(&mut cfg.claude);
+}
+
+fn validate_proxy_config(cfg: &ProxyConfig) -> Result<()> {
+    validate_service_profiles("codex", &cfg.codex)?;
+    validate_service_profiles("claude", &cfg.claude)?;
+    Ok(())
 }

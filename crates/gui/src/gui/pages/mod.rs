@@ -10,7 +10,7 @@ use super::util::{
     open_in_file_manager, spawn_windows_terminal_wt_new_tab,
     spawn_windows_terminal_wt_tabs_in_one_window,
 };
-use crate::dashboard_core::ConfigOption;
+use crate::dashboard_core::{ConfigOption, ControlProfileOption};
 use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::SessionSummary;
 use crate::state::{
@@ -162,6 +162,7 @@ impl Default for RequestsViewState {
 #[derive(Debug, Default)]
 struct SessionOverrideEditor {
     sid: Option<String>,
+    profile_selection: Option<String>,
     model_override: String,
     config_override: Option<String>,
     effort_override: Option<String>,
@@ -1576,13 +1577,13 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 }
 
 fn render_routing_presets(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
-    ui.label(pick(ctx.lang, "路由预设", "Routing presets"));
+    ui.label(pick(ctx.lang, "旧版路由预设", "Legacy routing presets"));
     ui.colored_label(
         egui::Color32::from_rgb(120, 120, 120),
         pick(
             ctx.lang,
-            "提示：全局覆盖(Pinned)影响所有会话/客户端，仅对当前代理进程有效。",
-            "Tip: Global override (pinned) affects all sessions/clients and is runtime-only.",
+            "提示：这是旧版 GUI preset；新的 control profile 来自代理配置中的 [codex.profiles.*]，更适合会话级控制。",
+            "Tip: this is the legacy GUI preset layer; new control profiles come from proxy config [codex.profiles.*].",
         ),
     );
 
@@ -1981,6 +1982,8 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let active = snapshot.active.clone();
     let recent = snapshot.recent.clone();
     let global_override = snapshot.global_override.clone();
+    let default_profile = snapshot.default_profile.clone();
+    let profiles = snapshot.profiles.clone();
     let session_model_overrides = snapshot.session_model_overrides.clone();
     let session_effort_overrides = snapshot.session_effort_overrides.clone();
     let session_config_overrides = snapshot.session_config_overrides.clone();
@@ -2106,6 +2109,9 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     // Sync editor to the selected session, but do not clobber while editing the same session.
     if ctx.view.sessions.editor.sid != ctx.view.sessions.selected_session_id {
         ctx.view.sessions.editor.sid = ctx.view.sessions.selected_session_id.clone();
+        ctx.view.sessions.editor.profile_selection = default_profile
+            .clone()
+            .or_else(|| profiles.first().map(|profile| profile.name.clone()));
         ctx.view.sessions.editor.model_override = selected
             .and_then(|r| r.override_model.clone())
             .unwrap_or_default();
@@ -2321,6 +2327,75 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         cols[1].add_space(6.0);
         cols[1].label(pick(ctx.lang, "会话覆盖设置", "Session overrides"));
+
+        if profiles.is_empty() {
+            cols[1].label(pick(
+                ctx.lang,
+                "当前未加载 control profile；可在 config.toml 的 [codex.profiles.*] 中定义。",
+                "No control profiles loaded; define them in config.toml [codex.profiles.*].",
+            ));
+        } else {
+            cols[1].horizontal(|ui| {
+                ui.label(pick(ctx.lang, "应用 profile", "Apply profile"));
+
+                let mut selected_profile = ctx.view.sessions.editor.profile_selection.clone();
+                egui::ComboBox::from_id_salt(("session_profile_apply", sid.as_str()))
+                    .selected_text(match selected_profile.as_deref() {
+                        Some(name) => format_profile_display(
+                            name,
+                            profiles.iter().find(|profile| profile.name == name),
+                        ),
+                        None => pick(ctx.lang, "<选择>", "<select>").to_string(),
+                    })
+                    .show_ui(ui, |ui| {
+                        for profile in profiles.iter() {
+                            ui.selectable_value(
+                                &mut selected_profile,
+                                Some(profile.name.clone()),
+                                format_profile_display(profile.name.as_str(), Some(profile)),
+                            );
+                        }
+                    });
+                if selected_profile != ctx.view.sessions.editor.profile_selection {
+                    ctx.view.sessions.editor.profile_selection = selected_profile;
+                }
+
+                if ui.button(pick(ctx.lang, "应用", "Apply")).clicked() {
+                    if let Some(profile_name) = ctx.view.sessions.editor.profile_selection.clone() {
+                        match ctx.proxy.apply_session_profile(ctx.rt, sid.clone(), profile_name) {
+                            Ok(()) => {
+                                force_refresh = true;
+                                *ctx.last_info = Some(
+                                    pick(ctx.lang, "已应用 profile", "Profile applied").to_string(),
+                                );
+                            }
+                            Err(e) => {
+                                *ctx.last_error = Some(format!("apply profile failed: {e}"));
+                            }
+                        }
+                    } else {
+                        *ctx.last_error = Some(
+                            pick(
+                                ctx.lang,
+                                "请先选择一个 profile。",
+                                "Select a profile first.",
+                            )
+                            .to_string(),
+                        );
+                    }
+                }
+            });
+
+            if let Some(profile_name) = ctx.view.sessions.editor.profile_selection.as_deref()
+                && let Some(profile) = profiles.iter().find(|profile| profile.name == profile_name)
+            {
+                cols[1].label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "Profile 详情", "Profile details"),
+                    format_profile_summary(profile)
+                ));
+            }
+        }
 
         cols[1].horizontal(|ui| {
             ui.label(pick(ctx.lang, "模型覆盖", "Model override"));
@@ -2597,6 +2672,21 @@ fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
         }
     }
     false
+}
+
+fn format_profile_display(name: &str, profile: Option<&ControlProfileOption>) -> String {
+    match profile {
+        Some(profile) if profile.is_default => format!("{name} [default]"),
+        _ => name.to_string(),
+    }
+}
+
+fn format_profile_summary(profile: &ControlProfileOption) -> String {
+    let station = profile.station.as_deref().unwrap_or("auto");
+    let model = profile.model.as_deref().unwrap_or("auto");
+    let effort = profile.reasoning_effort.as_deref().unwrap_or("auto");
+    let tier = profile.service_tier.as_deref().unwrap_or("auto");
+    format!("station={station}, model={model}, effort={effort}, tier={tier}")
 }
 
 fn sync_session_order(state: &mut SessionsViewState, rows: &[SessionRow]) {

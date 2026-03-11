@@ -58,8 +58,8 @@
 
 ## WS2 - Session-scoped Control Surface
 
-- [ ] CP-201 Add session override for `model`
-- [ ] CP-202 Add session override for `service_tier`
+- [x] CP-201 Add session override for `model`
+- [x] CP-202 Add session override for `service_tier`
 - [ ] CP-203 Normalize `reasoning_effort` override semantics with the same storage model
 - [ ] CP-204 Define override source precedence:
   - request payload
@@ -74,7 +74,7 @@
 
 ## WS3 - Profile System
 
-- [ ] CP-301 Introduce `Profile` schema in config
+- [x] CP-301 Introduce `Profile` schema in config
 - [ ] CP-302 Define default profile semantics for new sessions
 - [ ] CP-303 Add profile inheritance / `extends`
 - [ ] CP-304 Add profile CRUD in local API
@@ -138,11 +138,11 @@
 ## Suggested First Slice
 
 - See `PHASE1_IMPLEMENTATION.md` for the concrete module-level execution plan for the items below.
-- [ ] SLICE-001 Surface current session identity card using existing observed data
-- [ ] SLICE-002 Add session override for `model`
-- [ ] SLICE-003 Add session override for `service_tier`
+- [x] SLICE-001 Surface current session identity card using existing observed data
+- [x] SLICE-002 Add session override for `model`
+- [x] SLICE-003 Add session override for `service_tier`
 - [ ] SLICE-004 Add explicit source attribution for effective route values
-- [ ] SLICE-005 Add default profile skeleton without removing legacy config handling
+- [x] SLICE-005 Add default profile skeleton without removing legacy config handling
 
 ## Definition of Ready for Implementation
 

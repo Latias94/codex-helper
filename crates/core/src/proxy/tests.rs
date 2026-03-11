@@ -19,7 +19,7 @@ use tower::util::ServiceExt;
 
 use crate::config::{
     ProxyConfig, RetryConfig, RetryProfileName, RetryStrategy, ServiceConfig, ServiceConfigManager,
-    UiConfig, UpstreamAuth, UpstreamConfig,
+    ServiceControlProfile, UiConfig, UpstreamAuth, UpstreamConfig,
 };
 use crate::proxy::ProxyService;
 
@@ -131,7 +131,7 @@ fn reserve_unused_local_addr() -> std::net::SocketAddr {
 
 #[tokio::test]
 async fn proxy_api_v1_capabilities_and_overrides_work() {
-    let cfg = make_proxy_config(
+    let mut cfg = make_proxy_config(
         vec![UpstreamConfig {
             base_url: "http://127.0.0.1:9/v1".to_string(),
             auth: UpstreamAuth {
@@ -149,6 +149,16 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             model_mapping: HashMap::new(),
         }],
         RetryConfig::default(),
+    );
+    cfg.codex.default_profile = Some("fast".to_string());
+    cfg.codex.profiles.insert(
+        "fast".to_string(),
+        ServiceControlProfile {
+            station: Some("test".to_string()),
+            model: Some("gpt-5.4-mini".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            service_tier: Some("priority".to_string()),
+        },
     );
 
     let proxy = ProxyService::new(
@@ -180,6 +190,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         caps.get("service_name").and_then(|v| v.as_str()),
         Some("codex")
     );
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles"))
+    }));
 
     let set_global = client
         .post(format!(
@@ -258,6 +273,74 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         .await
         .expect("get session config json");
     assert_eq!(session_cfg_map.get("s1").map(String::as_str), Some("test"));
+
+    let profiles = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/profiles",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get profiles send")
+        .error_for_status()
+        .expect("get profiles status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get profiles json");
+    assert_eq!(
+        profiles.get("default_profile").and_then(|v| v.as_str()),
+        Some("fast")
+    );
+    assert_eq!(
+        profiles["profiles"][0]
+            .get("service_tier")
+            .and_then(|v| v.as_str()),
+        Some("priority")
+    );
+
+    let apply_profile = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/profile",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "session_id": "s2", "profile_name": "fast" }))
+        .send()
+        .await
+        .expect("apply profile send");
+    assert_eq!(apply_profile.status(), StatusCode::NO_CONTENT);
+
+    let model_map = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/model",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get model send")
+        .error_for_status()
+        .expect("get model status")
+        .json::<HashMap<String, String>>()
+        .await
+        .expect("get model json");
+    assert_eq!(
+        model_map.get("s2").map(String::as_str),
+        Some("gpt-5.4-mini")
+    );
+
+    let tier_map = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/service-tier",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get tier send")
+        .error_for_status()
+        .expect("get tier status")
+        .json::<HashMap<String, String>>()
+        .await
+        .expect("get tier json");
+    assert_eq!(tier_map.get("s2").map(String::as_str), Some("priority"));
 
     proxy_handle.abort();
 }

@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use crate::config::{
     ProxyConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
 };
-use crate::dashboard_core::{ApiV1Snapshot, ConfigOption, WindowStats, build_dashboard_snapshot};
+use crate::dashboard_core::{
+    ApiV1Snapshot, ConfigOption, ControlProfileOption, WindowStats, build_dashboard_snapshot,
+};
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_port_for_proxy_port,
     local_admin_base_url_for_proxy_port, local_proxy_base_url,
@@ -72,6 +74,8 @@ pub struct AttachedStatus {
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    pub default_profile: Option<String>,
+    pub profiles: Vec<ControlProfileOption>,
     pub session_model_overrides: HashMap<String, String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
@@ -102,6 +106,8 @@ impl AttachedStatus {
             recent: Vec::new(),
             session_cards: Vec::new(),
             global_override: None,
+            default_profile: None,
+            profiles: Vec::new(),
             session_model_overrides: HashMap::new(),
             session_config_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),
@@ -131,6 +137,8 @@ pub struct GuiRuntimeSnapshot {
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    pub default_profile: Option<String>,
+    pub profiles: Vec<ControlProfileOption>,
     pub session_model_overrides: HashMap<String, String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
@@ -155,6 +163,8 @@ pub struct RunningProxy {
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    pub default_profile: Option<String>,
+    pub profiles: Vec<ControlProfileOption>,
     pub session_model_overrides: HashMap<String, String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
@@ -298,6 +308,8 @@ impl ProxyController {
                 recent: r.recent.clone(),
                 session_cards: r.session_cards.clone(),
                 global_override: r.global_override.clone(),
+                default_profile: r.default_profile.clone(),
+                profiles: r.profiles.clone(),
                 session_model_overrides: r.session_model_overrides.clone(),
                 session_config_overrides: r.session_config_overrides.clone(),
                 session_effort_overrides: r.session_effort_overrides.clone(),
@@ -319,6 +331,8 @@ impl ProxyController {
                 recent: a.recent.clone(),
                 session_cards: a.session_cards.clone(),
                 global_override: a.global_override.clone(),
+                default_profile: a.default_profile.clone(),
+                profiles: a.profiles.clone(),
                 session_model_overrides: a.session_model_overrides.clone(),
                 session_config_overrides: a.session_config_overrides.clone(),
                 session_effort_overrides: a.session_effort_overrides.clone(),
@@ -676,6 +690,8 @@ impl ProxyController {
                 recent: Vec<FinishedRequest>,
                 session_cards: Vec<SessionIdentityCard>,
                 global_override: Option<String>,
+                default_profile: Option<String>,
+                profiles: Vec<ControlProfileOption>,
                 session_model: HashMap<String, String>,
                 session_cfg: HashMap<String, String>,
                 session_effort: HashMap<String, String>,
@@ -730,6 +746,8 @@ impl ProxyController {
                             recent: api.snapshot.recent,
                             session_cards: api.snapshot.session_cards,
                             global_override: api.snapshot.global_override,
+                            default_profile: api.default_profile,
+                            profiles: api.profiles,
                             session_model: api.snapshot.session_model_overrides,
                             session_cfg: api.snapshot.session_config_overrides,
                             session_effort: api.snapshot.session_effort_overrides,
@@ -819,6 +837,10 @@ impl ProxyController {
                         .endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/overrides/session/service-tier");
+                    let supports_profiles = caps
+                        .endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/profiles");
 
                     let session_model = if supports_session_model {
                         get_json::<HashMap<String, String>>(
@@ -846,6 +868,29 @@ impl ProxyController {
                         HashMap::new()
                     };
 
+                    let (default_profile, profiles) = if supports_profiles {
+                        #[derive(serde::Deserialize)]
+                        struct ProfilesResponse {
+                            default_profile: Option<String>,
+                            #[serde(default)]
+                            profiles: Vec<ControlProfileOption>,
+                        }
+
+                        let response = get_json::<ProfilesResponse>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/profiles"),
+                            req_timeout,
+                        )
+                        .await
+                        .ok();
+                        match response {
+                            Some(response) => (response.default_profile, response.profiles),
+                            None => (None, Vec::new()),
+                        }
+                    } else {
+                        (None, Vec::new())
+                    };
+
                     return Ok(RefreshResult {
                         management_base_url: base.to_string(),
                         api_version: Some(caps.api_version),
@@ -854,6 +899,8 @@ impl ProxyController {
                         recent,
                         session_cards: Vec::new(),
                         global_override,
+                        default_profile,
+                        profiles,
                         session_model,
                         session_cfg,
                         session_effort,
@@ -906,6 +953,8 @@ impl ProxyController {
                     recent,
                     session_cards: Vec::new(),
                     global_override: None,
+                    default_profile: None,
+                    profiles: Vec::new(),
                     session_model: HashMap::new(),
                     session_cfg: HashMap::new(),
                     session_effort,
@@ -945,6 +994,8 @@ impl ProxyController {
                     att.recent = result.recent;
                     att.session_cards = result.session_cards;
                     att.global_override = result.global_override;
+                    att.default_profile = result.default_profile;
+                    att.profiles = result.profiles;
                     att.session_model_overrides = result.session_model;
                     att.session_config_overrides = result.session_cfg;
                     att.session_effort_overrides = result.session_effort;
@@ -1057,6 +1108,96 @@ impl ProxyController {
                         .json(&serde_json::json!({
                             "session_id": session_id,
                             "model": model,
+                        }))
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
+    pub fn apply_session_profile(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        session_id: String,
+        profile_name: String,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                let state = r.state.clone();
+                let service_name = r.service_name;
+                let cfg = r.cfg.clone();
+                let now = now_ms();
+                rt.block_on(async move {
+                    let mgr = match service_name {
+                        "claude" => &cfg.claude,
+                        _ => &cfg.codex,
+                    };
+                    let profile = mgr
+                        .profile(profile_name.as_str())
+                        .with_context(|| format!("profile not found: {profile_name}"))?;
+
+                    match profile.station.clone() {
+                        Some(station) => {
+                            state
+                                .set_session_config_override(session_id.clone(), station, now)
+                                .await
+                        }
+                        None => state.clear_session_config_override(&session_id).await,
+                    }
+                    match profile.model.clone() {
+                        Some(model) => {
+                            state
+                                .set_session_model_override(session_id.clone(), model, now)
+                                .await
+                        }
+                        None => state.clear_session_model_override(&session_id).await,
+                    }
+                    match profile.reasoning_effort.clone() {
+                        Some(effort) => {
+                            state
+                                .set_session_effort_override(session_id.clone(), effort, now)
+                                .await
+                        }
+                        None => state.clear_session_effort_override(&session_id).await,
+                    }
+                    match profile.service_tier.clone() {
+                        Some(service_tier) => {
+                            state
+                                .set_session_service_tier_override(
+                                    session_id.clone(),
+                                    service_tier,
+                                    now,
+                                )
+                                .await
+                        }
+                        None => state.clear_session_service_tier_override(&session_id).await,
+                    }
+
+                    Ok::<(), anyhow::Error>(())
+                })?;
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) {
+                    bail!("attached proxy does not support session profile apply (need api v1)");
+                }
+                let base = att.admin_base_url.clone();
+                let client = self.http_client.clone();
+                let fut = async move {
+                    client
+                        .post(format!(
+                            "{base}/__codex_helper/api/v1/overrides/session/profile"
+                        ))
+                        .timeout(Duration::from_millis(1200))
+                        .json(&serde_json::json!({
+                            "session_id": session_id,
+                            "profile_name": profile_name,
                         }))
                         .send()
                         .await?
@@ -1333,6 +1474,11 @@ impl ProxyController {
         match rt.block_on(fut) {
             Ok(snap) => {
                 r.last_error = None;
+                r.default_profile = match r.service_name {
+                    "claude" => r.cfg.claude.default_profile.clone(),
+                    _ => r.cfg.codex.default_profile.clone(),
+                };
+                r.profiles = list_profiles_from_cfg(r.cfg.as_ref(), r.service_name);
                 r.active = snap.active;
                 r.recent = snap.recent;
                 r.session_cards = snap.session_cards;
@@ -1554,6 +1700,12 @@ impl ProxyController {
 
         let (shutdown_tx, server_handle, state, cfg) = rt.block_on(task)?;
 
+        let default_profile = match service_name {
+            "claude" => cfg.claude.default_profile.clone(),
+            _ => cfg.codex.default_profile.clone(),
+        };
+        let profiles = list_profiles_from_cfg(cfg.as_ref(), service_name);
+
         self.mode = ProxyMode::Running(RunningProxy {
             service_name,
             port,
@@ -1566,6 +1718,8 @@ impl ProxyController {
             recent: Vec::new(),
             session_cards: Vec::new(),
             global_override: None,
+            default_profile,
+            profiles,
             session_model_overrides: HashMap::new(),
             session_config_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),
@@ -1609,6 +1763,28 @@ fn list_configs_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<ConfigOpt
         })
         .collect::<Vec<_>>();
     out.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
+fn list_profiles_from_cfg(cfg: &ProxyConfig, service_name: &str) -> Vec<ControlProfileOption> {
+    let mgr = match service_name {
+        "claude" => &cfg.claude,
+        _ => &cfg.codex,
+    };
+    let default_name = mgr.default_profile.as_deref();
+    let mut out = mgr
+        .profiles
+        .iter()
+        .map(|(name, profile)| ControlProfileOption {
+            name: name.clone(),
+            station: profile.station.clone(),
+            model: profile.model.clone(),
+            reasoning_effort: profile.reasoning_effort.clone(),
+            service_tier: profile.service_tier.clone(),
+            is_default: default_name == Some(name.as_str()),
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 

@@ -235,6 +235,12 @@ pub struct ServiceConfigManager {
     /// 当前激活配置名
     #[serde(default)]
     pub active: Option<String>,
+    /// 新会话默认使用的控制模板名（Phase 1: 仅加载与展示，不自动绑定）。
+    #[serde(default)]
+    pub default_profile: Option<String>,
+    /// 可复用控制模板。
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ServiceControlProfile>,
     /// 配置集合
     #[serde(default)]
     pub configs: HashMap<String, ServiceConfig>,
@@ -248,6 +254,55 @@ impl ServiceConfigManager {
             // HashMap 的 values().next() 是非确定性的；这里用 key 排序后的最小项作为稳定兜底。
             .or_else(|| self.configs.iter().min_by_key(|(k, _)| *k).map(|(_, v)| v))
     }
+
+    pub fn profile(&self, name: &str) -> Option<&ServiceControlProfile> {
+        self.profiles.get(name)
+    }
+
+    pub fn default_profile_ref(&self) -> Option<(&str, &ServiceControlProfile)> {
+        let name = self.default_profile.as_deref()?;
+        self.profile(name).map(|profile| (name, profile))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ServiceControlProfile {
+    /// Phase 1 keeps legacy runtime terminology underneath, so `station` currently points to
+    /// a legacy config/group name.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "config")]
+    pub station: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+}
+
+fn validate_service_profiles(service_name: &str, mgr: &ServiceConfigManager) -> Result<()> {
+    if let Some(default_profile) = mgr.default_profile.as_deref()
+        && !mgr.profiles.contains_key(default_profile)
+    {
+        anyhow::bail!(
+            "[{service_name}] default_profile '{}' does not exist in profiles",
+            default_profile
+        );
+    }
+
+    for (profile_name, profile) in &mgr.profiles {
+        if let Some(station) = profile.station.as_deref()
+            && !station.trim().is_empty()
+            && !mgr.configs.contains_key(station)
+        {
+            anyhow::bail!(
+                "[{service_name}] profile '{}' references missing station/config '{}'",
+                profile_name,
+                station
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -691,6 +746,10 @@ impl Default for ProxyConfigV2 {
 pub struct ServiceViewV2 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ServiceControlProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, ProviderConfigV2>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -918,10 +977,14 @@ fn compile_service_view_v2(
         );
     }
 
-    Ok(ServiceConfigManager {
+    let mgr = ServiceConfigManager {
         active: view.active_group.clone(),
+        default_profile: view.default_profile.clone(),
+        profiles: view.profiles.clone(),
         configs,
-    })
+    };
+    validate_service_profiles(service_name, &mgr)?;
+    Ok(mgr)
 }
 
 pub fn compile_v2_to_runtime(v2: &ProxyConfigV2) -> Result<ProxyConfig> {
@@ -1014,6 +1077,8 @@ fn migrate_service_manager_to_v2(mgr: &ServiceConfigManager) -> ServiceViewV2 {
 
     ServiceViewV2 {
         active_group: mgr.active.clone(),
+        default_profile: mgr.default_profile.clone(),
+        profiles: mgr.profiles.clone(),
         providers,
         groups,
     }
@@ -1594,6 +1659,8 @@ fn compact_service_view_v2(view: &ServiceViewV2) -> Result<ServiceViewV2> {
 
     Ok(ServiceViewV2 {
         active_group: view.active_group.clone(),
+        default_profile: view.default_profile.clone(),
+        profiles: view.profiles.clone(),
         providers,
         groups,
     })
@@ -2672,6 +2739,8 @@ env_key = "RIGHTCODE_API_KEY"
             version: 2,
             codex: ServiceViewV2 {
                 active_group: Some("primary".to_string()),
+                default_profile: None,
+                profiles: BTreeMap::new(),
                 providers,
                 groups: BTreeMap::from([(
                     "primary".to_string(),
@@ -2892,6 +2961,12 @@ version = 2
 
 [codex]
 active_group = "primary"
+default_profile = "daily"
+
+[codex.profiles.daily]
+station = "primary"
+reasoning_effort = "medium"
+service_tier = "priority"
 
 [codex.providers.openai]
 [codex.providers.openai.auth]
@@ -2918,6 +2993,14 @@ preferred = true
             let cfg = super::load_config().await.expect("load v2 config");
             assert_eq!(cfg.version, Some(2));
             assert_eq!(cfg.codex.active.as_deref(), Some("primary"));
+            assert_eq!(cfg.codex.default_profile.as_deref(), Some("daily"));
+            assert_eq!(
+                cfg.codex
+                    .profiles
+                    .get("daily")
+                    .and_then(|profile| profile.station.as_deref()),
+                Some("primary")
+            );
 
             let svc = cfg
                 .codex
@@ -2956,6 +3039,11 @@ version = 2
 
 [codex]
 active_group = "primary"
+default_profile = "daily"
+
+[codex.profiles.daily]
+station = "primary"
+service_tier = "priority"
 
 [codex.providers.openai]
 [codex.providers.openai.auth]
@@ -2979,7 +3067,46 @@ endpoint_names = ["default"]
             let saved = std::fs::read_to_string(&toml_path).expect("read saved config.toml");
             assert!(saved.contains("version = 1"));
             assert!(saved.contains("[codex.configs.primary]"));
+            assert!(saved.contains("default_profile = \"daily\""));
+            assert!(saved.contains("[codex.profiles.daily]"));
+            assert!(saved.contains("service_tier = \"priority\""));
             assert!(!saved.contains("[codex.groups.primary]"));
+        });
+    }
+
+    #[test]
+    fn load_config_rejects_invalid_default_profile() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 1
+
+[codex]
+active = "primary"
+default_profile = "missing"
+
+[codex.configs.primary]
+name = "primary"
+
+[[codex.configs.primary.upstreams]]
+base_url = "https://api.example.com/v1"
+"#,
+            );
+
+            let err = super::load_config().await.expect_err("load should fail");
+            assert!(
+                err.to_string().contains("default_profile"),
+                "unexpected error: {err}"
+            );
         });
     }
 

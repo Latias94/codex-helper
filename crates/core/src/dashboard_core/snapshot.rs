@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dashboard_core::WindowStats;
-use crate::dashboard_core::types::ConfigOption;
+use crate::dashboard_core::types::{ConfigOption, ControlProfileOption};
 use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
@@ -42,6 +42,9 @@ pub struct ApiV1Snapshot {
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
     pub configs: Vec<ConfigOption>,
+    pub default_profile: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<ControlProfileOption>,
     pub snapshot: DashboardSnapshot,
 }
 

@@ -51,6 +51,45 @@ const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(not(test))]
 const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(800);
 
+fn list_config_options_from_mgr(
+    mgr: &ServiceConfigManager,
+) -> Vec<crate::dashboard_core::ConfigOption> {
+    let mut configs = mgr
+        .configs
+        .iter()
+        .map(|(name, c)| crate::dashboard_core::ConfigOption {
+            name: name.clone(),
+            alias: c.alias.clone(),
+            enabled: c.enabled,
+            level: c.level.clamp(1, 10),
+        })
+        .collect::<Vec<_>>();
+    configs.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+    configs
+}
+
+fn list_profile_options_from_mgr(
+    mgr: &ServiceConfigManager,
+) -> Vec<crate::dashboard_core::ControlProfileOption> {
+    let default_name = mgr.default_profile.as_deref();
+    let mut profiles = mgr
+        .profiles
+        .iter()
+        .map(
+            |(name, profile)| crate::dashboard_core::ControlProfileOption {
+                name: name.clone(),
+                station: profile.station.clone(),
+                model: profile.model.clone(),
+                reasoning_effort: profile.reasoning_effort.clone(),
+                service_tier: profile.service_tier.clone(),
+                is_default: default_name == Some(name.as_str()),
+            },
+        )
+        .collect::<Vec<_>>();
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    profiles
+}
+
 #[derive(Default)]
 struct JsonFileCache {
     last_check_at: Option<Instant>,
@@ -2987,8 +3026,20 @@ pub fn router(proxy: ProxyService) -> Router {
     }
 
     #[derive(serde::Deserialize)]
+    struct SessionProfileApplyRequest {
+        session_id: String,
+        profile_name: String,
+    }
+
+    #[derive(serde::Deserialize)]
     struct GlobalConfigOverrideRequest {
         config_name: Option<String>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct ProfilesResponse {
+        default_profile: Option<String>,
+        profiles: Vec<crate::dashboard_core::ControlProfileOption>,
     }
 
     #[derive(serde::Serialize)]
@@ -3194,6 +3245,100 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(Json(map))
     }
 
+    async fn list_profiles(
+        proxy: ProxyService,
+    ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+        Ok(Json(ProfilesResponse {
+            default_profile: mgr.default_profile.clone(),
+            profiles: list_profile_options_from_mgr(mgr),
+        }))
+    }
+
+    async fn apply_session_profile(
+        proxy: ProxyService,
+        Json(payload): Json<SessionProfileApplyRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        if payload.session_id.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "session_id is required".to_string(),
+            ));
+        }
+        if payload.profile_name.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "profile_name is required".to_string(),
+            ));
+        }
+
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+        let Some(profile) = mgr.profile(payload.profile_name.as_str()) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("profile '{}' not found", payload.profile_name),
+            ));
+        };
+
+        let now = now_ms();
+        if let Some(station) = profile.station.clone() {
+            proxy
+                .state
+                .set_session_config_override(payload.session_id.clone(), station, now)
+                .await;
+        } else {
+            proxy
+                .state
+                .clear_session_config_override(payload.session_id.as_str())
+                .await;
+        }
+
+        if let Some(model) = profile.model.clone() {
+            proxy
+                .state
+                .set_session_model_override(payload.session_id.clone(), model, now)
+                .await;
+        } else {
+            proxy
+                .state
+                .clear_session_model_override(payload.session_id.as_str())
+                .await;
+        }
+
+        if let Some(effort) = profile.reasoning_effort.clone() {
+            proxy
+                .state
+                .set_session_effort_override(payload.session_id.clone(), effort, now)
+                .await;
+        } else {
+            proxy
+                .state
+                .clear_session_effort_override(payload.session_id.as_str())
+                .await;
+        }
+
+        if let Some(service_tier) = profile.service_tier.clone() {
+            proxy
+                .state
+                .set_session_service_tier_override(payload.session_id, service_tier, now)
+                .await;
+        } else {
+            proxy
+                .state
+                .clear_session_service_tier_override(payload.session_id.as_str())
+                .await;
+        }
+        Ok(StatusCode::NO_CONTENT)
+    }
+
     async fn get_global_config_override(
         proxy: ProxyService,
     ) -> Result<Json<Option<String>>, (StatusCode, String)> {
@@ -3280,6 +3425,8 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/config/runtime",
                 "/__codex_helper/api/v1/config/reload",
                 "/__codex_helper/api/v1/configs",
+                "/__codex_helper/api/v1/profiles",
+                "/__codex_helper/api/v1/overrides/session/profile",
                 "/__codex_helper/api/v1/overrides/session/model",
                 "/__codex_helper/api/v1/overrides/session/effort",
                 "/__codex_helper/api/v1/overrides/session/config",
@@ -3309,17 +3456,7 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
-        let mut configs = mgr
-            .configs
-            .iter()
-            .map(|(name, c)| crate::dashboard_core::ConfigOption {
-                name: name.clone(),
-                alias: c.alias.clone(),
-                enabled: c.enabled,
-                level: c.level.clamp(1, 10),
-            })
-            .collect::<Vec<_>>();
-        configs.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+        let configs = list_config_options_from_mgr(mgr);
 
         let snapshot = crate::dashboard_core::build_dashboard_snapshot(
             &proxy.state,
@@ -3335,6 +3472,8 @@ pub fn router(proxy: ProxyService) -> Router {
             runtime_loaded_at_ms: Some(proxy.config.last_loaded_at_ms()),
             runtime_source_mtime_ms: proxy.config.last_mtime_ms().await,
             configs,
+            default_profile: mgr.default_profile.clone(),
+            profiles: list_profile_options_from_mgr(mgr),
             snapshot,
         }))
     }
@@ -3526,18 +3665,7 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
-        let mut out = mgr
-            .configs
-            .iter()
-            .map(|(name, c)| crate::dashboard_core::ConfigOption {
-                name: name.clone(),
-                alias: c.alias.clone(),
-                enabled: c.enabled,
-                level: c.level.clamp(1, 10),
-            })
-            .collect::<Vec<_>>();
-        out.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
-        Ok(Json(out))
+        Ok(Json(list_config_options_from_mgr(mgr)))
     }
 
     let admin_access = AdminAccessConfig::from_env();
@@ -3573,6 +3701,8 @@ pub fn router(proxy: ProxyService) -> Router {
     let p28 = proxy.clone();
     let p29 = proxy.clone();
     let p30 = proxy.clone();
+    let p31 = proxy.clone();
+    let p32 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -3619,6 +3749,14 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/configs",
             get(move || list_configs(p14.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/profiles",
+            get(move || list_profiles(p31.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/overrides/session/profile",
+            post(move |payload| apply_session_profile(p32.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/overrides/session/model",
