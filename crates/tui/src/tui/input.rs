@@ -22,7 +22,7 @@ use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
 use super::Language;
 use super::model::{
     CODEX_RECENT_WINDOWS, ProviderOption, Snapshot, codex_recent_window_label,
-    codex_recent_window_threshold_ms, filtered_requests_len, now_ms,
+    codex_recent_window_threshold_ms, filtered_requests_len, now_ms, session_row_has_any_override,
 };
 use super::report::build_stats_report;
 use super::state::{UiState, adjust_table_selection};
@@ -1564,10 +1564,7 @@ async fn handle_key_normal(
                     if ui.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
                         return false;
                     }
-                    if ui.sessions_page_overrides_only
-                        && row.override_effort.is_none()
-                        && row.override_config_name.is_none()
-                    {
+                    if ui.sessions_page_overrides_only && !session_row_has_any_override(row) {
                         return false;
                     }
                     true
@@ -1598,10 +1595,7 @@ async fn handle_key_normal(
                     if ui.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
                         return false;
                     }
-                    if ui.sessions_page_overrides_only
-                        && row.override_effort.is_none()
-                        && row.override_config_name.is_none()
-                    {
+                    if ui.sessions_page_overrides_only && !session_row_has_any_override(row) {
                         return false;
                     }
                     true

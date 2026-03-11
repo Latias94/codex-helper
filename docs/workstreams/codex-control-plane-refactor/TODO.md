@@ -53,7 +53,7 @@
   - source attribution
 - [ ] CP-103 Record route decision provenance per request/session
 - [ ] CP-104 Expose session identity card in API
-- [ ] CP-105 Update GUI/TUI Sessions view to show effective route rather than only last seen fields
+- [x] CP-105 Update GUI/TUI Sessions view to show effective route rather than only last seen fields
 - [ ] CP-106 Distinguish `observed session` from `enriched session` in UI and API
 
 ## WS2 - Session-scoped Control Surface

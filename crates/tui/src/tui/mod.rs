@@ -25,6 +25,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::watch;
 
+use crate::config::ProxyConfig;
 use crate::state::ProxyState;
 
 use self::model::{Palette, now_ms, refresh_snapshot};
@@ -33,6 +34,7 @@ use self::terminal::TerminalGuard;
 
 pub async fn run_dashboard(
     state: Arc<ProxyState>,
+    cfg: Arc<ProxyConfig>,
     service_name: &'static str,
     port: u16,
     admin_port: u16,
@@ -72,7 +74,7 @@ pub async fn run_dashboard(
 
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
 
-    let mut snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
+    let mut snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
     let mut providers = providers;
     ui.clamp_selection(&snapshot, providers.len());
 
@@ -108,7 +110,7 @@ pub async fn run_dashboard(
 
         tokio::select! {
             _ = ticker.tick() => {
-                let refresh = refresh_snapshot(&state, service_name, ui.stats_days);
+                let refresh = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days);
                 if let Ok(new_snapshot) = tokio::time::timeout(io_timeout, refresh).await {
                     snapshot = new_snapshot;
                     ui.clamp_selection(&snapshot, providers.len());
@@ -160,7 +162,7 @@ pub async fn run_dashboard(
                     Event::Key(key) if input::should_accept_key_event(&key) => {
                         if input::handle_key_event(state.clone(), &mut providers, &mut ui, &snapshot, key).await {
                             if ui.needs_snapshot_refresh {
-                                snapshot = refresh_snapshot(&state, service_name, ui.stats_days).await;
+                                snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
                                 ui.clamp_selection(&snapshot, providers.len());
                                 ui.needs_snapshot_refresh = false;
                             }

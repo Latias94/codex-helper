@@ -8,8 +8,8 @@ use ratatui::widgets::{
 
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, now_ms, short_sid, shorten, shorten_middle,
-    status_style, tokens_short, usage_line,
+    Palette, Snapshot, basename, format_age, now_ms, session_row_has_any_override, short_sid,
+    shorten, shorten_middle, status_style, tokens_short, usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -117,6 +117,12 @@ fn render_sessions_panel(
             if r.override_config_name.is_some() {
                 badges.push(Span::styled("C", Style::default().fg(p.accent)));
             }
+            if r.override_model.is_some() {
+                badges.push(Span::styled("M", Style::default().fg(p.accent)));
+            }
+            if r.override_service_tier.is_some() {
+                badges.push(Span::styled("T", Style::default().fg(p.accent)));
+            }
 
             let mut session_spans = vec![Span::styled(sid, Style::default().fg(p.text))];
             for b in badges {
@@ -127,7 +133,7 @@ fn render_sessions_panel(
             }
 
             let mut row_style = Style::default().fg(p.text).bg(p.panel);
-            if r.override_effort.is_some() || r.override_config_name.is_some() {
+            if session_row_has_any_override(r) {
                 row_style = row_style.add_modifier(Modifier::ITALIC);
             }
 
@@ -209,6 +215,12 @@ fn render_session_details(
     let override_cfg = selected
         .and_then(|r| r.override_config_name.as_deref())
         .unwrap_or("-");
+    let override_model = selected
+        .and_then(|r| r.override_model.as_deref())
+        .unwrap_or("-");
+    let override_service_tier = selected
+        .and_then(|r| r.override_service_tier.as_deref())
+        .unwrap_or("-");
     let model = selected
         .and_then(|r| r.last_model.as_deref())
         .unwrap_or("-");
@@ -279,12 +291,20 @@ fn render_session_details(
         kv_line(
             p,
             "override",
-            format!("effort={override_effort}, cfg={override_cfg}"),
-            Style::default().fg(if override_effort != "-" || override_cfg != "-" {
-                p.accent
-            } else {
-                p.muted
-            }),
+            format!(
+                "model={override_model}, effort={override_effort}, cfg={override_cfg}, tier={override_service_tier}"
+            ),
+            Style::default().fg(
+                if override_model != "-"
+                    || override_effort != "-"
+                    || override_cfg != "-"
+                    || override_service_tier != "-"
+                {
+                    p.accent
+                } else {
+                    p.muted
+                },
+            ),
         ),
         kv_line(
             p,

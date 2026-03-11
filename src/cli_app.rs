@@ -461,6 +461,7 @@ async fn run_server(
 
         let mut tui_handle = tokio::spawn(tui::run_dashboard(
             state,
+            cfg.clone(),
             service_name,
             port,
             admin_addr.port(),

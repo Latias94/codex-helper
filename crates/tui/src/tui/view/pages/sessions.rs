@@ -3,9 +3,10 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
+use crate::state::{ResolvedRouteValue, RouteValueSource};
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, now_ms, short_sid, shorten, shorten_middle,
-    status_style, tokens_short, usage_line,
+    Palette, Snapshot, basename, format_age, now_ms, session_row_has_any_override, short_sid,
+    shorten, shorten_middle, status_style, tokens_short, usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::view::widgets::kv_line;
@@ -33,10 +34,7 @@ pub(super) fn render_sessions_page(
             if ui.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
                 return false;
             }
-            if ui.sessions_page_overrides_only
-                && row.override_effort.is_none()
-                && row.override_config_name.is_none()
-            {
+            if ui.sessions_page_overrides_only && !session_row_has_any_override(row) {
                 return false;
             }
             true
@@ -134,7 +132,7 @@ pub(super) fn render_sessions_page(
             } else if row.last_status.is_some_and(|s| s >= 400) {
                 style = style.fg(p.warn);
             }
-            if row.override_effort.is_some() || row.override_config_name.is_some() {
+            if session_row_has_any_override(row) {
                 style = style.add_modifier(Modifier::BOLD);
             }
 
@@ -197,19 +195,28 @@ pub(super) fn render_sessions_page(
             .as_deref()
             .map(|s| shorten_middle(s, 80))
             .unwrap_or_else(|| "-".to_string());
-        let model = row.last_model.as_deref().unwrap_or("-");
+        let observed_model = row.last_model.as_deref().unwrap_or("-");
         let provider = row.last_provider_id.as_deref().unwrap_or("-");
-        let cfg = row.last_config_name.as_deref().unwrap_or("-");
-        let effort = row
-            .override_effort
-            .as_deref()
-            .or(row.last_reasoning_effort.as_deref())
-            .unwrap_or("-");
+        let observed_cfg = row.last_config_name.as_deref().unwrap_or("-");
+        let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
+        let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");
+        let observed_service_tier = row.last_service_tier.as_deref().unwrap_or("-");
+        let effective_model = format_resolved_route_value(row.effective_model.as_ref());
+        let effective_cfg = format_resolved_route_value(row.effective_config_name.as_ref());
+        let effective_upstream =
+            format_resolved_route_value(row.effective_upstream_base_url.as_ref());
+        let effective_effort = format_resolved_route_value(row.effective_reasoning_effort.as_ref());
+        let effective_service_tier =
+            format_resolved_route_value(row.effective_service_tier.as_ref());
+        let override_model = row.override_model.as_deref().unwrap_or("-");
         let override_effort = row.override_effort.as_deref().unwrap_or("-");
         let override_cfg = row.override_config_name.as_deref().unwrap_or("-");
+        let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
         let global_cfg = snapshot.global_override.as_deref().unwrap_or("-");
-        let routing = if override_cfg != "-" {
-            format!("pinned(session)={override_cfg}")
+        let routing = if session_row_has_any_override(row) {
+            format!(
+                "session(model={override_model}, cfg={override_cfg}, tier={override_service_tier})"
+            )
         } else if global_cfg != "-" {
             format!("pinned(global)={global_cfg}")
         } else {
@@ -223,10 +230,15 @@ pub(super) fn render_sessions_page(
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ));
         lines.push(kv_line(p, "cwd", cwd_full, Style::default().fg(p.text)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Observed route",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
         lines.push(kv_line(
             p,
-            "model",
-            model.to_string(),
+            "model(last)",
+            observed_model.to_string(),
             Style::default().fg(p.text),
         ));
         lines.push(kv_line(
@@ -237,25 +249,70 @@ pub(super) fn render_sessions_page(
         ));
         lines.push(kv_line(
             p,
+            "config(last)",
+            observed_cfg.to_string(),
+            Style::default().fg(p.text),
+        ));
+        lines.push(kv_line(
+            p,
+            "upstream(last)",
+            observed_upstream.to_string(),
+            Style::default().fg(p.text),
+        ));
+        lines.push(kv_line(
+            p,
+            "effort(last)",
+            observed_effort.to_string(),
+            Style::default().fg(p.text),
+        ));
+        lines.push(kv_line(
+            p,
+            "service_tier(last)",
+            observed_service_tier.to_string(),
+            Style::default().fg(p.text),
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Effective route",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(kv_line(
+            p,
+            "model",
+            effective_model,
+            Style::default().fg(p.text),
+        ));
+        lines.push(kv_line(
+            p,
             "config",
-            cfg.to_string(),
+            effective_cfg,
+            Style::default().fg(p.text),
+        ));
+        lines.push(kv_line(
+            p,
+            "upstream",
+            effective_upstream,
             Style::default().fg(p.text),
         ));
         lines.push(kv_line(
             p,
             "effort",
-            effort.to_string(),
-            Style::default().fg(if override_effort != "-" {
-                p.accent
-            } else {
-                p.text
-            }),
+            effective_effort,
+            Style::default().fg(p.text),
+        ));
+        lines.push(kv_line(
+            p,
+            "service_tier",
+            effective_service_tier,
+            Style::default().fg(p.text),
         ));
         lines.push(kv_line(
             p,
             "override",
-            format!("effort={override_effort}, cfg={override_cfg}, global={global_cfg}"),
-            Style::default().fg(if override_effort != "-" || override_cfg != "-" {
+            format!(
+                "model={override_model}, effort={override_effort}, cfg={override_cfg}, tier={override_service_tier}, global={global_cfg}"
+            ),
+            Style::default().fg(if session_row_has_any_override(row) || global_cfg != "-" {
                 p.accent
             } else {
                 p.muted
@@ -334,4 +391,26 @@ pub(super) fn render_sessions_page(
         .style(Style::default().fg(p.text))
         .wrap(Wrap { trim: false });
     f.render_widget(content, columns[1]);
+}
+
+fn route_value_source_label(source: RouteValueSource) -> &'static str {
+    match source {
+        RouteValueSource::RequestPayload => "request payload",
+        RouteValueSource::SessionOverride => "session override",
+        RouteValueSource::GlobalOverride => "global override",
+        RouteValueSource::ProfileDefault => "profile default",
+        RouteValueSource::StationMapping => "station mapping",
+        RouteValueSource::RuntimeFallback => "runtime fallback",
+    }
+}
+
+fn format_resolved_route_value(value: Option<&ResolvedRouteValue>) -> String {
+    match value {
+        Some(value) => format!(
+            "{} [{}]",
+            value.value,
+            route_value_source_label(value.source)
+        ),
+        None => "-".to_string(),
+    }
 }

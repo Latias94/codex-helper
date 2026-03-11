@@ -1,14 +1,16 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ratatui::prelude::{Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::config::ProxyConfig;
 use crate::dashboard_core::WindowStats;
 pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
-    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
-    SessionStats, UsageRollupView,
+    ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState, ResolvedRouteValue,
+    SessionIdentityCard, UsageRollupView,
 };
 use crate::usage::UsageMetrics;
 
@@ -45,14 +47,23 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) last_ended_at_ms: Option<u64>,
     pub(in crate::tui) last_model: Option<String>,
     pub(in crate::tui) last_reasoning_effort: Option<String>,
+    pub(in crate::tui) last_service_tier: Option<String>,
     pub(in crate::tui) last_provider_id: Option<String>,
     pub(in crate::tui) last_config_name: Option<String>,
+    pub(in crate::tui) last_upstream_base_url: Option<String>,
     pub(in crate::tui) last_usage: Option<UsageMetrics>,
     pub(in crate::tui) total_usage: Option<UsageMetrics>,
     pub(in crate::tui) turns_total: Option<u64>,
     pub(in crate::tui) turns_with_usage: Option<u64>,
+    pub(in crate::tui) effective_model: Option<ResolvedRouteValue>,
+    pub(in crate::tui) effective_reasoning_effort: Option<ResolvedRouteValue>,
+    pub(in crate::tui) effective_service_tier: Option<ResolvedRouteValue>,
+    pub(in crate::tui) effective_config_name: Option<ResolvedRouteValue>,
+    pub(in crate::tui) effective_upstream_base_url: Option<ResolvedRouteValue>,
+    pub(in crate::tui) override_model: Option<String>,
     pub(in crate::tui) override_effort: Option<String>,
     pub(in crate::tui) override_config_name: Option<String>,
+    pub(in crate::tui) override_service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -377,241 +388,68 @@ pub(in crate::tui) fn status_style(p: Palette, status: Option<u16>) -> Style {
     }
 }
 
-fn build_session_rows(
-    active: Vec<ActiveRequest>,
-    recent: &[FinishedRequest],
-    overrides: &HashMap<String, String>,
-    config_overrides: &HashMap<String, String>,
-    stats: &HashMap<String, SessionStats>,
-) -> Vec<SessionRow> {
-    use std::collections::HashMap as StdHashMap;
-
-    let mut map: StdHashMap<Option<String>, SessionRow> = StdHashMap::new();
-
-    for req in active {
-        let key = req.session_id.clone();
-        let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
-            session_id: key,
-            cwd: req.cwd.clone(),
-            active_count: 0,
-            active_started_at_ms_min: Some(req.started_at_ms),
-            active_last_method: Some(req.method.clone()),
-            active_last_path: Some(req.path.clone()),
-            last_status: None,
-            last_duration_ms: None,
-            last_ended_at_ms: None,
-            last_model: req.model.clone(),
-            last_reasoning_effort: req.reasoning_effort.clone(),
-            last_provider_id: req.provider_id.clone(),
-            last_config_name: req.config_name.clone(),
-            last_usage: None,
-            total_usage: None,
-            turns_total: None,
-            turns_with_usage: None,
-            override_effort: None,
-            override_config_name: None,
-        });
-
-        entry.active_count += 1;
-        entry.active_started_at_ms_min = Some(
-            entry
-                .active_started_at_ms_min
-                .unwrap_or(req.started_at_ms)
-                .min(req.started_at_ms),
-        );
-        entry.active_last_method = Some(req.method);
-        entry.active_last_path = Some(req.path);
-        if entry.cwd.is_none() {
-            entry.cwd = req.cwd;
-        }
-        if let Some(effort) = req.reasoning_effort {
-            entry.last_reasoning_effort = Some(effort);
-        }
-        if entry.last_model.is_none() {
-            entry.last_model = req.model;
-        }
-        if entry.last_provider_id.is_none() {
-            entry.last_provider_id = req.provider_id;
-        }
-        if entry.last_config_name.is_none() {
-            entry.last_config_name = req.config_name;
-        }
-    }
-
-    for r in recent {
-        let key = r.session_id.clone();
-        let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
-            session_id: key,
-            cwd: r.cwd.clone(),
-            active_count: 0,
-            active_started_at_ms_min: None,
+fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRow> {
+    let mut rows = cards
+        .iter()
+        .map(|card| SessionRow {
+            session_id: card.session_id.clone(),
+            cwd: card.cwd.clone(),
+            active_count: card.active_count as usize,
+            active_started_at_ms_min: card.active_started_at_ms_min,
             active_last_method: None,
             active_last_path: None,
-            last_status: None,
-            last_duration_ms: None,
-            last_ended_at_ms: None,
-            last_model: r.model.clone(),
-            last_reasoning_effort: r.reasoning_effort.clone(),
-            last_provider_id: r.provider_id.clone(),
-            last_config_name: r.config_name.clone(),
-            last_usage: r.usage.clone(),
-            total_usage: None,
-            turns_total: None,
-            turns_with_usage: None,
-            override_effort: None,
-            override_config_name: None,
-        });
-
-        let should_update = entry
-            .last_ended_at_ms
-            .map(|t| r.ended_at_ms >= t)
-            .unwrap_or(true);
-        if should_update {
-            entry.last_status = Some(r.status_code);
-            entry.last_duration_ms = Some(r.duration_ms);
-            entry.last_ended_at_ms = Some(r.ended_at_ms);
-            if r.reasoning_effort.is_some() {
-                entry.last_reasoning_effort = r.reasoning_effort.clone();
-            }
-            if r.model.is_some() {
-                entry.last_model = r.model.clone();
-            }
-            if r.provider_id.is_some() {
-                entry.last_provider_id = r.provider_id.clone();
-            }
-            if r.config_name.is_some() {
-                entry.last_config_name = r.config_name.clone();
-            }
-            if r.usage.is_some() {
-                entry.last_usage = r.usage.clone();
-            }
-        }
-        if entry.cwd.is_none() {
-            entry.cwd = r.cwd.clone();
-        }
-    }
-
-    for (sid, st) in stats.iter() {
-        let key = Some(sid.clone());
-        let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
-            session_id: key,
-            cwd: None,
-            active_count: 0,
-            active_started_at_ms_min: None,
-            active_last_method: None,
-            active_last_path: None,
-            last_status: None,
-            last_duration_ms: None,
-            last_ended_at_ms: None,
-            last_model: st.last_model.clone(),
-            last_reasoning_effort: st.last_reasoning_effort.clone(),
-            last_provider_id: st.last_provider_id.clone(),
-            last_config_name: st.last_config_name.clone(),
-            last_usage: st.last_usage.clone(),
-            total_usage: Some(st.total_usage.clone()),
-            turns_total: None,
-            turns_with_usage: Some(st.turns_with_usage),
-            override_effort: None,
-            override_config_name: None,
-        });
-        entry.turns_total = Some(st.turns_total);
-        if entry.last_model.is_none() {
-            entry.last_model = st.last_model.clone();
-        }
-        if entry.last_reasoning_effort.is_none() {
-            entry.last_reasoning_effort = st.last_reasoning_effort.clone();
-        }
-        if entry.last_provider_id.is_none() {
-            entry.last_provider_id = st.last_provider_id.clone();
-        }
-        if entry.last_config_name.is_none() {
-            entry.last_config_name = st.last_config_name.clone();
-        }
-        if entry.last_usage.is_none() {
-            entry.last_usage = st.last_usage.clone();
-        }
-        if entry.total_usage.is_none() {
-            entry.total_usage = Some(st.total_usage.clone());
-        }
-        if entry.turns_with_usage.is_none() {
-            entry.turns_with_usage = Some(st.turns_with_usage);
-        }
-    }
-
-    for (sid, eff) in overrides.iter() {
-        let key = Some(sid.clone());
-        let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
-            session_id: key,
-            cwd: None,
-            active_count: 0,
-            active_started_at_ms_min: None,
-            active_last_method: None,
-            active_last_path: None,
-            last_status: None,
-            last_duration_ms: None,
-            last_ended_at_ms: None,
-            last_model: None,
-            last_reasoning_effort: None,
-            last_provider_id: None,
-            last_config_name: None,
-            last_usage: None,
-            total_usage: None,
-            turns_total: None,
-            turns_with_usage: None,
-            override_effort: None,
-            override_config_name: None,
-        });
-        entry.override_effort = Some(eff.clone());
-    }
-
-    for (sid, cfg_name) in config_overrides.iter() {
-        let key = Some(sid.clone());
-        let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
-            session_id: key,
-            cwd: None,
-            active_count: 0,
-            active_started_at_ms_min: None,
-            active_last_method: None,
-            active_last_path: None,
-            last_status: None,
-            last_duration_ms: None,
-            last_ended_at_ms: None,
-            last_model: None,
-            last_reasoning_effort: None,
-            last_provider_id: None,
-            last_config_name: None,
-            last_usage: None,
-            total_usage: None,
-            turns_total: None,
-            turns_with_usage: None,
-            override_effort: None,
-            override_config_name: None,
-        });
-        entry.override_config_name = Some(cfg_name.clone());
-    }
-
-    let mut rows = map.into_values().collect::<Vec<_>>();
+            last_status: card.last_status,
+            last_duration_ms: card.last_duration_ms,
+            last_ended_at_ms: card.last_ended_at_ms,
+            last_model: card.last_model.clone(),
+            last_reasoning_effort: card.last_reasoning_effort.clone(),
+            last_service_tier: card.last_service_tier.clone(),
+            last_provider_id: card.last_provider_id.clone(),
+            last_config_name: card.last_config_name.clone(),
+            last_upstream_base_url: card.last_upstream_base_url.clone(),
+            last_usage: card.last_usage.clone(),
+            total_usage: card.total_usage.clone(),
+            turns_total: card.turns_total,
+            turns_with_usage: card.turns_with_usage,
+            effective_model: card.effective_model.clone(),
+            effective_reasoning_effort: card.effective_reasoning_effort.clone(),
+            effective_service_tier: card.effective_service_tier.clone(),
+            effective_config_name: card.effective_config_name.clone(),
+            effective_upstream_base_url: card.effective_upstream_base_url.clone(),
+            override_model: card.override_model.clone(),
+            override_effort: card.override_effort.clone(),
+            override_config_name: card.override_config_name.clone(),
+            override_service_tier: card.override_service_tier.clone(),
+        })
+        .collect::<Vec<_>>();
     rows.sort_by_key(|r| std::cmp::Reverse(session_sort_key(r)));
     rows
 }
 
+pub(in crate::tui) fn session_row_has_any_override(row: &SessionRow) -> bool {
+    row.override_model.is_some()
+        || row.override_effort.is_some()
+        || row.override_config_name.is_some()
+        || row.override_service_tier.is_some()
+}
+
 pub(in crate::tui) async fn refresh_snapshot(
     state: &ProxyState,
+    cfg: Arc<ProxyConfig>,
     service_name: &str,
     stats_days: usize,
 ) -> Snapshot {
-    let (snap, config_meta) = tokio::join!(
+    let (mut snap, config_meta) = tokio::join!(
         crate::dashboard_core::build_dashboard_snapshot(state, service_name, 2_000, stats_days),
         state.get_config_meta_overrides(service_name),
     );
+    let mgr = match service_name {
+        "claude" => &cfg.claude,
+        _ => &cfg.codex,
+    };
+    crate::state::enrich_session_identity_cards_with_runtime(&mut snap.session_cards, mgr);
 
-    let rows = build_session_rows(
-        snap.active.clone(),
-        &snap.recent,
-        &snap.session_effort_overrides,
-        &snap.session_config_overrides,
-        &snap.session_stats,
-    );
+    let rows = build_session_rows_from_cards(&snap.session_cards);
     Snapshot {
         rows,
         recent: snap.recent,
