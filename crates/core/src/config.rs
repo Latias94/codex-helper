@@ -3285,6 +3285,86 @@ provider = "openai"
     }
 
     #[test]
+    fn load_config_migrates_boolish_active_true_to_first_enabled_config() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 1
+
+[codex]
+active = "true"
+
+[codex.configs.right]
+name = "right"
+enabled = true
+level = 1
+
+[[codex.configs.right.upstreams]]
+base_url = "https://right.example.com/v1"
+
+[codex.configs.vibe]
+name = "vibe"
+enabled = true
+level = 2
+
+[[codex.configs.vibe.upstreams]]
+base_url = "https://vibe.example.com/v1"
+"#,
+            );
+
+            let cfg = super::load_config()
+                .await
+                .expect("load boolish active config");
+            assert_eq!(cfg.codex.active.as_deref(), Some("right"));
+        });
+    }
+
+    #[test]
+    fn load_config_migrates_boolish_active_false_to_none() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 1
+
+[codex]
+active = "false"
+
+[codex.configs.right]
+name = "right"
+enabled = true
+level = 1
+
+[[codex.configs.right.upstreams]]
+base_url = "https://right.example.com/v1"
+"#,
+            );
+
+            let cfg = super::load_config()
+                .await
+                .expect("load boolish inactive config");
+            assert_eq!(cfg.codex.active, None);
+        });
+    }
+
+    #[test]
     fn load_config_rejects_invalid_default_profile() {
         let _env = setup_temp_codex_home();
         let rt = tokio::runtime::Builder::new_current_thread()

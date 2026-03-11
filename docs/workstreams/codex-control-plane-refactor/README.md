@@ -24,6 +24,8 @@ The intended end state is:
   - Milestone sequencing, deliverables, and definition-of-done gates.
 - `PHASE1_IMPLEMENTATION.md`
   - Concrete implementation plan for `SLICE-001` to `SLICE-005`, including module touch points, API additions, compatibility strategy, and testing guidance.
+- `CONFIG_V2_MIGRATION.md`
+  - Operator-focused guide for moving legacy `config.toml` into the station/provider `v2` layout.
 
 ## Scope
 

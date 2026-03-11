@@ -437,16 +437,40 @@ pub async fn save_config_v2(cfg: &ProxyConfigV2) -> Result<PathBuf> {
 
 fn normalize_proxy_config(cfg: &mut ProxyConfig) {
     fn normalize_mgr(mgr: &mut ServiceConfigManager) {
+        fn select_default_active_name(configs: &HashMap<String, ServiceConfig>) -> Option<String> {
+            let mut items = configs.iter().collect::<Vec<_>>();
+            items.sort_by(|(name_a, svc_a), (name_b, svc_b)| {
+                svc_a
+                    .level
+                    .cmp(&svc_b.level)
+                    .then_with(|| name_a.cmp(name_b))
+            });
+            items
+                .iter()
+                .find(|(_, svc)| svc.enabled)
+                .map(|(name, _)| (*name).clone())
+                .or_else(|| items.first().map(|(name, _)| (*name).clone()))
+        }
+
         for (key, svc) in mgr.configs.iter_mut() {
             if svc.name.trim().is_empty() {
                 svc.name = key.clone();
             }
         }
-        mgr.active = mgr
+        let normalized_active = mgr
             .active
             .as_ref()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        mgr.active = match normalized_active {
+            Some(active) if mgr.configs.contains_key(active.as_str()) => Some(active),
+            Some(active) => match active.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => select_default_active_name(&mgr.configs),
+                "false" | "0" | "no" | "off" => None,
+                _ => Some(active),
+            },
+            None => None,
+        };
         mgr.default_profile = mgr
             .default_profile
             .as_ref()
