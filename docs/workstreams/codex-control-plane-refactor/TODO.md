@@ -107,7 +107,10 @@
   - [ ] half-open
 - [ ] CP-404 Implement passive health scoring
 - [ ] CP-405 Add active healthcheck API and UI
-- [ ] CP-406 Add circuit breaker thresholds and cooldowns
+- [~] CP-406 Add circuit breaker thresholds and cooldowns
+  - [x] expose persisted retry/cooldown config API via `/__codex_helper/api/v1/retry/config`
+  - [x] add GUI retry/failover operator panel with remote-safe write-back gating
+  - [ ] breaker threshold / cooldown transition behavior
 - [ ] CP-407 Add same-station upstream failover rules
 - [ ] CP-408 Add cross-station failover rules before first output
 - [x] CP-409 Ensure unsupported model/capability mismatch does not poison health state
@@ -129,9 +132,11 @@
   - [x] expose station quick switch and common station metadata in Overview / Config forms
   - [x] dedicated station-focused page for health / drain / breaker / quick switch
   - [x] Config v2 common station fields use control-plane directly when selected service matches the running/attached proxy
+  - [x] Stations page persisted station controls are remote-first when the current proxy exposes station config APIs
 - [x] CP-604 Add "effective route source" explanation UI
 - [x] CP-605 Add remote-safe capability gating in GUI
 - [x] CP-606 Keep transcript/history UI usable even when only observed-session data exists
+- [x] CP-607 Add retry/failover operator controls with configured-vs-resolved visibility
 
 ## WS7 - Tests, Migration, and Docs
 

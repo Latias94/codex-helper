@@ -92,6 +92,7 @@
 - [x] GUI-503 Extend proxy API to `/__codex_helper/api/v1/...` for full control
 - [~] GUI-504 Full attach via API v1 (Clash Verge style)
   - [x] Config actions: active/enabled/level
+  - [x] Retry/failover: persisted retry profile + cooldown policy editor
   - [x] Overrides: session config/effort + global pinned
   - [x] Health checks: start/cancel + status
   - [x] History/transcript: list + tail/all + copy + open file
@@ -139,3 +140,5 @@
 - 2026-03-11: Finished CP-305 GUI migration: removed legacy GUI routing presets from `gui.toml`, Overview, tray, and auto-apply flow; proxy config profiles are now the only formal profile entry point.
 - 2026-03-11: Config v2 Profiles section now uses control-plane profile CRUD when the selected service matches the running/attached proxy; attach mode no longer treats that section as local-file-only.
 - 2026-03-11: Config v2 common station fields (`active_station`, `enabled`, `level`) now use persisted station control-plane APIs when the selected service matches the running/attached proxy; attached mode no longer writes those actions to the local file by mistake.
+- 2026-03-11: Stations page is now remote-first for persisted station controls too: runtime quick switch remains runtime-only, while configured `active_station` / `enabled` / `level` write through the current proxy when the target exposes station config APIs.
+- 2026-03-11: Added persisted retry/failover control-plane support to GUI: running/attached snapshots now carry configured+resolved retry policy, the Stations page can edit retry profile plus cooldown/backoff fields, and attach mode stays read-only when the remote proxy does not expose `/api/v1/retry/config`.

@@ -5,11 +5,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::autostart;
 use super::config::GuiConfig;
 use super::i18n::{Language, pick};
-use super::proxy_control::{DiscoveredProxy, PortInUseAction, ProxyModeKind};
+use super::proxy_control::{DiscoveredProxy, GuiRuntimeSnapshot, PortInUseAction, ProxyModeKind};
 use super::util::{
     open_in_file_manager, spawn_windows_terminal_wt_new_tab,
     spawn_windows_terminal_wt_tabs_in_one_window,
 };
+use crate::config::{RetryConfig, RetryProfileName, RetryStrategy};
 use crate::dashboard_core::{
     CapabilitySupport, ConfigCapabilitySummary, ConfigOption, ControlProfileOption,
     HostLocalControlPlaneCapabilities, ModelCatalogKind, RemoteAdminAccessCapabilities,
@@ -60,6 +61,18 @@ pub struct StationsViewState {
     pub enabled_only: bool,
     pub overrides_only: bool,
     pub selected_name: Option<String>,
+    retry_editor: StationsRetryEditorState,
+}
+
+#[derive(Debug, Default)]
+struct StationsRetryEditorState {
+    source_signature: Option<String>,
+    profile: String,
+    cloudflare_challenge_cooldown_secs: String,
+    cloudflare_timeout_cooldown_secs: String,
+    transport_cooldown_secs: String,
+    cooldown_backoff_factor: String,
+    cooldown_backoff_max_secs: String,
 }
 
 #[derive(Debug, Default)]
@@ -1929,6 +1942,12 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     let runtime_maps = runtime_station_maps(ctx.proxy);
     let active_station = current_runtime_active_station(ctx.proxy);
+    let configured_active_station = snapshot.configured_active_station.clone();
+    let effective_active_station = snapshot
+        .effective_active_station
+        .clone()
+        .or(active_station.clone());
+    let supports_persisted_station_config = snapshot.supports_persisted_station_config;
     let mut stations = snapshot.configs.clone();
     stations.sort_by(|a, b| {
         a.level
@@ -2020,19 +2039,63 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ));
             ui.label(format!(
                 "{}: {}",
-                pick(ctx.lang, "当前 active_station", "Current active_station"),
-                active_station
+                pick(ctx.lang, "配置 active_station", "Configured active_station"),
+                configured_active_station
+                    .as_deref()
+                    .unwrap_or_else(|| pick(ctx.lang, "<无>", "<none>"))
+            ));
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "生效站点", "Effective station"),
+                effective_active_station
                     .as_deref()
                     .unwrap_or_else(|| pick(ctx.lang, "<未知/仅本机可见>", "<unknown/local-only>"))
             ));
             ui.label(format!(
                 "{}: {}",
-                pick(ctx.lang, "默认 profile", "Default profile"),
+                pick(ctx.lang, "配置 default_profile", "Configured default_profile"),
                 snapshot
-                    .default_profile
+                    .configured_default_profile
                     .as_deref()
+                    .or(snapshot.default_profile.as_deref())
                     .unwrap_or_else(|| pick(ctx.lang, "<无>", "<none>"))
             ));
+            if snapshot
+                .configured_default_profile
+                .as_deref()
+                != snapshot.default_profile.as_deref()
+            {
+                ui.label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "生效 default_profile", "Effective default_profile"),
+                    snapshot
+                        .default_profile
+                        .as_deref()
+                        .unwrap_or_else(|| pick(ctx.lang, "<无>", "<none>"))
+                ));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "持久化站点配置", "Persisted station config"),
+                if supports_persisted_station_config {
+                    pick(ctx.lang, "可用", "available")
+                } else {
+                    pick(ctx.lang, "不可用", "unavailable")
+                }
+            ));
+            if matches!(snapshot.kind, ProxyModeKind::Attached) {
+                ui.label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "远端写回", "Remote write-back"),
+                    if supports_persisted_station_config {
+                        pick(ctx.lang, "已启用", "enabled")
+                    } else {
+                        pick(ctx.lang, "未提供", "not exposed")
+                    }
+                ));
+            }
         });
         ui.horizontal(|ui| {
             if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
@@ -2065,16 +2128,24 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ui.colored_label(
             egui::Color32::from_rgb(120, 120, 120),
             if matches!(snapshot.kind, ProxyModeKind::Attached) {
-                pick(
-                    ctx.lang,
-                    "附着模式下，global pin / runtime 覆盖会直接作用到远端代理；保存 active_station 仍然只对本机配置文件有意义。",
-                    "In attached mode, global pin and runtime overrides act on the remote proxy; persisting active_station still only makes sense for the local config file.",
-                )
+                if supports_persisted_station_config {
+                    pick(
+                        ctx.lang,
+                        "附着模式下，global pin / runtime 覆盖会直接作用到远端代理；下面的“配置控制”也会直接写回远端代理配置，不会改动本机文件。",
+                        "In attached mode, global pin and runtime overrides act on the remote proxy directly; the persisted config controls below also write back to the remote proxy rather than this device's local file.",
+                    )
+                } else {
+                    pick(
+                        ctx.lang,
+                        "附着模式下，global pin / runtime 覆盖会直接作用到远端代理；当前附着目标还没有暴露 persisted station config API，因此只能做运行时控制。",
+                        "In attached mode, global pin and runtime overrides act on the remote proxy directly; this attached target does not expose persisted station config APIs yet, so only runtime controls are available.",
+                    )
+                }
             } else {
                 pick(
                     ctx.lang,
-                    "这里的 global pin 是运行时覆盖；“保存为默认 active_station”才会写回本机配置文件。",
-                    "Global pin here is runtime-only; only 'save as default active_station' writes back to the local config file.",
+                    "这里的 global pin 是运行时覆盖；“配置控制”会通过本地 control-plane 写回配置文件并刷新运行态。",
+                    "Global pin here is runtime-only; the persisted config controls write through the local control plane and refresh the runtime.",
                 )
             },
         );
@@ -2104,6 +2175,9 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
         }
     });
+
+    ui.add_space(8.0);
+    render_stations_retry_panel(ui, ctx, &snapshot);
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -2233,7 +2307,7 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].label(format!(
             "{}: {}",
             pick(ctx.lang, "路由角色", "Routing role"),
-            if active_station.as_deref() == Some(cfg.name.as_str()) {
+            if effective_active_station.as_deref() == Some(cfg.name.as_str()) {
                 pick(ctx.lang, "当前 active_station", "current active_station")
             } else if snapshot.global_override.as_deref() == Some(cfg.name.as_str()) {
                 pick(ctx.lang, "当前 global pin", "current global pin")
@@ -2241,6 +2315,15 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 pick(ctx.lang, "普通候选", "normal candidate")
             }
         ));
+        if configured_active_station.as_deref() == Some(cfg.name.as_str())
+            && effective_active_station.as_deref() != Some(cfg.name.as_str())
+        {
+            cols[1].small(pick(
+                ctx.lang,
+                "该站点是配置 active_station，但当前生效路由已被 fallback / pin / runtime 状态改变。",
+                "This station is the configured active_station, but the effective route currently differs because of fallback, pin, or runtime state.",
+            ));
+        }
         cols[1].label(format!(
             "enabled: {}  (configured: {})",
             cfg.enabled, cfg.configured_enabled
@@ -2305,7 +2388,11 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         cols[1].add_space(8.0);
         cols[1].separator();
-        cols[1].label(pick(ctx.lang, "Quick switch", "Quick switch"));
+        cols[1].label(pick(
+            ctx.lang,
+            "Quick switch（运行时）",
+            "Quick switch (runtime)",
+        ));
         cols[1].horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -2351,37 +2438,156 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     }
                 }
             }
-            let can_save_active =
-                matches!(snapshot.kind, ProxyModeKind::Running) && snapshot.service_name.is_some();
-            if ui
-                .add_enabled(
-                    can_save_active,
-                    egui::Button::new(pick(
+        });
+        cols[1].small(pick(
+            ctx.lang,
+            "这里的 pin 只影响当前代理运行态，不修改配置文件。",
+            "Pins here only affect the current proxy runtime and do not rewrite persisted config.",
+        ));
+
+        cols[1].add_space(8.0);
+        cols[1].separator();
+        cols[1].label(pick(ctx.lang, "配置控制", "Persisted config"));
+        if supports_persisted_station_config {
+            cols[1].horizontal(|ui| {
+                if ui
+                    .button(pick(
                         ctx.lang,
-                        "保存为默认 active_station",
-                        "Save as default active_station",
-                    )),
-                )
-                .clicked()
-                && let Some(service_name) = snapshot.service_name.as_deref()
+                        "设为配置 active_station",
+                        "Set configured active_station",
+                    ))
+                    .clicked()
+                {
+                    match ctx
+                        .proxy
+                        .set_persisted_active_station(ctx.rt, Some(cfg.name.clone()))
+                    {
+                        Ok(()) => {
+                            ctx.proxy
+                                .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                            refresh_config_editor_from_disk_if_running(ctx);
+                            *ctx.last_info = Some(
+                                pick(
+                                    ctx.lang,
+                                    "已更新配置 active_station",
+                                    "Configured active_station updated",
+                                )
+                                .to_string(),
+                            );
+                            *ctx.last_error = None;
+                        }
+                        Err(e) => {
+                            *ctx.last_error =
+                                Some(format!("set persisted active station failed: {e}"));
+                        }
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        configured_active_station.is_some(),
+                        egui::Button::new(pick(
+                            ctx.lang,
+                            "清除配置 active_station",
+                            "Clear configured active_station",
+                        )),
+                    )
+                    .clicked()
+                {
+                    match ctx.proxy.set_persisted_active_station(ctx.rt, None) {
+                        Ok(()) => {
+                            ctx.proxy
+                                .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                            refresh_config_editor_from_disk_if_running(ctx);
+                            *ctx.last_info = Some(
+                                pick(
+                                    ctx.lang,
+                                    "已清除配置 active_station",
+                                    "Configured active_station cleared",
+                                )
+                                .to_string(),
+                            );
+                            *ctx.last_error = None;
+                        }
+                        Err(e) => {
+                            *ctx.last_error =
+                                Some(format!("clear persisted active station failed: {e}"));
+                        }
+                    }
+                }
+            });
+
+            let mut persisted_enabled = cfg.configured_enabled;
+            let mut persisted_level = cfg.configured_level.clamp(1, 10);
+            cols[1].horizontal(|ui| {
+                ui.checkbox(
+                    &mut persisted_enabled,
+                    pick(ctx.lang, "配置启用", "Configured enabled"),
+                );
+                ui.label(pick(ctx.lang, "配置等级", "Configured level"));
+                egui::ComboBox::from_id_salt(("stations_persisted_level", cfg.name.as_str()))
+                    .selected_text(persisted_level.to_string())
+                    .show_ui(ui, |ui| {
+                        for candidate in 1u8..=10 {
+                            ui.selectable_value(
+                                &mut persisted_level,
+                                candidate,
+                                candidate.to_string(),
+                            );
+                        }
+                    });
+            });
+            if persisted_enabled != cfg.configured_enabled
+                || persisted_level != cfg.configured_level.clamp(1, 10)
             {
-                match save_active_station_and_reload(ctx, service_name, cfg.name.as_str()) {
+                match ctx.proxy.update_persisted_station(
+                    ctx.rt,
+                    cfg.name.clone(),
+                    persisted_enabled,
+                    persisted_level,
+                ) {
                     Ok(()) => {
+                        ctx.proxy
+                            .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                        refresh_config_editor_from_disk_if_running(ctx);
                         *ctx.last_info = Some(
                             pick(
                                 ctx.lang,
-                                "已保存并应用 active_station",
-                                "active_station saved & applied",
+                                "已写回站点配置字段",
+                                "Persisted station fields updated",
                             )
                             .to_string(),
                         );
+                        *ctx.last_error = None;
                     }
                     Err(e) => {
-                        *ctx.last_error = Some(format!("save active_station failed: {e}"));
+                        *ctx.last_error =
+                            Some(format!("update persisted station fields failed: {e}"));
                     }
                 }
             }
-        });
+            cols[1].small(if matches!(snapshot.kind, ProxyModeKind::Attached) {
+                pick(
+                    ctx.lang,
+                    "这里直接写回附着代理的配置，不依赖本机文件。",
+                    "These controls write back to the attached proxy's config directly and do not rely on this device's local file.",
+                )
+            } else {
+                pick(
+                    ctx.lang,
+                    "这里通过本地 control-plane 写回配置文件，并与运行态保持同步。",
+                    "These controls write back through the local control plane and keep runtime in sync.",
+                )
+            });
+        } else {
+            cols[1].colored_label(
+                egui::Color32::from_rgb(120, 120, 120),
+                pick(
+                    ctx.lang,
+                    "当前目标没有暴露 persisted station config API，因此这里只能查看配置态，不能直接修改。",
+                    "This target does not expose persisted station config APIs yet, so persisted fields are view-only here.",
+                ),
+            );
+        }
 
         cols[1].add_space(8.0);
         cols[1].separator();
@@ -2733,6 +2939,340 @@ fn render_profile_management_entrypoint(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>
             ctx.view.requested_page = Some(Page::Sessions);
         }
     });
+}
+
+fn render_stations_retry_panel(
+    ui: &mut egui::Ui,
+    ctx: &mut PageCtx<'_>,
+    snapshot: &GuiRuntimeSnapshot,
+) {
+    if snapshot.supports_retry_config_api {
+        let configured_retry = snapshot.configured_retry.clone().unwrap_or_default();
+        sync_stations_retry_editor(&mut ctx.view.stations.retry_editor, &configured_retry);
+    }
+
+    ui.group(|ui| {
+        ui.heading(pick(ctx.lang, "Retry / Failover", "Retry / Failover"));
+        ui.label(pick(
+            ctx.lang,
+            "这里管理全局的 retry profile 与冷却/熔断惩罚；它影响整个代理的路由行为，不是单个 station 的局部设置。",
+            "Manage the global retry profile plus cooldown/breaker penalties here; it affects whole-proxy routing behavior rather than a single station.",
+        ));
+
+        if snapshot.supports_retry_config_api {
+            {
+                let editor = &mut ctx.view.stations.retry_editor;
+                ui.horizontal(|ui| {
+                    ui.label(pick(ctx.lang, "Retry profile", "Retry profile"));
+                    egui::ComboBox::from_id_salt("stations_retry_profile")
+                        .selected_text(retry_profile_display_text(
+                            ctx.lang,
+                            retry_profile_name_from_value(editor.profile.as_str()),
+                        ))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut editor.profile,
+                                String::new(),
+                                retry_profile_display_text(ctx.lang, None),
+                            );
+                            for profile in [
+                                RetryProfileName::Balanced,
+                                RetryProfileName::SameUpstream,
+                                RetryProfileName::AggressiveFailover,
+                                RetryProfileName::CostPrimary,
+                            ] {
+                                ui.selectable_value(
+                                    &mut editor.profile,
+                                    retry_profile_name_value(profile).to_string(),
+                                    retry_profile_display_text(ctx.lang, Some(profile)),
+                                );
+                            }
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("cf challenge");
+                    ui.add_sized(
+                        [72.0, 22.0],
+                        egui::TextEdit::singleline(&mut editor.cloudflare_challenge_cooldown_secs),
+                    );
+                    ui.label("cf timeout");
+                    ui.add_sized(
+                        [72.0, 22.0],
+                        egui::TextEdit::singleline(&mut editor.cloudflare_timeout_cooldown_secs),
+                    );
+                    ui.label("transport");
+                    ui.add_sized(
+                        [72.0, 22.0],
+                        egui::TextEdit::singleline(&mut editor.transport_cooldown_secs),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("backoff factor");
+                    ui.add_sized(
+                        [72.0, 22.0],
+                        egui::TextEdit::singleline(&mut editor.cooldown_backoff_factor),
+                    );
+                    ui.label("backoff max");
+                    ui.add_sized(
+                        [72.0, 22.0],
+                        egui::TextEdit::singleline(&mut editor.cooldown_backoff_max_secs),
+                    );
+                });
+            }
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button(pick(
+                        ctx.lang,
+                        "写回 retry 配置",
+                        "Apply persisted retry config",
+                    ))
+                    .clicked()
+                {
+                    let base_retry = snapshot.configured_retry.as_ref().cloned().unwrap_or_default();
+                    match build_retry_config_from_editor(&ctx.view.stations.retry_editor, &base_retry)
+                    {
+                        Ok(retry) => match ctx.proxy.set_persisted_retry_config(ctx.rt, retry) {
+                            Ok(()) => {
+                                ctx.proxy.refresh_current_if_due(
+                                    ctx.rt,
+                                    std::time::Duration::from_secs(0),
+                                );
+                                refresh_config_editor_from_disk_if_running(ctx);
+                                *ctx.last_info = Some(
+                                    pick(
+                                        ctx.lang,
+                                        "已写回 retry/failover 配置",
+                                        "Persisted retry/failover config updated",
+                                    )
+                                    .to_string(),
+                                );
+                                *ctx.last_error = None;
+                            }
+                            Err(e) => {
+                                *ctx.last_error =
+                                    Some(format!("set persisted retry config failed: {e}"));
+                            }
+                        },
+                        Err(e) => {
+                            *ctx.last_error = Some(format!("invalid retry config: {e}"));
+                        }
+                    }
+                }
+
+                if ui
+                    .button(pick(ctx.lang, "恢复 balanced 表单", "Reset form to balanced"))
+                    .clicked()
+                {
+                    load_stations_retry_editor_fields(
+                        &mut ctx.view.stations.retry_editor,
+                        &RetryConfig::default(),
+                    );
+                }
+            });
+
+            ui.small(if matches!(snapshot.kind, ProxyModeKind::Attached) {
+                pick(
+                    ctx.lang,
+                    "附着模式下，这里直接写回远端代理暴露的 retry config API，不依赖本机文件。",
+                    "In attached mode, this writes directly to the remote proxy's retry config API instead of any local file on this device.",
+                )
+            } else {
+                pick(
+                    ctx.lang,
+                    "本地运行模式下，这里通过 control-plane 写回配置文件并触发 reload。",
+                    "In local running mode, this writes through the control plane to persisted config and reloads the runtime.",
+                )
+            });
+        } else {
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 120, 120),
+                if matches!(snapshot.kind, ProxyModeKind::Attached) {
+                    pick(
+                        ctx.lang,
+                        "当前附着目标没有暴露 retry config API，因此这里只能查看 resolved policy，不能直接写回。",
+                        "This attached target does not expose retry config APIs, so only the resolved policy is visible here.",
+                    )
+                } else {
+                    pick(
+                        ctx.lang,
+                        "当前运行态没有可写 retry config API；下面仅展示 resolved policy。",
+                        "No writable retry config API is available for the current runtime; only the resolved policy is shown below.",
+                    )
+                },
+            );
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(pick(
+            ctx.lang,
+            "Resolved policy",
+            "Resolved policy",
+        ));
+        if let Some(retry) = snapshot.resolved_retry.as_ref() {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "upstream: {} / attempts={}",
+                    retry_strategy_label(retry.upstream.strategy),
+                    retry.upstream.max_attempts
+                ));
+                ui.label(format!(
+                    "provider: {} / attempts={}",
+                    retry_strategy_label(retry.provider.strategy),
+                    retry.provider.max_attempts
+                ));
+            });
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "cf challenge={}s",
+                    retry.cloudflare_challenge_cooldown_secs
+                ));
+                ui.label(format!(
+                    "cf timeout={}s",
+                    retry.cloudflare_timeout_cooldown_secs
+                ));
+                ui.label(format!("transport={}s", retry.transport_cooldown_secs));
+            });
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "backoff factor={}",
+                    retry.cooldown_backoff_factor
+                ));
+                ui.label(format!(
+                    "backoff max={}s",
+                    retry.cooldown_backoff_max_secs
+                ));
+            });
+            ui.small(format!(
+                "upstream backoff={}..{} ms  provider backoff={}..{} ms",
+                retry.upstream.backoff_ms,
+                retry.upstream.backoff_max_ms,
+                retry.provider.backoff_ms,
+                retry.provider.backoff_max_ms
+            ));
+        } else {
+            ui.label(pick(
+                ctx.lang,
+                "当前还没有可见的 resolved retry policy。",
+                "No resolved retry policy is visible for the current runtime yet.",
+            ));
+        }
+    });
+}
+
+fn sync_stations_retry_editor(editor: &mut StationsRetryEditorState, retry: &RetryConfig) {
+    let signature = format!("{retry:?}");
+    if editor.source_signature.as_deref() == Some(signature.as_str()) {
+        return;
+    }
+    load_stations_retry_editor_fields(editor, retry);
+    editor.source_signature = Some(signature);
+}
+
+fn load_stations_retry_editor_fields(editor: &mut StationsRetryEditorState, retry: &RetryConfig) {
+    editor.profile = retry
+        .profile
+        .map(retry_profile_name_value)
+        .unwrap_or_default()
+        .to_string();
+    editor.cloudflare_challenge_cooldown_secs =
+        optional_u64_editor_value(retry.cloudflare_challenge_cooldown_secs);
+    editor.cloudflare_timeout_cooldown_secs =
+        optional_u64_editor_value(retry.cloudflare_timeout_cooldown_secs);
+    editor.transport_cooldown_secs = optional_u64_editor_value(retry.transport_cooldown_secs);
+    editor.cooldown_backoff_factor = optional_u64_editor_value(retry.cooldown_backoff_factor);
+    editor.cooldown_backoff_max_secs = optional_u64_editor_value(retry.cooldown_backoff_max_secs);
+}
+
+fn optional_u64_editor_value(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn build_retry_config_from_editor(
+    editor: &StationsRetryEditorState,
+    base: &RetryConfig,
+) -> Result<RetryConfig, String> {
+    let mut retry = base.clone();
+    retry.profile = retry_profile_name_from_value(editor.profile.as_str());
+    retry.cloudflare_challenge_cooldown_secs = parse_optional_u64_editor_value(
+        "cloudflare_challenge_cooldown_secs",
+        &editor.cloudflare_challenge_cooldown_secs,
+    )?;
+    retry.cloudflare_timeout_cooldown_secs = parse_optional_u64_editor_value(
+        "cloudflare_timeout_cooldown_secs",
+        &editor.cloudflare_timeout_cooldown_secs,
+    )?;
+    retry.transport_cooldown_secs = parse_optional_u64_editor_value(
+        "transport_cooldown_secs",
+        &editor.transport_cooldown_secs,
+    )?;
+    retry.cooldown_backoff_factor = parse_optional_u64_editor_value(
+        "cooldown_backoff_factor",
+        &editor.cooldown_backoff_factor,
+    )?;
+    retry.cooldown_backoff_max_secs = parse_optional_u64_editor_value(
+        "cooldown_backoff_max_secs",
+        &editor.cooldown_backoff_max_secs,
+    )?;
+    Ok(retry)
+}
+
+fn parse_optional_u64_editor_value(field: &str, raw: &str) -> Result<Option<u64>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("{field} must be a non-negative integer"))
+}
+
+fn retry_profile_name_value(profile: RetryProfileName) -> &'static str {
+    match profile {
+        RetryProfileName::Balanced => "balanced",
+        RetryProfileName::SameUpstream => "same-upstream",
+        RetryProfileName::AggressiveFailover => "aggressive-failover",
+        RetryProfileName::CostPrimary => "cost-primary",
+    }
+}
+
+fn retry_profile_name_from_value(value: &str) -> Option<RetryProfileName> {
+    match value.trim() {
+        "balanced" => Some(RetryProfileName::Balanced),
+        "same-upstream" => Some(RetryProfileName::SameUpstream),
+        "aggressive-failover" => Some(RetryProfileName::AggressiveFailover),
+        "cost-primary" => Some(RetryProfileName::CostPrimary),
+        _ => None,
+    }
+}
+
+fn retry_profile_display_text(lang: Language, profile: Option<RetryProfileName>) -> String {
+    match profile {
+        None => pick(lang, "自动（默认 balanced）", "Auto (default balanced)").to_string(),
+        Some(RetryProfileName::Balanced) => pick(lang, "balanced（均衡）", "balanced").to_string(),
+        Some(RetryProfileName::SameUpstream) => {
+            pick(lang, "same-upstream（优先同上游）", "same-upstream").to_string()
+        }
+        Some(RetryProfileName::AggressiveFailover) => pick(
+            lang,
+            "aggressive-failover（积极切换）",
+            "aggressive-failover",
+        )
+        .to_string(),
+        Some(RetryProfileName::CostPrimary) => {
+            pick(lang, "cost-primary（成本优先）", "cost-primary").to_string()
+        }
+    }
+}
+
+fn retry_strategy_label(strategy: RetryStrategy) -> &'static str {
+    match strategy {
+        RetryStrategy::Failover => "failover",
+        RetryStrategy::SameUpstream => "same_upstream",
+    }
 }
 
 fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
@@ -8301,30 +8841,6 @@ fn refresh_config_editor_from_disk_if_running(ctx: &mut PageCtx<'_>) {
             ctx.view.config.working = Some(parsed);
         }
     }
-}
-
-fn save_active_station_and_reload(
-    ctx: &mut PageCtx<'_>,
-    service_name: &str,
-    name: &str,
-) -> anyhow::Result<()> {
-    ctx.rt.block_on(async {
-        let mut cfg = crate::config::load_config().await?;
-        let mgr = match service_name {
-            "claude" => &mut cfg.claude,
-            _ => &mut cfg.codex,
-        };
-        mgr.active = Some(name.to_string());
-        crate::config::save_config(&cfg).await?;
-        Ok::<(), anyhow::Error>(())
-    })?;
-
-    let new_path = crate::config::config_file_path();
-    if let Ok(text) = std::fs::read_to_string(&new_path) {
-        *ctx.proxy_config_text = text;
-    }
-    ctx.proxy.reload_runtime_config(ctx.rt)?;
-    Ok(())
 }
 
 fn format_runtime_station_health_status(

@@ -11,7 +11,8 @@ use tokio::task::JoinHandle;
 use std::collections::HashMap;
 
 use crate::config::{
-    ProxyConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
+    ProxyConfig, ResolvedRetryConfig, RetryConfig, ServiceKind, load_or_bootstrap_for_service,
+    model_routing_warnings,
 };
 use crate::dashboard_core::{
     ApiV1Capabilities, ApiV1Snapshot, ConfigOption, ControlProfileOption,
@@ -96,6 +97,9 @@ pub struct AttachedStatus {
     pub lb_view: HashMap<String, LbConfigView>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
+    pub configured_retry: Option<RetryConfig>,
+    pub resolved_retry: Option<ResolvedRetryConfig>,
+    pub supports_retry_config_api: bool,
     pub supports_persisted_station_config: bool,
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
@@ -138,6 +142,9 @@ impl AttachedStatus {
             lb_view: HashMap::new(),
             runtime_loaded_at_ms: None,
             runtime_source_mtime_ms: None,
+            configured_retry: None,
+            resolved_retry: None,
+            supports_retry_config_api: false,
             supports_persisted_station_config: false,
             supports_default_profile_override: false,
             supports_config_runtime_override: false,
@@ -174,7 +181,10 @@ pub struct GuiRuntimeSnapshot {
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
+    pub configured_retry: Option<RetryConfig>,
+    pub resolved_retry: Option<ResolvedRetryConfig>,
     pub supports_v1: bool,
+    pub supports_retry_config_api: bool,
     pub supports_persisted_station_config: bool,
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
@@ -211,6 +221,8 @@ pub struct RunningProxy {
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
+    pub configured_retry: Option<RetryConfig>,
+    pub resolved_retry: Option<ResolvedRetryConfig>,
     pub lb_view: HashMap<String, LbConfigView>,
     shutdown_tx: watch::Sender<bool>,
     server_handle: Option<JoinHandle<anyhow::Result<()>>>,
@@ -425,7 +437,10 @@ impl ProxyController {
                 usage_rollup: r.usage_rollup.clone(),
                 stats_5m: r.stats_5m.clone(),
                 stats_1h: r.stats_1h.clone(),
+                configured_retry: r.configured_retry.clone(),
+                resolved_retry: r.resolved_retry.clone(),
                 supports_v1: true,
+                supports_retry_config_api: true,
                 supports_persisted_station_config: true,
                 supports_default_profile_override: true,
                 supports_config_runtime_override: true,
@@ -457,7 +472,10 @@ impl ProxyController {
                 usage_rollup: a.usage_rollup.clone(),
                 stats_5m: a.stats_5m.clone(),
                 stats_1h: a.stats_1h.clone(),
+                configured_retry: a.configured_retry.clone(),
+                resolved_retry: a.resolved_retry.clone(),
                 supports_v1: a.api_version == Some(1),
+                supports_retry_config_api: a.supports_retry_config_api,
                 supports_persisted_station_config: a.supports_persisted_station_config,
                 supports_default_profile_override: a.supports_default_profile_override,
                 supports_config_runtime_override: a.supports_config_runtime_override,
@@ -788,6 +806,8 @@ impl ProxyController {
                 loaded_at_ms: u64,
                 #[serde(default)]
                 source_mtime_ms: Option<u64>,
+                #[serde(default)]
+                retry: Option<ResolvedRetryConfig>,
             }
 
             let req_timeout = Duration::from_millis(800);
@@ -830,6 +850,9 @@ impl ProxyController {
                 lb_view: HashMap<String, LbConfigView>,
                 runtime_loaded_at_ms: Option<u64>,
                 runtime_source_mtime_ms: Option<u64>,
+                configured_retry: Option<RetryConfig>,
+                resolved_retry: Option<ResolvedRetryConfig>,
+                supports_retry_config_api: bool,
                 supports_persisted_station_config: bool,
                 supports_default_profile_override: bool,
                 supports_config_runtime_override: bool,
@@ -868,6 +891,9 @@ impl ProxyController {
                     let supports_profiles = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/profiles");
+                    let supports_retry_config_api = endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/retry/config");
                     let supports_default_profile_override = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/profiles/default");
@@ -901,6 +927,24 @@ impl ProxyController {
                         )
                         .await
                         .ok()
+                    } else {
+                        None
+                    };
+                    let configured_retry = if supports_retry_config_api {
+                        #[derive(serde::Deserialize)]
+                        struct RetryConfigResponse {
+                            configured: RetryConfig,
+                            resolved: ResolvedRetryConfig,
+                        }
+
+                        get_json::<RetryConfigResponse>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/retry/config"),
+                            req_timeout,
+                        )
+                        .await
+                        .ok()
+                        .map(|response| (response.configured, response.resolved))
                     } else {
                         None
                     };
@@ -972,6 +1016,13 @@ impl ProxyController {
                             lb_view: snapshot.lb_view,
                             runtime_loaded_at_ms,
                             runtime_source_mtime_ms,
+                            configured_retry: configured_retry
+                                .as_ref()
+                                .map(|(configured, _)| configured.clone()),
+                            resolved_retry: configured_retry
+                                .as_ref()
+                                .map(|(_, resolved)| resolved.clone()),
+                            supports_retry_config_api,
                             supports_persisted_station_config,
                             supports_default_profile_override,
                             supports_config_runtime_override,
@@ -1123,6 +1174,14 @@ impl ProxyController {
                         lb_view: HashMap::new(),
                         runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                         runtime_source_mtime_ms: runtime.source_mtime_ms,
+                        configured_retry: configured_retry
+                            .as_ref()
+                            .map(|(configured, _)| configured.clone()),
+                        resolved_retry: configured_retry
+                            .as_ref()
+                            .map(|(_, resolved)| resolved.clone())
+                            .or(runtime.retry),
+                        supports_retry_config_api,
                         supports_persisted_station_config,
                         supports_default_profile_override,
                         supports_config_runtime_override,
@@ -1187,6 +1246,9 @@ impl ProxyController {
                     lb_view: HashMap::new(),
                     runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                     runtime_source_mtime_ms: runtime.source_mtime_ms,
+                    configured_retry: None,
+                    resolved_retry: runtime.retry,
+                    supports_retry_config_api: false,
                     supports_persisted_station_config: false,
                     supports_default_profile_override: false,
                     supports_config_runtime_override: false,
@@ -1238,6 +1300,9 @@ impl ProxyController {
                     att.lb_view = result.lb_view;
                     att.runtime_loaded_at_ms = result.runtime_loaded_at_ms;
                     att.runtime_source_mtime_ms = result.runtime_source_mtime_ms;
+                    att.configured_retry = result.configured_retry;
+                    att.resolved_retry = result.resolved_retry;
+                    att.supports_retry_config_api = result.supports_retry_config_api;
                     att.supports_persisted_station_config =
                         result.supports_persisted_station_config;
                     att.supports_default_profile_override =
@@ -1658,6 +1723,61 @@ impl ProxyController {
             Ok::<(), anyhow::Error>(())
         };
         rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn set_persisted_retry_config(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        retry: RetryConfig,
+    ) -> anyhow::Result<()> {
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) || !att.supports_retry_config_api {
+                    bail!("attached proxy does not support persisted retry config (need api v1)");
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        #[derive(serde::Deserialize)]
+        struct RetryConfigResponse {
+            configured: RetryConfig,
+            resolved: ResolvedRetryConfig,
+        }
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .post(format!("{base}/__codex_helper/api/v1/retry/config"))
+                    .timeout(Duration::from_millis(1200))
+                    .json(&retry),
+            )
+            .await?
+            .json::<RetryConfigResponse>()
+            .await
+            .map_err(anyhow::Error::from)
+        };
+        let response = rt.block_on(fut)?;
+
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                r.configured_retry = Some(response.configured.clone());
+                r.resolved_retry = Some(response.resolved.clone());
+            }
+            ProxyMode::Attached(att) => {
+                att.configured_retry = Some(response.configured.clone());
+                att.resolved_retry = Some(response.resolved.clone());
+                att.supports_retry_config_api = true;
+            }
+            _ => {}
+        }
+
         self.refresh_current_if_due(rt, Duration::from_secs(0));
         Ok(())
     }
@@ -2412,6 +2532,8 @@ impl ProxyController {
             list_profiles_from_cfg(cfg.as_ref(), service_name, default_profile.as_deref());
         let configs =
             list_configs_from_cfg(cfg.as_ref(), service_name, HashMap::new(), HashMap::new());
+        let configured_retry = cfg.retry.clone();
+        let resolved_retry = configured_retry.resolve();
 
         self.mode = ProxyMode::Running(RunningProxy {
             service_name,
@@ -2441,6 +2563,8 @@ impl ProxyController {
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
+            configured_retry: Some(configured_retry),
+            resolved_retry: Some(resolved_retry),
             lb_view: HashMap::new(),
             shutdown_tx,
             server_handle: Some(server_handle),
@@ -3111,6 +3235,121 @@ mod tests {
             .expect("update payload");
         assert_eq!(update_payload.get("enabled"), Some(&Value::Bool(false)));
         assert_eq!(update_payload.get("level"), Some(&Value::from(7)));
+
+        handle.abort();
+    }
+
+    #[test]
+    fn attached_persisted_retry_config_uses_v1_retry_endpoint() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let observed_payload = Arc::new(Mutex::new(None::<Value>));
+        let app = Router::new().route(
+            "/__codex_helper/api/v1/retry/config",
+            post({
+                let observed_payload = observed_payload.clone();
+                move |Json(payload): Json<Value>| {
+                    let observed_payload = observed_payload.clone();
+                    async move {
+                        *observed_payload.lock().expect("retry payload lock") =
+                            Some(payload.clone());
+                        Json(serde_json::json!({
+                            "configured": payload,
+                            "resolved": {
+                                "upstream": {
+                                    "max_attempts": 2,
+                                    "backoff_ms": 200,
+                                    "backoff_max_ms": 2000,
+                                    "jitter_ms": 100,
+                                    "on_status": "429,500-599,524",
+                                    "on_class": ["upstream_transport_error"],
+                                    "strategy": "same_upstream"
+                                },
+                                "provider": {
+                                    "max_attempts": 2,
+                                    "backoff_ms": 0,
+                                    "backoff_max_ms": 0,
+                                    "jitter_ms": 0,
+                                    "on_status": "401,403,404,408,429,500-599,524",
+                                    "on_class": ["upstream_transport_error"],
+                                    "strategy": "failover"
+                                },
+                                "never_on_status": "413,415,422",
+                                "never_on_class": ["client_error_non_retryable"],
+                                "cloudflare_challenge_cooldown_secs": 300,
+                                "cloudflare_timeout_cooldown_secs": 12,
+                                "transport_cooldown_secs": 45,
+                                "cooldown_backoff_factor": 3,
+                                "cooldown_backoff_max_secs": 180
+                            }
+                        }))
+                    }
+                }
+            }),
+        );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4303, ServiceKind::Codex);
+        let mut attached = AttachedStatus::new(4303);
+        attached.api_version = Some(1);
+        attached.admin_base_url = base_url;
+        attached.supports_retry_config_api = true;
+        controller.mode = ProxyMode::Attached(attached);
+
+        controller
+            .set_persisted_retry_config(
+                &rt,
+                RetryConfig {
+                    profile: Some(crate::config::RetryProfileName::CostPrimary),
+                    transport_cooldown_secs: Some(45),
+                    cloudflare_timeout_cooldown_secs: Some(12),
+                    cooldown_backoff_factor: Some(3),
+                    cooldown_backoff_max_secs: Some(180),
+                    ..Default::default()
+                },
+            )
+            .expect("set persisted retry config");
+
+        let observed_payload = observed_payload
+            .lock()
+            .expect("retry payload lock")
+            .clone()
+            .expect("retry payload");
+        assert_eq!(
+            observed_payload.get("profile"),
+            Some(&Value::String("cost-primary".to_string()))
+        );
+        assert_eq!(
+            observed_payload.get("transport_cooldown_secs"),
+            Some(&Value::from(45))
+        );
+        assert_eq!(
+            observed_payload.get("cooldown_backoff_factor"),
+            Some(&Value::from(3))
+        );
+
+        let snapshot = controller.snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot
+                .configured_retry
+                .as_ref()
+                .and_then(|retry| retry.profile),
+            Some(crate::config::RetryProfileName::CostPrimary)
+        );
+        assert_eq!(
+            snapshot
+                .resolved_retry
+                .as_ref()
+                .map(|retry| retry.transport_cooldown_secs),
+            Some(45)
+        );
+        assert_eq!(
+            snapshot
+                .resolved_retry
+                .as_ref()
+                .map(|retry| retry.cooldown_backoff_factor),
+            Some(3)
+        );
 
         handle.abort();
     }

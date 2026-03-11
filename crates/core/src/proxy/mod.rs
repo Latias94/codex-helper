@@ -3405,6 +3405,12 @@ pub fn router(proxy: ProxyService) -> Router {
     }
 
     #[derive(serde::Serialize)]
+    struct RetryConfigResponse {
+        configured: crate::config::RetryConfig,
+        resolved: crate::config::ResolvedRetryConfig,
+    }
+
+    #[derive(serde::Serialize)]
     struct ReloadResult {
         reloaded: bool,
         status: RuntimeConfigStatus,
@@ -3426,6 +3432,32 @@ pub fn router(proxy: ProxyService) -> Router {
             loaded_at_ms: proxy.config.last_loaded_at_ms(),
             source_mtime_ms: proxy.config.last_mtime_ms().await,
             retry: cfg.retry.resolve(),
+        }))
+    }
+
+    async fn get_retry_config(
+        proxy: ProxyService,
+    ) -> Result<Json<RetryConfigResponse>, (StatusCode, String)> {
+        let cfg = proxy.config.snapshot().await;
+        Ok(Json(RetryConfigResponse {
+            configured: cfg.retry.clone(),
+            resolved: cfg.retry.resolve(),
+        }))
+    }
+
+    async fn set_retry_config(
+        proxy: ProxyService,
+        Json(payload): Json<crate::config::RetryConfig>,
+    ) -> Result<Json<RetryConfigResponse>, (StatusCode, String)> {
+        let cfg_snapshot = proxy.config.snapshot().await;
+        let mut cfg = cfg_snapshot.as_ref().clone();
+        cfg.retry = payload;
+
+        save_proxy_config_and_reload(&proxy, cfg).await?;
+        let cfg = proxy.config.snapshot().await;
+        Ok(Json(RetryConfigResponse {
+            configured: cfg.retry.clone(),
+            resolved: cfg.retry.resolve(),
         }))
     }
 
@@ -4087,6 +4119,7 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/status/config-health",
                 "/__codex_helper/api/v1/config/runtime",
                 "/__codex_helper/api/v1/config/reload",
+                "/__codex_helper/api/v1/retry/config",
                 "/__codex_helper/api/v1/configs",
                 "/__codex_helper/api/v1/configs/runtime",
                 "/__codex_helper/api/v1/stations",
@@ -4436,6 +4469,8 @@ pub fn router(proxy: ProxyService) -> Router {
     let p40 = proxy.clone();
     let p41 = proxy.clone();
     let p42 = proxy.clone();
+    let p43 = proxy.clone();
+    let p44 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -4478,6 +4513,11 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/config/reload",
             post(move || reload_runtime_config(p13.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/retry/config",
+            get(move || get_retry_config(p43.clone()))
+                .post(move |payload| set_retry_config(p44.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/configs",

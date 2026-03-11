@@ -243,6 +243,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/retry/config"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations"))
     }));
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
@@ -884,6 +889,140 @@ async fn proxy_api_v1_station_config_crud_persists_active_and_meta() {
     assert!(config_text.contains("enabled = false"));
     assert!(config_text.contains("level = 7"));
     assert!(!config_text.contains("active_station = \"zeta\""));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_retry_config_crud_persists_profile_and_cooldowns() {
+    let _env_lock = env_lock();
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let mut cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    cfg.version = Some(2);
+
+    let v2 = crate::config::migrate_legacy_to_v2(&cfg);
+    crate::config::save_config_v2(&v2)
+        .await
+        .expect("write initial v2 config");
+    let loaded = crate::config::load_config()
+        .await
+        .expect("load initial runtime config");
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(loaded),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let initial = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/retry/config",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get retry config send")
+        .error_for_status()
+        .expect("get retry config status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get retry config json");
+    assert_eq!(
+        initial["configured"]
+            .get("profile")
+            .and_then(|value| value.as_str()),
+        Some("balanced")
+    );
+    assert_eq!(
+        initial["resolved"]
+            .get("transport_cooldown_secs")
+            .and_then(|value| value.as_u64()),
+        Some(30)
+    );
+
+    let update = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/retry/config",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "profile": "cost-primary",
+            "transport_cooldown_secs": 45,
+            "cloudflare_timeout_cooldown_secs": 12,
+            "cooldown_backoff_factor": 3,
+            "cooldown_backoff_max_secs": 180,
+        }))
+        .send()
+        .await
+        .expect("set retry config send");
+    assert_eq!(update.status(), StatusCode::OK);
+    let update = update
+        .json::<serde_json::Value>()
+        .await
+        .expect("set retry config json");
+    assert_eq!(
+        update["configured"]
+            .get("profile")
+            .and_then(|value| value.as_str()),
+        Some("cost-primary")
+    );
+    assert_eq!(
+        update["configured"]
+            .get("transport_cooldown_secs")
+            .and_then(|value| value.as_u64()),
+        Some(45)
+    );
+    assert_eq!(
+        update["resolved"]
+            .get("cooldown_backoff_factor")
+            .and_then(|value| value.as_u64()),
+        Some(3)
+    );
+    assert_eq!(
+        update["resolved"]
+            .get("cooldown_backoff_max_secs")
+            .and_then(|value| value.as_u64()),
+        Some(180)
+    );
+
+    let reloaded_cfg = crate::config::load_config()
+        .await
+        .expect("reload config from disk after retry CRUD");
+    assert_eq!(
+        reloaded_cfg.retry.profile,
+        Some(RetryProfileName::CostPrimary)
+    );
+    assert_eq!(reloaded_cfg.retry.transport_cooldown_secs, Some(45));
+    assert_eq!(
+        reloaded_cfg.retry.cloudflare_timeout_cooldown_secs,
+        Some(12)
+    );
+    assert_eq!(reloaded_cfg.retry.cooldown_backoff_factor, Some(3));
+    assert_eq!(reloaded_cfg.retry.cooldown_backoff_max_secs, Some(180));
+
+    let config_text =
+        std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
+    assert!(config_text.contains("[retry]"));
+    assert!(config_text.contains("profile = \"cost-primary\""));
+    assert!(config_text.contains("transport_cooldown_secs = 45"));
 
     proxy_handle.abort();
 }
