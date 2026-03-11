@@ -10,7 +10,10 @@ use super::util::{
     open_in_file_manager, spawn_windows_terminal_wt_new_tab,
     spawn_windows_terminal_wt_tabs_in_one_window,
 };
-use crate::dashboard_core::{ConfigOption, ControlProfileOption};
+use crate::dashboard_core::{
+    CapabilitySupport, ConfigCapabilitySummary, ConfigOption, ControlProfileOption,
+    ModelCatalogKind,
+};
 use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::SessionSummary;
 use crate::state::{
@@ -1239,6 +1242,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 ui.label(pick(ctx.lang, "状态", "State"));
                                 ui.label(pick(ctx.lang, "启用", "Enabled"));
                                 ui.label(pick(ctx.lang, "等级", "Level"));
+                                ui.label(pick(ctx.lang, "能力", "Capabilities"));
                                 ui.label(pick(ctx.lang, "健康", "Health"));
                                 ui.label(pick(ctx.lang, "熔断/冷却", "Breaker"));
                                 ui.label(pick(ctx.lang, "来源", "Source"));
@@ -1258,6 +1262,15 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                         format_runtime_lb_summary(runtime_lb_view.get(&cfg.name));
                                     let source_label =
                                         format_runtime_config_source(ctx.lang, cfg);
+                                    let capability_label = format_runtime_config_capability_label(
+                                        ctx.lang,
+                                        &cfg.capabilities,
+                                    );
+                                    let capability_hover =
+                                        runtime_config_capability_hover_text(
+                                            ctx.lang,
+                                            &cfg.capabilities,
+                                        );
                                     let mut runtime_state = cfg.runtime_state;
 
                                     ui.label(label);
@@ -1410,6 +1423,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                         }
                                     }
 
+                                    ui.small(capability_label).on_hover_text(capability_hover);
                                     ui.label(health_label);
                                     ui.label(breaker_label);
                                     ui.label(source_label);
@@ -5545,6 +5559,105 @@ fn runtime_config_state_label(lang: Language, state: RuntimeConfigState) -> &'st
         (_, RuntimeConfigState::Draining) => "draining",
         (_, RuntimeConfigState::BreakerOpen) => "breaker_open",
     }
+}
+
+fn capability_support_short_label(lang: Language, support: CapabilitySupport) -> &'static str {
+    match (lang, support) {
+        (Language::Zh, CapabilitySupport::Supported) => "是",
+        (Language::Zh, CapabilitySupport::Unsupported) => "否",
+        (Language::Zh, CapabilitySupport::Unknown) => "?",
+        (_, CapabilitySupport::Supported) => "yes",
+        (_, CapabilitySupport::Unsupported) => "no",
+        (_, CapabilitySupport::Unknown) => "?",
+    }
+}
+
+fn capability_support_label(lang: Language, support: CapabilitySupport) -> &'static str {
+    match (lang, support) {
+        (Language::Zh, CapabilitySupport::Supported) => "支持",
+        (Language::Zh, CapabilitySupport::Unsupported) => "不支持",
+        (Language::Zh, CapabilitySupport::Unknown) => "未知",
+        (_, CapabilitySupport::Supported) => "supported",
+        (_, CapabilitySupport::Unsupported) => "unsupported",
+        (_, CapabilitySupport::Unknown) => "unknown",
+    }
+}
+
+fn format_runtime_config_capability_label(
+    lang: Language,
+    capabilities: &ConfigCapabilitySummary,
+) -> String {
+    let model_label = match capabilities.model_catalog_kind {
+        ModelCatalogKind::ImplicitAny => {
+            format!("{}:any", pick(lang, "模型", "models"))
+        }
+        ModelCatalogKind::Declared => {
+            format!(
+                "{}:{}",
+                pick(lang, "模型", "models"),
+                capabilities.supported_models.len()
+            )
+        }
+    };
+    format!(
+        "{model_label} | tier:{} | effort:{}",
+        capability_support_short_label(lang, capabilities.supports_service_tier),
+        capability_support_short_label(lang, capabilities.supports_reasoning_effort),
+    )
+}
+
+fn runtime_config_capability_hover_text(
+    lang: Language,
+    capabilities: &ConfigCapabilitySummary,
+) -> String {
+    let mut lines = Vec::new();
+    match capabilities.model_catalog_kind {
+        ModelCatalogKind::ImplicitAny => lines.push(
+            pick(
+                lang,
+                "模型能力: 未显式声明，当前按 implicit any 处理",
+                "Model support: not declared explicitly; current routing treats this station as implicit-any",
+            )
+            .to_string(),
+        ),
+        ModelCatalogKind::Declared => {
+            if capabilities.supported_models.is_empty() {
+                lines.push(
+                    pick(
+                        lang,
+                        "模型能力: 已声明，但没有正向可用模型模式",
+                        "Model support: declared, but no positive model patterns are available",
+                    )
+                    .to_string(),
+                );
+            } else {
+                lines.push(format!(
+                    "{}: {}",
+                    pick(lang, "模型列表", "Models"),
+                    capabilities.supported_models.join(", ")
+                ));
+            }
+        }
+    }
+    lines.push(format!(
+        "{}: {}",
+        pick(lang, "Fast/Service tier", "Fast/Service tier"),
+        capability_support_label(lang, capabilities.supports_service_tier)
+    ));
+    lines.push(format!(
+        "{}: {}",
+        pick(lang, "思考强度", "Reasoning effort"),
+        capability_support_label(lang, capabilities.supports_reasoning_effort)
+    ));
+    lines.push(
+        pick(
+            lang,
+            "来源: supported_models/model_mapping 与 upstream tags",
+            "Source: supported_models/model_mapping plus upstream tags",
+        )
+        .to_string(),
+    );
+    lines.join("\n")
 }
 
 fn format_runtime_config_source(lang: Language, cfg: &ConfigOption) -> String {

@@ -51,41 +51,6 @@ const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(not(test))]
 const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(800);
 
-fn list_config_options_from_mgr(
-    mgr: &ServiceConfigManager,
-    meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
-    state_overrides: &HashMap<String, RuntimeConfigState>,
-) -> Vec<crate::dashboard_core::ConfigOption> {
-    let mut configs = mgr
-        .configs
-        .iter()
-        .map(|(name, c)| {
-            let (enabled_override, level_override) = meta_overrides
-                .get(name.as_str())
-                .copied()
-                .unwrap_or((None, None));
-            let configured_level = c.level.clamp(1, 10);
-            crate::dashboard_core::ConfigOption {
-                name: name.clone(),
-                alias: c.alias.clone(),
-                enabled: enabled_override.unwrap_or(c.enabled),
-                level: level_override.unwrap_or(configured_level).clamp(1, 10),
-                configured_enabled: c.enabled,
-                configured_level,
-                runtime_enabled_override: enabled_override,
-                runtime_level_override: level_override.map(|level| level.clamp(1, 10)),
-                runtime_state: state_overrides
-                    .get(name.as_str())
-                    .copied()
-                    .unwrap_or_default(),
-                runtime_state_override: state_overrides.get(name.as_str()).copied(),
-            }
-        })
-        .collect::<Vec<_>>();
-    configs.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
-    configs
-}
-
 fn effective_runtime_config_state(
     state_overrides: &HashMap<String, RuntimeConfigState>,
     config_name: &str,
@@ -3769,7 +3734,11 @@ pub fn router(proxy: ProxyService) -> Router {
             .state
             .get_config_runtime_state_overrides(proxy.service_name)
             .await;
-        let configs = list_config_options_from_mgr(mgr, &meta_overrides, &state_overrides);
+        let configs = crate::dashboard_core::build_config_options_from_mgr(
+            mgr,
+            &meta_overrides,
+            &state_overrides,
+        );
         let default_profile =
             effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
 
@@ -3989,7 +3958,7 @@ pub fn router(proxy: ProxyService) -> Router {
             .state
             .get_config_runtime_state_overrides(proxy.service_name)
             .await;
-        Ok(Json(list_config_options_from_mgr(
+        Ok(Json(crate::dashboard_core::build_config_options_from_mgr(
             mgr,
             &meta_overrides,
             &state_overrides,

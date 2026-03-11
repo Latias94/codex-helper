@@ -14,7 +14,8 @@ use crate::config::{
     ProxyConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
 };
 use crate::dashboard_core::{
-    ApiV1Snapshot, ConfigOption, ControlProfileOption, WindowStats, build_dashboard_snapshot,
+    ApiV1Snapshot, ConfigOption, ControlProfileOption, WindowStats, build_config_options_from_mgr,
+    build_dashboard_snapshot,
 };
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_port_for_proxy_port,
@@ -2042,34 +2043,7 @@ fn list_configs_from_cfg(
         "claude" => &cfg.claude,
         _ => &cfg.codex,
     };
-    let mut out = mgr
-        .configs
-        .iter()
-        .map(|(name, c)| {
-            let (enabled_override, level_override) = meta_overrides
-                .get(name.as_str())
-                .copied()
-                .unwrap_or((None, None));
-            let configured_level = c.level.clamp(1, 10);
-            ConfigOption {
-                name: name.clone(),
-                alias: c.alias.clone(),
-                enabled: enabled_override.unwrap_or(c.enabled),
-                level: level_override.unwrap_or(configured_level).clamp(1, 10),
-                configured_enabled: c.enabled,
-                configured_level,
-                runtime_enabled_override: enabled_override,
-                runtime_level_override: level_override.map(|level| level.clamp(1, 10)),
-                runtime_state: state_overrides
-                    .get(name.as_str())
-                    .copied()
-                    .unwrap_or_default(),
-                runtime_state_override: state_overrides.get(name.as_str()).copied(),
-            }
-        })
-        .collect::<Vec<_>>();
-    out.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
-    out
+    build_config_options_from_mgr(mgr, &meta_overrides, &state_overrides)
 }
 
 fn list_profiles_from_cfg(

@@ -2,6 +2,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::RuntimeConfigState;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCatalogKind {
+    #[default]
+    ImplicitAny,
+    Declared,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ConfigCapabilitySummary {
+    #[serde(default)]
+    pub model_catalog_kind: ModelCatalogKind,
+    #[serde(default)]
+    pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub supports_service_tier: CapabilitySupport,
+    #[serde(default)]
+    pub supports_reasoning_effort: CapabilitySupport,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigOption {
     pub name: String,
@@ -23,6 +52,8 @@ pub struct ConfigOption {
     pub runtime_state: RuntimeConfigState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_state_override: Option<RuntimeConfigState>,
+    #[serde(default)]
+    pub capabilities: ConfigCapabilitySummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
