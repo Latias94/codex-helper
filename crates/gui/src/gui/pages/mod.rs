@@ -31,6 +31,7 @@ pub use history::HistoryViewState;
 pub enum Page {
     Setup,
     Overview,
+    Stations,
     Doctor,
     Config,
     Sessions,
@@ -45,6 +46,7 @@ pub struct ViewState {
     pub requested_page: Option<Page>,
     pub setup: SetupViewState,
     pub overview: OverviewViewState,
+    pub stations: StationsViewState,
     pub doctor: DoctorViewState,
     pub sessions: SessionsViewState,
     pub requests: RequestsViewState,
@@ -55,7 +57,14 @@ pub struct ViewState {
 #[derive(Debug, Default)]
 pub struct OverviewViewState {
     pub new_routing_profile_name: String,
-    pub active_config_selected: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct StationsViewState {
+    pub search: String,
+    pub enabled_only: bool,
+    pub overrides_only: bool,
+    pub selected_name: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -198,6 +207,7 @@ pub fn nav(ui: &mut egui::Ui, lang: Language, current: &mut Page) {
         let items = [
             (Page::Setup, pick(lang, "快速设置", "Setup")),
             (Page::Overview, pick(lang, "总览", "Overview")),
+            (Page::Stations, pick(lang, "站点", "Stations")),
             (Page::Doctor, pick(lang, "诊断", "Doctor")),
             (Page::Config, pick(lang, "配置", "Config")),
             (Page::Sessions, pick(lang, "会话", "Sessions")),
@@ -219,6 +229,7 @@ pub fn render(ui: &mut egui::Ui, page: Page, ctx: &mut PageCtx<'_>) {
     match page {
         Page::Setup => render_setup(ui, ctx),
         Page::Overview => render_overview(ui, ctx),
+        Page::Stations => render_stations(ui, ctx),
         Page::Doctor => render_doctor(ui, ctx),
         Page::Config => render_config(ui, ctx),
         Page::Sessions => render_sessions(ui, ctx),
@@ -859,7 +870,6 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     let mut action_scan_local_proxies = false;
     let mut action_attach_discovered: Option<DiscoveredProxy> = None;
-    let mut action_save_active_config: Option<(String, String)> = None;
 
     // Sync defaults from GUI config (so Settings changes take effect without restart).
     // Avoid overriding the UI state while running/attached.
@@ -1145,356 +1155,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ui.separator();
         render_routing_presets(ui, ctx);
 
-        if let Some(snapshot) = ctx.proxy.snapshot() {
-            let (runtime_config_health, runtime_lb_view) = match ctx.proxy.kind() {
-                ProxyModeKind::Running => {
-                    if let Some(r) = ctx.proxy.running() {
-                        (r.config_health.clone(), r.lb_view.clone())
-                    } else {
-                        (HashMap::new(), HashMap::new())
-                    }
-                }
-                ProxyModeKind::Attached => {
-                    if let Some(att) = ctx.proxy.attached() {
-                        (att.config_health.clone(), att.lb_view.clone())
-                    } else {
-                        (HashMap::new(), HashMap::new())
-                    }
-                }
-                _ => (HashMap::new(), HashMap::new()),
-            };
-
-            ui.add_space(8.0);
-            ui.separator();
-            ui.label(pick(
-                ctx.lang,
-                "路由（全局覆盖）",
-                "Routing (global override)",
-            ));
-
-            if snapshot.supports_v1 && !snapshot.configs.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.label(pick(ctx.lang, "固定站点", "Pinned station"));
-                    let global = snapshot.global_override.clone();
-                    let mut selected = global.clone();
-                    egui::ComboBox::from_id_salt("overview_global_cfg_override")
-                        .selected_text(match selected.as_deref() {
-                            Some(v) => v.to_string(),
-                            None => pick(ctx.lang, "<自动>", "<auto>").to_string(),
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut selected,
-                                None,
-                                pick(ctx.lang, "<自动>", "<auto>"),
-                            );
-                            for cfg in snapshot.configs.iter().filter(|c| c.enabled) {
-                                let label = match cfg.alias.as_deref() {
-                                    Some(a) if !a.trim().is_empty() => {
-                                        format!("{} ({a})", cfg.name)
-                                    }
-                                    _ => cfg.name.clone(),
-                                };
-                                ui.selectable_value(&mut selected, Some(cfg.name.clone()), label);
-                            }
-                        });
-
-                    if selected != global {
-                        match ctx.proxy.apply_global_config_override(ctx.rt, selected) {
-                            Ok(()) => {
-                                *ctx.last_info =
-                                    Some(pick(ctx.lang, "已应用全局覆盖", "Applied").to_string());
-                            }
-                            Err(e) => {
-                                *ctx.last_error =
-                                    Some(format!("apply global override failed: {e}"));
-                            }
-                        }
-                    }
-
-                    if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
-                        if let Err(e) = ctx.proxy.apply_global_config_override(ctx.rt, None) {
-                            *ctx.last_error = Some(format!("clear failed: {e}"));
-                        } else {
-                            *ctx.last_info =
-                                Some(pick(ctx.lang, "已清除全局覆盖", "Cleared").to_string());
-                        }
-                    }
-                });
-            } else if !snapshot.supports_v1 {
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 120, 120),
-                    pick(
-                        ctx.lang,
-                        "当前代理未启用 API v1：全局覆盖不可用。",
-                        "This proxy has no API v1: global override disabled.",
-                    ),
-                );
-            }
-
-            if !snapshot.configs.is_empty() {
-                ui.add_space(8.0);
-                ui.separator();
-                ui.label(pick(ctx.lang, "站点运行时控制", "Station runtime control"));
-
-                egui::ScrollArea::vertical()
-                    .id_salt("overview_runtime_station_scroll")
-                    .max_height(220.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("overview_runtime_station_grid")
-                            .striped(true)
-                            .show(ui, |ui| {
-                                ui.label(pick(ctx.lang, "站点", "Station"));
-                                ui.label(pick(ctx.lang, "状态", "State"));
-                                ui.label(pick(ctx.lang, "启用", "Enabled"));
-                                ui.label(pick(ctx.lang, "等级", "Level"));
-                                ui.label(pick(ctx.lang, "能力", "Capabilities"));
-                                ui.label(pick(ctx.lang, "健康", "Health"));
-                                ui.label(pick(ctx.lang, "熔断/冷却", "Breaker"));
-                                ui.label(pick(ctx.lang, "来源", "Source"));
-                                ui.label("");
-                                ui.end_row();
-
-                                for cfg in snapshot.configs.iter() {
-                                    let label = match cfg.alias.as_deref() {
-                                        Some(alias) if !alias.trim().is_empty() => {
-                                            format!("{} ({alias})", cfg.name)
-                                        }
-                                        _ => cfg.name.clone(),
-                                    };
-                                    let health_label =
-                                        format_runtime_config_health(runtime_config_health.get(&cfg.name));
-                                    let breaker_label =
-                                        format_runtime_lb_summary(runtime_lb_view.get(&cfg.name));
-                                    let source_label =
-                                        format_runtime_config_source(ctx.lang, cfg);
-                                    let capability_label = format_runtime_config_capability_label(
-                                        ctx.lang,
-                                        &cfg.capabilities,
-                                    );
-                                    let capability_hover =
-                                        runtime_config_capability_hover_text(
-                                            ctx.lang,
-                                            &cfg.capabilities,
-                                        );
-                                    let mut runtime_state = cfg.runtime_state;
-
-                                    ui.label(label);
-
-                                    ui.add_enabled_ui(
-                                        snapshot.supports_config_runtime_override,
-                                        |ui| {
-                                            egui::ComboBox::from_id_salt((
-                                                "overview_runtime_station_state",
-                                                cfg.name.as_str(),
-                                            ))
-                                            .selected_text(runtime_config_state_label(
-                                                ctx.lang,
-                                                runtime_state,
-                                            ))
-                                            .show_ui(ui, |ui| {
-                                                for candidate in [
-                                                    RuntimeConfigState::Normal,
-                                                    RuntimeConfigState::Draining,
-                                                    RuntimeConfigState::BreakerOpen,
-                                                ] {
-                                                    ui.selectable_value(
-                                                        &mut runtime_state,
-                                                        candidate,
-                                                        runtime_config_state_label(
-                                                            ctx.lang,
-                                                            candidate,
-                                                        ),
-                                                    );
-                                                }
-                                            });
-                                        },
-                                    );
-                                    if runtime_state != cfg.runtime_state
-                                        && snapshot.supports_config_runtime_override
-                                    {
-                                        match ctx.proxy.set_runtime_config_meta(
-                                            ctx.rt,
-                                            cfg.name.clone(),
-                                            None,
-                                            None,
-                                            Some(Some(runtime_state)),
-                                        ) {
-                                            Ok(()) => {
-                                                ctx.proxy.refresh_current_if_due(
-                                                    ctx.rt,
-                                                    std::time::Duration::from_secs(0),
-                                                );
-                                                *ctx.last_info = Some(
-                                                    pick(
-                                                        ctx.lang,
-                                                        "已应用站点运行时状态",
-                                                        "Runtime station state updated",
-                                                    )
-                                                    .to_string(),
-                                                );
-                                            }
-                                            Err(e) => {
-                                                *ctx.last_error = Some(format!(
-                                                    "apply runtime state failed: {e}"
-                                                ));
-                                            }
-                                        }
-                                    }
-
-                                    let mut enabled = cfg.enabled;
-                                    if ui
-                                        .add_enabled(
-                                            snapshot.supports_config_runtime_override,
-                                            egui::Checkbox::without_text(&mut enabled),
-                                        )
-                                        .changed()
-                                    {
-                                        match ctx.proxy.set_runtime_config_meta(
-                                            ctx.rt,
-                                            cfg.name.clone(),
-                                            Some(Some(enabled)),
-                                            None,
-                                            None,
-                                        ) {
-                                            Ok(()) => {
-                                                ctx.proxy.refresh_current_if_due(
-                                                    ctx.rt,
-                                                    std::time::Duration::from_secs(0),
-                                                );
-                                                *ctx.last_info = Some(
-                                                    pick(
-                                                        ctx.lang,
-                                                        "已应用站点运行时开关",
-                                                        "Runtime station enabled updated",
-                                                    )
-                                                    .to_string(),
-                                                );
-                                            }
-                                            Err(e) => {
-                                                *ctx.last_error = Some(format!(
-                                                    "apply runtime enabled failed: {e}"
-                                                ));
-                                            }
-                                        }
-                                    }
-
-                                    let mut level = cfg.level.clamp(1, 10);
-                                    ui.add_enabled_ui(
-                                        snapshot.supports_config_runtime_override,
-                                        |ui| {
-                                            egui::ComboBox::from_id_salt((
-                                                "overview_runtime_station_level",
-                                                cfg.name.as_str(),
-                                            ))
-                                            .selected_text(level.to_string())
-                                            .show_ui(ui, |ui| {
-                                                for candidate in 1u8..=10 {
-                                                    ui.selectable_value(
-                                                        &mut level,
-                                                        candidate,
-                                                        candidate.to_string(),
-                                                    );
-                                                }
-                                            });
-                                        },
-                                    );
-                                    if level != cfg.level && snapshot.supports_config_runtime_override {
-                                        match ctx.proxy.set_runtime_config_meta(
-                                            ctx.rt,
-                                            cfg.name.clone(),
-                                            None,
-                                            Some(Some(level)),
-                                            None,
-                                        ) {
-                                            Ok(()) => {
-                                                ctx.proxy.refresh_current_if_due(
-                                                    ctx.rt,
-                                                    std::time::Duration::from_secs(0),
-                                                );
-                                                *ctx.last_info = Some(
-                                                    pick(
-                                                        ctx.lang,
-                                                        "已应用站点运行时等级",
-                                                        "Runtime station level updated",
-                                                    )
-                                                    .to_string(),
-                                                );
-                                            }
-                                            Err(e) => {
-                                                *ctx.last_error = Some(format!(
-                                                    "apply runtime level failed: {e}"
-                                                ));
-                                            }
-                                        }
-                                    }
-
-                                    ui.small(capability_label).on_hover_text(capability_hover);
-                                    ui.label(health_label);
-                                    ui.label(breaker_label);
-                                    ui.label(source_label);
-
-                                    let has_override = cfg.runtime_enabled_override.is_some()
-                                        || cfg.runtime_level_override.is_some()
-                                        || cfg.runtime_state_override.is_some();
-                                    if ui
-                                        .add_enabled(
-                                            snapshot.supports_config_runtime_override && has_override,
-                                            egui::Button::new(pick(ctx.lang, "重置", "Reset")),
-                                        )
-                                        .clicked()
-                                    {
-                                        match ctx.proxy.set_runtime_config_meta(
-                                            ctx.rt,
-                                            cfg.name.clone(),
-                                            cfg.runtime_enabled_override.map(|_| None),
-                                            cfg.runtime_level_override.map(|_| None),
-                                            cfg.runtime_state_override.map(|_| None),
-                                        ) {
-                                            Ok(()) => {
-                                                ctx.proxy.refresh_current_if_due(
-                                                    ctx.rt,
-                                                    std::time::Duration::from_secs(0),
-                                                );
-                                                *ctx.last_info = Some(
-                                                    pick(
-                                                        ctx.lang,
-                                                        "已清除站点运行时覆盖",
-                                                        "Runtime station override cleared",
-                                                    )
-                                                    .to_string(),
-                                                );
-                                            }
-                                            Err(e) => {
-                                                *ctx.last_error = Some(format!(
-                                                    "clear runtime station override failed: {e}"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                    });
-
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 120, 120),
-                    if snapshot.supports_config_runtime_override {
-                        pick(
-                            ctx.lang,
-                            "说明：这里修改的是运行时站点状态，不会写入配置文件；重启代理后会回到配置文件值。",
-                            "Note: this only changes runtime station state and won't write config files.",
-                        )
-                    } else {
-                        pick(
-                            ctx.lang,
-                            "当前代理不支持运行时站点控制；这里只显示只读状态。",
-                            "Current proxy does not support runtime station control; read-only view only.",
-                        )
-                    },
-                );
-            }
-        }
+        render_overview_station_summary(ui, ctx);
     });
 
     match ctx.proxy.kind() {
@@ -1557,101 +1218,23 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     active_display
                 ));
 
-                // Quick "provider" switch: persist `active` to disk + reload runtime.
-                let mgr = match r.service_name {
-                    "claude" => &r.cfg.claude,
-                    _ => &r.cfg.codex,
-                };
-                let mut names = mgr.configs.keys().cloned().collect::<Vec<_>>();
-                names.sort_by(|a, b| {
-                    let la = mgr.configs.get(a).map(|c| c.level).unwrap_or(1);
-                    let lb = mgr.configs.get(b).map(|c| c.level).unwrap_or(1);
-                    la.cmp(&lb).then_with(|| a.cmp(b))
-                });
-
-                if !names.is_empty() {
-                    let current_active = active_name
-                        .clone()
-                        .or(active_fallback.clone())
-                        .or_else(|| names.first().cloned());
-                    if ctx
-                        .view
-                        .overview
-                        .active_config_selected
-                        .as_ref()
-                        .is_none_or(|n| !names.iter().any(|x| x == n))
-                    {
-                        ctx.view.overview.active_config_selected = current_active.clone();
-                    }
-
-                    let mut apply_active = false;
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(pick(
-                            ctx.lang,
-                            "默认站点(active)",
-                            "Default station (active)",
-                        ));
-                        egui::ComboBox::from_id_salt("overview_active_config_select")
-                            .selected_text(
-                                ctx.view
-                                    .overview
-                                    .active_config_selected
-                                    .as_deref()
-                                    .unwrap_or_else(|| pick(ctx.lang, "<无>", "<none>")),
-                            )
-                            .show_ui(ui, |ui| {
-                                for name in names.iter() {
-                                    let label = mgr
-                                        .configs
-                                        .get(name)
-                                        .map(|c| {
-                                            let alias = c.alias.as_deref().unwrap_or("").trim();
-                                            if alias.is_empty() {
-                                                format!("L{} {name}", c.level.clamp(1, 10))
-                                            } else {
-                                                format!(
-                                                    "L{} {name} ({alias})",
-                                                    c.level.clamp(1, 10)
-                                                )
-                                            }
-                                        })
-                                        .unwrap_or_else(|| name.clone());
-                                    ui.selectable_value(
-                                        &mut ctx.view.overview.active_config_selected,
-                                        Some(name.clone()),
-                                        label,
-                                    );
-                                }
-                            });
-
-                        if ui
-                            .button(pick(ctx.lang, "保存并应用", "Save & apply"))
-                            .clicked()
-                        {
-                            apply_active = true;
-                        }
-                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
                     ui.colored_label(
                         egui::Color32::from_rgb(120, 120, 120),
                         pick(
                             ctx.lang,
-                            "说明：这会修改本机配置中的 active_station/active，并立即重载代理运行态。",
-                            "Note: This writes local active_station/active and reloads proxy runtime.",
+                            "默认 active_station / global pin / drain / breaker 已移到 Stations 页集中操作。",
+                            "Default active_station / global pin / drain / breaker now live in the Stations page.",
                         ),
                     );
-
-                    if apply_active {
-                        let Some(name) = ctx.view.overview.active_config_selected.clone() else {
-                            *ctx.last_error = Some(
-                                pick(ctx.lang, "请选择一个站点", "Select a station").to_string(),
-                            );
-                            return;
-                        };
-                        action_save_active_config =
-                            Some((r.service_name.to_string(), name.to_string()));
+                    if ui
+                        .button(pick(ctx.lang, "打开 Stations 页", "Open Stations page"))
+                        .clicked()
+                    {
+                        ctx.view.requested_page = Some(Page::Stations);
                     }
-                }
+                });
 
                 let warnings =
                     crate::config::model_routing_warnings(r.cfg.as_ref(), r.service_name);
@@ -1732,37 +1315,6 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         "Tip: attached mode won't change your local config file, but runtime controls above can still act on the remote proxy process when supported.",
                     ),
                 );
-            }
-        }
-    }
-
-    if let Some((svc, name)) = action_save_active_config.take() {
-        let save_res = ctx.rt.block_on(async {
-            let mut cfg = crate::config::load_config().await?;
-            let mgr = match svc.as_str() {
-                "claude" => &mut cfg.claude,
-                _ => &mut cfg.codex,
-            };
-            mgr.active = Some(name.clone());
-            crate::config::save_config(&cfg).await?;
-            Ok::<(), anyhow::Error>(())
-        });
-        match save_res {
-            Ok(()) => {
-                let new_path = crate::config::config_file_path();
-                if let Ok(t) = std::fs::read_to_string(&new_path) {
-                    *ctx.proxy_config_text = t;
-                }
-                if let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt) {
-                    *ctx.last_error = Some(format!("reload runtime failed: {e}"));
-                } else {
-                    *ctx.last_info = Some(
-                        pick(ctx.lang, "已保存并应用 active", "Active saved & applied").to_string(),
-                    );
-                }
-            }
-            Err(e) => {
-                *ctx.last_error = Some(format!("save active failed: {e}"));
             }
         }
     }
@@ -1869,6 +1421,885 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ctx.proxy.clear_port_in_use_modal();
         }
     }
+}
+
+fn render_overview_station_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
+    let Some(snapshot) = ctx.proxy.snapshot() else {
+        return;
+    };
+    if snapshot.configs.is_empty() {
+        return;
+    }
+
+    let runtime_maps = runtime_station_maps(ctx.proxy);
+    let override_count = snapshot
+        .configs
+        .iter()
+        .filter(|cfg| {
+            cfg.runtime_enabled_override.is_some()
+                || cfg.runtime_level_override.is_some()
+                || cfg.runtime_state_override.is_some()
+        })
+        .count();
+    let health_count = runtime_maps.config_health.len();
+    let active_station = current_runtime_active_station(ctx.proxy);
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(pick(ctx.lang, "站点控制摘要", "Stations summary"));
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "{}: {}",
+            pick(ctx.lang, "站点数", "Stations"),
+            snapshot.configs.len()
+        ));
+        ui.label(format!(
+            "{}: {}",
+            pick(ctx.lang, "健康记录", "Health records"),
+            health_count
+        ));
+        ui.label(format!(
+            "{}: {}",
+            pick(ctx.lang, "运行时覆盖", "Runtime overrides"),
+            override_count
+        ));
+        if ui
+            .button(pick(ctx.lang, "打开 Stations 页", "Open Stations page"))
+            .clicked()
+        {
+            ctx.view.requested_page = Some(Page::Stations);
+        }
+    });
+    ui.label(format!(
+        "{}: {}",
+        pick(ctx.lang, "全局站点覆盖", "Global pinned station"),
+        snapshot
+            .global_override
+            .as_deref()
+            .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
+    ));
+    ui.label(format!(
+        "{}: {}",
+        pick(ctx.lang, "当前 active_station", "Current active_station"),
+        active_station.as_deref().unwrap_or_else(|| pick(
+            ctx.lang,
+            "<未知/仅本机可见>",
+            "<unknown/local-only>"
+        ))
+    ));
+    ui.colored_label(
+        egui::Color32::from_rgb(120, 120, 120),
+        pick(
+            ctx.lang,
+            "更细的 quick switch、drain、breaker、健康检查已经移到单独的 Stations 页。",
+            "Detailed quick switch, drain, breaker, and health controls now live in the dedicated Stations page.",
+        ),
+    );
+}
+
+fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
+    ui.heading(pick(ctx.lang, "站点", "Stations"));
+    ui.label(pick(
+        ctx.lang,
+        "面向 operator 的运行态站点面板：在这里集中查看站点能力、健康、熔断/冷却状态，并执行 quick switch 与运行时控制。",
+        "Operator-focused runtime station panel: inspect station capabilities, health, breaker/cooldown state, and perform quick switch plus runtime control here.",
+    ));
+
+    let Some(snapshot) = ctx.proxy.snapshot() else {
+        ui.add_space(8.0);
+        ui.label(pick(
+            ctx.lang,
+            "当前没有运行中的本地代理，也没有附着到远端代理。请先在“总览”页启动或附着。",
+            "No running or attached proxy is available. Start or attach one from Overview first.",
+        ));
+        if ui
+            .button(pick(ctx.lang, "前往总览", "Go to Overview"))
+            .clicked()
+        {
+            ctx.view.requested_page = Some(Page::Overview);
+        }
+        return;
+    };
+
+    if snapshot.configs.is_empty() {
+        ui.add_space(8.0);
+        ui.label(pick(
+            ctx.lang,
+            "当前运行态没有可见站点。你可以先去“配置”页或原始配置文件里定义 station/provider。",
+            "No stations are visible in the current runtime. Define stations/providers in Config first.",
+        ));
+        ui.horizontal(|ui| {
+            if ui
+                .button(pick(ctx.lang, "前往配置页", "Open Config page"))
+                .clicked()
+            {
+                ctx.view.requested_page = Some(Page::Config);
+            }
+            if ui
+                .button(pick(ctx.lang, "返回总览", "Back to Overview"))
+                .clicked()
+            {
+                ctx.view.requested_page = Some(Page::Overview);
+            }
+        });
+        return;
+    }
+
+    let runtime_maps = runtime_station_maps(ctx.proxy);
+    let active_station = current_runtime_active_station(ctx.proxy);
+    let mut stations = snapshot.configs.clone();
+    stations.sort_by(|a, b| {
+        a.level
+            .clamp(1, 10)
+            .cmp(&b.level.clamp(1, 10))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let search_query = ctx.view.stations.search.trim().to_ascii_lowercase();
+    let enabled_only = ctx.view.stations.enabled_only;
+    let overrides_only = ctx.view.stations.overrides_only;
+    let filtered = stations
+        .into_iter()
+        .filter(|cfg| {
+            if enabled_only && !cfg.enabled {
+                return false;
+            }
+            if overrides_only
+                && cfg.runtime_enabled_override.is_none()
+                && cfg.runtime_level_override.is_none()
+                && cfg.runtime_state_override.is_none()
+            {
+                return false;
+            }
+            if search_query.is_empty() {
+                return true;
+            }
+            let alias = cfg.alias.as_deref().unwrap_or("");
+            let capability = format_runtime_config_capability_label(ctx.lang, &cfg.capabilities);
+            let haystack = format!(
+                "{} {} {} {}",
+                cfg.name.to_ascii_lowercase(),
+                alias.to_ascii_lowercase(),
+                format_runtime_station_health_status(
+                    runtime_maps.config_health.get(cfg.name.as_str()),
+                    runtime_maps.health_checks.get(cfg.name.as_str())
+                )
+                .to_ascii_lowercase(),
+                capability.to_ascii_lowercase(),
+            );
+            haystack.contains(search_query.as_str())
+        })
+        .collect::<Vec<_>>();
+
+    if ctx
+        .view
+        .stations
+        .selected_name
+        .as_ref()
+        .is_none_or(|name| !filtered.iter().any(|cfg| cfg.name == *name))
+    {
+        ctx.view.stations.selected_name = filtered.first().map(|cfg| cfg.name.clone());
+    }
+    let mut selected_name = ctx.view.stations.selected_name.clone();
+
+    ui.add_space(8.0);
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "模式", "Mode"),
+                match snapshot.kind {
+                    ProxyModeKind::Running => pick(ctx.lang, "本地运行", "Running"),
+                    ProxyModeKind::Attached => pick(ctx.lang, "远端附着", "Attached"),
+                    ProxyModeKind::Starting => pick(ctx.lang, "启动中", "Starting"),
+                    ProxyModeKind::Stopped => pick(ctx.lang, "停止", "Stopped"),
+                }
+            ));
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "服务", "Service"),
+                snapshot
+                    .service_name
+                    .as_deref()
+                    .unwrap_or_else(|| pick(ctx.lang, "-", "-"))
+            ));
+            if let Some(base_url) = snapshot.base_url.as_deref() {
+                ui.label(format!("base: {}", shorten_middle(base_url, 56)));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "全局站点覆盖", "Global pinned station"),
+                snapshot
+                    .global_override
+                    .as_deref()
+                    .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
+            ));
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "当前 active_station", "Current active_station"),
+                active_station
+                    .as_deref()
+                    .unwrap_or_else(|| pick(ctx.lang, "<未知/仅本机可见>", "<unknown/local-only>"))
+            ));
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "默认 profile", "Default profile"),
+                snapshot
+                    .default_profile
+                    .as_deref()
+                    .unwrap_or_else(|| pick(ctx.lang, "<无>", "<none>"))
+            ));
+        });
+        ui.horizontal(|ui| {
+            if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+            }
+            if ui
+                .button(pick(ctx.lang, "重载代理运行态", "Reload proxy runtime"))
+                .clicked()
+            {
+                if let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt) {
+                    *ctx.last_error = Some(format!("reload runtime failed: {e}"));
+                } else {
+                    *ctx.last_info = Some(pick(ctx.lang, "已重载", "Reloaded").to_string());
+                }
+            }
+            if ui
+                .button(pick(ctx.lang, "打开配置页", "Open Config page"))
+                .clicked()
+            {
+                ctx.view.requested_page = Some(Page::Config);
+            }
+            if ui
+                .button(pick(ctx.lang, "回到总览", "Back to Overview"))
+                .clicked()
+            {
+                ctx.view.requested_page = Some(Page::Overview);
+            }
+        });
+        ui.colored_label(
+            egui::Color32::from_rgb(120, 120, 120),
+            if matches!(snapshot.kind, ProxyModeKind::Attached) {
+                pick(
+                    ctx.lang,
+                    "附着模式下，global pin / runtime 覆盖会直接作用到远端代理；保存 active_station 仍然只对本机配置文件有意义。",
+                    "In attached mode, global pin and runtime overrides act on the remote proxy; persisting active_station still only makes sense for the local config file.",
+                )
+            } else {
+                pick(
+                    ctx.lang,
+                    "这里的 global pin 是运行时覆盖；“保存为默认 active_station”才会写回本机配置文件。",
+                    "Global pin here is runtime-only; only 'save as default active_station' writes back to the local config file.",
+                )
+            },
+        );
+    });
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(pick(ctx.lang, "搜索", "Search"));
+        ui.add_sized(
+            [320.0, 20.0],
+            egui::TextEdit::singleline(&mut ctx.view.stations.search).hint_text(pick(
+                ctx.lang,
+                "按 station / alias / health / capability 过滤…",
+                "Filter by station / alias / health / capability...",
+            )),
+        );
+        ui.checkbox(
+            &mut ctx.view.stations.enabled_only,
+            pick(ctx.lang, "仅启用", "Enabled only"),
+        );
+        ui.checkbox(
+            &mut ctx.view.stations.overrides_only,
+            pick(ctx.lang, "仅运行时覆盖", "Overrides only"),
+        );
+        if ui.button(pick(ctx.lang, "清空", "Clear")).clicked() {
+            ctx.view.stations.search.clear();
+            ctx.view.stations.enabled_only = false;
+            ctx.view.stations.overrides_only = false;
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.columns(2, |cols| {
+        cols[0].heading(pick(ctx.lang, "站点列表", "Stations"));
+        cols[0].add_space(4.0);
+        if filtered.is_empty() {
+            cols[0].label(pick(
+                ctx.lang,
+                "筛选后没有匹配站点。",
+                "No stations matched the current filters.",
+            ));
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("stations_page_list_scroll")
+                .max_height(560.0)
+                .show(&mut cols[0], |ui| {
+                    for cfg in filtered.iter() {
+                        let is_selected = selected_name.as_deref() == Some(cfg.name.as_str());
+                        let is_active = active_station.as_deref() == Some(cfg.name.as_str());
+                        let is_pinned =
+                            snapshot.global_override.as_deref() == Some(cfg.name.as_str());
+                        let health_label = format_runtime_station_health_status(
+                            runtime_maps.config_health.get(cfg.name.as_str()),
+                            runtime_maps.health_checks.get(cfg.name.as_str()),
+                        );
+                        let breaker_label =
+                            format_runtime_lb_summary(runtime_maps.lb_view.get(cfg.name.as_str()));
+
+                        let mut label = format!("L{} {}", cfg.level.clamp(1, 10), cfg.name);
+                        if let Some(alias) = cfg.alias.as_deref()
+                            && !alias.trim().is_empty()
+                        {
+                            label.push_str(&format!(" ({alias})"));
+                        }
+                        if is_active {
+                            label = format!("★ {label}");
+                        } else if is_pinned {
+                            label = format!("◆ {label}");
+                        }
+                        if !cfg.enabled {
+                            label.push_str("  [off]");
+                        }
+
+                        let capability_hover =
+                            runtime_config_capability_hover_text(ctx.lang, &cfg.capabilities);
+                        let hover = format!(
+                            "health: {health_label}\nbreaker: {breaker_label}\n{}\nsource: {}",
+                            capability_hover,
+                            format_runtime_config_source(ctx.lang, cfg)
+                        );
+                        if ui
+                            .selectable_label(is_selected, label)
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            selected_name = Some(cfg.name.clone());
+                        }
+                        ui.small(format!(
+                            "{}  |  {}",
+                            health_label,
+                            format_runtime_config_capability_label(ctx.lang, &cfg.capabilities)
+                        ));
+                        ui.add_space(4.0);
+                    }
+                });
+        }
+
+        cols[1].heading(pick(ctx.lang, "站点详情", "Station details"));
+        cols[1].add_space(4.0);
+
+        let Some(name) = selected_name.clone() else {
+            cols[1].label(pick(ctx.lang, "未选择站点。", "No station selected."));
+            return;
+        };
+        let Some(cfg) = filtered.iter().find(|cfg| cfg.name == name).cloned() else {
+            cols[1].label(pick(
+                ctx.lang,
+                "当前选中站点不在筛选结果中。",
+                "The selected station is not visible under the current filters.",
+            ));
+            return;
+        };
+
+        let health = runtime_maps.config_health.get(cfg.name.as_str());
+        let health_status = runtime_maps.health_checks.get(cfg.name.as_str());
+        let lb = runtime_maps.lb_view.get(cfg.name.as_str());
+        let referencing_profiles = snapshot
+            .profiles
+            .iter()
+            .filter(|profile| profile.station.as_deref() == Some(cfg.name.as_str()))
+            .map(|profile| format_profile_display(profile.name.as_str(), Some(profile)))
+            .collect::<Vec<_>>();
+
+        cols[1].label(format!("name: {}", cfg.name));
+        cols[1].label(format!(
+            "alias: {}",
+            cfg.alias
+                .as_deref()
+                .unwrap_or_else(|| pick(ctx.lang, "-", "-"))
+        ));
+        cols[1].label(format!(
+            "{}: {}",
+            pick(ctx.lang, "路由角色", "Routing role"),
+            if active_station.as_deref() == Some(cfg.name.as_str()) {
+                pick(ctx.lang, "当前 active_station", "current active_station")
+            } else if snapshot.global_override.as_deref() == Some(cfg.name.as_str()) {
+                pick(ctx.lang, "当前 global pin", "current global pin")
+            } else {
+                pick(ctx.lang, "普通候选", "normal candidate")
+            }
+        ));
+        cols[1].label(format!(
+            "enabled: {}  (configured: {})",
+            cfg.enabled, cfg.configured_enabled
+        ));
+        cols[1].label(format!(
+            "level: L{}  (configured: L{})",
+            cfg.level.clamp(1, 10),
+            cfg.configured_level.clamp(1, 10)
+        ));
+        cols[1].label(format!(
+            "state: {}",
+            runtime_config_state_label(ctx.lang, cfg.runtime_state)
+        ));
+        cols[1].label(format!(
+            "source: {}",
+            format_runtime_config_source(ctx.lang, &cfg)
+        ));
+        cols[1].label(format!(
+            "health: {}",
+            format_runtime_station_health_status(health, health_status)
+        ));
+        cols[1].label(format!("breaker: {}", format_runtime_lb_summary(lb)));
+        cols[1].label(format!(
+            "{}: {}",
+            pick(ctx.lang, "Profiles", "Profiles"),
+            if referencing_profiles.is_empty() {
+                pick(ctx.lang, "<无>", "<none>").to_string()
+            } else {
+                referencing_profiles.join(", ")
+            }
+        ));
+        cols[1]
+            .small(format_runtime_config_capability_label(
+                ctx.lang,
+                &cfg.capabilities,
+            ))
+            .on_hover_text(runtime_config_capability_hover_text(
+                ctx.lang,
+                &cfg.capabilities,
+            ));
+
+        if cfg.capabilities.model_catalog_kind == ModelCatalogKind::Declared
+            && !cfg.capabilities.supported_models.is_empty()
+        {
+            let preview = cfg
+                .capabilities
+                .supported_models
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>();
+            let suffix = if cfg.capabilities.supported_models.len() > preview.len() {
+                format!(
+                    " … +{}",
+                    cfg.capabilities.supported_models.len() - preview.len()
+                )
+            } else {
+                String::new()
+            };
+            cols[1].small(format!("models: {}{suffix}", preview.join(", ")));
+        }
+
+        cols[1].add_space(8.0);
+        cols[1].separator();
+        cols[1].label(pick(ctx.lang, "Quick switch", "Quick switch"));
+        cols[1].horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    snapshot.supports_v1,
+                    egui::Button::new(pick(ctx.lang, "Pin 当前站点", "Pin selected station")),
+                )
+                .clicked()
+            {
+                match ctx
+                    .proxy
+                    .apply_global_config_override(ctx.rt, Some(cfg.name.clone()))
+                {
+                    Ok(()) => {
+                        ctx.proxy
+                            .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                        *ctx.last_info = Some(
+                            pick(ctx.lang, "已应用全局站点覆盖", "Global station pin applied")
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        *ctx.last_error = Some(format!("apply global override failed: {e}"));
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    snapshot.supports_v1 && snapshot.global_override.is_some(),
+                    egui::Button::new(pick(ctx.lang, "清除 global pin", "Clear global pin")),
+                )
+                .clicked()
+            {
+                match ctx.proxy.apply_global_config_override(ctx.rt, None) {
+                    Ok(()) => {
+                        ctx.proxy
+                            .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                        *ctx.last_info = Some(
+                            pick(ctx.lang, "已清除全局覆盖", "Global pin cleared").to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        *ctx.last_error = Some(format!("clear global override failed: {e}"));
+                    }
+                }
+            }
+            let can_save_active =
+                matches!(snapshot.kind, ProxyModeKind::Running) && snapshot.service_name.is_some();
+            if ui
+                .add_enabled(
+                    can_save_active,
+                    egui::Button::new(pick(
+                        ctx.lang,
+                        "保存为默认 active_station",
+                        "Save as default active_station",
+                    )),
+                )
+                .clicked()
+                && let Some(service_name) = snapshot.service_name.as_deref()
+            {
+                match save_active_station_and_reload(ctx, service_name, cfg.name.as_str()) {
+                    Ok(()) => {
+                        *ctx.last_info = Some(
+                            pick(
+                                ctx.lang,
+                                "已保存并应用 active_station",
+                                "active_station saved & applied",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        *ctx.last_error = Some(format!("save active_station failed: {e}"));
+                    }
+                }
+            }
+        });
+
+        cols[1].add_space(8.0);
+        cols[1].separator();
+        cols[1].label(pick(ctx.lang, "运行时控制", "Runtime control"));
+        if snapshot.supports_config_runtime_override {
+            let mut runtime_state = cfg.runtime_state;
+            cols[1].horizontal(|ui| {
+                ui.label(pick(ctx.lang, "状态", "State"));
+                egui::ComboBox::from_id_salt(("stations_runtime_state", cfg.name.as_str()))
+                    .selected_text(runtime_config_state_label(ctx.lang, runtime_state))
+                    .show_ui(ui, |ui| {
+                        for candidate in [
+                            RuntimeConfigState::Normal,
+                            RuntimeConfigState::Draining,
+                            RuntimeConfigState::BreakerOpen,
+                        ] {
+                            ui.selectable_value(
+                                &mut runtime_state,
+                                candidate,
+                                runtime_config_state_label(ctx.lang, candidate),
+                            );
+                        }
+                    });
+                if runtime_state != cfg.runtime_state {
+                    match ctx.proxy.set_runtime_config_meta(
+                        ctx.rt,
+                        cfg.name.clone(),
+                        None,
+                        None,
+                        Some(Some(runtime_state)),
+                    ) {
+                        Ok(()) => {
+                            ctx.proxy
+                                .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                            *ctx.last_info = Some(
+                                pick(
+                                    ctx.lang,
+                                    "已应用站点运行时状态",
+                                    "Runtime station state updated",
+                                )
+                                .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            *ctx.last_error = Some(format!("apply runtime state failed: {e}"));
+                        }
+                    }
+                }
+            });
+
+            cols[1].horizontal(|ui| {
+                let mut enabled = cfg.enabled;
+                if ui
+                    .checkbox(&mut enabled, pick(ctx.lang, "启用", "Enabled"))
+                    .changed()
+                {
+                    match ctx.proxy.set_runtime_config_meta(
+                        ctx.rt,
+                        cfg.name.clone(),
+                        Some(Some(enabled)),
+                        None,
+                        None,
+                    ) {
+                        Ok(()) => {
+                            ctx.proxy
+                                .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                            *ctx.last_info = Some(
+                                pick(
+                                    ctx.lang,
+                                    "已应用站点运行时开关",
+                                    "Runtime station enabled updated",
+                                )
+                                .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            *ctx.last_error = Some(format!("apply runtime enabled failed: {e}"));
+                        }
+                    }
+                }
+
+                let mut level = cfg.level.clamp(1, 10);
+                ui.label(pick(ctx.lang, "等级", "Level"));
+                egui::ComboBox::from_id_salt(("stations_runtime_level", cfg.name.as_str()))
+                    .selected_text(level.to_string())
+                    .show_ui(ui, |ui| {
+                        for candidate in 1u8..=10 {
+                            ui.selectable_value(&mut level, candidate, candidate.to_string());
+                        }
+                    });
+                if level != cfg.level {
+                    match ctx.proxy.set_runtime_config_meta(
+                        ctx.rt,
+                        cfg.name.clone(),
+                        None,
+                        Some(Some(level)),
+                        None,
+                    ) {
+                        Ok(()) => {
+                            ctx.proxy
+                                .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                            *ctx.last_info = Some(
+                                pick(
+                                    ctx.lang,
+                                    "已应用站点运行时等级",
+                                    "Runtime station level updated",
+                                )
+                                .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            *ctx.last_error = Some(format!("apply runtime level failed: {e}"));
+                        }
+                    }
+                }
+            });
+
+            let has_override = cfg.runtime_enabled_override.is_some()
+                || cfg.runtime_level_override.is_some()
+                || cfg.runtime_state_override.is_some();
+            if cols[1]
+                .add_enabled(
+                    has_override,
+                    egui::Button::new(pick(ctx.lang, "清除运行时覆盖", "Clear runtime override")),
+                )
+                .clicked()
+            {
+                match ctx.proxy.set_runtime_config_meta(
+                    ctx.rt,
+                    cfg.name.clone(),
+                    cfg.runtime_enabled_override.map(|_| None),
+                    cfg.runtime_level_override.map(|_| None),
+                    cfg.runtime_state_override.map(|_| None),
+                ) {
+                    Ok(()) => {
+                        ctx.proxy
+                            .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                        *ctx.last_info = Some(
+                            pick(
+                                ctx.lang,
+                                "已清除站点运行时覆盖",
+                                "Runtime station override cleared",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        *ctx.last_error =
+                            Some(format!("clear runtime station override failed: {e}"));
+                    }
+                }
+            }
+        } else {
+            cols[1].colored_label(
+                egui::Color32::from_rgb(120, 120, 120),
+                pick(
+                    ctx.lang,
+                    "当前代理不支持运行时站点控制；此区域只读。",
+                    "This proxy does not support runtime station control; this area is read-only.",
+                ),
+            );
+        }
+
+        cols[1].add_space(8.0);
+        cols[1].separator();
+        cols[1].label(pick(ctx.lang, "健康检查", "Health check"));
+        if let Some(status) = health_status {
+            cols[1].label(format!(
+                "status: {}/{} ok={} err={} cancel={} done={}",
+                status.completed,
+                status.total,
+                status.ok,
+                status.err,
+                status.cancel_requested,
+                status.done
+            ));
+            if let Some(err) = status.last_error.as_deref() {
+                cols[1].colored_label(egui::Color32::from_rgb(200, 120, 40), err);
+            }
+        } else {
+            cols[1].label(pick(ctx.lang, "(无状态)", "(no status)"));
+        }
+        cols[1].horizontal(|ui| {
+            if ui
+                .button(pick(ctx.lang, "检查当前", "Check selected"))
+                .clicked()
+            {
+                match ctx
+                    .proxy
+                    .start_health_checks(ctx.rt, false, vec![cfg.name.clone()])
+                {
+                    Ok(()) => {
+                        ctx.proxy
+                            .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                        *ctx.last_info = Some(
+                            pick(ctx.lang, "已开始健康检查", "Health check started").to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        *ctx.last_error = Some(format!("health check start failed: {e}"));
+                    }
+                }
+            }
+            if ui
+                .button(pick(ctx.lang, "取消当前", "Cancel selected"))
+                .clicked()
+            {
+                match ctx
+                    .proxy
+                    .cancel_health_checks(ctx.rt, false, vec![cfg.name.clone()])
+                {
+                    Ok(()) => {
+                        ctx.proxy
+                            .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                        *ctx.last_info =
+                            Some(pick(ctx.lang, "已请求取消", "Cancel requested").to_string());
+                    }
+                    Err(e) => {
+                        *ctx.last_error = Some(format!("health check cancel failed: {e}"));
+                    }
+                }
+            }
+            if ui.button(pick(ctx.lang, "检查全部", "Check all")).clicked() {
+                match ctx.proxy.start_health_checks(ctx.rt, true, Vec::new()) {
+                    Ok(()) => {
+                        ctx.proxy
+                            .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                        *ctx.last_info = Some(
+                            pick(ctx.lang, "已开始健康检查", "Health check started").to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        *ctx.last_error = Some(format!("health check start failed: {e}"));
+                    }
+                }
+            }
+            if ui
+                .button(pick(ctx.lang, "取消全部", "Cancel all"))
+                .clicked()
+            {
+                match ctx.proxy.cancel_health_checks(ctx.rt, true, Vec::new()) {
+                    Ok(()) => {
+                        ctx.proxy
+                            .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                        *ctx.last_info =
+                            Some(pick(ctx.lang, "已请求取消", "Cancel requested").to_string());
+                    }
+                    Err(e) => {
+                        *ctx.last_error = Some(format!("health check cancel failed: {e}"));
+                    }
+                }
+            }
+        });
+
+        if let Some(health) = health {
+            cols[1].add_space(6.0);
+            cols[1].label(format!(
+                "{}: {}  upstreams={}",
+                pick(ctx.lang, "最近检查", "Last checked"),
+                health.checked_at_ms,
+                health.upstreams.len()
+            ));
+            egui::ScrollArea::vertical()
+                .id_salt(("stations_health_upstreams_scroll", cfg.name.as_str()))
+                .max_height(140.0)
+                .show(&mut cols[1], |ui| {
+                    let max = 12usize;
+                    for up in health.upstreams.iter().rev().take(max) {
+                        let ok = up.ok.map(|v| if v { "ok" } else { "err" }).unwrap_or("-");
+                        let sc = up
+                            .status_code
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        let lat = up
+                            .latency_ms
+                            .map(|v| format!("{v}ms"))
+                            .unwrap_or_else(|| "-".to_string());
+                        let err = up
+                            .error
+                            .as_deref()
+                            .map(|e| shorten(e, 60))
+                            .unwrap_or_else(|| "-".to_string());
+                        ui.label(format!(
+                            "{ok} {sc} {lat}  {}  {err}",
+                            shorten_middle(&up.base_url, 52)
+                        ));
+                    }
+                    if health.upstreams.len() > max {
+                        ui.label(format!("… +{} more", health.upstreams.len() - max));
+                    }
+                });
+        }
+
+        cols[1].add_space(8.0);
+        cols[1].separator();
+        cols[1].label(pick(ctx.lang, "熔断/冷却细节", "Breaker/cooldown details"));
+        if let Some(lb) = lb {
+            if lb.upstreams.is_empty() {
+                cols[1].label(pick(ctx.lang, "(无上游状态)", "(no upstream state)"));
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt(("stations_lb_scroll", cfg.name.as_str()))
+                    .max_height(120.0)
+                    .show(&mut cols[1], |ui| {
+                        for (idx, upstream) in lb.upstreams.iter().enumerate() {
+                            let cooldown = upstream
+                                .cooldown_remaining_secs
+                                .map(|secs| format!("{secs}s"))
+                                .unwrap_or_else(|| "-".to_string());
+                            ui.label(format!(
+                                "#{} fail={} cooldown={} quota_exhausted={}",
+                                idx, upstream.failure_count, cooldown, upstream.usage_exhausted
+                            ));
+                        }
+                        if let Some(last_good_index) = lb.last_good_index {
+                            ui.small(format!("last_good_index={last_good_index}"));
+                        }
+                    });
+            }
+        } else {
+            cols[1].label(pick(ctx.lang, "(无熔断数据)", "(no breaker data)"));
+        }
+    });
+
+    ctx.view.stations.selected_name = selected_name;
 }
 
 fn render_routing_presets(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
@@ -6156,7 +6587,97 @@ fn usage_line(usage: &UsageMetrics) -> String {
     )
 }
 
-fn format_runtime_config_health(health: Option<&ConfigHealth>) -> String {
+#[derive(Debug, Default)]
+struct RuntimeStationMaps {
+    config_health: HashMap<String, ConfigHealth>,
+    health_checks: HashMap<String, HealthCheckStatus>,
+    lb_view: HashMap<String, LbConfigView>,
+}
+
+fn runtime_station_maps(proxy: &super::proxy_control::ProxyController) -> RuntimeStationMaps {
+    match proxy.kind() {
+        ProxyModeKind::Running => proxy
+            .running()
+            .map(|running| RuntimeStationMaps {
+                config_health: running.config_health.clone(),
+                health_checks: running.health_checks.clone(),
+                lb_view: running.lb_view.clone(),
+            })
+            .unwrap_or_default(),
+        ProxyModeKind::Attached => proxy
+            .attached()
+            .map(|attached| RuntimeStationMaps {
+                config_health: attached.config_health.clone(),
+                health_checks: attached.health_checks.clone(),
+                lb_view: attached.lb_view.clone(),
+            })
+            .unwrap_or_default(),
+        _ => RuntimeStationMaps::default(),
+    }
+}
+
+fn current_runtime_active_station(proxy: &super::proxy_control::ProxyController) -> Option<String> {
+    let running = proxy.running()?;
+    let active_name = match running.service_name {
+        "claude" => running.cfg.claude.active.clone(),
+        _ => running.cfg.codex.active.clone(),
+    };
+    let active_fallback = match running.service_name {
+        "claude" => running
+            .cfg
+            .claude
+            .active_config()
+            .map(|cfg| cfg.name.clone()),
+        _ => running
+            .cfg
+            .codex
+            .active_config()
+            .map(|cfg| cfg.name.clone()),
+    };
+    active_name.or(active_fallback)
+}
+
+fn save_active_station_and_reload(
+    ctx: &mut PageCtx<'_>,
+    service_name: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    ctx.rt.block_on(async {
+        let mut cfg = crate::config::load_config().await?;
+        let mgr = match service_name {
+            "claude" => &mut cfg.claude,
+            _ => &mut cfg.codex,
+        };
+        mgr.active = Some(name.to_string());
+        crate::config::save_config(&cfg).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let new_path = crate::config::config_file_path();
+    if let Ok(text) = std::fs::read_to_string(&new_path) {
+        *ctx.proxy_config_text = text;
+    }
+    ctx.proxy.reload_runtime_config(ctx.rt)?;
+    Ok(())
+}
+
+fn format_runtime_station_health_status(
+    health: Option<&ConfigHealth>,
+    status: Option<&HealthCheckStatus>,
+) -> String {
+    if let Some(status) = status {
+        if !status.done {
+            return if status.cancel_requested {
+                format!("cancel {}/{}", status.completed, status.total.max(1))
+            } else {
+                format!("run {}/{}", status.completed, status.total.max(1))
+            };
+        }
+        if status.canceled {
+            return "canceled".to_string();
+        }
+    }
+
     let Some(health) = health else {
         return "-".to_string();
     };
@@ -6168,7 +6689,29 @@ fn format_runtime_config_health(health: Option<&ConfigHealth>) -> String {
         .iter()
         .filter(|upstream| upstream.ok == Some(true))
         .count();
-    format!("{ok}/{} @{}", health.upstreams.len(), health.checked_at_ms)
+    let best_ms = health
+        .upstreams
+        .iter()
+        .filter(|upstream| upstream.ok == Some(true))
+        .filter_map(|upstream| upstream.latency_ms)
+        .min();
+    if ok > 0 {
+        if let Some(latency_ms) = best_ms {
+            format!("{ok}/{} {latency_ms}ms", health.upstreams.len())
+        } else {
+            format!("{ok}/{} ok", health.upstreams.len())
+        }
+    } else {
+        let code = health
+            .upstreams
+            .iter()
+            .filter_map(|upstream| upstream.status_code)
+            .next();
+        match code {
+            Some(code) => format!("err {code}"),
+            None => "err".to_string(),
+        }
+    }
 }
 
 fn format_runtime_lb_summary(lb: Option<&LbConfigView>) -> String {
