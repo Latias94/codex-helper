@@ -504,7 +504,7 @@ fn build_observed_history_summaries(
 fn refresh_history_sessions_with_fallback(
     ctx: &mut PageCtx<'_>,
     scope: HistoryScope,
-    remote_attached: bool,
+    observed_fallback_supported: bool,
 ) -> anyhow::Result<(Vec<SessionSummary>, HistoryDataSource)> {
     let recent_since_minutes = ctx.view.history.recent_since_minutes;
     let recent_limit = ctx.view.history.recent_limit;
@@ -525,7 +525,7 @@ fn refresh_history_sessions_with_fallback(
 
     match local_result {
         Ok(mut list) => {
-            if !list.is_empty() || !remote_attached {
+            if !list.is_empty() || !observed_fallback_supported {
                 sort_session_summaries_by_mtime_desc(&mut list);
                 return Ok((list, HistoryDataSource::LocalFiles));
             }
@@ -543,6 +543,9 @@ fn refresh_history_sessions_with_fallback(
             }
         }
         Err(err) => {
+            if !observed_fallback_supported {
+                return Err(err);
+            }
             let observed = ctx
                 .proxy
                 .snapshot()
@@ -608,6 +611,16 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     poll_transcript_loader(ctx);
     let mut refresh_requested = false;
     let remote_attached = remote_attached_proxy_active(ctx.proxy);
+    let (shared_observed_history_available, attached_host_local_history_advertised) = ctx
+        .proxy
+        .snapshot()
+        .map(|snapshot| {
+            (
+                snapshot.shared_capabilities.session_observability,
+                snapshot.host_local_capabilities.session_history,
+            )
+        })
+        .unwrap_or((false, false));
 
     ui.heading(pick(ctx.lang, "历史会话", "History"));
     ui.label(pick(
@@ -620,17 +633,40 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ui.group(|ui| {
             ui.colored_label(
                 egui::Color32::from_rgb(200, 120, 40),
+                if shared_observed_history_available {
+                    pick(
+                        ctx.lang,
+                        "当前附着的是远端代理。本页优先读取这台设备自己的 ~/.codex/sessions；若本机 history 为空，会退到共享观测摘要，但那仍不代表远端 host 的原始 transcript 文件。",
+                        "A remote proxy is attached. This page prefers this device's ~/.codex/sessions; if local history is empty it falls back to shared observed summaries, which still do not represent the remote host's raw transcript files.",
+                    )
+                } else {
+                    pick(
+                        ctx.lang,
+                        "当前附着的是远端代理。本页仍只会读取这台设备自己的 ~/.codex/sessions；当前附着目标未声明共享 history 观测能力，因此无法退到共享观测摘要。",
+                        "A remote proxy is attached. This page still reads only this device's ~/.codex/sessions; the attached target does not advertise shared history observability, so observed fallback is unavailable.",
+                    )
+                },
+            );
+            ui.small(if shared_observed_history_available {
                 pick(
                     ctx.lang,
-                    "当前附着的是远端代理。本页优先读取这台设备自己的 ~/.codex/sessions；若本机 history 为空，会退到共享观测摘要，但那仍不代表远端 host 的原始 transcript 文件。",
-                    "A remote proxy is attached. This page prefers this device's ~/.codex/sessions; if local history is empty it falls back to shared observed summaries, which still do not represent the remote host's raw transcript files.",
-                ),
-            );
-            ui.small(pick(
-                ctx.lang,
-                "当本机 history 为空时，本页会退到共享观测摘要；更完整的 session / route / request 观测仍建议看 Sessions 或 Requests。",
-                "When local history is empty, this page falls back to shared observed summaries; use Sessions or Requests for fuller session/route/request observability.",
-            ));
+                    "当本机 history 为空时，本页会退到共享观测摘要；更完整的 session / route / request 观测仍建议看 Sessions 或 Requests。",
+                    "When local history is empty, this page falls back to shared observed summaries; use Sessions or Requests for fuller session/route/request observability.",
+                )
+            } else {
+                pick(
+                    ctx.lang,
+                    "当前模式下 host-local transcript / cwd 仍不会直接映射到远端机器；如需更完整的共享观测，请查看 Sessions 或 Requests。",
+                    "In this mode, host-local transcript/cwd access still does not map to the remote machine; use Sessions or Requests for fuller shared observability.",
+                )
+            });
+            if attached_host_local_history_advertised {
+                ui.small(pick(
+                    ctx.lang,
+                    "附着目标声明其代理主机本地具备 session history 能力，但那不会自动映射为当前设备可读的 transcript 文件。",
+                    "The attached target advertises host-local session history on its own machine, but that does not automatically map to transcript files readable from this device.",
+                ));
+            }
             ui.horizontal(|ui| {
                 if ui.button(pick(ctx.lang, "转到会话", "Go to Sessions")).clicked() {
                     ctx.view.requested_page = Some(Page::Sessions);
@@ -984,7 +1020,11 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         if refresh_requested || ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
             let scope = ctx.view.history.scope;
-            match refresh_history_sessions_with_fallback(ctx, scope, remote_attached) {
+            match refresh_history_sessions_with_fallback(
+                ctx,
+                scope,
+                shared_observed_history_available,
+            ) {
                 Ok((list, data_source)) => {
                     ctx.view.history.sessions_all = list;
                     ctx.view.history.data_source = data_source;
@@ -2052,7 +2092,10 @@ fn start_transcript_load(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dashboard_core::{ConfigOption, ControlProfileOption, WindowStats};
+    use crate::dashboard_core::{
+        ConfigOption, ControlProfileOption, HostLocalControlPlaneCapabilities,
+        SharedControlPlaneCapabilities, WindowStats,
+    };
     use crate::state::{FinishedRequest, ResolvedRouteValue, RouteValueSource, UsageRollupView};
 
     fn empty_snapshot() -> GuiRuntimeSnapshot {
@@ -2080,6 +2123,15 @@ mod tests {
             supports_v1: true,
             supports_default_profile_override: true,
             supports_config_runtime_override: true,
+            shared_capabilities: SharedControlPlaneCapabilities {
+                session_observability: true,
+                request_history: true,
+            },
+            host_local_capabilities: HostLocalControlPlaneCapabilities {
+                session_history: true,
+                transcript_read: true,
+                cwd_enrichment: true,
+            },
         }
     }
 

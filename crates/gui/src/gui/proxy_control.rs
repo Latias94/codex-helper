@@ -14,8 +14,9 @@ use crate::config::{
     ProxyConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
 };
 use crate::dashboard_core::{
-    ApiV1Snapshot, ConfigOption, ControlProfileOption, WindowStats, build_config_options_from_mgr,
-    build_dashboard_snapshot,
+    ApiV1Capabilities, ApiV1Snapshot, ConfigOption, ControlProfileOption,
+    HostLocalControlPlaneCapabilities, SharedControlPlaneCapabilities, WindowStats,
+    build_config_options_from_mgr, build_dashboard_snapshot,
 };
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_port_for_proxy_port,
@@ -94,6 +95,8 @@ pub struct AttachedStatus {
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
     pub supports_station_api: bool,
+    pub shared_capabilities: SharedControlPlaneCapabilities,
+    pub host_local_capabilities: HostLocalControlPlaneCapabilities,
 }
 
 impl AttachedStatus {
@@ -129,6 +132,8 @@ impl AttachedStatus {
             supports_default_profile_override: false,
             supports_config_runtime_override: false,
             supports_station_api: false,
+            shared_capabilities: SharedControlPlaneCapabilities::default(),
+            host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
         }
     }
 }
@@ -158,6 +163,8 @@ pub struct GuiRuntimeSnapshot {
     pub supports_v1: bool,
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
+    pub shared_capabilities: SharedControlPlaneCapabilities,
+    pub host_local_capabilities: HostLocalControlPlaneCapabilities,
 }
 
 pub struct RunningProxy {
@@ -220,6 +227,8 @@ pub struct DiscoveredProxy {
     pub endpoints: Vec<String>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub last_error: Option<String>,
+    pub shared_capabilities: SharedControlPlaneCapabilities,
+    pub host_local_capabilities: HostLocalControlPlaneCapabilities,
 }
 
 struct PortInUseModal {
@@ -234,6 +243,22 @@ fn attached_management_candidates(att: &AttachedStatus) -> Vec<String> {
         out.push(att.base_url.clone());
     }
     out
+}
+
+fn local_shared_control_plane_capabilities() -> SharedControlPlaneCapabilities {
+    SharedControlPlaneCapabilities {
+        session_observability: true,
+        request_history: true,
+    }
+}
+
+fn local_host_local_control_plane_capabilities() -> HostLocalControlPlaneCapabilities {
+    let host_local_history = crate::config::codex_sessions_dir().is_dir();
+    HostLocalControlPlaneCapabilities {
+        session_history: host_local_history,
+        transcript_read: host_local_history,
+        cwd_enrichment: host_local_history,
+    }
 }
 
 impl ProxyController {
@@ -332,6 +357,8 @@ impl ProxyController {
                 supports_v1: true,
                 supports_default_profile_override: true,
                 supports_config_runtime_override: true,
+                shared_capabilities: local_shared_control_plane_capabilities(),
+                host_local_capabilities: local_host_local_control_plane_capabilities(),
             }),
             ProxyMode::Attached(a) => Some(GuiRuntimeSnapshot {
                 kind: ProxyModeKind::Attached,
@@ -357,6 +384,8 @@ impl ProxyController {
                 supports_v1: a.api_version == Some(1),
                 supports_default_profile_override: a.supports_default_profile_override,
                 supports_config_runtime_override: a.supports_config_runtime_override,
+                shared_capabilities: a.shared_capabilities.clone(),
+                host_local_capabilities: a.host_local_capabilities.clone(),
             }),
             _ => None,
         }
@@ -417,7 +446,15 @@ impl ProxyController {
     pub fn request_attach_with_admin_base(&mut self, port: u16, admin_base_url: Option<String>) {
         let mut attached = AttachedStatus::new(port);
         if let Some(admin_base_url) = admin_base_url {
-            attached.admin_base_url = admin_base_url;
+            attached.admin_base_url = admin_base_url.clone();
+            if let Some(discovered) = self.discovered.iter().find(|candidate| {
+                candidate.port == port && candidate.admin_base_url == admin_base_url
+            }) {
+                attached.api_version = discovered.api_version;
+                attached.service_name = discovered.service_name.clone();
+                attached.shared_capabilities = discovered.shared_capabilities.clone();
+                attached.host_local_capabilities = discovered.host_local_capabilities.clone();
+            }
         }
         self.mode = ProxyMode::Attached(attached);
         self.last_start_error = None;
@@ -429,14 +466,6 @@ impl ProxyController {
         rt: &tokio::runtime::Runtime,
         ports: std::ops::RangeInclusive<u16>,
     ) -> anyhow::Result<()> {
-        #[derive(Debug, serde::Deserialize)]
-        struct ApiCapabilities {
-            api_version: u32,
-            service_name: String,
-            #[serde(default)]
-            endpoints: Vec<String>,
-        }
-
         #[derive(Debug, serde::Deserialize)]
         struct RuntimeConfigStatus {
             loaded_at_ms: u64,
@@ -467,7 +496,7 @@ impl ProxyController {
             let admin_base_url = local_admin_base_url_for_proxy_port(port);
             let timeout = Duration::from_millis(250);
 
-            let caps = get_json::<ApiCapabilities>(
+            let caps = get_json::<ApiV1Capabilities>(
                 &client,
                 format!("{admin_base_url}/__codex_helper/api/v1/capabilities"),
                 timeout,
@@ -492,10 +521,12 @@ impl ProxyController {
                     endpoints: c.endpoints,
                     runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
                     last_error: None,
+                    shared_capabilities: c.shared_capabilities,
+                    host_local_capabilities: c.host_local_capabilities,
                 });
             }
 
-            let caps = get_json::<ApiCapabilities>(
+            let caps = get_json::<ApiV1Capabilities>(
                 &client,
                 format!("{base_url}/__codex_helper/api/v1/capabilities"),
                 timeout,
@@ -520,6 +551,8 @@ impl ProxyController {
                     endpoints: c.endpoints,
                     runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
                     last_error: None,
+                    shared_capabilities: c.shared_capabilities,
+                    host_local_capabilities: c.host_local_capabilities,
                 });
             }
 
@@ -536,7 +569,7 @@ impl ProxyController {
                 && discovered_admin_base != admin_base_url
                 && discovered_admin_base != base_url
             {
-                let caps = get_json::<ApiCapabilities>(
+                let caps = get_json::<ApiV1Capabilities>(
                     &client,
                     format!("{discovered_admin_base}/__codex_helper/api/v1/capabilities"),
                     timeout,
@@ -561,6 +594,8 @@ impl ProxyController {
                         endpoints: c.endpoints,
                         runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
                         last_error: None,
+                        shared_capabilities: c.shared_capabilities,
+                        host_local_capabilities: c.host_local_capabilities,
                     });
                 }
 
@@ -580,6 +615,8 @@ impl ProxyController {
                         endpoints: Vec::new(),
                         runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                         last_error: None,
+                        shared_capabilities: SharedControlPlaneCapabilities::default(),
+                        host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
                     });
                 }
             }
@@ -611,6 +648,8 @@ impl ProxyController {
                     endpoints: Vec::new(),
                     runtime_loaded_at_ms: Some(r.loaded_at_ms),
                     last_error: None,
+                    shared_capabilities: SharedControlPlaneCapabilities::default(),
+                    host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
                 }),
                 Err(_) => None,
             }
@@ -665,14 +704,6 @@ impl ProxyController {
         let client = self.http_client.clone();
         let fut = async move {
             #[derive(Debug, serde::Deserialize)]
-            struct ApiCapabilities {
-                api_version: u32,
-                service_name: String,
-                #[serde(default)]
-                endpoints: Vec<String>,
-            }
-
-            #[derive(Debug, serde::Deserialize)]
             struct RuntimeConfigStatus {
                 loaded_at_ms: u64,
                 #[serde(default)]
@@ -723,6 +754,8 @@ impl ProxyController {
                 supports_default_profile_override: bool,
                 supports_config_runtime_override: bool,
                 supports_station_api: bool,
+                shared_capabilities: SharedControlPlaneCapabilities,
+                host_local_capabilities: HostLocalControlPlaneCapabilities,
             }
 
             async fn refresh_from_base(
@@ -730,7 +763,7 @@ impl ProxyController {
                 base: &str,
                 req_timeout: Duration,
             ) -> anyhow::Result<RefreshResult> {
-                let caps = get_json::<ApiCapabilities>(
+                let caps = get_json::<ApiV1Capabilities>(
                     client,
                     format!("{base}/__codex_helper/api/v1/capabilities"),
                     req_timeout,
@@ -740,19 +773,24 @@ impl ProxyController {
 
                 if supports_v1 {
                     let caps = caps.expect("checked ok above");
-                    let supports_snapshot = caps
-                        .endpoints
+                    let ApiV1Capabilities {
+                        api_version,
+                        service_name,
+                        endpoints,
+                        shared_capabilities,
+                        host_local_capabilities,
+                    } = caps;
+                    let supports_snapshot = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/snapshot");
-                    let supports_default_profile_override = caps
-                        .endpoints
+                    let supports_default_profile_override = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/profiles/default");
-                    let supports_station_api = caps.endpoints.iter().any(|e| {
+                    let supports_station_api = endpoints.iter().any(|e| {
                         e == "/__codex_helper/api/v1/stations"
                             || e == "/__codex_helper/api/v1/stations/runtime"
                     });
-                    let supports_config_runtime_override = caps.endpoints.iter().any(|e| {
+                    let supports_config_runtime_override = endpoints.iter().any(|e| {
                         e == "/__codex_helper/api/v1/configs/runtime"
                             || e == "/__codex_helper/api/v1/stations/runtime"
                     });
@@ -810,6 +848,8 @@ impl ProxyController {
                             supports_default_profile_override,
                             supports_config_runtime_override,
                             supports_station_api,
+                            shared_capabilities,
+                            host_local_capabilities,
                         });
                     }
 
@@ -881,16 +921,13 @@ impl ProxyController {
                         ),
                     )?;
 
-                    let supports_session_model = caps
-                        .endpoints
+                    let supports_session_model = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/overrides/session/model");
-                    let supports_session_service_tier = caps
-                        .endpoints
+                    let supports_session_service_tier = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/overrides/session/service-tier");
-                    let supports_profiles = caps
-                        .endpoints
+                    let supports_profiles = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/profiles");
 
@@ -945,8 +982,8 @@ impl ProxyController {
 
                     return Ok(RefreshResult {
                         management_base_url: base.to_string(),
-                        api_version: Some(caps.api_version),
-                        service_name: Some(caps.service_name),
+                        api_version: Some(api_version),
+                        service_name: Some(service_name),
                         active,
                         recent,
                         session_cards: Vec::new(),
@@ -970,6 +1007,8 @@ impl ProxyController {
                         supports_default_profile_override,
                         supports_config_runtime_override,
                         supports_station_api,
+                        shared_capabilities,
+                        host_local_capabilities,
                     });
                 }
 
@@ -1027,6 +1066,8 @@ impl ProxyController {
                     supports_default_profile_override: false,
                     supports_config_runtime_override: false,
                     supports_station_api: false,
+                    shared_capabilities: SharedControlPlaneCapabilities::default(),
+                    host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
                 })
             }
 
@@ -1072,6 +1113,8 @@ impl ProxyController {
                         result.supports_default_profile_override;
                     att.supports_config_runtime_override = result.supports_config_runtime_override;
                     att.supports_station_api = result.supports_station_api;
+                    att.shared_capabilities = result.shared_capabilities;
+                    att.host_local_capabilities = result.host_local_capabilities;
                 }
             }
             Err(e) => {
@@ -2237,6 +2280,15 @@ mod tests {
         let caps = serde_json::json!({
             "api_version": 1,
             "service_name": "codex",
+            "shared_capabilities": {
+                "session_observability": true,
+                "request_history": true
+            },
+            "host_local_capabilities": {
+                "session_history": true,
+                "transcript_read": true,
+                "cwd_enrichment": true
+            },
             "endpoints": [
                 "/__codex_helper/api/v1/snapshot",
                 "/__codex_helper/api/v1/stations",
@@ -2277,6 +2329,11 @@ mod tests {
         let snapshot = controller.snapshot().expect("attached snapshot");
         assert_eq!(snapshot.configs.len(), 1);
         assert_eq!(snapshot.configs[0].name, "preferred-station");
+        assert!(snapshot.shared_capabilities.session_observability);
+        assert!(snapshot.shared_capabilities.request_history);
+        assert!(snapshot.host_local_capabilities.session_history);
+        assert!(snapshot.host_local_capabilities.transcript_read);
+        assert!(snapshot.host_local_capabilities.cwd_enrichment);
         assert!(
             controller
                 .attached()
@@ -2379,6 +2436,14 @@ mod tests {
         let snapshot = controller.snapshot().expect("legacy attached snapshot");
         assert_eq!(snapshot.configs.len(), 1);
         assert_eq!(snapshot.configs[0].name, "legacy-only");
+        assert_eq!(
+            snapshot.shared_capabilities,
+            SharedControlPlaneCapabilities::default()
+        );
+        assert_eq!(
+            snapshot.host_local_capabilities,
+            HostLocalControlPlaneCapabilities::default()
+        );
         assert!(
             !controller
                 .attached()

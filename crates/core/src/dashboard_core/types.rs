@@ -2,6 +2,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::RuntimeConfigState;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SharedControlPlaneCapabilities {
+    #[serde(default)]
+    pub session_observability: bool,
+    #[serde(default)]
+    pub request_history: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostLocalControlPlaneCapabilities {
+    #[serde(default)]
+    pub session_history: bool,
+    #[serde(default)]
+    pub transcript_read: bool,
+    #[serde(default)]
+    pub cwd_enrichment: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ApiV1Capabilities {
+    #[serde(default)]
+    pub api_version: u32,
+    #[serde(default)]
+    pub service_name: String,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    #[serde(default)]
+    pub shared_capabilities: SharedControlPlaneCapabilities,
+    #[serde(default)]
+    pub host_local_capabilities: HostLocalControlPlaneCapabilities,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilitySupport {

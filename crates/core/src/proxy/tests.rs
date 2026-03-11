@@ -254,6 +254,27 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles/default"))
     }));
+    let host_local_history = crate::config::codex_sessions_dir().is_dir();
+    assert_eq!(
+        caps["shared_capabilities"]["session_observability"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["shared_capabilities"]["request_history"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["host_local_capabilities"]["session_history"].as_bool(),
+        Some(host_local_history)
+    );
+    assert_eq!(
+        caps["host_local_capabilities"]["transcript_read"].as_bool(),
+        Some(host_local_history)
+    );
+    assert_eq!(
+        caps["host_local_capabilities"]["cwd_enrichment"].as_bool(),
+        Some(host_local_history)
+    );
 
     let set_global = client
         .post(format!(

@@ -114,8 +114,8 @@
 ## WS5 - LAN-shared Product Shape
 
 - [ ] CP-501 Add explicit control-plane mode docs for central relay deployment
-- [ ] CP-502 Mark local-only features in API capability response
-- [ ] CP-503 Separate "host-local history available" from global session observability
+- [x] CP-502 Mark local-only features in API capability response
+- [x] CP-503 Separate "host-local history available" from global session observability
 - [ ] CP-504 Add lightweight access control for non-loopback use
 - [ ] CP-505 Add device/client identity field in observed session records
 - [ ] CP-506 Add operator-facing warning when a requested local-only feature is unavailable remotely

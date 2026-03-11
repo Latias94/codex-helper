@@ -23,6 +23,9 @@ mod stream;
 mod tests;
 
 use crate::config::{ProxyConfig, RetryStrategy, ServiceConfigManager};
+use crate::dashboard_core::{
+    ApiV1Capabilities, HostLocalControlPlaneCapabilities, SharedControlPlaneCapabilities,
+};
 use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
@@ -3233,16 +3236,16 @@ pub fn router(proxy: ProxyService) -> Router {
     }
 
     #[derive(serde::Serialize)]
-    struct ApiCapabilities {
-        api_version: u32,
-        service_name: &'static str,
-        endpoints: Vec<&'static str>,
-    }
-
-    #[derive(serde::Serialize)]
     struct ReloadResult {
         reloaded: bool,
         status: RuntimeConfigStatus,
+    }
+
+    fn host_local_session_history_available() -> bool {
+        let sessions_dir = crate::config::codex_sessions_dir();
+        std::fs::metadata(sessions_dir)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false)
     }
 
     async fn runtime_config_status(
@@ -3719,10 +3722,11 @@ pub fn router(proxy: ProxyService) -> Router {
 
     async fn api_capabilities(
         proxy: ProxyService,
-    ) -> Result<Json<ApiCapabilities>, (StatusCode, String)> {
-        Ok(Json(ApiCapabilities {
+    ) -> Result<Json<ApiV1Capabilities>, (StatusCode, String)> {
+        let host_local_history = host_local_session_history_available();
+        Ok(Json(ApiV1Capabilities {
             api_version: 1,
-            service_name: proxy.service_name,
+            service_name: proxy.service_name.to_string(),
             endpoints: vec![
                 "/__codex_helper/api/v1/capabilities",
                 "/__codex_helper/api/v1/snapshot",
@@ -3748,7 +3752,19 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/overrides/global-config",
                 "/__codex_helper/api/v1/healthcheck/start",
                 "/__codex_helper/api/v1/healthcheck/cancel",
-            ],
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            shared_capabilities: SharedControlPlaneCapabilities {
+                session_observability: true,
+                request_history: true,
+            },
+            host_local_capabilities: HostLocalControlPlaneCapabilities {
+                session_history: host_local_history,
+                transcript_read: host_local_history,
+                cwd_enrichment: host_local_history,
+            },
         }))
     }
 

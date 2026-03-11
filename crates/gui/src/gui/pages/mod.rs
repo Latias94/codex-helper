@@ -245,12 +245,22 @@ pub(super) fn remote_attached_proxy_active(proxy: &super::proxy_control::ProxyCo
         && !host_local_session_features_available(proxy)
 }
 
+fn attached_host_local_session_features_available(
+    admin_base_url: &str,
+    host_local_session_history: bool,
+) -> bool {
+    management_base_url_is_loopback(admin_base_url) && host_local_session_history
+}
+
 pub(super) fn host_local_session_features_available(
     proxy: &super::proxy_control::ProxyController,
 ) -> bool {
     match proxy.kind() {
         super::proxy_control::ProxyModeKind::Attached => proxy.attached().is_some_and(|attached| {
-            management_base_url_is_loopback(attached.admin_base_url.as_str())
+            attached_host_local_session_features_available(
+                attached.admin_base_url.as_str(),
+                attached.host_local_capabilities.session_history,
+            )
         }),
         _ => true,
     }
@@ -7489,21 +7499,22 @@ mod tests {
     }
 
     #[test]
-    fn host_local_session_features_follow_attached_management_base() {
-        let mut local = crate::gui::proxy_control::ProxyController::new(
-            3210,
-            crate::config::ServiceKind::Codex,
-        );
-        local.request_attach_with_admin_base(3210, Some("http://127.0.0.1:3211".to_string()));
-        assert!(host_local_session_features_available(&local));
-        assert!(!remote_attached_proxy_active(&local));
-
-        let mut remote = crate::gui::proxy_control::ProxyController::new(
-            3210,
-            crate::config::ServiceKind::Codex,
-        );
-        remote.request_attach_with_admin_base(3210, Some("http://100.79.12.5:3211".to_string()));
-        assert!(!host_local_session_features_available(&remote));
-        assert!(remote_attached_proxy_active(&remote));
+    fn attached_host_local_session_features_require_loopback_and_capability() {
+        assert!(attached_host_local_session_features_available(
+            "http://127.0.0.1:3211",
+            true,
+        ));
+        assert!(!attached_host_local_session_features_available(
+            "http://127.0.0.1:3211",
+            false,
+        ));
+        assert!(!attached_host_local_session_features_available(
+            "http://100.79.12.5:3211",
+            true,
+        ));
+        assert!(!attached_host_local_session_features_available(
+            "https://relay.example.com/admin",
+            true,
+        ));
     }
 }
