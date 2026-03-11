@@ -240,6 +240,55 @@ pub fn render(ui: &mut egui::Ui, page: Page, ctx: &mut PageCtx<'_>) {
     }
 }
 
+pub(super) fn remote_attached_proxy_active(proxy: &super::proxy_control::ProxyController) -> bool {
+    matches!(proxy.kind(), super::proxy_control::ProxyModeKind::Attached)
+        && !host_local_session_features_available(proxy)
+}
+
+pub(super) fn host_local_session_features_available(
+    proxy: &super::proxy_control::ProxyController,
+) -> bool {
+    match proxy.kind() {
+        super::proxy_control::ProxyModeKind::Attached => proxy.attached().is_some_and(|attached| {
+            management_base_url_is_loopback(attached.admin_base_url.as_str())
+        }),
+        _ => true,
+    }
+}
+
+fn management_base_url_is_loopback(base_url: &str) -> bool {
+    let input = base_url.trim();
+    if input.is_empty() {
+        return false;
+    }
+
+    let after_scheme = input
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(input);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
+        .trim();
+    if authority.is_empty() {
+        return false;
+    }
+
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']').map(|(host, _)| host).unwrap_or(rest)
+    } else if let Some((host, _)) = authority.rsplit_once(':') {
+        host
+    } else {
+        authority
+    };
+
+    matches!(
+        host.trim().to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
 fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.heading(pick(ctx.lang, "快速设置", "Setup"));
     ui.label(pick(
@@ -2703,6 +2752,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ));
         return;
     };
+    let host_local_session_features = host_local_session_features_available(ctx.proxy);
 
     let last_error = snapshot.last_error.clone();
     let active = snapshot.active.clone();
@@ -2731,6 +2781,18 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     if let Some(err) = last_error.as_deref() {
         ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
+        ui.add_space(4.0);
+    }
+
+    if remote_attached_proxy_active(ctx.proxy) {
+        ui.colored_label(
+            egui::Color32::from_rgb(200, 120, 40),
+            pick(
+                ctx.lang,
+                "当前附着的是远端代理：共享的 session 控制仍可用，但 cwd / transcript 这类 host-local 入口已按远端模式收敛。",
+                "A remote proxy is attached: shared session controls remain available, but host-local entries such as cwd/transcript are gated for remote safety.",
+            ),
+        );
         ui.add_space(4.0);
     }
 
@@ -3136,10 +3198,25 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 *ctx.last_info = Some(pick(ctx.lang, "已复制", "Copied").to_string());
             }
 
-            let can_open_cwd = row.cwd.is_some();
-            if ui
-                .add_enabled(can_open_cwd, egui::Button::new(pick(ctx.lang, "打开 cwd", "Open cwd")))
-                .clicked()
+            let can_open_cwd = row.cwd.is_some() && host_local_session_features;
+            let mut open_cwd = ui.add_enabled(
+                can_open_cwd,
+                egui::Button::new(pick(ctx.lang, "打开 cwd", "Open cwd")),
+            );
+            if row.cwd.is_none() {
+                open_cwd = open_cwd.on_disabled_hover_text(pick(
+                    ctx.lang,
+                    "当前会话没有可用 cwd。",
+                    "The current session has no cwd.",
+                ));
+            } else if !host_local_session_features {
+                open_cwd = open_cwd.on_disabled_hover_text(pick(
+                    ctx.lang,
+                    "当前附着的是远端代理；这个 cwd 来自 host-local 观测，不一定存在于这台设备上。",
+                    "A remote proxy is attached; this cwd came from host-local observation and may not exist on this device.",
+                ));
+            }
+            if open_cwd.clicked()
                 && let Some(cwd) = row.cwd.as_deref()
             {
                 let path = std::path::PathBuf::from(cwd);
@@ -3148,13 +3225,25 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
             }
 
-            let can_open_transcript = row.session_id.is_some();
-            if ui
-                .add_enabled(
-                    can_open_transcript,
-                    egui::Button::new(pick(ctx.lang, "打开对话记录", "Open transcript")),
-                )
-                .clicked()
+            let can_open_transcript = row.session_id.is_some() && host_local_session_features;
+            let mut open_transcript = ui.add_enabled(
+                can_open_transcript,
+                egui::Button::new(pick(ctx.lang, "打开对话记录", "Open transcript")),
+            );
+            if row.session_id.is_none() {
+                open_transcript = open_transcript.on_disabled_hover_text(pick(
+                    ctx.lang,
+                    "当前会话没有 session_id。",
+                    "The current session has no session_id.",
+                ));
+            } else if !host_local_session_features {
+                open_transcript = open_transcript.on_disabled_hover_text(pick(
+                    ctx.lang,
+                    "当前附着的是远端代理；GUI 无法假设这台设备能直接读取远端 host 的 ~/.codex/sessions。",
+                    "A remote proxy is attached; the GUI cannot assume this device can directly read the remote host's ~/.codex/sessions.",
+                ));
+            }
+            if open_transcript.clicked()
             {
                 let Some(sid) = row.session_id.clone() else {
                     return;
@@ -3210,6 +3299,13 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
             }
         });
+        if !host_local_session_features {
+            cols[1].small(pick(
+                ctx.lang,
+                "提示：远端附着时，cwd / transcript 入口会被禁用；请用 Sessions / Requests 查看共享观测数据。",
+                "Tip: in remote-attached mode, cwd/transcript entries are disabled; use Sessions / Requests for shared observed data.",
+            ));
+        }
 
         if let Some(status) = row.last_status {
             cols[1].label(format!("status(last): {status}"));
@@ -7360,5 +7456,35 @@ mod tests {
         assert_eq!(explanation.source_label, "未解析");
         assert!(explanation.reason.contains("vibe"));
         assert!(explanation.reason.contains("right"));
+    }
+
+    #[test]
+    fn management_base_url_loopback_detection_handles_localhosts() {
+        assert!(management_base_url_is_loopback("http://127.0.0.1:3211"));
+        assert!(management_base_url_is_loopback("http://localhost:3211"));
+        assert!(management_base_url_is_loopback("http://[::1]:3211"));
+        assert!(!management_base_url_is_loopback("http://100.79.12.5:3211"));
+        assert!(!management_base_url_is_loopback(
+            "https://relay.example.com/admin"
+        ));
+    }
+
+    #[test]
+    fn host_local_session_features_follow_attached_management_base() {
+        let mut local = crate::gui::proxy_control::ProxyController::new(
+            3210,
+            crate::config::ServiceKind::Codex,
+        );
+        local.request_attach_with_admin_base(3210, Some("http://127.0.0.1:3211".to_string()));
+        assert!(host_local_session_features_available(&local));
+        assert!(!remote_attached_proxy_active(&local));
+
+        let mut remote = crate::gui::proxy_control::ProxyController::new(
+            3210,
+            crate::config::ServiceKind::Codex,
+        );
+        remote.request_attach_with_admin_base(3210, Some("http://100.79.12.5:3211".to_string()));
+        assert!(!host_local_session_features_available(&remote));
+        assert!(remote_attached_proxy_active(&remote));
     }
 }

@@ -2,8 +2,8 @@ use eframe::egui;
 use std::collections::{HashMap, HashSet};
 
 use super::super::i18n::pick;
-use super::PageCtx;
 use super::components::{history_controls, history_sessions, history_transcript};
+use super::{Page, PageCtx, remote_attached_proxy_active};
 use super::{
     build_wt_items_from_session_summaries, history_workdir_from_cwd, now_ms, open_wt_items,
     sort_session_summaries_by_mtime_desc,
@@ -306,6 +306,7 @@ pub(in crate::gui::pages) struct TranscriptLoad {
 pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     poll_transcript_loader(ctx);
     let mut refresh_requested = false;
+    let remote_attached = remote_attached_proxy_active(ctx.proxy);
 
     ui.heading(pick(ctx.lang, "历史会话", "History"));
     ui.label(pick(
@@ -313,6 +314,32 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         "读取 Codex 的本地 sessions（~/.codex/sessions）。",
         "Reads local Codex sessions (~/.codex/sessions).",
     ));
+    if remote_attached {
+        ui.add_space(6.0);
+        ui.group(|ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 40),
+                pick(
+                    ctx.lang,
+                    "当前附着的是远端代理。本页仍然只浏览这台设备自己的 ~/.codex/sessions，不代表远端 relay 或其他设备的 host-local 会话文件。",
+                    "A remote proxy is attached. This page still browses only this device's ~/.codex/sessions and does not represent host-local session files on the remote relay or other devices.",
+                ),
+            );
+            ui.small(pick(
+                ctx.lang,
+                "共享的 session / route / request 观测请转到 Sessions 或 Requests；后续再补远端安全的历史视图。",
+                "Use Sessions or Requests for shared session/route/request observability; a remote-safe history view will be added separately.",
+            ));
+            ui.horizontal(|ui| {
+                if ui.button(pick(ctx.lang, "转到会话", "Go to Sessions")).clicked() {
+                    ctx.view.requested_page = Some(Page::Sessions);
+                }
+                if ui.button(pick(ctx.lang, "转到请求", "Go to Requests")).clicked() {
+                    ctx.view.requested_page = Some(Page::Requests);
+                }
+            });
+        });
+    }
 
     ui.add_space(6.0);
 
