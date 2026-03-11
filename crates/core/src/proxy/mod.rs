@@ -901,6 +901,13 @@ fn extract_model_from_request_body(body: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn extract_service_tier_from_request_body(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.get("service_tier")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+}
+
 fn apply_reasoning_effort_override(body: &[u8], effort: &str) -> Option<Vec<u8>> {
     let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let reasoning = v.get_mut("reasoning").and_then(|r| r.as_object_mut());
@@ -926,6 +933,15 @@ fn apply_model_override(body: &[u8], model: &str) -> Option<Vec<u8>> {
     v.as_object_mut()?.insert(
         "model".to_string(),
         serde_json::Value::String(model.to_string()),
+    );
+    serde_json::to_vec(&v).ok()
+}
+
+fn apply_service_tier_override(body: &[u8], service_tier: &str) -> Option<Vec<u8>> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.as_object_mut()?.insert(
+        "service_tier".to_string(),
+        serde_json::Value::String(service_tier.to_string()),
     );
     serde_json::to_vec(&v).ok()
 }
@@ -1032,6 +1048,14 @@ pub async fn handle_proxy(
             .state
             .touch_session_config_override(id, started_at_ms)
             .await;
+        proxy
+            .state
+            .touch_session_model_override(id, started_at_ms)
+            .await;
+        proxy
+            .state
+            .touch_session_service_tier_override(id, started_at_ms)
+            .await;
     }
 
     // Read request body and apply filters.
@@ -1096,9 +1120,7 @@ pub async fn handle_proxy(
     } else {
         None
     };
-    let effective_effort = override_effort.clone().or(original_effort.clone());
-
-    let body_for_upstream = if let Some(ref effort) = override_effort {
+    let mut body_for_upstream = if let Some(ref effort) = override_effort {
         Bytes::from(
             apply_reasoning_effort_override(&raw_body, effort)
                 .unwrap_or_else(|| raw_body.as_ref().to_vec()),
@@ -1106,7 +1128,37 @@ pub async fn handle_proxy(
     } else {
         raw_body.clone()
     };
+    let effective_effort = extract_reasoning_effort_from_request_body(body_for_upstream.as_ref())
+        .or(original_effort.clone());
+
+    let override_model = if let Some(id) = session_id.as_deref() {
+        proxy.state.get_session_model_override(id).await
+    } else {
+        None
+    };
+    if let Some(ref model) = override_model {
+        body_for_upstream = Bytes::from(
+            apply_model_override(body_for_upstream.as_ref(), model)
+                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
+        );
+    }
+
+    let original_service_tier = extract_service_tier_from_request_body(body_for_upstream.as_ref());
+    let override_service_tier = if let Some(id) = session_id.as_deref() {
+        proxy.state.get_session_service_tier_override(id).await
+    } else {
+        None
+    };
+    if let Some(ref service_tier) = override_service_tier {
+        body_for_upstream = Bytes::from(
+            apply_service_tier_override(body_for_upstream.as_ref(), service_tier)
+                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
+        );
+    }
+
     let request_model = extract_model_from_request_body(body_for_upstream.as_ref());
+    let effective_service_tier = extract_service_tier_from_request_body(body_for_upstream.as_ref())
+        .or(original_service_tier.clone());
     let request_body_len = raw_body.len();
 
     let debug_opt = http_debug_options();
@@ -1143,6 +1195,7 @@ pub async fn handle_proxy(
             cwd.clone(),
             request_model.clone(),
             effective_effort.clone(),
+            effective_service_tier.clone(),
             started_at_ms,
         )
         .await;
@@ -2922,6 +2975,18 @@ pub fn router(proxy: ProxyService) -> Router {
     }
 
     #[derive(serde::Deserialize)]
+    struct SessionModelOverrideRequest {
+        session_id: String,
+        model: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SessionServiceTierOverrideRequest {
+        session_id: String,
+        service_tier: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
     struct GlobalConfigOverrideRequest {
         config_name: Option<String>,
     }
@@ -3061,6 +3126,74 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(Json(map))
     }
 
+    async fn set_session_model_override(
+        proxy: ProxyService,
+        Json(payload): Json<SessionModelOverrideRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        if payload.session_id.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "session_id is required".to_string(),
+            ));
+        }
+        if let Some(model) = payload.model {
+            if model.trim().is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "model is empty".to_string()));
+            }
+            proxy
+                .state
+                .set_session_model_override(payload.session_id, model, now_ms())
+                .await;
+        } else {
+            proxy
+                .state
+                .clear_session_model_override(payload.session_id.as_str())
+                .await;
+        }
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn list_session_model_overrides(
+        proxy: ProxyService,
+    ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
+        let map = proxy.state.list_session_model_overrides().await;
+        Ok(Json(map))
+    }
+
+    async fn set_session_service_tier_override(
+        proxy: ProxyService,
+        Json(payload): Json<SessionServiceTierOverrideRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        if payload.session_id.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "session_id is required".to_string(),
+            ));
+        }
+        if let Some(service_tier) = payload.service_tier {
+            if service_tier.trim().is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "service_tier is empty".to_string()));
+            }
+            proxy
+                .state
+                .set_session_service_tier_override(payload.session_id, service_tier, now_ms())
+                .await;
+        } else {
+            proxy
+                .state
+                .clear_session_service_tier_override(payload.session_id.as_str())
+                .await;
+        }
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn list_session_service_tier_overrides(
+        proxy: ProxyService,
+    ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
+        let map = proxy.state.list_session_service_tier_overrides().await;
+        Ok(Json(map))
+    }
+
     async fn get_global_config_override(
         proxy: ProxyService,
     ) -> Result<Json<Option<String>>, (StatusCode, String)> {
@@ -3147,8 +3280,10 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/config/runtime",
                 "/__codex_helper/api/v1/config/reload",
                 "/__codex_helper/api/v1/configs",
+                "/__codex_helper/api/v1/overrides/session/model",
                 "/__codex_helper/api/v1/overrides/session/effort",
                 "/__codex_helper/api/v1/overrides/session/config",
+                "/__codex_helper/api/v1/overrides/session/service-tier",
                 "/__codex_helper/api/v1/overrides/global-config",
                 "/__codex_helper/api/v1/healthcheck/start",
                 "/__codex_helper/api/v1/healthcheck/cancel",
@@ -3434,6 +3569,10 @@ pub fn router(proxy: ProxyService) -> Router {
     let p24 = proxy.clone();
     let p25 = proxy.clone();
     let p26 = proxy.clone();
+    let p27 = proxy.clone();
+    let p28 = proxy.clone();
+    let p29 = proxy.clone();
+    let p30 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -3482,27 +3621,37 @@ pub fn router(proxy: ProxyService) -> Router {
             get(move || list_configs(p14.clone())),
         )
         .route(
+            "/__codex_helper/api/v1/overrides/session/model",
+            get(move || list_session_model_overrides(p15.clone()))
+                .post(move |payload| set_session_model_override(p16.clone(), payload)),
+        )
+        .route(
             "/__codex_helper/api/v1/overrides/session/effort",
-            get(move || list_session_overrides(p15.clone()))
-                .post(move |payload| set_session_override(p16.clone(), payload)),
+            get(move || list_session_overrides(p17.clone()))
+                .post(move |payload| set_session_override(p18.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/overrides/session/config",
-            get(move || list_session_config_overrides(p17.clone()))
-                .post(move |payload| set_session_config_override(p18.clone(), payload)),
+            get(move || list_session_config_overrides(p19.clone()))
+                .post(move |payload| set_session_config_override(p20.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/overrides/session/service-tier",
+            get(move || list_session_service_tier_overrides(p23.clone()))
+                .post(move |payload| set_session_service_tier_override(p24.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/overrides/global-config",
-            get(move || get_global_config_override(p19.clone()))
-                .post(move |payload| set_global_config_override(p20.clone(), payload)),
+            get(move || get_global_config_override(p27.clone()))
+                .post(move |payload| set_global_config_override(p28.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/healthcheck/start",
-            post(move |payload| start_health_checks(p23.clone(), payload)),
+            post(move |payload| start_health_checks(p29.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/healthcheck/cancel",
-            post(move |payload| cancel_health_checks(p24.clone(), payload)),
+            post(move |payload| cancel_health_checks(p30.clone(), payload)),
         )
         .route(
             "/__codex_helper/override/session",

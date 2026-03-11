@@ -18,8 +18,14 @@ pub struct DashboardSnapshot {
     #[serde(default)]
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    #[serde(default)]
+    pub session_model_overrides: HashMap<String, String>,
+    #[serde(default)]
     pub session_config_overrides: HashMap<String, String>,
+    #[serde(default)]
     pub session_effort_overrides: HashMap<String, String>,
+    #[serde(default)]
+    pub session_service_tier_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
     pub config_health: HashMap<String, ConfigHealth>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
@@ -60,8 +66,10 @@ pub async fn build_dashboard_snapshot(
         active,
         mut recent_all,
         global_override,
+        session_model,
         session_cfg,
         session_effort,
+        session_service_tier,
         session_stats,
         usage_rollup,
         config_health,
@@ -71,8 +79,10 @@ pub async fn build_dashboard_snapshot(
         state.list_active_requests(),
         state.list_recent_finished(recent_for_stats),
         state.get_global_config_override(),
+        state.list_session_model_overrides(),
         state.list_session_config_overrides(),
         state.list_session_effort_overrides(),
+        state.list_session_service_tier_overrides(),
         state.list_session_stats(),
         state.get_usage_rollup_view(service_name, 12, stats_days),
         state.get_config_health(service_name),
@@ -87,6 +97,8 @@ pub async fn build_dashboard_snapshot(
         &recent_all,
         &session_effort,
         &session_cfg,
+        &session_model,
+        &session_service_tier,
         &session_stats,
     );
 
@@ -100,8 +112,10 @@ pub async fn build_dashboard_snapshot(
         recent: recent_all,
         session_cards,
         global_override,
+        session_model_overrides: session_model,
         session_config_overrides: session_cfg,
         session_effort_overrides: session_effort,
+        session_service_tier_overrides: session_service_tier,
         session_stats,
         config_health,
         health_checks,

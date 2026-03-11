@@ -162,9 +162,12 @@ impl Default for RequestsViewState {
 #[derive(Debug, Default)]
 struct SessionOverrideEditor {
     sid: Option<String>,
+    model_override: String,
     config_override: Option<String>,
     effort_override: Option<String>,
     custom_effort: String,
+    service_tier_override: Option<String>,
+    custom_service_tier: String,
 }
 
 pub struct PageCtx<'a> {
@@ -1978,8 +1981,10 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let active = snapshot.active.clone();
     let recent = snapshot.recent.clone();
     let global_override = snapshot.global_override.clone();
+    let session_model_overrides = snapshot.session_model_overrides.clone();
     let session_effort_overrides = snapshot.session_effort_overrides.clone();
     let session_config_overrides = snapshot.session_config_overrides.clone();
+    let session_service_tier_overrides = snapshot.session_service_tier_overrides.clone();
     let session_stats = snapshot.session_stats.clone();
 
     if let Some(err) = last_error.as_deref() {
@@ -2034,8 +2039,10 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         build_session_rows(
             active,
             &recent,
+            &session_model_overrides,
             &session_effort_overrides,
             &session_config_overrides,
+            &session_service_tier_overrides,
             &session_stats,
         )
     };
@@ -2062,8 +2069,10 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 return false;
             }
             if ctx.view.sessions.overrides_only
+                && row.override_model.is_none()
                 && row.override_effort.is_none()
                 && row.override_config_name.is_none()
+                && row.override_service_tier.is_none()
             {
                 return false;
             }
@@ -2097,11 +2106,19 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     // Sync editor to the selected session, but do not clobber while editing the same session.
     if ctx.view.sessions.editor.sid != ctx.view.sessions.selected_session_id {
         ctx.view.sessions.editor.sid = ctx.view.sessions.selected_session_id.clone();
+        ctx.view.sessions.editor.model_override = selected
+            .and_then(|r| r.override_model.clone())
+            .unwrap_or_default();
         ctx.view.sessions.editor.config_override =
             selected.and_then(|r| r.override_config_name.clone());
         ctx.view.sessions.editor.effort_override = selected.and_then(|r| r.override_effort.clone());
         ctx.view.sessions.editor.custom_effort = selected
             .and_then(|r| r.override_effort.clone())
+            .unwrap_or_default();
+        ctx.view.sessions.editor.service_tier_override =
+            selected.and_then(|r| r.override_service_tier.clone());
+        ctx.view.sessions.editor.custom_service_tier = selected
+            .and_then(|r| r.override_service_tier.clone())
             .unwrap_or_default();
     }
 
@@ -2166,6 +2183,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let last_cfg = row.last_config_name.as_deref().unwrap_or("-");
         let upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
         let effort_last = row.last_reasoning_effort.as_deref().unwrap_or("-");
+        let service_tier_last = row.last_service_tier.as_deref().unwrap_or("-");
 
         cols[1].label(format!("session: {sid_full}"));
         cols[1].label(format!("cwd: {cwd_full}"));
@@ -2174,6 +2192,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].label(format!("config(last): {last_cfg}"));
         cols[1].label(format!("upstream(last): {upstream}"));
         cols[1].label(format!("effort(last): {effort_last}"));
+        cols[1].label(format!("service_tier(last): {service_tier_last}"));
 
         cols[1].horizontal(|ui| {
             let can_copy = row.session_id.is_some();
@@ -2279,11 +2298,13 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         cols[1].separator();
 
+        let override_model = row.override_model.as_deref().unwrap_or("-");
         let override_cfg = row.override_config_name.as_deref().unwrap_or("-");
         let override_eff = row.override_effort.as_deref().unwrap_or("-");
+        let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
         let global_cfg = global_override.as_deref().unwrap_or("-");
         cols[1].label(format!(
-            "{}: effort={override_eff}, cfg={override_cfg}, global={global_cfg}",
+            "{}: model={override_model}, effort={override_eff}, cfg={override_cfg}, tier={override_service_tier}, global={global_cfg}",
             pick(ctx.lang, "覆盖", "Overrides")
         ));
 
@@ -2300,6 +2321,44 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         cols[1].add_space(6.0);
         cols[1].label(pick(ctx.lang, "会话覆盖设置", "Session overrides"));
+
+        cols[1].horizontal(|ui| {
+            ui.label(pick(ctx.lang, "模型覆盖", "Model override"));
+            ui.add(
+                egui::TextEdit::singleline(&mut ctx.view.sessions.editor.model_override)
+                    .desired_width(180.0)
+                    .hint_text(pick(ctx.lang, "留空表示自动", "empty = auto")),
+            );
+
+            if ui.button(pick(ctx.lang, "应用", "Apply")).clicked() {
+                let sid = sid.clone();
+                let desired = {
+                    let v = ctx.view.sessions.editor.model_override.trim().to_string();
+                    if v.is_empty() { None } else { Some(v) }
+                };
+                if !snapshot.supports_v1 {
+                    *ctx.last_error = Some(
+                        pick(
+                            ctx.lang,
+                            "附着到的代理不支持会话模型覆盖（需要 API v1）。",
+                            "Attached proxy does not support session model override (need API v1).",
+                        )
+                        .to_string(),
+                    );
+                } else {
+                    match ctx.proxy.apply_session_model_override(ctx.rt, sid, desired) {
+                        Ok(()) => {
+                            force_refresh = true;
+                            *ctx.last_info =
+                                Some(pick(ctx.lang, "已应用覆盖", "Override applied").to_string());
+                        }
+                        Err(e) => {
+                            *ctx.last_error = Some(format!("apply override failed: {e}"));
+                        }
+                    }
+                }
+            }
+        });
 
         cols[1].horizontal(|ui| {
             ui.label(pick(ctx.lang, "固定配置", "Pinned config"));
@@ -2418,6 +2477,93 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
             }
         });
+
+        cols[1].horizontal(|ui| {
+            ui.label(pick(ctx.lang, "Fast / Service Tier", "Fast / Service tier"));
+
+            let mut choice = match ctx.view.sessions.editor.service_tier_override.as_deref() {
+                None => "auto",
+                Some("default") => "default",
+                Some("priority") => "priority",
+                Some("flex") => "flex",
+                Some(_) => "custom",
+            };
+
+            egui::ComboBox::from_id_salt(("session_service_tier_choice", sid.as_str()))
+                .selected_text(match choice {
+                    "priority" => pick(ctx.lang, "priority（fast）", "priority (fast)"),
+                    v => v,
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut choice, "auto", "auto");
+                    ui.selectable_value(&mut choice, "default", "default");
+                    ui.selectable_value(
+                        &mut choice,
+                        "priority",
+                        pick(ctx.lang, "priority（fast）", "priority (fast)"),
+                    );
+                    ui.selectable_value(&mut choice, "flex", "flex");
+                    ui.selectable_value(&mut choice, "custom", "custom");
+                });
+
+            if choice == "auto" {
+                ctx.view.sessions.editor.service_tier_override = None;
+            } else if choice != "custom" {
+                ctx.view.sessions.editor.service_tier_override = Some(choice.to_string());
+                ctx.view.sessions.editor.custom_service_tier = choice.to_string();
+            } else if ctx.view.sessions.editor.service_tier_override.is_none() {
+                ctx.view.sessions.editor.service_tier_override =
+                    Some(ctx.view.sessions.editor.custom_service_tier.clone());
+            }
+
+            ui.add(
+                egui::TextEdit::singleline(&mut ctx.view.sessions.editor.custom_service_tier)
+                    .desired_width(100.0)
+                    .hint_text(pick(ctx.lang, "自定义", "custom")),
+            );
+
+            if ui.button(pick(ctx.lang, "应用", "Apply")).clicked() {
+                let sid = sid.clone();
+                let desired = match choice {
+                    "auto" => None,
+                    "custom" => {
+                        let v = ctx
+                            .view
+                            .sessions
+                            .editor
+                            .custom_service_tier
+                            .trim()
+                            .to_string();
+                        if v.is_empty() { None } else { Some(v) }
+                    }
+                    v => Some(v.to_string()),
+                };
+                if !snapshot.supports_v1 {
+                    *ctx.last_error = Some(
+                        pick(
+                            ctx.lang,
+                            "附着到的代理不支持会话 service tier 覆盖（需要 API v1）。",
+                            "Attached proxy does not support session service tier override (need API v1).",
+                        )
+                        .to_string(),
+                    );
+                } else {
+                    match ctx
+                        .proxy
+                        .apply_session_service_tier_override(ctx.rt, sid, desired)
+                    {
+                        Ok(()) => {
+                            force_refresh = true;
+                            *ctx.last_info =
+                                Some(pick(ctx.lang, "已应用覆盖", "Override applied").to_string());
+                        }
+                        Err(e) => {
+                            *ctx.last_error = Some(format!("apply override failed: {e}"));
+                        }
+                    }
+                }
+            }
+        });
     });
 
     if force_refresh {
@@ -2434,9 +2580,14 @@ fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
         row.session_id.as_deref(),
         row.cwd.as_deref(),
         row.last_model.as_deref(),
+        row.last_service_tier.as_deref(),
         row.last_provider_id.as_deref(),
         row.last_config_name.as_deref(),
         row.last_upstream_base_url.as_deref(),
+        row.override_model.as_deref(),
+        row.override_effort.as_deref(),
+        row.override_config_name.as_deref(),
+        row.override_service_tier.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -2658,6 +2809,10 @@ fn render_requests(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         cols[1].label(format!(
             "effort: {}",
             r.reasoning_effort.as_deref().unwrap_or("-")
+        ));
+        cols[1].label(format!(
+            "service_tier: {}",
+            r.service_tier.as_deref().unwrap_or("-")
         ));
         cols[1].label(format!(
             "config: {}",
@@ -4053,6 +4208,7 @@ struct SessionRow {
     last_ended_at_ms: Option<u64>,
     last_model: Option<String>,
     last_reasoning_effort: Option<String>,
+    last_service_tier: Option<String>,
     last_provider_id: Option<String>,
     last_config_name: Option<String>,
     last_upstream_base_url: Option<String>,
@@ -4060,8 +4216,10 @@ struct SessionRow {
     total_usage: Option<UsageMetrics>,
     turns_total: Option<u64>,
     turns_with_usage: Option<u64>,
+    override_model: Option<String>,
     override_effort: Option<String>,
     override_config_name: Option<String>,
+    override_service_tier: Option<String>,
 }
 
 fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRow> {
@@ -4077,6 +4235,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
             last_ended_at_ms: card.last_ended_at_ms,
             last_model: card.last_model.clone(),
             last_reasoning_effort: card.last_reasoning_effort.clone(),
+            last_service_tier: card.last_service_tier.clone(),
             last_provider_id: card.last_provider_id.clone(),
             last_config_name: card.last_config_name.clone(),
             last_upstream_base_url: card.last_upstream_base_url.clone(),
@@ -4084,8 +4243,10 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
             total_usage: card.total_usage.clone(),
             turns_total: card.turns_total,
             turns_with_usage: card.turns_with_usage,
+            override_model: card.override_model.clone(),
             override_effort: card.override_effort.clone(),
             override_config_name: card.override_config_name.clone(),
+            override_service_tier: card.override_service_tier.clone(),
         })
         .collect::<Vec<_>>();
     rows.sort_by_key(|r| std::cmp::Reverse(session_sort_key(r)));
@@ -4095,8 +4256,10 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
 fn build_session_rows(
     active: Vec<ActiveRequest>,
     recent: &[FinishedRequest],
+    model_overrides: &HashMap<String, String>,
     overrides: &HashMap<String, String>,
     config_overrides: &HashMap<String, String>,
+    service_tier_overrides: &HashMap<String, String>,
     stats: &HashMap<String, SessionStats>,
 ) -> Vec<SessionRow> {
     use std::collections::HashMap as StdHashMap;
@@ -4115,6 +4278,7 @@ fn build_session_rows(
             last_ended_at_ms: None,
             last_model: req.model.clone(),
             last_reasoning_effort: req.reasoning_effort.clone(),
+            last_service_tier: req.service_tier.clone(),
             last_provider_id: req.provider_id.clone(),
             last_config_name: req.config_name.clone(),
             last_upstream_base_url: req.upstream_base_url.clone(),
@@ -4122,8 +4286,10 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            override_model: None,
             override_effort: None,
             override_config_name: None,
+            override_service_tier: None,
         });
 
         entry.active_count = entry.active_count.saturating_add(1);
@@ -4138,6 +4304,9 @@ fn build_session_rows(
         }
         if let Some(effort) = req.reasoning_effort {
             entry.last_reasoning_effort = Some(effort);
+        }
+        if let Some(service_tier) = req.service_tier {
+            entry.last_service_tier = Some(service_tier);
         }
         if entry.last_model.is_none() {
             entry.last_model = req.model;
@@ -4165,6 +4334,7 @@ fn build_session_rows(
             last_ended_at_ms: None,
             last_model: r.model.clone(),
             last_reasoning_effort: r.reasoning_effort.clone(),
+            last_service_tier: r.service_tier.clone(),
             last_provider_id: r.provider_id.clone(),
             last_config_name: r.config_name.clone(),
             last_upstream_base_url: r.upstream_base_url.clone(),
@@ -4172,8 +4342,10 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            override_model: None,
             override_effort: None,
             override_config_name: None,
+            override_service_tier: None,
         });
 
         let should_update = entry
@@ -4188,6 +4360,7 @@ fn build_session_rows(
                 .reasoning_effort
                 .clone()
                 .or(entry.last_reasoning_effort.clone());
+            entry.last_service_tier = r.service_tier.clone().or(entry.last_service_tier.clone());
             entry.last_provider_id = r.provider_id.clone().or(entry.last_provider_id.clone());
             entry.last_config_name = r.config_name.clone().or(entry.last_config_name.clone());
             entry.last_upstream_base_url = r
@@ -4213,6 +4386,7 @@ fn build_session_rows(
             last_ended_at_ms: None,
             last_model: None,
             last_reasoning_effort: None,
+            last_service_tier: None,
             last_provider_id: None,
             last_config_name: None,
             last_upstream_base_url: None,
@@ -4220,8 +4394,10 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            override_model: None,
             override_effort: None,
             override_config_name: None,
+            override_service_tier: None,
         });
 
         if entry.turns_total.is_none() {
@@ -4242,6 +4418,9 @@ fn build_session_rows(
         if entry.last_reasoning_effort.is_none() {
             entry.last_reasoning_effort = st.last_reasoning_effort.clone();
         }
+        if entry.last_service_tier.is_none() {
+            entry.last_service_tier = st.last_service_tier.clone();
+        }
         if entry.last_provider_id.is_none() {
             entry.last_provider_id = st.last_provider_id.clone();
         }
@@ -4259,6 +4438,34 @@ fn build_session_rows(
         }
     }
 
+    for (sid, model) in model_overrides.iter() {
+        let key = Some(sid.clone());
+        let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
+            session_id: key,
+            cwd: None,
+            active_count: 0,
+            active_started_at_ms_min: None,
+            last_status: None,
+            last_duration_ms: None,
+            last_ended_at_ms: None,
+            last_model: None,
+            last_reasoning_effort: None,
+            last_service_tier: None,
+            last_provider_id: None,
+            last_config_name: None,
+            last_upstream_base_url: None,
+            last_usage: None,
+            total_usage: None,
+            turns_total: None,
+            turns_with_usage: None,
+            override_model: None,
+            override_effort: None,
+            override_config_name: None,
+            override_service_tier: None,
+        });
+        entry.override_model = Some(model.clone());
+    }
+
     for (sid, eff) in overrides.iter() {
         let key = Some(sid.clone());
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
@@ -4271,6 +4478,7 @@ fn build_session_rows(
             last_ended_at_ms: None,
             last_model: None,
             last_reasoning_effort: None,
+            last_service_tier: None,
             last_provider_id: None,
             last_config_name: None,
             last_upstream_base_url: None,
@@ -4278,8 +4486,10 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            override_model: None,
             override_effort: None,
             override_config_name: None,
+            override_service_tier: None,
         });
         entry.override_effort = Some(eff.clone());
     }
@@ -4296,6 +4506,7 @@ fn build_session_rows(
             last_ended_at_ms: None,
             last_model: None,
             last_reasoning_effort: None,
+            last_service_tier: None,
             last_provider_id: None,
             last_config_name: None,
             last_upstream_base_url: None,
@@ -4303,10 +4514,40 @@ fn build_session_rows(
             total_usage: None,
             turns_total: None,
             turns_with_usage: None,
+            override_model: None,
             override_effort: None,
             override_config_name: None,
+            override_service_tier: None,
         });
         entry.override_config_name = Some(cfg_name.clone());
+    }
+
+    for (sid, service_tier) in service_tier_overrides.iter() {
+        let key = Some(sid.clone());
+        let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
+            session_id: key,
+            cwd: None,
+            active_count: 0,
+            active_started_at_ms_min: None,
+            last_status: None,
+            last_duration_ms: None,
+            last_ended_at_ms: None,
+            last_model: None,
+            last_reasoning_effort: None,
+            last_service_tier: None,
+            last_provider_id: None,
+            last_config_name: None,
+            last_upstream_base_url: None,
+            last_usage: None,
+            total_usage: None,
+            turns_total: None,
+            turns_with_usage: None,
+            override_model: None,
+            override_effort: None,
+            override_config_name: None,
+            override_service_tier: None,
+        });
+        entry.override_service_tier = Some(service_tier.clone());
     }
 
     let mut rows = map.into_values().collect::<Vec<_>>();

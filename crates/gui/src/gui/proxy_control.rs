@@ -72,8 +72,10 @@ pub struct AttachedStatus {
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    pub session_model_overrides: HashMap<String, String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
+    pub session_service_tier_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
     pub configs: Vec<ConfigOption>,
     pub config_health: HashMap<String, ConfigHealth>,
@@ -100,8 +102,10 @@ impl AttachedStatus {
             recent: Vec::new(),
             session_cards: Vec::new(),
             global_override: None,
+            session_model_overrides: HashMap::new(),
             session_config_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),
+            session_service_tier_overrides: HashMap::new(),
             session_stats: HashMap::new(),
             configs: Vec::new(),
             config_health: HashMap::new(),
@@ -127,8 +131,10 @@ pub struct GuiRuntimeSnapshot {
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    pub session_model_overrides: HashMap<String, String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
+    pub session_service_tier_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
     pub configs: Vec<ConfigOption>,
     pub usage_rollup: UsageRollupView,
@@ -149,8 +155,10 @@ pub struct RunningProxy {
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    pub session_model_overrides: HashMap<String, String>,
     pub session_config_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
+    pub session_service_tier_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
     pub config_health: HashMap<String, ConfigHealth>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
@@ -290,8 +298,10 @@ impl ProxyController {
                 recent: r.recent.clone(),
                 session_cards: r.session_cards.clone(),
                 global_override: r.global_override.clone(),
+                session_model_overrides: r.session_model_overrides.clone(),
                 session_config_overrides: r.session_config_overrides.clone(),
                 session_effort_overrides: r.session_effort_overrides.clone(),
+                session_service_tier_overrides: r.session_service_tier_overrides.clone(),
                 session_stats: r.session_stats.clone(),
                 configs: list_configs_from_cfg(r.cfg.as_ref(), r.service_name),
                 usage_rollup: r.usage_rollup.clone(),
@@ -309,8 +319,10 @@ impl ProxyController {
                 recent: a.recent.clone(),
                 session_cards: a.session_cards.clone(),
                 global_override: a.global_override.clone(),
+                session_model_overrides: a.session_model_overrides.clone(),
                 session_config_overrides: a.session_config_overrides.clone(),
                 session_effort_overrides: a.session_effort_overrides.clone(),
+                session_service_tier_overrides: a.session_service_tier_overrides.clone(),
                 session_stats: a.session_stats.clone(),
                 configs: a.configs.clone(),
                 usage_rollup: a.usage_rollup.clone(),
@@ -664,8 +676,10 @@ impl ProxyController {
                 recent: Vec<FinishedRequest>,
                 session_cards: Vec<SessionIdentityCard>,
                 global_override: Option<String>,
+                session_model: HashMap<String, String>,
                 session_cfg: HashMap<String, String>,
                 session_effort: HashMap<String, String>,
+                session_service_tier: HashMap<String, String>,
                 session_stats: HashMap<String, SessionStats>,
                 configs: Vec<ConfigOption>,
                 config_health: HashMap<String, ConfigHealth>,
@@ -716,8 +730,10 @@ impl ProxyController {
                             recent: api.snapshot.recent,
                             session_cards: api.snapshot.session_cards,
                             global_override: api.snapshot.global_override,
+                            session_model: api.snapshot.session_model_overrides,
                             session_cfg: api.snapshot.session_config_overrides,
                             session_effort: api.snapshot.session_effort_overrides,
+                            session_service_tier: api.snapshot.session_service_tier_overrides,
                             session_stats: api.snapshot.session_stats,
                             configs: api.configs,
                             config_health: api.snapshot.config_health,
@@ -795,6 +811,41 @@ impl ProxyController {
                         ),
                     )?;
 
+                    let supports_session_model = caps
+                        .endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/overrides/session/model");
+                    let supports_session_service_tier = caps
+                        .endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/overrides/session/service-tier");
+
+                    let session_model = if supports_session_model {
+                        get_json::<HashMap<String, String>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/overrides/session/model"),
+                            req_timeout,
+                        )
+                        .await
+                        .ok()
+                        .unwrap_or_default()
+                    } else {
+                        HashMap::new()
+                    };
+
+                    let session_service_tier = if supports_session_service_tier {
+                        get_json::<HashMap<String, String>>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/overrides/session/service-tier"),
+                            req_timeout,
+                        )
+                        .await
+                        .ok()
+                        .unwrap_or_default()
+                    } else {
+                        HashMap::new()
+                    };
+
                     return Ok(RefreshResult {
                         management_base_url: base.to_string(),
                         api_version: Some(caps.api_version),
@@ -803,8 +854,10 @@ impl ProxyController {
                         recent,
                         session_cards: Vec::new(),
                         global_override,
+                        session_model,
                         session_cfg,
                         session_effort,
+                        session_service_tier,
                         session_stats: stats,
                         configs,
                         config_health,
@@ -853,8 +906,10 @@ impl ProxyController {
                     recent,
                     session_cards: Vec::new(),
                     global_override: None,
+                    session_model: HashMap::new(),
                     session_cfg: HashMap::new(),
                     session_effort,
+                    session_service_tier: HashMap::new(),
                     session_stats: HashMap::new(),
                     configs: Vec::new(),
                     config_health: HashMap::new(),
@@ -890,8 +945,10 @@ impl ProxyController {
                     att.recent = result.recent;
                     att.session_cards = result.session_cards;
                     att.global_override = result.global_override;
+                    att.session_model_overrides = result.session_model;
                     att.session_config_overrides = result.session_cfg;
                     att.session_effort_overrides = result.session_effort;
+                    att.session_service_tier_overrides = result.session_service_tier;
                     att.session_stats = result.session_stats;
                     att.configs = result.configs;
                     att.config_health = result.config_health;
@@ -963,6 +1020,56 @@ impl ProxyController {
         }
     }
 
+    pub fn apply_session_model_override(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        session_id: String,
+        model: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                let state = r.state.clone();
+                let now = now_ms();
+                rt.block_on(async move {
+                    match model {
+                        Some(model) => {
+                            state
+                                .set_session_model_override(session_id, model, now)
+                                .await
+                        }
+                        None => state.clear_session_model_override(&session_id).await,
+                    }
+                });
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) {
+                    bail!("attached proxy does not support session model overrides (need api v1)");
+                }
+                let base = att.admin_base_url.clone();
+                let client = self.http_client.clone();
+                let fut = async move {
+                    client
+                        .post(format!(
+                            "{base}/__codex_helper/api/v1/overrides/session/model"
+                        ))
+                        .timeout(Duration::from_millis(800))
+                        .json(&serde_json::json!({
+                            "session_id": session_id,
+                            "model": model,
+                        }))
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
     pub fn apply_session_config_override(
         &mut self,
         rt: &tokio::runtime::Runtime,
@@ -1000,6 +1107,58 @@ impl ProxyController {
                         .json(&serde_json::json!({
                             "session_id": session_id,
                             "config_name": config_name,
+                        }))
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
+    pub fn apply_session_service_tier_override(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        session_id: String,
+        service_tier: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                let state = r.state.clone();
+                let now = now_ms();
+                rt.block_on(async move {
+                    match service_tier {
+                        Some(service_tier) => {
+                            state
+                                .set_session_service_tier_override(session_id, service_tier, now)
+                                .await
+                        }
+                        None => state.clear_session_service_tier_override(&session_id).await,
+                    }
+                });
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) {
+                    bail!(
+                        "attached proxy does not support session service tier overrides (need api v1)"
+                    );
+                }
+                let base = att.admin_base_url.clone();
+                let client = self.http_client.clone();
+                let fut = async move {
+                    client
+                        .post(format!(
+                            "{base}/__codex_helper/api/v1/overrides/session/service-tier"
+                        ))
+                        .timeout(Duration::from_millis(800))
+                        .json(&serde_json::json!({
+                            "session_id": session_id,
+                            "service_tier": service_tier,
                         }))
                         .send()
                         .await?
@@ -1178,8 +1337,10 @@ impl ProxyController {
                 r.recent = snap.recent;
                 r.session_cards = snap.session_cards;
                 r.global_override = snap.global_override;
+                r.session_model_overrides = snap.session_model_overrides;
                 r.session_config_overrides = snap.session_config_overrides;
                 r.session_effort_overrides = snap.session_effort_overrides;
+                r.session_service_tier_overrides = snap.session_service_tier_overrides;
                 r.session_stats = snap.session_stats;
                 r.config_health = snap.config_health;
                 r.health_checks = snap.health_checks;
@@ -1405,8 +1566,10 @@ impl ProxyController {
             recent: Vec::new(),
             session_cards: Vec::new(),
             global_override: None,
+            session_model_overrides: HashMap::new(),
             session_config_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),
+            session_service_tier_overrides: HashMap::new(),
             session_stats: HashMap::new(),
             config_health: HashMap::new(),
             health_checks: HashMap::new(),

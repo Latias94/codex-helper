@@ -154,6 +154,8 @@ pub struct ActiveRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub config_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
@@ -176,6 +178,8 @@ pub struct FinishedRequest {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -215,6 +219,8 @@ pub struct SessionStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_config_name: Option<String>,
@@ -250,6 +256,8 @@ pub struct SessionIdentityCard {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_config_name: Option<String>,
@@ -267,6 +275,10 @@ pub struct SessionIdentityCard {
     pub override_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub override_config_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +292,22 @@ struct SessionEffortOverride {
 #[derive(Debug, Clone)]
 struct SessionConfigOverride {
     config_name: String,
+    #[allow(dead_code)]
+    updated_at_ms: u64,
+    last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SessionModelOverride {
+    model: String,
+    #[allow(dead_code)]
+    updated_at_ms: u64,
+    last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SessionServiceTierOverride {
+    service_tier: String,
     #[allow(dead_code)]
     updated_at_ms: u64,
     last_seen_ms: u64,
@@ -310,6 +338,8 @@ pub struct ProxyState {
     session_cwd_cache_max_entries: usize,
     session_effort_overrides: RwLock<HashMap<String, SessionEffortOverride>>,
     session_config_overrides: RwLock<HashMap<String, SessionConfigOverride>>,
+    session_model_overrides: RwLock<HashMap<String, SessionModelOverride>>,
+    session_service_tier_overrides: RwLock<HashMap<String, SessionServiceTierOverride>>,
     global_config_override: RwLock<Option<String>>,
     config_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
@@ -357,6 +387,8 @@ impl ProxyState {
             session_cwd_cache_max_entries: cwd_cache_max_entries,
             session_effort_overrides: RwLock::new(HashMap::new()),
             session_config_overrides: RwLock::new(HashMap::new()),
+            session_model_overrides: RwLock::new(HashMap::new()),
+            session_service_tier_overrides: RwLock::new(HashMap::new()),
             global_config_override: RwLock::new(None),
             config_meta_overrides: RwLock::new(HashMap::new()),
             session_cwd_cache: RwLock::new(HashMap::new()),
@@ -415,6 +447,85 @@ impl ProxyState {
     pub async fn get_session_config_override(&self, session_id: &str) -> Option<String> {
         let guard = self.session_config_overrides.read().await;
         guard.get(session_id).map(|v| v.config_name.clone())
+    }
+
+    pub async fn get_session_model_override(&self, session_id: &str) -> Option<String> {
+        let guard = self.session_model_overrides.read().await;
+        guard.get(session_id).map(|v| v.model.clone())
+    }
+
+    pub async fn set_session_model_override(&self, session_id: String, model: String, now_ms: u64) {
+        let mut guard = self.session_model_overrides.write().await;
+        guard.insert(
+            session_id,
+            SessionModelOverride {
+                model,
+                updated_at_ms: now_ms,
+                last_seen_ms: now_ms,
+            },
+        );
+    }
+
+    pub async fn clear_session_model_override(&self, session_id: &str) {
+        let mut guard = self.session_model_overrides.write().await;
+        guard.remove(session_id);
+    }
+
+    pub async fn list_session_model_overrides(&self) -> HashMap<String, String> {
+        let guard = self.session_model_overrides.read().await;
+        guard
+            .iter()
+            .map(|(k, v)| (k.clone(), v.model.clone()))
+            .collect()
+    }
+
+    pub async fn touch_session_model_override(&self, session_id: &str, now_ms: u64) {
+        let mut guard = self.session_model_overrides.write().await;
+        if let Some(v) = guard.get_mut(session_id) {
+            v.last_seen_ms = now_ms;
+        }
+    }
+
+    pub async fn get_session_service_tier_override(&self, session_id: &str) -> Option<String> {
+        let guard = self.session_service_tier_overrides.read().await;
+        guard.get(session_id).map(|v| v.service_tier.clone())
+    }
+
+    pub async fn set_session_service_tier_override(
+        &self,
+        session_id: String,
+        service_tier: String,
+        now_ms: u64,
+    ) {
+        let mut guard = self.session_service_tier_overrides.write().await;
+        guard.insert(
+            session_id,
+            SessionServiceTierOverride {
+                service_tier,
+                updated_at_ms: now_ms,
+                last_seen_ms: now_ms,
+            },
+        );
+    }
+
+    pub async fn clear_session_service_tier_override(&self, session_id: &str) {
+        let mut guard = self.session_service_tier_overrides.write().await;
+        guard.remove(session_id);
+    }
+
+    pub async fn list_session_service_tier_overrides(&self) -> HashMap<String, String> {
+        let guard = self.session_service_tier_overrides.read().await;
+        guard
+            .iter()
+            .map(|(k, v)| (k.clone(), v.service_tier.clone()))
+            .collect()
+    }
+
+    pub async fn touch_session_service_tier_override(&self, session_id: &str, now_ms: u64) {
+        let mut guard = self.session_service_tier_overrides.write().await;
+        if let Some(v) = guard.get_mut(session_id) {
+            v.last_seen_ms = now_ms;
+        }
     }
 
     pub async fn set_session_config_override(
@@ -1022,6 +1133,7 @@ impl ProxyState {
         cwd: Option<String>,
         model: Option<String>,
         reasoning_effort: Option<String>,
+        service_tier: Option<String>,
         started_at_ms: u64,
     ) -> u64 {
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -1031,6 +1143,7 @@ impl ProxyState {
             cwd,
             model,
             reasoning_effort,
+            service_tier,
             config_name: None,
             provider_id: None,
             upstream_base_url: None,
@@ -1072,6 +1185,7 @@ impl ProxyState {
             cwd: req.cwd,
             model: req.model,
             reasoning_effort: req.reasoning_effort,
+            service_tier: req.service_tier,
             config_name: req.config_name,
             provider_id: req.provider_id,
             upstream_base_url: req.upstream_base_url,
@@ -1163,6 +1277,10 @@ impl ProxyState {
                 .reasoning_effort
                 .clone()
                 .or(entry.last_reasoning_effort.clone());
+            entry.last_service_tier = finished
+                .service_tier
+                .clone()
+                .or(entry.last_service_tier.clone());
             entry.last_provider_id = finished
                 .provider_id
                 .clone()
@@ -1206,13 +1324,26 @@ impl ProxyState {
         guard.clone()
     }
 
-    pub async fn list_session_identity_cards(&self, recent_limit: usize) -> Vec<SessionIdentityCard> {
+    pub async fn list_session_identity_cards(
+        &self,
+        recent_limit: usize,
+    ) -> Vec<SessionIdentityCard> {
         let recent_limit = recent_limit.clamp(1, recent_finished_max());
-        let (active, recent, overrides, config_overrides, stats) = tokio::join!(
+        let (
+            active,
+            recent,
+            overrides,
+            config_overrides,
+            model_overrides,
+            service_tier_overrides,
+            stats,
+        ) = tokio::join!(
             self.list_active_requests(),
             self.list_recent_finished(recent_limit),
             self.list_session_effort_overrides(),
             self.list_session_config_overrides(),
+            self.list_session_model_overrides(),
+            self.list_session_service_tier_overrides(),
             self.list_session_stats(),
         );
         build_session_identity_cards_from_parts(
@@ -1220,6 +1351,8 @@ impl ProxyState {
             &recent,
             &overrides,
             &config_overrides,
+            &model_overrides,
+            &service_tier_overrides,
             &stats,
         )
     }
@@ -1264,6 +1397,28 @@ impl ProxyState {
         if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
             let cutoff_override = now_ms - self.session_override_ttl_ms;
             let mut overrides = self.session_config_overrides.write().await;
+            overrides.retain(|sid, v| {
+                if active_sessions.contains_key(sid) {
+                    return true;
+                }
+                v.last_seen_ms >= cutoff_override
+            });
+        }
+
+        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
+            let cutoff_override = now_ms - self.session_override_ttl_ms;
+            let mut overrides = self.session_model_overrides.write().await;
+            overrides.retain(|sid, v| {
+                if active_sessions.contains_key(sid) {
+                    return true;
+                }
+                v.last_seen_ms >= cutoff_override
+            });
+        }
+
+        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
+            let cutoff_override = now_ms - self.session_override_ttl_ms;
+            let mut overrides = self.session_service_tier_overrides.write().await;
             overrides.retain(|sid, v| {
                 if active_sessions.contains_key(sid) {
                     return true;
@@ -1355,6 +1510,7 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         last_ended_at_ms: None,
         last_model: None,
         last_reasoning_effort: None,
+        last_service_tier: None,
         last_provider_id: None,
         last_config_name: None,
         last_upstream_base_url: None,
@@ -1364,6 +1520,8 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         turns_with_usage: None,
         override_effort: None,
         override_config_name: None,
+        override_model: None,
+        override_service_tier: None,
     }
 }
 
@@ -1378,6 +1536,8 @@ pub fn build_session_identity_cards_from_parts(
     recent: &[FinishedRequest],
     overrides: &HashMap<String, String>,
     config_overrides: &HashMap<String, String>,
+    model_overrides: &HashMap<String, String>,
+    service_tier_overrides: &HashMap<String, String>,
     stats: &HashMap<String, SessionStats>,
 ) -> Vec<SessionIdentityCard> {
     use std::collections::HashMap as StdHashMap;
@@ -1403,6 +1563,9 @@ pub fn build_session_identity_cards_from_parts(
         if let Some(effort) = req.reasoning_effort.as_ref() {
             entry.last_reasoning_effort = Some(effort.clone());
         }
+        if let Some(service_tier) = req.service_tier.as_ref() {
+            entry.last_service_tier = Some(service_tier.clone());
+        }
         if entry.last_model.is_none() {
             entry.last_model = req.model.clone();
         }
@@ -1423,7 +1586,9 @@ pub fn build_session_identity_cards_from_parts(
             .entry(key.clone())
             .or_insert_with(|| empty_session_identity_card(key));
 
-        let should_update = entry.last_ended_at_ms.is_none_or(|prev| r.ended_at_ms >= prev);
+        let should_update = entry
+            .last_ended_at_ms
+            .is_none_or(|prev| r.ended_at_ms >= prev);
         if should_update {
             entry.last_status = Some(r.status_code);
             entry.last_duration_ms = Some(r.duration_ms);
@@ -1433,6 +1598,7 @@ pub fn build_session_identity_cards_from_parts(
                 .reasoning_effort
                 .clone()
                 .or(entry.last_reasoning_effort.clone());
+            entry.last_service_tier = r.service_tier.clone().or(entry.last_service_tier.clone());
             entry.last_provider_id = r.provider_id.clone().or(entry.last_provider_id.clone());
             entry.last_config_name = r.config_name.clone().or(entry.last_config_name.clone());
             entry.last_upstream_base_url = r
@@ -1470,6 +1636,9 @@ pub fn build_session_identity_cards_from_parts(
         if entry.last_reasoning_effort.is_none() {
             entry.last_reasoning_effort = st.last_reasoning_effort.clone();
         }
+        if entry.last_service_tier.is_none() {
+            entry.last_service_tier = st.last_service_tier.clone();
+        }
         if entry.last_provider_id.is_none() {
             entry.last_provider_id = st.last_provider_id.clone();
         }
@@ -1503,6 +1672,22 @@ pub fn build_session_identity_cards_from_parts(
         entry.override_config_name = Some(cfg_name.clone());
     }
 
+    for (sid, model) in model_overrides {
+        let key = Some(sid.clone());
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| empty_session_identity_card(key));
+        entry.override_model = Some(model.clone());
+    }
+
+    for (sid, service_tier) in service_tier_overrides {
+        let key = Some(sid.clone());
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| empty_session_identity_card(key));
+        entry.override_service_tier = Some(service_tier.clone());
+    }
+
     let mut cards = map.into_values().collect::<Vec<_>>();
     cards.sort_by_key(|card| std::cmp::Reverse(session_identity_sort_key(card)));
     cards
@@ -1520,6 +1705,7 @@ mod tests {
             cwd: Some("G:/codes/project".to_string()),
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: Some("medium".to_string()),
+            service_tier: Some("priority".to_string()),
             config_name: Some("right".to_string()),
             provider_id: Some("right".to_string()),
             upstream_base_url: Some("https://right.example/v1".to_string()),
@@ -1535,6 +1721,7 @@ mod tests {
                 cwd: Some("G:/codes/other".to_string()),
                 model: Some("gpt-5.3".to_string()),
                 reasoning_effort: Some("high".to_string()),
+                service_tier: Some("default".to_string()),
                 config_name: Some("vibe".to_string()),
                 provider_id: Some("vibe".to_string()),
                 upstream_base_url: Some("https://vibe.example/v1".to_string()),
@@ -1559,6 +1746,7 @@ mod tests {
                 cwd: Some("G:/codes/project".to_string()),
                 model: Some("gpt-5.4".to_string()),
                 reasoning_effort: Some("low".to_string()),
+                service_tier: Some("flex".to_string()),
                 config_name: Some("right".to_string()),
                 provider_id: Some("right".to_string()),
                 upstream_base_url: Some("https://right.example/v1".to_string()),
@@ -1575,12 +1763,17 @@ mod tests {
         ];
         let overrides = HashMap::from([("sid-active".to_string(), "xhigh".to_string())]);
         let config_overrides = HashMap::from([("sid-active".to_string(), "temp".to_string())]);
+        let model_overrides =
+            HashMap::from([("sid-active".to_string(), "gpt-5.4-mini".to_string())]);
+        let service_tier_overrides =
+            HashMap::from([("sid-active".to_string(), "priority".to_string())]);
         let stats = HashMap::from([(
             "sid-active".to_string(),
             SessionStats {
                 turns_total: 3,
                 last_model: Some("gpt-5.4".to_string()),
                 last_reasoning_effort: Some("low".to_string()),
+                last_service_tier: Some("flex".to_string()),
                 last_provider_id: Some("right".to_string()),
                 last_config_name: Some("right".to_string()),
                 last_usage: None,
@@ -1603,6 +1796,8 @@ mod tests {
             &recent,
             &overrides,
             &config_overrides,
+            &model_overrides,
+            &service_tier_overrides,
             &stats,
         );
 
@@ -1613,11 +1808,17 @@ mod tests {
         assert_eq!(cards[1].last_status, Some(429));
         assert_eq!(cards[1].override_effort.as_deref(), Some("xhigh"));
         assert_eq!(cards[1].override_config_name.as_deref(), Some("temp"));
+        assert_eq!(cards[1].override_model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(cards[1].override_service_tier.as_deref(), Some("priority"));
         assert_eq!(
             cards[1].last_upstream_base_url.as_deref(),
             Some("https://right.example/v1")
         );
         assert_eq!(cards[1].turns_total, Some(3));
-        assert_eq!(cards[1].total_usage.as_ref().map(|u| u.total_tokens), Some(35));
+        assert_eq!(cards[1].last_service_tier.as_deref(), Some("flex"));
+        assert_eq!(
+            cards[1].total_usage.as_ref().map(|u| u.total_tokens),
+            Some(35)
+        );
     }
 }
