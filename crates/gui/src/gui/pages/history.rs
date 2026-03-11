@@ -69,6 +69,7 @@ pub struct HistoryViewState {
     pub(super) loaded_for: Option<(String, Option<usize>)>,
     pub branch_by_workdir: HashMap<String, Option<String>>,
     pub data_source: HistoryDataSource,
+    external_focus: Option<ExternalHistoryFocus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,17 @@ pub enum HistoryDataSource {
     #[default]
     LocalFiles,
     ObservedFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExternalHistoryOrigin {
+    Sessions,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalHistoryFocus {
+    summary: SessionSummary,
+    origin: ExternalHistoryOrigin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +188,7 @@ impl Default for HistoryViewState {
             loaded_for: None,
             branch_by_workdir: HashMap::new(),
             data_source: HistoryDataSource::LocalFiles,
+            external_focus: None,
         }
     }
 }
@@ -284,13 +297,78 @@ fn refresh_branch_cache_for_day_items(
     }
 }
 
+fn merge_external_focus_session(list: &mut Vec<SessionSummary>, focus: &ExternalHistoryFocus) {
+    if let Some(existing) = list
+        .iter_mut()
+        .find(|summary| summary.id == focus.summary.id)
+    {
+        let prefer_focus = matches!(focus.summary.source, SessionSummarySource::LocalFile)
+            && !matches!(existing.source, SessionSummarySource::LocalFile);
+        if prefer_focus {
+            *existing = focus.summary.clone();
+            return;
+        }
+
+        if existing.cwd.is_none() {
+            existing.cwd = focus.summary.cwd.clone();
+        }
+        if existing.first_user_message.is_none() {
+            existing.first_user_message = focus.summary.first_user_message.clone();
+        }
+        if existing.sort_hint_ms.is_none() {
+            existing.sort_hint_ms = focus.summary.sort_hint_ms;
+        }
+        if existing.updated_at.is_none() {
+            existing.updated_at = focus.summary.updated_at.clone();
+        }
+        if existing.last_response_at.is_none() {
+            existing.last_response_at = focus.summary.last_response_at.clone();
+        }
+        if existing.path.as_os_str().is_empty() && !focus.summary.path.as_os_str().is_empty() {
+            existing.path = focus.summary.path.clone();
+        }
+        return;
+    }
+
+    list.insert(0, focus.summary.clone());
+}
+
+fn ensure_external_focus_visible(state: &mut HistoryViewState) {
+    let Some(focus) = state.external_focus.as_ref() else {
+        return;
+    };
+    if state.selected_id.as_deref() != Some(focus.summary.id.as_str()) {
+        return;
+    }
+    if !state
+        .sessions
+        .iter()
+        .any(|summary| summary.id == focus.summary.id)
+    {
+        state.sessions.insert(0, focus.summary.clone());
+    }
+}
+
 pub(super) fn prepare_select_session_from_external(
     state: &mut HistoryViewState,
-    selected_idx: usize,
-    sid: String,
+    summary: SessionSummary,
+    origin: ExternalHistoryOrigin,
 ) {
-    state.selected_idx = selected_idx;
-    state.selected_id = Some(sid);
+    let sid = summary.id.clone();
+    state.scope = HistoryScope::GlobalRecent;
+    state.query.clear();
+    state.applied_scope = HistoryScope::GlobalRecent;
+    state.applied_query.clear();
+    state.search_transcript_applied = None;
+    state.external_focus = Some(ExternalHistoryFocus { summary, origin });
+    if let Some(focus) = state.external_focus.as_ref() {
+        merge_external_focus_session(&mut state.sessions_all, focus);
+        merge_external_focus_session(&mut state.sessions, focus);
+    }
+    state.selected_idx = 0;
+    state.selected_id = Some(sid.clone());
+    ensure_external_focus_visible(state);
+    state.loaded_at_ms = None;
     state.loaded_for = None;
     state.auto_load_transcript = true;
     cancel_transcript_load(state);
@@ -523,6 +601,75 @@ fn build_observed_history_summaries(
     out
 }
 
+fn history_summary_source_label(source: SessionSummarySource, lang: Language) -> &'static str {
+    match source {
+        SessionSummarySource::LocalFile => {
+            pick(lang, "本地 transcript 文件", "Local transcript file")
+        }
+        SessionSummarySource::ObservedOnly => pick(lang, "共享观测摘要", "Shared observed summary"),
+    }
+}
+
+fn external_history_origin_label(origin: ExternalHistoryOrigin, lang: Language) -> &'static str {
+    match origin {
+        ExternalHistoryOrigin::Sessions => pick(lang, "来自 Sessions", "Opened from Sessions"),
+    }
+}
+
+fn render_history_selection_context(
+    ui: &mut egui::Ui,
+    lang: Language,
+    state: &HistoryViewState,
+    summary: &SessionSummary,
+) {
+    let color = match summary.source {
+        SessionSummarySource::LocalFile => egui::Color32::from_rgb(60, 160, 90),
+        SessionSummarySource::ObservedOnly => egui::Color32::from_rgb(200, 120, 40),
+    };
+    let focus_origin = state
+        .external_focus
+        .as_ref()
+        .filter(|focus| focus.summary.id == summary.id)
+        .map(|focus| focus.origin);
+
+    ui.group(|ui| {
+        if let Some(origin) = focus_origin {
+            ui.small(format!(
+                "{}: {}",
+                pick(lang, "入口", "Entry"),
+                external_history_origin_label(origin, lang)
+            ));
+        }
+        ui.colored_label(
+            color,
+            format!(
+                "{}: {}",
+                pick(lang, "来源", "Source"),
+                history_summary_source_label(summary.source, lang)
+            ),
+        );
+        match summary.source {
+            SessionSummarySource::LocalFile => {
+                ui.small(pick(
+                    lang,
+                    "当前条目映射到这台设备可读取的本地 session 文件；resume、open file 和 transcript 动作都可用。",
+                    "This item maps to a local session file readable on this device; resume, open-file, and transcript actions are available.",
+                ));
+                if !summary.path.as_os_str().is_empty() {
+                    ui.small(format!("file: {}", summary.path.display()));
+                }
+            }
+            SessionSummarySource::ObservedOnly => {
+                ui.small(pick(
+                    lang,
+                    "当前条目只带共享观测摘要；可以浏览 session 标识和路由线索，但不能假设这台设备有对应 transcript 文件。",
+                    "This item carries shared observed metadata only; you can inspect session identity and routing clues, but this device cannot assume a matching transcript file exists.",
+                ));
+            }
+        }
+    });
+}
+
 fn refresh_history_sessions_with_fallback(
     ctx: &mut PageCtx<'_>,
     scope: HistoryScope,
@@ -718,6 +865,21 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         && ctx.view.history.scope != HistoryScope::AllByDate
         && ctx.view.history.loaded_at_ms.is_none()
         && ctx.view.history.sessions_all.is_empty()
+    {
+        refresh_requested = true;
+    }
+    if ctx
+        .view
+        .history
+        .external_focus
+        .as_ref()
+        .is_some_and(|focus| {
+            !ctx.view
+                .history
+                .sessions_all
+                .iter()
+                .any(|summary| summary.id == focus.summary.id)
+        })
     {
         refresh_requested = true;
     }
@@ -1061,7 +1223,10 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 scope,
                 shared_observed_history_available,
             ) {
-                Ok((list, data_source)) => {
+                Ok((mut list, data_source)) => {
+                    if let Some(focus) = ctx.view.history.external_focus.as_ref() {
+                        merge_external_focus_session(&mut list, focus);
+                    }
                     ctx.view.history.sessions_all = list;
                     ctx.view.history.data_source = data_source;
                     let infer_git_root = ctx.view.history.infer_git_root;
@@ -1100,6 +1265,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             .cloned()
                             .collect()
                     };
+                    ensure_external_focus_visible(&mut ctx.view.history);
                     ctx.view.history.applied_scope = scope;
                     ctx.view.history.applied_query = ctx.view.history.query.clone();
 
@@ -1238,6 +1404,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     match ctx.rt.block_on(fut) {
                         Ok(list) => {
                             ctx.view.history.sessions = list;
+                            ensure_external_focus_visible(&mut ctx.view.history);
                             ctx.view.history.search_transcript_applied = Some((scope, q, tail));
                             ctx.view.history.applied_scope = scope;
                             ctx.view.history.applied_query = ctx.view.history.query.clone();
@@ -1299,6 +1466,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 .cloned()
                 .collect();
         }
+        ensure_external_focus_visible(&mut ctx.view.history);
 
         // If selection falls out, reset and clear transcript.
         let selected_ok = ctx
@@ -1405,18 +1573,13 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .history
             .selected_idx
             .min(ctx.view.history.sessions.len().saturating_sub(1));
-        let (selected_id, selected_cwd, selected_path, selected_first, selected_source) = {
-            let selected = &ctx.view.history.sessions[selected_idx];
-            (
-                selected.id.clone(),
-                selected.cwd.clone().unwrap_or_else(|| "-".to_string()),
-                selected.path.clone(),
-                selected.first_user_message.clone(),
-                selected.source,
-            )
-        };
-        let workdir =
-            history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
+        let selected = ctx.view.history.sessions[selected_idx].clone();
+        let selected_id = selected.id.clone();
+        let selected_source = selected.source;
+        let workdir = history_workdir_from_cwd(
+            selected.cwd.as_deref().unwrap_or("-"),
+            ctx.view.history.infer_git_root,
+        );
         let mut open_selected_clicked = false;
 
         cols[1].group(|ui| {
@@ -1429,15 +1592,16 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     ctx,
                     selected_id.as_str(),
                     workdir.as_str(),
-                    selected_path.as_path(),
+                    selected.path.as_path(),
                     selected_source,
                 );
             });
 
+            render_history_selection_context(ui, ctx.lang, &ctx.view.history, &selected);
             ui.label(format!("id: {}", selected_id));
             ui.label(format!("dir: {}", workdir));
 
-            if let Some(first) = selected_first.as_deref() {
+            if let Some(first) = selected.first_user_message.as_deref() {
                 let mut text = first.to_string();
                 ui.add(
                     egui::TextEdit::multiline(&mut text)
@@ -1478,11 +1642,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 480.0,
             );
         } else {
-            render_observed_session_placeholder(
-                &mut cols[1],
-                ctx.lang,
-                &ctx.view.history.sessions[selected_idx],
-            );
+            render_observed_session_placeholder(&mut cols[1], ctx.lang, &selected);
         }
     });
 }
@@ -1556,16 +1716,13 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         .history
         .selected_idx
         .min(ctx.view.history.sessions.len().saturating_sub(1));
-    let (selected_id, selected_cwd, selected_path, selected_source) = {
-        let selected = &ctx.view.history.sessions[selected_idx];
-        (
-            selected.id.clone(),
-            selected.cwd.clone().unwrap_or_else(|| "-".to_string()),
-            selected.path.clone(),
-            selected.source,
-        )
-    };
-    let workdir = history_workdir_from_cwd(selected_cwd.as_str(), ctx.view.history.infer_git_root);
+    let selected = ctx.view.history.sessions[selected_idx].clone();
+    let selected_id = selected.id.clone();
+    let selected_source = selected.source;
+    let workdir = history_workdir_from_cwd(
+        selected.cwd.as_deref().unwrap_or("-"),
+        ctx.view.history.infer_git_root,
+    );
     let mut open_selected_clicked = false;
 
     ui.horizontal(|ui| {
@@ -1574,7 +1731,7 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ctx,
             selected_id.as_str(),
             workdir.as_str(),
-            selected_path.as_path(),
+            selected.path.as_path(),
             selected_source,
         );
         open_selected_clicked = history_controls::render_open_selected_in_wt_button(ui, ctx);
@@ -1596,6 +1753,7 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         open_wt_items(ctx, items);
     }
 
+    render_history_selection_context(ui, ctx.lang, &ctx.view.history, &selected);
     ui.label(format!("id: {}", selected_id));
     ui.label(format!("dir: {}", workdir));
 
@@ -1609,8 +1767,7 @@ fn render_history_vertical(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             transcript_max_h,
         );
     } else {
-        let selected = &ctx.view.history.sessions[selected_idx];
-        render_observed_session_placeholder(ui, ctx.lang, selected);
+        render_observed_session_placeholder(ui, ctx.lang, &selected);
     }
 }
 
@@ -2071,6 +2228,15 @@ fn poll_transcript_loader(ctx: &mut PageCtx<'_>) {
 }
 
 fn select_session_and_reset_transcript(ctx: &mut PageCtx<'_>, idx: usize, id: String) {
+    if ctx
+        .view
+        .history
+        .external_focus
+        .as_ref()
+        .is_some_and(|focus| focus.summary.id != id)
+    {
+        ctx.view.history.external_focus = None;
+    }
     ctx.view.history.selected_idx = idx;
     ctx.view.history.selected_id = Some(id);
     reset_transcript_view_after_session_switch(ctx);
@@ -2134,6 +2300,26 @@ mod tests {
     };
     use crate::state::{FinishedRequest, ResolvedRouteValue, RouteValueSource, UsageRollupView};
 
+    fn sample_summary(id: &str, source: SessionSummarySource) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            path: match source {
+                SessionSummarySource::LocalFile => PathBuf::from(format!("/tmp/{id}.jsonl")),
+                SessionSummarySource::ObservedOnly => PathBuf::new(),
+            },
+            cwd: Some("/workdir".to_string()),
+            created_at: None,
+            updated_at: Some("1m".to_string()),
+            last_response_at: Some("1m".to_string()),
+            user_turns: 1,
+            assistant_turns: 1,
+            rounds: 1,
+            first_user_message: Some("summary".to_string()),
+            source,
+            sort_hint_ms: Some(1_000),
+        }
+    }
+
     fn empty_snapshot() -> GuiRuntimeSnapshot {
         GuiRuntimeSnapshot {
             kind: crate::gui::proxy_control::ProxyModeKind::Attached,
@@ -2177,6 +2363,59 @@ mod tests {
             },
             remote_admin_access: RemoteAdminAccessCapabilities::default(),
         }
+    }
+
+    #[test]
+    fn prepare_select_session_from_external_resets_scope_and_focus() {
+        let mut state = HistoryViewState::default();
+        state.scope = HistoryScope::CurrentProject;
+        state.query = "old".to_string();
+        state.applied_query = "old".to_string();
+
+        prepare_select_session_from_external(
+            &mut state,
+            sample_summary("sid-ext", SessionSummarySource::ObservedOnly),
+            ExternalHistoryOrigin::Sessions,
+        );
+
+        assert_eq!(state.scope, HistoryScope::GlobalRecent);
+        assert!(state.query.is_empty());
+        assert_eq!(state.selected_id.as_deref(), Some("sid-ext"));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].id, "sid-ext");
+        assert!(state.external_focus.is_some());
+        assert!(state.loaded_at_ms.is_none());
+    }
+
+    #[test]
+    fn merge_external_focus_session_preserves_local_file_when_richer() {
+        let mut list = vec![sample_summary("sid-1", SessionSummarySource::LocalFile)];
+        let focus = ExternalHistoryFocus {
+            summary: sample_summary("sid-1", SessionSummarySource::ObservedOnly),
+            origin: ExternalHistoryOrigin::Sessions,
+        };
+
+        merge_external_focus_session(&mut list, &focus);
+
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].source, SessionSummarySource::LocalFile);
+        assert!(!list[0].path.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn ensure_external_focus_visible_inserts_selected_external_summary() {
+        let mut state = HistoryViewState::default();
+        state.external_focus = Some(ExternalHistoryFocus {
+            summary: sample_summary("sid-ext", SessionSummarySource::ObservedOnly),
+            origin: ExternalHistoryOrigin::Sessions,
+        });
+        state.selected_id = Some("sid-ext".to_string());
+
+        ensure_external_focus_visible(&mut state);
+
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].id, "sid-ext");
+        assert_eq!(state.sessions[0].source, SessionSummarySource::ObservedOnly);
     }
 
     #[test]

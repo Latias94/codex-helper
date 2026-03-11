@@ -3844,6 +3844,60 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
             }
 
+            let can_open_history = row.session_id.is_some();
+            let mut open_history = ui.add_enabled(
+                can_open_history,
+                egui::Button::new(pick(ctx.lang, "在 History 查看", "Open in History")),
+            );
+            if row.session_id.is_none() {
+                open_history = open_history.on_disabled_hover_text(pick(
+                    ctx.lang,
+                    "当前会话没有 session_id。",
+                    "The current session has no session_id.",
+                ));
+            }
+            if open_history.clicked() {
+                let Some(sid) = row.session_id.clone() else {
+                    return;
+                };
+                match ctx
+                    .rt
+                    .block_on(crate::sessions::find_codex_session_file_by_id(&sid))
+                {
+                    Ok(path) => {
+                        if let Some(summary) =
+                            session_history_summary_from_row(row, path.clone(), ctx.lang)
+                        {
+                            history::prepare_select_session_from_external(
+                                &mut ctx.view.history,
+                                summary,
+                                history::ExternalHistoryOrigin::Sessions,
+                            );
+                            ctx.view.requested_page = Some(Page::History);
+                            *ctx.last_info = Some(
+                                if path.is_some() {
+                                    pick(
+                                        ctx.lang,
+                                        "已切到 History（本地 transcript）",
+                                        "Opened in History (local transcript)",
+                                    )
+                                } else {
+                                    pick(
+                                        ctx.lang,
+                                        "已切到 History（共享观测摘要）",
+                                        "Opened in History (observed summary)",
+                                    )
+                                }
+                                .to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        *ctx.last_error = Some(format!("find session file failed: {e}"));
+                    }
+                }
+            }
+
             let can_open_transcript = row.session_id.is_some() && host_local_session_features;
             let mut open_transcript = ui.add_enabled(
                 can_open_transcript,
@@ -3872,40 +3926,16 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     .block_on(crate::sessions::find_codex_session_file_by_id(&sid))
                 {
                     Ok(Some(path)) => {
-                        let pos = ctx.view.history.sessions.iter().position(|s| s.id == sid);
-                        let selected_idx = if let Some(pos) = pos {
-                            ctx.view.history.sessions[pos].path = path;
-                            pos
-                        } else {
-                            ctx.view.history.sessions.insert(
-                                0,
-                                SessionSummary {
-                                    id: sid.clone(),
-                                    path,
-                                    cwd: row.cwd.clone(),
-                                    created_at: None,
-                                    updated_at: None,
-                                    last_response_at: None,
-                                    user_turns: 0,
-                                    assistant_turns: 0,
-                                    rounds: 0,
-                                    first_user_message: Some(
-                                        pick(ctx.lang, "（来自 Sessions）", "(from Sessions)")
-                                            .to_string(),
-                                    ),
-                                    source: SessionSummarySource::LocalFile,
-                                    sort_hint_ms: None,
-                                },
+                        if let Some(summary) =
+                            session_history_summary_from_row(row, Some(path), ctx.lang)
+                        {
+                            history::prepare_select_session_from_external(
+                                &mut ctx.view.history,
+                                summary,
+                                history::ExternalHistoryOrigin::Sessions,
                             );
-                            0
-                        };
-
-                        history::prepare_select_session_from_external(
-                            &mut ctx.view.history,
-                            selected_idx,
-                            sid.clone(),
-                        );
-                        ctx.view.requested_page = Some(Page::History);
+                            ctx.view.requested_page = Some(Page::History);
+                        }
                     }
                     Ok(None) => {
                         *ctx.last_error = Some(pick(
@@ -5189,6 +5219,60 @@ fn session_last_activity_summary(row: &SessionRow) -> String {
         .unwrap_or_else(|| "-".to_string());
     let last = format_age(now_ms(), row.last_ended_at_ms);
     format!("status={status}, duration={duration}, last={last}")
+}
+
+fn session_history_bridge_summary(row: &SessionRow, lang: Language) -> String {
+    let mut parts = vec![session_effective_route_inline_summary(row, lang)];
+    if let Some(profile) = row.binding_profile_name.as_deref() {
+        parts.push(format!("profile={profile}"));
+    }
+    if let Some(client) = format_observed_client_identity(
+        row.last_client_name.as_deref(),
+        row.last_client_addr.as_deref(),
+    ) {
+        parts.push(format!("client={client}"));
+    }
+    if let Some(status) = row.last_status {
+        parts.push(format!("status={status}"));
+    }
+    if row.active_count > 0 {
+        parts.push(format!("active={}", row.active_count));
+    }
+    format!(
+        "{}: {}",
+        pick(lang, "来自 Sessions", "From Sessions"),
+        parts.join(", ")
+    )
+}
+
+fn session_history_summary_from_row(
+    row: &SessionRow,
+    path: Option<std::path::PathBuf>,
+    lang: Language,
+) -> Option<SessionSummary> {
+    let sid = row.session_id.clone()?;
+    let sort_hint_ms = row.last_ended_at_ms.or(row.active_started_at_ms_min);
+    let updated_at = sort_hint_ms.map(|ms| format_age(now_ms(), Some(ms)));
+    let turns = row.turns_total.unwrap_or(0).min(usize::MAX as u64) as usize;
+    let source = if path.is_some() {
+        SessionSummarySource::LocalFile
+    } else {
+        SessionSummarySource::ObservedOnly
+    };
+    Some(SessionSummary {
+        id: sid,
+        path: path.unwrap_or_default(),
+        cwd: row.cwd.clone(),
+        created_at: None,
+        updated_at: updated_at.clone(),
+        last_response_at: updated_at,
+        user_turns: turns,
+        assistant_turns: turns,
+        rounds: turns,
+        first_user_message: Some(session_history_bridge_summary(row, lang)),
+        source,
+        sort_hint_ms,
+    })
 }
 
 fn session_list_control_label(row: &SessionRow) -> String {
