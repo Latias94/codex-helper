@@ -16,7 +16,7 @@ pub enum TrayAction {
     ReloadConfig,
     SwitchOn,
     SwitchOff,
-    /// Persist `active` to local config and (if possible) reload proxy runtime.
+    /// Prefer persisted station control-plane; fall back to local config save when no live proxy is manageable.
     SetActiveConfig {
         service: crate::config::ServiceKind,
         name: String,
@@ -24,10 +24,6 @@ pub enum TrayAction {
     /// Apply API v1 global override (pinned). `None` means <auto>.
     ApplyPinnedConfig {
         name: Option<String>,
-    },
-    /// Select and apply a routing preset (best-effort).
-    ApplyRoutingProfile {
-        name: String,
     },
     OpenConfig,
     OpenLogs,
@@ -44,8 +40,6 @@ pub struct TrayMenuModel {
     pub active_display: Option<String>,
     pub configs: Vec<crate::dashboard_core::ConfigOption>,
     pub global_override: Option<String>,
-    pub routing_profiles: Vec<super::config::RoutingProfile>,
-    pub selected_routing_profile: Option<String>,
 }
 
 pub struct TrayController {
@@ -236,21 +230,6 @@ fn compute_menu_sig(m: &TrayMenuModel) -> String {
         s.push_str(&c.level.to_string());
         s.push('|');
     }
-    s.push_str("|profiles=");
-    for p in m.routing_profiles.iter() {
-        s.push_str(&p.name);
-        s.push(',');
-        s.push_str(p.service.as_str());
-        s.push(',');
-        if let Some(port) = p.port {
-            s.push_str(&port.to_string());
-        } else {
-            s.push('-');
-        }
-        s.push('|');
-    }
-    s.push_str("|sel=");
-    s.push_str(m.selected_routing_profile.as_deref().unwrap_or("-"));
     s
 }
 
@@ -428,39 +407,6 @@ fn build_menu_base(
             }
         }
         quick.append(&pinned_menu)?;
-
-        // Routing profiles (best-effort apply).
-        let profiles_menu = Submenu::new(pick(lang, "路由预设", "Routing presets"), true);
-        if model.routing_profiles.is_empty() {
-            profiles_menu.append(&MenuItem::new(pick(lang, "（无）", "(none)"), false, None))?;
-        } else {
-            let sel = model.selected_routing_profile.as_deref();
-            for p in model.routing_profiles.iter() {
-                let mut label = p.name.clone();
-                if !p.service.trim().is_empty() {
-                    label.push_str(&format!(" [{}]", p.service));
-                }
-                if let Some(port) = p.port {
-                    label.push_str(&format!(":{port}"));
-                }
-                let id = menu_id("codex-helper-gui.tray.routing", p.name.as_str());
-                let item = CheckMenuItem::with_id(
-                    id.clone(),
-                    label,
-                    true,
-                    sel == Some(p.name.as_str()),
-                    None,
-                );
-                dynamic_actions.insert(
-                    id,
-                    TrayAction::ApplyRoutingProfile {
-                        name: p.name.clone(),
-                    },
-                );
-                profiles_menu.append(&item)?;
-            }
-        }
-        quick.append(&profiles_menu)?;
 
         menu.append(&quick)?;
         menu.append(&PredefinedMenuItem::separator())?;

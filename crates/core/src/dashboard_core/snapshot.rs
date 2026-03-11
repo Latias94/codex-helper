@@ -44,6 +44,10 @@ pub struct ApiV1Snapshot {
     pub configs: Vec<ConfigOption>,
     #[serde(default)]
     pub stations: Vec<StationOption>,
+    #[serde(default)]
+    pub configured_active_station: Option<String>,
+    #[serde(default)]
+    pub effective_active_station: Option<String>,
     pub default_profile: Option<String>,
     #[serde(default)]
     pub profiles: Vec<ControlProfileOption>,

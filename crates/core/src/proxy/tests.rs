@@ -161,6 +161,7 @@ async fn send_responses_json(
 
 #[tokio::test]
 async fn proxy_api_v1_capabilities_and_overrides_work() {
+    let _env_lock = env_lock();
     let mut cfg = make_proxy_config(
         vec![UpstreamConfig {
             base_url: "http://127.0.0.1:9/v1".to_string(),
@@ -252,7 +253,27 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations/config-active"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations/{name}"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles/default"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles/config-default"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles/{name}"))
     }));
     let host_local_history = crate::config::codex_sessions_dir().is_dir();
     assert_eq!(
@@ -274,6 +295,26 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert_eq!(
         caps["host_local_capabilities"]["cwd_enrichment"].as_bool(),
         Some(host_local_history)
+    );
+    assert_eq!(
+        caps["remote_admin_access"]["loopback_without_token"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["remote_admin_access"]["remote_requires_token"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["remote_admin_access"]["remote_enabled"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        caps["remote_admin_access"]["token_header"].as_str(),
+        Some(crate::proxy::ADMIN_TOKEN_HEADER)
+    );
+    assert_eq!(
+        caps["remote_admin_access"]["token_env_var"].as_str(),
+        Some(crate::proxy::ADMIN_TOKEN_ENV_VAR)
     );
 
     let set_global = client
@@ -478,6 +519,533 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(!tier_map.contains_key("s2"));
 
     proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_profile_config_crud_persists_and_clears_stale_runtime_override() {
+    let _env_lock = env_lock();
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let mut cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::from([
+                ("gpt-5.4".to_string(), true),
+                ("gpt-5.4-mini".to_string(), true),
+            ]),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    cfg.version = Some(2);
+    cfg.codex.default_profile = Some("fast".to_string());
+    cfg.codex.profiles.insert(
+        "fast".to_string(),
+        ServiceControlProfile {
+            station: Some("test".to_string()),
+            model: Some("gpt-5.4-mini".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            service_tier: Some("priority".to_string()),
+        },
+    );
+
+    let v2 = crate::config::migrate_legacy_to_v2(&cfg);
+    crate::config::save_config_v2(&v2)
+        .await
+        .expect("write initial v2 config");
+    let loaded = crate::config::load_config()
+        .await
+        .expect("load initial runtime config");
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(loaded),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let upsert = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/profiles/steady",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "station": "test",
+            "model": "gpt-5.4",
+            "reasoning_effort": "medium",
+            "service_tier": "default",
+        }))
+        .send()
+        .await
+        .expect("upsert profile send");
+    assert_eq!(upsert.status(), StatusCode::OK);
+    let upsert_body = upsert
+        .json::<serde_json::Value>()
+        .await
+        .expect("upsert profile json");
+    assert_eq!(
+        upsert_body
+            .get("configured_default_profile")
+            .and_then(|value| value.as_str()),
+        Some("fast")
+    );
+    assert!(upsert_body["profiles"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.get("name").and_then(|value| value.as_str()) == Some("steady"))
+    }));
+
+    let set_config_default = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/profiles/config-default",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "profile_name": "steady" }))
+        .send()
+        .await
+        .expect("set persisted default send");
+    assert_eq!(set_config_default.status(), StatusCode::OK);
+    let set_config_default_body = set_config_default
+        .json::<serde_json::Value>()
+        .await
+        .expect("set persisted default json");
+    assert_eq!(
+        set_config_default_body
+            .get("configured_default_profile")
+            .and_then(|value| value.as_str()),
+        Some("steady")
+    );
+    assert_eq!(
+        set_config_default_body
+            .get("default_profile")
+            .and_then(|value| value.as_str()),
+        Some("steady")
+    );
+
+    let set_runtime_default = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/profiles/default",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "profile_name": "fast" }))
+        .send()
+        .await
+        .expect("set runtime default send");
+    assert_eq!(set_runtime_default.status(), StatusCode::NO_CONTENT);
+
+    let delete_fast = client
+        .delete(format!(
+            "http://{}/__codex_helper/api/v1/profiles/fast",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("delete profile send");
+    assert_eq!(delete_fast.status(), StatusCode::OK);
+    let delete_body = delete_fast
+        .json::<serde_json::Value>()
+        .await
+        .expect("delete profile json");
+    assert_eq!(
+        delete_body
+            .get("configured_default_profile")
+            .and_then(|value| value.as_str()),
+        Some("steady")
+    );
+    assert_eq!(
+        delete_body
+            .get("default_profile")
+            .and_then(|value| value.as_str()),
+        Some("steady")
+    );
+    assert!(delete_body["profiles"].as_array().is_some_and(|items| {
+        items.len() == 1 && items[0].get("name").and_then(|value| value.as_str()) == Some("steady")
+    }));
+
+    let reloaded_cfg = crate::config::load_config()
+        .await
+        .expect("reload config from disk after CRUD");
+    assert_eq!(
+        reloaded_cfg.codex.default_profile.as_deref(),
+        Some("steady")
+    );
+    assert!(reloaded_cfg.codex.profiles.contains_key("steady"));
+    assert!(!reloaded_cfg.codex.profiles.contains_key("fast"));
+    assert_eq!(
+        reloaded_cfg
+            .codex
+            .profiles
+            .get("steady")
+            .and_then(|profile| profile.model.as_deref()),
+        Some("gpt-5.4")
+    );
+
+    let config_text =
+        std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
+    assert!(config_text.contains("[codex.profiles.steady]"));
+    assert!(!config_text.contains("[codex.profiles.fast]"));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_station_config_crud_persists_active_and_meta() {
+    let _env_lock = env_lock();
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let mut cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    cfg.version = Some(2);
+    cfg.codex.configs.insert(
+        "zeta".to_string(),
+        ServiceConfig {
+            name: "zeta".to_string(),
+            alias: Some("backup".to_string()),
+            enabled: true,
+            level: 2,
+            upstreams: vec![UpstreamConfig {
+                base_url: "http://127.0.0.1:10/v1".to_string(),
+                auth: UpstreamAuth::default(),
+                tags: HashMap::new(),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        },
+    );
+
+    let v2 = crate::config::migrate_legacy_to_v2(&cfg);
+    crate::config::save_config_v2(&v2)
+        .await
+        .expect("write initial v2 config");
+    let loaded = crate::config::load_config()
+        .await
+        .expect("load initial runtime config");
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(loaded),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let update_station = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/stations/zeta",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "enabled": false,
+            "level": 7,
+        }))
+        .send()
+        .await
+        .expect("update station send");
+    assert_eq!(update_station.status(), StatusCode::NO_CONTENT);
+
+    let set_active = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/stations/config-active",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "station_name": "zeta",
+        }))
+        .send()
+        .await
+        .expect("set persisted active station send");
+    assert_eq!(set_active.status(), StatusCode::NO_CONTENT);
+
+    let snapshot = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/snapshot",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("snapshot send")
+        .error_for_status()
+        .expect("snapshot status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("snapshot json");
+    assert_eq!(
+        snapshot
+            .get("configured_active_station")
+            .and_then(|value| value.as_str()),
+        Some("zeta")
+    );
+    assert_eq!(
+        snapshot
+            .get("effective_active_station")
+            .and_then(|value| value.as_str()),
+        Some("zeta")
+    );
+
+    let stations = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/stations",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("stations send")
+        .error_for_status()
+        .expect("stations status")
+        .json::<Vec<crate::dashboard_core::StationOption>>()
+        .await
+        .expect("stations json");
+    let zeta = stations
+        .iter()
+        .find(|station| station.name == "zeta")
+        .expect("zeta station");
+    assert!(!zeta.enabled);
+    assert_eq!(zeta.level, 7);
+    assert_eq!(zeta.configured_enabled, false);
+    assert_eq!(zeta.configured_level, 7);
+
+    let clear_active = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/stations/config-active",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "station_name": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .expect("clear persisted active station send");
+    assert_eq!(clear_active.status(), StatusCode::NO_CONTENT);
+
+    let snapshot = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/snapshot",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("snapshot after clear send")
+        .error_for_status()
+        .expect("snapshot after clear status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("snapshot after clear json");
+    assert_eq!(
+        snapshot
+            .get("configured_active_station")
+            .and_then(|value| value.as_str()),
+        None
+    );
+    assert_eq!(
+        snapshot
+            .get("effective_active_station")
+            .and_then(|value| value.as_str()),
+        Some("test")
+    );
+
+    let reloaded_cfg = crate::config::load_config()
+        .await
+        .expect("reload config from disk after station CRUD");
+    assert_eq!(reloaded_cfg.codex.active.as_deref(), None);
+    let zeta = reloaded_cfg
+        .codex
+        .configs
+        .get("zeta")
+        .expect("zeta config from disk");
+    assert!(!zeta.enabled);
+    assert_eq!(zeta.level, 7);
+
+    let config_text =
+        std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
+    assert!(config_text.contains("[codex.stations.zeta]"));
+    assert!(config_text.contains("enabled = false"));
+    assert!(config_text.contains("level = 7"));
+    assert!(!config_text.contains("active_station = \"zeta\""));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_capabilities_report_remote_enabled_when_admin_token_configured() {
+    let _env_lock = env_lock();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set(super::ADMIN_TOKEN_ENV_VAR, "remote-secret");
+    }
+
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let caps = Client::new()
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/capabilities",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("caps send")
+        .error_for_status()
+        .expect("caps status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("caps json");
+    assert_eq!(
+        caps["remote_admin_access"]["loopback_without_token"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["remote_admin_access"]["remote_requires_token"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["remote_admin_access"]["remote_enabled"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["remote_admin_access"]["token_header"].as_str(),
+        Some(super::ADMIN_TOKEN_HEADER)
+    );
+    assert_eq!(
+        caps["remote_admin_access"]["token_env_var"].as_str(),
+        Some(super::ADMIN_TOKEN_ENV_VAR)
+    );
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_sessions_report_client_identity_from_request_context() {
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": "resp_test",
+                    "output": [],
+                })),
+            )
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{upstream_addr}/v1"),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::from([("provider_id".to_string(), "u1".to_string())]),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = Client::new();
+    let response = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("session_id", "sid-client")
+        .header(super::CLIENT_NAME_HEADER, "Frank-Desk")
+        .header("user-agent", "Codex CLI/0.1")
+        .body(r#"{"input":"hi"}"#)
+        .send()
+        .await
+        .expect("responses send");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sessions = client
+        .get(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/sessions"
+        ))
+        .send()
+        .await
+        .expect("sessions send")
+        .error_for_status()
+        .expect("sessions status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("sessions json");
+    let sessions = sessions.as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0]
+            .get("session_id")
+            .and_then(|value| value.as_str()),
+        Some("sid-client")
+    );
+    assert_eq!(
+        sessions[0]
+            .get("last_client_name")
+            .and_then(|value| value.as_str()),
+        Some("Frank-Desk")
+    );
+    assert_eq!(
+        sessions[0]
+            .get("last_client_addr")
+            .and_then(|value| value.as_str()),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        sessions[0]
+            .get("observation_scope")
+            .and_then(|value| value.as_str()),
+        Some("observed_only")
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
 }
 
 #[tokio::test]
@@ -724,6 +1292,8 @@ async fn proxy_api_v1_snapshot_works() {
             "POST",
             "/v1/responses",
             Some("sid-1".to_string()),
+            Some("Frank-Desk".to_string()),
+            Some("100.64.0.12".to_string()),
             Some("G:/codes/demo".to_string()),
             Some("gpt-5.4".to_string()),
             Some("medium".to_string()),

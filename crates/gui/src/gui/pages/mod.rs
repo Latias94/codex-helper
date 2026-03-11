@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::autostart;
 use super::config::GuiConfig;
@@ -12,13 +12,14 @@ use super::util::{
 };
 use crate::dashboard_core::{
     CapabilitySupport, ConfigCapabilitySummary, ConfigOption, ControlProfileOption,
-    ModelCatalogKind,
+    HostLocalControlPlaneCapabilities, ModelCatalogKind, RemoteAdminAccessCapabilities,
 };
 use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::{SessionSummary, SessionSummarySource};
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView,
-    ResolvedRouteValue, RouteValueSource, RuntimeConfigState, SessionIdentityCard, SessionStats,
+    ResolvedRouteValue, RouteValueSource, RuntimeConfigState, SessionIdentityCard,
+    SessionObservationScope, SessionStats,
 };
 use crate::usage::UsageMetrics;
 
@@ -45,18 +46,12 @@ pub enum Page {
 pub struct ViewState {
     pub requested_page: Option<Page>,
     pub setup: SetupViewState,
-    pub overview: OverviewViewState,
     pub stations: StationsViewState,
     pub doctor: DoctorViewState,
     pub sessions: SessionsViewState,
     pub requests: RequestsViewState,
     pub config: ConfigViewState,
     pub history: HistoryViewState,
-}
-
-#[derive(Debug, Default)]
-pub struct OverviewViewState {
-    pub new_routing_profile_name: String,
 }
 
 #[derive(Debug, Default)]
@@ -99,6 +94,10 @@ pub struct ConfigViewState {
     mode: ConfigMode,
     service: crate::config::ServiceKind,
     selected_name: Option<String>,
+    station_editor: ConfigStationEditorState,
+    selected_profile_name: Option<String>,
+    new_profile_name: String,
+    profile_editor: ConfigProfileEditorState,
     working: Option<ConfigWorkingDocument>,
     load_error: Option<String>,
     import_codex: ImportCodexModalState,
@@ -110,11 +109,31 @@ impl Default for ConfigViewState {
             mode: ConfigMode::Form,
             service: crate::config::ServiceKind::Codex,
             selected_name: None,
+            station_editor: ConfigStationEditorState::default(),
+            selected_profile_name: None,
+            new_profile_name: String::new(),
+            profile_editor: ConfigProfileEditorState::default(),
             working: None,
             load_error: None,
             import_codex: ImportCodexModalState::default(),
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct ConfigStationEditorState {
+    station_name: Option<String>,
+    enabled: bool,
+    level: u8,
+}
+
+#[derive(Debug, Default)]
+struct ConfigProfileEditorState {
+    profile_name: Option<String>,
+    station: Option<String>,
+    model: String,
+    reasoning_effort: String,
+    service_tier: String,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +269,154 @@ fn attached_host_local_session_features_available(
     host_local_session_history: bool,
 ) -> bool {
     management_base_url_is_loopback(admin_base_url) && host_local_session_history
+}
+
+fn format_host_local_capability_summary(
+    caps: &HostLocalControlPlaneCapabilities,
+    lang: Language,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if caps.session_history {
+        parts.push(pick(lang, "会话历史", "session history"));
+    }
+    if caps.transcript_read {
+        parts.push(pick(lang, "对话读取", "transcript read"));
+    }
+    if caps.cwd_enrichment {
+        parts.push(pick(lang, "cwd 补全", "cwd enrichment"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" / "))
+    }
+}
+
+pub(super) fn remote_local_only_warning_message(
+    admin_base_url: &str,
+    caps: &HostLocalControlPlaneCapabilities,
+    lang: Language,
+    requested_features: &[&str],
+) -> Option<String> {
+    if management_base_url_is_loopback(admin_base_url) {
+        return None;
+    }
+
+    let requested = if requested_features.is_empty() {
+        pick(lang, "这些功能", "these features").to_string()
+    } else {
+        requested_features.join(" / ")
+    };
+
+    match (lang, format_host_local_capability_summary(caps, lang)) {
+        (Language::Zh, Some(summary)) => Some(format!(
+            "当前是远端附着：{requested} 属于 host-local 功能，这台设备不能直接访问。附着目标声明这些能力只在代理主机本地可用：{summary}；如需使用，请在代理主机上运行 codex-helper GUI。"
+        )),
+        (Language::Zh, None) => Some(format!(
+            "当前是远端附着：{requested} 属于 host-local 功能，这台设备不能直接访问。附着目标也没有声明可供主机本地使用的 session/transcript/cwd 能力；如需使用，请切回本机代理或在代理主机上运行 codex-helper GUI。"
+        )),
+        (Language::En, Some(summary)) => Some(format!(
+            "This is a remote attach: {requested} are host-local features and are not directly available from this device. The attached target reports these as host-only capabilities on the proxy machine: {summary}. Run codex-helper GUI on the proxy host to use them."
+        )),
+        (Language::En, None) => Some(format!(
+            "This is a remote attach: {requested} are host-local features and are not directly available from this device. The attached target does not advertise host-local session/transcript/cwd capabilities either. Use a local proxy on this device or run codex-helper GUI on the proxy host."
+        )),
+    }
+}
+
+fn remote_admin_token_present() -> bool {
+    std::env::var(crate::proxy::ADMIN_TOKEN_ENV_VAR)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn remote_admin_access_short_label(
+    admin_base_url: &str,
+    caps: &RemoteAdminAccessCapabilities,
+    lang: Language,
+) -> Option<String> {
+    if management_base_url_is_loopback(admin_base_url) {
+        return None;
+    }
+    if !caps.remote_enabled {
+        return Some(
+            pick(lang, "远端 admin 未开放", "Remote admin locked to loopback").to_string(),
+        );
+    }
+    if !remote_admin_token_present() {
+        return Some(
+            pick(
+                lang,
+                "远端 admin 需 token（本机未设置）",
+                "Remote admin needs token (client missing)",
+            )
+            .to_string(),
+        );
+    }
+    Some(pick(lang, "远端 admin 已启用 token", "Remote admin token ready").to_string())
+}
+
+fn remote_admin_access_message(
+    admin_base_url: &str,
+    caps: &RemoteAdminAccessCapabilities,
+    lang: Language,
+) -> Option<String> {
+    if management_base_url_is_loopback(admin_base_url) {
+        return None;
+    }
+
+    if !caps.remote_enabled {
+        return Some(match lang {
+            Language::Zh => format!(
+                "当前目标的 admin 控制面仍是 loopback-only。要允许 LAN/Tailscale 设备附着，请在代理主机设置环境变量 {}，客户端随后需通过请求头 {} 发送相同 token。",
+                caps.token_env_var, caps.token_header
+            ),
+            Language::En => format!(
+                "This target keeps its admin control plane loopback-only. To allow LAN/Tailscale attach, set {} on the proxy host, then clients must send the same token via header {}.",
+                caps.token_env_var, caps.token_header
+            ),
+        });
+    }
+
+    if !remote_admin_token_present() {
+        return Some(match lang {
+            Language::Zh => format!(
+                "目标已开放远端 admin，但当前 GUI 进程未设置 {}。若继续远端附着，admin 请求会被拒绝；请在当前设备设置该环境变量，并让其值与代理主机一致，请求头名为 {}。",
+                caps.token_env_var, caps.token_header
+            ),
+            Language::En => format!(
+                "The target allows remote admin, but this GUI process has no {} set. Remote attach admin requests will be rejected until this device provides the same token; the required header name is {}.",
+                caps.token_env_var, caps.token_header
+            ),
+        });
+    }
+
+    Some(match lang {
+        Language::Zh => format!(
+            "当前远端 admin 将通过环境变量 {} 注入，并以请求头 {} 发送。请确保客户端与代理主机使用相同 token。",
+            caps.token_env_var, caps.token_header
+        ),
+        Language::En => format!(
+            "Remote admin will use the token from env {} and send it via header {}. Ensure the client and proxy host use the same token value.",
+            caps.token_env_var, caps.token_header
+        ),
+    })
+}
+
+fn merge_info_message<I>(base: String, extras: I) -> String
+where
+    I: IntoIterator<Item = String>,
+{
+    let extras = extras
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    if extras.is_empty() {
+        base
+    } else {
+        format!("{base} {}", extras.join(" "))
+    }
 }
 
 pub(super) fn host_local_session_features_available(
@@ -533,11 +700,51 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                     Some(v) => format!("v{v}"),
                                     None => "-".to_string(),
                                 });
-                                if let Some(err) = p.last_error.as_deref() {
-                                    ui.label(err);
-                                } else {
-                                    ui.label(pick(ctx.lang, "可用", "OK"));
-                                }
+                                ui.vertical(|ui| {
+                                    if let Some(err) = p.last_error.as_deref() {
+                                        ui.label(err);
+                                    } else {
+                                        ui.label(pick(ctx.lang, "可用", "OK"));
+                                    }
+                                    if let Some(warning) = remote_local_only_warning_message(
+                                        p.admin_base_url.as_str(),
+                                        &p.host_local_capabilities,
+                                        ctx.lang,
+                                        &[
+                                            pick(ctx.lang, "cwd", "cwd"),
+                                            pick(ctx.lang, "transcript", "transcript"),
+                                            pick(ctx.lang, "resume", "resume"),
+                                        ],
+                                    ) {
+                                        ui.small(pick(
+                                            ctx.lang,
+                                            "远端附着：本机禁用 host-local 功能",
+                                            "Remote attach: no host-local access here",
+                                        ))
+                                        .on_hover_text(warning);
+                                    }
+                                    if let Some(label) = remote_admin_access_short_label(
+                                        p.admin_base_url.as_str(),
+                                        &p.remote_admin_access,
+                                        ctx.lang,
+                                    ) {
+                                        let color = if p.remote_admin_access.remote_enabled
+                                            && remote_admin_token_present()
+                                        {
+                                            egui::Color32::from_rgb(60, 160, 90)
+                                        } else {
+                                            egui::Color32::from_rgb(200, 120, 40)
+                                        };
+                                        let response = ui.colored_label(color, label);
+                                        if let Some(message) = remote_admin_access_message(
+                                            p.admin_base_url.as_str(),
+                                            &p.remote_admin_access,
+                                            ctx.lang,
+                                        ) {
+                                            response.on_hover_text(message);
+                                        }
+                                    }
+                                });
 
                                 if ui.button(pick(ctx.lang, "附着", "Attach")).clicked() {
                                     action_attach_discovered = Some(p.clone());
@@ -781,6 +988,22 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     }
 
     if let Some(proxy) = action_attach_discovered {
+        let warning = remote_local_only_warning_message(
+            proxy.admin_base_url.as_str(),
+            &proxy.host_local_capabilities,
+            ctx.lang,
+            &[
+                pick(ctx.lang, "cwd", "cwd"),
+                pick(ctx.lang, "transcript", "transcript"),
+                pick(ctx.lang, "resume", "resume"),
+                pick(ctx.lang, "open file", "open file"),
+            ],
+        );
+        let admin_message = remote_admin_access_message(
+            proxy.admin_base_url.as_str(),
+            &proxy.remote_admin_access,
+            ctx.lang,
+        );
         ctx.proxy
             .request_attach_with_admin_base(proxy.port, Some(proxy.admin_base_url.clone()));
         ctx.proxy.set_desired_port(proxy.port);
@@ -789,7 +1012,10 @@ fn render_setup(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         if let Err(e) = ctx.gui_cfg.save() {
             *ctx.last_error = Some(format!("save gui config failed: {e}"));
         } else {
-            *ctx.last_info = Some(pick(ctx.lang, "已附着到代理", "Attached").to_string());
+            *ctx.last_info = Some(merge_info_message(
+                pick(ctx.lang, "已附着到代理。", "Attached.").to_string(),
+                [warning, admin_message].into_iter().flatten(),
+            ));
         }
     }
 }
@@ -1187,11 +1413,51 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                             Some(v) => format!("v{v}"),
                                             None => "-".to_string(),
                                         });
-                                        if let Some(err) = p.last_error.as_deref() {
-                                            ui.label(err);
-                                        } else {
-                                            ui.label(pick(ctx.lang, "可用", "OK"));
-                                        }
+                                        ui.vertical(|ui| {
+                                            if let Some(err) = p.last_error.as_deref() {
+                                                ui.label(err);
+                                            } else {
+                                                ui.label(pick(ctx.lang, "可用", "OK"));
+                                            }
+                                            if let Some(warning) = remote_local_only_warning_message(
+                                                p.admin_base_url.as_str(),
+                                                &p.host_local_capabilities,
+                                                ctx.lang,
+                                                &[
+                                                    pick(ctx.lang, "cwd", "cwd"),
+                                                    pick(ctx.lang, "transcript", "transcript"),
+                                                    pick(ctx.lang, "resume", "resume"),
+                                                ],
+                                            ) {
+                                                ui.small(pick(
+                                                    ctx.lang,
+                                                    "远端附着：本机禁用 host-local 功能",
+                                                    "Remote attach: no host-local access here",
+                                                ))
+                                                .on_hover_text(warning);
+                                            }
+                                            if let Some(label) = remote_admin_access_short_label(
+                                                p.admin_base_url.as_str(),
+                                                &p.remote_admin_access,
+                                                ctx.lang,
+                                            ) {
+                                                let color = if p.remote_admin_access.remote_enabled
+                                                    && remote_admin_token_present()
+                                                {
+                                                    egui::Color32::from_rgb(60, 160, 90)
+                                                } else {
+                                                    egui::Color32::from_rgb(200, 120, 40)
+                                                };
+                                                let response = ui.colored_label(color, label);
+                                                if let Some(message) = remote_admin_access_message(
+                                                    p.admin_base_url.as_str(),
+                                                    &p.remote_admin_access,
+                                                    ctx.lang,
+                                                ) {
+                                                    response.on_hover_text(message);
+                                                }
+                                            }
+                                        });
 
                                         if ui
                                             .add_enabled(
@@ -1212,7 +1478,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         ui.add_space(8.0);
         ui.separator();
-        render_routing_presets(ui, ctx);
+        render_profile_management_entrypoint(ui, ctx);
 
         render_overview_station_summary(ui, ctx);
     });
@@ -1374,6 +1640,44 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         "Tip: attached mode won't change your local config file, but runtime controls above can still act on the remote proxy process when supported.",
                     ),
                 );
+                if let Some(warning) = remote_local_only_warning_message(
+                    att.admin_base_url.as_str(),
+                    &att.host_local_capabilities,
+                    ctx.lang,
+                    &[
+                        pick(ctx.lang, "cwd", "cwd"),
+                        pick(ctx.lang, "transcript", "transcript"),
+                        pick(ctx.lang, "resume", "resume"),
+                        pick(ctx.lang, "open file", "open file"),
+                    ],
+                ) {
+                    ui.colored_label(egui::Color32::from_rgb(200, 120, 40), warning);
+                }
+                if let Some(label) = remote_admin_access_short_label(
+                    att.admin_base_url.as_str(),
+                    &att.remote_admin_access,
+                    ctx.lang,
+                ) {
+                    let color =
+                        if att.remote_admin_access.remote_enabled && remote_admin_token_present() {
+                            egui::Color32::from_rgb(60, 160, 90)
+                        } else {
+                            egui::Color32::from_rgb(200, 120, 40)
+                        };
+                    let response = ui.colored_label(color, label);
+                    let remote_admin_message = remote_admin_access_message(
+                        att.admin_base_url.as_str(),
+                        &att.remote_admin_access,
+                        ctx.lang,
+                    );
+                    if let Some(message) = remote_admin_message.clone() {
+                        response.on_hover_text(message.clone());
+                        if !att.remote_admin_access.remote_enabled || !remote_admin_token_present()
+                        {
+                            ui.colored_label(egui::Color32::from_rgb(200, 120, 40), message);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1391,13 +1695,32 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     }
 
     if let Some(proxy) = action_attach_discovered {
+        let warning = remote_local_only_warning_message(
+            proxy.admin_base_url.as_str(),
+            &proxy.host_local_capabilities,
+            ctx.lang,
+            &[
+                pick(ctx.lang, "cwd", "cwd"),
+                pick(ctx.lang, "transcript", "transcript"),
+                pick(ctx.lang, "resume", "resume"),
+                pick(ctx.lang, "open file", "open file"),
+            ],
+        );
+        let admin_message = remote_admin_access_message(
+            proxy.admin_base_url.as_str(),
+            &proxy.remote_admin_access,
+            ctx.lang,
+        );
         ctx.proxy
             .request_attach_with_admin_base(proxy.port, Some(proxy.admin_base_url.clone()));
         ctx.gui_cfg.attach.last_port = Some(proxy.port);
         if let Err(e) = ctx.gui_cfg.save() {
             *ctx.last_error = Some(format!("save gui config failed: {e}"));
         } else {
-            *ctx.last_info = Some(pick(ctx.lang, "正在附着…", "Attaching...").into());
+            *ctx.last_info = Some(merge_info_message(
+                pick(ctx.lang, "正在附着…", "Attaching...").to_string(),
+                [warning, admin_message].into_iter().flatten(),
+            ));
         }
     }
 
@@ -1755,6 +2078,31 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 )
             },
         );
+        if matches!(snapshot.kind, ProxyModeKind::Attached)
+            && let Some(base_url) = snapshot.base_url.as_deref()
+            && let Some(label) = remote_admin_access_short_label(
+                base_url,
+                &snapshot.remote_admin_access,
+                ctx.lang,
+            )
+        {
+            let color = if snapshot.remote_admin_access.remote_enabled
+                && remote_admin_token_present()
+            {
+                egui::Color32::from_rgb(60, 160, 90)
+            } else {
+                egui::Color32::from_rgb(200, 120, 40)
+            };
+            let response = ui.colored_label(color, label);
+            if let Some(message) =
+                remote_admin_access_message(base_url, &snapshot.remote_admin_access, ctx.lang)
+            {
+                response.on_hover_text(message.clone());
+                if !snapshot.remote_admin_access.remote_enabled || !remote_admin_token_present() {
+                    ui.colored_label(egui::Color32::from_rgb(200, 120, 40), message);
+                }
+            }
+        }
     });
 
     ui.add_space(8.0);
@@ -2361,393 +2709,30 @@ fn render_stations(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ctx.view.stations.selected_name = selected_name;
 }
 
-fn render_routing_presets(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
-    ui.label(pick(ctx.lang, "旧版路由预设", "Legacy routing presets"));
+fn render_profile_management_entrypoint(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
+    ui.label(pick(ctx.lang, "控制 profiles", "Control profiles"));
     ui.colored_label(
         egui::Color32::from_rgb(120, 120, 120),
         pick(
             ctx.lang,
-            "提示：这是旧版 GUI preset；新的 control profile 来自代理配置中的 [codex.profiles.*]，更适合会话级控制。",
-            "Tip: this is the legacy GUI preset layer; new control profiles come from proxy config [codex.profiles.*].",
+            "旧版 GUI routing preset 已停用。现在统一使用代理配置里的 [codex.profiles.*]；默认 profile 在“配置”页管理，单会话覆盖在“会话”页管理。",
+            "Legacy GUI routing presets are retired. Use [codex.profiles.*] in proxy config instead; manage default profiles in Config and per-session overrides in Sessions.",
         ),
     );
-
-    let snapshot = ctx.proxy.snapshot();
-
-    // Select preset (persisted).
-    let old_selected = ctx.gui_cfg.routing.selected_profile.clone();
-    let mut selected = old_selected.clone();
     ui.horizontal(|ui| {
-        ui.label(pick(ctx.lang, "选择预设", "Preset"));
-        egui::ComboBox::from_id_salt("routing_profile_select")
-            .selected_text(match selected.as_deref() {
-                Some(v) => v.to_string(),
-                None => pick(ctx.lang, "<无>", "<none>").to_string(),
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut selected, None, pick(ctx.lang, "<无>", "<none>"));
-                for p in ctx.gui_cfg.routing.profiles.iter() {
-                    let mut label = p.name.clone();
-                    if !p.service.trim().is_empty() {
-                        label.push_str(&format!(" [{}]", p.service));
-                    }
-                    if let Some(port) = p.port {
-                        label.push_str(&format!(":{port}"));
-                    }
-                    ui.selectable_value(&mut selected, Some(p.name.clone()), label);
-                }
-            });
-    });
-    if selected != old_selected {
-        ctx.gui_cfg.routing.selected_profile = selected.clone();
-        if let Err(e) = ctx.gui_cfg.save() {
-            *ctx.last_error = Some(format!("save gui config failed: {e}"));
-        }
-    }
-
-    // Apply-on-connect (persisted).
-    let old_apply = ctx.gui_cfg.routing.apply_on_connect;
-    let mut apply_on_connect = old_apply;
-    ui.horizontal(|ui| {
-        ui.checkbox(
-            &mut apply_on_connect,
-            pick(
-                ctx.lang,
-                "连接后自动应用选中预设（仅 pinned）",
-                "Auto-apply selected preset after connect (pinned only)",
-            ),
-        );
-    });
-    if apply_on_connect != old_apply {
-        ctx.gui_cfg.routing.apply_on_connect = apply_on_connect;
-        if let Err(e) = ctx.gui_cfg.save() {
-            *ctx.last_error = Some(format!("save gui config failed: {e}"));
-        }
-    }
-
-    ui.add_space(6.0);
-
-    // Save current routing as a preset.
-    ui.horizontal(|ui| {
-        ui.label(pick(ctx.lang, "新预设名", "New preset"));
-        ui.text_edit_singleline(&mut ctx.view.overview.new_routing_profile_name);
         if ui
-            .button(pick(ctx.lang, "保存当前为预设", "Save current"))
+            .button(pick(ctx.lang, "前往配置页", "Open Config page"))
             .clicked()
         {
-            let name = ctx
-                .view
-                .overview
-                .new_routing_profile_name
-                .trim()
-                .to_string();
-            if name.is_empty() {
-                *ctx.last_error =
-                    Some(pick(ctx.lang, "预设名不能为空", "Preset name is empty").to_string());
-                return;
-            }
-
-            let svc = match ctx.proxy.desired_service() {
-                crate::config::ServiceKind::Claude => "claude".to_string(),
-                crate::config::ServiceKind::Codex => "codex".to_string(),
-            };
-            let port = Some(ctx.proxy.desired_port());
-            let pinned = snapshot.as_ref().and_then(|s| s.global_override.clone());
-
-            let mut overwritten = false;
-            if let Some(p) = ctx
-                .gui_cfg
-                .routing
-                .profiles
-                .iter_mut()
-                .find(|p| p.name == name)
-            {
-                p.service = svc;
-                p.port = port;
-                p.pinned_config = pinned;
-                overwritten = true;
-            } else {
-                ctx.gui_cfg
-                    .routing
-                    .profiles
-                    .push(super::config::RoutingProfile {
-                        name: name.clone(),
-                        service: svc,
-                        port,
-                        pinned_config: pinned,
-                    });
-            }
-
-            ctx.gui_cfg.routing.selected_profile = Some(name.clone());
-            if let Err(e) = ctx.gui_cfg.save() {
-                *ctx.last_error = Some(format!("save gui config failed: {e}"));
-            } else {
-                *ctx.last_info = Some(
-                    if overwritten {
-                        pick(ctx.lang, "已覆盖预设", "Preset overwritten")
-                    } else {
-                        pick(ctx.lang, "已保存预设", "Preset saved")
-                    }
-                    .to_string(),
-                );
-                ctx.view.overview.new_routing_profile_name.clear();
-            }
+            ctx.view.requested_page = Some(Page::Config);
+        }
+        if ui
+            .button(pick(ctx.lang, "前往会话页", "Open Sessions page"))
+            .clicked()
+        {
+            ctx.view.requested_page = Some(Page::Sessions);
         }
     });
-
-    let selected_name = ctx.gui_cfg.routing.selected_profile.clone();
-    let selected_idx = selected_name.as_ref().and_then(|n| {
-        ctx.gui_cfg
-            .routing
-            .profiles
-            .iter()
-            .position(|p| &p.name == n)
-    });
-    if selected_idx.is_none() && selected_name.is_some() {
-        // Selected preset was deleted/renamed; clean it up.
-        ctx.gui_cfg.routing.selected_profile = None;
-        let _ = ctx.gui_cfg.save();
-    }
-
-    let Some(selected_idx) = selected_idx else {
-        return;
-    };
-
-    let kind = ctx.proxy.kind();
-    let can_apply_service_port = matches!(kind, ProxyModeKind::Stopped);
-
-    let snapshot_service = snapshot
-        .as_ref()
-        .and_then(|s| s.service_name.as_deref())
-        .unwrap_or("");
-    let snapshot_supports_v1 = snapshot.as_ref().is_some_and(|s| s.supports_v1);
-
-    let mut delete_selected = false;
-    let mut profile_changed = false;
-    let mut action_apply_service_port = false;
-    let mut action_apply_pinned_now = false;
-
-    ui.add_space(6.0);
-    ui.group(|ui| {
-        ui.label(pick(ctx.lang, "预设详情", "Preset details"));
-
-        let profile = &mut ctx.gui_cfg.routing.profiles[selected_idx];
-
-        ui.horizontal(|ui| {
-            ui.label(pick(ctx.lang, "服务", "Service"));
-            let mut svc = if profile.service.trim().eq_ignore_ascii_case("claude") {
-                crate::config::ServiceKind::Claude
-            } else {
-                crate::config::ServiceKind::Codex
-            };
-            egui::ComboBox::from_id_salt(format!("routing_profile_service_{selected_idx}"))
-                .selected_text(match svc {
-                    crate::config::ServiceKind::Codex => "codex",
-                    crate::config::ServiceKind::Claude => "claude",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut svc, crate::config::ServiceKind::Codex, "codex");
-                    ui.selectable_value(&mut svc, crate::config::ServiceKind::Claude, "claude");
-                });
-            let next = match svc {
-                crate::config::ServiceKind::Claude => "claude".to_string(),
-                crate::config::ServiceKind::Codex => "codex".to_string(),
-            };
-            if next != profile.service {
-                profile.service = next;
-                profile_changed = true;
-            }
-        });
-
-        ui.horizontal(|ui| {
-            let mut use_port = profile.port.is_some();
-            ui.checkbox(&mut use_port, pick(ctx.lang, "包含端口", "Include port"));
-            let next_port = if use_port {
-                let mut port = profile.port.unwrap_or(ctx.gui_cfg.proxy.default_port);
-                ui.label(pick(ctx.lang, "端口", "Port"));
-                ui.add(egui::DragValue::new(&mut port).range(1..=65535));
-                Some(port)
-            } else {
-                None
-            };
-            if next_port != profile.port {
-                profile.port = next_port;
-                profile_changed = true;
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label(pick(ctx.lang, "固定站点(Pinned)", "Pinned station"));
-
-            let service_matches_snapshot =
-                !snapshot_service.is_empty() && snapshot_service == profile.service;
-            let can_use_combo = snapshot_supports_v1
-                && service_matches_snapshot
-                && snapshot.as_ref().is_some_and(|s| !s.configs.is_empty());
-
-            if can_use_combo {
-                let snapshot = snapshot.as_ref().expect("checked above");
-                let current = profile.pinned_config.clone();
-                let mut selected = current.clone();
-                egui::ComboBox::from_id_salt(format!("routing_profile_pinned_{selected_idx}"))
-                    .selected_text(match selected.as_deref() {
-                        Some(v) => v.to_string(),
-                        None => pick(ctx.lang, "<自动>", "<auto>").to_string(),
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut selected,
-                            None,
-                            pick(ctx.lang, "<自动>", "<auto>"),
-                        );
-                        for cfg in snapshot.configs.iter().filter(|c| c.enabled) {
-                            let label = match cfg.alias.as_deref() {
-                                Some(a) if !a.trim().is_empty() => format!("{} ({a})", cfg.name),
-                                _ => cfg.name.clone(),
-                            };
-                            ui.selectable_value(&mut selected, Some(cfg.name.clone()), label);
-                        }
-                    });
-                if selected != current {
-                    profile.pinned_config = selected;
-                    profile_changed = true;
-                }
-            } else {
-                let mut text = profile.pinned_config.clone().unwrap_or_default();
-                ui.text_edit_singleline(&mut text);
-                let next = if text.trim().is_empty() {
-                    None
-                } else {
-                    Some(text.trim().to_string())
-                };
-                if next != profile.pinned_config {
-                    profile.pinned_config = next;
-                    profile_changed = true;
-                }
-
-                if snapshot.is_some() && !snapshot_supports_v1 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(120, 120, 120),
-                        pick(
-                            ctx.lang,
-                            "当前代理未启用 API v1：Pinned 不可应用。",
-                            "This proxy has no API v1: pinned cannot be applied.",
-                        ),
-                    );
-                } else if snapshot.is_some() && snapshot_supports_v1 && !service_matches_snapshot {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(120, 120, 120),
-                        pick(
-                            ctx.lang,
-                            "提示：预设服务与当前代理服务不一致，为避免误操作，将禁用“立即应用”。",
-                            "Tip: preset service != current proxy service; Apply is disabled.",
-                        ),
-                    );
-                }
-            }
-        });
-
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    can_apply_service_port,
-                    egui::Button::new(pick(ctx.lang, "填入服务/端口", "Apply service/port")),
-                )
-                .clicked()
-            {
-                action_apply_service_port = true;
-            }
-
-            let can_apply_pinned_now =
-                matches!(kind, ProxyModeKind::Running | ProxyModeKind::Attached)
-                    && snapshot_supports_v1
-                    && snapshot_service == profile.service.as_str();
-            if ui
-                .add_enabled(
-                    can_apply_pinned_now,
-                    egui::Button::new(pick(ctx.lang, "立即应用 Pinned", "Apply pinned now")),
-                )
-                .clicked()
-            {
-                action_apply_pinned_now = true;
-            }
-
-            if ui.button(pick(ctx.lang, "删除预设", "Delete")).clicked() {
-                delete_selected = true;
-            }
-        });
-    });
-
-    if profile_changed && let Err(e) = ctx.gui_cfg.save() {
-        *ctx.last_error = Some(format!("save gui config failed: {e}"));
-    }
-
-    if action_apply_service_port {
-        let profile = ctx.gui_cfg.routing.profiles[selected_idx].clone();
-        let svc = if profile.service.trim().eq_ignore_ascii_case("claude") {
-            crate::config::ServiceKind::Claude
-        } else {
-            crate::config::ServiceKind::Codex
-        };
-        ctx.proxy.set_desired_service(svc);
-        ctx.gui_cfg.set_service_kind(svc);
-        if let Some(port) = profile.port {
-            ctx.proxy.set_desired_port(port);
-            ctx.gui_cfg.proxy.default_port = port;
-            ctx.gui_cfg.attach.last_port = Some(port);
-        }
-        if let Err(e) = ctx.gui_cfg.save() {
-            *ctx.last_error = Some(format!("save gui config failed: {e}"));
-        } else {
-            *ctx.last_info =
-                Some(pick(ctx.lang, "已应用服务/端口", "Applied service/port").to_string());
-        }
-    }
-
-    if action_apply_pinned_now {
-        let profile = ctx.gui_cfg.routing.profiles[selected_idx].clone();
-        let target_service = snapshot
-            .as_ref()
-            .and_then(|s| s.service_name.clone())
-            .unwrap_or_default();
-        if !target_service.is_empty() && target_service != profile.service {
-            *ctx.last_error = Some(
-                pick(
-                    ctx.lang,
-                    "预设服务与当前代理服务不一致，已取消应用。",
-                    "Preset service != current proxy service; aborted.",
-                )
-                .to_string(),
-            );
-        } else {
-            match ctx
-                .proxy
-                .apply_global_config_override(ctx.rt, profile.pinned_config.clone())
-            {
-                Ok(()) => {
-                    ctx.proxy
-                        .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
-                    *ctx.last_info = Some(pick(ctx.lang, "已应用全局覆盖", "Applied").to_string());
-                }
-                Err(e) => {
-                    *ctx.last_error = Some(format!("apply global override failed: {e}"));
-                }
-            }
-        }
-    }
-
-    if delete_selected {
-        let name = ctx.gui_cfg.routing.profiles[selected_idx].name.clone();
-        ctx.gui_cfg.routing.profiles.remove(selected_idx);
-        if ctx.gui_cfg.routing.selected_profile.as_deref() == Some(name.as_str()) {
-            ctx.gui_cfg.routing.selected_profile = None;
-        }
-        if let Err(e) = ctx.gui_cfg.save() {
-            *ctx.last_error = Some(format!("save gui config failed: {e}"));
-        } else {
-            *ctx.last_info = Some(pick(ctx.lang, "已删除预设", "Preset deleted").to_string());
-        }
-    }
 }
 
 fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
@@ -3106,7 +3091,16 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         .as_deref()
                         .map(|s| shorten(s, 12))
                         .unwrap_or_else(|| "-".to_string());
-                    let label = format!("{sid}  {cwd}  {active}  st={st}  last={last}  pin={pin}");
+                    let client = format_observed_client_identity(
+                        row.last_client_name.as_deref(),
+                        row.last_client_addr.as_deref(),
+                    )
+                    .map(|value| shorten(value.as_str(), 18))
+                    .unwrap_or_else(|| "-".to_string());
+                    let scope = session_observation_scope_short_label(ctx.lang, row.observation_scope);
+                    let label = format!(
+                        "{sid}  {cwd}  {active}  st={st}  last={last}  pin={pin}  src={client}  {scope}"
+                    );
                     if ui.selectable_label(selected, label).clicked() {
                         ctx.view.sessions.selected_idx = pos;
                         ctx.view.sessions.selected_session_id = row.session_id.clone();
@@ -3123,6 +3117,12 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         };
 
         let sid_full = row.session_id.as_deref().unwrap_or("-");
+        let client_full = format_observed_client_identity(
+            row.last_client_name.as_deref(),
+            row.last_client_addr.as_deref(),
+        )
+        .unwrap_or_else(|| "-".to_string());
+        let observation_scope = session_observation_scope_label(ctx.lang, row.observation_scope);
         let cwd_full = row.cwd.as_deref().unwrap_or("-");
         let provider = row.last_provider_id.as_deref().unwrap_or("-");
         let observed_model = row.last_model.as_deref().unwrap_or("-");
@@ -3146,6 +3146,8 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             format_resolved_route_value(row.effective_service_tier.as_ref(), ctx.lang);
 
         cols[1].label(format!("session: {sid_full}"));
+        cols[1].label(format!("scope: {observation_scope}"));
+        cols[1].label(format!("client(last): {client_full}"));
         cols[1].label(format!("cwd: {cwd_full}"));
         cols[1].label(format!("provider: {provider}"));
         cols[1].label(format!("binding: {binding_profile} ({binding_mode})"));
@@ -3312,11 +3314,22 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
         });
         if !host_local_session_features {
-            cols[1].small(pick(
-                ctx.lang,
-                "提示：远端附着时，cwd / transcript 入口会被禁用；请用 Sessions / Requests 查看共享观测数据。",
-                "Tip: in remote-attached mode, cwd/transcript entries are disabled; use Sessions / Requests for shared observed data.",
-            ));
+            if let Some(att) = ctx.proxy.attached()
+                && let Some(warning) = remote_local_only_warning_message(
+                    att.admin_base_url.as_str(),
+                    &att.host_local_capabilities,
+                    ctx.lang,
+                    &[pick(ctx.lang, "cwd", "cwd"), pick(ctx.lang, "transcript", "transcript")],
+                )
+            {
+                cols[1].small(warning);
+            } else {
+                cols[1].small(pick(
+                    ctx.lang,
+                    "提示：远端附着时，cwd / transcript 入口会被禁用；请用 Sessions / Requests 查看共享观测数据。",
+                    "Tip: in remote-attached mode, cwd/transcript entries are disabled; use Sessions / Requests for shared observed data.",
+                ));
+            }
         }
 
         if let Some(status) = row.last_status {
@@ -3683,6 +3696,8 @@ fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
     }
     for s in [
         row.session_id.as_deref(),
+        row.last_client_name.as_deref(),
+        row.last_client_addr.as_deref(),
         row.cwd.as_deref(),
         row.last_model.as_deref(),
         row.last_service_tier.as_deref(),
@@ -3729,6 +3744,17 @@ fn format_profile_summary(profile: &ControlProfileOption) -> String {
     let effort = profile.reasoning_effort.as_deref().unwrap_or("auto");
     let tier = profile.service_tier.as_deref().unwrap_or("auto");
     format!("station={station}, model={model}, effort={effort}, tier={tier}")
+}
+
+fn service_profile_from_option(
+    profile: &ControlProfileOption,
+) -> crate::config::ServiceControlProfile {
+    crate::config::ServiceControlProfile {
+        station: profile.station.clone(),
+        model: profile.model.clone(),
+        reasoning_effort: profile.reasoning_effort.clone(),
+        service_tier: profile.service_tier.clone(),
+    }
 }
 
 fn sync_session_order(state: &mut SessionsViewState, rows: &[SessionRow]) {
@@ -5271,7 +5297,14 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ctx.view.config.service = svc;
     });
 
-    let (schema_version, active_name, active_fallback, default_profile, station_names) = {
+    let (
+        schema_version,
+        active_name,
+        active_fallback,
+        default_profile,
+        station_names,
+        profile_names,
+    ) = {
         let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_ref() else {
             return;
         };
@@ -5288,16 +5321,69 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             let lb = view.groups.get(b).map(|c| c.level).unwrap_or(1);
             la.cmp(&lb).then_with(|| a.cmp(b))
         });
+        let profiles = view.profiles.keys().cloned().collect::<Vec<_>>();
         (
             cfg.version,
             view.active_group.clone(),
             runtime_mgr.and_then(|mgr| mgr.active_config().map(|cfg| cfg.name.clone())),
             view.default_profile.clone(),
             names,
+            profiles,
         )
     };
 
-    if station_names.is_empty() {
+    let selected_service = match ctx.view.config.service {
+        crate::config::ServiceKind::Claude => "claude",
+        crate::config::ServiceKind::Codex => "codex",
+    };
+    let control_plane_snapshot = ctx.proxy.snapshot().filter(|snapshot| {
+        snapshot.supports_v1 && snapshot.service_name.as_deref() == Some(selected_service)
+    });
+    let station_control_plane_snapshot = control_plane_snapshot
+        .clone()
+        .filter(|snapshot| snapshot.supports_persisted_station_config);
+    let station_control_plane_catalog = station_control_plane_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .configs
+                .iter()
+                .cloned()
+                .map(|config| (config.name.clone(), config))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let station_display_names = if let Some(snapshot) = station_control_plane_snapshot.as_ref() {
+        let mut names = snapshot.configs.clone();
+        names.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+        names
+            .into_iter()
+            .map(|config| config.name)
+            .collect::<Vec<_>>()
+    } else {
+        station_names.clone()
+    };
+    let station_control_plane_enabled = station_control_plane_snapshot.is_some();
+    let station_control_plane_configured_active = station_control_plane_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.configured_active_station.clone());
+    let station_control_plane_effective_active = station_control_plane_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.effective_active_station.clone());
+    let station_default_profile = if station_control_plane_enabled {
+        station_control_plane_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.configured_default_profile.clone())
+            .or_else(|| {
+                station_control_plane_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.default_profile.clone())
+            })
+    } else {
+        default_profile.clone()
+    };
+
+    if station_display_names.is_empty() {
         ui.add_space(6.0);
         ui.label(pick(
             ctx.lang,
@@ -5312,16 +5398,11 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         .config
         .selected_name
         .as_ref()
-        .is_none_or(|n| !station_names.iter().any(|x| x == n))
+        .is_none_or(|n| !station_display_names.iter().any(|x| x == n))
     {
-        ctx.view.config.selected_name = station_names.first().cloned();
+        ctx.view.config.selected_name = station_display_names.first().cloned();
     }
-
     let selected_name = ctx.view.config.selected_name.clone();
-    let selected_service = match ctx.view.config.service {
-        crate::config::ServiceKind::Claude => "claude",
-        crate::config::ServiceKind::Codex => "codex",
-    };
     let selected_station_name = selected_name.clone().unwrap_or_default();
     let (runtime_service, supports_v1, cfg_health, hc_status): (
         Option<String>,
@@ -5365,9 +5446,112 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     let mut action_set_active: Option<String> = None;
     let mut action_clear_active = false;
+    let mut action_set_active_remote: Option<Option<String>> = None;
     let mut action_health_start: Option<(bool, Vec<String>)> = None;
     let mut action_health_cancel: Option<(bool, Vec<String>)> = None;
     let mut action_save_apply = false;
+    let mut action_save_apply_remote: Option<(String, bool, u8)> = None;
+    let mut station_editor_name = ctx.view.config.station_editor.station_name.clone();
+    let mut station_editor_enabled = ctx.view.config.station_editor.enabled;
+    let mut station_editor_level = ctx.view.config.station_editor.level.max(1);
+    if station_control_plane_enabled {
+        let selected_station = selected_name
+            .as_deref()
+            .and_then(|name| station_control_plane_catalog.get(name));
+        if station_editor_name.as_deref() != selected_name.as_deref() {
+            station_editor_name = selected_name.clone();
+            station_editor_enabled = selected_station
+                .map(|station| station.enabled)
+                .unwrap_or(false);
+            station_editor_level = selected_station
+                .map(|station| station.level)
+                .unwrap_or(1)
+                .clamp(1, 10);
+        }
+    }
+    let profile_control_plane_snapshot = control_plane_snapshot;
+    let profile_control_plane_catalog = profile_control_plane_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .profiles
+                .iter()
+                .map(|profile| (profile.name.clone(), service_profile_from_option(profile)))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let profile_control_plane_default = profile_control_plane_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.configured_default_profile.clone())
+        .or_else(|| {
+            profile_control_plane_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.default_profile.clone())
+        });
+    let profile_control_plane_station_names = profile_control_plane_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            let mut names = snapshot
+                .configs
+                .iter()
+                .map(|config| config.name.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            names
+        })
+        .unwrap_or_else(|| station_names.clone());
+    let profile_control_plane_enabled = profile_control_plane_snapshot.is_some();
+    let mut selected_profile_name = ctx.view.config.selected_profile_name.clone();
+    if profile_control_plane_enabled {
+        if selected_profile_name
+            .as_ref()
+            .is_none_or(|name| !profile_control_plane_catalog.contains_key(name))
+        {
+            selected_profile_name = profile_control_plane_default
+                .clone()
+                .or_else(|| profile_control_plane_catalog.keys().next().cloned());
+        }
+    } else if selected_profile_name
+        .as_ref()
+        .is_none_or(|name| !profile_names.iter().any(|item| item == name))
+    {
+        selected_profile_name = default_profile
+            .clone()
+            .or_else(|| profile_names.first().cloned());
+    }
+    let mut new_profile_name = ctx.view.config.new_profile_name.clone();
+    let mut profile_editor_name = ctx.view.config.profile_editor.profile_name.clone();
+    let mut profile_editor_station = ctx.view.config.profile_editor.station.clone();
+    let mut profile_editor_model = ctx.view.config.profile_editor.model.clone();
+    let mut profile_editor_reasoning_effort =
+        ctx.view.config.profile_editor.reasoning_effort.clone();
+    let mut profile_editor_service_tier = ctx.view.config.profile_editor.service_tier.clone();
+    let mut profile_info: Option<String> = None;
+    let mut profile_error: Option<String> = None;
+    let mut action_profile_upsert_remote: Option<(String, crate::config::ServiceControlProfile)> =
+        None;
+    let mut action_profile_delete_remote: Option<String> = None;
+    let mut action_profile_set_persisted_default_remote: Option<Option<String>> = None;
+
+    if profile_control_plane_enabled {
+        let selected_profile = selected_profile_name
+            .as_deref()
+            .and_then(|name| profile_control_plane_catalog.get(name));
+        if profile_editor_name.as_deref() != selected_profile_name.as_deref() {
+            profile_editor_name = selected_profile_name.clone();
+            profile_editor_station = selected_profile.and_then(|profile| profile.station.clone());
+            profile_editor_model = selected_profile
+                .and_then(|profile| profile.model.clone())
+                .unwrap_or_default();
+            profile_editor_reasoning_effort = selected_profile
+                .and_then(|profile| profile.reasoning_effort.clone())
+                .unwrap_or_default();
+            profile_editor_service_tier = selected_profile
+                .and_then(|profile| profile.service_tier.clone())
+                .unwrap_or_default();
+        }
+    }
 
     {
         let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_mut() else {
@@ -5379,6 +5563,18 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         };
         let provider_catalog = view.providers.clone();
         let profile_catalog = view.profiles.clone();
+        let configured_active_name = if station_control_plane_enabled {
+            station_control_plane_configured_active.clone()
+        } else {
+            active_name.clone()
+        };
+        let effective_active_name = if station_control_plane_enabled {
+            station_control_plane_effective_active.clone()
+        } else if active_name.is_some() {
+            active_name.clone()
+        } else {
+            active_fallback.clone()
+        };
 
         ui.columns(2, |cols| {
             cols[0].heading(pick(ctx.lang, "站点列表", "Stations"));
@@ -5387,48 +5583,80 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 .id_salt("config_v2_stations_scroll")
                 .max_height(520.0)
                 .show(&mut cols[0], |ui| {
-                    for name in station_names.iter() {
-                        let is_active = active_name.as_deref() == Some(name.as_str());
-                        let is_fallback_active = active_name.is_none()
-                            && active_fallback.as_deref() == Some(name.as_str());
+                    for name in station_display_names.iter() {
+                        let is_active = configured_active_name.as_deref() == Some(name.as_str());
+                        let is_fallback_active = configured_active_name.is_none()
+                            && effective_active_name.as_deref() == Some(name.as_str());
                         let is_selected = selected_name.as_deref() == Some(name.as_str());
 
-                        let station = view.groups.get(name);
-                        let (enabled, level, alias, members, endpoint_refs) = station
-                            .map(|station| {
-                                let endpoint_refs = station
-                                    .members
-                                    .iter()
-                                    .map(|member| {
-                                        provider_catalog
-                                            .get(&member.provider)
-                                            .map(|provider| {
-                                                if member.endpoint_names.is_empty() {
-                                                    provider.endpoints.len()
-                                                } else {
-                                                    member.endpoint_names.len()
-                                                }
-                                            })
-                                            .unwrap_or(0)
-                                    })
-                                    .sum::<usize>();
-                                (
-                                    station.enabled,
-                                    station.level.clamp(1, 10),
-                                    station.alias.as_deref().unwrap_or(""),
-                                    station.members.len(),
-                                    endpoint_refs,
-                                )
-                            })
-                            .unwrap_or((false, 1, "", 0, 0));
+                        let mut label = if station_control_plane_enabled {
+                            let station = station_control_plane_catalog.get(name);
+                            let (enabled, level, alias) = station
+                                .map(|station| {
+                                    (
+                                        station.enabled,
+                                        station.level.clamp(1, 10),
+                                        station.alias.as_deref().unwrap_or(""),
+                                    )
+                                })
+                                .unwrap_or((false, 1, ""));
+                            let mut label = format!("L{level} {name}");
+                            if !alias.trim().is_empty() {
+                                label.push_str(&format!(" ({alias})"));
+                            }
+                            if !enabled {
+                                label.push_str("  [off]");
+                            }
+                            label
+                        } else {
+                            let station = view.groups.get(name);
+                            let (enabled, level, alias, members, endpoint_refs) = station
+                                .map(|station| {
+                                    let endpoint_refs = station
+                                        .members
+                                        .iter()
+                                        .map(|member| {
+                                            provider_catalog
+                                                .get(&member.provider)
+                                                .map(|provider| {
+                                                    if member.endpoint_names.is_empty() {
+                                                        provider.endpoints.len()
+                                                    } else {
+                                                        member.endpoint_names.len()
+                                                    }
+                                                })
+                                                .unwrap_or(0)
+                                        })
+                                        .sum::<usize>();
+                                    (
+                                        station.enabled,
+                                        station.level.clamp(1, 10),
+                                        station.alias.as_deref().unwrap_or(""),
+                                        station.members.len(),
+                                        endpoint_refs,
+                                    )
+                                })
+                                .unwrap_or((false, 1, "", 0, 0));
 
-                        let mut label = format!("L{level} {name}");
-                        if !alias.trim().is_empty() {
-                            label.push_str(&format!(" ({alias})"));
-                        }
-                        label.push_str(&format!("  members={members} refs={endpoint_refs}"));
-                        if !enabled {
-                            label.push_str("  [off]");
+                            let mut label = format!("L{level} {name}");
+                            if !alias.trim().is_empty() {
+                                label.push_str(&format!(" ({alias})"));
+                            }
+                            label.push_str(&format!("  members={members} refs={endpoint_refs}"));
+                            if !enabled {
+                                label.push_str("  [off]");
+                            }
+                            label
+                        };
+                        if station_control_plane_enabled
+                            && let Some(station) = station_control_plane_catalog.get(name)
+                        {
+                            if let Some(override_enabled) = station.runtime_enabled_override {
+                                label.push_str(&format!("  rt_enabled={override_enabled}"));
+                            }
+                            if let Some(override_level) = station.runtime_level_override {
+                                label.push_str(&format!("  rt_level={override_level}"));
+                            }
                         }
                         if is_active {
                             label = format!("★ {label}");
@@ -5450,18 +5678,14 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 return;
             };
 
-            let active_label = if active_name.as_deref() == Some(name.as_str()) {
+            let active_label = if configured_active_name.as_deref() == Some(name.as_str()) {
                 pick(ctx.lang, "是", "yes")
             } else {
                 pick(ctx.lang, "否", "no")
             };
-            let effective_label = if active_name.is_some() {
-                active_name.as_deref().unwrap_or("-").to_string()
-            } else {
-                active_fallback
-                    .clone()
-                    .unwrap_or_else(|| pick(ctx.lang, "(无)", "(none)").to_string())
-            };
+            let effective_label = effective_active_name
+                .clone()
+                .unwrap_or_else(|| pick(ctx.lang, "(无)", "(none)").to_string());
 
             cols[1].label(format!("schema: v{schema_version}"));
             cols[1].label(format!("active_station: {active_label}"));
@@ -5471,143 +5695,233 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ));
             cols[1].label(format!(
                 "default_profile: {}",
-                default_profile.as_deref().unwrap_or("-")
+                station_default_profile.as_deref().unwrap_or("-")
             ));
             cols[1].add_space(6.0);
 
-            let Some(station_snapshot) = view.groups.get(&name).cloned() else {
-                cols[1].label(pick(
-                    ctx.lang,
-                    "站点不存在（可能已被删除）。",
-                    "Station missing.",
+            if station_control_plane_enabled {
+                let Some(station_snapshot) = station_control_plane_catalog.get(&name).cloned() else {
+                    cols[1].label(pick(
+                        ctx.lang,
+                        "远端 station 不存在（可能已被删除）。",
+                        "Remote station missing.",
+                    ));
+                    return;
+                };
+                cols[1].colored_label(
+                    egui::Color32::from_rgb(120, 120, 120),
+                    pick(
+                        ctx.lang,
+                        "当前 common station 字段直接管理运行中的代理；provider/member 结构请回到原始视图或本机文件查看。",
+                        "Common station fields below manage the live proxy directly; use Raw view or the local file for provider/member structure.",
+                    ),
+                );
+                cols[1].add_space(6.0);
+                cols[1].label(format!("name: {}", name));
+                cols[1].label(format!(
+                    "alias: {}",
+                    station_snapshot.alias.as_deref().unwrap_or("-")
                 ));
-                return;
-            };
-
-            cols[1].label(format!("name: {}", name));
-            cols[1].label(format!(
-                "alias: {}",
-                station_snapshot.alias.as_deref().unwrap_or("-")
-            ));
-            cols[1].label(format!("members: {}", station_snapshot.members.len()));
-            let referencing_profiles = profile_catalog
-                .iter()
-                .filter_map(|(profile_name, profile)| {
-                    (profile.station.as_deref() == Some(name.as_str()))
-                        .then_some(profile_name.clone())
-                })
-                .collect::<Vec<_>>();
-            cols[1].label(format!(
-                "profiles: {}",
-                if referencing_profiles.is_empty() {
-                    "-".to_string()
-                } else {
-                    referencing_profiles.join(", ")
+                cols[1].label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "配置启用", "Configured enabled"),
+                    station_snapshot.configured_enabled
+                ));
+                cols[1].label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "配置等级", "Configured level"),
+                    station_snapshot.configured_level
+                ));
+                cols[1].label(format!(
+                    "{}: {:?}",
+                    pick(ctx.lang, "运行状态", "Runtime state"),
+                    station_snapshot.runtime_state
+                ));
+                cols[1].label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "运行时 enabled 覆盖", "Runtime enabled override"),
+                    station_snapshot
+                        .runtime_enabled_override
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                ));
+                cols[1].label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "运行时 level 覆盖", "Runtime level override"),
+                    station_snapshot
+                        .runtime_level_override
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                ));
+                cols[1].label(format!(
+                    "{}: {:?}",
+                    pick(ctx.lang, "模型目录", "Model catalog"),
+                    station_snapshot.capabilities.model_catalog_kind
+                ));
+                cols[1].label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "支持 service tier", "Supports service tier"),
+                    capability_support_label(ctx.lang, station_snapshot.capabilities.supports_service_tier)
+                ));
+                cols[1].label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "支持 reasoning", "Supports reasoning"),
+                    capability_support_label(
+                        ctx.lang,
+                        station_snapshot.capabilities.supports_reasoning_effort
+                    )
+                ));
+                if !station_snapshot.capabilities.supported_models.is_empty() {
+                    cols[1].small(format!(
+                        "{}: {}",
+                        pick(ctx.lang, "支持模型", "Supported models"),
+                        station_snapshot.capabilities.supported_models.join(", ")
+                    ));
                 }
-            ));
-            cols[1].add_space(6.0);
-
-            cols[1].horizontal(|ui| {
-                if let Some(station) = view.groups.get_mut(&name) {
-                    ui.checkbox(&mut station.enabled, pick(ctx.lang, "启用", "Enabled"));
+                cols[1].add_space(6.0);
+                cols[1].horizontal(|ui| {
+                    ui.checkbox(
+                        &mut station_editor_enabled,
+                        pick(ctx.lang, "启用", "Enabled"),
+                    );
                     ui.label(pick(ctx.lang, "等级", "Level"));
-                    ui.add(egui::DragValue::new(&mut station.level).range(1..=10));
-                }
-            });
+                    ui.add(egui::DragValue::new(&mut station_editor_level).range(1..=10));
+                });
+            } else {
+                let Some(station_snapshot) = view.groups.get(&name).cloned() else {
+                    cols[1].label(pick(
+                        ctx.lang,
+                        "站点不存在（可能已被删除）。",
+                        "Station missing.",
+                    ));
+                    return;
+                };
 
-            cols[1].add_space(8.0);
-            cols[1].separator();
-            cols[1].label(pick(ctx.lang, "成员引用", "Members"));
-            egui::ScrollArea::vertical()
-                .id_salt("config_v2_station_members_scroll")
-                .max_height(160.0)
-                .show(&mut cols[1], |ui| {
-                    if station_snapshot.members.is_empty() {
-                        ui.label(pick(ctx.lang, "(无成员)", "(no members)"));
+                cols[1].label(format!("name: {}", name));
+                cols[1].label(format!(
+                    "alias: {}",
+                    station_snapshot.alias.as_deref().unwrap_or("-")
+                ));
+                cols[1].label(format!("members: {}", station_snapshot.members.len()));
+                let referencing_profiles = profile_catalog
+                    .iter()
+                    .filter_map(|(profile_name, profile)| {
+                        (profile.station.as_deref() == Some(name.as_str()))
+                            .then_some(profile_name.clone())
+                    })
+                    .collect::<Vec<_>>();
+                cols[1].label(format!(
+                    "profiles: {}",
+                    if referencing_profiles.is_empty() {
+                        "-".to_string()
                     } else {
-                        for member in &station_snapshot.members {
-                            let preferred = if member.preferred {
-                                pick(ctx.lang, "preferred", "preferred")
-                            } else {
-                                pick(ctx.lang, "normal", "normal")
-                            };
-                            if let Some(provider) = provider_catalog.get(&member.provider) {
-                                let endpoint_names = if member.endpoint_names.is_empty() {
-                                    provider.endpoints.keys().cloned().collect::<Vec<_>>()
-                                } else {
-                                    member.endpoint_names.clone()
-                                };
-                                let urls = endpoint_names
-                                    .iter()
-                                    .filter_map(|endpoint_name| {
-                                        provider.endpoints.get(endpoint_name).map(|endpoint| {
-                                            format!(
-                                                "{}={}",
-                                                endpoint_name,
-                                                shorten_middle(&endpoint.base_url, 52)
-                                            )
-                                        })
-                                    })
-                                    .collect::<Vec<_>>();
-                                ui.label(format!(
-                                    "{}  provider={}  endpoints={}  {}",
-                                    preferred,
-                                    member.provider,
-                                    endpoint_names.join(", "),
-                                    provider.alias.as_deref().unwrap_or("-")
-                                ));
-                                if !urls.is_empty() {
-                                    ui.small(urls.join(" | "));
-                                }
-                            } else {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(200, 120, 40),
-                                    format!("missing provider: {}", member.provider),
-                                );
-                            }
-                            ui.add_space(4.0);
-                        }
+                        referencing_profiles.join(", ")
+                    }
+                ));
+                cols[1].add_space(6.0);
+
+                cols[1].horizontal(|ui| {
+                    if let Some(station) = view.groups.get_mut(&name) {
+                        ui.checkbox(&mut station.enabled, pick(ctx.lang, "启用", "Enabled"));
+                        ui.label(pick(ctx.lang, "等级", "Level"));
+                        ui.add(egui::DragValue::new(&mut station.level).range(1..=10));
                     }
                 });
 
-            cols[1].add_space(8.0);
-            cols[1].separator();
-            cols[1].label(pick(ctx.lang, "相关 Provider", "Referenced Providers"));
-            egui::ScrollArea::vertical()
-                .id_salt("config_v2_station_providers_scroll")
-                .max_height(140.0)
-                .show(&mut cols[1], |ui| {
-                    let mut seen = HashSet::new();
-                    for member in &station_snapshot.members {
-                        if !seen.insert(member.provider.clone()) {
-                            continue;
+                cols[1].add_space(8.0);
+                cols[1].separator();
+                cols[1].label(pick(ctx.lang, "成员引用", "Members"));
+                egui::ScrollArea::vertical()
+                    .id_salt("config_v2_station_members_scroll")
+                    .max_height(160.0)
+                    .show(&mut cols[1], |ui| {
+                        if station_snapshot.members.is_empty() {
+                            ui.label(pick(ctx.lang, "(无成员)", "(no members)"));
+                        } else {
+                            for member in &station_snapshot.members {
+                                let preferred = if member.preferred {
+                                    pick(ctx.lang, "preferred", "preferred")
+                                } else {
+                                    pick(ctx.lang, "normal", "normal")
+                                };
+                                if let Some(provider) = provider_catalog.get(&member.provider) {
+                                    let endpoint_names = if member.endpoint_names.is_empty() {
+                                        provider.endpoints.keys().cloned().collect::<Vec<_>>()
+                                    } else {
+                                        member.endpoint_names.clone()
+                                    };
+                                    let urls = endpoint_names
+                                        .iter()
+                                        .filter_map(|endpoint_name| {
+                                            provider.endpoints.get(endpoint_name).map(|endpoint| {
+                                                format!(
+                                                    "{}={}",
+                                                    endpoint_name,
+                                                    shorten_middle(&endpoint.base_url, 52)
+                                                )
+                                            })
+                                        })
+                                        .collect::<Vec<_>>();
+                                    ui.label(format!(
+                                        "{}  provider={}  endpoints={}  {}",
+                                        preferred,
+                                        member.provider,
+                                        endpoint_names.join(", "),
+                                        provider.alias.as_deref().unwrap_or("-")
+                                    ));
+                                    if !urls.is_empty() {
+                                        ui.small(urls.join(" | "));
+                                    }
+                                } else {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(200, 120, 40),
+                                        format!("missing provider: {}", member.provider),
+                                    );
+                                }
+                                ui.add_space(4.0);
+                            }
                         }
-                        let Some(provider) = provider_catalog.get(&member.provider) else {
-                            continue;
-                        };
-                        let auth_ref = provider
-                            .auth
-                            .auth_token_env
-                            .as_deref()
-                            .or(provider.auth.api_key_env.as_deref())
-                            .unwrap_or("-");
-                        ui.label(format!(
-                            "{}  alias={}  endpoints={}  enabled={}  auth={}",
-                            member.provider,
-                            provider.alias.as_deref().unwrap_or("-"),
-                            provider.endpoints.len(),
-                            provider.enabled,
-                            auth_ref
-                        ));
-                    }
-                    if station_snapshot.members.is_empty() {
-                        ui.label(pick(
-                            ctx.lang,
-                            "(无相关 provider)",
-                            "(no referenced providers)",
-                        ));
-                    }
-                });
+                    });
+
+                cols[1].add_space(8.0);
+                cols[1].separator();
+                cols[1].label(pick(ctx.lang, "相关 Provider", "Referenced Providers"));
+                egui::ScrollArea::vertical()
+                    .id_salt("config_v2_station_providers_scroll")
+                    .max_height(140.0)
+                    .show(&mut cols[1], |ui| {
+                        let mut seen = HashSet::new();
+                        for member in &station_snapshot.members {
+                            if !seen.insert(member.provider.clone()) {
+                                continue;
+                            }
+                            let Some(provider) = provider_catalog.get(&member.provider) else {
+                                continue;
+                            };
+                            let auth_ref = provider
+                                .auth
+                                .auth_token_env
+                                .as_deref()
+                                .or(provider.auth.api_key_env.as_deref())
+                                .unwrap_or("-");
+                            ui.label(format!(
+                                "{}  alias={}  endpoints={}  enabled={}  auth={}",
+                                member.provider,
+                                provider.alias.as_deref().unwrap_or("-"),
+                                provider.endpoints.len(),
+                                provider.enabled,
+                                auth_ref
+                            ));
+                        }
+                        if station_snapshot.members.is_empty() {
+                            ui.label(pick(
+                                ctx.lang,
+                                "(无相关 provider)",
+                                "(no referenced providers)",
+                            ));
+                        }
+                    });
+            }
 
             cols[1].add_space(8.0);
             cols[1].separator();
@@ -5684,7 +5998,11 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     .button(pick(ctx.lang, "设为 active_station", "Set active_station"))
                     .clicked()
                 {
-                    action_set_active = Some(name.clone());
+                    if station_control_plane_enabled {
+                        action_set_active_remote = Some(Some(name.clone()));
+                    } else {
+                        action_set_active = Some(name.clone());
+                    }
                 }
 
                 if ui
@@ -5695,17 +6013,504 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     ))
                     .clicked()
                 {
-                    action_clear_active = true;
+                    if station_control_plane_enabled {
+                        action_set_active_remote = Some(None);
+                    } else {
+                        action_clear_active = true;
+                    }
                 }
 
                 if ui
-                    .button(pick(ctx.lang, "保存并应用", "Save & apply"))
+                    .button(pick(
+                        ctx.lang,
+                        if station_control_plane_enabled {
+                            "保存到当前代理"
+                        } else {
+                            "保存并应用"
+                        },
+                        if station_control_plane_enabled {
+                            "Save to current proxy"
+                        } else {
+                            "Save & apply"
+                        },
+                    ))
                     .clicked()
                 {
-                    action_save_apply = true;
+                    if station_control_plane_enabled {
+                        action_save_apply_remote = Some((
+                            name.clone(),
+                            station_editor_enabled,
+                            station_editor_level.clamp(1, 10),
+                        ));
+                    } else {
+                        action_save_apply = true;
+                    }
                 }
             });
         });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.group(|ui| {
+            ui.heading(pick(ctx.lang, "Profiles", "Profiles"));
+            ui.label(pick(
+                ctx.lang,
+                "Profile 用于把 station / model / reasoning_effort / service_tier 组合成可复用控制模板；更适合表达 fast mode、模型切换和思考模式。",
+                "Profiles bundle station / model / reasoning_effort / service_tier into reusable control templates for fast mode, model switching, and reasoning mode.",
+            ));
+            if profile_control_plane_enabled {
+                render_config_v2_profiles_control_plane(
+                    ui,
+                    ctx.lang,
+                    selected_service,
+                    &profile_control_plane_catalog,
+                    profile_control_plane_default.as_deref(),
+                    &profile_control_plane_station_names,
+                    &mut selected_profile_name,
+                    &mut new_profile_name,
+                    &mut profile_editor_name,
+                    &mut profile_editor_station,
+                    &mut profile_editor_model,
+                    &mut profile_editor_reasoning_effort,
+                    &mut profile_editor_service_tier,
+                    &mut profile_error,
+                    &mut action_profile_upsert_remote,
+                    &mut action_profile_delete_remote,
+                    &mut action_profile_set_persisted_default_remote,
+                    matches!(ctx.proxy.kind(), ProxyModeKind::Attached),
+                    station_control_plane_enabled,
+                );
+            } else {
+            ui.horizontal(|ui| {
+                ui.label(pick(ctx.lang, "新建 profile", "New profile"));
+                ui.add_sized(
+                    [180.0, 22.0],
+                    egui::TextEdit::singleline(&mut new_profile_name).hint_text(pick(
+                        ctx.lang,
+                        "例如 fast / deep / cheap",
+                        "e.g. fast / deep / cheap",
+                    )),
+                );
+                if ui.button(pick(ctx.lang, "新增", "Add")).clicked() {
+                    let name = new_profile_name.trim();
+                    if name.is_empty() {
+                        profile_error = Some(
+                            pick(
+                                ctx.lang,
+                                "profile 名称不能为空。",
+                                "Profile name cannot be empty.",
+                            )
+                            .to_string(),
+                        );
+                    } else if view.profiles.contains_key(name) {
+                        profile_error = Some(
+                            pick(
+                                ctx.lang,
+                                "profile 名称已存在。",
+                                "Profile name already exists.",
+                            )
+                            .to_string(),
+                        );
+                    } else {
+                        view.profiles.insert(
+                            name.to_string(),
+                            crate::config::ServiceControlProfile::default(),
+                        );
+                        if view.default_profile.is_none() {
+                            view.default_profile = Some(name.to_string());
+                        }
+                        selected_profile_name = Some(name.to_string());
+                        new_profile_name.clear();
+                        profile_info = Some(
+                            pick(
+                                ctx.lang,
+                                "已新增 profile（待保存）。",
+                                "Profile added (save pending).",
+                            )
+                            .to_string(),
+                        );
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.columns(2, |cols| {
+                cols[0].label(pick(ctx.lang, "Profile 列表", "Profile list"));
+                cols[0].add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("config_v2_profiles_scroll")
+                    .max_height(240.0)
+                    .show(&mut cols[0], |ui| {
+                        let names = view.profiles.keys().cloned().collect::<Vec<_>>();
+                        if names.is_empty() {
+                            ui.label(pick(
+                                ctx.lang,
+                                "(当前没有 profile)",
+                                "(no profiles yet)",
+                            ));
+                        } else {
+                            for name in names {
+                                let is_selected =
+                                    selected_profile_name.as_deref() == Some(name.as_str());
+                                let label = if view.default_profile.as_deref()
+                                    == Some(name.as_str())
+                                {
+                                    format!("{name} [default]")
+                                } else {
+                                    name.clone()
+                                };
+                                if ui.selectable_label(is_selected, label).clicked() {
+                                    selected_profile_name = Some(name);
+                                }
+                            }
+                        }
+                    });
+
+                cols[1].label(pick(ctx.lang, "Profile 详情", "Profile details"));
+                cols[1].add_space(4.0);
+
+                let Some(profile_name) = selected_profile_name.clone() else {
+                    cols[1].label(pick(
+                        ctx.lang,
+                        "未选择 profile。",
+                        "No profile selected.",
+                    ));
+                    return;
+                };
+
+                let is_default = view.default_profile.as_deref() == Some(profile_name.as_str());
+                let mut delete_selected = false;
+                let Some(profile) = view.profiles.get_mut(profile_name.as_str()) else {
+                    cols[1].label(pick(
+                        ctx.lang,
+                        "profile 不存在（可能已被删除）。",
+                        "Profile missing.",
+                    ));
+                    return;
+                };
+
+                cols[1].label(format!("name: {profile_name}"));
+                cols[1].label(format!(
+                    "{}: {}",
+                    pick(ctx.lang, "默认", "Default"),
+                    if is_default {
+                        pick(ctx.lang, "是", "yes")
+                    } else {
+                        pick(ctx.lang, "否", "no")
+                    }
+                ));
+
+                cols[1].horizontal(|ui| {
+                    if ui
+                        .button(pick(ctx.lang, "设为 default_profile", "Set default_profile"))
+                        .clicked()
+                    {
+                        view.default_profile = Some(profile_name.clone());
+                        profile_info = Some(
+                            pick(
+                                ctx.lang,
+                                "已更新 default_profile（待保存）。",
+                                "default_profile updated (save pending).",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    if ui
+                        .button(pick(ctx.lang, "清除 default_profile", "Clear default_profile"))
+                        .clicked()
+                    {
+                        if is_default {
+                            view.default_profile = None;
+                            profile_info = Some(
+                                pick(
+                                    ctx.lang,
+                                    "已清除 default_profile（待保存）。",
+                                    "default_profile cleared (save pending).",
+                                )
+                                .to_string(),
+                            );
+                        }
+                    }
+                    if ui.button(pick(ctx.lang, "删除 profile", "Delete profile")).clicked() {
+                        delete_selected = true;
+                    }
+                });
+
+                let mut station = profile.station.clone();
+                cols[1].horizontal(|ui| {
+                    ui.label(pick(ctx.lang, "station", "station"));
+                    egui::ComboBox::from_id_salt(format!(
+                        "config_v2_profile_station_{selected_service}_{profile_name}"
+                    ))
+                    .selected_text(
+                        station
+                            .as_deref()
+                            .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>")),
+                    )
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut station,
+                            None,
+                            pick(ctx.lang, "<自动>", "<auto>"),
+                        );
+                        for station_name in station_names.iter() {
+                            ui.selectable_value(
+                                &mut station,
+                                Some(station_name.clone()),
+                                station_name.as_str(),
+                            );
+                        }
+                    });
+                });
+                if station != profile.station {
+                    profile.station = station;
+                }
+
+                let mut model = profile.model.clone().unwrap_or_default();
+                cols[1].horizontal(|ui| {
+                    ui.label("model");
+                    ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut model));
+                    if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
+                        model.clear();
+                    }
+                });
+                let next_model = non_empty_trimmed(Some(model.as_str()));
+                if next_model != profile.model {
+                    profile.model = next_model;
+                }
+
+                let mut effort = profile.reasoning_effort.clone().unwrap_or_default();
+                cols[1].horizontal(|ui| {
+                    ui.label("reasoning_effort");
+                    ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut effort));
+                    if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
+                        effort.clear();
+                    }
+                });
+                let next_effort = non_empty_trimmed(Some(effort.as_str()));
+                if next_effort != profile.reasoning_effort {
+                    profile.reasoning_effort = next_effort;
+                }
+
+                let mut tier = profile.service_tier.clone().unwrap_or_default();
+                cols[1].horizontal(|ui| {
+                    ui.label("service_tier");
+                    ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut tier));
+                    if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
+                        tier.clear();
+                    }
+                });
+                let next_tier = non_empty_trimmed(Some(tier.as_str()));
+                if next_tier != profile.service_tier {
+                    profile.service_tier = next_tier;
+                }
+
+                cols[1].add_space(6.0);
+                cols[1].small(format_profile_summary(&ControlProfileOption {
+                    name: profile_name.clone(),
+                    station: profile.station.clone(),
+                    model: profile.model.clone(),
+                    reasoning_effort: profile.reasoning_effort.clone(),
+                    service_tier: profile.service_tier.clone(),
+                    is_default,
+                }));
+                cols[1].small(pick(
+                    ctx.lang,
+                    "提示：service_tier=priority 通常可视为 fast mode；reasoning_effort 可表达思考模式。",
+                    "Tip: service_tier=priority usually maps to fast mode; reasoning_effort expresses reasoning mode.",
+                ));
+
+                if delete_selected {
+                    view.profiles.remove(profile_name.as_str());
+                    if view.default_profile.as_deref() == Some(profile_name.as_str()) {
+                        view.default_profile = None;
+                    }
+                    selected_profile_name = view
+                        .default_profile
+                        .clone()
+                        .or_else(|| view.profiles.keys().next().cloned());
+                    profile_info = Some(
+                        pick(
+                            ctx.lang,
+                            "已删除 profile（待保存）。",
+                            "Profile deleted (save pending).",
+                        )
+                        .to_string(),
+                    );
+                }
+            });
+
+            ui.add_space(6.0);
+            if ui
+                .button(pick(ctx.lang, "保存并应用 profile 变更", "Save & apply profile changes"))
+                .clicked()
+            {
+                action_save_apply = true;
+            }
+            }
+        });
+    }
+
+    ctx.view.config.selected_profile_name = selected_profile_name;
+    ctx.view.config.new_profile_name = new_profile_name;
+    ctx.view.config.station_editor.station_name = station_editor_name;
+    ctx.view.config.station_editor.enabled = station_editor_enabled;
+    ctx.view.config.station_editor.level = station_editor_level.clamp(1, 10);
+    ctx.view.config.profile_editor.profile_name = profile_editor_name;
+    ctx.view.config.profile_editor.station = profile_editor_station;
+    ctx.view.config.profile_editor.model = profile_editor_model;
+    ctx.view.config.profile_editor.reasoning_effort = profile_editor_reasoning_effort;
+    ctx.view.config.profile_editor.service_tier = profile_editor_service_tier;
+    if let Some(message) = profile_info {
+        *ctx.last_info = Some(message);
+    }
+    if let Some(message) = profile_error {
+        *ctx.last_error = Some(message);
+    }
+
+    if let Some((profile_name, profile)) = action_profile_upsert_remote {
+        match ctx
+            .proxy
+            .upsert_persisted_profile(ctx.rt, profile_name.clone(), profile)
+        {
+            Ok(()) => {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                refresh_config_editor_from_disk_if_running(ctx);
+                ctx.view.config.selected_profile_name = Some(profile_name);
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "已写入 profile 配置并刷新代理。",
+                        "Profile config saved and proxy refreshed.",
+                    )
+                    .to_string(),
+                );
+                *ctx.last_error = None;
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!("save profile via control plane failed: {e}"));
+            }
+        }
+    }
+
+    if let Some(default_profile_name) = action_profile_set_persisted_default_remote {
+        match ctx
+            .proxy
+            .set_persisted_default_profile(ctx.rt, default_profile_name.clone())
+        {
+            Ok(()) => {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                refresh_config_editor_from_disk_if_running(ctx);
+                *ctx.last_info = Some(
+                    match default_profile_name {
+                        Some(_) => pick(
+                            ctx.lang,
+                            "已更新配置默认 profile。",
+                            "Configured default profile updated.",
+                        ),
+                        None => pick(
+                            ctx.lang,
+                            "已清除配置默认 profile。",
+                            "Configured default profile cleared.",
+                        ),
+                    }
+                    .to_string(),
+                );
+                *ctx.last_error = None;
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!(
+                    "set persisted default profile via control plane failed: {e}"
+                ));
+            }
+        }
+    }
+
+    if let Some(profile_name) = action_profile_delete_remote {
+        match ctx.proxy.delete_persisted_profile(ctx.rt, profile_name) {
+            Ok(()) => {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                refresh_config_editor_from_disk_if_running(ctx);
+                ctx.view.config.selected_profile_name = None;
+                ctx.view.config.profile_editor = ConfigProfileEditorState::default();
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "已删除 profile 并刷新代理。",
+                        "Profile deleted and proxy refreshed.",
+                    )
+                    .to_string(),
+                );
+                *ctx.last_error = None;
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!(
+                    "delete persisted profile via control plane failed: {e}"
+                ));
+            }
+        }
+    }
+
+    if let Some(station_name) = action_set_active_remote {
+        match ctx
+            .proxy
+            .set_persisted_active_station(ctx.rt, station_name.clone())
+        {
+            Ok(()) => {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                refresh_config_editor_from_disk_if_running(ctx);
+                *ctx.last_info = Some(
+                    match station_name {
+                        Some(_) => pick(
+                            ctx.lang,
+                            "已更新配置 active_station 并刷新代理。",
+                            "Configured active_station updated and proxy refreshed.",
+                        ),
+                        None => pick(
+                            ctx.lang,
+                            "已清除配置 active_station 并刷新代理。",
+                            "Configured active_station cleared and proxy refreshed.",
+                        ),
+                    }
+                    .to_string(),
+                );
+                *ctx.last_error = None;
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!(
+                    "set persisted active station via control plane failed: {e}"
+                ));
+            }
+        }
+    }
+
+    if let Some((station_name, enabled, level)) = action_save_apply_remote {
+        match ctx
+            .proxy
+            .update_persisted_station(ctx.rt, station_name, enabled, level)
+        {
+            Ok(()) => {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                refresh_config_editor_from_disk_if_running(ctx);
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "已保存 station 配置并刷新代理。",
+                        "Station config saved and proxy refreshed.",
+                    )
+                    .to_string(),
+                );
+                *ctx.last_error = None;
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!("save station via control plane failed: {e}"));
+            }
+        }
     }
 
     if let Some(name) = action_set_active {
@@ -5784,6 +6589,289 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 *ctx.last_error = Some(format!("save failed: {e}"));
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_config_v2_profiles_control_plane(
+    ui: &mut egui::Ui,
+    lang: Language,
+    selected_service: &str,
+    profile_catalog: &BTreeMap<String, crate::config::ServiceControlProfile>,
+    configured_default_profile: Option<&str>,
+    station_names: &[String],
+    selected_profile_name: &mut Option<String>,
+    new_profile_name: &mut String,
+    editor_profile_name: &mut Option<String>,
+    editor_station: &mut Option<String>,
+    editor_model: &mut String,
+    editor_reasoning_effort: &mut String,
+    editor_service_tier: &mut String,
+    profile_error: &mut Option<String>,
+    action_profile_upsert_remote: &mut Option<(String, crate::config::ServiceControlProfile)>,
+    action_profile_delete_remote: &mut Option<String>,
+    action_profile_set_persisted_default_remote: &mut Option<Option<String>>,
+    attached_mode: bool,
+    station_control_plane_enabled: bool,
+) {
+    ui.colored_label(
+        egui::Color32::from_rgb(120, 120, 120),
+        if attached_mode {
+            if station_control_plane_enabled {
+                pick(
+                    lang,
+                    "当前 station 常用字段与下面的 Profiles 都直接管理附着代理；provider/member 深层结构仍建议在原始视图查看。",
+                    "Station common fields and the Profiles below manage the attached proxy directly; use Raw view for deeper provider/member structure.",
+                )
+            } else {
+                pick(
+                    lang,
+                    "下面的 Profiles 直接管理当前附着代理；上面的 station/provider 仍然是本机文件视图。",
+                    "Profiles below manage the attached proxy directly; the station/provider form above still reflects the local file on this device.",
+                )
+            }
+        } else {
+            pick(
+                lang,
+                "下面的 Profiles 直接管理当前运行中的代理配置。",
+                "Profiles below manage the currently running proxy config directly.",
+            )
+        },
+    );
+
+    ui.horizontal(|ui| {
+        ui.label(pick(lang, "新建 profile", "New profile"));
+        ui.add_sized(
+            [180.0, 22.0],
+            egui::TextEdit::singleline(new_profile_name).hint_text(pick(
+                lang,
+                "例如 fast / deep / cheap",
+                "e.g. fast / deep / cheap",
+            )),
+        );
+        if ui.button(pick(lang, "新增", "Add")).clicked() {
+            let name = new_profile_name.trim();
+            if name.is_empty() {
+                *profile_error = Some(
+                    pick(
+                        lang,
+                        "profile 名称不能为空。",
+                        "Profile name cannot be empty.",
+                    )
+                    .to_string(),
+                );
+            } else if profile_catalog.contains_key(name) {
+                *profile_error = Some(
+                    pick(lang, "profile 名称已存在。", "Profile name already exists.").to_string(),
+                );
+            } else {
+                *action_profile_upsert_remote = Some((
+                    name.to_string(),
+                    crate::config::ServiceControlProfile::default(),
+                ));
+                if configured_default_profile.is_none() {
+                    *action_profile_set_persisted_default_remote = Some(Some(name.to_string()));
+                }
+                *selected_profile_name = Some(name.to_string());
+                *editor_profile_name = Some(name.to_string());
+                *editor_station = None;
+                editor_model.clear();
+                editor_reasoning_effort.clear();
+                editor_service_tier.clear();
+                new_profile_name.clear();
+            }
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.columns(2, |cols| {
+        cols[0].label(pick(lang, "Profile 列表", "Profile list"));
+        cols[0].add_space(4.0);
+        egui::ScrollArea::vertical()
+            .id_salt("config_v2_profiles_scroll")
+            .max_height(240.0)
+            .show(&mut cols[0], |ui| {
+                if profile_catalog.is_empty() {
+                    ui.label(pick(lang, "(当前没有 profile)", "(no profiles yet)"));
+                } else {
+                    for name in profile_catalog.keys() {
+                        let is_selected = selected_profile_name.as_deref() == Some(name.as_str());
+                        let label = if configured_default_profile == Some(name.as_str()) {
+                            format!("{name} [default]")
+                        } else {
+                            name.clone()
+                        };
+                        if ui.selectable_label(is_selected, label).clicked() {
+                            *selected_profile_name = Some(name.clone());
+                        }
+                    }
+                }
+            });
+
+        if editor_profile_name.as_deref() != selected_profile_name.as_deref() {
+            let selected_profile = selected_profile_name
+                .as_deref()
+                .and_then(|name| profile_catalog.get(name));
+            *editor_profile_name = selected_profile_name.clone();
+            *editor_station = selected_profile.and_then(|profile| profile.station.clone());
+            *editor_model = selected_profile
+                .and_then(|profile| profile.model.clone())
+                .unwrap_or_default();
+            *editor_reasoning_effort = selected_profile
+                .and_then(|profile| profile.reasoning_effort.clone())
+                .unwrap_or_default();
+            *editor_service_tier = selected_profile
+                .and_then(|profile| profile.service_tier.clone())
+                .unwrap_or_default();
+        }
+
+        cols[1].label(pick(lang, "Profile 详情", "Profile details"));
+        cols[1].add_space(4.0);
+
+        let Some(profile_name) = selected_profile_name.clone() else {
+            cols[1].label(pick(lang, "未选择 profile。", "No profile selected."));
+            return;
+        };
+
+        let Some(profile) = profile_catalog.get(profile_name.as_str()) else {
+            cols[1].label(pick(
+                lang,
+                "profile 不存在（可能已被删除）。",
+                "Profile missing.",
+            ));
+            return;
+        };
+        let is_default = configured_default_profile == Some(profile_name.as_str());
+
+        cols[1].label(format!("name: {profile_name}"));
+        cols[1].label(format!(
+            "{}: {}",
+            pick(lang, "默认", "Default"),
+            if is_default {
+                pick(lang, "是", "yes")
+            } else {
+                pick(lang, "否", "no")
+            }
+        ));
+
+        cols[1].horizontal(|ui| {
+            if ui
+                .button(pick(lang, "设为 default_profile", "Set default_profile"))
+                .clicked()
+            {
+                *action_profile_set_persisted_default_remote = Some(Some(profile_name.clone()));
+            }
+            if ui
+                .button(pick(lang, "清除 default_profile", "Clear default_profile"))
+                .clicked()
+                && is_default
+            {
+                *action_profile_set_persisted_default_remote = Some(None);
+            }
+            if ui.button(pick(lang, "删除 profile", "Delete profile")).clicked() {
+                *action_profile_delete_remote = Some(profile_name.clone());
+            }
+        });
+
+        cols[1].horizontal(|ui| {
+            ui.label(pick(lang, "station", "station"));
+            egui::ComboBox::from_id_salt(format!(
+                "config_v2_profile_station_remote_{selected_service}_{profile_name}"
+            ))
+            .selected_text(
+                editor_station
+                    .as_deref()
+                    .unwrap_or_else(|| pick(lang, "<自动>", "<auto>")),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(editor_station, None, pick(lang, "<自动>", "<auto>"));
+                for station_name in station_names {
+                    ui.selectable_value(
+                        editor_station,
+                        Some(station_name.clone()),
+                        station_name.as_str(),
+                    );
+                }
+            });
+        });
+
+        cols[1].horizontal(|ui| {
+            ui.label("model");
+            ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(editor_model));
+            if ui.button(pick(lang, "清除", "Clear")).clicked() {
+                editor_model.clear();
+            }
+        });
+
+        cols[1].horizontal(|ui| {
+            ui.label("reasoning_effort");
+            ui.add_sized(
+                [220.0, 22.0],
+                egui::TextEdit::singleline(editor_reasoning_effort),
+            );
+            if ui.button(pick(lang, "清除", "Clear")).clicked() {
+                editor_reasoning_effort.clear();
+            }
+        });
+
+        cols[1].horizontal(|ui| {
+            ui.label("service_tier");
+            ui.add_sized(
+                [220.0, 22.0],
+                egui::TextEdit::singleline(editor_service_tier),
+            );
+            if ui.button(pick(lang, "清除", "Clear")).clicked() {
+                editor_service_tier.clear();
+            }
+        });
+
+        cols[1].add_space(6.0);
+        cols[1].small(format_profile_summary(&ControlProfileOption {
+            name: profile_name.clone(),
+            station: editor_station.clone(),
+            model: non_empty_trimmed(Some(editor_model.as_str())),
+            reasoning_effort: non_empty_trimmed(Some(editor_reasoning_effort.as_str())),
+            service_tier: non_empty_trimmed(Some(editor_service_tier.as_str())),
+            is_default,
+        }));
+        cols[1].small(pick(
+            lang,
+            "提示：service_tier=priority 通常可视为 fast mode；reasoning_effort 可表达思考模式。",
+            "Tip: service_tier=priority usually maps to fast mode; reasoning_effort expresses reasoning mode.",
+        ));
+        if editor_station != &profile.station
+            || non_empty_trimmed(Some(editor_model.as_str())) != profile.model
+            || non_empty_trimmed(Some(editor_reasoning_effort.as_str()))
+                != profile.reasoning_effort
+            || non_empty_trimmed(Some(editor_service_tier.as_str())) != profile.service_tier
+        {
+            cols[1].small(pick(
+                lang,
+                "当前编辑内容尚未写入代理配置。",
+                "Current edits have not been written to the proxy config yet.",
+            ));
+        }
+    });
+
+    ui.add_space(6.0);
+    if ui
+        .button(pick(
+            lang,
+            "保存并应用 profile 变更",
+            "Save & apply profile changes",
+        ))
+        .clicked()
+        && let Some(profile_name) = selected_profile_name.clone()
+    {
+        *action_profile_upsert_remote = Some((
+            profile_name,
+            crate::config::ServiceControlProfile {
+                station: editor_station.clone(),
+                model: non_empty_trimmed(Some(editor_model.as_str())),
+                reasoning_effort: non_empty_trimmed(Some(editor_reasoning_effort.as_str())),
+                service_tier: non_empty_trimmed(Some(editor_service_tier.as_str())),
+            },
+        ));
     }
 }
 
@@ -5970,6 +7058,9 @@ fn working_legacy_config_mut(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionRow {
     session_id: Option<String>,
+    observation_scope: SessionObservationScope,
+    last_client_name: Option<String>,
+    last_client_addr: Option<String>,
     cwd: Option<String>,
     active_count: u64,
     active_started_at_ms_min: Option<u64>,
@@ -6030,6 +7121,9 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
         .iter()
         .map(|card| SessionRow {
             session_id: card.session_id.clone(),
+            observation_scope: card.observation_scope,
+            last_client_name: card.last_client_name.clone(),
+            last_client_addr: card.last_client_addr.clone(),
             cwd: card.cwd.clone(),
             active_count: card.active_count,
             active_started_at_ms_min: card.active_started_at_ms_min,
@@ -6081,6 +7175,9 @@ fn build_session_rows(
         let key = req.session_id.clone();
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
+            observation_scope: SessionObservationScope::ObservedOnly,
+            last_client_name: req.client_name.clone(),
+            last_client_addr: req.client_addr.clone(),
             cwd: req.cwd.clone(),
             active_count: 0,
             active_started_at_ms_min: Some(req.started_at_ms),
@@ -6120,6 +7217,12 @@ fn build_session_rows(
         if entry.cwd.is_none() {
             entry.cwd = req.cwd;
         }
+        if entry.last_client_name.is_none() {
+            entry.last_client_name = req.client_name;
+        }
+        if entry.last_client_addr.is_none() {
+            entry.last_client_addr = req.client_addr;
+        }
         if let Some(effort) = req.reasoning_effort {
             entry.last_reasoning_effort = Some(effort);
         }
@@ -6144,6 +7247,9 @@ fn build_session_rows(
         let key = r.session_id.clone();
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
+            observation_scope: SessionObservationScope::ObservedOnly,
+            last_client_name: r.client_name.clone(),
+            last_client_addr: r.client_addr.clone(),
             cwd: r.cwd.clone(),
             active_count: 0,
             active_started_at_ms_min: None,
@@ -6180,6 +7286,8 @@ fn build_session_rows(
             entry.last_status = Some(r.status_code);
             entry.last_duration_ms = Some(r.duration_ms);
             entry.last_ended_at_ms = Some(r.ended_at_ms);
+            entry.last_client_name = r.client_name.clone().or(entry.last_client_name.clone());
+            entry.last_client_addr = r.client_addr.clone().or(entry.last_client_addr.clone());
             entry.last_model = r.model.clone().or(entry.last_model.clone());
             entry.last_reasoning_effort = r
                 .reasoning_effort
@@ -6203,6 +7311,9 @@ fn build_session_rows(
         let key = Some(sid.clone());
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
+            observation_scope: SessionObservationScope::ObservedOnly,
+            last_client_name: None,
+            last_client_addr: None,
             cwd: None,
             active_count: 0,
             active_started_at_ms_min: None,
@@ -6234,6 +7345,12 @@ fn build_session_rows(
 
         if entry.turns_total.is_none() {
             entry.turns_total = Some(st.turns_total);
+        }
+        if entry.last_client_name.is_none() {
+            entry.last_client_name = st.last_client_name.clone();
+        }
+        if entry.last_client_addr.is_none() {
+            entry.last_client_addr = st.last_client_addr.clone();
         }
         if entry.last_status.is_none() {
             entry.last_status = st.last_status;
@@ -6274,6 +7391,9 @@ fn build_session_rows(
         let key = Some(sid.clone());
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
+            observation_scope: SessionObservationScope::ObservedOnly,
+            last_client_name: None,
+            last_client_addr: None,
             cwd: None,
             active_count: 0,
             active_started_at_ms_min: None,
@@ -6309,6 +7429,9 @@ fn build_session_rows(
         let key = Some(sid.clone());
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
+            observation_scope: SessionObservationScope::ObservedOnly,
+            last_client_name: None,
+            last_client_addr: None,
             cwd: None,
             active_count: 0,
             active_started_at_ms_min: None,
@@ -6344,6 +7467,9 @@ fn build_session_rows(
         let key = Some(sid.clone());
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
+            observation_scope: SessionObservationScope::ObservedOnly,
+            last_client_name: None,
+            last_client_addr: None,
             cwd: None,
             active_count: 0,
             active_started_at_ms_min: None,
@@ -6379,6 +7505,9 @@ fn build_session_rows(
         let key = Some(sid.clone());
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
+            observation_scope: SessionObservationScope::ObservedOnly,
+            last_client_name: None,
+            last_client_addr: None,
             cwd: None,
             active_count: 0,
             active_started_at_ms_min: None,
@@ -6412,6 +7541,9 @@ fn build_session_rows(
 
     let mut rows = map.into_values().collect::<Vec<_>>();
     for row in &mut rows {
+        if row.cwd.is_some() {
+            row.observation_scope = SessionObservationScope::HostLocalEnriched;
+        }
         apply_effective_route_to_row(row, global_override);
     }
     rows.sort_by_key(|r| std::cmp::Reverse(session_sort_key(r)));
@@ -6429,6 +7561,40 @@ fn non_empty_trimmed(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+pub(super) fn format_observed_client_identity(
+    client_name: Option<&str>,
+    client_addr: Option<&str>,
+) -> Option<String> {
+    match (
+        non_empty_trimmed(client_name),
+        non_empty_trimmed(client_addr),
+    ) {
+        (Some(name), Some(addr)) => Some(format!("{name} @ {addr}")),
+        (Some(name), None) => Some(name),
+        (None, Some(addr)) => Some(addr),
+        (None, None) => None,
+    }
+}
+
+fn session_observation_scope_short_label(
+    lang: Language,
+    scope: SessionObservationScope,
+) -> &'static str {
+    match scope {
+        SessionObservationScope::ObservedOnly => pick(lang, "obs", "obs"),
+        SessionObservationScope::HostLocalEnriched => pick(lang, "host", "host"),
+    }
+}
+
+fn session_observation_scope_label(lang: Language, scope: SessionObservationScope) -> &'static str {
+    match scope {
+        SessionObservationScope::ObservedOnly => pick(lang, "仅共享观测", "Observed only"),
+        SessionObservationScope::HostLocalEnriched => {
+            pick(lang, "代理主机 enrich", "Host-local enriched")
+        }
+    }
 }
 
 fn resolve_effective_observed_value(
@@ -7118,24 +8284,23 @@ fn runtime_station_maps(proxy: &super::proxy_control::ProxyController) -> Runtim
 }
 
 fn current_runtime_active_station(proxy: &super::proxy_control::ProxyController) -> Option<String> {
-    let running = proxy.running()?;
-    let active_name = match running.service_name {
-        "claude" => running.cfg.claude.active.clone(),
-        _ => running.cfg.codex.active.clone(),
-    };
-    let active_fallback = match running.service_name {
-        "claude" => running
-            .cfg
-            .claude
-            .active_config()
-            .map(|cfg| cfg.name.clone()),
-        _ => running
-            .cfg
-            .codex
-            .active_config()
-            .map(|cfg| cfg.name.clone()),
-    };
-    active_name.or(active_fallback)
+    let snapshot = proxy.snapshot()?;
+    snapshot
+        .effective_active_station
+        .or(snapshot.configured_active_station)
+}
+
+fn refresh_config_editor_from_disk_if_running(ctx: &mut PageCtx<'_>) {
+    if !matches!(ctx.proxy.kind(), ProxyModeKind::Running) {
+        return;
+    }
+    let new_path = crate::config::config_file_path();
+    if let Ok(text) = std::fs::read_to_string(&new_path) {
+        *ctx.proxy_config_text = text.clone();
+        if let Ok(parsed) = parse_proxy_config_document(&text) {
+            ctx.view.config.working = Some(parsed);
+        }
+    }
 }
 
 fn save_active_station_and_reload(
@@ -7396,6 +8561,9 @@ mod tests {
     fn sample_session_row() -> SessionRow {
         SessionRow {
             session_id: Some("sid-1".to_string()),
+            observation_scope: SessionObservationScope::ObservedOnly,
+            last_client_name: None,
+            last_client_addr: None,
             cwd: Some("G:/codes/rust/codex-helper".to_string()),
             active_count: 0,
             active_started_at_ms_min: None,
@@ -7516,5 +8684,38 @@ mod tests {
             "https://relay.example.com/admin",
             true,
         ));
+    }
+
+    #[test]
+    fn remote_local_only_warning_absent_for_loopback_attach() {
+        let warning = remote_local_only_warning_message(
+            "http://127.0.0.1:3211",
+            &HostLocalControlPlaneCapabilities {
+                session_history: true,
+                transcript_read: true,
+                cwd_enrichment: true,
+            },
+            Language::Zh,
+            &["cwd", "transcript"],
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn remote_local_only_warning_mentions_host_only_capabilities() {
+        let warning = remote_local_only_warning_message(
+            "http://100.79.12.5:3211",
+            &HostLocalControlPlaneCapabilities {
+                session_history: true,
+                transcript_read: false,
+                cwd_enrichment: true,
+            },
+            Language::En,
+            &["cwd", "transcript"],
+        )
+        .expect("remote warning");
+        assert!(warning.contains("cwd / transcript"));
+        assert!(warning.contains("session history / cwd enrichment"));
+        assert!(warning.contains("proxy host"));
     }
 }

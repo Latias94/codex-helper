@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use super::super::i18n::{Language, pick};
 use super::components::{history_controls, history_sessions, history_transcript};
-use super::{Page, PageCtx, remote_attached_proxy_active};
+use super::{Page, PageCtx, remote_attached_proxy_active, remote_local_only_warning_message};
 use super::{
     build_wt_items_from_session_summaries, format_age, history_workdir_from_cwd, now_ms,
     open_wt_items, sort_session_summaries_by_mtime_desc,
@@ -339,6 +339,12 @@ fn observed_route_summary_from_card(card: &SessionIdentityCard, lang: Language) 
     if let Some(provider) = card.last_provider_id.as_deref() {
         parts.push(format!("provider={provider}"));
     }
+    if let Some(client) = super::format_observed_client_identity(
+        card.last_client_name.as_deref(),
+        card.last_client_addr.as_deref(),
+    ) {
+        parts.push(format!("client={client}"));
+    }
     if let Some(profile) = card.binding_profile_name.as_deref() {
         parts.push(format!("profile={profile}"));
     }
@@ -399,6 +405,8 @@ fn build_observed_history_summaries(
     struct ObservedAggregate {
         cwd: Option<String>,
         sort_hint_ms: Option<u64>,
+        client_name: Option<String>,
+        client_addr: Option<String>,
         model: Option<String>,
         tier: Option<String>,
         station: Option<String>,
@@ -415,6 +423,12 @@ fn build_observed_history_summaries(
         let entry = map.entry(sid).or_default();
         if entry.cwd.is_none() {
             entry.cwd = req.cwd.clone();
+        }
+        if entry.client_name.is_none() {
+            entry.client_name = req.client_name.clone();
+        }
+        if entry.client_addr.is_none() {
+            entry.client_addr = req.client_addr.clone();
         }
         entry.sort_hint_ms = Some(
             entry
@@ -445,6 +459,8 @@ fn build_observed_history_summaries(
         if entry.cwd.is_none() {
             entry.cwd = req.cwd.clone();
         }
+        entry.client_name = req.client_name.clone().or(entry.client_name.clone());
+        entry.client_addr = req.client_addr.clone().or(entry.client_addr.clone());
         entry.sort_hint_ms = Some(
             entry
                 .sort_hint_ms
@@ -469,6 +485,12 @@ fn build_observed_history_summaries(
             ];
             if let Some(provider) = aggregate.provider.as_deref() {
                 parts.push(format!("provider={provider}"));
+            }
+            if let Some(client) = super::format_observed_client_identity(
+                aggregate.client_name.as_deref(),
+                aggregate.client_addr.as_deref(),
+            ) {
+                parts.push(format!("client={client}"));
             }
             if let Some(status) = aggregate.status {
                 parts.push(format!("status={status}"));
@@ -660,6 +682,20 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     "In this mode, host-local transcript/cwd access still does not map to the remote machine; use Sessions or Requests for fuller shared observability.",
                 )
             });
+            if let Some(att) = ctx.proxy.attached()
+                && let Some(warning) = remote_local_only_warning_message(
+                    att.admin_base_url.as_str(),
+                    &att.host_local_capabilities,
+                    ctx.lang,
+                    &[
+                        pick(ctx.lang, "resume", "resume"),
+                        pick(ctx.lang, "open file", "open file"),
+                        pick(ctx.lang, "transcript", "transcript"),
+                    ],
+                )
+            {
+                ui.small(warning);
+            }
             if attached_host_local_history_advertised {
                 ui.small(pick(
                     ctx.lang,
@@ -2094,7 +2130,7 @@ mod tests {
     use super::*;
     use crate::dashboard_core::{
         ConfigOption, ControlProfileOption, HostLocalControlPlaneCapabilities,
-        SharedControlPlaneCapabilities, WindowStats,
+        RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, WindowStats,
     };
     use crate::state::{FinishedRequest, ResolvedRouteValue, RouteValueSource, UsageRollupView};
 
@@ -2109,6 +2145,9 @@ mod tests {
             recent: Vec::new(),
             session_cards: Vec::new(),
             global_override: None,
+            configured_active_station: None,
+            effective_active_station: None,
+            configured_default_profile: None,
             default_profile: None,
             profiles: Vec::<ControlProfileOption>::new(),
             session_model_overrides: HashMap::new(),
@@ -2121,6 +2160,7 @@ mod tests {
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             supports_v1: true,
+            supports_persisted_station_config: true,
             supports_default_profile_override: true,
             supports_config_runtime_override: true,
             shared_capabilities: SharedControlPlaneCapabilities {
@@ -2132,6 +2172,7 @@ mod tests {
                 transcript_read: true,
                 cwd_enrichment: true,
             },
+            remote_admin_access: RemoteAdminAccessCapabilities::default(),
         }
     }
 
@@ -2140,6 +2181,8 @@ mod tests {
         let mut snapshot = empty_snapshot();
         snapshot.session_cards = vec![SessionIdentityCard {
             session_id: Some("sid-card".to_string()),
+            last_client_name: Some("Frank-Desk".to_string()),
+            last_client_addr: Some("100.64.0.12".to_string()),
             cwd: Some("/remote/workdir".to_string()),
             last_ended_at_ms: Some(2_000),
             last_status: Some(200),
@@ -2170,9 +2213,11 @@ mod tests {
             summaries[0]
                 .first_user_message
                 .as_deref()
-                .is_some_and(
-                    |msg| msg.contains("station=right") && msg.contains("model=gpt-5.4-fast")
-                )
+                .is_some_and(|msg| {
+                    msg.contains("station=right")
+                        && msg.contains("model=gpt-5.4-fast")
+                        && msg.contains("client=Frank-Desk @ 100.64.0.12")
+                })
         );
         assert!(!history_session_supports_local_actions(&summaries[0]));
     }
@@ -2183,6 +2228,8 @@ mod tests {
         snapshot.recent = vec![FinishedRequest {
             id: 1,
             session_id: Some("sid-recent".to_string()),
+            client_name: Some("Tablet".to_string()),
+            client_addr: Some("100.64.0.13".to_string()),
             cwd: Some("/remote/recent".to_string()),
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: None,
@@ -2211,7 +2258,11 @@ mod tests {
             summaries[0]
                 .first_user_message
                 .as_deref()
-                .is_some_and(|msg| msg.contains("station=vibe") && msg.contains("provider=vibe"))
+                .is_some_and(|msg| {
+                    msg.contains("station=vibe")
+                        && msg.contains("provider=vibe")
+                        && msg.contains("client=Tablet @ 100.64.0.13")
+                })
         );
     }
 }

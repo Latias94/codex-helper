@@ -15,8 +15,9 @@ use crate::config::{
 };
 use crate::dashboard_core::{
     ApiV1Capabilities, ApiV1Snapshot, ConfigOption, ControlProfileOption,
-    HostLocalControlPlaneCapabilities, SharedControlPlaneCapabilities, WindowStats,
-    build_config_options_from_mgr, build_dashboard_snapshot,
+    HostLocalControlPlaneCapabilities, RemoteAdminAccessCapabilities,
+    SharedControlPlaneCapabilities, WindowStats, build_config_options_from_mgr,
+    build_dashboard_snapshot,
 };
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_port_for_proxy_port,
@@ -76,6 +77,9 @@ pub struct AttachedStatus {
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    pub configured_active_station: Option<String>,
+    pub effective_active_station: Option<String>,
+    pub configured_default_profile: Option<String>,
     pub default_profile: Option<String>,
     pub profiles: Vec<ControlProfileOption>,
     pub session_model_overrides: HashMap<String, String>,
@@ -92,11 +96,13 @@ pub struct AttachedStatus {
     pub lb_view: HashMap<String, LbConfigView>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
+    pub supports_persisted_station_config: bool,
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
     pub supports_station_api: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
+    pub remote_admin_access: RemoteAdminAccessCapabilities,
 }
 
 impl AttachedStatus {
@@ -113,6 +119,9 @@ impl AttachedStatus {
             recent: Vec::new(),
             session_cards: Vec::new(),
             global_override: None,
+            configured_active_station: None,
+            effective_active_station: None,
+            configured_default_profile: None,
             default_profile: None,
             profiles: Vec::new(),
             session_model_overrides: HashMap::new(),
@@ -129,11 +138,13 @@ impl AttachedStatus {
             lb_view: HashMap::new(),
             runtime_loaded_at_ms: None,
             runtime_source_mtime_ms: None,
+            supports_persisted_station_config: false,
             supports_default_profile_override: false,
             supports_config_runtime_override: false,
             supports_station_api: false,
             shared_capabilities: SharedControlPlaneCapabilities::default(),
             host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
+            remote_admin_access: RemoteAdminAccessCapabilities::default(),
         }
     }
 }
@@ -149,6 +160,9 @@ pub struct GuiRuntimeSnapshot {
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    pub configured_active_station: Option<String>,
+    pub effective_active_station: Option<String>,
+    pub configured_default_profile: Option<String>,
     pub default_profile: Option<String>,
     pub profiles: Vec<ControlProfileOption>,
     pub session_model_overrides: HashMap<String, String>,
@@ -161,10 +175,12 @@ pub struct GuiRuntimeSnapshot {
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
     pub supports_v1: bool,
+    pub supports_persisted_station_config: bool,
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
+    pub remote_admin_access: RemoteAdminAccessCapabilities,
 }
 
 pub struct RunningProxy {
@@ -179,6 +195,9 @@ pub struct RunningProxy {
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
     pub global_override: Option<String>,
+    pub configured_active_station: Option<String>,
+    pub effective_active_station: Option<String>,
+    pub configured_default_profile: Option<String>,
     pub default_profile: Option<String>,
     pub profiles: Vec<ControlProfileOption>,
     pub session_model_overrides: HashMap<String, String>,
@@ -229,6 +248,7 @@ pub struct DiscoveredProxy {
     pub last_error: Option<String>,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
+    pub remote_admin_access: RemoteAdminAccessCapabilities,
 }
 
 struct PortInUseModal {
@@ -259,6 +279,54 @@ fn local_host_local_control_plane_capabilities() -> HostLocalControlPlaneCapabil
         transcript_read: host_local_history,
         cwd_enrichment: host_local_history,
     }
+}
+
+fn local_remote_admin_access_capabilities() -> RemoteAdminAccessCapabilities {
+    RemoteAdminAccessCapabilities {
+        loopback_without_token: true,
+        remote_requires_token: true,
+        remote_enabled: std::env::var(crate::proxy::ADMIN_TOKEN_ENV_VAR)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty()),
+        token_header: crate::proxy::ADMIN_TOKEN_HEADER.to_string(),
+        token_env_var: crate::proxy::ADMIN_TOKEN_ENV_VAR.to_string(),
+    }
+}
+
+fn admin_auth_token() -> Option<String> {
+    std::env::var(crate::proxy::ADMIN_TOKEN_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn with_admin_auth(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    if let Some(token) = admin_auth_token() {
+        builder.header(crate::proxy::ADMIN_TOKEN_HEADER, token)
+    } else {
+        builder
+    }
+}
+
+async fn send_admin_request(builder: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+    let response = with_admin_auth(builder).send().await?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::FORBIDDEN
+        && (body.contains(crate::proxy::ADMIN_TOKEN_HEADER)
+            || body.contains(crate::proxy::ADMIN_TOKEN_ENV_VAR))
+    {
+        bail!("admin access denied: {body}");
+    }
+
+    if body.trim().is_empty() {
+        bail!("admin request failed: {status}");
+    }
+    bail!("admin request failed: {status}: {body}");
 }
 
 impl ProxyController {
@@ -343,6 +411,9 @@ impl ProxyController {
                 recent: r.recent.clone(),
                 session_cards: r.session_cards.clone(),
                 global_override: r.global_override.clone(),
+                configured_active_station: r.configured_active_station.clone(),
+                effective_active_station: r.effective_active_station.clone(),
+                configured_default_profile: r.configured_default_profile.clone(),
                 default_profile: r.default_profile.clone(),
                 profiles: r.profiles.clone(),
                 session_model_overrides: r.session_model_overrides.clone(),
@@ -355,10 +426,12 @@ impl ProxyController {
                 stats_5m: r.stats_5m.clone(),
                 stats_1h: r.stats_1h.clone(),
                 supports_v1: true,
+                supports_persisted_station_config: true,
                 supports_default_profile_override: true,
                 supports_config_runtime_override: true,
                 shared_capabilities: local_shared_control_plane_capabilities(),
                 host_local_capabilities: local_host_local_control_plane_capabilities(),
+                remote_admin_access: local_remote_admin_access_capabilities(),
             }),
             ProxyMode::Attached(a) => Some(GuiRuntimeSnapshot {
                 kind: ProxyModeKind::Attached,
@@ -370,6 +443,9 @@ impl ProxyController {
                 recent: a.recent.clone(),
                 session_cards: a.session_cards.clone(),
                 global_override: a.global_override.clone(),
+                configured_active_station: a.configured_active_station.clone(),
+                effective_active_station: a.effective_active_station.clone(),
+                configured_default_profile: a.configured_default_profile.clone(),
                 default_profile: a.default_profile.clone(),
                 profiles: a.profiles.clone(),
                 session_model_overrides: a.session_model_overrides.clone(),
@@ -382,10 +458,12 @@ impl ProxyController {
                 stats_5m: a.stats_5m.clone(),
                 stats_1h: a.stats_1h.clone(),
                 supports_v1: a.api_version == Some(1),
+                supports_persisted_station_config: a.supports_persisted_station_config,
                 supports_default_profile_override: a.supports_default_profile_override,
                 supports_config_runtime_override: a.supports_config_runtime_override,
                 shared_capabilities: a.shared_capabilities.clone(),
                 host_local_capabilities: a.host_local_capabilities.clone(),
+                remote_admin_access: a.remote_admin_access.clone(),
             }),
             _ => None,
         }
@@ -454,6 +532,7 @@ impl ProxyController {
                 attached.service_name = discovered.service_name.clone();
                 attached.shared_capabilities = discovered.shared_capabilities.clone();
                 attached.host_local_capabilities = discovered.host_local_capabilities.clone();
+                attached.remote_admin_access = discovered.remote_admin_access.clone();
             }
         }
         self.mode = ProxyMode::Attached(attached);
@@ -481,12 +560,8 @@ impl ProxyController {
             url: String,
             timeout: Duration,
         ) -> anyhow::Result<T> {
-            Ok(client
-                .get(url)
-                .timeout(timeout)
-                .send()
+            Ok(send_admin_request(client.get(url).timeout(timeout))
                 .await?
-                .error_for_status()?
                 .json::<T>()
                 .await?)
         }
@@ -523,6 +598,7 @@ impl ProxyController {
                     last_error: None,
                     shared_capabilities: c.shared_capabilities,
                     host_local_capabilities: c.host_local_capabilities,
+                    remote_admin_access: c.remote_admin_access,
                 });
             }
 
@@ -553,6 +629,7 @@ impl ProxyController {
                     last_error: None,
                     shared_capabilities: c.shared_capabilities,
                     host_local_capabilities: c.host_local_capabilities,
+                    remote_admin_access: c.remote_admin_access,
                 });
             }
 
@@ -596,6 +673,7 @@ impl ProxyController {
                         last_error: None,
                         shared_capabilities: c.shared_capabilities,
                         host_local_capabilities: c.host_local_capabilities,
+                        remote_admin_access: c.remote_admin_access,
                     });
                 }
 
@@ -617,6 +695,7 @@ impl ProxyController {
                         last_error: None,
                         shared_capabilities: SharedControlPlaneCapabilities::default(),
                         host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
+                        remote_admin_access: RemoteAdminAccessCapabilities::default(),
                     });
                 }
             }
@@ -650,6 +729,7 @@ impl ProxyController {
                     last_error: None,
                     shared_capabilities: SharedControlPlaneCapabilities::default(),
                     host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
+                    remote_admin_access: RemoteAdminAccessCapabilities::default(),
                 }),
                 Err(_) => None,
             }
@@ -716,12 +796,8 @@ impl ProxyController {
                 url: String,
                 timeout: Duration,
             ) -> anyhow::Result<T> {
-                Ok(client
-                    .get(url)
-                    .timeout(timeout)
-                    .send()
+                Ok(send_admin_request(client.get(url).timeout(timeout))
                     .await?
-                    .error_for_status()?
                     .json::<T>()
                     .await?)
             }
@@ -735,6 +811,9 @@ impl ProxyController {
                 recent: Vec<FinishedRequest>,
                 session_cards: Vec<SessionIdentityCard>,
                 global_override: Option<String>,
+                configured_active_station: Option<String>,
+                effective_active_station: Option<String>,
+                configured_default_profile: Option<String>,
                 default_profile: Option<String>,
                 profiles: Vec<ControlProfileOption>,
                 session_model: HashMap<String, String>,
@@ -751,11 +830,13 @@ impl ProxyController {
                 lb_view: HashMap<String, LbConfigView>,
                 runtime_loaded_at_ms: Option<u64>,
                 runtime_source_mtime_ms: Option<u64>,
+                supports_persisted_station_config: bool,
                 supports_default_profile_override: bool,
                 supports_config_runtime_override: bool,
                 supports_station_api: bool,
                 shared_capabilities: SharedControlPlaneCapabilities,
                 host_local_capabilities: HostLocalControlPlaneCapabilities,
+                remote_admin_access: RemoteAdminAccessCapabilities,
             }
 
             async fn refresh_from_base(
@@ -779,13 +860,21 @@ impl ProxyController {
                         endpoints,
                         shared_capabilities,
                         host_local_capabilities,
+                        remote_admin_access,
                     } = caps;
                     let supports_snapshot = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/snapshot");
+                    let supports_profiles = endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/profiles");
                     let supports_default_profile_override = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/profiles/default");
+                    let supports_persisted_station_config = endpoints.iter().any(|e| {
+                        e == "/__codex_helper/api/v1/stations/config-active"
+                            || e == "/__codex_helper/api/v1/stations/{name}"
+                    });
                     let supports_station_api = endpoints.iter().any(|e| {
                         e == "/__codex_helper/api/v1/stations"
                             || e == "/__codex_helper/api/v1/stations/runtime"
@@ -794,6 +883,27 @@ impl ProxyController {
                         e == "/__codex_helper/api/v1/configs/runtime"
                             || e == "/__codex_helper/api/v1/stations/runtime"
                     });
+
+                    let configured_profiles = if supports_profiles {
+                        #[derive(serde::Deserialize)]
+                        struct ProfilesResponse {
+                            default_profile: Option<String>,
+                            #[serde(default)]
+                            configured_default_profile: Option<String>,
+                            #[serde(default)]
+                            profiles: Vec<ControlProfileOption>,
+                        }
+
+                        get_json::<ProfilesResponse>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/profiles"),
+                            req_timeout,
+                        )
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    };
 
                     if supports_snapshot {
                         let api = get_json::<ApiV1Snapshot>(
@@ -811,6 +921,8 @@ impl ProxyController {
                             runtime_source_mtime_ms,
                             configs,
                             stations,
+                            configured_active_station,
+                            effective_active_station,
                             default_profile,
                             profiles,
                             snapshot,
@@ -820,6 +932,18 @@ impl ProxyController {
                         } else {
                             stations
                         };
+                        let configured_default_profile = configured_profiles
+                            .as_ref()
+                            .and_then(|response| response.configured_default_profile.clone())
+                            .or_else(|| {
+                                configured_profiles
+                                    .as_ref()
+                                    .and_then(|response| response.default_profile.clone())
+                            });
+                        let profiles = configured_profiles
+                            .as_ref()
+                            .map(|response| response.profiles.clone())
+                            .unwrap_or(profiles);
 
                         return Ok(RefreshResult {
                             management_base_url: base.to_string(),
@@ -829,6 +953,9 @@ impl ProxyController {
                             recent: snapshot.recent,
                             session_cards: snapshot.session_cards,
                             global_override: snapshot.global_override,
+                            configured_active_station,
+                            effective_active_station,
+                            configured_default_profile,
                             default_profile,
                             profiles,
                             session_model: snapshot.session_model_overrides,
@@ -845,11 +972,13 @@ impl ProxyController {
                             lb_view: snapshot.lb_view,
                             runtime_loaded_at_ms,
                             runtime_source_mtime_ms,
+                            supports_persisted_station_config,
                             supports_default_profile_override,
                             supports_config_runtime_override,
                             supports_station_api,
                             shared_capabilities,
                             host_local_capabilities,
+                            remote_admin_access,
                         });
                     }
 
@@ -927,9 +1056,6 @@ impl ProxyController {
                     let supports_session_service_tier = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/overrides/session/service-tier");
-                    let supports_profiles = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/profiles");
 
                     let session_model = if supports_session_model {
                         get_json::<HashMap<String, String>>(
@@ -957,28 +1083,18 @@ impl ProxyController {
                         HashMap::new()
                     };
 
-                    let (default_profile, profiles) = if supports_profiles {
-                        #[derive(serde::Deserialize)]
-                        struct ProfilesResponse {
-                            default_profile: Option<String>,
-                            #[serde(default)]
-                            profiles: Vec<ControlProfileOption>,
-                        }
-
-                        let response = get_json::<ProfilesResponse>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/profiles"),
-                            req_timeout,
-                        )
-                        .await
-                        .ok();
-                        match response {
-                            Some(response) => (response.default_profile, response.profiles),
-                            None => (None, Vec::new()),
-                        }
-                    } else {
-                        (None, Vec::new())
-                    };
+                    let (configured_default_profile, default_profile, profiles) =
+                        match configured_profiles {
+                            Some(response) => (
+                                response
+                                    .configured_default_profile
+                                    .clone()
+                                    .or_else(|| response.default_profile.clone()),
+                                response.default_profile,
+                                response.profiles,
+                            ),
+                            None => (None, None, Vec::new()),
+                        };
 
                     return Ok(RefreshResult {
                         management_base_url: base.to_string(),
@@ -988,6 +1104,9 @@ impl ProxyController {
                         recent,
                         session_cards: Vec::new(),
                         global_override,
+                        configured_active_station: None,
+                        effective_active_station: None,
+                        configured_default_profile,
                         default_profile,
                         profiles,
                         session_model,
@@ -1004,11 +1123,13 @@ impl ProxyController {
                         lb_view: HashMap::new(),
                         runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                         runtime_source_mtime_ms: runtime.source_mtime_ms,
+                        supports_persisted_station_config,
                         supports_default_profile_override,
                         supports_config_runtime_override,
                         supports_station_api,
                         shared_capabilities,
                         host_local_capabilities,
+                        remote_admin_access,
                     });
                 }
 
@@ -1047,6 +1168,9 @@ impl ProxyController {
                     recent,
                     session_cards: Vec::new(),
                     global_override: None,
+                    configured_active_station: None,
+                    effective_active_station: None,
+                    configured_default_profile: None,
                     default_profile: None,
                     profiles: Vec::new(),
                     session_model: HashMap::new(),
@@ -1063,11 +1187,13 @@ impl ProxyController {
                     lb_view: HashMap::new(),
                     runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                     runtime_source_mtime_ms: runtime.source_mtime_ms,
+                    supports_persisted_station_config: false,
                     supports_default_profile_override: false,
                     supports_config_runtime_override: false,
                     supports_station_api: false,
                     shared_capabilities: SharedControlPlaneCapabilities::default(),
                     host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
+                    remote_admin_access: RemoteAdminAccessCapabilities::default(),
                 })
             }
 
@@ -1093,6 +1219,9 @@ impl ProxyController {
                     att.recent = result.recent;
                     att.session_cards = result.session_cards;
                     att.global_override = result.global_override;
+                    att.configured_active_station = result.configured_active_station;
+                    att.effective_active_station = result.effective_active_station;
+                    att.configured_default_profile = result.configured_default_profile;
                     att.default_profile = result.default_profile;
                     att.profiles = result.profiles;
                     att.session_model_overrides = result.session_model;
@@ -1109,12 +1238,15 @@ impl ProxyController {
                     att.lb_view = result.lb_view;
                     att.runtime_loaded_at_ms = result.runtime_loaded_at_ms;
                     att.runtime_source_mtime_ms = result.runtime_source_mtime_ms;
+                    att.supports_persisted_station_config =
+                        result.supports_persisted_station_config;
                     att.supports_default_profile_override =
                         result.supports_default_profile_override;
                     att.supports_config_runtime_override = result.supports_config_runtime_override;
                     att.supports_station_api = result.supports_station_api;
                     att.shared_capabilities = result.shared_capabilities;
                     att.host_local_capabilities = result.host_local_capabilities;
+                    att.remote_admin_access = result.remote_admin_access;
                 }
             }
             Err(e) => {
@@ -1157,16 +1289,13 @@ impl ProxyController {
                     } else {
                         format!("{base}/__codex_helper/override/session")
                     };
-                    client
-                        .post(url)
-                        .timeout(Duration::from_millis(800))
-                        .json(&serde_json::json!({
+                    send_admin_request(client.post(url).timeout(Duration::from_millis(800)).json(
+                        &serde_json::json!({
                             "session_id": session_id,
                             "effort": effort,
-                        }))
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                        }),
+                    ))
+                    .await?;
                     Ok::<(), anyhow::Error>(())
                 };
                 rt.block_on(fut)?;
@@ -1205,18 +1334,18 @@ impl ProxyController {
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
                 let fut = async move {
-                    client
-                        .post(format!(
-                            "{base}/__codex_helper/api/v1/overrides/session/model"
-                        ))
-                        .timeout(Duration::from_millis(800))
-                        .json(&serde_json::json!({
-                            "session_id": session_id,
-                            "model": model,
-                        }))
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                    send_admin_request(
+                        client
+                            .post(format!(
+                                "{base}/__codex_helper/api/v1/overrides/session/model"
+                            ))
+                            .timeout(Duration::from_millis(800))
+                            .json(&serde_json::json!({
+                                "session_id": session_id,
+                                "model": model,
+                            })),
+                    )
+                    .await?;
                     Ok::<(), anyhow::Error>(())
                 };
                 rt.block_on(fut)?;
@@ -1276,18 +1405,18 @@ impl ProxyController {
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
                 let fut = async move {
-                    client
-                        .post(format!(
-                            "{base}/__codex_helper/api/v1/overrides/session/profile"
-                        ))
-                        .timeout(Duration::from_millis(1200))
-                        .json(&serde_json::json!({
-                            "session_id": session_id,
-                            "profile_name": profile_name,
-                        }))
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                    send_admin_request(
+                        client
+                            .post(format!(
+                                "{base}/__codex_helper/api/v1/overrides/session/profile"
+                            ))
+                            .timeout(Duration::from_millis(1200))
+                            .json(&serde_json::json!({
+                                "session_id": session_id,
+                                "profile_name": profile_name,
+                            })),
+                    )
+                    .await?;
                     Ok::<(), anyhow::Error>(())
                 };
                 rt.block_on(fut)?;
@@ -1361,15 +1490,15 @@ impl ProxyController {
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
                 let fut = async move {
-                    client
-                        .post(format!("{base}/__codex_helper/api/v1/profiles/default"))
-                        .timeout(Duration::from_millis(1200))
-                        .json(&serde_json::json!({
+                    send_admin_request(
+                        client
+                            .post(format!("{base}/__codex_helper/api/v1/profiles/default"))
+                            .timeout(Duration::from_millis(1200))
+                            .json(&serde_json::json!({
                             "profile_name": profile_name,
-                        }))
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                            })),
+                    )
+                    .await?;
                     Ok::<(), anyhow::Error>(())
                 };
                 rt.block_on(fut)?;
@@ -1377,6 +1506,205 @@ impl ProxyController {
             }
             _ => bail!("proxy is not running/attached"),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_persisted_default_profile(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        profile_name: Option<String>,
+    ) -> anyhow::Result<()> {
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) {
+                    bail!("attached proxy does not support persisted profile config (need api v1)");
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .post(format!(
+                        "{base}/__codex_helper/api/v1/profiles/config-default"
+                    ))
+                    .timeout(Duration::from_millis(1200))
+                    .json(&serde_json::json!({
+                        "profile_name": profile_name,
+                    })),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn upsert_persisted_profile(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        profile_name: String,
+        profile: crate::config::ServiceControlProfile,
+    ) -> anyhow::Result<()> {
+        if profile_name.trim().is_empty() {
+            bail!("profile name is required");
+        }
+
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) {
+                    bail!("attached proxy does not support persisted profile config (need api v1)");
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .put(format!(
+                        "{base}/__codex_helper/api/v1/profiles/{}",
+                        profile_name.trim()
+                    ))
+                    .timeout(Duration::from_millis(1200))
+                    .json(&profile),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_persisted_profile(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        profile_name: String,
+    ) -> anyhow::Result<()> {
+        if profile_name.trim().is_empty() {
+            bail!("profile name is required");
+        }
+
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) {
+                    bail!("attached proxy does not support persisted profile config (need api v1)");
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .delete(format!(
+                        "{base}/__codex_helper/api/v1/profiles/{}",
+                        profile_name.trim()
+                    ))
+                    .timeout(Duration::from_millis(1200)),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn set_persisted_active_station(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        station_name: Option<String>,
+    ) -> anyhow::Result<()> {
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) || !att.supports_persisted_station_config {
+                    bail!("attached proxy does not support persisted station config (need api v1)");
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .post(format!(
+                        "{base}/__codex_helper/api/v1/stations/config-active"
+                    ))
+                    .timeout(Duration::from_millis(1200))
+                    .json(&serde_json::json!({
+                        "station_name": station_name,
+                    })),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn update_persisted_station(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        station_name: String,
+        enabled: bool,
+        level: u8,
+    ) -> anyhow::Result<()> {
+        if station_name.trim().is_empty() {
+            bail!("station name is required");
+        }
+
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) || !att.supports_persisted_station_config {
+                    bail!("attached proxy does not support persisted station config (need api v1)");
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .put(format!(
+                        "{base}/__codex_helper/api/v1/stations/{}",
+                        station_name.trim()
+                    ))
+                    .timeout(Duration::from_millis(1200))
+                    .json(&serde_json::json!({
+                        "enabled": enabled,
+                        "level": level,
+                    })),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
     }
 
     pub fn set_runtime_config_meta(
@@ -1515,20 +1843,20 @@ impl ProxyController {
                         "clear_runtime_state".to_string(),
                         serde_json::json!(clear_runtime_state),
                     );
-                    client
-                        .post(format!(
-                            "{base}{}",
-                            if use_station_api {
-                                "/__codex_helper/api/v1/stations/runtime"
-                            } else {
-                                "/__codex_helper/api/v1/configs/runtime"
-                            }
-                        ))
-                        .timeout(Duration::from_millis(1200))
-                        .json(&serde_json::Value::Object(body))
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                    send_admin_request(
+                        client
+                            .post(format!(
+                                "{base}{}",
+                                if use_station_api {
+                                    "/__codex_helper/api/v1/stations/runtime"
+                                } else {
+                                    "/__codex_helper/api/v1/configs/runtime"
+                                }
+                            ))
+                            .timeout(Duration::from_millis(1200))
+                            .json(&serde_json::Value::Object(body)),
+                    )
+                    .await?;
                     Ok::<(), anyhow::Error>(())
                 };
                 rt.block_on(fut)?;
@@ -1567,18 +1895,18 @@ impl ProxyController {
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
                 let fut = async move {
-                    client
-                        .post(format!(
-                            "{base}/__codex_helper/api/v1/overrides/session/config"
-                        ))
-                        .timeout(Duration::from_millis(800))
-                        .json(&serde_json::json!({
-                            "session_id": session_id,
-                            "config_name": config_name,
-                        }))
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                    send_admin_request(
+                        client
+                            .post(format!(
+                                "{base}/__codex_helper/api/v1/overrides/session/config"
+                            ))
+                            .timeout(Duration::from_millis(800))
+                            .json(&serde_json::json!({
+                                "session_id": session_id,
+                                "config_name": config_name,
+                            })),
+                    )
+                    .await?;
                     Ok::<(), anyhow::Error>(())
                 };
                 rt.block_on(fut)?;
@@ -1619,18 +1947,18 @@ impl ProxyController {
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
                 let fut = async move {
-                    client
-                        .post(format!(
-                            "{base}/__codex_helper/api/v1/overrides/session/service-tier"
-                        ))
-                        .timeout(Duration::from_millis(800))
-                        .json(&serde_json::json!({
-                            "session_id": session_id,
-                            "service_tier": service_tier,
-                        }))
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                    send_admin_request(
+                        client
+                            .post(format!(
+                                "{base}/__codex_helper/api/v1/overrides/session/service-tier"
+                            ))
+                            .timeout(Duration::from_millis(800))
+                            .json(&serde_json::json!({
+                                "session_id": session_id,
+                                "service_tier": service_tier,
+                            })),
+                    )
+                    .await?;
                     Ok::<(), anyhow::Error>(())
                 };
                 rt.block_on(fut)?;
@@ -1664,15 +1992,15 @@ impl ProxyController {
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
                 let fut = async move {
-                    client
-                        .post(format!(
-                            "{base}/__codex_helper/api/v1/overrides/global-config"
-                        ))
-                        .timeout(Duration::from_millis(800))
-                        .json(&serde_json::json!({ "config_name": config_name }))
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                    send_admin_request(
+                        client
+                            .post(format!(
+                                "{base}/__codex_helper/api/v1/overrides/global-config"
+                            ))
+                            .timeout(Duration::from_millis(800))
+                            .json(&serde_json::json!({ "config_name": config_name })),
+                    )
+                    .await?;
                     Ok::<(), anyhow::Error>(())
                 };
                 rt.block_on(fut)?;
@@ -1696,12 +2024,7 @@ impl ProxyController {
             } else {
                 format!("{base}/__codex_helper/config/reload")
             };
-            client
-                .post(url)
-                .timeout(Duration::from_millis(800))
-                .send()
-                .await?
-                .error_for_status()?;
+            send_admin_request(client.post(url).timeout(Duration::from_millis(800))).await?;
             Ok::<(), anyhow::Error>(())
         };
         rt.block_on(fut)?;
@@ -1728,13 +2051,13 @@ impl ProxyController {
 
         let client = self.http_client.clone();
         let fut = async move {
-            client
-                .post(format!("{base}/__codex_helper/api/v1/healthcheck/start"))
-                .timeout(Duration::from_millis(800))
-                .json(&serde_json::json!({ "all": all, "config_names": config_names }))
-                .send()
-                .await?
-                .error_for_status()?;
+            send_admin_request(
+                client
+                    .post(format!("{base}/__codex_helper/api/v1/healthcheck/start"))
+                    .timeout(Duration::from_millis(800))
+                    .json(&serde_json::json!({ "all": all, "config_names": config_names })),
+            )
+            .await?;
             Ok::<(), anyhow::Error>(())
         };
         rt.block_on(fut)?;
@@ -1761,13 +2084,13 @@ impl ProxyController {
 
         let client = self.http_client.clone();
         let fut = async move {
-            client
-                .post(format!("{base}/__codex_helper/api/v1/healthcheck/cancel"))
-                .timeout(Duration::from_millis(800))
-                .json(&serde_json::json!({ "all": all, "config_names": config_names }))
-                .send()
-                .await?
-                .error_for_status()?;
+            send_admin_request(
+                client
+                    .post(format!("{base}/__codex_helper/api/v1/healthcheck/cancel"))
+                    .timeout(Duration::from_millis(800))
+                    .json(&serde_json::json!({ "all": all, "config_names": config_names })),
+            )
+            .await?;
             Ok::<(), anyhow::Error>(())
         };
         rt.block_on(fut)?;
@@ -1804,6 +2127,9 @@ impl ProxyController {
                 &mut snapshot.session_cards,
                 mgr,
             );
+            let configured_active_station = mgr.active.clone();
+            let effective_active_station = mgr.active_config().map(|cfg| cfg.name.clone());
+            let configured_default_profile = mgr.default_profile.clone();
             let default_profile = effective_default_profile_from_cfg_state(
                 state.as_ref(),
                 service_name.as_str(),
@@ -1821,12 +2147,31 @@ impl ProxyController {
                 cfg.as_ref(),
             )
             .await;
-            Ok::<_, anyhow::Error>((snapshot, default_profile, profiles, configs))
+            Ok::<_, anyhow::Error>((
+                snapshot,
+                configured_active_station,
+                effective_active_station,
+                configured_default_profile,
+                default_profile,
+                profiles,
+                configs,
+            ))
         };
 
         match rt.block_on(fut) {
-            Ok((snap, default_profile, profiles, configs)) => {
+            Ok((
+                snap,
+                configured_active_station,
+                effective_active_station,
+                configured_default_profile,
+                default_profile,
+                profiles,
+                configs,
+            )) => {
                 r.last_error = None;
+                r.configured_active_station = configured_active_station;
+                r.effective_active_station = effective_active_station;
+                r.configured_default_profile = configured_default_profile;
                 r.default_profile = default_profile;
                 r.profiles = profiles;
                 r.configs = configs;
@@ -2055,6 +2400,14 @@ impl ProxyController {
             "claude" => cfg.claude.default_profile.clone(),
             _ => cfg.codex.default_profile.clone(),
         };
+        let configured_active_station = match service_name {
+            "claude" => cfg.claude.active.clone(),
+            _ => cfg.codex.active.clone(),
+        };
+        let effective_active_station = match service_name {
+            "claude" => cfg.claude.active_config().map(|cfg| cfg.name.clone()),
+            _ => cfg.codex.active_config().map(|cfg| cfg.name.clone()),
+        };
         let profiles =
             list_profiles_from_cfg(cfg.as_ref(), service_name, default_profile.as_deref());
         let configs =
@@ -2072,6 +2425,9 @@ impl ProxyController {
             recent: Vec::new(),
             session_cards: Vec::new(),
             global_override: None,
+            configured_active_station,
+            effective_active_station,
+            configured_default_profile: default_profile.clone(),
             default_profile,
             profiles,
             session_model_overrides: HashMap::new(),
@@ -2204,15 +2560,53 @@ fn suggest_next_port(
 mod tests {
     use super::*;
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use axum::{
         Json, Router,
-        http::StatusCode,
-        routing::{get, post},
+        http::{HeaderMap, StatusCode},
+        routing::{get, post, put},
     };
     use codex_helper_core::dashboard_core::snapshot::DashboardSnapshot;
     use serde_json::Value;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[derive(Default)]
+    struct ScopedEnv {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl ScopedEnv {
+        unsafe fn set(&mut self, key: &str, value: &str) {
+            if !self.saved.iter().any(|(saved_key, _)| saved_key == key) {
+                self.saved.push((key.to_string(), std::env::var(key).ok()));
+            }
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                match value {
+                    Some(value) => unsafe {
+                        std::env::set_var(key, value);
+                    },
+                    None => unsafe {
+                        std::env::remove_var(key);
+                    },
+                }
+            }
+        }
+    }
 
     fn sample_station(name: &str) -> ConfigOption {
         ConfigOption {
@@ -2238,6 +2632,8 @@ mod tests {
             runtime_source_mtime_ms: Some(2),
             configs,
             stations,
+            configured_active_station: None,
+            effective_active_station: None,
             default_profile: None,
             profiles: Vec::new(),
             snapshot: DashboardSnapshot {
@@ -2455,6 +2851,106 @@ mod tests {
     }
 
     #[test]
+    fn refresh_attached_sends_admin_token_when_configured() {
+        let _env_lock = env_lock();
+        let mut scoped = ScopedEnv::default();
+        unsafe {
+            scoped.set(crate::proxy::ADMIN_TOKEN_ENV_VAR, "gui-secret");
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let observed_headers = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let caps = serde_json::json!({
+            "api_version": 1,
+            "service_name": "codex",
+            "shared_capabilities": {
+                "session_observability": true,
+                "request_history": true
+            },
+            "host_local_capabilities": {
+                "session_history": false,
+                "transcript_read": false,
+                "cwd_enrichment": false
+            },
+            "remote_admin_access": {
+                "loopback_without_token": true,
+                "remote_requires_token": true,
+                "remote_enabled": true,
+                "token_header": crate::proxy::ADMIN_TOKEN_HEADER,
+                "token_env_var": crate::proxy::ADMIN_TOKEN_ENV_VAR
+            },
+            "endpoints": [
+                "/__codex_helper/api/v1/snapshot"
+            ]
+        });
+        let snapshot =
+            sample_snapshot(vec![sample_station("alpha")], vec![sample_station("alpha")]);
+        let app = Router::new()
+            .route(
+                "/__codex_helper/api/v1/capabilities",
+                get({
+                    let caps = caps.clone();
+                    let observed_headers = observed_headers.clone();
+                    move |headers: HeaderMap| {
+                        let caps = caps.clone();
+                        let observed_headers = observed_headers.clone();
+                        async move {
+                            observed_headers.lock().expect("header lock").push(
+                                headers
+                                    .get(crate::proxy::ADMIN_TOKEN_HEADER)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string),
+                            );
+                            Json(caps)
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/snapshot",
+                get({
+                    let snapshot = snapshot.clone();
+                    let observed_headers = observed_headers.clone();
+                    move |headers: HeaderMap| {
+                        let snapshot = snapshot.clone();
+                        let observed_headers = observed_headers.clone();
+                        async move {
+                            observed_headers.lock().expect("header lock").push(
+                                headers
+                                    .get(crate::proxy::ADMIN_TOKEN_HEADER)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string),
+                            );
+                            Json(snapshot)
+                        }
+                    }
+                }),
+            );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4250, ServiceKind::Codex);
+        controller.request_attach_with_admin_base(4250, Some(base_url));
+        controller.refresh_attached_if_due(&rt, Duration::ZERO);
+
+        let observed_headers = observed_headers.lock().expect("header lock").clone();
+        assert!(!observed_headers.is_empty());
+        assert!(
+            observed_headers
+                .iter()
+                .all(|value| value.as_deref() == Some("gui-secret"))
+        );
+        assert!(
+            controller
+                .attached()
+                .expect("attached status")
+                .remote_admin_access
+                .remote_enabled
+        );
+
+        handle.abort();
+    }
+
+    #[test]
     fn attached_runtime_meta_uses_station_and_legacy_endpoints_compatibly() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
 
@@ -2547,5 +3043,75 @@ mod tests {
             Some(&Value::Bool(true))
         );
         config_handle.abort();
+    }
+
+    #[test]
+    fn attached_persisted_station_config_uses_v1_station_endpoints() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let active_payload = Arc::new(Mutex::new(None::<Value>));
+        let update_payload = Arc::new(Mutex::new(None::<Value>));
+        let app = Router::new()
+            .route(
+                "/__codex_helper/api/v1/stations/config-active",
+                post({
+                    let active_payload = active_payload.clone();
+                    move |Json(payload): Json<Value>| {
+                        let active_payload = active_payload.clone();
+                        async move {
+                            *active_payload.lock().expect("active payload lock") = Some(payload);
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/stations/alpha",
+                put({
+                    let update_payload = update_payload.clone();
+                    move |Json(payload): Json<Value>| {
+                        let update_payload = update_payload.clone();
+                        async move {
+                            *update_payload.lock().expect("update payload lock") = Some(payload);
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4302, ServiceKind::Codex);
+        let mut attached = AttachedStatus::new(4302);
+        attached.api_version = Some(1);
+        attached.admin_base_url = base_url;
+        attached.supports_persisted_station_config = true;
+        controller.mode = ProxyMode::Attached(attached);
+
+        controller
+            .set_persisted_active_station(&rt, Some("alpha".to_string()))
+            .expect("set persisted active station");
+        controller
+            .update_persisted_station(&rt, "alpha".to_string(), false, 7)
+            .expect("update persisted station");
+
+        let active_payload = active_payload
+            .lock()
+            .expect("active payload lock")
+            .clone()
+            .expect("active payload");
+        assert_eq!(
+            active_payload.get("station_name"),
+            Some(&Value::String("alpha".to_string()))
+        );
+
+        let update_payload = update_payload
+            .lock()
+            .expect("update payload lock")
+            .clone()
+            .expect("update payload");
+        assert_eq!(update_payload.get("enabled"), Some(&Value::Bool(false)));
+        assert_eq!(update_payload.get("level"), Some(&Value::from(7)));
+
+        handle.abort();
     }
 }

@@ -15,7 +15,7 @@
 - On port-in-use: prompt user, support **Attach**, support “remember my choice”.
 - Config editing: start with **GUI editing** (form-first); optionally add raw editor as advanced mode.
 - Default close behavior: **minimize to tray**.
-- Attach security (v1): **no token**, keep API extensible for future hardening.
+- Attach security (v1): **loopback-default; remote non-loopback admin requires shared token**.
 
 ## Open Questions (need confirmation before M4/M5)
 
@@ -136,3 +136,6 @@
 - 2026-01-24: Finished GUI-504 discovery: scan local ports 3210-3220 and attach with one click.
 - 2026-01-24: Finished GUI-106: sessions list stable ordering + search + lock order (avoid jitter with multiple CLIs).
 - 2026-01-24: Finished GUI-304: open transcript directly from Sessions (auto-navigate to History).
+- 2026-03-11: Finished CP-305 GUI migration: removed legacy GUI routing presets from `gui.toml`, Overview, tray, and auto-apply flow; proxy config profiles are now the only formal profile entry point.
+- 2026-03-11: Config v2 Profiles section now uses control-plane profile CRUD when the selected service matches the running/attached proxy; attach mode no longer treats that section as local-file-only.
+- 2026-03-11: Config v2 common station fields (`active_station`, `enabled`, `level`) now use persisted station control-plane APIs when the selected service matches the running/attached proxy; attached mode no longer writes those actions to the local file by mistake.

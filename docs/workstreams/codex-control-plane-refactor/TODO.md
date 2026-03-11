@@ -56,7 +56,7 @@
 - [ ] CP-103 Record route decision provenance per request/session
 - [ ] CP-104 Expose session identity card in API
 - [x] CP-105 Update GUI/TUI Sessions view to show effective route rather than only last seen fields
-- [ ] CP-106 Distinguish `observed session` from `enriched session` in UI and API
+- [x] CP-106 Distinguish `observed session` from `enriched session` in UI and API
 
 ## WS2 - Session-scoped Control Surface
 
@@ -79,8 +79,8 @@
 - [x] CP-301 Introduce `Profile` schema in config
 - [x] CP-302 Define default profile semantics for new sessions
 - [ ] CP-303 Add profile inheritance / `extends`
-- [ ] CP-304 Add profile CRUD in local API
-- [ ] CP-305 Replace weak routing preset concept with profile concept in GUI config
+- [x] CP-304 Add profile CRUD in local API
+- [x] CP-305 Replace weak routing preset concept with profile concept in GUI config
 - [x] CP-306 Support quick switch:
   - set default profile
   - apply profile to selected session
@@ -91,6 +91,7 @@
 - [x] CP-400 Add runtime station metadata overrides for `enabled` / `level`
 - [~] CP-401 Introduce explicit `Station` runtime model
   - [x] add explicit `/api/v1/stations` and `/api/v1/stations/runtime` aliases
+  - [x] add persisted station config API for `active_station` / `enabled` / `level`
   - [x] prefer station API in attach mode with legacy `configs` fallback
   - [x] align operator-facing GUI/tray labels with station terminology where semantics are already station-first
   - [ ] rename internal runtime/public UI model from `config` to `station`
@@ -116,17 +117,18 @@
 - [ ] CP-501 Add explicit control-plane mode docs for central relay deployment
 - [x] CP-502 Mark local-only features in API capability response
 - [x] CP-503 Separate "host-local history available" from global session observability
-- [ ] CP-504 Add lightweight access control for non-loopback use
-- [ ] CP-505 Add device/client identity field in observed session records
-- [ ] CP-506 Add operator-facing warning when a requested local-only feature is unavailable remotely
+- [x] CP-504 Add lightweight access control for non-loopback use
+- [x] CP-505 Add device/client identity field in observed session records
+- [x] CP-506 Add operator-facing warning when a requested local-only feature is unavailable remotely
 
 ## WS6 - GUI / Web-readiness
 
 - [ ] CP-601 Redesign Sessions page around session identity card
-- [ ] CP-602 Add Profiles page or Profiles section under provider management
+- [x] CP-602 Add Profiles page or Profiles section under provider management
 - [x] CP-603 Add Stations page with:
   - [x] expose station quick switch and common station metadata in Overview / Config forms
   - [x] dedicated station-focused page for health / drain / breaker / quick switch
+  - [x] Config v2 common station fields use control-plane directly when selected service matches the running/attached proxy
 - [x] CP-604 Add "effective route source" explanation UI
 - [x] CP-605 Add remote-safe capability gating in GUI
 - [x] CP-606 Keep transcript/history UI usable even when only observed-session data exists

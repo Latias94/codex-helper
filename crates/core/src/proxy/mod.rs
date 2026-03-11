@@ -7,10 +7,10 @@ use anyhow::{Result, anyhow};
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::middleware::{self, Next};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, post, put};
 use reqwest::Client;
 use std::sync::OnceLock;
 use tracing::{instrument, warn};
@@ -24,7 +24,8 @@ mod tests;
 
 use crate::config::{ProxyConfig, RetryStrategy, ServiceConfigManager};
 use crate::dashboard_core::{
-    ApiV1Capabilities, HostLocalControlPlaneCapabilities, SharedControlPlaneCapabilities,
+    ApiV1Capabilities, HostLocalControlPlaneCapabilities, RemoteAdminAccessCapabilities,
+    SharedControlPlaneCapabilities,
 };
 use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
@@ -47,6 +48,7 @@ use self::stream::{SseSuccessMeta, build_sse_success_response};
 
 pub const ADMIN_TOKEN_ENV_VAR: &str = "CODEX_HELPER_ADMIN_TOKEN";
 pub const ADMIN_TOKEN_HEADER: &str = "x-codex-helper-admin-token";
+pub const CLIENT_NAME_HEADER: &str = "x-codex-helper-client-name";
 pub const ADMIN_PORT_OFFSET: u16 = 1000;
 
 #[cfg(test)]
@@ -101,6 +103,18 @@ async fn effective_default_profile_name(
     mgr.default_profile_ref().map(|(name, _)| name.to_string())
 }
 
+fn configured_active_station_name(mgr: &ServiceConfigManager) -> Option<String> {
+    mgr.active
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn effective_active_station_name(mgr: &ServiceConfigManager) -> Option<String> {
+    mgr.active_config().map(|cfg| cfg.name.clone())
+}
+
 #[derive(Default)]
 struct JsonFileCache {
     last_check_at: Option<Instant>,
@@ -121,6 +135,17 @@ impl AdminAccessConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         Self { token }
+    }
+}
+
+fn admin_access_capabilities() -> RemoteAdminAccessCapabilities {
+    let access = AdminAccessConfig::from_env();
+    RemoteAdminAccessCapabilities {
+        loopback_without_token: true,
+        remote_requires_token: true,
+        remote_enabled: access.token.is_some(),
+        token_header: ADMIN_TOKEN_HEADER.to_string(),
+        token_env_var: ADMIN_TOKEN_ENV_VAR.to_string(),
     }
 }
 
@@ -1005,6 +1030,35 @@ fn extract_session_id(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn normalize_client_identity_value(value: &str, max_chars: usize) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = trimmed.to_string();
+    if out.chars().count() > max_chars {
+        out = out.chars().take(max_chars).collect::<String>();
+    }
+    Some(out)
+}
+
+fn extract_client_name(headers: &HeaderMap) -> Option<String> {
+    header_str(headers, CLIENT_NAME_HEADER)
+        .and_then(|value| normalize_client_identity_value(value, 80))
+        .or_else(|| {
+            header_str(headers, "user-agent")
+                .and_then(|value| normalize_client_identity_value(value, 120))
+        })
+}
+
+fn extract_client_addr(extensions: &axum::http::Extensions) -> Option<String> {
+    extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip().to_string())
+        .and_then(|value| normalize_client_identity_value(value.as_str(), 64))
+}
+
 fn extract_reasoning_effort_from_request_body(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     v.get("reasoning")
@@ -1077,12 +1131,14 @@ pub async fn handle_proxy(
         .unwrap_or(0);
 
     let (parts, body) = req.into_parts();
+    let client_addr = extract_client_addr(&parts.extensions);
     let uri = parts.uri;
     let method = parts.method;
     let client_headers = parts.headers;
     let client_headers_entries_cache: OnceLock<Vec<HeaderEntry>> = OnceLock::new();
 
     let session_id = extract_session_id(&client_headers);
+    let client_name = extract_client_name(&client_headers);
 
     proxy.config.maybe_reload_from_disk().await;
     let cfg_snapshot = proxy.config.snapshot().await;
@@ -1353,6 +1409,8 @@ pub async fn handle_proxy(
             method.as_str(),
             uri.path(),
             session_id.clone(),
+            client_name.clone(),
+            client_addr.clone(),
             cwd.clone(),
             request_model.clone(),
             effective_effort.clone(),
@@ -3170,6 +3228,60 @@ pub fn router(proxy: ProxyService) -> Router {
     }
 
     #[derive(serde::Deserialize)]
+    struct PersistedProfileUpsertRequest {
+        #[serde(default, alias = "config")]
+        station: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        reasoning_effort: Option<String>,
+        #[serde(default)]
+        service_tier: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PersistedStationUpdateRequest {
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        level: Option<u8>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PersistedStationActiveRequest {
+        #[serde(default)]
+        station_name: Option<String>,
+        #[serde(default)]
+        config_name: Option<String>,
+    }
+
+    impl PersistedStationActiveRequest {
+        fn station_name(&self) -> Result<Option<String>, (StatusCode, String)> {
+            let station_name = self
+                .station_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned);
+            let config_name = self
+                .config_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned);
+            match (station_name, config_name) {
+                (Some(station_name), Some(config_name)) if station_name != config_name => Err((
+                    StatusCode::BAD_REQUEST,
+                    "station_name and config_name must match when both are provided".to_string(),
+                )),
+                (Some(station_name), _) => Ok(Some(station_name)),
+                (_, Some(config_name)) => Ok(Some(config_name)),
+                _ => Ok(None),
+            }
+        }
+    }
+
+    #[derive(serde::Deserialize)]
     struct GlobalConfigOverrideRequest {
         config_name: Option<String>,
     }
@@ -3224,7 +3336,64 @@ pub fn router(proxy: ProxyService) -> Router {
     #[derive(serde::Serialize)]
     struct ProfilesResponse {
         default_profile: Option<String>,
+        configured_default_profile: Option<String>,
         profiles: Vec<crate::dashboard_core::ControlProfileOption>,
+    }
+
+    fn sanitize_profile_name(profile_name: &str) -> Result<String, (StatusCode, String)> {
+        let profile_name = profile_name.trim();
+        if profile_name.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "profile name is required".to_string(),
+            ));
+        }
+        Ok(profile_name.to_string())
+    }
+
+    fn sanitize_station_name(station_name: &str) -> Result<String, (StatusCode, String)> {
+        let station_name = station_name.trim();
+        if station_name.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "station name is required".to_string(),
+            ));
+        }
+        Ok(station_name.to_string())
+    }
+
+    fn sanitize_profile_request(
+        payload: PersistedProfileUpsertRequest,
+    ) -> crate::config::ServiceControlProfile {
+        fn normalize(value: Option<String>) -> Option<String> {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        }
+
+        crate::config::ServiceControlProfile {
+            station: normalize(payload.station),
+            model: normalize(payload.model),
+            reasoning_effort: normalize(payload.reasoning_effort),
+            service_tier: normalize(payload.service_tier),
+        }
+    }
+
+    async fn make_profiles_response(proxy: &ProxyService) -> ProfilesResponse {
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+        let default_profile =
+            effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
+        ProfilesResponse {
+            default_profile: default_profile.clone(),
+            configured_default_profile: mgr.default_profile.clone(),
+            profiles: list_profile_options_from_mgr(mgr, default_profile.as_deref()),
+        }
     }
 
     #[derive(serde::Serialize)]
@@ -3433,17 +3602,159 @@ pub fn router(proxy: ProxyService) -> Router {
     async fn list_profiles(
         proxy: ProxyService,
     ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
-        let cfg = proxy.config.snapshot().await;
+        Ok(Json(make_profiles_response(&proxy).await))
+    }
+
+    async fn save_proxy_config_and_reload(
+        proxy: &ProxyService,
+        cfg: crate::config::ProxyConfig,
+    ) -> Result<(), (StatusCode, String)> {
+        crate::config::save_config(&cfg)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        proxy
+            .config
+            .force_reload_from_disk()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        Ok(())
+    }
+
+    async fn save_profiles_config_and_reload(
+        proxy: &ProxyService,
+        cfg: crate::config::ProxyConfig,
+    ) -> Result<ProfilesResponse, (StatusCode, String)> {
+        save_proxy_config_and_reload(proxy, cfg).await?;
+        Ok(make_profiles_response(proxy).await)
+    }
+
+    async fn upsert_persisted_profile(
+        proxy: ProxyService,
+        Path(profile_name): Path<String>,
+        Json(payload): Json<PersistedProfileUpsertRequest>,
+    ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
+        let profile_name = sanitize_profile_name(profile_name.as_str())?;
+        let profile = sanitize_profile_request(payload);
+
+        let cfg_snapshot = proxy.config.snapshot().await;
+        let mut cfg = cfg_snapshot.as_ref().clone();
         let mgr = match proxy.service_name {
-            "claude" => &cfg.claude,
-            _ => &cfg.codex,
+            "claude" => &mut cfg.claude,
+            _ => &mut cfg.codex,
         };
-        let default_profile =
-            effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
-        Ok(Json(ProfilesResponse {
-            default_profile: default_profile.clone(),
-            profiles: list_profile_options_from_mgr(mgr, default_profile.as_deref()),
-        }))
+
+        crate::config::validate_profile_station_compatibility(
+            proxy.service_name,
+            mgr,
+            profile_name.as_str(),
+            &profile,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        mgr.profiles.insert(profile_name, profile);
+
+        Ok(Json(save_profiles_config_and_reload(&proxy, cfg).await?))
+    }
+
+    async fn delete_persisted_profile(
+        proxy: ProxyService,
+        Path(profile_name): Path<String>,
+    ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
+        let profile_name = sanitize_profile_name(profile_name.as_str())?;
+
+        let cfg_snapshot = proxy.config.snapshot().await;
+        let mut cfg = cfg_snapshot.as_ref().clone();
+        let mgr = match proxy.service_name {
+            "claude" => &mut cfg.claude,
+            _ => &mut cfg.codex,
+        };
+
+        if mgr.profiles.remove(profile_name.as_str()).is_none() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("profile '{}' not found", profile_name),
+            ));
+        }
+        if mgr.default_profile.as_deref() == Some(profile_name.as_str()) {
+            mgr.default_profile = None;
+        }
+
+        save_profiles_config_and_reload(&proxy, cfg).await?;
+        if proxy
+            .state
+            .get_runtime_default_profile_override(proxy.service_name)
+            .await
+            .as_deref()
+            == Some(profile_name.as_str())
+        {
+            proxy
+                .state
+                .clear_runtime_default_profile_override(proxy.service_name)
+                .await;
+        }
+
+        Ok(Json(make_profiles_response(&proxy).await))
+    }
+
+    async fn update_persisted_station(
+        proxy: ProxyService,
+        Path(station_name): Path<String>,
+        Json(payload): Json<PersistedStationUpdateRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        let station_name = sanitize_station_name(station_name.as_str())?;
+        if payload.enabled.is_none() && payload.level.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "at least one persisted station field must be provided".to_string(),
+            ));
+        }
+
+        let cfg_snapshot = proxy.config.snapshot().await;
+        let mut cfg = cfg_snapshot.as_ref().clone();
+        let mgr = match proxy.service_name {
+            "claude" => &mut cfg.claude,
+            _ => &mut cfg.codex,
+        };
+        let Some(station) = mgr.configs.get_mut(station_name.as_str()) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("station '{}' not found", station_name),
+            ));
+        };
+        if let Some(enabled) = payload.enabled {
+            station.enabled = enabled;
+        }
+        if let Some(level) = payload.level {
+            station.level = level.clamp(1, 10);
+        }
+
+        save_proxy_config_and_reload(&proxy, cfg).await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn set_persisted_active_station(
+        proxy: ProxyService,
+        Json(payload): Json<PersistedStationActiveRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        let station_name = payload.station_name()?;
+
+        let cfg_snapshot = proxy.config.snapshot().await;
+        let mut cfg = cfg_snapshot.as_ref().clone();
+        let mgr = match proxy.service_name {
+            "claude" => &mut cfg.claude,
+            _ => &mut cfg.codex,
+        };
+        if let Some(station_name) = station_name.as_deref()
+            && !mgr.configs.contains_key(station_name)
+        {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("station '{}' not found", station_name),
+            ));
+        }
+        mgr.active = station_name;
+
+        save_proxy_config_and_reload(&proxy, cfg).await?;
+        Ok(StatusCode::NO_CONTENT)
     }
 
     async fn apply_config_runtime_meta(
@@ -3525,6 +3836,44 @@ pub fn router(proxy: ProxyService) -> Router {
         }
 
         Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn set_persisted_default_profile(
+        proxy: ProxyService,
+        Json(payload): Json<DefaultProfileRequest>,
+    ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
+        let profile_name = payload
+            .profile_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        let cfg_snapshot = proxy.config.snapshot().await;
+        let mut cfg = cfg_snapshot.as_ref().clone();
+        let mgr = match proxy.service_name {
+            "claude" => &mut cfg.claude,
+            _ => &mut cfg.codex,
+        };
+
+        if let Some(profile_name) = profile_name.as_deref() {
+            let Some(profile) = mgr.profile(profile_name) else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("profile '{}' not found", profile_name),
+                ));
+            };
+            crate::config::validate_profile_station_compatibility(
+                proxy.service_name,
+                mgr,
+                profile_name,
+                profile,
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        }
+        mgr.default_profile = profile_name;
+
+        Ok(Json(save_profiles_config_and_reload(&proxy, cfg).await?))
     }
 
     async fn set_default_profile(
@@ -3742,8 +4091,12 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/configs/runtime",
                 "/__codex_helper/api/v1/stations",
                 "/__codex_helper/api/v1/stations/runtime",
+                "/__codex_helper/api/v1/stations/config-active",
+                "/__codex_helper/api/v1/stations/{name}",
                 "/__codex_helper/api/v1/profiles",
                 "/__codex_helper/api/v1/profiles/default",
+                "/__codex_helper/api/v1/profiles/config-default",
+                "/__codex_helper/api/v1/profiles/{name}",
                 "/__codex_helper/api/v1/overrides/session/profile",
                 "/__codex_helper/api/v1/overrides/session/model",
                 "/__codex_helper/api/v1/overrides/session/effort",
@@ -3765,6 +4118,7 @@ pub fn router(proxy: ProxyService) -> Router {
                 transcript_read: host_local_history,
                 cwd_enrichment: host_local_history,
             },
+            remote_admin_access: admin_access_capabilities(),
         }))
     }
 
@@ -3800,6 +4154,8 @@ pub fn router(proxy: ProxyService) -> Router {
             &state_overrides,
         );
         let stations = configs.clone();
+        let configured_active_station = configured_active_station_name(mgr);
+        let effective_active_station = effective_active_station_name(mgr);
         let default_profile =
             effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
 
@@ -3819,6 +4175,8 @@ pub fn router(proxy: ProxyService) -> Router {
             runtime_source_mtime_ms: proxy.config.last_mtime_ms().await,
             configs,
             stations,
+            configured_active_station,
+            effective_active_station,
             default_profile: default_profile.clone(),
             profiles: list_profile_options_from_mgr(mgr, default_profile.as_deref()),
             snapshot,
@@ -4073,6 +4431,11 @@ pub fn router(proxy: ProxyService) -> Router {
     let p34 = proxy.clone();
     let p35 = proxy.clone();
     let p36 = proxy.clone();
+    let p38 = proxy.clone();
+    let p39 = proxy.clone();
+    let p40 = proxy.clone();
+    let p41 = proxy.clone();
+    let p42 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -4133,12 +4496,29 @@ pub fn router(proxy: ProxyService) -> Router {
             post(move |payload| apply_config_runtime_meta(p36.clone(), payload)),
         )
         .route(
+            "/__codex_helper/api/v1/stations/config-active",
+            post(move |payload| set_persisted_active_station(p41.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/stations/{name}",
+            put(move |name, payload| update_persisted_station(p42.clone(), name, payload)),
+        )
+        .route(
             "/__codex_helper/api/v1/profiles",
             get(move || list_profiles(p31.clone())),
         )
         .route(
             "/__codex_helper/api/v1/profiles/default",
             post(move |payload| set_default_profile(p33.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/profiles/config-default",
+            post(move |payload| set_persisted_default_profile(p38.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/profiles/{name}",
+            put(move |name, payload| upsert_persisted_profile(p39.clone(), name, payload))
+                .delete(move |name| delete_persisted_profile(p40.clone(), name)),
         )
         .route(
             "/__codex_helper/api/v1/overrides/session/profile",
