@@ -22,6 +22,7 @@ use crate::config::{
     ServiceControlProfile, UiConfig, UpstreamAuth, UpstreamConfig,
 };
 use crate::proxy::ProxyService;
+use crate::state::RuntimeConfigState;
 
 fn spawn_axum_server(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -127,6 +128,35 @@ fn make_proxy_config(upstreams: Vec<UpstreamConfig>, retry: RetryConfig) -> Prox
 fn reserve_unused_local_addr() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.local_addr().expect("local_addr")
+}
+
+async fn send_responses_request(
+    client: &Client,
+    proxy_addr: std::net::SocketAddr,
+    session_id: Option<&str>,
+) -> reqwest::Response {
+    let mut request = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"input":"hi"}"#);
+    if let Some(session_id) = session_id {
+        request = request.header("session_id", session_id);
+    }
+    request.send().await.expect("send request")
+}
+
+async fn send_responses_json(
+    client: &Client,
+    proxy_addr: std::net::SocketAddr,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    send_responses_request(client, proxy_addr, session_id)
+        .await
+        .error_for_status()
+        .expect("request status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("request json")
 }
 
 #[tokio::test]
@@ -994,6 +1024,231 @@ async fn proxy_runtime_config_meta_override_controls_routing() {
         resp.get("upstream").and_then(|v| v.as_str()),
         Some("backup")
     );
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_runtime_config_state_override_controls_routing() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let primary_hits_for_route = primary_hits.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_hits = primary_hits_for_route.clone();
+            async move {
+                primary_hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "upstream": "primary" })),
+                )
+            }
+        }),
+    );
+    let backup_hits_for_route = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_hits = backup_hits_for_route.clone();
+            async move {
+                backup_hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "upstream": "backup" })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let mut mgr = ServiceConfigManager {
+        active: None,
+        ..Default::default()
+    };
+    mgr.configs.insert(
+        "primary".to_string(),
+        ServiceConfig {
+            name: "primary".to_string(),
+            alias: Some("primary".to_string()),
+            enabled: true,
+            level: 1,
+            upstreams: vec![UpstreamConfig {
+                base_url: format!("http://{}/v1", primary_addr),
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: None,
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: HashMap::from([("provider_id".to_string(), "primary".to_string())]),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        },
+    );
+    mgr.configs.insert(
+        "backup".to_string(),
+        ServiceConfig {
+            name: "backup".to_string(),
+            alias: Some("backup".to_string()),
+            enabled: true,
+            level: 2,
+            upstreams: vec![UpstreamConfig {
+                base_url: format!("http://{}/v1", backup_addr),
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: None,
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: HashMap::from([("provider_id".to_string(), "backup".to_string())]),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        },
+    );
+    let cfg = ProxyConfig {
+        version: Some(1),
+        codex: mgr,
+        claude: ServiceConfigManager::default(),
+        retry: RetryConfig::default(),
+        notify: Default::default(),
+        default_service: None,
+        ui: UiConfig::default(),
+    };
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let resp = send_responses_json(&client, proxy_addr, None).await;
+    assert_eq!(
+        resp.get("upstream").and_then(|v| v.as_str()),
+        Some("primary")
+    );
+
+    let set_draining = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/configs/runtime",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "config_name": "primary",
+            "runtime_state": "draining",
+        }))
+        .send()
+        .await
+        .expect("set primary draining send");
+    assert_eq!(set_draining.status(), StatusCode::NO_CONTENT);
+
+    let configs = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/configs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get configs after draining send")
+        .error_for_status()
+        .expect("get configs after draining status")
+        .json::<Vec<crate::dashboard_core::ConfigOption>>()
+        .await
+        .expect("get configs after draining json");
+    let primary_cfg = configs
+        .iter()
+        .find(|cfg| cfg.name == "primary")
+        .expect("primary config after draining");
+    assert_eq!(primary_cfg.runtime_state, RuntimeConfigState::Draining);
+    assert_eq!(
+        primary_cfg.runtime_state_override,
+        Some(RuntimeConfigState::Draining)
+    );
+
+    let resp = send_responses_json(&client, proxy_addr, None).await;
+    assert_eq!(
+        resp.get("upstream").and_then(|v| v.as_str()),
+        Some("backup")
+    );
+
+    let set_session_cfg = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/config",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "session_id": "sid-runtime-state",
+            "config_name": "primary",
+        }))
+        .send()
+        .await
+        .expect("set session config override send");
+    assert_eq!(set_session_cfg.status(), StatusCode::NO_CONTENT);
+
+    let resp = send_responses_json(&client, proxy_addr, Some("sid-runtime-state")).await;
+    assert_eq!(
+        resp.get("upstream").and_then(|v| v.as_str()),
+        Some("primary")
+    );
+
+    let set_breaker_open = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/configs/runtime",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "config_name": "primary",
+            "runtime_state": "breaker_open",
+        }))
+        .send()
+        .await
+        .expect("set primary breaker open send");
+    assert_eq!(set_breaker_open.status(), StatusCode::NO_CONTENT);
+
+    let configs = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/configs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get configs after breaker open send")
+        .error_for_status()
+        .expect("get configs after breaker open status")
+        .json::<Vec<crate::dashboard_core::ConfigOption>>()
+        .await
+        .expect("get configs after breaker open json");
+    let primary_cfg = configs
+        .iter()
+        .find(|cfg| cfg.name == "primary")
+        .expect("primary config after breaker open");
+    assert_eq!(primary_cfg.runtime_state, RuntimeConfigState::BreakerOpen);
+    assert_eq!(
+        primary_cfg.runtime_state_override,
+        Some(RuntimeConfigState::BreakerOpen)
+    );
+
+    let resp = send_responses_json(&client, proxy_addr, None).await;
+    assert_eq!(
+        resp.get("upstream").and_then(|v| v.as_str()),
+        Some("backup")
+    );
+
+    let primary_before_blocked = primary_hits.load(Ordering::SeqCst);
+    let backup_before_blocked = backup_hits.load(Ordering::SeqCst);
+    let blocked = send_responses_request(&client, proxy_addr, Some("sid-runtime-state")).await;
+    assert_eq!(blocked.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(primary_hits.load(Ordering::SeqCst), primary_before_blocked);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), backup_before_blocked);
 
     proxy_handle.abort();
     primary_handle.abort();

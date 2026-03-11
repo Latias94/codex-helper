@@ -128,6 +128,15 @@ pub struct LbConfigView {
     pub upstreams: Vec<LbUpstreamView>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeConfigState {
+    #[default]
+    Normal,
+    Draining,
+    BreakerOpen,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct HealthCheckStatus {
     pub started_at_ms: u64,
@@ -396,6 +405,7 @@ struct SessionCwdCacheEntry {
 struct ConfigMetaOverride {
     enabled: Option<bool>,
     level: Option<u8>,
+    state: Option<RuntimeConfigState>,
     #[allow(dead_code)]
     updated_at_ms: u64,
 }
@@ -758,6 +768,20 @@ impl ProxyState {
         entry.updated_at_ms = now_ms;
     }
 
+    pub async fn set_config_runtime_state_override(
+        &self,
+        service_name: &str,
+        config_name: String,
+        state: RuntimeConfigState,
+        now_ms: u64,
+    ) {
+        let mut guard = self.config_meta_overrides.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let entry = per_service.entry(config_name).or_default();
+        entry.state = Some(state);
+        entry.updated_at_ms = now_ms;
+    }
+
     pub async fn clear_config_enabled_override(&self, service_name: &str, config_name: &str) {
         let mut guard = self.config_meta_overrides.write().await;
         let Some(per_service) = guard.get_mut(service_name) else {
@@ -767,7 +791,7 @@ impl ProxyState {
             return;
         };
         entry.enabled = None;
-        if entry.enabled.is_none() && entry.level.is_none() {
+        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
             per_service.remove(config_name);
         }
         if per_service.is_empty() {
@@ -784,7 +808,24 @@ impl ProxyState {
             return;
         };
         entry.level = None;
-        if entry.enabled.is_none() && entry.level.is_none() {
+        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
+            per_service.remove(config_name);
+        }
+        if per_service.is_empty() {
+            guard.remove(service_name);
+        }
+    }
+
+    pub async fn clear_config_runtime_state_override(&self, service_name: &str, config_name: &str) {
+        let mut guard = self.config_meta_overrides.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return;
+        };
+        let Some(entry) = per_service.get_mut(config_name) else {
+            return;
+        };
+        entry.state = None;
+        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
             per_service.remove(config_name);
         }
         if per_service.is_empty() {
@@ -802,6 +843,21 @@ impl ProxyState {
             .map(|m| {
                 m.iter()
                     .map(|(k, v)| (k.clone(), (v.enabled, v.level)))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default()
+    }
+
+    pub async fn get_config_runtime_state_overrides(
+        &self,
+        service_name: &str,
+    ) -> HashMap<String, RuntimeConfigState> {
+        let guard = self.config_meta_overrides.read().await;
+        guard
+            .get(service_name)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.state.map(|state| (k.clone(), state)))
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default()

@@ -92,12 +92,12 @@
   - supported models
   - fast/service tier support
   - reasoning support
-- [ ] CP-403 Add station states:
-  - enabled
-  - disabled
-  - draining
-  - breaker-open
-  - half-open
+- [~] CP-403 Add station states:
+  - [x] enabled
+  - [x] disabled
+  - [x] draining
+  - [x] breaker-open
+  - [ ] half-open
 - [ ] CP-404 Implement passive health scoring
 - [ ] CP-405 Add active healthcheck API and UI
 - [ ] CP-406 Add circuit breaker thresholds and cooldowns
@@ -131,7 +131,9 @@
 
 - [ ] CP-701 Add config migration tests for legacy -> v2 shape
 - [ ] CP-702 Add session binding resolution tests
-- [ ] CP-703 Add breaker/failover behavior tests
+- [~] CP-703 Add breaker/failover behavior tests
+  - [x] runtime station `draining` / `breaker-open` routing behavior
+  - [ ] breaker threshold / cooldown transition coverage
 - [ ] CP-704 Add API compatibility tests for existing attach mode consumers
 - [ ] CP-705 Update README docs after the first usable milestone lands
 - [ ] CP-706 Add operator migration guide for existing `config.toml`

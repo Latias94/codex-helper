@@ -23,7 +23,7 @@ use crate::proxy::{
 };
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
-    SessionIdentityCard, SessionStats, UsageRollupView,
+    RuntimeConfigState, SessionIdentityCard, SessionStats, UsageRollupView,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1310,6 +1310,7 @@ impl ProxyController {
         config_name: String,
         enabled: Option<Option<bool>>,
         level: Option<Option<u8>>,
+        runtime_state: Option<Option<RuntimeConfigState>>,
     ) -> anyhow::Result<()> {
         match &mut self.mode {
             ProxyMode::Running(r) => {
@@ -1369,6 +1370,29 @@ impl ProxyController {
                         }
                     }
 
+                    if let Some(runtime_state) = runtime_state {
+                        match runtime_state {
+                            Some(runtime_state) => {
+                                state
+                                    .set_config_runtime_state_override(
+                                        service_name,
+                                        config_name.clone(),
+                                        runtime_state,
+                                        now,
+                                    )
+                                    .await;
+                            }
+                            None => {
+                                state
+                                    .clear_config_runtime_state_override(
+                                        service_name,
+                                        config_name.as_str(),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+
                     Ok::<_, anyhow::Error>(
                         effective_configs_from_cfg_state(
                             state.as_ref(),
@@ -1390,6 +1414,7 @@ impl ProxyController {
                 let fut = async move {
                     let clear_enabled = matches!(enabled, Some(None));
                     let clear_level = matches!(level, Some(None));
+                    let clear_runtime_state = matches!(runtime_state, Some(None));
                     client
                         .post(format!("{base}/__codex_helper/api/v1/configs/runtime"))
                         .timeout(Duration::from_millis(1200))
@@ -1399,6 +1424,8 @@ impl ProxyController {
                             "level": level.flatten(),
                             "clear_enabled": clear_enabled,
                             "clear_level": clear_level,
+                            "runtime_state": runtime_state.flatten(),
+                            "clear_runtime_state": clear_runtime_state,
                         }))
                         .send()
                         .await?
@@ -1931,7 +1958,8 @@ impl ProxyController {
         };
         let profiles =
             list_profiles_from_cfg(cfg.as_ref(), service_name, default_profile.as_deref());
-        let configs = list_configs_from_cfg(cfg.as_ref(), service_name, HashMap::new());
+        let configs =
+            list_configs_from_cfg(cfg.as_ref(), service_name, HashMap::new(), HashMap::new());
 
         self.mode = ProxyMode::Running(RunningProxy {
             service_name,
@@ -2000,13 +2028,15 @@ async fn effective_configs_from_cfg_state(
     cfg: &ProxyConfig,
 ) -> Vec<ConfigOption> {
     let overrides = state.get_config_meta_overrides(service_name).await;
-    list_configs_from_cfg(cfg, service_name, overrides)
+    let state_overrides = state.get_config_runtime_state_overrides(service_name).await;
+    list_configs_from_cfg(cfg, service_name, overrides, state_overrides)
 }
 
 fn list_configs_from_cfg(
     cfg: &ProxyConfig,
     service_name: &str,
     meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
+    state_overrides: HashMap<String, RuntimeConfigState>,
 ) -> Vec<ConfigOption> {
     let mgr = match service_name {
         "claude" => &cfg.claude,
@@ -2030,6 +2060,11 @@ fn list_configs_from_cfg(
                 configured_level,
                 runtime_enabled_override: enabled_override,
                 runtime_level_override: level_override.map(|level| level.clamp(1, 10)),
+                runtime_state: state_overrides
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+                runtime_state_override: state_overrides.get(name.as_str()).copied(),
             }
         })
         .collect::<Vec<_>>();

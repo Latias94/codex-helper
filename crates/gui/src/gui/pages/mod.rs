@@ -15,7 +15,7 @@ use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::SessionSummary;
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView,
-    ResolvedRouteValue, RouteValueSource, SessionIdentityCard, SessionStats,
+    ResolvedRouteValue, RouteValueSource, RuntimeConfigState, SessionIdentityCard, SessionStats,
 };
 use crate::usage::UsageMetrics;
 
@@ -1236,6 +1236,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             .striped(true)
                             .show(ui, |ui| {
                                 ui.label(pick(ctx.lang, "站点", "Station"));
+                                ui.label(pick(ctx.lang, "状态", "State"));
                                 ui.label(pick(ctx.lang, "启用", "Enabled"));
                                 ui.label(pick(ctx.lang, "等级", "Level"));
                                 ui.label(pick(ctx.lang, "健康", "Health"));
@@ -1257,8 +1258,70 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                         format_runtime_lb_summary(runtime_lb_view.get(&cfg.name));
                                     let source_label =
                                         format_runtime_config_source(ctx.lang, cfg);
+                                    let mut runtime_state = cfg.runtime_state;
 
                                     ui.label(label);
+
+                                    ui.add_enabled_ui(
+                                        snapshot.supports_config_runtime_override,
+                                        |ui| {
+                                            egui::ComboBox::from_id_salt((
+                                                "overview_runtime_station_state",
+                                                cfg.name.as_str(),
+                                            ))
+                                            .selected_text(runtime_config_state_label(
+                                                ctx.lang,
+                                                runtime_state,
+                                            ))
+                                            .show_ui(ui, |ui| {
+                                                for candidate in [
+                                                    RuntimeConfigState::Normal,
+                                                    RuntimeConfigState::Draining,
+                                                    RuntimeConfigState::BreakerOpen,
+                                                ] {
+                                                    ui.selectable_value(
+                                                        &mut runtime_state,
+                                                        candidate,
+                                                        runtime_config_state_label(
+                                                            ctx.lang,
+                                                            candidate,
+                                                        ),
+                                                    );
+                                                }
+                                            });
+                                        },
+                                    );
+                                    if runtime_state != cfg.runtime_state
+                                        && snapshot.supports_config_runtime_override
+                                    {
+                                        match ctx.proxy.set_runtime_config_meta(
+                                            ctx.rt,
+                                            cfg.name.clone(),
+                                            None,
+                                            None,
+                                            Some(Some(runtime_state)),
+                                        ) {
+                                            Ok(()) => {
+                                                ctx.proxy.refresh_current_if_due(
+                                                    ctx.rt,
+                                                    std::time::Duration::from_secs(0),
+                                                );
+                                                *ctx.last_info = Some(
+                                                    pick(
+                                                        ctx.lang,
+                                                        "已应用站点运行时状态",
+                                                        "Runtime station state updated",
+                                                    )
+                                                    .to_string(),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                *ctx.last_error = Some(format!(
+                                                    "apply runtime state failed: {e}"
+                                                ));
+                                            }
+                                        }
+                                    }
 
                                     let mut enabled = cfg.enabled;
                                     if ui
@@ -1272,6 +1335,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                             ctx.rt,
                                             cfg.name.clone(),
                                             Some(Some(enabled)),
+                                            None,
                                             None,
                                         ) {
                                             Ok(()) => {
@@ -1322,6 +1386,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                             cfg.name.clone(),
                                             None,
                                             Some(Some(level)),
+                                            None,
                                         ) {
                                             Ok(()) => {
                                                 ctx.proxy.refresh_current_if_due(
@@ -1350,7 +1415,8 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                     ui.label(source_label);
 
                                     let has_override = cfg.runtime_enabled_override.is_some()
-                                        || cfg.runtime_level_override.is_some();
+                                        || cfg.runtime_level_override.is_some()
+                                        || cfg.runtime_state_override.is_some();
                                     if ui
                                         .add_enabled(
                                             snapshot.supports_config_runtime_override && has_override,
@@ -1363,6 +1429,7 @@ fn render_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                             cfg.name.clone(),
                                             cfg.runtime_enabled_override.map(|_| None),
                                             cfg.runtime_level_override.map(|_| None),
+                                            cfg.runtime_state_override.map(|_| None),
                                         ) {
                                             Ok(()) => {
                                                 ctx.proxy.refresh_current_if_due(
@@ -5469,6 +5536,17 @@ fn format_runtime_lb_summary(lb: Option<&LbConfigView>) -> String {
     format!("cd={cooldowns} fail={failures} quota={exhausted}")
 }
 
+fn runtime_config_state_label(lang: Language, state: RuntimeConfigState) -> &'static str {
+    match (lang, state) {
+        (Language::Zh, RuntimeConfigState::Normal) => "normal",
+        (Language::Zh, RuntimeConfigState::Draining) => "draining",
+        (Language::Zh, RuntimeConfigState::BreakerOpen) => "breaker_open",
+        (_, RuntimeConfigState::Normal) => "normal",
+        (_, RuntimeConfigState::Draining) => "draining",
+        (_, RuntimeConfigState::BreakerOpen) => "breaker_open",
+    }
+}
+
 fn format_runtime_config_source(lang: Language, cfg: &ConfigOption) -> String {
     let mut parts = Vec::new();
     if let Some(enabled) = cfg.runtime_enabled_override {
@@ -5480,6 +5558,9 @@ fn format_runtime_config_source(lang: Language, cfg: &ConfigOption) -> String {
     }
     if cfg.runtime_level_override.is_some() {
         parts.push(format!("{}=rt", pick(lang, "等级", "level")));
+    }
+    if cfg.runtime_state_override.is_some() {
+        parts.push(format!("{}=rt", pick(lang, "状态", "state")));
     }
     if parts.is_empty() {
         pick(lang, "配置文件", "config").to_string()

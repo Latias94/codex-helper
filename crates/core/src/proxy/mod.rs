@@ -31,7 +31,7 @@ use crate::logging::{
     should_include_http_warn, should_log_request_body_preview,
 };
 use crate::model_routing;
-use crate::state::{ActiveRequest, FinishedRequest, ProxyState};
+use crate::state::{ActiveRequest, FinishedRequest, ProxyState, RuntimeConfigState};
 use crate::usage::extract_usage_from_bytes;
 
 use self::classify::classify_upstream_response;
@@ -54,6 +54,7 @@ const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(800);
 fn list_config_options_from_mgr(
     mgr: &ServiceConfigManager,
     meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
+    state_overrides: &HashMap<String, RuntimeConfigState>,
 ) -> Vec<crate::dashboard_core::ConfigOption> {
     let mut configs = mgr
         .configs
@@ -73,11 +74,26 @@ fn list_config_options_from_mgr(
                 configured_level,
                 runtime_enabled_override: enabled_override,
                 runtime_level_override: level_override.map(|level| level.clamp(1, 10)),
+                runtime_state: state_overrides
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+                runtime_state_override: state_overrides.get(name.as_str()).copied(),
             }
         })
         .collect::<Vec<_>>();
     configs.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
     configs
+}
+
+fn effective_runtime_config_state(
+    state_overrides: &HashMap<String, RuntimeConfigState>,
+    config_name: &str,
+) -> RuntimeConfigState {
+    state_overrides
+        .get(config_name)
+        .copied()
+        .unwrap_or_default()
 }
 
 fn list_profile_options_from_mgr(
@@ -725,7 +741,26 @@ impl ProxyService {
             .state
             .get_config_meta_overrides(self.service_name)
             .await;
+        let state_overrides = self
+            .state
+            .get_config_runtime_state_overrides(self.service_name)
+            .await;
         if let Some((name, source)) = self.pinned_config(mgr, session_id).await {
+            let runtime_state = effective_runtime_config_state(&state_overrides, name.as_str());
+            if runtime_state == RuntimeConfigState::BreakerOpen {
+                log_retry_trace(serde_json::json!({
+                    "event": "lbs_for_request",
+                    "service": self.service_name,
+                    "session_id": session_id,
+                    "mode": "pinned_blocked_breaker_open",
+                    "pinned_source": source,
+                    "pinned_name": name,
+                    "runtime_state": "breaker_open",
+                    "active_config": mgr.active.as_deref(),
+                    "config_count": mgr.configs.len(),
+                }));
+                return Vec::new();
+            }
             if let Some(svc) = mgr
                 .configs
                 .get(&name)
@@ -739,6 +774,7 @@ impl ProxyService {
                     "mode": "pinned",
                     "pinned_source": source,
                     "pinned_name": name,
+                    "runtime_state": format!("{runtime_state:?}").to_ascii_lowercase(),
                     "selected_config": svc.name,
                     "selected_level": svc.level.clamp(1, 10),
                     "selected_upstreams": svc.upstreams.len(),
@@ -772,7 +808,9 @@ impl ProxyService {
                     .copied()
                     .unwrap_or((None, None));
                 let enabled = enabled_ovr.unwrap_or(svc.enabled);
+                let runtime_state = effective_runtime_config_state(&state_overrides, name.as_str());
                 !svc.upstreams.is_empty()
+                    && runtime_state == RuntimeConfigState::Normal
                     && (enabled || active_name.is_some_and(|n| n == name.as_str()))
             })
             .collect::<Vec<_>>();
@@ -806,6 +844,11 @@ impl ProxyService {
                             "name": (*name).clone(),
                             "level": level_ovr.unwrap_or(svc.level).clamp(1, 10),
                             "enabled": svc.enabled,
+                            "runtime_state": format!(
+                                "{:?}",
+                                effective_runtime_config_state(&state_overrides, name.as_str())
+                            )
+                            .to_ascii_lowercase(),
                             "upstreams": svc.upstreams.len(),
                         })
                     })
@@ -3163,6 +3206,10 @@ pub fn router(proxy: ProxyService) -> Router {
         clear_enabled: bool,
         #[serde(default)]
         clear_level: bool,
+        #[serde(default)]
+        runtime_state: Option<RuntimeConfigState>,
+        #[serde(default)]
+        clear_runtime_state: bool,
     }
 
     #[derive(serde::Serialize)]
@@ -3405,6 +3452,8 @@ pub fn router(proxy: ProxyService) -> Router {
             && payload.level.is_none()
             && !payload.clear_enabled
             && !payload.clear_level
+            && payload.runtime_state.is_none()
+            && !payload.clear_runtime_state
         {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -3454,6 +3503,26 @@ pub fn router(proxy: ProxyService) -> Router {
                     proxy.service_name,
                     payload.config_name.clone(),
                     level.clamp(1, 10),
+                    now,
+                )
+                .await;
+        }
+
+        if payload.clear_runtime_state {
+            proxy
+                .state
+                .clear_config_runtime_state_override(
+                    proxy.service_name,
+                    payload.config_name.as_str(),
+                )
+                .await;
+        } else if let Some(runtime_state) = payload.runtime_state {
+            proxy
+                .state
+                .set_config_runtime_state_override(
+                    proxy.service_name,
+                    payload.config_name.clone(),
+                    runtime_state,
                     now,
                 )
                 .await;
@@ -3696,7 +3765,11 @@ pub fn router(proxy: ProxyService) -> Router {
             .state
             .get_config_meta_overrides(proxy.service_name)
             .await;
-        let configs = list_config_options_from_mgr(mgr, &meta_overrides);
+        let state_overrides = proxy
+            .state
+            .get_config_runtime_state_overrides(proxy.service_name)
+            .await;
+        let configs = list_config_options_from_mgr(mgr, &meta_overrides, &state_overrides);
         let default_profile =
             effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
 
@@ -3912,7 +3985,15 @@ pub fn router(proxy: ProxyService) -> Router {
             .state
             .get_config_meta_overrides(proxy.service_name)
             .await;
-        Ok(Json(list_config_options_from_mgr(mgr, &meta_overrides)))
+        let state_overrides = proxy
+            .state
+            .get_config_runtime_state_overrides(proxy.service_name)
+            .await;
+        Ok(Json(list_config_options_from_mgr(
+            mgr,
+            &meta_overrides,
+            &state_overrides,
+        )))
     }
 
     let admin_access = AdminAccessConfig::from_env();

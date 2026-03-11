@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::state::RuntimeConfigState;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigOption {
     pub name: String,
@@ -17,6 +19,10 @@ pub struct ConfigOption {
     pub runtime_enabled_override: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_level_override: Option<u8>,
+    #[serde(default)]
+    pub runtime_state: RuntimeConfigState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_state_override: Option<RuntimeConfigState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
