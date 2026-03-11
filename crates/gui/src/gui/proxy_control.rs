@@ -2156,3 +2156,331 @@ fn suggest_next_port(
     };
     rt.block_on(fut)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        Json, Router,
+        http::StatusCode,
+        routing::{get, post},
+    };
+    use codex_helper_core::dashboard_core::snapshot::DashboardSnapshot;
+    use serde_json::Value;
+
+    fn sample_station(name: &str) -> ConfigOption {
+        ConfigOption {
+            name: name.to_string(),
+            alias: None,
+            enabled: true,
+            level: 1,
+            configured_enabled: true,
+            configured_level: 1,
+            runtime_enabled_override: None,
+            runtime_level_override: None,
+            runtime_state: RuntimeConfigState::Normal,
+            runtime_state_override: None,
+            capabilities: Default::default(),
+        }
+    }
+
+    fn sample_snapshot(configs: Vec<ConfigOption>, stations: Vec<ConfigOption>) -> ApiV1Snapshot {
+        ApiV1Snapshot {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            runtime_loaded_at_ms: Some(1),
+            runtime_source_mtime_ms: Some(2),
+            configs,
+            stations,
+            default_profile: None,
+            profiles: Vec::new(),
+            snapshot: DashboardSnapshot {
+                refreshed_at_ms: 1,
+                active: Vec::new(),
+                recent: Vec::new(),
+                session_cards: Vec::new(),
+                global_override: None,
+                session_model_overrides: HashMap::new(),
+                session_config_overrides: HashMap::new(),
+                session_effort_overrides: HashMap::new(),
+                session_service_tier_overrides: HashMap::new(),
+                session_stats: HashMap::new(),
+                config_health: HashMap::new(),
+                health_checks: HashMap::new(),
+                lb_view: HashMap::new(),
+                usage_rollup: UsageRollupView::default(),
+                stats_5m: WindowStats::default(),
+                stats_1h: WindowStats::default(),
+            },
+        }
+    }
+
+    fn spawn_test_server(rt: &tokio::runtime::Runtime, app: Router) -> (String, JoinHandle<()>) {
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind test server");
+            let addr = listener.local_addr().expect("test server addr");
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve test app");
+            });
+            (format!("http://{addr}"), handle)
+        })
+    }
+
+    #[test]
+    fn refresh_attached_prefers_station_snapshot_payload() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let caps = serde_json::json!({
+            "api_version": 1,
+            "service_name": "codex",
+            "endpoints": [
+                "/__codex_helper/api/v1/snapshot",
+                "/__codex_helper/api/v1/stations",
+                "/__codex_helper/api/v1/stations/runtime"
+            ]
+        });
+        let snapshot = sample_snapshot(
+            vec![sample_station("legacy-config")],
+            vec![sample_station("preferred-station")],
+        );
+        let app = Router::new()
+            .route(
+                "/__codex_helper/api/v1/capabilities",
+                get({
+                    let caps = caps.clone();
+                    move || {
+                        let caps = caps.clone();
+                        async move { Json(caps) }
+                    }
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/snapshot",
+                get({
+                    let snapshot = snapshot.clone();
+                    move || {
+                        let snapshot = snapshot.clone();
+                        async move { Json(snapshot) }
+                    }
+                }),
+            );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4100, ServiceKind::Codex);
+        controller.request_attach_with_admin_base(4100, Some(base_url));
+        controller.refresh_attached_if_due(&rt, Duration::ZERO);
+
+        let snapshot = controller.snapshot().expect("attached snapshot");
+        assert_eq!(snapshot.configs.len(), 1);
+        assert_eq!(snapshot.configs[0].name, "preferred-station");
+        assert!(
+            controller
+                .attached()
+                .expect("attached status")
+                .supports_station_api
+        );
+
+        handle.abort();
+    }
+
+    #[test]
+    fn refresh_attached_falls_back_to_legacy_configs_api() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let caps = serde_json::json!({
+            "api_version": 1,
+            "service_name": "codex",
+            "endpoints": [
+                "/__codex_helper/api/v1/status/active",
+                "/__codex_helper/api/v1/status/recent",
+                "/__codex_helper/api/v1/status/session-stats",
+                "/__codex_helper/api/v1/status/health-checks",
+                "/__codex_helper/api/v1/status/config-health",
+                "/__codex_helper/api/v1/config/runtime",
+                "/__codex_helper/api/v1/configs",
+                "/__codex_helper/api/v1/configs/runtime",
+                "/__codex_helper/api/v1/overrides/global-config",
+                "/__codex_helper/api/v1/overrides/session/config",
+                "/__codex_helper/api/v1/overrides/session/effort"
+            ]
+        });
+        let configs = vec![sample_station("legacy-only")];
+        let app = Router::new()
+            .route(
+                "/__codex_helper/api/v1/capabilities",
+                get({
+                    let caps = caps.clone();
+                    move || {
+                        let caps = caps.clone();
+                        async move { Json(caps) }
+                    }
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/active",
+                get(|| async { Json(Vec::<ActiveRequest>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/recent",
+                get(|| async { Json(Vec::<FinishedRequest>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/session-stats",
+                get(|| async { Json(HashMap::<String, SessionStats>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/health-checks",
+                get(|| async { Json(HashMap::<String, HealthCheckStatus>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/config-health",
+                get(|| async { Json(HashMap::<String, ConfigHealth>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/config/runtime",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "loaded_at_ms": 1,
+                        "source_mtime_ms": 2,
+                    }))
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/configs",
+                get({
+                    let configs = configs.clone();
+                    move || {
+                        let configs = configs.clone();
+                        async move { Json(configs) }
+                    }
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/global-config",
+                get(|| async { Json(Option::<String>::None) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/session/config",
+                get(|| async { Json(HashMap::<String, String>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/session/effort",
+                get(|| async { Json(HashMap::<String, String>::new()) }),
+            );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4200, ServiceKind::Codex);
+        controller.request_attach_with_admin_base(4200, Some(base_url));
+        controller.refresh_attached_if_due(&rt, Duration::ZERO);
+
+        let snapshot = controller.snapshot().expect("legacy attached snapshot");
+        assert_eq!(snapshot.configs.len(), 1);
+        assert_eq!(snapshot.configs[0].name, "legacy-only");
+        assert!(
+            !controller
+                .attached()
+                .expect("legacy attached status")
+                .supports_station_api
+        );
+
+        handle.abort();
+    }
+
+    #[test]
+    fn attached_runtime_meta_uses_station_and_legacy_endpoints_compatibly() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let station_payload = Arc::new(Mutex::new(None::<Value>));
+        let station_app = Router::new().route(
+            "/__codex_helper/api/v1/stations/runtime",
+            post({
+                let station_payload = station_payload.clone();
+                move |Json(payload): Json<Value>| {
+                    let station_payload = station_payload.clone();
+                    async move {
+                        *station_payload.lock().expect("station payload lock") = Some(payload);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let (station_base_url, station_handle) = spawn_test_server(&rt, station_app);
+
+        let mut station_controller = ProxyController::new(4300, ServiceKind::Codex);
+        let mut station_attached = AttachedStatus::new(4300);
+        station_attached.admin_base_url = station_base_url;
+        station_attached.supports_config_runtime_override = true;
+        station_attached.supports_station_api = true;
+        station_controller.mode = ProxyMode::Attached(station_attached);
+        station_controller
+            .set_runtime_config_meta(
+                &rt,
+                "alpha".to_string(),
+                Some(Some(false)),
+                Some(Some(7)),
+                Some(Some(RuntimeConfigState::Draining)),
+            )
+            .expect("station runtime meta update");
+
+        let station_payload = station_payload
+            .lock()
+            .expect("station payload lock")
+            .clone()
+            .expect("station payload");
+        assert_eq!(
+            station_payload.get("station_name"),
+            Some(&Value::String("alpha".to_string()))
+        );
+        assert_eq!(station_payload.get("config_name"), None);
+        assert_eq!(
+            station_payload.get("runtime_state"),
+            Some(&Value::String("draining".to_string()))
+        );
+        station_handle.abort();
+
+        let config_payload = Arc::new(Mutex::new(None::<Value>));
+        let config_app = Router::new().route(
+            "/__codex_helper/api/v1/configs/runtime",
+            post({
+                let config_payload = config_payload.clone();
+                move |Json(payload): Json<Value>| {
+                    let config_payload = config_payload.clone();
+                    async move {
+                        *config_payload.lock().expect("config payload lock") = Some(payload);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let (config_base_url, config_handle) = spawn_test_server(&rt, config_app);
+
+        let mut legacy_controller = ProxyController::new(4301, ServiceKind::Codex);
+        let mut legacy_attached = AttachedStatus::new(4301);
+        legacy_attached.admin_base_url = config_base_url;
+        legacy_attached.supports_config_runtime_override = true;
+        legacy_attached.supports_station_api = false;
+        legacy_controller.mode = ProxyMode::Attached(legacy_attached);
+        legacy_controller
+            .set_runtime_config_meta(&rt, "beta".to_string(), Some(Some(true)), None, Some(None))
+            .expect("legacy runtime meta update");
+
+        let config_payload = config_payload
+            .lock()
+            .expect("config payload lock")
+            .clone()
+            .expect("config payload");
+        assert_eq!(
+            config_payload.get("config_name"),
+            Some(&Value::String("beta".to_string()))
+        );
+        assert_eq!(config_payload.get("station_name"), None);
+        assert_eq!(
+            config_payload.get("clear_runtime_state"),
+            Some(&Value::Bool(true))
+        );
+        config_handle.abort();
+    }
+}
