@@ -1031,6 +1031,35 @@ pub struct PersistedStationsCatalog {
     pub providers: Vec<PersistedStationProviderRef>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PersistedProviderEndpointSpec {
+    pub name: String,
+    pub base_url: String,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PersistedProviderSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<PersistedProviderEndpointSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PersistedProvidersCatalog {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<PersistedProviderSpec>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RoutingCandidate {
     pub name: String,
@@ -1216,6 +1245,38 @@ pub fn build_persisted_station_catalog(view: &ServiceViewV2) -> PersistedStation
         stations,
         providers,
     }
+}
+
+pub fn build_persisted_provider_catalog(view: &ServiceViewV2) -> PersistedProvidersCatalog {
+    let mut providers = view
+        .providers
+        .iter()
+        .map(|(name, provider)| PersistedProviderSpec {
+            name: name.clone(),
+            alias: provider.alias.clone(),
+            enabled: provider.enabled,
+            auth_token_env: provider.auth.auth_token_env.clone(),
+            api_key_env: provider.auth.api_key_env.clone(),
+            endpoints: provider
+                .endpoints
+                .iter()
+                .map(|(endpoint_name, endpoint)| PersistedProviderEndpointSpec {
+                    name: endpoint_name.clone(),
+                    base_url: endpoint.base_url.clone(),
+                    enabled: endpoint.enabled,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|a, b| a.name.cmp(&b.name));
+    for provider in &mut providers {
+        provider.endpoints.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.base_url.cmp(&b.base_url))
+        });
+    }
+    PersistedProvidersCatalog { providers }
 }
 
 pub fn compile_v2_to_runtime(v2: &ProxyConfigV2) -> Result<ProxyConfig> {
@@ -1542,15 +1603,18 @@ fn provider_name_hint(
     original_name: &str,
     provider: &ProviderConfigV2,
 ) -> (String, Option<String>) {
+    let original_name = original_name.trim();
+    let explicit_alias = provider
+        .alias
+        .clone()
+        .map(|alias| alias.trim().to_string())
+        .filter(|alias| !alias.is_empty());
     let mut raw_hint = None;
-    if !original_name.trim().is_empty() && !looks_generated_provider_name(original_name) {
-        raw_hint = Some(original_name.trim().to_string());
+    if !original_name.is_empty() && !looks_generated_provider_name(original_name) {
+        raw_hint = Some(original_name.to_string());
     }
     if raw_hint.is_none() {
-        raw_hint = provider
-            .alias
-            .clone()
-            .filter(|alias| !alias.trim().is_empty());
+        raw_hint = explicit_alias.clone();
     }
     if raw_hint.is_none() {
         raw_hint = provider
@@ -1578,12 +1642,21 @@ fn provider_name_hint(
 
     let raw_hint = raw_hint.unwrap_or_else(|| "provider".to_string());
     let slug = sanitize_schema_key(&raw_hint, "provider");
-    let alias = if raw_hint == slug {
-        None
-    } else {
-        Some(raw_hint)
-    };
+    let alias = explicit_alias
+        .filter(|alias| alias != original_name)
+        .or_else(|| {
+            if raw_hint == slug {
+                None
+            } else {
+                Some(raw_hint)
+            }
+        });
     (slug, alias)
+}
+
+fn should_persist_provider_alias(alias: &str, provider_name: &str) -> bool {
+    let alias = alias.trim();
+    !alias.is_empty() && alias != provider_name.trim()
 }
 
 fn endpoint_name_hint(endpoint: &EndpointCompactBuild, total: usize) -> String {
@@ -1753,7 +1826,7 @@ fn compact_service_view_v2(view: &ServiceViewV2) -> Result<ServiceViewV2> {
                     alias: build
                         .alias
                         .clone()
-                        .filter(|alias| sanitize_schema_key(alias, "provider") != *provider_name),
+                        .filter(|alias| should_persist_provider_alias(alias, provider_name)),
                     enabled: build.enabled,
                     auth: build.auth.clone(),
                     tags: build.empty_provider_tags.clone(),
@@ -1807,7 +1880,7 @@ fn compact_service_view_v2(view: &ServiceViewV2) -> Result<ServiceViewV2> {
                 alias: build
                     .alias
                     .clone()
-                    .filter(|alias| sanitize_schema_key(alias, "provider") != *provider_name),
+                    .filter(|alias| should_persist_provider_alias(alias, provider_name)),
                 enabled: build.enabled,
                 auth: build.auth.clone(),
                 tags: common_tags,
@@ -3196,6 +3269,55 @@ env_key = "RIGHTCODE_API_KEY"
             group.members[0].endpoint_names,
             vec!["hk".to_string(), "us".to_string()]
         );
+    }
+
+    #[test]
+    fn compact_v2_config_preserves_explicit_provider_alias() {
+        let mut v2 = ProxyConfigV2 {
+            version: 2,
+            codex: ServiceViewV2::default(),
+            claude: ServiceViewV2::default(),
+            retry: RetryConfig::default(),
+            notify: NotifyConfig::default(),
+            default_service: None,
+            ui: UiConfig::default(),
+        };
+        v2.codex.providers.insert(
+            "alpha".to_string(),
+            ProviderConfigV2 {
+                alias: Some("Relay Alpha".to_string()),
+                enabled: true,
+                auth: UpstreamAuth {
+                    auth_token: None,
+                    auth_token_env: Some("ALPHA_KEY".to_string()),
+                    api_key: None,
+                    api_key_env: None,
+                },
+                tags: BTreeMap::from([("provider_id".to_string(), "alpha".to_string())]),
+                supported_models: BTreeMap::new(),
+                model_mapping: BTreeMap::new(),
+                endpoints: [(
+                    "default".to_string(),
+                    ProviderEndpointV2 {
+                        base_url: "https://alpha.example.com/v1".to_string(),
+                        enabled: true,
+                        tags: BTreeMap::new(),
+                        supported_models: BTreeMap::new(),
+                        model_mapping: BTreeMap::new(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let compact = compact_v2_config(&v2).expect("compact_v2_config");
+        let provider = compact
+            .codex
+            .providers
+            .get("alpha")
+            .expect("alpha provider should exist");
+        assert_eq!(provider.alias.as_deref(), Some("Relay Alpha"));
     }
 
     #[test]

@@ -3268,6 +3268,28 @@ pub fn router(proxy: ProxyService) -> Router {
     }
 
     #[derive(serde::Deserialize)]
+    struct PersistedProviderEndpointSpecUpsertRequest {
+        name: String,
+        base_url: String,
+        #[serde(default = "default_persisted_station_enabled")]
+        enabled: bool,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PersistedProviderSpecUpsertRequest {
+        #[serde(default)]
+        alias: Option<String>,
+        #[serde(default = "default_persisted_station_enabled")]
+        enabled: bool,
+        #[serde(default)]
+        auth_token_env: Option<String>,
+        #[serde(default)]
+        api_key_env: Option<String>,
+        #[serde(default)]
+        endpoints: Vec<PersistedProviderEndpointSpecUpsertRequest>,
+    }
+
+    #[derive(serde::Deserialize)]
     struct PersistedStationActiveRequest {
         #[serde(default)]
         station_name: Option<String>,
@@ -3382,6 +3404,17 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(station_name.to_string())
     }
 
+    fn sanitize_provider_name(provider_name: &str) -> Result<String, (StatusCode, String)> {
+        let provider_name = provider_name.trim();
+        if provider_name.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "provider name is required".to_string(),
+            ));
+        }
+        Ok(provider_name.to_string())
+    }
+
     fn sanitize_profile_request(
         payload: PersistedProfileUpsertRequest,
     ) -> crate::config::ServiceControlProfile {
@@ -3444,6 +3477,100 @@ pub fn router(proxy: ProxyService) -> Router {
             level: payload.level.clamp(1, 10),
             members,
         })
+    }
+
+    fn sanitize_provider_spec_request(
+        payload: PersistedProviderSpecUpsertRequest,
+    ) -> Result<crate::config::PersistedProviderSpec, (StatusCode, String)> {
+        let mut endpoints = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for endpoint in payload.endpoints {
+            let endpoint_name = endpoint.name.trim();
+            if endpoint_name.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "provider endpoint name is required".to_string(),
+                ));
+            }
+            let base_url = endpoint.base_url.trim();
+            if base_url.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("provider endpoint '{}' base_url is required", endpoint_name),
+                ));
+            }
+            if !seen.insert(endpoint_name.to_string()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("duplicate provider endpoint '{}'", endpoint_name),
+                ));
+            }
+
+            endpoints.push(crate::config::PersistedProviderEndpointSpec {
+                name: endpoint_name.to_string(),
+                base_url: base_url.to_string(),
+                enabled: endpoint.enabled,
+            });
+        }
+
+        Ok(crate::config::PersistedProviderSpec {
+            name: String::new(),
+            alias: normalize_optional_config_string(payload.alias),
+            enabled: payload.enabled,
+            auth_token_env: normalize_optional_config_string(payload.auth_token_env),
+            api_key_env: normalize_optional_config_string(payload.api_key_env),
+            endpoints,
+        })
+    }
+
+    fn merge_persisted_provider_spec(
+        existing: Option<&crate::config::ProviderConfigV2>,
+        provider: &crate::config::PersistedProviderSpec,
+    ) -> crate::config::ProviderConfigV2 {
+        let mut auth = existing
+            .map(|provider| provider.auth.clone())
+            .unwrap_or_default();
+        auth.auth_token_env = provider.auth_token_env.clone();
+        auth.api_key_env = provider.api_key_env.clone();
+
+        crate::config::ProviderConfigV2 {
+            alias: provider.alias.clone(),
+            enabled: provider.enabled,
+            auth,
+            tags: existing
+                .map(|provider| provider.tags.clone())
+                .unwrap_or_default(),
+            supported_models: existing
+                .map(|provider| provider.supported_models.clone())
+                .unwrap_or_default(),
+            model_mapping: existing
+                .map(|provider| provider.model_mapping.clone())
+                .unwrap_or_default(),
+            endpoints: provider
+                .endpoints
+                .iter()
+                .map(|endpoint| {
+                    let existing_endpoint = existing
+                        .and_then(|provider| provider.endpoints.get(endpoint.name.as_str()));
+                    (
+                        endpoint.name.clone(),
+                        crate::config::ProviderEndpointV2 {
+                            base_url: endpoint.base_url.clone(),
+                            enabled: endpoint.enabled,
+                            tags: existing_endpoint
+                                .map(|endpoint| endpoint.tags.clone())
+                                .unwrap_or_default(),
+                            supported_models: existing_endpoint
+                                .map(|endpoint| endpoint.supported_models.clone())
+                                .unwrap_or_default(),
+                            model_mapping: existing_endpoint
+                                .map(|endpoint| endpoint.model_mapping.clone())
+                                .unwrap_or_default(),
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 
     fn service_view_v2<'a>(
@@ -3833,6 +3960,15 @@ pub fn router(proxy: ProxyService) -> Router {
         )))
     }
 
+    async fn list_persisted_provider_specs(
+        proxy: ProxyService,
+    ) -> Result<Json<crate::config::PersistedProvidersCatalog>, (StatusCode, String)> {
+        let cfg = load_persisted_config_v2().await?;
+        Ok(Json(crate::config::build_persisted_provider_catalog(
+            service_view_v2(&cfg, proxy.service_name),
+        )))
+    }
+
     async fn upsert_persisted_profile(
         proxy: ProxyService,
         Path(profile_name): Path<String>,
@@ -4030,6 +4166,72 @@ pub fn router(proxy: ProxyService) -> Router {
         }
         if view.active_group.as_deref() == Some(station_name.as_str()) {
             view.active_group = None;
+        }
+
+        crate::config::compile_v2_to_runtime(&cfg)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        save_proxy_config_v2_and_reload(&proxy, cfg).await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn upsert_persisted_provider_spec(
+        proxy: ProxyService,
+        Path(provider_name): Path<String>,
+        Json(payload): Json<PersistedProviderSpecUpsertRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        let provider_name = sanitize_provider_name(provider_name.as_str())?;
+        let mut provider = sanitize_provider_spec_request(payload)?;
+        provider.name = provider_name.clone();
+
+        let mut cfg = load_persisted_config_v2().await?;
+        let view = service_view_v2_mut(&mut cfg, proxy.service_name);
+        let existing_provider = view.providers.get(provider_name.as_str()).cloned();
+        view.providers.insert(
+            provider_name,
+            merge_persisted_provider_spec(existing_provider.as_ref(), &provider),
+        );
+
+        crate::config::compile_v2_to_runtime(&cfg)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        save_proxy_config_v2_and_reload(&proxy, cfg).await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn delete_persisted_provider_spec(
+        proxy: ProxyService,
+        Path(provider_name): Path<String>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        let provider_name = sanitize_provider_name(provider_name.as_str())?;
+        let mut cfg = load_persisted_config_v2().await?;
+        let view = service_view_v2_mut(&mut cfg, proxy.service_name);
+
+        let referencing_stations = view
+            .groups
+            .iter()
+            .filter_map(|(station_name, station)| {
+                station
+                    .members
+                    .iter()
+                    .any(|member| member.provider == provider_name)
+                    .then_some(station_name.clone())
+            })
+            .collect::<Vec<_>>();
+        if !referencing_stations.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "provider '{}' is referenced by stations: {}",
+                    provider_name,
+                    referencing_stations.join(", ")
+                ),
+            ));
+        }
+
+        if view.providers.remove(provider_name.as_str()).is_none() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("provider '{}' not found", provider_name),
+            ));
         }
 
         crate::config::compile_v2_to_runtime(&cfg)
@@ -4377,6 +4579,8 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/stations/{name}",
                 "/__codex_helper/api/v1/stations/specs",
                 "/__codex_helper/api/v1/stations/specs/{name}",
+                "/__codex_helper/api/v1/providers/specs",
+                "/__codex_helper/api/v1/providers/specs/{name}",
                 "/__codex_helper/api/v1/profiles",
                 "/__codex_helper/api/v1/profiles/default",
                 "/__codex_helper/api/v1/profiles/config-default",
@@ -4725,6 +4929,9 @@ pub fn router(proxy: ProxyService) -> Router {
     let p44 = proxy.clone();
     let p45 = proxy.clone();
     let p46 = proxy.clone();
+    let p47 = proxy.clone();
+    let p48 = proxy.clone();
+    let p49 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -4805,6 +5012,15 @@ pub fn router(proxy: ProxyService) -> Router {
             "/__codex_helper/api/v1/stations/specs/{name}",
             put(move |name, payload| upsert_persisted_station_spec(p45.clone(), name, payload))
                 .delete(move |name| delete_persisted_station_spec(p46.clone(), name)),
+        )
+        .route(
+            "/__codex_helper/api/v1/providers/specs",
+            get(move || list_persisted_provider_specs(p47.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/providers/specs/{name}",
+            put(move |name, payload| upsert_persisted_provider_spec(p48.clone(), name, payload))
+                .delete(move |name| delete_persisted_provider_spec(p49.clone(), name)),
         )
         .route(
             "/__codex_helper/api/v1/profiles",

@@ -280,6 +280,16 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/providers/specs"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/providers/specs/{name}"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles/default"))
     }));
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
@@ -1239,6 +1249,266 @@ async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
     assert!(config_text.contains("[codex.providers.right]"));
     assert!(config_text.contains("[codex.stations.alpha]"));
     assert!(!config_text.contains("[codex.stations.beta]"));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
+    let _env_lock = env_lock();
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let mut cfg = ProxyConfigV2 {
+        version: 2,
+        codex: ServiceViewV2::default(),
+        claude: ServiceViewV2::default(),
+        retry: RetryConfig::default(),
+        notify: Default::default(),
+        default_service: None,
+        ui: UiConfig::default(),
+    };
+    cfg.codex.providers.insert(
+        "alpha".to_string(),
+        ProviderConfigV2 {
+            alias: Some("Alpha".to_string()),
+            enabled: true,
+            auth: UpstreamAuth {
+                auth_token: Some("inline-alpha-token".to_string()),
+                auth_token_env: Some("ALPHA_KEY".to_string()),
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: [("provider_id".to_string(), "alpha".to_string())]
+                .into_iter()
+                .collect(),
+            supported_models: [("gpt-5.4".to_string(), true)].into_iter().collect(),
+            model_mapping: [("gpt-5.4".to_string(), "gpt-5.4-fast".to_string())]
+                .into_iter()
+                .collect(),
+            endpoints: [(
+                "default".to_string(),
+                ProviderEndpointV2 {
+                    base_url: "https://alpha.example.com/v1".to_string(),
+                    enabled: true,
+                    tags: [("region".to_string(), "hk".to_string())]
+                        .into_iter()
+                        .collect(),
+                    supported_models: [("gpt-5.4-mini".to_string(), true)].into_iter().collect(),
+                    model_mapping: [("gpt-5.4-mini".to_string(), "gpt-5.4".to_string())]
+                        .into_iter()
+                        .collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+    );
+    cfg.codex.groups.insert(
+        "main".to_string(),
+        GroupConfigV2 {
+            alias: None,
+            enabled: true,
+            level: 1,
+            members: vec![GroupMemberRefV2 {
+                provider: "alpha".to_string(),
+                endpoint_names: vec!["default".to_string()],
+                preferred: true,
+            }],
+        },
+    );
+
+    crate::config::save_config_v2(&cfg)
+        .await
+        .expect("write initial provider v2 config");
+    let loaded = crate::config::load_config()
+        .await
+        .expect("load initial runtime config");
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(loaded),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let initial = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get provider specs send")
+        .error_for_status()
+        .expect("get provider specs status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get provider specs json");
+    assert_eq!(
+        initial["providers"]
+            .as_array()
+            .map(|providers| providers.len()),
+        Some(1)
+    );
+
+    let update_alpha = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/alpha",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "alias": "Relay Alpha",
+            "enabled": false,
+            "auth_token_env": "ALPHA_NEXT_KEY",
+            "api_key_env": "ALPHA_API_KEY",
+            "endpoints": [
+                {
+                    "name": "default",
+                    "base_url": "https://alpha2.example.com/v1",
+                    "enabled": false
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("update alpha provider spec send");
+    assert_eq!(update_alpha.status(), StatusCode::NO_CONTENT);
+
+    let update_beta = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/beta",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "alias": "Beta",
+            "enabled": false,
+            "auth_token_env": "BETA_KEY",
+            "api_key_env": "BETA_API_KEY",
+            "endpoints": [
+                {
+                    "name": "hk",
+                    "base_url": "https://beta-hk.example.com/v1",
+                    "enabled": true
+                },
+                {
+                    "name": "us",
+                    "base_url": "https://beta-us.example.com/v1",
+                    "enabled": false
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("upsert provider spec send");
+    assert_eq!(update_beta.status(), StatusCode::NO_CONTENT);
+
+    let after_update = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get provider specs after update send")
+        .error_for_status()
+        .expect("get provider specs after update status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get provider specs after update json");
+    let beta = after_update["providers"]
+        .as_array()
+        .and_then(|providers| {
+            providers.iter().find(|provider| {
+                provider.get("name").and_then(|value| value.as_str()) == Some("beta")
+            })
+        })
+        .expect("beta provider");
+    assert_eq!(
+        beta.get("enabled").and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        beta.get("auth_token_env").and_then(|value| value.as_str()),
+        Some("BETA_KEY")
+    );
+    assert_eq!(
+        beta["endpoints"]
+            .as_array()
+            .map(|endpoints| endpoints.len()),
+        Some(2)
+    );
+
+    let delete = client
+        .delete(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/beta",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("delete provider spec send");
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let persisted_text =
+        std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
+    let persisted_cfg: ProxyConfigV2 =
+        toml::from_str(&persisted_text).expect("parse persisted provider v2 config");
+    let alpha = persisted_cfg
+        .codex
+        .providers
+        .get("alpha")
+        .expect("alpha provider should still exist");
+    assert_eq!(alpha.alias.as_deref(), Some("Relay Alpha"));
+    assert!(!alpha.enabled);
+    assert_eq!(alpha.auth.auth_token.as_deref(), Some("inline-alpha-token"));
+    assert_eq!(alpha.auth.auth_token_env.as_deref(), Some("ALPHA_NEXT_KEY"));
+    assert_eq!(alpha.auth.api_key_env.as_deref(), Some("ALPHA_API_KEY"));
+    assert_eq!(
+        alpha.tags.get("provider_id").map(|value| value.as_str()),
+        Some("alpha")
+    );
+    assert_eq!(
+        alpha.tags.get("region").map(|value| value.as_str()),
+        Some("hk")
+    );
+    assert_eq!(alpha.supported_models.get("gpt-5.4").copied(), Some(true));
+    assert_eq!(
+        alpha.supported_models.get("gpt-5.4-mini").copied(),
+        Some(true)
+    );
+    assert_eq!(
+        alpha
+            .model_mapping
+            .get("gpt-5.4")
+            .map(|value| value.as_str()),
+        Some("gpt-5.4-fast")
+    );
+    assert_eq!(
+        alpha
+            .model_mapping
+            .get("gpt-5.4-mini")
+            .map(|value| value.as_str()),
+        Some("gpt-5.4")
+    );
+    let alpha_default = alpha
+        .endpoints
+        .get("default")
+        .expect("alpha default endpoint should exist");
+    assert_eq!(alpha_default.base_url, "https://alpha2.example.com/v1");
+    assert!(!alpha_default.enabled);
+    let reloaded_cfg = crate::config::load_config()
+        .await
+        .expect("reload config from disk after provider spec CRUD");
+    assert!(reloaded_cfg.codex.configs.contains_key("main"));
+    assert!(!reloaded_cfg.codex.configs.contains_key("beta"));
+    assert!(persisted_text.contains("[codex.providers.alpha]"));
+    assert!(!persisted_text.contains("[codex.providers.beta]"));
 
     proxy_handle.abort();
 }

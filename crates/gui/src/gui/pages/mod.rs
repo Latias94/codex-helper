@@ -11,8 +11,9 @@ use super::util::{
     spawn_windows_terminal_wt_tabs_in_one_window,
 };
 use crate::config::{
-    GroupConfigV2, GroupMemberRefV2, PersistedStationProviderRef, PersistedStationSpec,
-    RetryConfig, RetryProfileName, RetryStrategy,
+    GroupConfigV2, GroupMemberRefV2, PersistedProviderSpec, PersistedStationProviderRef,
+    PersistedStationSpec, ProviderConfigV2, ProviderEndpointV2, RetryConfig, RetryProfileName,
+    RetryStrategy,
 };
 use crate::dashboard_core::{
     CapabilitySupport, ConfigCapabilitySummary, ConfigOption, ControlProfileOption,
@@ -111,6 +112,8 @@ pub struct ConfigViewState {
     service: crate::config::ServiceKind,
     selected_name: Option<String>,
     station_editor: ConfigStationEditorState,
+    selected_provider_name: Option<String>,
+    provider_editor: ConfigProviderEditorState,
     selected_profile_name: Option<String>,
     new_profile_name: String,
     profile_editor: ConfigProfileEditorState,
@@ -126,6 +129,8 @@ impl Default for ConfigViewState {
             service: crate::config::ServiceKind::Codex,
             selected_name: None,
             station_editor: ConfigStationEditorState::default(),
+            selected_provider_name: None,
+            provider_editor: ConfigProviderEditorState::default(),
             selected_profile_name: None,
             new_profile_name: String::new(),
             profile_editor: ConfigProfileEditorState::default(),
@@ -151,6 +156,24 @@ struct ConfigStationMemberEditorState {
     provider: String,
     endpoint_names: String,
     preferred: bool,
+}
+
+#[derive(Debug, Default)]
+struct ConfigProviderEditorState {
+    provider_name: Option<String>,
+    alias: String,
+    enabled: bool,
+    auth_token_env: String,
+    api_key_env: String,
+    endpoints: Vec<ConfigProviderEndpointEditorState>,
+    new_provider_name: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ConfigProviderEndpointEditorState {
+    name: String,
+    base_url: String,
+    enabled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -5830,8 +5853,8 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.add_space(6.0);
     ui.label(pick(
         ctx.lang,
-        "当前文件是 v2 station/provider 布局。表单视图优先支持常用站点字段（active_station / enabled / level）；provider、endpoint、profile 的复杂编辑仍建议用“原始”视图。",
-        "This file uses the v2 station/provider schema. Form view focuses on common station fields (active_station / enabled / level); use Raw view for advanced provider, endpoint, and profile edits.",
+        "当前文件是 v2 station/provider 布局。表单视图现在支持 station/provider/profile 的常用结构管理；provider tags、supported_models、model_mapping 等高级字段仍建议用“原始”视图。",
+        "This file uses the v2 station/provider schema. Form view now covers common station/provider/profile structure management; use Raw view for advanced provider tags, supported_models, and model_mapping edits.",
     ));
 
     ui.add_space(6.0);
@@ -5940,6 +5963,16 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let station_structure_control_plane_enabled = attached_station_specs.is_some();
     let station_structure_edit_enabled = station_structure_control_plane_enabled
         || !matches!(ctx.proxy.kind(), ProxyModeKind::Attached);
+    let attached_provider_specs = ctx
+        .proxy
+        .attached()
+        .filter(|att| {
+            att.service_name.as_deref() == Some(selected_service) && att.supports_provider_spec_api
+        })
+        .map(|att| att.persisted_providers.clone());
+    let provider_structure_control_plane_enabled = attached_provider_specs.is_some();
+    let provider_structure_edit_enabled = provider_structure_control_plane_enabled
+        || !matches!(ctx.proxy.kind(), ProxyModeKind::Attached);
     let station_display_names = if let Some((stations, _)) = attached_station_specs.as_ref() {
         let mut names = stations.values().cloned().collect::<Vec<_>>();
         names.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
@@ -6018,12 +6051,22 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let mut action_save_apply_remote: Option<(String, bool, u8)> = None;
     let mut action_upsert_station_spec_remote: Option<(String, PersistedStationSpec)> = None;
     let mut action_delete_station_spec_remote: Option<String> = None;
+    let mut action_upsert_provider_spec_remote: Option<(String, PersistedProviderSpec)> = None;
+    let mut action_delete_provider_spec_remote: Option<String> = None;
     let mut station_editor_name = ctx.view.config.station_editor.station_name.clone();
     let mut station_editor_alias = ctx.view.config.station_editor.alias.clone();
     let mut station_editor_enabled = ctx.view.config.station_editor.enabled;
     let mut station_editor_level = ctx.view.config.station_editor.level.max(1);
     let mut station_editor_members = ctx.view.config.station_editor.members.clone();
     let mut new_station_name = ctx.view.config.station_editor.new_station_name.clone();
+    let mut selected_provider_name = ctx.view.config.selected_provider_name.clone();
+    let mut provider_editor_name = ctx.view.config.provider_editor.provider_name.clone();
+    let mut provider_editor_alias = ctx.view.config.provider_editor.alias.clone();
+    let mut provider_editor_enabled = ctx.view.config.provider_editor.enabled;
+    let mut provider_editor_auth_token_env = ctx.view.config.provider_editor.auth_token_env.clone();
+    let mut provider_editor_api_key_env = ctx.view.config.provider_editor.api_key_env.clone();
+    let mut provider_editor_endpoints = ctx.view.config.provider_editor.endpoints.clone();
+    let mut new_provider_name = ctx.view.config.provider_editor.new_provider_name.clone();
     if station_structure_control_plane_enabled {
         let selected_station = selected_name.as_deref().and_then(|name| {
             attached_station_specs
@@ -6162,6 +6205,13 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             crate::config::ServiceKind::Codex => &mut cfg.codex,
         };
         let provider_catalog = view.providers.clone();
+        let local_provider_catalog = crate::config::build_persisted_provider_catalog(view);
+        let local_provider_spec_catalog = local_provider_catalog
+            .providers
+            .iter()
+            .cloned()
+            .map(|provider| (provider.name.clone(), provider))
+            .collect::<BTreeMap<_, _>>();
         let local_station_catalog = crate::config::build_persisted_station_catalog(view);
         let local_station_spec_catalog = local_station_catalog
             .stations
@@ -6198,6 +6248,81 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         .members
                         .iter()
                         .map(config_station_member_editor_from_member)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        let mut provider_display_names =
+            if let Some(provider_specs) = attached_provider_specs.as_ref() {
+                provider_specs.keys().cloned().collect::<Vec<_>>()
+            } else {
+                local_provider_spec_catalog
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+        provider_display_names.sort();
+        if selected_provider_name
+            .as_ref()
+            .is_none_or(|name| !provider_display_names.iter().any(|item| item == name))
+        {
+            selected_provider_name = provider_display_names.first().cloned();
+        }
+        if provider_structure_control_plane_enabled {
+            let selected_provider = selected_provider_name.as_deref().and_then(|name| {
+                attached_provider_specs
+                    .as_ref()
+                    .and_then(|specs| specs.get(name))
+            });
+            if provider_editor_name.as_deref() != selected_provider_name.as_deref() {
+                provider_editor_name = selected_provider_name.clone();
+                provider_editor_alias = selected_provider
+                    .and_then(|provider| provider.alias.clone())
+                    .unwrap_or_default();
+                provider_editor_enabled = selected_provider
+                    .map(|provider| provider.enabled)
+                    .unwrap_or(true);
+                provider_editor_auth_token_env = selected_provider
+                    .and_then(|provider| provider.auth_token_env.clone())
+                    .unwrap_or_default();
+                provider_editor_api_key_env = selected_provider
+                    .and_then(|provider| provider.api_key_env.clone())
+                    .unwrap_or_default();
+                provider_editor_endpoints = selected_provider
+                    .map(|provider| {
+                        provider
+                            .endpoints
+                            .iter()
+                            .map(config_provider_endpoint_editor_from_spec)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+        } else if !matches!(ctx.proxy.kind(), ProxyModeKind::Attached)
+            && provider_editor_name.as_deref() != selected_provider_name.as_deref()
+        {
+            let selected_provider = selected_provider_name
+                .as_deref()
+                .and_then(|name| local_provider_spec_catalog.get(name));
+            provider_editor_name = selected_provider_name.clone();
+            provider_editor_alias = selected_provider
+                .and_then(|provider| provider.alias.clone())
+                .unwrap_or_default();
+            provider_editor_enabled = selected_provider
+                .map(|provider| provider.enabled)
+                .unwrap_or(true);
+            provider_editor_auth_token_env = selected_provider
+                .and_then(|provider| provider.auth_token_env.clone())
+                .unwrap_or_default();
+            provider_editor_api_key_env = selected_provider
+                .and_then(|provider| provider.api_key_env.clone())
+                .unwrap_or_default();
+            provider_editor_endpoints = selected_provider
+                .map(|provider| {
+                    provider
+                        .endpoints
+                        .iter()
+                        .map(config_provider_endpoint_editor_from_spec)
                         .collect()
                 })
                 .unwrap_or_default();
@@ -6874,6 +6999,395 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ui.add_space(10.0);
         ui.separator();
         ui.group(|ui| {
+            ui.heading(pick(ctx.lang, "Providers", "Providers"));
+            ui.label(pick(
+                ctx.lang,
+                "Provider 负责认证引用与 endpoint 集合；适合做快捷切换、故障切换和不同中转站的结构管理。这里不会显示明文密钥。",
+                "Providers hold auth references plus endpoint sets; they are the right place for quick switching, failover, and relay structure management. Plaintext secrets are never shown here.",
+            ));
+
+            if provider_structure_control_plane_enabled
+                || !matches!(ctx.proxy.kind(), ProxyModeKind::Attached)
+            {
+                ui.columns(2, |cols| {
+                    cols[0].heading(pick(ctx.lang, "Provider 列表", "Provider list"));
+                    cols[0].add_space(4.0);
+                    cols[0].horizontal(|ui| {
+                        ui.label(pick(ctx.lang, "新建 provider", "New provider"));
+                        ui.add_sized(
+                            [180.0, 22.0],
+                            egui::TextEdit::singleline(&mut new_provider_name).hint_text(pick(
+                                ctx.lang,
+                                "例如 right / backup",
+                                "e.g. right / backup",
+                            )),
+                        );
+                        if ui
+                            .add_enabled(
+                                provider_structure_edit_enabled,
+                                egui::Button::new(pick(ctx.lang, "新增", "Add")),
+                            )
+                            .clicked()
+                        {
+                            let name = new_provider_name.trim();
+                            if name.is_empty() {
+                                *ctx.last_error = Some(
+                                    pick(
+                                        ctx.lang,
+                                        "provider 名称不能为空。",
+                                        "Provider name cannot be empty.",
+                                    )
+                                    .to_string(),
+                                );
+                            } else if provider_structure_control_plane_enabled {
+                                if attached_provider_specs
+                                    .as_ref()
+                                    .is_some_and(|providers| providers.contains_key(name))
+                                {
+                                    *ctx.last_error = Some(
+                                        pick(
+                                            ctx.lang,
+                                            "provider 名称已存在。",
+                                            "Provider name already exists.",
+                                        )
+                                        .to_string(),
+                                    );
+                                } else {
+                                    action_upsert_provider_spec_remote = Some((
+                                        name.to_string(),
+                                        PersistedProviderSpec {
+                                            name: name.to_string(),
+                                            alias: None,
+                                            enabled: true,
+                                            auth_token_env: None,
+                                            api_key_env: None,
+                                            endpoints: Vec::new(),
+                                        },
+                                    ));
+                                    selected_provider_name = Some(name.to_string());
+                                    provider_editor_name = Some(name.to_string());
+                                    provider_editor_alias.clear();
+                                    provider_editor_enabled = true;
+                                    provider_editor_auth_token_env.clear();
+                                    provider_editor_api_key_env.clear();
+                                    provider_editor_endpoints.clear();
+                                    new_provider_name.clear();
+                                }
+                            } else if view.providers.contains_key(name) {
+                                *ctx.last_error = Some(
+                                    pick(
+                                        ctx.lang,
+                                        "provider 名称已存在。",
+                                        "Provider name already exists.",
+                                    )
+                                    .to_string(),
+                                );
+                            } else {
+                                view.providers.insert(name.to_string(), ProviderConfigV2::default());
+                                selected_provider_name = Some(name.to_string());
+                                provider_editor_name = Some(name.to_string());
+                                provider_editor_alias.clear();
+                                provider_editor_enabled = true;
+                                provider_editor_auth_token_env.clear();
+                                provider_editor_api_key_env.clear();
+                                provider_editor_endpoints.clear();
+                                new_provider_name.clear();
+                                *ctx.last_info = Some(
+                                    pick(
+                                        ctx.lang,
+                                        "已新增 provider（待保存）。",
+                                        "Provider added (save pending).",
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                        }
+                    });
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("config_v2_providers_scroll")
+                        .max_height(300.0)
+                        .show(&mut cols[0], |ui| {
+                            if provider_display_names.is_empty() {
+                                ui.label(pick(
+                                    ctx.lang,
+                                    "当前没有 provider。可以先新增一个空 provider，再补 endpoint 与 env 引用。",
+                                    "No providers yet. Add an empty provider first, then fill endpoints and env refs.",
+                                ));
+                            }
+                            for name in provider_display_names.iter() {
+                                let provider = if provider_structure_control_plane_enabled {
+                                    attached_provider_specs
+                                        .as_ref()
+                                        .and_then(|providers| providers.get(name))
+                                } else {
+                                    local_provider_spec_catalog.get(name)
+                                };
+                                let (alias, enabled, endpoints) = provider
+                                    .map(|provider| {
+                                        (
+                                            provider.alias.as_deref().unwrap_or(""),
+                                            provider.enabled,
+                                            provider.endpoints.len(),
+                                        )
+                                    })
+                                    .unwrap_or(("", false, 0));
+                                let mut label = format!("{name}  endpoints={endpoints}");
+                                if !alias.trim().is_empty() {
+                                    label.push_str(&format!(" ({alias})"));
+                                }
+                                if !enabled {
+                                    label.push_str("  [off]");
+                                }
+                                if ui
+                                    .selectable_label(
+                                        selected_provider_name.as_deref() == Some(name.as_str()),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    selected_provider_name = Some(name.clone());
+                                }
+                            }
+                        });
+
+                    cols[1].heading(pick(ctx.lang, "Provider 详情", "Provider details"));
+                    cols[1].add_space(4.0);
+
+                    let Some(name) = selected_provider_name.clone() else {
+                        cols[1].label(pick(ctx.lang, "未选择 provider。", "No provider selected."));
+                        return;
+                    };
+
+                    let provider_snapshot = if provider_structure_control_plane_enabled {
+                        let Some(provider) = attached_provider_specs
+                            .as_ref()
+                            .and_then(|providers| providers.get(name.as_str()))
+                            .cloned()
+                        else {
+                            cols[1].label(pick(
+                                ctx.lang,
+                                "远端 provider 不存在（可能已被删除）。",
+                                "Remote provider missing.",
+                            ));
+                            return;
+                        };
+                        provider
+                    } else {
+                        let Some(provider) = local_provider_spec_catalog.get(name.as_str()).cloned()
+                        else {
+                            cols[1].label(pick(
+                                ctx.lang,
+                                "provider 不存在（可能已被删除）。",
+                                "Provider missing.",
+                            ));
+                            return;
+                        };
+                        provider
+                    };
+
+                    let referencing_stations = if provider_structure_control_plane_enabled {
+                        attached_station_specs
+                            .as_ref()
+                            .map(|(stations, _)| {
+                                stations
+                                    .iter()
+                                    .filter_map(|(station_name, station)| {
+                                        station
+                                            .members
+                                            .iter()
+                                            .any(|member| member.provider == name)
+                                            .then_some(station_name.clone())
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        view.groups
+                            .iter()
+                            .filter_map(|(station_name, station)| {
+                                station
+                                    .members
+                                    .iter()
+                                    .any(|member| member.provider == name)
+                                    .then_some(station_name.clone())
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
+                    cols[1].colored_label(
+                        egui::Color32::from_rgb(120, 120, 120),
+                        if provider_structure_control_plane_enabled {
+                            pick(
+                                ctx.lang,
+                                "当前通过附着代理暴露的 provider 结构 API 直接管理远端 provider；明文密钥、tags、模型映射等高级字段仍不会在这里暴露。",
+                                "This view manages the attached proxy through its provider structure API directly; plaintext secrets, tags, and model mappings are still not exposed here.",
+                            )
+                        } else {
+                            pick(
+                                ctx.lang,
+                                "这里编辑的是本机 v2 provider 结构；保存后会重载当前代理。高级 tags / model_mapping 仍建议在 Raw 视图处理。",
+                                "This edits the local v2 provider structure; saving will reload the current proxy. Advanced tags and model_mapping are still better handled in Raw view.",
+                            )
+                        },
+                    );
+                    cols[1].add_space(6.0);
+                    cols[1].label(format!("name: {name}"));
+                    cols[1].label(format!("endpoints: {}", provider_snapshot.endpoints.len()));
+                    cols[1].label(format!(
+                        "stations: {}",
+                        if referencing_stations.is_empty() {
+                            "-".to_string()
+                        } else {
+                            referencing_stations.join(", ")
+                        }
+                    ));
+
+                    cols[1].horizontal(|ui| {
+                        ui.label("alias");
+                        ui.add_sized(
+                            [220.0, 22.0],
+                            egui::TextEdit::singleline(&mut provider_editor_alias),
+                        );
+                        if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
+                            provider_editor_alias.clear();
+                        }
+                    });
+
+                    cols[1].horizontal(|ui| {
+                        ui.checkbox(&mut provider_editor_enabled, pick(ctx.lang, "启用", "Enabled"));
+                    });
+
+                    cols[1].horizontal(|ui| {
+                        ui.label("auth_token_env");
+                        ui.add_sized(
+                            [220.0, 22.0],
+                            egui::TextEdit::singleline(&mut provider_editor_auth_token_env),
+                        );
+                        if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
+                            provider_editor_auth_token_env.clear();
+                        }
+                    });
+
+                    cols[1].horizontal(|ui| {
+                        ui.label("api_key_env");
+                        ui.add_sized(
+                            [220.0, 22.0],
+                            egui::TextEdit::singleline(&mut provider_editor_api_key_env),
+                        );
+                        if ui.button(pick(ctx.lang, "清除", "Clear")).clicked() {
+                            provider_editor_api_key_env.clear();
+                        }
+                    });
+
+                    cols[1].add_space(8.0);
+                    cols[1].separator();
+                    cols[1].label(pick(ctx.lang, "Endpoints", "Endpoints"));
+                    render_config_provider_endpoint_editor(
+                        &mut cols[1],
+                        ctx.lang,
+                        selected_service,
+                        name.as_str(),
+                        &mut provider_editor_endpoints,
+                    );
+
+                    cols[1].add_space(8.0);
+                    cols[1].horizontal(|ui| {
+                        if ui
+                            .button(pick(
+                                ctx.lang,
+                                if provider_structure_control_plane_enabled {
+                                    "保存到当前代理"
+                                } else {
+                                    "保存并应用"
+                                },
+                                if provider_structure_control_plane_enabled {
+                                    "Save to current proxy"
+                                } else {
+                                    "Save & apply"
+                                },
+                            ))
+                            .clicked()
+                        {
+                            match build_provider_spec_from_config_editor(
+                                name.as_str(),
+                                provider_editor_alias.as_str(),
+                                provider_editor_enabled,
+                                provider_editor_auth_token_env.as_str(),
+                                provider_editor_api_key_env.as_str(),
+                                &provider_editor_endpoints,
+                            ) {
+                                Ok(provider_spec) => {
+                                    if provider_structure_control_plane_enabled {
+                                        action_upsert_provider_spec_remote =
+                                            Some((name.clone(), provider_spec));
+                                    } else {
+                                        let existing_provider =
+                                            view.providers.get(name.as_str()).cloned();
+                                        view.providers.insert(
+                                            name.clone(),
+                                            merge_provider_spec_into_provider_config(
+                                                existing_provider.as_ref(),
+                                                &provider_spec,
+                                            ),
+                                        );
+                                        action_save_apply = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    *ctx.last_error = Some(e);
+                                }
+                            }
+                        }
+
+                        if ui
+                            .button(pick(ctx.lang, "删除 provider", "Delete provider"))
+                            .clicked()
+                        {
+                            if !provider_structure_control_plane_enabled
+                                && !referencing_stations.is_empty()
+                            {
+                                *ctx.last_error = Some(format!(
+                                    "{}: {}",
+                                    pick(
+                                        ctx.lang,
+                                        "仍有 station 引用了该 provider，不能删除",
+                                        "Stations still reference this provider; delete is blocked",
+                                    ),
+                                    referencing_stations.join(", ")
+                                ));
+                            } else if provider_structure_control_plane_enabled {
+                                action_delete_provider_spec_remote = Some(name.clone());
+                            } else {
+                                view.providers.remove(name.as_str());
+                                selected_provider_name = view.providers.keys().next().cloned();
+                                *ctx.last_info = Some(
+                                    pick(
+                                        ctx.lang,
+                                        "已删除 provider（待保存）。",
+                                        "Provider deleted (save pending).",
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                        }
+                    });
+                });
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 120, 120),
+                    pick(
+                        ctx.lang,
+                        "当前附着目标还没有暴露 provider 结构 API；这里保持只读，避免误导为会写回本机文件。需要查看高级字段时请使用 Raw 视图。",
+                        "This attached target does not expose provider structure APIs yet; this section stays read-only to avoid implying local-file writes. Use Raw view for advanced fields.",
+                    ),
+                );
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.group(|ui| {
             ui.heading(pick(ctx.lang, "Profiles", "Profiles"));
             ui.label(pick(
                 ctx.lang,
@@ -7173,6 +7687,7 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         });
     }
 
+    ctx.view.config.selected_provider_name = selected_provider_name;
     ctx.view.config.selected_profile_name = selected_profile_name;
     ctx.view.config.new_profile_name = new_profile_name;
     ctx.view.config.station_editor.station_name = station_editor_name;
@@ -7181,6 +7696,13 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ctx.view.config.station_editor.level = station_editor_level.clamp(1, 10);
     ctx.view.config.station_editor.members = station_editor_members;
     ctx.view.config.station_editor.new_station_name = new_station_name;
+    ctx.view.config.provider_editor.provider_name = provider_editor_name;
+    ctx.view.config.provider_editor.alias = provider_editor_alias;
+    ctx.view.config.provider_editor.enabled = provider_editor_enabled;
+    ctx.view.config.provider_editor.auth_token_env = provider_editor_auth_token_env;
+    ctx.view.config.provider_editor.api_key_env = provider_editor_api_key_env;
+    ctx.view.config.provider_editor.endpoints = provider_editor_endpoints;
+    ctx.view.config.provider_editor.new_provider_name = new_provider_name;
     ctx.view.config.profile_editor.profile_name = profile_editor_name;
     ctx.view.config.profile_editor.station = profile_editor_station;
     ctx.view.config.profile_editor.model = profile_editor_model;
@@ -7390,6 +7912,63 @@ fn render_config_form_v2(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             Err(e) => {
                 *ctx.last_error = Some(format!(
                     "delete station structure via control plane failed: {e}"
+                ));
+            }
+        }
+    }
+
+    if let Some((provider_name, provider_spec)) = action_upsert_provider_spec_remote {
+        match ctx
+            .proxy
+            .upsert_persisted_provider_spec(ctx.rt, provider_name.clone(), provider_spec)
+        {
+            Ok(()) => {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                refresh_config_editor_from_disk_if_running(ctx);
+                ctx.view.config.selected_provider_name = Some(provider_name);
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "已写入 provider 结构并刷新代理。",
+                        "Provider structure saved and proxy refreshed.",
+                    )
+                    .to_string(),
+                );
+                *ctx.last_error = None;
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!(
+                    "save provider structure via control plane failed: {e}"
+                ));
+            }
+        }
+    }
+
+    if let Some(provider_name) = action_delete_provider_spec_remote {
+        match ctx
+            .proxy
+            .delete_persisted_provider_spec(ctx.rt, provider_name)
+        {
+            Ok(()) => {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                refresh_config_editor_from_disk_if_running(ctx);
+                ctx.view.config.selected_provider_name = None;
+                ctx.view.config.provider_editor = ConfigProviderEditorState::default();
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "已删除 provider 并刷新代理。",
+                        "Provider deleted and proxy refreshed.",
+                    )
+                    .to_string(),
+                );
+                *ctx.last_error = None;
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!(
+                    "delete provider structure via control plane failed: {e}"
                 ));
             }
         }
@@ -7672,6 +8251,177 @@ fn render_config_station_provider_summary(
                     );
                 }
                 ui.add_space(4.0);
+            }
+        });
+}
+
+fn config_provider_endpoint_editor_from_spec(
+    endpoint: &crate::config::PersistedProviderEndpointSpec,
+) -> ConfigProviderEndpointEditorState {
+    ConfigProviderEndpointEditorState {
+        name: endpoint.name.clone(),
+        base_url: endpoint.base_url.clone(),
+        enabled: endpoint.enabled,
+    }
+}
+
+fn build_provider_spec_from_config_editor(
+    provider_name: &str,
+    alias: &str,
+    enabled: bool,
+    auth_token_env: &str,
+    api_key_env: &str,
+    endpoints: &[ConfigProviderEndpointEditorState],
+) -> Result<PersistedProviderSpec, String> {
+    let provider_name = provider_name.trim();
+    if provider_name.is_empty() {
+        return Err("provider name is required".to_string());
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut spec_endpoints = Vec::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        let endpoint_name = endpoint.name.trim();
+        if endpoint_name.is_empty() {
+            return Err(format!("endpoint #{} name is required", index + 1));
+        }
+        if !seen.insert(endpoint_name.to_string()) {
+            return Err(format!("duplicate endpoint name: {endpoint_name}"));
+        }
+        let base_url = endpoint.base_url.trim();
+        if base_url.is_empty() {
+            return Err(format!("endpoint '{}' base_url is required", endpoint_name));
+        }
+        spec_endpoints.push(crate::config::PersistedProviderEndpointSpec {
+            name: endpoint_name.to_string(),
+            base_url: base_url.to_string(),
+            enabled: endpoint.enabled,
+        });
+    }
+
+    Ok(PersistedProviderSpec {
+        name: provider_name.to_string(),
+        alias: non_empty_trimmed(Some(alias)),
+        enabled,
+        auth_token_env: non_empty_trimmed(Some(auth_token_env)),
+        api_key_env: non_empty_trimmed(Some(api_key_env)),
+        endpoints: spec_endpoints,
+    })
+}
+
+fn merge_provider_spec_into_provider_config(
+    existing: Option<&ProviderConfigV2>,
+    provider: &PersistedProviderSpec,
+) -> ProviderConfigV2 {
+    let mut auth = existing
+        .map(|provider| provider.auth.clone())
+        .unwrap_or_default();
+    auth.auth_token_env = provider.auth_token_env.clone();
+    auth.api_key_env = provider.api_key_env.clone();
+
+    ProviderConfigV2 {
+        alias: provider.alias.clone(),
+        enabled: provider.enabled,
+        auth,
+        tags: existing
+            .map(|provider| provider.tags.clone())
+            .unwrap_or_default(),
+        supported_models: existing
+            .map(|provider| provider.supported_models.clone())
+            .unwrap_or_default(),
+        model_mapping: existing
+            .map(|provider| provider.model_mapping.clone())
+            .unwrap_or_default(),
+        endpoints: provider
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                let existing_endpoint =
+                    existing.and_then(|provider| provider.endpoints.get(endpoint.name.as_str()));
+                (
+                    endpoint.name.clone(),
+                    ProviderEndpointV2 {
+                        base_url: endpoint.base_url.clone(),
+                        enabled: endpoint.enabled,
+                        tags: existing_endpoint
+                            .map(|endpoint| endpoint.tags.clone())
+                            .unwrap_or_default(),
+                        supported_models: existing_endpoint
+                            .map(|endpoint| endpoint.supported_models.clone())
+                            .unwrap_or_default(),
+                        model_mapping: existing_endpoint
+                            .map(|endpoint| endpoint.model_mapping.clone())
+                            .unwrap_or_default(),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn render_config_provider_endpoint_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    selected_service: &str,
+    provider_name: &str,
+    endpoints: &mut Vec<ConfigProviderEndpointEditorState>,
+) {
+    if ui
+        .button(pick(lang, "新增 endpoint", "Add endpoint"))
+        .clicked()
+    {
+        endpoints.push(ConfigProviderEndpointEditorState {
+            enabled: true,
+            ..Default::default()
+        });
+    }
+
+    egui::ScrollArea::vertical()
+        .id_salt(format!(
+            "config_v2_provider_endpoints_edit_{selected_service}_{provider_name}"
+        ))
+        .max_height(180.0)
+        .show(ui, |ui| {
+            if endpoints.is_empty() {
+                ui.label(pick(
+                    lang,
+                    "(无 endpoint；可先保存空 provider，再逐步补地址)",
+                    "(no endpoints yet; you can save an empty provider first and fill URLs later)",
+                ));
+                return;
+            }
+
+            let mut delete_idx = None;
+            for (idx, endpoint) in endpoints.iter_mut().enumerate() {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("#{}", idx + 1));
+                        ui.checkbox(&mut endpoint.enabled, pick(lang, "启用", "Enabled"));
+                        if ui.button(pick(lang, "删除", "Delete")).clicked() {
+                            delete_idx = Some(idx);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("name");
+                        ui.add_sized(
+                            [180.0, 22.0],
+                            egui::TextEdit::singleline(&mut endpoint.name),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("base_url");
+                        ui.add_sized(
+                            [280.0, 22.0],
+                            egui::TextEdit::singleline(&mut endpoint.base_url)
+                                .hint_text("https://example.com/v1"),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
+            }
+
+            if let Some(idx) = delete_idx {
+                endpoints.remove(idx);
             }
         });
 }

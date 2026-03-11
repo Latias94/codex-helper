@@ -11,8 +11,9 @@ use tokio::task::JoinHandle;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::config::{
-    PersistedStationProviderRef, PersistedStationSpec, ProxyConfig, ResolvedRetryConfig,
-    RetryConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
+    PersistedProviderSpec, PersistedStationProviderRef, PersistedStationSpec, ProxyConfig,
+    ResolvedRetryConfig, RetryConfig, ServiceKind, load_or_bootstrap_for_service,
+    model_routing_warnings,
 };
 use crate::dashboard_core::{
     ApiV1Capabilities, ApiV1Snapshot, ConfigOption, ControlProfileOption,
@@ -100,6 +101,8 @@ pub struct AttachedStatus {
     pub configured_retry: Option<RetryConfig>,
     pub resolved_retry: Option<ResolvedRetryConfig>,
     pub supports_retry_config_api: bool,
+    pub persisted_providers: BTreeMap<String, PersistedProviderSpec>,
+    pub supports_provider_spec_api: bool,
     pub persisted_stations: BTreeMap<String, PersistedStationSpec>,
     pub persisted_station_providers: BTreeMap<String, PersistedStationProviderRef>,
     pub supports_station_spec_api: bool,
@@ -148,6 +151,8 @@ impl AttachedStatus {
             configured_retry: None,
             resolved_retry: None,
             supports_retry_config_api: false,
+            persisted_providers: BTreeMap::new(),
+            supports_provider_spec_api: false,
             persisted_stations: BTreeMap::new(),
             persisted_station_providers: BTreeMap::new(),
             supports_station_spec_api: false,
@@ -859,6 +864,8 @@ impl ProxyController {
                 configured_retry: Option<RetryConfig>,
                 resolved_retry: Option<ResolvedRetryConfig>,
                 supports_retry_config_api: bool,
+                persisted_providers: BTreeMap<String, PersistedProviderSpec>,
+                supports_provider_spec_api: bool,
                 persisted_stations: BTreeMap<String, PersistedStationSpec>,
                 persisted_station_providers: BTreeMap<String, PersistedStationProviderRef>,
                 supports_station_spec_api: bool,
@@ -903,6 +910,9 @@ impl ProxyController {
                     let supports_retry_config_api = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/retry/config");
+                    let supports_provider_spec_api = endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/providers/specs");
                     let supports_station_spec_api = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/stations/specs");
@@ -964,6 +974,17 @@ impl ProxyController {
                         get_json::<crate::config::PersistedStationsCatalog>(
                             client,
                             format!("{base}/__codex_helper/api/v1/stations/specs"),
+                            req_timeout,
+                        )
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    };
+                    let persisted_provider_catalog = if supports_provider_spec_api {
+                        get_json::<crate::config::PersistedProvidersCatalog>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/providers/specs"),
                             req_timeout,
                         )
                         .await
@@ -1046,6 +1067,18 @@ impl ProxyController {
                                 .as_ref()
                                 .map(|(_, resolved)| resolved.clone()),
                             supports_retry_config_api,
+                            persisted_providers: persisted_provider_catalog
+                                .as_ref()
+                                .map(|catalog| {
+                                    catalog
+                                        .providers
+                                        .iter()
+                                        .cloned()
+                                        .map(|provider| (provider.name.clone(), provider))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            supports_provider_spec_api,
                             persisted_stations: persisted_station_catalog
                                 .as_ref()
                                 .map(|catalog| {
@@ -1228,6 +1261,18 @@ impl ProxyController {
                             .map(|(_, resolved)| resolved.clone())
                             .or(runtime.retry),
                         supports_retry_config_api,
+                        persisted_providers: persisted_provider_catalog
+                            .as_ref()
+                            .map(|catalog| {
+                                catalog
+                                    .providers
+                                    .iter()
+                                    .cloned()
+                                    .map(|provider| (provider.name.clone(), provider))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        supports_provider_spec_api,
                         persisted_stations: persisted_station_catalog
                             .as_ref()
                             .map(|catalog| {
@@ -1318,6 +1363,8 @@ impl ProxyController {
                     configured_retry: None,
                     resolved_retry: runtime.retry,
                     supports_retry_config_api: false,
+                    persisted_providers: BTreeMap::new(),
+                    supports_provider_spec_api: false,
                     persisted_stations: BTreeMap::new(),
                     persisted_station_providers: BTreeMap::new(),
                     supports_station_spec_api: false,
@@ -1375,6 +1422,8 @@ impl ProxyController {
                     att.configured_retry = result.configured_retry;
                     att.resolved_retry = result.resolved_retry;
                     att.supports_retry_config_api = result.supports_retry_config_api;
+                    att.persisted_providers = result.persisted_providers;
+                    att.supports_provider_spec_api = result.supports_provider_spec_api;
                     att.persisted_stations = result.persisted_stations;
                     att.persisted_station_providers = result.persisted_station_providers;
                     att.supports_station_spec_api = result.supports_station_spec_api;
@@ -1980,6 +2029,96 @@ impl ProxyController {
                     .delete(format!(
                         "{base}/__codex_helper/api/v1/stations/specs/{}",
                         station_name.trim()
+                    ))
+                    .timeout(Duration::from_millis(1500)),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn upsert_persisted_provider_spec(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        provider_name: String,
+        provider: PersistedProviderSpec,
+    ) -> anyhow::Result<()> {
+        if provider_name.trim().is_empty() {
+            bail!("provider name is required");
+        }
+
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) || !att.supports_provider_spec_api {
+                    bail!(
+                        "attached proxy does not support persisted provider spec API (need api v1)"
+                    );
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .put(format!(
+                        "{base}/__codex_helper/api/v1/providers/specs/{}",
+                        provider_name.trim()
+                    ))
+                    .timeout(Duration::from_millis(1500))
+                    .json(&serde_json::json!({
+                        "alias": provider.alias,
+                        "enabled": provider.enabled,
+                        "auth_token_env": provider.auth_token_env,
+                        "api_key_env": provider.api_key_env,
+                        "endpoints": provider.endpoints,
+                    })),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_persisted_provider_spec(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        provider_name: String,
+    ) -> anyhow::Result<()> {
+        if provider_name.trim().is_empty() {
+            bail!("provider name is required");
+        }
+
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) || !att.supports_provider_spec_api {
+                    bail!(
+                        "attached proxy does not support persisted provider spec API (need api v1)"
+                    );
+                }
+                att.admin_base_url.clone()
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .delete(format!(
+                        "{base}/__codex_helper/api/v1/providers/specs/{}",
+                        provider_name.trim()
                     ))
                     .timeout(Duration::from_millis(1500)),
             )
@@ -3598,6 +3737,107 @@ mod tests {
                 .get("provider")
                 .and_then(|value| value.as_str()),
             Some("right")
+        );
+        assert_eq!(*delete_hits.lock().expect("delete hits lock"), 1);
+
+        handle.abort();
+    }
+
+    #[test]
+    fn attached_persisted_provider_spec_uses_v1_specs_endpoints() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let observed_put_payload = Arc::new(Mutex::new(None::<Value>));
+        let delete_hits = Arc::new(Mutex::new(0usize));
+        let app = Router::new().route(
+            "/__codex_helper/api/v1/providers/specs/right",
+            put({
+                let observed_put_payload = observed_put_payload.clone();
+                move |Json(payload): Json<Value>| {
+                    let observed_put_payload = observed_put_payload.clone();
+                    async move {
+                        *observed_put_payload
+                            .lock()
+                            .expect("provider spec payload lock") = Some(payload);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            })
+            .delete({
+                let delete_hits = delete_hits.clone();
+                move || {
+                    let delete_hits = delete_hits.clone();
+                    async move {
+                        *delete_hits.lock().expect("delete hits lock") += 1;
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4305, ServiceKind::Codex);
+        let mut attached = AttachedStatus::new(4305);
+        attached.api_version = Some(1);
+        attached.admin_base_url = base_url;
+        attached.supports_provider_spec_api = true;
+        controller.mode = ProxyMode::Attached(attached);
+
+        controller
+            .upsert_persisted_provider_spec(
+                &rt,
+                "right".to_string(),
+                PersistedProviderSpec {
+                    name: "right".to_string(),
+                    alias: Some("Right".to_string()),
+                    enabled: false,
+                    auth_token_env: Some("RIGHTCODE_API_KEY".to_string()),
+                    api_key_env: Some("RIGHTCODE_HEADER_KEY".to_string()),
+                    endpoints: vec![
+                        crate::config::PersistedProviderEndpointSpec {
+                            name: "hk".to_string(),
+                            base_url: "https://right-hk.example.com/v1".to_string(),
+                            enabled: true,
+                        },
+                        crate::config::PersistedProviderEndpointSpec {
+                            name: "us".to_string(),
+                            base_url: "https://right-us.example.com/v1".to_string(),
+                            enabled: false,
+                        },
+                    ],
+                },
+            )
+            .expect("upsert persisted provider spec");
+        controller
+            .delete_persisted_provider_spec(&rt, "right".to_string())
+            .expect("delete persisted provider spec");
+
+        let observed_put_payload = observed_put_payload
+            .lock()
+            .expect("provider spec payload lock")
+            .clone()
+            .expect("provider spec payload");
+        assert_eq!(
+            observed_put_payload.get("alias"),
+            Some(&Value::String("Right".to_string()))
+        );
+        assert_eq!(
+            observed_put_payload.get("enabled"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            observed_put_payload.get("auth_token_env"),
+            Some(&Value::String("RIGHTCODE_API_KEY".to_string()))
+        );
+        assert_eq!(
+            observed_put_payload.get("api_key_env"),
+            Some(&Value::String("RIGHTCODE_HEADER_KEY".to_string()))
+        );
+        assert_eq!(
+            observed_put_payload["endpoints"][0]
+                .get("name")
+                .and_then(|value| value.as_str()),
+            Some("hk")
         );
         assert_eq!(*delete_hits.lock().expect("delete hits lock"), 1);
 

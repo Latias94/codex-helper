@@ -92,6 +92,7 @@
 - [x] GUI-503 Extend proxy API to `/__codex_helper/api/v1/...` for full control
 - [~] GUI-504 Full attach via API v1 (Clash Verge style)
   - [x] Config actions: active/enabled/level
+  - [x] Provider structure: alias/enabled/auth env refs/endpoints CRUD
   - [x] Retry/failover: persisted retry profile + cooldown policy editor
   - [x] Overrides: session config/effort + global pinned
   - [x] Health checks: start/cancel + status
@@ -143,3 +144,4 @@
 - 2026-03-11: Stations page is now remote-first for persisted station controls too: runtime quick switch remains runtime-only, while configured `active_station` / `enabled` / `level` write through the current proxy when the target exposes station config APIs.
 - 2026-03-11: Added persisted retry/failover control-plane support to GUI: running/attached snapshots now carry configured+resolved retry policy, the Stations page can edit retry profile plus cooldown/backoff fields, and attach mode stays read-only when the remote proxy does not expose `/api/v1/retry/config`.
 - 2026-03-11: Config v2 station editor now supports structure-level station management too: local mode can add/delete/edit station alias+members in form view, and attached mode can do the same when the proxy exposes `/api/v1/stations/specs` without exposing provider secrets.
+- 2026-03-11: Config v2 provider editor now supports structure-level provider management: local mode can add/delete/edit alias, env auth refs, and endpoints while preserving advanced tags/model mappings; attached mode can do the same when the proxy exposes `/api/v1/providers/specs`, otherwise the section stays read-only.
