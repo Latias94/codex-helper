@@ -3173,7 +3173,10 @@ pub fn router(proxy: ProxyService) -> Router {
 
     #[derive(serde::Deserialize)]
     struct ConfigRuntimeMetaRequest {
-        config_name: String,
+        #[serde(default)]
+        config_name: Option<String>,
+        #[serde(default)]
+        station_name: Option<String>,
         #[serde(default)]
         enabled: Option<bool>,
         #[serde(default)]
@@ -3186,6 +3189,33 @@ pub fn router(proxy: ProxyService) -> Router {
         runtime_state: Option<RuntimeConfigState>,
         #[serde(default)]
         clear_runtime_state: bool,
+    }
+
+    impl ConfigRuntimeMetaRequest {
+        fn target_name(&self) -> Result<&str, (StatusCode, String)> {
+            let station_name = self
+                .station_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            let config_name = self
+                .config_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            match (station_name, config_name) {
+                (Some(station_name), Some(config_name)) if station_name != config_name => Err((
+                    StatusCode::BAD_REQUEST,
+                    "station_name and config_name must match when both are provided".to_string(),
+                )),
+                (Some(station_name), _) => Ok(station_name),
+                (_, Some(config_name)) => Ok(config_name),
+                _ => Err((
+                    StatusCode::BAD_REQUEST,
+                    "station_name or config_name is required".to_string(),
+                )),
+            }
+        }
     }
 
     #[derive(serde::Serialize)]
@@ -3417,12 +3447,7 @@ pub fn router(proxy: ProxyService) -> Router {
         proxy: ProxyService,
         Json(payload): Json<ConfigRuntimeMetaRequest>,
     ) -> Result<StatusCode, (StatusCode, String)> {
-        if payload.config_name.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "config_name is required".to_string(),
-            ));
-        }
+        let config_name = payload.target_name()?.to_string();
 
         if payload.enabled.is_none()
             && payload.level.is_none()
@@ -3442,10 +3467,10 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
-        if !mgr.configs.contains_key(payload.config_name.as_str()) {
+        if !mgr.configs.contains_key(config_name.as_str()) {
             return Err((
                 StatusCode::NOT_FOUND,
-                format!("config '{}' not found", payload.config_name),
+                format!("config '{}' not found", config_name),
             ));
         }
 
@@ -3453,31 +3478,26 @@ pub fn router(proxy: ProxyService) -> Router {
         if payload.clear_enabled {
             proxy
                 .state
-                .clear_config_enabled_override(proxy.service_name, payload.config_name.as_str())
+                .clear_config_enabled_override(proxy.service_name, config_name.as_str())
                 .await;
         } else if let Some(enabled) = payload.enabled {
             proxy
                 .state
-                .set_config_enabled_override(
-                    proxy.service_name,
-                    payload.config_name.clone(),
-                    enabled,
-                    now,
-                )
+                .set_config_enabled_override(proxy.service_name, config_name.clone(), enabled, now)
                 .await;
         }
 
         if payload.clear_level {
             proxy
                 .state
-                .clear_config_level_override(proxy.service_name, payload.config_name.as_str())
+                .clear_config_level_override(proxy.service_name, config_name.as_str())
                 .await;
         } else if let Some(level) = payload.level {
             proxy
                 .state
                 .set_config_level_override(
                     proxy.service_name,
-                    payload.config_name.clone(),
+                    config_name.clone(),
                     level.clamp(1, 10),
                     now,
                 )
@@ -3487,17 +3507,14 @@ pub fn router(proxy: ProxyService) -> Router {
         if payload.clear_runtime_state {
             proxy
                 .state
-                .clear_config_runtime_state_override(
-                    proxy.service_name,
-                    payload.config_name.as_str(),
-                )
+                .clear_config_runtime_state_override(proxy.service_name, config_name.as_str())
                 .await;
         } else if let Some(runtime_state) = payload.runtime_state {
             proxy
                 .state
                 .set_config_runtime_state_override(
                     proxy.service_name,
-                    payload.config_name.clone(),
+                    config_name.clone(),
                     runtime_state,
                     now,
                 )
@@ -3719,6 +3736,8 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/config/reload",
                 "/__codex_helper/api/v1/configs",
                 "/__codex_helper/api/v1/configs/runtime",
+                "/__codex_helper/api/v1/stations",
+                "/__codex_helper/api/v1/stations/runtime",
                 "/__codex_helper/api/v1/profiles",
                 "/__codex_helper/api/v1/profiles/default",
                 "/__codex_helper/api/v1/overrides/session/profile",
@@ -3764,6 +3783,7 @@ pub fn router(proxy: ProxyService) -> Router {
             &meta_overrides,
             &state_overrides,
         );
+        let stations = configs.clone();
         let default_profile =
             effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
 
@@ -3782,6 +3802,7 @@ pub fn router(proxy: ProxyService) -> Router {
             runtime_loaded_at_ms: Some(proxy.config.last_loaded_at_ms()),
             runtime_source_mtime_ms: proxy.config.last_mtime_ms().await,
             configs,
+            stations,
             default_profile: default_profile.clone(),
             profiles: list_profile_options_from_mgr(mgr, default_profile.as_deref()),
             snapshot,
@@ -3990,6 +4011,13 @@ pub fn router(proxy: ProxyService) -> Router {
         )))
     }
 
+    async fn list_stations(
+        proxy: ProxyService,
+    ) -> Result<Json<Vec<crate::dashboard_core::StationOption>>, (StatusCode, String)> {
+        let Json(configs) = list_configs(proxy).await?;
+        Ok(Json(configs))
+    }
+
     let admin_access = AdminAccessConfig::from_env();
 
     let p0 = proxy.clone();
@@ -4027,6 +4055,8 @@ pub fn router(proxy: ProxyService) -> Router {
     let p32 = proxy.clone();
     let p33 = proxy.clone();
     let p34 = proxy.clone();
+    let p35 = proxy.clone();
+    let p36 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -4077,6 +4107,14 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/configs/runtime",
             post(move |payload| apply_config_runtime_meta(p34.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/stations",
+            get(move || list_stations(p35.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/stations/runtime",
+            post(move |payload| apply_config_runtime_meta(p36.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/profiles",

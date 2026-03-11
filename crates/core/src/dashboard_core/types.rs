@@ -56,6 +56,8 @@ pub struct ConfigOption {
     pub capabilities: ConfigCapabilitySummary,
 }
 
+pub type StationOption = ConfigOption;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlProfileOption {
     pub name: String,

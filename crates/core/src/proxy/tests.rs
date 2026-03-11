@@ -242,6 +242,16 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations/runtime"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles/default"))
     }));
 
@@ -738,6 +748,11 @@ async fn proxy_api_v1_snapshot_works() {
         "should include snapshot object"
     );
     assert!(snap.get("configs").is_some(), "should include configs list");
+    assert!(
+        snap.get("stations").is_some(),
+        "should include stations list"
+    );
+    assert_eq!(snap.get("configs"), snap.get("stations"));
     assert_eq!(
         snap["snapshot"]["session_cards"][0]["effective_config_name"]["source"].as_str(),
         Some("session_override")
@@ -1454,6 +1469,91 @@ async fn proxy_runtime_config_state_override_controls_routing() {
     proxy_handle.abort();
     primary_handle.abort();
     backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_stations_alias_works() {
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::from([("provider_id".to_string(), "u1".to_string())]),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let stations = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/stations",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get stations send")
+        .error_for_status()
+        .expect("get stations status")
+        .json::<Vec<crate::dashboard_core::StationOption>>()
+        .await
+        .expect("get stations json");
+    let primary = stations
+        .iter()
+        .find(|station| station.name == "test")
+        .expect("test station");
+    assert!(primary.enabled);
+    assert_eq!(primary.runtime_enabled_override, None);
+
+    let set_disable = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/stations/runtime",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "station_name": "test",
+            "enabled": false,
+        }))
+        .send()
+        .await
+        .expect("disable station send");
+    assert_eq!(set_disable.status(), StatusCode::NO_CONTENT);
+
+    let stations = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/stations",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get stations after disable send")
+        .error_for_status()
+        .expect("get stations after disable status")
+        .json::<Vec<crate::dashboard_core::StationOption>>()
+        .await
+        .expect("get stations after disable json");
+    let primary = stations
+        .iter()
+        .find(|station| station.name == "test")
+        .expect("test station after disable");
+    assert!(!primary.enabled);
+    assert_eq!(primary.runtime_enabled_override, Some(false));
+
+    proxy_handle.abort();
 }
 
 #[tokio::test]

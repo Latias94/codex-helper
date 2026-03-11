@@ -93,6 +93,7 @@ pub struct AttachedStatus {
     pub runtime_source_mtime_ms: Option<u64>,
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
+    pub supports_station_api: bool,
 }
 
 impl AttachedStatus {
@@ -127,6 +128,7 @@ impl AttachedStatus {
             runtime_source_mtime_ms: None,
             supports_default_profile_override: false,
             supports_config_runtime_override: false,
+            supports_station_api: false,
         }
     }
 }
@@ -720,6 +722,7 @@ impl ProxyController {
                 runtime_source_mtime_ms: Option<u64>,
                 supports_default_profile_override: bool,
                 supports_config_runtime_override: bool,
+                supports_station_api: bool,
             }
 
             async fn refresh_from_base(
@@ -745,10 +748,14 @@ impl ProxyController {
                         .endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/profiles/default");
-                    let supports_config_runtime_override = caps
-                        .endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/configs/runtime");
+                    let supports_station_api = caps.endpoints.iter().any(|e| {
+                        e == "/__codex_helper/api/v1/stations"
+                            || e == "/__codex_helper/api/v1/stations/runtime"
+                    });
+                    let supports_config_runtime_override = caps.endpoints.iter().any(|e| {
+                        e == "/__codex_helper/api/v1/configs/runtime"
+                            || e == "/__codex_helper/api/v1/stations/runtime"
+                    });
 
                     if supports_snapshot {
                         let api = get_json::<ApiV1Snapshot>(
@@ -759,33 +766,50 @@ impl ProxyController {
                             req_timeout,
                         )
                         .await?;
+                        let ApiV1Snapshot {
+                            api_version,
+                            service_name,
+                            runtime_loaded_at_ms,
+                            runtime_source_mtime_ms,
+                            configs,
+                            stations,
+                            default_profile,
+                            profiles,
+                            snapshot,
+                        } = api;
+                        let configs = if stations.is_empty() {
+                            configs
+                        } else {
+                            stations
+                        };
 
                         return Ok(RefreshResult {
                             management_base_url: base.to_string(),
-                            api_version: Some(api.api_version),
-                            service_name: Some(api.service_name),
-                            active: api.snapshot.active,
-                            recent: api.snapshot.recent,
-                            session_cards: api.snapshot.session_cards,
-                            global_override: api.snapshot.global_override,
-                            default_profile: api.default_profile,
-                            profiles: api.profiles,
-                            session_model: api.snapshot.session_model_overrides,
-                            session_cfg: api.snapshot.session_config_overrides,
-                            session_effort: api.snapshot.session_effort_overrides,
-                            session_service_tier: api.snapshot.session_service_tier_overrides,
-                            session_stats: api.snapshot.session_stats,
-                            configs: api.configs,
-                            config_health: api.snapshot.config_health,
-                            health_checks: api.snapshot.health_checks,
-                            usage_rollup: api.snapshot.usage_rollup,
-                            stats_5m: api.snapshot.stats_5m,
-                            stats_1h: api.snapshot.stats_1h,
-                            lb_view: api.snapshot.lb_view,
-                            runtime_loaded_at_ms: api.runtime_loaded_at_ms,
-                            runtime_source_mtime_ms: api.runtime_source_mtime_ms,
+                            api_version: Some(api_version),
+                            service_name: Some(service_name),
+                            active: snapshot.active,
+                            recent: snapshot.recent,
+                            session_cards: snapshot.session_cards,
+                            global_override: snapshot.global_override,
+                            default_profile,
+                            profiles,
+                            session_model: snapshot.session_model_overrides,
+                            session_cfg: snapshot.session_config_overrides,
+                            session_effort: snapshot.session_effort_overrides,
+                            session_service_tier: snapshot.session_service_tier_overrides,
+                            session_stats: snapshot.session_stats,
+                            configs,
+                            config_health: snapshot.config_health,
+                            health_checks: snapshot.health_checks,
+                            usage_rollup: snapshot.usage_rollup,
+                            stats_5m: snapshot.stats_5m,
+                            stats_1h: snapshot.stats_1h,
+                            lb_view: snapshot.lb_view,
+                            runtime_loaded_at_ms,
+                            runtime_source_mtime_ms,
                             supports_default_profile_override,
                             supports_config_runtime_override,
+                            supports_station_api,
                         });
                     }
 
@@ -838,7 +862,11 @@ impl ProxyController {
                         ),
                         get_json::<Vec<ConfigOption>>(
                             client,
-                            format!("{base}/__codex_helper/api/v1/configs"),
+                            if supports_station_api {
+                                format!("{base}/__codex_helper/api/v1/stations")
+                            } else {
+                                format!("{base}/__codex_helper/api/v1/configs")
+                            },
                             req_timeout,
                         ),
                         get_json::<HashMap<String, ConfigHealth>>(
@@ -941,6 +969,7 @@ impl ProxyController {
                         runtime_source_mtime_ms: runtime.source_mtime_ms,
                         supports_default_profile_override,
                         supports_config_runtime_override,
+                        supports_station_api,
                     });
                 }
 
@@ -997,6 +1026,7 @@ impl ProxyController {
                     runtime_source_mtime_ms: runtime.source_mtime_ms,
                     supports_default_profile_override: false,
                     supports_config_runtime_override: false,
+                    supports_station_api: false,
                 })
             }
 
@@ -1041,6 +1071,7 @@ impl ProxyController {
                     att.supports_default_profile_override =
                         result.supports_default_profile_override;
                     att.supports_config_runtime_override = result.supports_config_runtime_override;
+                    att.supports_station_api = result.supports_station_api;
                 }
             }
             Err(e) => {
@@ -1412,22 +1443,46 @@ impl ProxyController {
                 }
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
+                let use_station_api = att.supports_station_api;
                 let fut = async move {
                     let clear_enabled = matches!(enabled, Some(None));
                     let clear_level = matches!(level, Some(None));
                     let clear_runtime_state = matches!(runtime_state, Some(None));
+                    let mut body = serde_json::Map::new();
+                    body.insert(
+                        if use_station_api {
+                            "station_name".to_string()
+                        } else {
+                            "config_name".to_string()
+                        },
+                        serde_json::Value::String(config_name),
+                    );
+                    body.insert("enabled".to_string(), serde_json::json!(enabled.flatten()));
+                    body.insert("level".to_string(), serde_json::json!(level.flatten()));
+                    body.insert(
+                        "clear_enabled".to_string(),
+                        serde_json::json!(clear_enabled),
+                    );
+                    body.insert("clear_level".to_string(), serde_json::json!(clear_level));
+                    body.insert(
+                        "runtime_state".to_string(),
+                        serde_json::json!(runtime_state.flatten()),
+                    );
+                    body.insert(
+                        "clear_runtime_state".to_string(),
+                        serde_json::json!(clear_runtime_state),
+                    );
                     client
-                        .post(format!("{base}/__codex_helper/api/v1/configs/runtime"))
+                        .post(format!(
+                            "{base}{}",
+                            if use_station_api {
+                                "/__codex_helper/api/v1/stations/runtime"
+                            } else {
+                                "/__codex_helper/api/v1/configs/runtime"
+                            }
+                        ))
                         .timeout(Duration::from_millis(1200))
-                        .json(&serde_json::json!({
-                            "config_name": config_name,
-                            "enabled": enabled.flatten(),
-                            "level": level.flatten(),
-                            "clear_enabled": clear_enabled,
-                            "clear_level": clear_level,
-                            "runtime_state": runtime_state.flatten(),
-                            "clear_runtime_state": clear_runtime_state,
-                        }))
+                        .json(&serde_json::Value::Object(body))
                         .send()
                         .await?
                         .error_for_status()?;

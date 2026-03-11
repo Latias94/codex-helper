@@ -87,7 +87,10 @@
 ## WS4 - Station Registry and HA
 
 - [x] CP-400 Add runtime station metadata overrides for `enabled` / `level`
-- [ ] CP-401 Introduce explicit `Station` runtime model
+- [~] CP-401 Introduce explicit `Station` runtime model
+  - [x] add explicit `/api/v1/stations` and `/api/v1/stations/runtime` aliases
+  - [x] prefer station API in attach mode with legacy `configs` fallback
+  - [ ] rename internal runtime/public UI model from `config` to `station`
 - [x] CP-402 Add capability summary per station:
   - [x] supported models
   - [x] fast/service tier support

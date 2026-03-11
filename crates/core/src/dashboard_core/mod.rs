@@ -7,6 +7,6 @@ pub use config_options::build_config_options_from_mgr;
 pub use snapshot::{ApiV1Snapshot, build_dashboard_snapshot};
 pub use types::{
     CapabilitySupport, ConfigCapabilitySummary, ConfigOption, ControlProfileOption,
-    ModelCatalogKind,
+    ModelCatalogKind, StationOption,
 };
 pub use window_stats::WindowStats;
