@@ -1,6 +1,8 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
 
+pub(super) const ROUTING_MISMATCH_CAPABILITY_CLASS: &str = "routing_mismatch_capability";
+
 fn header_value_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -80,6 +82,50 @@ fn extract_error_type(v: &Value) -> Option<String> {
     None
 }
 
+pub(super) fn class_is_health_neutral(class: Option<&str>) -> bool {
+    matches!(class, Some(ROUTING_MISMATCH_CAPABILITY_CLASS))
+}
+
+fn capability_message_indicates_mismatch(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+
+    let model_mismatch = m.contains("model")
+        && (m.contains("not supported")
+            || m.contains("unsupported")
+            || m.contains("does not support")
+            || m.contains("not available")
+            || m.contains("unavailable")
+            || m.contains("does not exist")
+            || m.contains("do not have access")
+            || m.contains("no access"));
+
+    let service_tier_mismatch = (m.contains("service_tier") || m.contains("service tier"))
+        && (m.contains("not supported")
+            || m.contains("unsupported")
+            || m.contains("does not support")
+            || m.contains("not available")
+            || m.contains("unavailable"));
+
+    let reasoning_mismatch = (m.contains("reasoning")
+        || m.contains("reasoning_effort")
+        || m.contains("reasoning.effort"))
+        && (m.contains("not supported")
+            || m.contains("unsupported")
+            || m.contains("does not support")
+            || m.contains("not available")
+            || m.contains("unavailable"));
+
+    model_mismatch || service_tier_mismatch || reasoning_mismatch
+}
+
+fn capability_type_indicates_mismatch(error_type: &str) -> bool {
+    let t = error_type.to_ascii_lowercase();
+    t.contains("unsupported_model")
+        || t.contains("model_not_found")
+        || t.contains("unsupported_value")
+        || t.contains("unsupported_parameter")
+}
+
 pub(super) fn classify_upstream_response(
     status_code: u16,
     headers: &HeaderMap,
@@ -111,6 +157,46 @@ pub(super) fn classify_upstream_response(
             ),
             cf_ray,
         );
+    }
+
+    if matches!(status_code, 400 | 404 | 409 | 422) && !body.is_empty() {
+        if looks_like_json(headers)
+            && let Ok(v) = serde_json::from_slice::<Value>(body)
+        {
+            let msg = extract_error_message(&v);
+            let err_type = extract_error_type(&v);
+            if msg
+                .as_deref()
+                .is_some_and(capability_message_indicates_mismatch)
+                || err_type
+                    .as_deref()
+                    .is_some_and(capability_type_indicates_mismatch)
+                    && msg
+                        .as_deref()
+                        .is_some_and(capability_message_indicates_mismatch)
+            {
+                return (
+                    Some(ROUTING_MISMATCH_CAPABILITY_CLASS.to_string()),
+                    Some(
+                        "检测到模型/fast/service-tier/reasoning 能力不匹配；这属于路由兼容性问题，不应计入上游健康惩罚。"
+                            .to_string(),
+                    ),
+                    cf_ray,
+                );
+            }
+        } else {
+            let text = String::from_utf8_lossy(body);
+            if capability_message_indicates_mismatch(text.as_ref()) {
+                return (
+                    Some(ROUTING_MISMATCH_CAPABILITY_CLASS.to_string()),
+                    Some(
+                        "检测到模型/fast/service-tier/reasoning 能力不匹配；这属于路由兼容性问题，不应计入上游健康惩罚。"
+                            .to_string(),
+                    ),
+                    cf_ray,
+                );
+            }
+        }
     }
 
     // Be conservative for 4xx classification: we only mark a subset of obvious client-side mistakes

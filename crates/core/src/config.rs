@@ -583,7 +583,10 @@ impl RetryProfileName {
                     backoff_max_ms: 0,
                     jitter_ms: 0,
                     on_status: "401,403,404,408,429,500-599,524".to_string(),
-                    on_class: vec!["upstream_transport_error".to_string()],
+                    on_class: vec![
+                        "upstream_transport_error".to_string(),
+                        "routing_mismatch_capability".to_string(),
+                    ],
                     strategy: RetryStrategy::Failover,
                 },
                 never_on_status: "413,415,422".to_string(),
@@ -625,7 +628,10 @@ impl RetryProfileName {
                     backoff_max_ms: 0,
                     jitter_ms: 0,
                     on_status: "401,403,404,408,429,500-599,524".to_string(),
-                    on_class: vec!["upstream_transport_error".to_string()],
+                    on_class: vec![
+                        "upstream_transport_error".to_string(),
+                        "routing_mismatch_capability".to_string(),
+                    ],
                     strategy: RetryStrategy::Failover,
                 },
                 ..RetryProfileName::Balanced.defaults()
@@ -2330,6 +2336,13 @@ env_key = "RIGHTCODE_API_KEY"
             resolved.provider.on_status,
             "401,403,404,408,429,500-599,524"
         );
+        assert!(
+            resolved
+                .provider
+                .on_class
+                .iter()
+                .any(|c| c == "routing_mismatch_capability")
+        );
         assert_eq!(resolved.never_on_status, "413,415,422");
         assert!(
             resolved
@@ -2369,6 +2382,13 @@ env_key = "RIGHTCODE_API_KEY"
         assert_eq!(
             resolved.provider.on_status,
             "401,403,404,408,429,500-599,524"
+        );
+        assert!(
+            resolved
+                .provider
+                .on_class
+                .iter()
+                .any(|c| c == "routing_mismatch_capability")
         );
         assert_eq!(resolved.never_on_status, "413,415,422");
         assert!(

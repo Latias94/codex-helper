@@ -103,7 +103,7 @@
 - [ ] CP-406 Add circuit breaker thresholds and cooldowns
 - [ ] CP-407 Add same-station upstream failover rules
 - [ ] CP-408 Add cross-station failover rules before first output
-- [ ] CP-409 Ensure unsupported model/capability mismatch does not poison health state
+- [x] CP-409 Ensure unsupported model/capability mismatch does not poison health state
 
 ## WS5 - LAN-shared Product Shape
 

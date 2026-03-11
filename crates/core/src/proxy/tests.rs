@@ -522,6 +522,135 @@ async fn proxy_rejects_incompatible_profile_station_capabilities() {
 }
 
 #[tokio::test]
+async fn proxy_capability_mismatch_fails_over_without_poisoning_health() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+
+    let primary_hits_for_route = primary_hits.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_hits = primary_hits_for_route.clone();
+            async move {
+                primary_hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "unsupported_value",
+                            "message": "service_tier 'priority' is not supported by this provider"
+                        }
+                    })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_hits_for_route = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_hits = backup_hits_for_route.clone();
+            async move {
+                backup_hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "upstream": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let mut mgr = ServiceConfigManager {
+        active: Some("primary".to_string()),
+        ..Default::default()
+    };
+    mgr.configs.insert(
+        "primary".to_string(),
+        ServiceConfig {
+            name: "primary".to_string(),
+            alias: None,
+            enabled: true,
+            level: 1,
+            upstreams: vec![UpstreamConfig {
+                base_url: format!("http://{}/v1", primary_addr),
+                auth: UpstreamAuth::default(),
+                tags: HashMap::from([("provider_id".to_string(), "primary".to_string())]),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        },
+    );
+    mgr.configs.insert(
+        "backup".to_string(),
+        ServiceConfig {
+            name: "backup".to_string(),
+            alias: None,
+            enabled: true,
+            level: 2,
+            upstreams: vec![UpstreamConfig {
+                base_url: format!("http://{}/v1", backup_addr),
+                auth: UpstreamAuth::default(),
+                tags: HashMap::from([("provider_id".to_string(), "backup".to_string())]),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        },
+    );
+    let cfg = ProxyConfig {
+        version: Some(1),
+        codex: mgr,
+        claude: ServiceConfigManager::default(),
+        retry: RetryConfig::default(),
+        notify: Default::default(),
+        default_service: None,
+        ui: UiConfig::default(),
+    };
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let proxy_for_state = proxy.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .body(r#"{"input":"hi","service_tier":"priority"}"#)
+        .send()
+        .await
+        .expect("send capability mismatch request")
+        .error_for_status()
+        .expect("capability mismatch final status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("capability mismatch final json");
+    assert_eq!(
+        resp.get("upstream").and_then(|v| v.as_str()),
+        Some("backup")
+    );
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    let lb_view = proxy_for_state.state.get_lb_view().await;
+    let primary_lb = lb_view.get("primary").expect("primary lb view");
+    assert_eq!(primary_lb.upstreams.len(), 1);
+    assert_eq!(primary_lb.upstreams[0].failure_count, 0);
+    assert_eq!(primary_lb.upstreams[0].cooldown_remaining_secs, None);
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_api_v1_snapshot_works() {
     let cfg = make_proxy_config(
         vec![UpstreamConfig {

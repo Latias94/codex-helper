@@ -34,7 +34,7 @@ use crate::model_routing;
 use crate::state::{ActiveRequest, FinishedRequest, ProxyState, RuntimeConfigState};
 use crate::usage::extract_usage_from_bytes;
 
-use self::classify::classify_upstream_response;
+use self::classify::{class_is_health_neutral, classify_upstream_response};
 use self::retry::{
     backoff_sleep, retry_info_for_chain, retry_plan, retry_sleep, should_never_retry,
     should_retry_class, should_retry_status,
@@ -1820,12 +1820,14 @@ pub async fn handle_proxy(
                 }
 
                 if never_retry {
-                    lb.record_result_with_backoff(
-                        selected.index,
-                        false,
-                        crate::lb::COOLDOWN_SECS,
-                        cooldown_backoff,
-                    );
+                    if !class_is_health_neutral(cls.as_deref()) {
+                        lb.record_result_with_backoff(
+                            selected.index,
+                            false,
+                            crate::lb::COOLDOWN_SECS,
+                            cooldown_backoff,
+                        );
+                    }
 
                     let retry = retry_info_for_chain(&upstream_chain);
                     let retry_for_log = retry.clone();
@@ -1880,12 +1882,14 @@ pub async fn handle_proxy(
                 let provider_retryable = should_retry_status(provider_opt, status_code)
                     || should_retry_class(provider_opt, cls.as_deref());
                 if provider_retryable {
-                    lb.penalize_with_backoff(
-                        selected.index,
-                        plan.transport_cooldown_secs,
-                        &format!("status_{}", status_code),
-                        cooldown_backoff,
-                    );
+                    if !class_is_health_neutral(cls.as_deref()) {
+                        lb.penalize_with_backoff(
+                            selected.index,
+                            plan.transport_cooldown_secs,
+                            &format!("status_{}", status_code),
+                            cooldown_backoff,
+                        );
+                    }
                     last_err = Some((status, String::from_utf8_lossy(bytes.as_ref()).to_string()));
 
                     if avoid_set.insert(selected.index) {
@@ -2740,6 +2744,7 @@ pub async fn handle_proxy(
                 if !success
                     && attempt_index + 1 >= retry_opt.max_attempts
                     && !never_retry
+                    && !class_is_health_neutral(cls.as_deref())
                     && (should_retry_status(&retry_opt, status_code)
                         || should_retry_class(&retry_opt, cls.as_deref()))
                 {
@@ -2831,7 +2836,9 @@ pub async fn handle_proxy(
                     );
                     if retry_failover {
                         // Treat retryable 5xx / WAF-like responses as upstream failures for LB tracking.
-                        if status_code >= 500 || cls.is_some() {
+                        if (status_code >= 500 || cls.is_some())
+                            && !class_is_health_neutral(cls.as_deref())
+                        {
                             lb.record_result_with_backoff(
                                 selected.index,
                                 false,
@@ -2839,26 +2846,28 @@ pub async fn handle_proxy(
                                 cooldown_backoff,
                             );
                         }
-                        match cls.as_deref() {
-                            Some("cloudflare_challenge") => lb.penalize_with_backoff(
-                                selected.index,
-                                retry_opt.cloudflare_challenge_cooldown_secs,
-                                "cloudflare_challenge",
-                                cooldown_backoff,
-                            ),
-                            Some("cloudflare_timeout") => lb.penalize_with_backoff(
-                                selected.index,
-                                retry_opt.cloudflare_timeout_cooldown_secs,
-                                "cloudflare_timeout",
-                                cooldown_backoff,
-                            ),
-                            _ if status_code >= 400 => lb.penalize_with_backoff(
-                                selected.index,
-                                retry_opt.transport_cooldown_secs,
-                                &format!("status_{}", status_code),
-                                cooldown_backoff,
-                            ),
-                            _ => {}
+                        if !class_is_health_neutral(cls.as_deref()) {
+                            match cls.as_deref() {
+                                Some("cloudflare_challenge") => lb.penalize_with_backoff(
+                                    selected.index,
+                                    retry_opt.cloudflare_challenge_cooldown_secs,
+                                    "cloudflare_challenge",
+                                    cooldown_backoff,
+                                ),
+                                Some("cloudflare_timeout") => lb.penalize_with_backoff(
+                                    selected.index,
+                                    retry_opt.cloudflare_timeout_cooldown_secs,
+                                    "cloudflare_timeout",
+                                    cooldown_backoff,
+                                ),
+                                _ if status_code >= 400 => lb.penalize_with_backoff(
+                                    selected.index,
+                                    retry_opt.transport_cooldown_secs,
+                                    &format!("status_{}", status_code),
+                                    cooldown_backoff,
+                                ),
+                                _ => {}
+                            }
                         }
                         avoid
                             .entry(selected.config_name.clone())
@@ -2884,7 +2893,9 @@ pub async fn handle_proxy(
                         crate::lb::COOLDOWN_SECS,
                         cooldown_backoff,
                     );
-                } else if status_code >= 500 || cls.is_some() {
+                } else if (status_code >= 500 || cls.is_some())
+                    && !class_is_health_neutral(cls.as_deref())
+                {
                     lb.record_result_with_backoff(
                         selected.index,
                         false,
