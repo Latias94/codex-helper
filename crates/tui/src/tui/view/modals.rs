@@ -638,8 +638,10 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from("  ↑/↓, j/k   移动选中项"),
-            Line::from("  1-7        切换页面"),
-            Line::from("            1 总览  2 配置  3 会话  4 请求  5 统计  6 设置  7 历史"),
+            Line::from("  1-8        切换页面"),
+            Line::from(
+                "            1 总览  2 配置  3 会话  4 请求  5 统计  6 设置  7 历史  8 最近",
+            ),
             Line::from("  L          切换语言（中/英，自动落盘）"),
             Line::from("  Tab        切换焦点（总览页）"),
             Line::from("  6 设置     查看运行态与关键配置入口"),
@@ -679,6 +681,8 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             )]),
             Line::from("  e          仅看错误（errors-only）"),
             Line::from("  s          scope：全部 vs 当前会话"),
+            Line::from("  x          清除显式 session 聚焦"),
+            Line::from("  o/h        打开到 Sessions / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "会话页（Sessions）",
@@ -689,6 +693,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  v          仅看覆盖（overrides-only）"),
             Line::from("  r          重置筛选"),
             Line::from("  t          对话记录（全屏）"),
+            Line::from("  o/h        打开到 Requests / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "历史页（History）",
@@ -696,6 +701,16 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             )]),
             Line::from("  r          刷新历史会话列表"),
             Line::from("  t/Enter    打开对话记录（全屏）"),
+            Line::from("  s/f        打开到 Sessions / Requests"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "最近页（Recent）",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  [ / ]      切换时间窗口"),
+            Line::from("  Enter / y  复制选中 / 复制可见列表"),
+            Line::from("  t          打开对话记录（全屏）"),
+            Line::from("  s/f/h      打开到 Sessions / Requests / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "统计页（Stats）",
@@ -721,9 +736,9 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             )]),
             Line::from("  Tab        switch focus (Dashboard)"),
             Line::from("  ↑/↓, j/k   move selection"),
-            Line::from("  1-7        switch page"),
+            Line::from("  1-8        switch page"),
             Line::from(
-                "            1 Dashboard  2 Configs  3 Sessions  4 Requests  5 Stats  6 Settings  7 History",
+                "            1 Dashboard  2 Configs  3 Sessions  4 Requests  5 Stats  6 Settings  7 History  8 Recent",
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
             Line::from("  6 Settings show runtime + config overview"),
@@ -763,6 +778,8 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             )]),
             Line::from("  e          toggle errors-only filter"),
             Line::from("  s          toggle scope (all vs selected session)"),
+            Line::from("  x          clear explicit session focus"),
+            Line::from("  o/h        open in Sessions / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Sessions page",
@@ -773,6 +790,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  v          toggle overrides-only"),
             Line::from("  r          reset filters"),
             Line::from("  t          transcript (full-screen)"),
+            Line::from("  o/h        open in Requests / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "History page",
@@ -780,6 +798,16 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             )]),
             Line::from("  r          refresh history session list"),
             Line::from("  t/Enter    open transcript (full-screen)"),
+            Line::from("  s/f        open in Sessions / Requests"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Recent page",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  [ / ]      switch time window"),
+            Line::from("  Enter / y  copy selected / copy visible list"),
+            Line::from("  t          open transcript (full-screen)"),
+            Line::from("  s/f/h      open in Sessions / Requests / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Stats page",

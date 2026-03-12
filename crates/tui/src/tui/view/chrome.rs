@@ -273,13 +273,13 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Requests => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  x 清除聚焦  o 打开到 Sessions  h 打开到 History  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  x clear focus  o open Sessions  h open History  ? help",
             ),
             Page::Sessions => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  t transcript  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  o 打开到 Requests  h 打开到 History  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  t transcript  o open Requests  h open History  ? help",
             ),
             Page::Stats => crate::tui::i18n::pick(
                 ui.language,
@@ -301,13 +301,13 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::History => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r 刷新  t/Enter 对话记录  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  r refresh  t/Enter transcript  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r 刷新  t/Enter 对话记录  s 打开到 Sessions  f 打开到 Requests  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  r refresh  t/Enter transcript  s open Sessions  f open Requests  ? help",
             ),
             Page::Recent => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  [] 切换时间  r 刷新  Enter 复制选中  y 复制全部(可见)  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  [] window  r refresh  Enter copy selected  y copy all(visible)  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  [] 切换时间  r 刷新  Enter 复制选中  y 复制全部(可见)  t transcript  s/f/h 跳转  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  [] window  r refresh  Enter copy selected  y copy all(visible)  t transcript  s/f/h navigate  ? help",
             ),
         },
         Overlay::Help => crate::tui::i18n::pick(
