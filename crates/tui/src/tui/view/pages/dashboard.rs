@@ -8,8 +8,9 @@ use ratatui::widgets::{
 
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, now_ms, session_row_has_any_override, short_sid,
-    shorten, shorten_middle, status_style, tokens_short, usage_line,
+    Palette, Snapshot, basename, format_age, now_ms, session_control_posture,
+    session_row_has_any_override, short_sid, shorten, shorten_middle, status_style, tokens_short,
+    usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -186,7 +187,7 @@ fn render_details_and_requests(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .constraints([Constraint::Length(11), Constraint::Min(0)])
         .split(area);
 
     render_session_details(f, p, ui, snapshot, chunks[0]);
@@ -220,6 +221,9 @@ fn render_session_details(
         .unwrap_or("-");
     let override_service_tier = selected
         .and_then(|r| r.override_service_tier.as_deref())
+        .unwrap_or("-");
+    let binding = selected
+        .and_then(|r| r.binding_profile_name.as_deref())
         .unwrap_or("-");
     let model = selected
         .and_then(|r| r.last_model.as_deref())
@@ -261,6 +265,8 @@ fn render_session_details(
         .filter(|u| u.total_tokens > 0)
         .map(usage_line)
         .unwrap_or_else(|| "tok in/out/rsn/ttl: -".to_string());
+    let posture =
+        selected.map(|row| session_control_posture(row, snapshot.global_override.as_deref()));
 
     let lines = vec![
         kv_line(
@@ -270,6 +276,24 @@ fn render_session_details(
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ),
         kv_line(p, "cwd", cwd, Style::default().fg(p.text)),
+        kv_line(
+            p,
+            "binding",
+            binding.to_string(),
+            Style::default().fg(if binding == "-" { p.muted } else { p.text }),
+        ),
+        kv_line(
+            p,
+            "control",
+            posture
+                .as_ref()
+                .map(|posture| posture.headline.clone())
+                .unwrap_or_else(|| "-".to_string()),
+            Style::default().fg(posture
+                .as_ref()
+                .map(|posture| posture.color)
+                .unwrap_or(p.muted)),
+        ),
         kv_line(p, "model", model.to_string(), Style::default().fg(p.text)),
         kv_line(
             p,
@@ -351,7 +375,12 @@ fn render_requests_panel(
 ) {
     let focused = ui.focus == Focus::Requests && ui.overlay == Overlay::None;
     let title = Span::styled(
-        "Requests",
+        snapshot
+            .rows
+            .get(ui.selected_session_idx)
+            .and_then(|r| r.session_id.as_deref())
+            .map(|sid| format!("Requests [{}]", short_sid(sid, 12)))
+            .unwrap_or_else(|| "Requests".to_string()),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     );
     let block = Block::default()

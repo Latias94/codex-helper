@@ -2,7 +2,9 @@ use ratatui::widgets::{ListState, TableState};
 
 use crate::config::ResolvedRetryConfig;
 use crate::proxy::admin_port_for_proxy_port;
-use crate::sessions::{SessionMeta, SessionSummary, SessionTranscriptMessage};
+use crate::sessions::{
+    SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
+};
 use std::collections::HashMap;
 
 use super::Language;
@@ -16,6 +18,19 @@ pub(in crate::tui) struct RecentCodexRow {
     pub(in crate::tui) session_id: String,
     pub(in crate::tui) cwd: Option<String>,
     pub(in crate::tui) mtime_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum CodexHistoryExternalFocusOrigin {
+    Sessions,
+    Requests,
+    Recent,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::tui) struct CodexHistoryExternalFocus {
+    pub(in crate::tui) summary: SessionSummary,
+    pub(in crate::tui) origin: CodexHistoryExternalFocusOrigin,
 }
 
 #[derive(Debug)]
@@ -32,6 +47,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_session_id: Option<String>,
     pub(in crate::tui) selected_request_idx: usize,
     pub(in crate::tui) selected_request_page_idx: usize,
+    pub(in crate::tui) focused_request_session_id: Option<String>,
     pub(in crate::tui) request_page_errors_only: bool,
     pub(in crate::tui) request_page_scope_session: bool,
     pub(in crate::tui) selected_sessions_page_idx: usize,
@@ -52,6 +68,8 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) codex_history_loaded_at_ms: Option<u64>,
     pub(in crate::tui) needs_codex_history_refresh: bool,
     pub(in crate::tui) selected_codex_history_idx: usize,
+    pub(in crate::tui) selected_codex_history_id: Option<String>,
+    pub(in crate::tui) codex_history_external_focus: Option<CodexHistoryExternalFocus>,
     pub(in crate::tui) codex_recent_rows: Vec<RecentCodexRow>,
     pub(in crate::tui) codex_recent_error: Option<String>,
     pub(in crate::tui) codex_recent_loaded_at_ms: Option<u64>,
@@ -102,6 +120,7 @@ impl Default for UiState {
             selected_session_id: None,
             selected_request_idx: 0,
             selected_request_page_idx: 0,
+            focused_request_session_id: None,
             request_page_errors_only: false,
             request_page_scope_session: false,
             selected_sessions_page_idx: 0,
@@ -122,6 +141,8 @@ impl Default for UiState {
             codex_history_loaded_at_ms: None,
             needs_codex_history_refresh: false,
             selected_codex_history_idx: 0,
+            selected_codex_history_id: None,
+            codex_history_external_focus: None,
             codex_recent_rows: Vec::new(),
             codex_recent_error: None,
             codex_recent_loaded_at_ms: None,
@@ -224,6 +245,64 @@ impl UiState {
                 .select(Some(self.selected_stats_provider_idx));
         }
     }
+
+    pub(in crate::tui) fn sync_codex_history_selection(&mut self) {
+        let len = self.codex_history_sessions.len();
+        let selected_idx = self
+            .selected_codex_history_id
+            .as_deref()
+            .and_then(|sid| {
+                self.codex_history_sessions
+                    .iter()
+                    .position(|summary| summary.id == sid)
+            })
+            .unwrap_or(self.selected_codex_history_idx.min(len.saturating_sub(1)));
+
+        self.selected_codex_history_idx = selected_idx;
+        self.selected_codex_history_id = self
+            .codex_history_sessions
+            .get(self.selected_codex_history_idx)
+            .map(|summary| summary.id.clone());
+        self.codex_history_table
+            .select(if self.codex_history_sessions.is_empty() {
+                None
+            } else {
+                Some(self.selected_codex_history_idx)
+            });
+    }
+
+    pub(in crate::tui) fn prepare_codex_history_external_focus(
+        &mut self,
+        summary: SessionSummary,
+        origin: CodexHistoryExternalFocusOrigin,
+    ) {
+        let sid = summary.id.clone();
+        self.codex_history_external_focus = Some(CodexHistoryExternalFocus { summary, origin });
+        if let Some(focus) = self.codex_history_external_focus.as_ref() {
+            merge_codex_history_external_focus(&mut self.codex_history_sessions, focus);
+        }
+        self.selected_codex_history_idx = 0;
+        self.selected_codex_history_id = Some(sid);
+        self.sync_codex_history_selection();
+    }
+}
+
+pub(in crate::tui) fn merge_codex_history_external_focus(
+    list: &mut Vec<SessionSummary>,
+    focus: &CodexHistoryExternalFocus,
+) {
+    let merged = list
+        .iter()
+        .find(|summary| {
+            summary.id == focus.summary.id
+                && (!summary.path.as_os_str().is_empty()
+                    || summary.source == SessionSummarySource::LocalFile)
+        })
+        .cloned()
+        .unwrap_or_else(|| focus.summary.clone());
+
+    list.retain(|summary| summary.id != merged.id);
+    list.insert(0, merged);
 }
 
 pub(in crate::tui) fn adjust_table_selection(
@@ -243,4 +322,67 @@ pub(in crate::tui) fn adjust_table_selection(
     };
     table.select(Some(next));
     Some(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn sample_summary(id: &str, path: &str, source: SessionSummarySource) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            path: PathBuf::from(path),
+            cwd: None,
+            created_at: None,
+            updated_at: None,
+            last_response_at: None,
+            user_turns: 0,
+            assistant_turns: 0,
+            rounds: 0,
+            first_user_message: None,
+            source,
+            sort_hint_ms: None,
+        }
+    }
+
+    #[test]
+    fn merge_codex_history_external_focus_keeps_local_file_summary() {
+        let mut list = vec![sample_summary(
+            "sid-1",
+            "local.jsonl",
+            SessionSummarySource::LocalFile,
+        )];
+        let focus = CodexHistoryExternalFocus {
+            summary: sample_summary("sid-1", "", SessionSummarySource::ObservedOnly),
+            origin: CodexHistoryExternalFocusOrigin::Requests,
+        };
+
+        merge_codex_history_external_focus(&mut list, &focus);
+
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "sid-1");
+        assert_eq!(list[0].path, PathBuf::from("local.jsonl"));
+        assert_eq!(list[0].source, SessionSummarySource::LocalFile);
+    }
+
+    #[test]
+    fn sync_codex_history_selection_prefers_selected_id() {
+        let mut ui = UiState {
+            codex_history_sessions: vec![
+                sample_summary("sid-a", "a.jsonl", SessionSummarySource::LocalFile),
+                sample_summary("sid-b", "b.jsonl", SessionSummarySource::LocalFile),
+            ],
+            selected_codex_history_idx: 0,
+            selected_codex_history_id: Some("sid-b".to_string()),
+            ..Default::default()
+        };
+
+        ui.sync_codex_history_selection();
+
+        assert_eq!(ui.selected_codex_history_idx, 1);
+        assert_eq!(ui.selected_codex_history_id.as_deref(), Some("sid-b"));
+        assert_eq!(ui.codex_history_table.selected(), Some(1));
+    }
 }

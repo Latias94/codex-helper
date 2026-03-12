@@ -437,6 +437,99 @@ pub(in crate::tui) fn session_row_has_any_override(row: &SessionRow) -> bool {
         || row.override_service_tier.is_some()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tui) struct SessionControlPosture {
+    pub(in crate::tui) headline: String,
+    pub(in crate::tui) detail: String,
+    pub(in crate::tui) color: Color,
+}
+
+pub(in crate::tui) fn session_override_fields(row: &SessionRow) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if row.override_model.is_some() {
+        fields.push("model");
+    }
+    if row.override_effort.is_some() {
+        fields.push("effort");
+    }
+    if row.override_config_name.is_some() {
+        fields.push("station");
+    }
+    if row.override_service_tier.is_some() {
+        fields.push("service_tier");
+    }
+    fields
+}
+
+pub(in crate::tui) fn session_control_posture(
+    row: &SessionRow,
+    global_cfg: Option<&str>,
+) -> SessionControlPosture {
+    if row.session_id.is_none() {
+        return SessionControlPosture {
+            headline: "aggregated runtime-only row".to_string(),
+            detail: "This row has no concrete session_id, so it cannot own per-session overrides."
+                .to_string(),
+            color: Color::Rgb(210, 153, 34),
+        };
+    }
+
+    let override_fields = session_override_fields(row);
+    if let Some(profile_name) = row.binding_profile_name.as_deref() {
+        if override_fields.is_empty() {
+            let mode = row
+                .binding_continuity_mode
+                .map(|mode| format!("{mode:?}").to_ascii_lowercase())
+                .unwrap_or_else(|| "default_profile".to_string());
+            return SessionControlPosture {
+                headline: format!("bound to profile {profile_name} ({mode})"),
+                detail:
+                    "This session keeps its stored binding until another profile or override rewrites it."
+                        .to_string(),
+                color: Color::Rgb(63, 185, 80),
+            };
+        }
+
+        return SessionControlPosture {
+            headline: format!("profile {profile_name} with session overrides"),
+            detail: format!(
+                "Session overrides on {} currently take priority over the bound profile.",
+                override_fields.join(", ")
+            ),
+            color: Color::Rgb(88, 166, 255),
+        };
+    }
+
+    if !override_fields.is_empty() {
+        return SessionControlPosture {
+            headline: "session-controlled route".to_string(),
+            detail: format!(
+                "This session is currently pinned by overrides on {}.",
+                override_fields.join(", ")
+            ),
+            color: Color::Rgb(88, 166, 255),
+        };
+    }
+
+    if let Some(cfg) = global_cfg.filter(|cfg| !cfg.trim().is_empty()) {
+        return SessionControlPosture {
+            headline: format!("no binding; global cfg {cfg} may still influence fallback"),
+            detail:
+                "Without a stored profile or session override, runtime/global routing explains the effective route."
+                    .to_string(),
+            color: Color::Rgb(210, 153, 34),
+        };
+    }
+
+    SessionControlPosture {
+        headline: "no stored binding or session override".to_string(),
+        detail:
+            "Effective route comes from request payloads, station defaults, and runtime fallback."
+                .to_string(),
+        color: Color::Rgb(144, 154, 164),
+    }
+}
+
 pub(in crate::tui) async fn refresh_snapshot(
     state: &ProxyState,
     cfg: Arc<ProxyConfig>,
@@ -491,10 +584,73 @@ pub(in crate::tui) fn filtered_requests_len(
         .count()
 }
 
+pub(in crate::tui) fn find_session_idx(snapshot: &Snapshot, sid: &str) -> Option<usize> {
+    snapshot
+        .rows
+        .iter()
+        .position(|row| row.session_id.as_deref() == Some(sid))
+}
+
+pub(in crate::tui) fn request_page_focus_session_id(
+    snapshot: &Snapshot,
+    explicit_focus: Option<&str>,
+    selected_session_idx: usize,
+) -> Option<String> {
+    explicit_focus.map(ToOwned::to_owned).or_else(|| {
+        snapshot
+            .rows
+            .get(selected_session_idx)
+            .and_then(|row| row.session_id.clone())
+    })
+}
+
+pub(in crate::tui) fn request_matches_page_filters(
+    request: &FinishedRequest,
+    errors_only: bool,
+    scope_session: bool,
+    focused_sid: Option<&str>,
+) -> bool {
+    if errors_only && request.status_code < 400 {
+        return false;
+    }
+    if !scope_session {
+        return true;
+    }
+
+    match (focused_sid, request.session_id.as_deref()) {
+        (Some(sid), Some(request_sid)) => sid == request_sid,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+pub(in crate::tui) fn filtered_request_page_len(
+    snapshot: &Snapshot,
+    explicit_focus: Option<&str>,
+    selected_session_idx: usize,
+    errors_only: bool,
+    scope_session: bool,
+) -> usize {
+    let focused_sid = request_page_focus_session_id(snapshot, explicit_focus, selected_session_idx);
+    snapshot
+        .recent
+        .iter()
+        .filter(|request| {
+            request_matches_page_filters(
+                request,
+                errors_only,
+                scope_session,
+                focused_sid.as_deref(),
+            )
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::state::FinishedRequest;
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -517,5 +673,199 @@ mod tests {
     fn shorten_middle_keeps_both_ends() {
         let s = "abcdef";
         assert_eq!(shorten_middle(s, 5), "ab…ef");
+    }
+
+    #[test]
+    fn request_page_focus_session_prefers_explicit_focus() {
+        let snapshot = Snapshot {
+            rows: vec![SessionRow {
+                session_id: Some("sid-selected".to_string()),
+                cwd: None,
+                active_count: 0,
+                active_started_at_ms_min: None,
+                active_last_method: None,
+                active_last_path: None,
+                last_status: None,
+                last_duration_ms: None,
+                last_ended_at_ms: None,
+                last_model: None,
+                last_reasoning_effort: None,
+                last_service_tier: None,
+                last_provider_id: None,
+                last_config_name: None,
+                last_upstream_base_url: None,
+                last_usage: None,
+                total_usage: None,
+                turns_total: None,
+                turns_with_usage: None,
+                binding_profile_name: None,
+                binding_continuity_mode: None,
+                effective_model: None,
+                effective_reasoning_effort: None,
+                effective_service_tier: None,
+                effective_config_name: None,
+                effective_upstream_base_url: None,
+                override_model: None,
+                override_effort: None,
+                override_config_name: None,
+                override_service_tier: None,
+            }],
+            recent: Vec::new(),
+            overrides: HashMap::new(),
+            config_overrides: HashMap::new(),
+            global_override: None,
+            config_meta_overrides: HashMap::new(),
+            usage_rollup: UsageRollupView::default(),
+            config_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            refreshed_at: Instant::now(),
+        };
+
+        let focused = request_page_focus_session_id(&snapshot, Some("sid-explicit"), 0);
+
+        assert_eq!(focused.as_deref(), Some("sid-explicit"));
+    }
+
+    #[test]
+    fn filtered_request_page_len_uses_explicit_focus() {
+        let snapshot = Snapshot {
+            rows: vec![SessionRow {
+                session_id: Some("sid-selected".to_string()),
+                cwd: None,
+                active_count: 0,
+                active_started_at_ms_min: None,
+                active_last_method: None,
+                active_last_path: None,
+                last_status: None,
+                last_duration_ms: None,
+                last_ended_at_ms: None,
+                last_model: None,
+                last_reasoning_effort: None,
+                last_service_tier: None,
+                last_provider_id: None,
+                last_config_name: None,
+                last_upstream_base_url: None,
+                last_usage: None,
+                total_usage: None,
+                turns_total: None,
+                turns_with_usage: None,
+                binding_profile_name: None,
+                binding_continuity_mode: None,
+                effective_model: None,
+                effective_reasoning_effort: None,
+                effective_service_tier: None,
+                effective_config_name: None,
+                effective_upstream_base_url: None,
+                override_model: None,
+                override_effort: None,
+                override_config_name: None,
+                override_service_tier: None,
+            }],
+            recent: vec![
+                FinishedRequest {
+                    id: 1,
+                    session_id: Some("sid-selected".to_string()),
+                    client_name: None,
+                    client_addr: None,
+                    cwd: None,
+                    model: None,
+                    reasoning_effort: None,
+                    service_tier: None,
+                    config_name: None,
+                    provider_id: None,
+                    upstream_base_url: None,
+                    usage: None,
+                    retry: None,
+                    service: "codex".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/responses".to_string(),
+                    status_code: 200,
+                    duration_ms: 120,
+                    ttfb_ms: None,
+                    ended_at_ms: 1,
+                },
+                FinishedRequest {
+                    id: 2,
+                    session_id: Some("sid-explicit".to_string()),
+                    client_name: None,
+                    client_addr: None,
+                    cwd: None,
+                    model: None,
+                    reasoning_effort: None,
+                    service_tier: None,
+                    config_name: None,
+                    provider_id: None,
+                    upstream_base_url: None,
+                    usage: None,
+                    retry: None,
+                    service: "codex".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/responses".to_string(),
+                    status_code: 200,
+                    duration_ms: 120,
+                    ttfb_ms: None,
+                    ended_at_ms: 2,
+                },
+            ],
+            overrides: HashMap::new(),
+            config_overrides: HashMap::new(),
+            global_override: None,
+            config_meta_overrides: HashMap::new(),
+            usage_rollup: UsageRollupView::default(),
+            config_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            refreshed_at: Instant::now(),
+        };
+
+        let count = filtered_request_page_len(&snapshot, Some("sid-explicit"), 0, false, true);
+
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn session_control_posture_reports_profile_overrides() {
+        let row = SessionRow {
+            session_id: Some("sid-1".to_string()),
+            cwd: None,
+            active_count: 0,
+            active_started_at_ms_min: None,
+            active_last_method: None,
+            active_last_path: None,
+            last_status: None,
+            last_duration_ms: None,
+            last_ended_at_ms: None,
+            last_model: None,
+            last_reasoning_effort: None,
+            last_service_tier: None,
+            last_provider_id: None,
+            last_config_name: None,
+            last_upstream_base_url: None,
+            last_usage: None,
+            total_usage: None,
+            turns_total: None,
+            turns_with_usage: None,
+            binding_profile_name: Some("fast".to_string()),
+            binding_continuity_mode: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_config_name: None,
+            effective_upstream_base_url: None,
+            override_model: Some("gpt-5.4".to_string()),
+            override_effort: None,
+            override_config_name: None,
+            override_service_tier: None,
+        };
+
+        let posture = session_control_posture(&row, None);
+
+        assert!(posture.headline.contains("profile fast"));
+        assert!(posture.detail.contains("model"));
     }
 }

@@ -29,7 +29,7 @@ use crate::config::ProxyConfig;
 use crate::state::ProxyState;
 
 use self::model::{Palette, now_ms, refresh_snapshot};
-use self::state::UiState;
+use self::state::{UiState, merge_codex_history_external_focus};
 use self::terminal::TerminalGuard;
 
 pub async fn run_dashboard(
@@ -171,13 +171,11 @@ pub async fn run_dashboard(
                                 match crate::sessions::find_codex_sessions_for_current_dir(200).await {
                                     Ok(list) => {
                                         ui.codex_history_sessions = list;
+                                        if let Some(focus) = ui.codex_history_external_focus.as_ref() {
+                                            merge_codex_history_external_focus(&mut ui.codex_history_sessions, focus);
+                                        }
                                         ui.codex_history_loaded_at_ms = Some(now_ms());
-                                        ui.selected_codex_history_idx = 0;
-                                        ui.codex_history_table.select(if ui.codex_history_sessions.is_empty() {
-                                            None
-                                        } else {
-                                            Some(0)
-                                        });
+                                        ui.sync_codex_history_selection();
                                         let count = ui.codex_history_sessions.len();
                                         let zh = format!("history: 已加载 {count} 个会话");
                                         let en = format!("history: loaded {count} sessions");
@@ -188,8 +186,12 @@ pub async fn run_dashboard(
                                     }
                                     Err(e) => {
                                         ui.codex_history_sessions.clear();
+                                        if let Some(focus) = ui.codex_history_external_focus.as_ref() {
+                                            merge_codex_history_external_focus(&mut ui.codex_history_sessions, focus);
+                                        }
                                         ui.codex_history_loaded_at_ms = Some(now_ms());
                                         ui.codex_history_error = Some(e.to_string());
+                                        ui.sync_codex_history_selection();
                                         let zh = format!("history: 加载失败：{e}");
                                         let en = format!("history: load failed: {e}");
                                         ui.toast = Some((

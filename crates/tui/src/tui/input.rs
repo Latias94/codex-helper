@@ -15,17 +15,22 @@ use crate::config::{
     storage::{load_config, save_config},
 };
 use crate::sessions::{
-    find_codex_session_file_by_id, read_codex_session_meta, read_codex_session_transcript,
+    SessionSummary, SessionSummarySource, find_codex_session_file_by_id, read_codex_session_meta,
+    read_codex_session_transcript,
 };
-use crate::state::{ConfigHealth, ProxyState, UpstreamHealth};
+use crate::state::{ConfigHealth, FinishedRequest, ProxyState, UpstreamHealth};
 
 use super::Language;
 use super::model::{
-    CODEX_RECENT_WINDOWS, ProviderOption, Snapshot, codex_recent_window_label,
-    codex_recent_window_threshold_ms, filtered_requests_len, now_ms, session_row_has_any_override,
+    CODEX_RECENT_WINDOWS, ProviderOption, SessionRow, Snapshot, codex_recent_window_label,
+    codex_recent_window_threshold_ms, filtered_request_page_len, filtered_requests_len,
+    find_session_idx, format_age, now_ms, request_matches_page_filters,
+    request_page_focus_session_id, session_row_has_any_override, short_sid,
 };
 use super::report::build_stats_report;
-use super::state::{UiState, adjust_table_selection};
+use super::state::{
+    CodexHistoryExternalFocusOrigin, RecentCodexRow, UiState, adjust_table_selection,
+};
 use super::types::{EffortChoice, Focus, Overlay, Page, StatsFocus};
 
 pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
@@ -209,8 +214,7 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         }
         if ui.page == Page::History {
             ui.needs_codex_history_refresh = true;
-            ui.selected_codex_history_idx = 0;
-            ui.codex_history_table.select(None);
+            ui.sync_codex_history_selection();
         }
         if ui.page == Page::Recent {
             ui.needs_codex_recent_refresh = true;
@@ -240,6 +244,223 @@ fn apply_selected_session(ui: &mut UiState, snapshot: &Snapshot, idx: usize) {
     let req_len = filtered_requests_len(snapshot, ui.selected_session_idx);
     ui.requests_table
         .select(if req_len == 0 { None } else { Some(0) });
+}
+
+fn focus_session_in_sessions(ui: &mut UiState, snapshot: &Snapshot, sid: &str) -> bool {
+    let Some(idx) = find_session_idx(snapshot, sid) else {
+        return false;
+    };
+
+    ui.sessions_page_active_only = false;
+    ui.sessions_page_errors_only = false;
+    ui.sessions_page_overrides_only = false;
+    ui.selected_sessions_page_idx = 0;
+    ui.page = Page::Sessions;
+    ui.focus = Focus::Sessions;
+    apply_selected_session(ui, snapshot, idx);
+    true
+}
+
+fn prepare_select_requests_for_session(ui: &mut UiState, sid: String) {
+    ui.page = Page::Requests;
+    ui.focus = Focus::Requests;
+    ui.request_page_errors_only = false;
+    ui.request_page_scope_session = true;
+    ui.focused_request_session_id = Some(sid);
+    ui.selected_request_page_idx = 0;
+}
+
+fn clear_request_page_focus(ui: &mut UiState) {
+    ui.focused_request_session_id = None;
+    ui.selected_request_page_idx = 0;
+}
+
+fn selected_request_page_request<'a>(
+    snapshot: &'a Snapshot,
+    ui: &UiState,
+) -> Option<&'a FinishedRequest> {
+    let focused_sid = request_page_focus_session_id(
+        snapshot,
+        ui.focused_request_session_id.as_deref(),
+        ui.selected_session_idx,
+    );
+
+    snapshot
+        .recent
+        .iter()
+        .filter(|request| {
+            request_matches_page_filters(
+                request,
+                ui.request_page_errors_only,
+                ui.request_page_scope_session,
+                focused_sid.as_deref(),
+            )
+        })
+        .nth(ui.selected_request_page_idx)
+}
+
+fn selected_recent_row(ui: &UiState) -> Option<RecentCodexRow> {
+    let now = now_ms();
+    let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
+    ui.codex_recent_rows
+        .iter()
+        .filter(|row| row.mtime_ms >= threshold_ms)
+        .nth(ui.codex_recent_selected_idx)
+        .cloned()
+}
+
+fn session_history_bridge_summary(row: &SessionRow) -> String {
+    let mut parts = vec![
+        format!(
+            "station={}",
+            row.effective_config_name
+                .as_ref()
+                .map(|value| value.value.as_str())
+                .or(row.last_config_name.as_deref())
+                .unwrap_or("auto")
+        ),
+        format!(
+            "model={}",
+            row.effective_model
+                .as_ref()
+                .map(|value| value.value.as_str())
+                .or(row.last_model.as_deref())
+                .unwrap_or("auto")
+        ),
+        format!(
+            "tier={}",
+            row.effective_service_tier
+                .as_ref()
+                .map(|value| value.value.as_str())
+                .or(row.last_service_tier.as_deref())
+                .unwrap_or("auto")
+        ),
+    ];
+    if let Some(provider) = row.last_provider_id.as_deref() {
+        parts.push(format!("provider={provider}"));
+    }
+    if let Some(status) = row.last_status {
+        parts.push(format!("status={status}"));
+    }
+    format!("From Sessions: {}", parts.join(", "))
+}
+
+fn request_history_bridge_summary(request: &FinishedRequest) -> String {
+    let mut parts = vec![
+        format!(
+            "station={}",
+            request.config_name.as_deref().unwrap_or("auto")
+        ),
+        format!("model={}", request.model.as_deref().unwrap_or("auto")),
+        format!("tier={}", request.service_tier.as_deref().unwrap_or("auto")),
+    ];
+    if let Some(provider) = request.provider_id.as_deref() {
+        parts.push(format!("provider={provider}"));
+    }
+    parts.push(format!("status={}", request.status_code));
+    parts.push(format!("path={}", request.path));
+    format!("From Requests: {}", parts.join(", "))
+}
+
+fn session_history_summary_from_row(
+    row: &SessionRow,
+    path: Option<PathBuf>,
+) -> Option<SessionSummary> {
+    let sid = row.session_id.clone()?;
+    let sort_hint_ms = row.last_ended_at_ms.or(row.active_started_at_ms_min);
+    let updated_at = sort_hint_ms.map(|ms| format_age(now_ms(), Some(ms)));
+    let turns = row.turns_total.unwrap_or(0).min(usize::MAX as u64) as usize;
+    let source = if path.is_some() {
+        SessionSummarySource::LocalFile
+    } else {
+        SessionSummarySource::ObservedOnly
+    };
+    Some(SessionSummary {
+        id: sid,
+        path: path.unwrap_or_default(),
+        cwd: row.cwd.clone(),
+        created_at: None,
+        updated_at: updated_at.clone(),
+        last_response_at: updated_at,
+        user_turns: turns,
+        assistant_turns: turns,
+        rounds: turns,
+        first_user_message: Some(session_history_bridge_summary(row)),
+        source,
+        sort_hint_ms,
+    })
+}
+
+fn recent_history_bridge_summary(row: &RecentCodexRow) -> String {
+    let mut parts = vec![format!("root={}", row.root)];
+    if let Some(branch) = row.branch.as_deref() {
+        parts.push(format!("branch={branch}"));
+    }
+    if let Some(cwd) = row.cwd.as_deref() {
+        parts.push(format!("cwd={cwd}"));
+    }
+    format!("From Recent: {}", parts.join(", "))
+}
+
+fn recent_history_summary_from_row(row: &RecentCodexRow, path: Option<PathBuf>) -> SessionSummary {
+    let updated_at = Some(format_age(now_ms(), Some(row.mtime_ms)));
+    let source = if path.is_some() {
+        SessionSummarySource::LocalFile
+    } else {
+        SessionSummarySource::ObservedOnly
+    };
+    SessionSummary {
+        id: row.session_id.clone(),
+        path: path.unwrap_or_default(),
+        cwd: row.cwd.clone(),
+        created_at: None,
+        updated_at: updated_at.clone(),
+        last_response_at: updated_at,
+        user_turns: 0,
+        assistant_turns: 0,
+        rounds: 0,
+        first_user_message: Some(recent_history_bridge_summary(row)),
+        source,
+        sort_hint_ms: Some(row.mtime_ms),
+    }
+}
+
+fn request_history_summary_from_request(
+    request: &FinishedRequest,
+    path: Option<PathBuf>,
+) -> Option<SessionSummary> {
+    let sid = request.session_id.clone()?;
+    let updated_at = Some(format_age(now_ms(), Some(request.ended_at_ms)));
+    let source = if path.is_some() {
+        SessionSummarySource::LocalFile
+    } else {
+        SessionSummarySource::ObservedOnly
+    };
+    Some(SessionSummary {
+        id: sid,
+        path: path.unwrap_or_default(),
+        cwd: request.cwd.clone(),
+        created_at: None,
+        updated_at: updated_at.clone(),
+        last_response_at: updated_at,
+        user_turns: 1,
+        assistant_turns: 1,
+        rounds: 1,
+        first_user_message: Some(request_history_bridge_summary(request)),
+        source,
+        sort_hint_ms: Some(request.ended_at_ms),
+    })
+}
+
+fn prepare_select_history_from_external(
+    ui: &mut UiState,
+    summary: SessionSummary,
+    origin: CodexHistoryExternalFocusOrigin,
+) {
+    ui.page = Page::History;
+    ui.focus = Focus::Sessions;
+    ui.prepare_codex_history_external_focus(summary, origin);
+    ui.needs_codex_history_refresh = true;
 }
 
 async fn apply_effort_override(state: &ProxyState, sid: String, effort: Option<String>) {
@@ -1390,6 +1611,60 @@ async fn handle_key_normal(
             ));
             true
         }
+        KeyCode::Char('o') if ui.page == Page::Sessions => {
+            let Some(sid) = ui.selected_session_id.clone() else {
+                ui.toast = Some(("sessions: no session selected".to_string(), Instant::now()));
+                return true;
+            };
+            let sid_label = short_sid(&sid, 18);
+            prepare_select_requests_for_session(ui, sid);
+            ui.toast = Some((
+                format!("requests: focused session {sid_label}"),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('h') if ui.page == Page::Sessions => {
+            let Some(row) = snapshot.rows.get(ui.selected_session_idx) else {
+                ui.toast = Some(("sessions: no session selected".to_string(), Instant::now()));
+                return true;
+            };
+            let Some(sid) = row.session_id.as_deref() else {
+                ui.toast = Some((
+                    "sessions: selected row has no session id".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let path = match find_codex_session_file_by_id(sid).await {
+                Ok(path) => path,
+                Err(e) => {
+                    ui.toast = Some((
+                        format!("history: resolve session file failed: {e}"),
+                        Instant::now(),
+                    ));
+                    return true;
+                }
+            };
+            let Some(summary) = session_history_summary_from_row(row, path) else {
+                ui.toast = Some((
+                    "history: failed to prepare session focus".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let sid_label = short_sid(sid, 18);
+            prepare_select_history_from_external(
+                ui,
+                summary,
+                CodexHistoryExternalFocusOrigin::Sessions,
+            );
+            ui.toast = Some((
+                format!("history: focused session {sid_label}"),
+                Instant::now(),
+            ));
+            true
+        }
         KeyCode::Char('t') if ui.page == Page::Sessions => {
             let Some(sid) = ui.selected_session_id.clone() else {
                 ui.toast = Some(("no session selected".to_string(), Instant::now()));
@@ -1414,14 +1689,7 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Enter if ui.page == Page::Recent => {
-            let now = now_ms();
-            let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
-            let selected = ui
-                .codex_recent_rows
-                .iter()
-                .filter(|r| r.mtime_ms >= threshold_ms)
-                .nth(ui.codex_recent_selected_idx);
-            let Some(r) = selected else {
+            let Some(r) = selected_recent_row(ui) else {
                 ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
                 return true;
             };
@@ -1442,6 +1710,95 @@ async fn handle_key_normal(
                     ui.toast = Some((format!("clipboard failed: {e}"), Instant::now()));
                 }
             }
+            true
+        }
+        KeyCode::Char('t') if ui.page == Page::Recent => {
+            let Some(r) = selected_recent_row(ui) else {
+                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            let sid = r.session_id.clone();
+            match find_codex_session_file_by_id(&sid).await {
+                Ok(Some(path)) => {
+                    open_session_transcript_from_path(ui, sid, &path, Some(80)).await;
+                }
+                Ok(None) => {
+                    ui.toast = Some((
+                        "recent: no local transcript file found for this session".to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    ui.toast = Some((
+                        format!("recent: resolve session file failed: {e}"),
+                        Instant::now(),
+                    ));
+                }
+            }
+            true
+        }
+        KeyCode::Char('s') if ui.page == Page::Recent => {
+            let Some(r) = selected_recent_row(ui) else {
+                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            if focus_session_in_sessions(ui, snapshot, r.session_id.as_str()) {
+                ui.toast = Some((
+                    format!("sessions: focused {}", short_sid(r.session_id.as_str(), 18)),
+                    Instant::now(),
+                ));
+            } else {
+                ui.toast = Some((
+                    crate::tui::i18n::pick(
+                        ui.language,
+                        "sessions: 当前 runtime 未观测到这个 recent session",
+                        "sessions: this recent session is not currently observed in runtime",
+                    )
+                    .to_string(),
+                    Instant::now(),
+                ));
+            }
+            true
+        }
+        KeyCode::Char('f') if ui.page == Page::Recent => {
+            let Some(r) = selected_recent_row(ui) else {
+                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            let sid_label = short_sid(r.session_id.as_str(), 18);
+            prepare_select_requests_for_session(ui, r.session_id);
+            ui.toast = Some((
+                format!("requests: focused session {sid_label}"),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('h') if ui.page == Page::Recent => {
+            let Some(r) = selected_recent_row(ui) else {
+                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            let path = match find_codex_session_file_by_id(r.session_id.as_str()).await {
+                Ok(path) => path,
+                Err(e) => {
+                    ui.toast = Some((
+                        format!("history: resolve session file failed: {e}"),
+                        Instant::now(),
+                    ));
+                    return true;
+                }
+            };
+            let summary = recent_history_summary_from_row(&r, path);
+            let sid_label = short_sid(r.session_id.as_str(), 18);
+            prepare_select_history_from_external(
+                ui,
+                summary,
+                CodexHistoryExternalFocusOrigin::Recent,
+            );
+            ui.toast = Some((
+                format!("history: focused session {sid_label}"),
+                Instant::now(),
+            ));
             true
         }
         KeyCode::Char('y') if ui.page == Page::Recent => {
@@ -1493,13 +1850,73 @@ async fn handle_key_normal(
                 ui.toast = Some(("history: no selection".to_string(), Instant::now()));
                 return true;
             };
+            if summary.path.as_os_str().is_empty() {
+                ui.toast = Some((
+                    crate::tui::i18n::pick(
+                        ui.language,
+                        "history: 当前选中项没有本地 transcript 文件",
+                        "history: selected entry has no local transcript file",
+                    )
+                    .to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            }
             open_session_transcript_from_path(ui, summary.id, &summary.path, Some(80)).await;
+            true
+        }
+        KeyCode::Char('s') if ui.page == Page::History => {
+            let Some(sid) = ui
+                .codex_history_sessions
+                .get(ui.selected_codex_history_idx)
+                .map(|summary| summary.id.clone())
+            else {
+                ui.toast = Some(("history: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            if focus_session_in_sessions(ui, snapshot, sid.as_str()) {
+                ui.toast = Some((
+                    format!("sessions: focused {}", short_sid(sid.as_str(), 18)),
+                    Instant::now(),
+                ));
+            } else {
+                ui.toast = Some((
+                    crate::tui::i18n::pick(
+                        ui.language,
+                        "sessions: 当前 runtime 未观测到这个 session",
+                        "sessions: this session is not currently observed in runtime",
+                    )
+                    .to_string(),
+                    Instant::now(),
+                ));
+            }
+            true
+        }
+        KeyCode::Char('f') if ui.page == Page::History => {
+            let Some(summary) = ui
+                .codex_history_sessions
+                .get(ui.selected_codex_history_idx)
+                .cloned()
+            else {
+                ui.toast = Some(("history: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            let sid_label = short_sid(summary.id.as_str(), 18);
+            prepare_select_requests_for_session(ui, summary.id);
+            ui.toast = Some((
+                format!("requests: focused session {sid_label}"),
+                Instant::now(),
+            ));
             true
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::History => {
             let len = ui.codex_history_sessions.len();
             if let Some(next) = adjust_table_selection(&mut ui.codex_history_table, -1, len) {
                 ui.selected_codex_history_idx = next;
+                ui.selected_codex_history_id = ui
+                    .codex_history_sessions
+                    .get(next)
+                    .map(|summary| summary.id.clone());
                 return true;
             }
             false
@@ -1508,6 +1925,10 @@ async fn handle_key_normal(
             let len = ui.codex_history_sessions.len();
             if let Some(next) = adjust_table_selection(&mut ui.codex_history_table, 1, len) {
                 ui.selected_codex_history_idx = next;
+                ui.selected_codex_history_id = ui
+                    .codex_history_sessions
+                    .get(next)
+                    .map(|summary| summary.id.clone());
                 return true;
             }
             false
@@ -1616,6 +2037,7 @@ async fn handle_key_normal(
         }
         KeyCode::Char('e') if ui.page == Page::Requests => {
             ui.request_page_errors_only = !ui.request_page_errors_only;
+            ui.selected_request_page_idx = 0;
             ui.toast = Some((
                 format!(
                     "requests filter: errors_only={}",
@@ -1627,6 +2049,13 @@ async fn handle_key_normal(
         }
         KeyCode::Char('s') if ui.page == Page::Requests => {
             ui.request_page_scope_session = !ui.request_page_scope_session;
+            if ui.request_page_scope_session && ui.focused_request_session_id.is_none() {
+                ui.focused_request_session_id = snapshot
+                    .rows
+                    .get(ui.selected_session_idx)
+                    .and_then(|row| row.session_id.clone());
+            }
+            ui.selected_request_page_idx = 0;
             ui.toast = Some((
                 format!(
                     "requests scope: {}",
@@ -1640,29 +2069,93 @@ async fn handle_key_normal(
             ));
             true
         }
+        KeyCode::Char('x') if ui.page == Page::Requests => {
+            clear_request_page_focus(ui);
+            ui.toast = Some((
+                "requests: cleared explicit session focus".to_string(),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('o') if ui.page == Page::Requests => {
+            let Some(request) = selected_request_page_request(snapshot, ui) else {
+                ui.toast = Some(("requests: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            let Some(sid) = request.session_id.as_deref() else {
+                ui.toast = Some((
+                    "requests: selected request has no session id".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            if focus_session_in_sessions(ui, snapshot, sid) {
+                ui.toast = Some((
+                    format!("sessions: focused {}", short_sid(sid, 18)),
+                    Instant::now(),
+                ));
+            } else {
+                ui.toast = Some((
+                    crate::tui::i18n::pick(
+                        ui.language,
+                        "sessions: 当前 runtime 未观测到这个 session",
+                        "sessions: this session is not currently observed in runtime",
+                    )
+                    .to_string(),
+                    Instant::now(),
+                ));
+            }
+            true
+        }
+        KeyCode::Char('h') if ui.page == Page::Requests => {
+            let Some(request) = selected_request_page_request(snapshot, ui).cloned() else {
+                ui.toast = Some(("requests: no selection".to_string(), Instant::now()));
+                return true;
+            };
+            let Some(sid) = request.session_id.as_deref() else {
+                ui.toast = Some((
+                    "requests: selected request has no session id".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let path = match find_codex_session_file_by_id(sid).await {
+                Ok(path) => path,
+                Err(e) => {
+                    ui.toast = Some((
+                        format!("history: resolve session file failed: {e}"),
+                        Instant::now(),
+                    ));
+                    return true;
+                }
+            };
+            let Some(summary) = request_history_summary_from_request(&request, path) else {
+                ui.toast = Some((
+                    "history: failed to prepare request focus".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let sid_label = short_sid(sid, 18);
+            prepare_select_history_from_external(
+                ui,
+                summary,
+                CodexHistoryExternalFocusOrigin::Requests,
+            );
+            ui.toast = Some((
+                format!("history: focused session {sid_label}"),
+                Instant::now(),
+            ));
+            true
+        }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Requests => {
-            let selected_sid = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.session_id.as_deref());
-            let filtered_len = snapshot
-                .recent
-                .iter()
-                .filter(|r| {
-                    if ui.request_page_errors_only && r.status_code < 400 {
-                        return false;
-                    }
-                    if ui.request_page_scope_session {
-                        match (selected_sid, r.session_id.as_deref()) {
-                            (Some(sid), Some(rid)) => sid == rid,
-                            (Some(_), None) => false,
-                            (None, _) => true,
-                        }
-                    } else {
-                        true
-                    }
-                })
-                .count();
+            let filtered_len = filtered_request_page_len(
+                snapshot,
+                ui.focused_request_session_id.as_deref(),
+                ui.selected_session_idx,
+                ui.request_page_errors_only,
+                ui.request_page_scope_session,
+            );
             if let Some(next) = adjust_table_selection(&mut ui.request_page_table, -1, filtered_len)
             {
                 ui.selected_request_page_idx = next;
@@ -1671,28 +2164,13 @@ async fn handle_key_normal(
             false
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Requests => {
-            let selected_sid = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.session_id.as_deref());
-            let filtered_len = snapshot
-                .recent
-                .iter()
-                .filter(|r| {
-                    if ui.request_page_errors_only && r.status_code < 400 {
-                        return false;
-                    }
-                    if ui.request_page_scope_session {
-                        match (selected_sid, r.session_id.as_deref()) {
-                            (Some(sid), Some(rid)) => sid == rid,
-                            (Some(_), None) => false,
-                            (None, _) => true,
-                        }
-                    } else {
-                        true
-                    }
-                })
-                .count();
+            let filtered_len = filtered_request_page_len(
+                snapshot,
+                ui.focused_request_session_id.as_deref(),
+                ui.selected_session_idx,
+                ui.request_page_errors_only,
+                ui.request_page_scope_session,
+            );
             if let Some(next) = adjust_table_selection(&mut ui.request_page_table, 1, filtered_len)
             {
                 ui.selected_request_page_idx = next;

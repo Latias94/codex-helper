@@ -5,8 +5,9 @@ use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, T
 
 use crate::state::{ResolvedRouteValue, RouteValueSource};
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, now_ms, session_row_has_any_override, short_sid,
-    shorten, shorten_middle, status_style, tokens_short, usage_line,
+    Palette, Snapshot, basename, format_age, now_ms, session_control_posture,
+    session_row_has_any_override, short_sid, shorten, shorten_middle, status_style, tokens_short,
+    usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::view::widgets::kv_line;
@@ -218,6 +219,7 @@ pub(super) fn render_sessions_page(
         let override_cfg = row.override_config_name.as_deref().unwrap_or("-");
         let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
         let global_cfg = snapshot.global_override.as_deref().unwrap_or("-");
+        let posture = session_control_posture(row, snapshot.global_override.as_deref());
         let routing = if session_row_has_any_override(row) {
             format!(
                 "session(model={override_model}, cfg={override_cfg}, tier={override_service_tier})"
@@ -240,6 +242,18 @@ pub(super) fn render_sessions_page(
             "binding",
             format!("{binding_profile} ({binding_mode})"),
             Style::default().fg(p.text),
+        ));
+        lines.push(kv_line(
+            p,
+            "control",
+            posture.headline,
+            Style::default().fg(posture.color),
+        ));
+        lines.push(kv_line(
+            p,
+            "explain",
+            posture.detail,
+            Style::default().fg(p.muted),
         ));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
@@ -380,6 +394,8 @@ pub(super) fn render_sessions_page(
         lines.push(Line::from("  v toggle overrides-only"));
         lines.push(Line::from("  r reset filters"));
         lines.push(Line::from("  t transcript (full-screen)"));
+        lines.push(Line::from("  o open session in Requests"));
+        lines.push(Line::from("  h open session in History"));
         lines.push(Line::from("  Enter effort menu  p/P provider override"));
     } else {
         lines.push(Line::from(Span::styled(

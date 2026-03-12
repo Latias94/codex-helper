@@ -180,6 +180,21 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
                 Style::default().fg(p.accent),
             ),
         ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            crate::tui::i18n::pick(ui.language, "按键", "Keys"),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(crate::tui::i18n::pick(
+            ui.language,
+            "  Enter 复制条目  y 复制可见列表  t 打开 transcript",
+            "  Enter copy selected  y copy visible list  t open transcript",
+        )));
+        lines.push(Line::from(crate::tui::i18n::pick(
+            ui.language,
+            "  s 打开到 Sessions  f 打开到 Requests  h 打开到 History",
+            "  s open in Sessions  f open in Requests  h open in History",
+        )));
     } else {
         lines.push(Line::from(Span::styled(
             crate::tui::i18n::pick(ui.language, "未选中任何条目。", "No selection."),

@@ -4,7 +4,8 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
 use crate::tui::model::{
-    Palette, Snapshot, format_age, now_ms, shorten, shorten_middle, status_style, usage_line,
+    Palette, Snapshot, format_age, now_ms, request_matches_page_filters,
+    request_page_focus_session_id, short_sid, shorten, shorten_middle, status_style, usage_line,
 };
 use crate::tui::state::UiState;
 
@@ -20,27 +21,22 @@ pub(super) fn render_requests_page(
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(area);
 
-    let selected_sid = snapshot
-        .rows
-        .get(ui.selected_session_idx)
-        .and_then(|r| r.session_id.as_deref());
+    let focused_sid = request_page_focus_session_id(
+        snapshot,
+        ui.focused_request_session_id.as_deref(),
+        ui.selected_session_idx,
+    );
 
     let filtered = snapshot
         .recent
         .iter()
         .filter(|r| {
-            if ui.request_page_errors_only && r.status_code < 400 {
-                return false;
-            }
-            if ui.request_page_scope_session {
-                match (selected_sid, r.session_id.as_deref()) {
-                    (Some(sid), Some(rid)) => sid == rid,
-                    (Some(_), None) => false,
-                    (None, _) => true,
-                }
-            } else {
-                true
-            }
+            request_matches_page_filters(
+                r,
+                ui.request_page_errors_only,
+                ui.request_page_scope_session,
+                focused_sid.as_deref(),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -53,13 +49,17 @@ pub(super) fn render_requests_page(
             .select(Some(ui.selected_request_page_idx));
     }
 
+    let scope_label = if ui.request_page_scope_session {
+        focused_sid
+            .as_deref()
+            .map(|sid| format!("session {}", short_sid(sid, 16)))
+            .unwrap_or_else(|| "session".to_string())
+    } else {
+        "all".to_string()
+    };
     let left_title = format!(
         "Requests  (scope: {}, errors_only: {})",
-        if ui.request_page_scope_session {
-            "session"
-        } else {
-            "all"
-        },
+        scope_label,
         if ui.request_page_errors_only {
             "on"
         } else {
@@ -136,6 +136,29 @@ pub(super) fn render_requests_page(
     let selected = filtered.get(ui.selected_request_page_idx);
     let mut lines = Vec::new();
     if let Some(r) = selected {
+        let focus_mode = if ui.focused_request_session_id.is_some() {
+            "explicit session focus"
+        } else {
+            "follow selected session"
+        };
+        lines.push(Line::from(vec![
+            Span::styled("scope: ", Style::default().fg(p.muted)),
+            Span::styled(
+                if ui.request_page_scope_session {
+                    focused_sid
+                        .as_deref()
+                        .map(|sid| short_sid(sid, 20))
+                        .unwrap_or_else(|| "-".to_string())
+                } else {
+                    "all requests".to_string()
+                },
+                Style::default().fg(p.text),
+            ),
+            Span::raw("  "),
+            Span::styled("mode: ", Style::default().fg(p.muted)),
+            Span::styled(focus_mode, Style::default().fg(p.muted)),
+        ]));
+        lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("status: ", Style::default().fg(p.muted)),
             Span::styled(
@@ -243,6 +266,17 @@ pub(super) fn render_requests_page(
                 Style::default().fg(p.muted),
             )));
         }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Keys",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from("  e toggle errors-only"));
+        lines.push(Line::from("  s toggle session scope"));
+        lines.push(Line::from("  x clear explicit session focus"));
+        lines.push(Line::from("  o open session in Sessions"));
+        lines.push(Line::from("  h open session in History"));
     } else {
         lines.push(Line::from(Span::styled(
             "No requests match the current filters.",

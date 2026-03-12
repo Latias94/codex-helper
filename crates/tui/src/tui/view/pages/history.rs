@@ -3,8 +3,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
+use crate::sessions::SessionSummarySource;
 use crate::tui::model::{Palette, basename, short_sid, shorten, shorten_middle};
-use crate::tui::state::UiState;
+use crate::tui::state::{CodexHistoryExternalFocusOrigin, UiState};
 
 pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
     let columns = Layout::default()
@@ -26,14 +27,7 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
         .style(Style::default().fg(p.muted))
         .height(1);
 
-    let len = ui.codex_history_sessions.len();
-    ui.selected_codex_history_idx = ui.selected_codex_history_idx.min(len.saturating_sub(1));
-    if len == 0 {
-        ui.codex_history_table.select(None);
-    } else {
-        ui.codex_history_table
-            .select(Some(ui.selected_codex_history_idx));
-    }
+    ui.sync_codex_history_selection();
 
     let rows = ui
         .codex_history_sessions
@@ -115,6 +109,19 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
             Style::default().fg(p.muted),
         )));
     } else if let Some(s) = ui.codex_history_sessions.get(ui.selected_codex_history_idx) {
+        if let Some(focus) = ui
+            .codex_history_external_focus
+            .as_ref()
+            .filter(|focus| focus.summary.id == s.id)
+        {
+            lines.push(Line::from(vec![
+                Span::styled("context: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    format!("focused from {}", history_focus_origin_label(focus.origin)),
+                    Style::default().fg(p.accent),
+                ),
+            ]));
+        }
         lines.push(Line::from(vec![
             Span::styled("sid: ", Style::default().fg(p.muted)),
             Span::styled(s.id.clone(), Style::default().fg(p.text)),
@@ -156,6 +163,20 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
                 Span::styled(shorten_middle(ts, 80), Style::default().fg(p.muted)),
             ]));
         }
+        lines.push(Line::from(vec![
+            Span::styled("source: ", Style::default().fg(p.muted)),
+            Span::styled(
+                match s.source {
+                    SessionSummarySource::LocalFile => "local transcript",
+                    SessionSummarySource::ObservedOnly => "observed bridge",
+                },
+                Style::default().fg(if s.source == SessionSummarySource::LocalFile {
+                    p.text
+                } else {
+                    p.warn
+                }),
+            ),
+        ]));
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -180,9 +201,16 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
         )));
         lines.push(Line::from(crate::tui::i18n::pick(
             ui.language,
-            "  ↑/↓ 选择  r 刷新  t/Enter 打开对话记录",
-            "  ↑/↓ select  r refresh  t/Enter open transcript",
+            "  ↑/↓ 选择  r 刷新  t/Enter 打开对话记录  s 打开到 Sessions  f 打开到 Requests",
+            "  ↑/↓ select  r refresh  t/Enter open transcript  s open in Sessions  f open in Requests",
         )));
+        if s.source == SessionSummarySource::ObservedOnly {
+            lines.push(Line::from(crate::tui::i18n::pick(
+                ui.language,
+                "  当前条目来自外部桥接，没有本地 transcript 文件。",
+                "  This entry comes from an external bridge and may not have a local transcript file.",
+            )));
+        }
     }
 
     let content = Paragraph::new(Text::from(lines))
@@ -190,4 +218,12 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
         .style(Style::default().fg(p.text))
         .wrap(Wrap { trim: false });
     f.render_widget(content, columns[1]);
+}
+
+fn history_focus_origin_label(origin: CodexHistoryExternalFocusOrigin) -> &'static str {
+    match origin {
+        CodexHistoryExternalFocusOrigin::Sessions => "Sessions",
+        CodexHistoryExternalFocusOrigin::Requests => "Requests",
+        CodexHistoryExternalFocusOrigin::Recent => "Recent",
+    }
 }
