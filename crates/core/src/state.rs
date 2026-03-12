@@ -158,6 +158,10 @@ pub struct ActiveRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -182,6 +186,10 @@ pub struct FinishedRequest {
     pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,6 +233,10 @@ pub struct FinishRequestParams {
 pub struct SessionStats {
     pub turns_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_client_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_reasoning_effort: Option<String>,
@@ -253,6 +265,14 @@ pub enum SessionContinuityMode {
     #[default]
     DefaultProfile,
     ManualProfile,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionObservationScope {
+    #[default]
+    ObservedOnly,
+    HostLocalEnriched,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -303,6 +323,12 @@ impl ResolvedRouteValue {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionIdentityCard {
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub observation_scope: SessionObservationScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_client_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub active_count: u64,
@@ -651,6 +677,49 @@ impl ProxyState {
     pub async fn clear_session_binding(&self, session_id: &str) {
         let mut guard = self.session_bindings.write().await;
         guard.remove(session_id);
+    }
+
+    pub async fn clear_session_manual_overrides(&self, session_id: &str) {
+        self.clear_session_config_override(session_id).await;
+        self.clear_session_model_override(session_id).await;
+        self.clear_session_effort_override(session_id).await;
+        self.clear_session_service_tier_override(session_id).await;
+    }
+
+    pub async fn apply_session_profile_binding(
+        &self,
+        service_name: &str,
+        mgr: &ServiceConfigManager,
+        session_id: String,
+        profile_name: String,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        let profile = mgr
+            .profile(profile_name.as_str())
+            .ok_or_else(|| anyhow::anyhow!("profile not found: {profile_name}"))?;
+        crate::config::validate_profile_station_compatibility(
+            service_name,
+            mgr,
+            profile_name.as_str(),
+            profile,
+        )?;
+
+        self.set_session_binding(SessionBinding {
+            session_id: session_id.clone(),
+            profile_name: Some(profile_name),
+            station_name: profile.station.clone(),
+            model: profile.model.clone(),
+            reasoning_effort: profile.reasoning_effort.clone(),
+            service_tier: profile.service_tier.clone(),
+            continuity_mode: SessionContinuityMode::ManualProfile,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            last_seen_ms: now_ms,
+        })
+        .await;
+        self.clear_session_manual_overrides(session_id.as_str())
+            .await;
+        Ok(())
     }
 
     pub async fn touch_session_binding(&self, session_id: &str, now_ms: u64) {
@@ -1370,6 +1439,8 @@ impl ProxyState {
         method: &str,
         path: &str,
         session_id: Option<String>,
+        client_name: Option<String>,
+        client_addr: Option<String>,
         cwd: Option<String>,
         model: Option<String>,
         reasoning_effort: Option<String>,
@@ -1380,6 +1451,8 @@ impl ProxyState {
         let req = ActiveRequest {
             id,
             session_id,
+            client_name,
+            client_addr,
             cwd,
             model,
             reasoning_effort,
@@ -1422,6 +1495,8 @@ impl ProxyState {
         let finished = FinishedRequest {
             id: params.id,
             session_id: req.session_id,
+            client_name: req.client_name,
+            client_addr: req.client_addr,
             cwd: req.cwd,
             model: req.model,
             reasoning_effort: req.reasoning_effort,
@@ -1512,6 +1587,14 @@ impl ProxyState {
             let mut stats = self.session_stats.write().await;
             let entry = stats.entry(sid.to_string()).or_default();
             entry.turns_total = entry.turns_total.saturating_add(1);
+            entry.last_client_name = finished
+                .client_name
+                .clone()
+                .or(entry.last_client_name.clone());
+            entry.last_client_addr = finished
+                .client_addr
+                .clone()
+                .or(entry.last_client_addr.clone());
             entry.last_model = finished.model.clone().or(entry.last_model.clone());
             entry.last_reasoning_effort = finished
                 .reasoning_effort
@@ -1759,6 +1842,9 @@ impl ProxyState {
 fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCard {
     SessionIdentityCard {
         session_id,
+        observation_scope: SessionObservationScope::ObservedOnly,
+        last_client_name: None,
+        last_client_addr: None,
         cwd: None,
         active_count: 0,
         active_started_at_ms_min: None,
@@ -1816,6 +1902,14 @@ fn resolve_effective_observed_value(
     }
     non_empty_trimmed(observed_value)
         .map(|observed| ResolvedRouteValue::new(observed, RouteValueSource::RequestPayload))
+}
+
+fn classify_session_observation_scope(card: &SessionIdentityCard) -> SessionObservationScope {
+    if card.cwd.is_some() {
+        SessionObservationScope::HostLocalEnriched
+    } else {
+        SessionObservationScope::ObservedOnly
+    }
 }
 
 fn resolve_effective_config_value(
@@ -1991,6 +2085,12 @@ pub fn build_session_identity_cards_from_parts(
         if entry.cwd.is_none() {
             entry.cwd = req.cwd.clone();
         }
+        if entry.last_client_name.is_none() {
+            entry.last_client_name = req.client_name.clone();
+        }
+        if entry.last_client_addr.is_none() {
+            entry.last_client_addr = req.client_addr.clone();
+        }
         if let Some(effort) = req.reasoning_effort.as_ref() {
             entry.last_reasoning_effort = Some(effort.clone());
         }
@@ -2024,6 +2124,8 @@ pub fn build_session_identity_cards_from_parts(
             entry.last_status = Some(r.status_code);
             entry.last_duration_ms = Some(r.duration_ms);
             entry.last_ended_at_ms = Some(r.ended_at_ms);
+            entry.last_client_name = r.client_name.clone().or(entry.last_client_name.clone());
+            entry.last_client_addr = r.client_addr.clone().or(entry.last_client_addr.clone());
             entry.last_model = r.model.clone().or(entry.last_model.clone());
             entry.last_reasoning_effort = r
                 .reasoning_effort
@@ -2051,6 +2153,12 @@ pub fn build_session_identity_cards_from_parts(
 
         if entry.turns_total.is_none() {
             entry.turns_total = Some(st.turns_total);
+        }
+        if entry.last_client_name.is_none() {
+            entry.last_client_name = st.last_client_name.clone();
+        }
+        if entry.last_client_addr.is_none() {
+            entry.last_client_addr = st.last_client_addr.clone();
         }
         if entry.last_status.is_none() {
             entry.last_status = st.last_status;
@@ -2126,6 +2234,7 @@ pub fn build_session_identity_cards_from_parts(
             .as_deref()
             .and_then(|session_id| bindings.get(session_id));
         apply_basic_effective_route(card, global_config_override, binding);
+        card.observation_scope = classify_session_observation_scope(card);
     }
     cards.sort_by_key(|card| std::cmp::Reverse(session_identity_sort_key(card)));
     cards
@@ -2142,6 +2251,8 @@ mod tests {
         let active = vec![ActiveRequest {
             id: 1,
             session_id: Some("sid-active".to_string()),
+            client_name: Some("Frank-Laptop".to_string()),
+            client_addr: Some("100.64.0.8".to_string()),
             cwd: Some("G:/codes/project".to_string()),
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: Some("medium".to_string()),
@@ -2158,6 +2269,8 @@ mod tests {
             FinishedRequest {
                 id: 2,
                 session_id: Some("sid-recent".to_string()),
+                client_name: Some("Studio-Mini".to_string()),
+                client_addr: Some("100.64.0.9".to_string()),
                 cwd: Some("G:/codes/other".to_string()),
                 model: Some("gpt-5.3".to_string()),
                 reasoning_effort: Some("high".to_string()),
@@ -2183,6 +2296,8 @@ mod tests {
             FinishedRequest {
                 id: 3,
                 session_id: Some("sid-active".to_string()),
+                client_name: Some("Frank-Laptop".to_string()),
+                client_addr: Some("100.64.0.8".to_string()),
                 cwd: Some("G:/codes/project".to_string()),
                 model: Some("gpt-5.4".to_string()),
                 reasoning_effort: Some("low".to_string()),
@@ -2211,6 +2326,8 @@ mod tests {
             "sid-active".to_string(),
             SessionStats {
                 turns_total: 3,
+                last_client_name: Some("Frank-Laptop".to_string()),
+                last_client_addr: Some("100.64.0.8".to_string()),
                 last_model: Some("gpt-5.4".to_string()),
                 last_reasoning_effort: Some("low".to_string()),
                 last_service_tier: Some("flex".to_string()),
@@ -2245,8 +2362,20 @@ mod tests {
 
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].session_id.as_deref(), Some("sid-recent"));
+        assert_eq!(
+            cards[0].observation_scope,
+            SessionObservationScope::HostLocalEnriched
+        );
+        assert_eq!(cards[0].last_client_name.as_deref(), Some("Studio-Mini"));
+        assert_eq!(cards[0].last_client_addr.as_deref(), Some("100.64.0.9"));
         assert_eq!(cards[1].session_id.as_deref(), Some("sid-active"));
+        assert_eq!(
+            cards[1].observation_scope,
+            SessionObservationScope::HostLocalEnriched
+        );
         assert_eq!(cards[1].active_count, 1);
+        assert_eq!(cards[1].last_client_name.as_deref(), Some("Frank-Laptop"));
+        assert_eq!(cards[1].last_client_addr.as_deref(), Some("100.64.0.8"));
         assert_eq!(cards[1].last_status, Some(429));
         assert_eq!(cards[1].override_effort.as_deref(), Some("xhigh"));
         assert_eq!(cards[1].override_config_name.as_deref(), Some("temp"));
@@ -2302,6 +2431,8 @@ mod tests {
         let active = vec![ActiveRequest {
             id: 1,
             session_id: Some("sid-bound".to_string()),
+            client_name: Some("Workstation".to_string()),
+            client_addr: Some("100.64.0.10".to_string()),
             cwd: None,
             model: Some("gpt-observed".to_string()),
             reasoning_effort: Some("medium".to_string()),
@@ -2343,6 +2474,10 @@ mod tests {
         );
 
         assert_eq!(cards[0].binding_profile_name.as_deref(), Some("daily"));
+        assert_eq!(
+            cards[0].observation_scope,
+            SessionObservationScope::ObservedOnly
+        );
         assert_eq!(
             cards[0].binding_continuity_mode,
             Some(SessionContinuityMode::DefaultProfile)
@@ -2439,5 +2574,91 @@ mod tests {
                 .map(|value| value.value.as_str()),
             Some("https://right.example/v1")
         );
+    }
+
+    #[test]
+    fn apply_session_profile_binding_sets_binding_and_clears_manual_overrides() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let now_ms = 42;
+            let mut mgr = ServiceConfigManager::default();
+            mgr.configs.insert(
+                "right".to_string(),
+                ServiceConfig {
+                    name: "right".to_string(),
+                    alias: None,
+                    enabled: true,
+                    level: 1,
+                    upstreams: vec![UpstreamConfig {
+                        base_url: "https://right.example/v1".to_string(),
+                        auth: UpstreamAuth::default(),
+                        tags: HashMap::from([
+                            ("supports_reasoning_effort".to_string(), "true".to_string()),
+                            ("supports_service_tier".to_string(), "true".to_string()),
+                        ]),
+                        supported_models: HashMap::from([("gpt-5.4".to_string(), true)]),
+                        model_mapping: HashMap::new(),
+                    }],
+                },
+            );
+            mgr.profiles.insert(
+                "fast".to_string(),
+                crate::config::ServiceControlProfile {
+                    station: Some("right".to_string()),
+                    model: Some("gpt-5.4".to_string()),
+                    reasoning_effort: Some("low".to_string()),
+                    service_tier: Some("flex".to_string()),
+                },
+            );
+
+            state
+                .set_session_config_override("sid-1".to_string(), "other".to_string(), 1)
+                .await;
+            state
+                .set_session_model_override("sid-1".to_string(), "gpt-x".to_string(), 1)
+                .await;
+            state
+                .set_session_effort_override("sid-1".to_string(), "high".to_string(), 1)
+                .await;
+            state
+                .set_session_service_tier_override("sid-1".to_string(), "priority".to_string(), 1)
+                .await;
+
+            state
+                .apply_session_profile_binding(
+                    "codex",
+                    &mgr,
+                    "sid-1".to_string(),
+                    "fast".to_string(),
+                    now_ms,
+                )
+                .await
+                .expect("apply profile");
+
+            let binding = state
+                .get_session_binding("sid-1")
+                .await
+                .expect("binding exists");
+            assert_eq!(binding.profile_name.as_deref(), Some("fast"));
+            assert_eq!(binding.station_name.as_deref(), Some("right"));
+            assert_eq!(binding.model.as_deref(), Some("gpt-5.4"));
+            assert_eq!(binding.reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(binding.service_tier.as_deref(), Some("flex"));
+            assert_eq!(
+                binding.continuity_mode,
+                SessionContinuityMode::ManualProfile
+            );
+            assert_eq!(binding.updated_at_ms, now_ms);
+            assert!(state.get_session_config_override("sid-1").await.is_none());
+            assert!(state.get_session_model_override("sid-1").await.is_none());
+            assert!(state.get_session_effort_override("sid-1").await.is_none());
+            assert!(
+                state
+                    .get_session_service_tier_override("sid-1")
+                    .await
+                    .is_none()
+            );
+        });
     }
 }

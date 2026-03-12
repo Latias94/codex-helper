@@ -14,6 +14,7 @@ use crate::config::{
     proxy_home_dir,
     storage::{load_config, save_config},
 };
+use crate::dashboard_core::{ControlProfileOption, build_profile_options_from_mgr};
 use crate::sessions::{
     SessionSummary, SessionSummarySource, find_codex_session_file_by_id, read_codex_session_meta,
     read_codex_session_transcript,
@@ -181,6 +182,7 @@ pub(in crate::tui) async fn handle_key_event(
             _ => false,
         },
         Overlay::EffortMenu => handle_key_effort_menu(&state, ui, snapshot, key).await,
+        Overlay::ProfileMenuSession => handle_key_profile_menu(&state, ui, snapshot, key).await,
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             handle_key_provider_menu(&state, providers, ui, snapshot, key).await
         }
@@ -244,6 +246,20 @@ fn apply_selected_session(ui: &mut UiState, snapshot: &Snapshot, idx: usize) {
     let req_len = filtered_requests_len(snapshot, ui.selected_session_idx);
     ui.requests_table
         .select(if req_len == 0 { None } else { Some(0) });
+}
+
+async fn load_profile_options_for_service(
+    service_name: &str,
+) -> anyhow::Result<Vec<ControlProfileOption>> {
+    let cfg = load_config().await?;
+    let mgr = match service_name {
+        "claude" => &cfg.claude,
+        _ => &cfg.codex,
+    };
+    Ok(build_profile_options_from_mgr(
+        mgr,
+        mgr.default_profile.as_deref(),
+    ))
 }
 
 fn focus_session_in_sessions(ui: &mut UiState, snapshot: &Snapshot, sid: &str) -> bool {
@@ -493,6 +509,22 @@ async fn apply_effort_override(state: &ProxyState, sid: String, effort: Option<S
     } else {
         state.clear_session_effort_override(&sid).await;
     }
+}
+
+async fn apply_session_profile(
+    state: &ProxyState,
+    service_name: &str,
+    sid: String,
+    profile_name: String,
+) -> anyhow::Result<()> {
+    let cfg = load_config().await?;
+    let mgr = match service_name {
+        "claude" => &cfg.claude,
+        _ => &cfg.codex,
+    };
+    state
+        .apply_session_profile_binding(service_name, mgr, sid, profile_name, now_ms())
+        .await
 }
 
 async fn apply_session_provider_override(state: &ProxyState, sid: String, cfg: Option<String>) {
@@ -1601,6 +1633,52 @@ async fn handle_key_normal(
             ));
             true
         }
+        KeyCode::Char('b')
+            if ui.focus == Focus::Sessions
+                && matches!(ui.page, Page::Dashboard | Page::Sessions) =>
+        {
+            let Some(sid) = snapshot
+                .rows
+                .get(ui.selected_session_idx)
+                .and_then(|row| row.session_id.as_deref())
+            else {
+                ui.toast = Some(("no session selected".to_string(), Instant::now()));
+                return true;
+            };
+
+            match load_profile_options_for_service(ui.service_name).await {
+                Ok(profiles) if profiles.is_empty() => {
+                    ui.toast = Some((
+                        crate::tui::i18n::pick(
+                            ui.language,
+                            "profile: 当前服务没有可用 profile",
+                            "profile: no profiles configured for this service",
+                        )
+                        .to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Ok(profiles) => {
+                    let selected_profile = snapshot
+                        .rows
+                        .get(ui.selected_session_idx)
+                        .and_then(|row| row.binding_profile_name.as_deref());
+                    ui.profile_menu_idx = selected_profile
+                        .and_then(|name| profiles.iter().position(|profile| profile.name == name))
+                        .unwrap_or(0);
+                    ui.session_profile_options = profiles;
+                    ui.overlay = Overlay::ProfileMenuSession;
+                    ui.toast = Some((
+                        format!("profile: select target for {}", short_sid(sid, 18)),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    ui.toast = Some((format!("profile: load failed: {e}"), Instant::now()));
+                }
+            }
+            true
+        }
         KeyCode::Char('[') if ui.page == Page::Recent => {
             if ui.codex_recent_window_idx == 0 {
                 ui.codex_recent_window_idx = CODEX_RECENT_WINDOWS.len().saturating_sub(1);
@@ -1647,7 +1725,7 @@ async fn handle_key_normal(
             ));
             true
         }
-        KeyCode::Char('h') if ui.page == Page::Sessions => {
+        KeyCode::Char('H') if ui.page == Page::Sessions => {
             let Some(row) = snapshot.rows.get(ui.selected_session_idx) else {
                 ui.toast = Some(("sessions: no session selected".to_string(), Instant::now()));
                 return true;
@@ -2518,6 +2596,55 @@ async fn handle_key_effort_menu(
             apply_effort_override(state, sid, choice.value().map(|s| s.to_string())).await;
             ui.overlay = Overlay::None;
             ui.toast = Some((format!("effort set: {}", choice.label()), Instant::now()));
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn handle_key_profile_menu(
+    state: &ProxyState,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    key: KeyEvent,
+) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            ui.overlay = Overlay::None;
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.profile_menu_idx = ui.profile_menu_idx.saturating_sub(1);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let max = ui.session_profile_options.len().saturating_sub(1);
+            ui.profile_menu_idx = (ui.profile_menu_idx + 1).min(max);
+            true
+        }
+        KeyCode::Enter => {
+            let Some(profile) = ui.session_profile_options.get(ui.profile_menu_idx).cloned() else {
+                ui.overlay = Overlay::None;
+                return true;
+            };
+            let Some(sid) = snapshot
+                .rows
+                .get(ui.selected_session_idx)
+                .and_then(|row| row.session_id.clone())
+            else {
+                ui.overlay = Overlay::None;
+                return true;
+            };
+            match apply_session_profile(state, ui.service_name, sid, profile.name.clone()).await {
+                Ok(()) => {
+                    ui.needs_snapshot_refresh = true;
+                    ui.toast = Some((format!("profile applied: {}", profile.name), Instant::now()));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("profile apply failed: {err}"), Instant::now()));
+                }
+            }
+            ui.overlay = Overlay::None;
             true
         }
         _ => false,

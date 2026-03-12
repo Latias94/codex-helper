@@ -19,7 +19,7 @@ use crate::dashboard_core::{
     ApiV1Capabilities, ApiV1Snapshot, ConfigOption, ControlProfileOption,
     HostLocalControlPlaneCapabilities, RemoteAdminAccessCapabilities,
     SharedControlPlaneCapabilities, WindowStats, build_config_options_from_mgr,
-    build_dashboard_snapshot,
+    build_dashboard_snapshot, build_profile_options_from_mgr,
 };
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_port_for_proxy_port,
@@ -1561,29 +1561,15 @@ impl ProxyController {
                         "claude" => &cfg.claude,
                         _ => &cfg.codex,
                     };
-                    let profile = mgr
-                        .profile(profile_name.as_str())
-                        .with_context(|| format!("profile not found: {profile_name}"))?;
                     state
-                        .set_session_binding(crate::state::SessionBinding {
-                            session_id: session_id.clone(),
-                            profile_name: Some(profile_name),
-                            station_name: profile.station.clone(),
-                            model: profile.model.clone(),
-                            reasoning_effort: profile.reasoning_effort.clone(),
-                            service_tier: profile.service_tier.clone(),
-                            continuity_mode: crate::state::SessionContinuityMode::ManualProfile,
-                            created_at_ms: now,
-                            updated_at_ms: now,
-                            last_seen_ms: now,
-                        })
-                        .await;
-                    state.clear_session_config_override(&session_id).await;
-                    state.clear_session_model_override(&session_id).await;
-                    state.clear_session_effort_override(&session_id).await;
-                    state.clear_session_service_tier_override(&session_id).await;
-
-                    Ok::<(), anyhow::Error>(())
+                        .apply_session_profile_binding(
+                            service_name,
+                            mgr,
+                            session_id,
+                            profile_name,
+                            now,
+                        )
+                        .await
                 })?;
                 Ok(())
             }
@@ -2936,20 +2922,7 @@ fn list_profiles_from_cfg(
         "claude" => &cfg.claude,
         _ => &cfg.codex,
     };
-    let mut out = mgr
-        .profiles
-        .iter()
-        .map(|(name, profile)| ControlProfileOption {
-            name: name.clone(),
-            station: profile.station.clone(),
-            model: profile.model.clone(),
-            reasoning_effort: profile.reasoning_effort.clone(),
-            service_tier: profile.service_tier.clone(),
-            is_default: default_name == Some(name.as_str()),
-        })
-        .collect::<Vec<_>>();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    build_profile_options_from_mgr(mgr, default_name)
 }
 
 fn is_addr_in_use(err: &anyhow::Error) -> bool {

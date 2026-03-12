@@ -1,6 +1,7 @@
 use ratatui::widgets::{ListState, TableState};
 
 use crate::config::ResolvedRetryConfig;
+use crate::dashboard_core::ControlProfileOption;
 use crate::proxy::admin_port_for_proxy_port;
 use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
@@ -55,7 +56,9 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) sessions_page_errors_only: bool,
     pub(in crate::tui) sessions_page_overrides_only: bool,
     pub(in crate::tui) effort_menu_idx: usize,
+    pub(in crate::tui) profile_menu_idx: usize,
     pub(in crate::tui) provider_menu_idx: usize,
+    pub(in crate::tui) session_profile_options: Vec<ControlProfileOption>,
     pub(in crate::tui) stats_focus: StatsFocus,
     pub(in crate::tui) stats_days: usize,
     pub(in crate::tui) stats_errors_only: bool,
@@ -128,7 +131,9 @@ impl Default for UiState {
             sessions_page_errors_only: false,
             sessions_page_overrides_only: false,
             effort_menu_idx: 0,
+            profile_menu_idx: 0,
             provider_menu_idx: 0,
+            session_profile_options: Vec::new(),
             stats_focus: StatsFocus::Configs,
             stats_days: 21,
             stats_errors_only: false,

@@ -28,6 +28,7 @@ pub(in crate::tui) enum Overlay {
     None,
     Help,
     EffortMenu,
+    ProfileMenuSession,
     ProviderMenuSession,
     ProviderMenuGlobal,
     ConfigInfo,

@@ -25,7 +25,7 @@ mod tests;
 use crate::config::{ProxyConfig, RetryStrategy, ServiceConfigManager};
 use crate::dashboard_core::{
     ApiV1Capabilities, HostLocalControlPlaneCapabilities, RemoteAdminAccessCapabilities,
-    SharedControlPlaneCapabilities,
+    SharedControlPlaneCapabilities, build_profile_options_from_mgr,
 };
 use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
@@ -64,28 +64,6 @@ fn effective_runtime_config_state(
         .get(config_name)
         .copied()
         .unwrap_or_default()
-}
-
-fn list_profile_options_from_mgr(
-    mgr: &ServiceConfigManager,
-    default_name: Option<&str>,
-) -> Vec<crate::dashboard_core::ControlProfileOption> {
-    let mut profiles = mgr
-        .profiles
-        .iter()
-        .map(
-            |(name, profile)| crate::dashboard_core::ControlProfileOption {
-                name: name.clone(),
-                station: profile.station.clone(),
-                model: profile.model.clone(),
-                reasoning_effort: profile.reasoning_effort.clone(),
-                service_tier: profile.service_tier.clone(),
-                is_default: default_name == Some(name.as_str()),
-            },
-        )
-        .collect::<Vec<_>>();
-    profiles.sort_by(|a, b| a.name.cmp(&b.name));
-    profiles
 }
 
 async fn effective_default_profile_name(
@@ -3639,7 +3617,7 @@ pub fn router(proxy: ProxyService) -> Router {
         ProfilesResponse {
             default_profile: default_profile.clone(),
             configured_default_profile: mgr.default_profile.clone(),
-            profiles: list_profile_options_from_mgr(mgr, default_profile.as_deref()),
+            profiles: build_profile_options_from_mgr(mgr, default_profile.as_deref()),
         }
     }
 
@@ -4429,52 +4407,27 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
-        let Some(profile) = mgr.profile(payload.profile_name.as_str()) else {
+        if mgr.profile(payload.profile_name.as_str()).is_none() {
             return Err((
                 StatusCode::NOT_FOUND,
                 format!("profile '{}' not found", payload.profile_name),
             ));
-        };
-        crate::config::validate_profile_station_compatibility(
-            proxy.service_name,
-            mgr,
-            payload.profile_name.as_str(),
-            profile,
-        )
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        }
 
         let now = now_ms();
-        proxy
+        if let Err(err) = proxy
             .state
-            .set_session_binding(crate::state::SessionBinding {
-                session_id: payload.session_id.clone(),
-                profile_name: Some(payload.profile_name),
-                station_name: profile.station.clone(),
-                model: profile.model.clone(),
-                reasoning_effort: profile.reasoning_effort.clone(),
-                service_tier: profile.service_tier.clone(),
-                continuity_mode: crate::state::SessionContinuityMode::ManualProfile,
-                created_at_ms: now,
-                updated_at_ms: now,
-                last_seen_ms: now,
-            })
-            .await;
-        proxy
-            .state
-            .clear_session_config_override(payload.session_id.as_str())
-            .await;
-        proxy
-            .state
-            .clear_session_model_override(payload.session_id.as_str())
-            .await;
-        proxy
-            .state
-            .clear_session_effort_override(payload.session_id.as_str())
-            .await;
-        proxy
-            .state
-            .clear_session_service_tier_override(payload.session_id.as_str())
-            .await;
+            .apply_session_profile_binding(
+                proxy.service_name,
+                mgr,
+                payload.session_id,
+                payload.profile_name,
+                now,
+            )
+            .await
+        {
+            return Err((StatusCode::BAD_REQUEST, err.to_string()));
+        }
         Ok(StatusCode::NO_CONTENT)
     }
 
@@ -4666,7 +4619,7 @@ pub fn router(proxy: ProxyService) -> Router {
             configured_active_station,
             effective_active_station,
             default_profile: default_profile.clone(),
-            profiles: list_profile_options_from_mgr(mgr, default_profile.as_deref()),
+            profiles: build_profile_options_from_mgr(mgr, default_profile.as_deref()),
             snapshot,
         }))
     }

@@ -263,8 +263,8 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
         Overlay::None => match ui.page {
             Page::Dashboard => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  Enter effort  l/m/h/X 设置  x 清除  p 会话配置  P 全局配置  O/H(会话) o/h(请求) 跳转  ? 帮助",
-                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  Enter effort  l/m/h/X set  x clear  p session cfg  P global cfg  O/H(session) o/h(request) jump  ? help",
+                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile  Enter effort  l/m/h/X 设置  x 清除  p 会话配置  P 全局配置  O/H(会话) o/h(请求) 跳转  ? 帮助",
+                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile  Enter effort  l/m/h/X set  x clear  p session cfg  P global cfg  O/H(session) o/h(request) jump  ? help",
             ),
             Page::Configs => crate::tui::i18n::pick(
                 ui.language,
@@ -278,8 +278,8 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Sessions => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  o 打开到 Requests  h 打开到 History  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  a active_only  e errors_only  v overrides_only  r reset  t transcript  o open Requests  h open History  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  b 应用 profile  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  o 打开到 Requests  H 打开到 History  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  b apply profile  a active_only  e errors_only  v overrides_only  r reset  t transcript  o open Requests  H open History  ? help",
             ),
             Page::Stats => crate::tui::i18n::pick(
                 ui.language,
@@ -319,6 +319,11 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ui.language,
             "↑/↓ 选择  Enter 应用  Esc 取消",
             "↑/↓ select  Enter apply  Esc cancel",
+        ),
+        Overlay::ProfileMenuSession => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 选择 profile  Enter 应用  Esc 取消",
+            "↑/↓ select profile  Enter apply  Esc cancel",
         ),
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => crate::tui::i18n::pick(
             ui.language,

@@ -3,7 +3,10 @@ use std::collections::{BTreeSet, HashMap};
 use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamConfig};
 use crate::state::RuntimeConfigState;
 
-use super::types::{CapabilitySupport, ConfigCapabilitySummary, ConfigOption, ModelCatalogKind};
+use super::types::{
+    CapabilitySupport, ConfigCapabilitySummary, ConfigOption, ControlProfileOption,
+    ModelCatalogKind,
+};
 
 pub fn build_config_options_from_mgr(
     mgr: &ServiceConfigManager,
@@ -39,6 +42,26 @@ pub fn build_config_options_from_mgr(
         .collect::<Vec<_>>();
     configs.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
     configs
+}
+
+pub fn build_profile_options_from_mgr(
+    mgr: &ServiceConfigManager,
+    default_name: Option<&str>,
+) -> Vec<ControlProfileOption> {
+    let mut profiles = mgr
+        .profiles
+        .iter()
+        .map(|(name, profile)| ControlProfileOption {
+            name: name.clone(),
+            station: profile.station.clone(),
+            model: profile.model.clone(),
+            reasoning_effort: profile.reasoning_effort.clone(),
+            service_tier: profile.service_tier.clone(),
+            is_default: default_name == Some(name.as_str()),
+        })
+        .collect::<Vec<_>>();
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    profiles
 }
 
 fn build_config_capability_summary(config: &ServiceConfig) -> ConfigCapabilitySummary {
@@ -248,5 +271,37 @@ mod tests {
             blocked.capabilities.supports_reasoning_effort,
             CapabilitySupport::Unsupported
         );
+    }
+
+    #[test]
+    fn build_profile_options_from_mgr_marks_default_and_sorts() {
+        let mut mgr = ServiceConfigManager::default();
+        mgr.profiles.insert(
+            "z-fast".to_string(),
+            crate::config::ServiceControlProfile {
+                station: Some("z".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                reasoning_effort: Some("low".to_string()),
+                service_tier: None,
+            },
+        );
+        mgr.profiles.insert(
+            "a-deep".to_string(),
+            crate::config::ServiceControlProfile {
+                station: Some("a".to_string()),
+                model: Some("gpt-5".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                service_tier: Some("priority".to_string()),
+            },
+        );
+
+        let profiles = build_profile_options_from_mgr(&mgr, Some("z-fast"));
+
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].name, "a-deep");
+        assert!(!profiles[0].is_default);
+        assert_eq!(profiles[1].name, "z-fast");
+        assert!(profiles[1].is_default);
+        assert_eq!(profiles[1].reasoning_effort.as_deref(), Some("low"));
     }
 }
