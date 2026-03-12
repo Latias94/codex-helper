@@ -10,7 +10,7 @@ use crate::dashboard_core::WindowStats;
 pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
     ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState, ResolvedRouteValue,
-    SessionIdentityCard, UsageRollupView,
+    SessionIdentityCard, SessionObservationScope, UsageRollupView,
 };
 use crate::usage::UsageMetrics;
 
@@ -37,6 +37,10 @@ pub struct ProviderOption {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) session_id: Option<String>,
+    pub(in crate::tui) observation_scope: SessionObservationScope,
+    pub(in crate::tui) host_local_transcript_path: Option<String>,
+    pub(in crate::tui) last_client_name: Option<String>,
+    pub(in crate::tui) last_client_addr: Option<String>,
     pub(in crate::tui) cwd: Option<String>,
     pub(in crate::tui) active_count: usize,
     pub(in crate::tui) active_started_at_ms_min: Option<u64>,
@@ -72,8 +76,10 @@ pub(in crate::tui) struct SessionRow {
 pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) rows: Vec<SessionRow>,
     pub(in crate::tui) recent: Vec<FinishedRequest>,
+    pub(in crate::tui) model_overrides: HashMap<String, String>,
     pub(in crate::tui) overrides: HashMap<String, String>,
     pub(in crate::tui) config_overrides: HashMap<String, String>,
+    pub(in crate::tui) service_tier_overrides: HashMap<String, String>,
     pub(in crate::tui) global_override: Option<String>,
     pub(in crate::tui) config_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
     pub(in crate::tui) usage_rollup: UsageRollupView,
@@ -395,6 +401,10 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
         .iter()
         .map(|card| SessionRow {
             session_id: card.session_id.clone(),
+            observation_scope: card.observation_scope,
+            host_local_transcript_path: card.host_local_transcript_path.clone(),
+            last_client_name: card.last_client_name.clone(),
+            last_client_addr: card.last_client_addr.clone(),
             cwd: card.cwd.clone(),
             active_count: card.active_count as usize,
             active_started_at_ms_min: card.active_started_at_ms_min,
@@ -435,6 +445,40 @@ pub(in crate::tui) fn session_row_has_any_override(row: &SessionRow) -> bool {
         || row.override_effort.is_some()
         || row.override_config_name.is_some()
         || row.override_service_tier.is_some()
+}
+
+pub(in crate::tui) fn format_observed_client_identity(
+    client_name: Option<&str>,
+    client_addr: Option<&str>,
+) -> Option<String> {
+    match (
+        client_name.map(str::trim).filter(|value| !value.is_empty()),
+        client_addr.map(str::trim).filter(|value| !value.is_empty()),
+    ) {
+        (Some(name), Some(addr)) => Some(format!("{name} @ {addr}")),
+        (Some(name), None) => Some(name.to_string()),
+        (None, Some(addr)) => Some(addr.to_string()),
+        (None, None) => None,
+    }
+}
+
+pub(in crate::tui) fn session_observation_scope_label(
+    scope: SessionObservationScope,
+) -> &'static str {
+    match scope {
+        SessionObservationScope::ObservedOnly => "observed only",
+        SessionObservationScope::HostLocalEnriched => "host-local enriched",
+    }
+}
+
+pub(in crate::tui) fn session_transcript_host_status(row: &SessionRow) -> String {
+    if row.host_local_transcript_path.is_some() {
+        "linked under ~/.codex/sessions".to_string()
+    } else if row.session_id.is_some() {
+        "no host-local transcript detected".to_string()
+    } else {
+        "no session_id to match".to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,8 +594,10 @@ pub(in crate::tui) async fn refresh_snapshot(
     Snapshot {
         rows,
         recent: snap.recent,
+        model_overrides: snap.session_model_overrides,
         overrides: snap.session_effort_overrides,
         config_overrides: snap.session_config_overrides,
+        service_tier_overrides: snap.session_service_tier_overrides,
         global_override: snap.global_override,
         config_meta_overrides: config_meta,
         usage_rollup: snap.usage_rollup,
@@ -680,6 +726,10 @@ mod tests {
         let snapshot = Snapshot {
             rows: vec![SessionRow {
                 session_id: Some("sid-selected".to_string()),
+                observation_scope: SessionObservationScope::ObservedOnly,
+                host_local_transcript_path: None,
+                last_client_name: None,
+                last_client_addr: None,
                 cwd: None,
                 active_count: 0,
                 active_started_at_ms_min: None,
@@ -711,8 +761,10 @@ mod tests {
                 override_service_tier: None,
             }],
             recent: Vec::new(),
+            model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             config_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
             global_override: None,
             config_meta_overrides: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
@@ -734,6 +786,10 @@ mod tests {
         let snapshot = Snapshot {
             rows: vec![SessionRow {
                 session_id: Some("sid-selected".to_string()),
+                observation_scope: SessionObservationScope::ObservedOnly,
+                host_local_transcript_path: None,
+                last_client_name: None,
+                last_client_addr: None,
                 cwd: None,
                 active_count: 0,
                 active_started_at_ms_min: None,
@@ -810,8 +866,10 @@ mod tests {
                     ended_at_ms: 2,
                 },
             ],
+            model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             config_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
             global_override: None,
             config_meta_overrides: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
@@ -832,6 +890,10 @@ mod tests {
     fn session_control_posture_reports_profile_overrides() {
         let row = SessionRow {
             session_id: Some("sid-1".to_string()),
+            observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
+            last_client_name: None,
+            last_client_addr: None,
             cwd: None,
             active_count: 0,
             active_started_at_ms_min: None,

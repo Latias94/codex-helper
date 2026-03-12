@@ -45,8 +45,10 @@ pub(super) fn render_header(
         .filter(|r| r.status_code >= 400)
         .count();
     let updated = snapshot.refreshed_at.elapsed().as_millis();
+    let overrides_model = snapshot.model_overrides.len();
     let overrides_effort = snapshot.overrides.len();
     let overrides_cfg = snapshot.config_overrides.len();
+    let overrides_tier = snapshot.service_tier_overrides.len();
     let (hc_running, hc_canceling) = {
         let mut running = 0usize;
         let mut canceling = 0usize;
@@ -210,11 +212,11 @@ pub(super) fn render_header(
         ),
         Span::raw("   "),
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "覆盖 ", "overrides "),
+            crate::tui::i18n::pick(ui.language, "覆盖(M/E/C/T) ", "overrides(M/E/C/T) "),
             Style::default().fg(p.muted),
         ),
         Span::styled(
-            format!("{overrides_effort}/{overrides_cfg}"),
+            format!("{overrides_model}/{overrides_effort}/{overrides_cfg}/{overrides_tier}"),
             Style::default().fg(p.muted),
         ),
         Span::raw("   "),
@@ -263,8 +265,8 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
         Overlay::None => match ui.page {
             Page::Dashboard => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile  Enter effort  l/m/h/X 设置  x 清除  p 会话配置  P 全局配置  O/H(会话) o/h(请求) 跳转  ? 帮助",
-                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile  Enter effort  l/m/h/X set  x clear  p session cfg  P global cfg  O/H(session) o/h(request) jump  ? help",
+                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话配置  P 全局配置  O/H(会话) o/h(请求) 跳转  ? 帮助",
+                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session cfg  P global cfg  O/H(session) o/h(request) jump  ? help",
             ),
             Page::Configs => crate::tui::i18n::pick(
                 ui.language,
@@ -278,8 +280,8 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Sessions => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  b 应用 profile  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  o 打开到 Requests  H 打开到 History  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  b apply profile  a active_only  e errors_only  v overrides_only  r reset  t transcript  o open Requests  H open History  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  b profile绑定  M model  f fast/tier  R 重置覆盖  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  o 打开到 Requests  H 打开到 History  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  b profile binding  M model  f fast/tier  R reset overrides  a active_only  e errors_only  v overrides_only  r reset  t transcript  o open Requests  H open History  ? help",
             ),
             Page::Stats => crate::tui::i18n::pick(
                 ui.language,
@@ -320,10 +322,30 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             "↑/↓ 选择  Enter 应用  Esc 取消",
             "↑/↓ select  Enter apply  Esc cancel",
         ),
+        Overlay::ModelMenuSession => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 选择 model  Enter 应用  Esc 取消",
+            "↑/↓ select model  Enter apply  Esc cancel",
+        ),
+        Overlay::ModelInputSession => crate::tui::i18n::pick(
+            ui.language,
+            "输入 model  Enter 应用  Esc 返回菜单  Backspace 删除  Delete/Ctrl+U 清空",
+            "type model  Enter apply  Esc back to menu  Backspace delete  Delete/Ctrl+U clear",
+        ),
+        Overlay::ServiceTierMenuSession => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 选择 service tier  Enter 应用  Esc 取消",
+            "↑/↓ select service tier  Enter apply  Esc cancel",
+        ),
+        Overlay::ServiceTierInputSession => crate::tui::i18n::pick(
+            ui.language,
+            "输入 service_tier  Enter 应用  Esc 返回菜单  Backspace 删除  Delete/Ctrl+U 清空",
+            "type service_tier  Enter apply  Esc back to menu  Backspace delete  Delete/Ctrl+U clear",
+        ),
         Overlay::ProfileMenuSession => crate::tui::i18n::pick(
             ui.language,
-            "↑/↓ 选择 profile  Enter 应用  Esc 取消",
-            "↑/↓ select profile  Enter apply  Esc cancel",
+            "↑/↓ 选择 profile 操作  Enter 应用/清除绑定  Esc 取消",
+            "↑/↓ select profile action  Enter apply/clear binding  Esc cancel",
         ),
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => crate::tui::i18n::pick(
             ui.language,

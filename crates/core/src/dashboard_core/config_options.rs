@@ -64,6 +64,27 @@ pub fn build_profile_options_from_mgr(
     profiles
 }
 
+pub fn build_model_options_from_mgr(mgr: &ServiceConfigManager) -> Vec<String> {
+    let mut models = BTreeSet::new();
+
+    for profile in mgr.profiles.values() {
+        if let Some(model) = profile
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            models.insert(model.to_string());
+        }
+    }
+
+    for config in mgr.configs.values() {
+        models.extend(build_config_capability_summary(config).supported_models);
+    }
+
+    models.into_iter().collect()
+}
+
 fn build_config_capability_summary(config: &ServiceConfig) -> ConfigCapabilitySummary {
     let mut supported_models = BTreeSet::new();
     let mut has_declared_models = false;
@@ -303,5 +324,62 @@ mod tests {
         assert_eq!(profiles[1].name, "z-fast");
         assert!(profiles[1].is_default);
         assert_eq!(profiles[1].reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn build_model_options_from_mgr_merges_profiles_and_declared_models() {
+        let mut mgr = ServiceConfigManager::default();
+        mgr.profiles.insert(
+            "z-fast".to_string(),
+            crate::config::ServiceControlProfile {
+                station: Some("z".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                reasoning_effort: Some("low".to_string()),
+                service_tier: None,
+            },
+        );
+        mgr.profiles.insert(
+            "trimmed".to_string(),
+            crate::config::ServiceControlProfile {
+                station: None,
+                model: Some("  gpt-5.5-preview  ".to_string()),
+                reasoning_effort: None,
+                service_tier: None,
+            },
+        );
+        mgr.configs.insert(
+            "alpha".to_string(),
+            crate::config::ServiceConfig {
+                name: "alpha".to_string(),
+                alias: None,
+                enabled: true,
+                level: 1,
+                upstreams: vec![crate::config::UpstreamConfig {
+                    base_url: "https://alpha.example/v1".to_string(),
+                    auth: crate::config::UpstreamAuth::default(),
+                    tags: HashMap::from([("provider_id".to_string(), "alpha".to_string())]),
+                    supported_models: HashMap::from([
+                        ("gpt-5.4".to_string(), true),
+                        ("gpt-5.4-mini".to_string(), true),
+                    ]),
+                    model_mapping: HashMap::from([(
+                        "gpt-5.4-fast".to_string(),
+                        "gpt-5.4-mini".to_string(),
+                    )]),
+                }],
+            },
+        );
+
+        let models = build_model_options_from_mgr(&mgr);
+
+        assert_eq!(
+            models,
+            vec![
+                "gpt-5.4".to_string(),
+                "gpt-5.4-fast".to_string(),
+                "gpt-5.4-mini".to_string(),
+                "gpt-5.5-preview".to_string(),
+            ]
+        );
     }
 }

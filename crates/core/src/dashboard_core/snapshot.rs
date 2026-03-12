@@ -8,6 +8,7 @@ use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
     ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
     SessionIdentityCard, SessionStats, UsageRollupView, build_session_identity_cards_from_parts,
+    enrich_session_identity_cards_with_host_transcripts,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,7 +104,7 @@ pub async fn build_dashboard_snapshot(
 
     let stats_5m = compute_window_stats(&recent_all, now, 5 * 60_000, |_| true);
     let stats_1h = compute_window_stats(&recent_all, now, 60 * 60_000, |_| true);
-    let session_cards = build_session_identity_cards_from_parts(
+    let mut session_cards = build_session_identity_cards_from_parts(
         &active,
         &recent_all,
         &session_effort,
@@ -114,6 +115,7 @@ pub async fn build_dashboard_snapshot(
         global_override.as_deref(),
         &session_stats,
     );
+    enrich_session_identity_cards_with_host_transcripts(&mut session_cards).await;
 
     if recent_all.len() > recent_limit {
         recent_all.truncate(recent_limit);

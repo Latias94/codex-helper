@@ -8,8 +8,9 @@ use ratatui::widgets::{
 
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, now_ms, session_control_posture,
-    session_row_has_any_override, short_sid, shorten, shorten_middle, status_style, tokens_short,
+    Palette, Snapshot, basename, format_age, format_observed_client_identity, now_ms,
+    session_control_posture, session_observation_scope_label, session_row_has_any_override,
+    session_transcript_host_status, short_sid, shorten, shorten_middle, status_style, tokens_short,
     usage_line,
 };
 use crate::tui::state::UiState;
@@ -187,7 +188,7 @@ fn render_details_and_requests(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(0)])
+        .constraints([Constraint::Length(15), Constraint::Min(0)])
         .split(area);
 
     render_session_details(f, p, ui, snapshot, chunks[0]);
@@ -208,6 +209,20 @@ fn render_session_details(
     let cwd = selected
         .and_then(|r| r.cwd.as_deref())
         .map(|s| shorten_middle(s, 64))
+        .unwrap_or_else(|| "-".to_string());
+    let identity = selected
+        .map(|r| session_observation_scope_label(r.observation_scope).to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let transcript = selected
+        .map(session_transcript_host_status)
+        .unwrap_or_else(|| "-".to_string());
+    let client = selected
+        .and_then(|r| {
+            format_observed_client_identity(
+                r.last_client_name.as_deref(),
+                r.last_client_addr.as_deref(),
+            )
+        })
         .unwrap_or_else(|| "-".to_string());
 
     let override_effort = selected
@@ -237,6 +252,17 @@ fn render_session_details(
     let effort = selected
         .and_then(|r| r.override_effort.as_deref())
         .or_else(|| selected.and_then(|r| r.last_reasoning_effort.as_deref()))
+        .unwrap_or("-");
+    let service_tier = selected
+        .and_then(|r| {
+            r.override_service_tier
+                .as_deref()
+                .or(r
+                    .effective_service_tier
+                    .as_ref()
+                    .map(|value| value.value.as_str()))
+                .or(r.last_service_tier.as_deref())
+        })
         .unwrap_or("-");
 
     let now = now_ms();
@@ -275,6 +301,23 @@ fn render_session_details(
             short_sid(sid, 24),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ),
+        kv_line(p, "identity", identity, Style::default().fg(p.text)),
+        kv_line(
+            p,
+            "transcript",
+            transcript,
+            Style::default().fg(
+                if selected
+                    .and_then(|r| r.host_local_transcript_path.as_ref())
+                    .is_some()
+                {
+                    p.good
+                } else {
+                    p.muted
+                },
+            ),
+        ),
+        kv_line(p, "client", client, Style::default().fg(p.text)),
         kv_line(p, "cwd", cwd, Style::default().fg(p.text)),
         kv_line(
             p,
@@ -307,6 +350,16 @@ fn render_session_details(
             "effort",
             effort.to_string(),
             Style::default().fg(if override_effort != "-" {
+                p.accent
+            } else {
+                p.text
+            }),
+        ),
+        kv_line(
+            p,
+            "service_tier",
+            service_tier.to_string(),
+            Style::default().fg(if override_service_tier != "-" {
                 p.accent
             } else {
                 p.text

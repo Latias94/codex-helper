@@ -3197,7 +3197,12 @@ pub fn router(proxy: ProxyService) -> Router {
     #[derive(serde::Deserialize)]
     struct SessionProfileApplyRequest {
         session_id: String,
-        profile_name: String,
+        profile_name: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SessionOverrideResetRequest {
+        session_id: String,
     }
 
     #[derive(serde::Deserialize)]
@@ -3856,6 +3861,23 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(Json(map))
     }
 
+    async fn reset_session_manual_overrides(
+        proxy: ProxyService,
+        Json(payload): Json<SessionOverrideResetRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        if payload.session_id.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "session_id is required".to_string(),
+            ));
+        }
+        proxy
+            .state
+            .clear_session_manual_overrides(payload.session_id.as_str())
+            .await;
+        Ok(StatusCode::NO_CONTENT)
+    }
+
     async fn list_profiles(
         proxy: ProxyService,
     ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
@@ -4395,11 +4417,19 @@ pub fn router(proxy: ProxyService) -> Router {
                 "session_id is required".to_string(),
             ));
         }
-        if payload.profile_name.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "profile_name is required".to_string(),
-            ));
+        let profile_name = payload
+            .profile_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        if profile_name.is_none() {
+            proxy
+                .state
+                .clear_session_binding(payload.session_id.as_str())
+                .await;
+            return Ok(StatusCode::NO_CONTENT);
         }
 
         let cfg = proxy.config.snapshot().await;
@@ -4407,10 +4437,11 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
-        if mgr.profile(payload.profile_name.as_str()).is_none() {
+        let profile_name = profile_name.expect("profile_name checked above");
+        if mgr.profile(profile_name.as_str()).is_none() {
             return Err((
                 StatusCode::NOT_FOUND,
-                format!("profile '{}' not found", payload.profile_name),
+                format!("profile '{}' not found", profile_name),
             ));
         }
 
@@ -4421,7 +4452,7 @@ pub fn router(proxy: ProxyService) -> Router {
                 proxy.service_name,
                 mgr,
                 payload.session_id,
-                payload.profile_name,
+                profile_name,
                 now,
             )
             .await
@@ -4481,7 +4512,10 @@ pub fn router(proxy: ProxyService) -> Router {
     async fn list_session_identity_cards(
         proxy: ProxyService,
     ) -> Result<Json<Vec<crate::state::SessionIdentityCard>>, (StatusCode, String)> {
-        let mut cards = proxy.state.list_session_identity_cards(2_000).await;
+        let mut cards = proxy
+            .state
+            .list_session_identity_cards_with_host_transcripts(2_000)
+            .await;
         let cfg = proxy.config.snapshot().await;
         let mgr = match proxy.service_name {
             "claude" => &cfg.claude,
@@ -4543,6 +4577,7 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/overrides/session/effort",
                 "/__codex_helper/api/v1/overrides/session/config",
                 "/__codex_helper/api/v1/overrides/session/service-tier",
+                "/__codex_helper/api/v1/overrides/session/reset",
                 "/__codex_helper/api/v1/overrides/global-config",
                 "/__codex_helper/api/v1/healthcheck/start",
                 "/__codex_helper/api/v1/healthcheck/cancel",
@@ -4885,6 +4920,7 @@ pub fn router(proxy: ProxyService) -> Router {
     let p47 = proxy.clone();
     let p48 = proxy.clone();
     let p49 = proxy.clone();
+    let p50 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -5015,6 +5051,10 @@ pub fn router(proxy: ProxyService) -> Router {
             "/__codex_helper/api/v1/overrides/session/service-tier",
             get(move || list_session_service_tier_overrides(p23.clone()))
                 .post(move |payload| set_session_service_tier_override(p24.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/overrides/session/reset",
+            post(move |payload| reset_session_manual_overrides(p50.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/overrides/global-config",

@@ -28,6 +28,10 @@ pub(in crate::tui) enum Overlay {
     None,
     Help,
     EffortMenu,
+    ModelMenuSession,
+    ModelInputSession,
+    ServiceTierMenuSession,
+    ServiceTierInputSession,
     ProfileMenuSession,
     ProviderMenuSession,
     ProviderMenuGlobal,
@@ -62,6 +66,34 @@ impl EffortChoice {
             EffortChoice::Medium => Some("medium"),
             EffortChoice::High => Some("high"),
             EffortChoice::XHigh => Some("xhigh"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum ServiceTierChoice {
+    Clear,
+    Default,
+    Priority,
+    Flex,
+}
+
+impl ServiceTierChoice {
+    pub(in crate::tui) fn label(self) -> &'static str {
+        match self {
+            ServiceTierChoice::Clear => "Clear (use request/binding value)",
+            ServiceTierChoice::Default => "default",
+            ServiceTierChoice::Priority => "priority (fast)",
+            ServiceTierChoice::Flex => "flex",
+        }
+    }
+
+    pub(in crate::tui) fn value(self) -> Option<&'static str> {
+        match self {
+            ServiceTierChoice::Clear => None,
+            ServiceTierChoice::Default => Some("default"),
+            ServiceTierChoice::Priority => Some("priority"),
+            ServiceTierChoice::Flex => Some("flex"),
         }
     }
 }

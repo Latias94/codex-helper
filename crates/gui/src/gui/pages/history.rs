@@ -2399,6 +2399,7 @@ mod tests {
             supports_persisted_station_config: true,
             supports_default_profile_override: true,
             supports_config_runtime_override: true,
+            supports_session_override_reset: true,
             shared_capabilities: SharedControlPlaneCapabilities {
                 session_observability: true,
                 request_history: true,

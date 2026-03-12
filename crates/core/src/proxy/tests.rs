@@ -209,6 +209,7 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         "codex",
         Arc::new(std::sync::Mutex::new(HashMap::new())),
     );
+    let proxy_state = proxy.state.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -302,6 +303,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/profiles/{name}"))
     }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/overrides/session/reset"))
+    }));
     let host_local_history = crate::config::codex_sessions_dir().is_dir();
     assert_eq!(
         caps["shared_capabilities"]["session_observability"].as_bool(),
@@ -392,6 +398,28 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         .expect("set session config send");
     assert_eq!(set_session_cfg.status(), StatusCode::NO_CONTENT);
 
+    let set_model = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/model",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "session_id": "s1", "model": "gpt-5.4-fast" }))
+        .send()
+        .await
+        .expect("set model send");
+    assert_eq!(set_model.status(), StatusCode::NO_CONTENT);
+
+    let set_session_tier = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/service-tier",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "session_id": "s1", "service_tier": "priority" }))
+        .send()
+        .await
+        .expect("set session tier send");
+    assert_eq!(set_session_tier.status(), StatusCode::NO_CONTENT);
+
     let effort_map = client
         .get(format!(
             "http://{}/__codex_helper/api/v1/overrides/session/effort",
@@ -421,6 +449,110 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         .await
         .expect("get session config json");
     assert_eq!(session_cfg_map.get("s1").map(String::as_str), Some("test"));
+
+    let model_map = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/model",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get model send")
+        .error_for_status()
+        .expect("get model status")
+        .json::<HashMap<String, String>>()
+        .await
+        .expect("get model json");
+    assert_eq!(
+        model_map.get("s1").map(String::as_str),
+        Some("gpt-5.4-fast")
+    );
+
+    let tier_map = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/service-tier",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get tier send")
+        .error_for_status()
+        .expect("get tier status")
+        .json::<HashMap<String, String>>()
+        .await
+        .expect("get tier json");
+    assert_eq!(tier_map.get("s1").map(String::as_str), Some("priority"));
+
+    let reset_session_overrides = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/reset",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "session_id": "s1" }))
+        .send()
+        .await
+        .expect("reset session overrides send");
+    assert_eq!(reset_session_overrides.status(), StatusCode::NO_CONTENT);
+
+    let effort_map = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/effort",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get effort after reset send")
+        .error_for_status()
+        .expect("get effort after reset status")
+        .json::<HashMap<String, String>>()
+        .await
+        .expect("get effort after reset json");
+    assert!(!effort_map.contains_key("s1"));
+
+    let session_cfg_map = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/config",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get session config after reset send")
+        .error_for_status()
+        .expect("get session config after reset status")
+        .json::<HashMap<String, String>>()
+        .await
+        .expect("get session config after reset json");
+    assert!(!session_cfg_map.contains_key("s1"));
+
+    let model_map = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/model",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get model after reset send")
+        .error_for_status()
+        .expect("get model after reset status")
+        .json::<HashMap<String, String>>()
+        .await
+        .expect("get model after reset json");
+    assert!(!model_map.contains_key("s1"));
+
+    let tier_map = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/service-tier",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get tier after reset send")
+        .error_for_status()
+        .expect("get tier after reset status")
+        .json::<HashMap<String, String>>()
+        .await
+        .expect("get tier after reset json");
+    assert!(!tier_map.contains_key("s1"));
 
     let profiles = client
         .get(format!(
@@ -514,6 +646,23 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         .await
         .expect("apply profile send");
     assert_eq!(apply_profile.status(), StatusCode::NO_CONTENT);
+    let binding = proxy_state
+        .get_session_binding("s2")
+        .await
+        .expect("s2 binding");
+    assert_eq!(binding.profile_name.as_deref(), Some("fast"));
+
+    let clear_profile = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/profile",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "session_id": "s2", "profile_name": null }))
+        .send()
+        .await
+        .expect("clear profile send");
+    assert_eq!(clear_profile.status(), StatusCode::NO_CONTENT);
+    assert!(proxy_state.get_session_binding("s2").await.is_none());
 
     let model_map = client
         .get(format!(

@@ -3679,6 +3679,8 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     }
 
     let mut action_apply_session_profile: Option<(String, String)> = None;
+    let mut action_clear_session_profile_binding: Option<String> = None;
+    let mut action_clear_session_manual_overrides: Option<String> = None;
 
     ui.columns(2, |cols| {
         cols[0].heading(pick(ctx.lang, "列表", "List"));
@@ -3890,10 +3892,13 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 let Some(sid) = row.session_id.clone() else {
                     return;
                 };
-                match ctx
-                    .rt
-                    .block_on(crate::sessions::find_codex_session_file_by_id(&sid))
-                {
+                let resolved_path = if host_local_session_features {
+                    Ok(host_transcript_path_from_session_row(row))
+                } else {
+                    ctx.rt
+                        .block_on(crate::sessions::find_codex_session_file_by_id(&sid))
+                };
+                match resolved_path {
                     Ok(path) => {
                         if let Some(summary) =
                             session_history_summary_from_row(row, path.clone(), ctx.lang)
@@ -3951,10 +3956,13 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 let Some(sid) = row.session_id.clone() else {
                     return;
                 };
-                match ctx
-                    .rt
-                    .block_on(crate::sessions::find_codex_session_file_by_id(&sid))
-                {
+                let resolved_path = if let Some(path) = host_transcript_path_from_session_row(row) {
+                    Ok(Some(path))
+                } else {
+                    ctx.rt
+                        .block_on(crate::sessions::find_codex_session_file_by_id(&sid))
+                };
+                match resolved_path {
                     Ok(Some(path)) => {
                         if let Some(summary) =
                             session_history_summary_from_row(row, Some(path), ctx.lang)
@@ -4034,9 +4042,32 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         };
 
         let cfg_options = config_options_from_gui_configs(&snapshot.configs);
+        let has_session_manual_overrides = row.override_model.is_some()
+            || row.override_config_name.is_some()
+            || row.override_effort.is_some()
+            || row.override_service_tier.is_some();
 
         cols[1].add_space(6.0);
-        cols[1].label(pick(ctx.lang, "会话覆盖设置", "Session overrides"));
+        cols[1].horizontal(|ui| {
+            ui.label(pick(ctx.lang, "会话覆盖设置", "Session overrides"));
+            let reset_overrides = ui
+                .add_enabled(
+                    snapshot.supports_session_override_reset && has_session_manual_overrides,
+                    egui::Button::new(pick(
+                        ctx.lang,
+                        "重置 manual overrides",
+                        "Reset manual overrides",
+                    )),
+                )
+                .on_hover_text(pick(
+                    ctx.lang,
+                    "清除当前会话的 model / station / effort / service_tier 覆盖，不影响已绑定的 profile。",
+                    "Clear the current session model / station / effort / service_tier overrides without touching the bound profile.",
+                ));
+            if reset_overrides.clicked() {
+                action_clear_session_manual_overrides = Some(sid.clone());
+            }
+        });
 
         if profiles.is_empty() {
             cols[1].label(pick(
@@ -4067,7 +4098,7 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             });
 
             cols[1].horizontal(|ui| {
-                ui.label(pick(ctx.lang, "应用 profile", "Apply profile"));
+                ui.label(pick(ctx.lang, "Profile binding", "Profile binding"));
 
                 let mut selected_profile = ctx.view.sessions.editor.profile_selection.clone();
                 egui::ComboBox::from_id_salt(("session_profile_apply", sid.as_str()))
@@ -4104,6 +4135,20 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             .to_string(),
                         );
                     }
+                }
+
+                let clear_binding = ui
+                    .add_enabled(
+                        row.binding_profile_name.is_some(),
+                        egui::Button::new(pick(ctx.lang, "清除 binding", "Clear binding")),
+                    )
+                    .on_hover_text(pick(
+                        ctx.lang,
+                        "只移除当前会话已存储的 profile binding；保留 model / station / effort / service_tier 覆盖。",
+                        "Only removes the stored session profile binding; keep model / station / effort / service_tier overrides.",
+                    ));
+                if clear_binding.clicked() {
+                    action_clear_session_profile_binding = Some(sid.clone());
                 }
             });
 
@@ -4393,6 +4438,53 @@ fn render_sessions(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
             Err(e) => {
                 *ctx.last_error = Some(format!("apply profile failed: {e}"));
+            }
+        }
+    }
+
+    if let Some(sid) = action_clear_session_manual_overrides {
+        match ctx.proxy.clear_session_manual_overrides(ctx.rt, sid) {
+            Ok(()) => {
+                force_refresh = true;
+                ctx.view.sessions.editor.model_override.clear();
+                ctx.view.sessions.editor.config_override = None;
+                ctx.view.sessions.editor.effort_override = None;
+                ctx.view.sessions.editor.custom_effort.clear();
+                ctx.view.sessions.editor.service_tier_override = None;
+                ctx.view.sessions.editor.custom_service_tier.clear();
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "已重置 session manual overrides",
+                        "Session manual overrides reset",
+                    )
+                    .to_string(),
+                );
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!("reset session manual overrides failed: {e}"));
+            }
+        }
+    }
+
+    if let Some(sid) = action_clear_session_profile_binding {
+        match ctx.proxy.clear_session_profile_binding(ctx.rt, sid) {
+            Ok(()) => {
+                force_refresh = true;
+                ctx.view.sessions.editor.profile_selection = default_profile
+                    .clone()
+                    .or_else(|| profiles.first().map(|profile| profile.name.clone()));
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "已清除 profile binding",
+                        "Profile binding cleared",
+                    )
+                    .to_string(),
+                );
+            }
+            Err(e) => {
+                *ctx.last_error = Some(format!("clear profile binding failed: {e}"));
             }
         }
     }
@@ -5305,6 +5397,12 @@ fn session_history_summary_from_row(
     })
 }
 
+fn host_transcript_path_from_session_row(row: &SessionRow) -> Option<std::path::PathBuf> {
+    row.host_local_transcript_path
+        .as_deref()
+        .map(std::path::PathBuf::from)
+}
+
 fn request_history_bridge_summary(request: &FinishedRequest, lang: Language) -> String {
     let mut parts = vec![
         format!(
@@ -5418,6 +5516,9 @@ fn render_session_identity_card(
     )
     .unwrap_or_else(|| "-".to_string());
     let observation_scope = session_observation_scope_label(lang, row.observation_scope);
+    let transcript_host_status = session_transcript_host_status_label(lang, row);
+    let transcript_access =
+        session_transcript_access_message(lang, row, host_local_session_features);
     let cwd_full = row.cwd.as_deref().unwrap_or("-");
     let provider = row.last_provider_id.as_deref().unwrap_or("-");
     let binding_mode = session_binding_mode_label(row.binding_continuity_mode, lang);
@@ -5425,7 +5526,18 @@ fn render_session_identity_card(
     ui.group(|ui| {
         ui.label(pick(lang, "会话身份卡", "Session identity"));
         ui.monospace(format!("session_id: {sid_full}"));
-        ui.small(format!("scope: {observation_scope}"));
+        ui.small(format!(
+            "{}: {observation_scope}",
+            pick(lang, "identity source", "Identity source")
+        ));
+        ui.small(format!(
+            "{}: {transcript_host_status}",
+            pick(lang, "transcript(host)", "Transcript (host)")
+        ));
+        if let Some(path) = row.host_local_transcript_path.as_deref() {
+            ui.monospace(format!("transcript_path(host): {path}"));
+        }
+        ui.small(transcript_access);
         ui.small(format!("client(last): {client_full}"));
         ui.small(format!("cwd: {cwd_full}"));
         ui.small(format!("provider(last): {provider}"));
@@ -10218,6 +10330,7 @@ fn working_legacy_config_mut(
 struct SessionRow {
     session_id: Option<String>,
     observation_scope: SessionObservationScope,
+    host_local_transcript_path: Option<String>,
     last_client_name: Option<String>,
     last_client_addr: Option<String>,
     cwd: Option<String>,
@@ -10281,6 +10394,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
         .map(|card| SessionRow {
             session_id: card.session_id.clone(),
             observation_scope: card.observation_scope,
+            host_local_transcript_path: card.host_local_transcript_path.clone(),
             last_client_name: card.last_client_name.clone(),
             last_client_addr: card.last_client_addr.clone(),
             cwd: card.cwd.clone(),
@@ -10335,6 +10449,7 @@ fn build_session_rows(
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
             observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
             last_client_name: req.client_name.clone(),
             last_client_addr: req.client_addr.clone(),
             cwd: req.cwd.clone(),
@@ -10407,6 +10522,7 @@ fn build_session_rows(
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
             observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
             last_client_name: r.client_name.clone(),
             last_client_addr: r.client_addr.clone(),
             cwd: r.cwd.clone(),
@@ -10471,6 +10587,7 @@ fn build_session_rows(
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
             observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
             last_client_name: None,
             last_client_addr: None,
             cwd: None,
@@ -10551,6 +10668,7 @@ fn build_session_rows(
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
             observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
             last_client_name: None,
             last_client_addr: None,
             cwd: None,
@@ -10589,6 +10707,7 @@ fn build_session_rows(
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
             observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
             last_client_name: None,
             last_client_addr: None,
             cwd: None,
@@ -10627,6 +10746,7 @@ fn build_session_rows(
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
             observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
             last_client_name: None,
             last_client_addr: None,
             cwd: None,
@@ -10665,6 +10785,7 @@ fn build_session_rows(
         let entry = map.entry(key.clone()).or_insert_with(|| SessionRow {
             session_id: key,
             observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
             last_client_name: None,
             last_client_addr: None,
             cwd: None,
@@ -10753,6 +10874,69 @@ fn session_observation_scope_label(lang: Language, scope: SessionObservationScop
         SessionObservationScope::HostLocalEnriched => {
             pick(lang, "代理主机 enrich", "Host-local enriched")
         }
+    }
+}
+
+fn session_transcript_host_status_label(lang: Language, row: &SessionRow) -> String {
+    if row.host_local_transcript_path.is_some() {
+        pick(
+            lang,
+            "已在 ~/.codex/sessions 链接",
+            "linked under ~/.codex/sessions",
+        )
+        .to_string()
+    } else if row.session_id.is_some() {
+        pick(
+            lang,
+            "未检测到 host-local transcript",
+            "no host-local transcript detected",
+        )
+        .to_string()
+    } else {
+        pick(lang, "无 session_id，无法匹配", "no session_id to match").to_string()
+    }
+}
+
+fn session_transcript_access_message(
+    lang: Language,
+    row: &SessionRow,
+    host_local_session_features: bool,
+) -> String {
+    match (
+        row.session_id.is_some(),
+        row.host_local_transcript_path.is_some(),
+        host_local_session_features,
+    ) {
+        (false, _, _) => pick(
+            lang,
+            "当前记录没有 session_id，不能建立 transcript 映射。",
+            "This record has no session_id, so transcript mapping is unavailable.",
+        )
+        .to_string(),
+        (true, true, true) => pick(
+            lang,
+            "这台设备可直接打开这个 host-local transcript。",
+            "This device can open the linked host-local transcript directly.",
+        )
+        .to_string(),
+        (true, true, false) => pick(
+            lang,
+            "代理主机已链接到 transcript，但当前附着设备不能直接访问代理主机的文件系统。",
+            "The proxy host has a linked transcript, but this attached device cannot access the proxy host filesystem directly.",
+        )
+        .to_string(),
+        (true, false, true) => pick(
+            lang,
+            "这台设备具备 host-local 能力，但当前未在 ~/.codex/sessions 下找到匹配文件。",
+            "This device has host-local access, but no matching file was found under ~/.codex/sessions yet.",
+        )
+        .to_string(),
+        (true, false, false) => pick(
+            lang,
+            "当前是远端附着视角；可控制该 session_id，但不能假设本机可读取代理主机的 transcript。",
+            "This is a remote-attached view; the session_id is controllable, but local transcript access on the proxy host cannot be assumed here.",
+        )
+        .to_string(),
     }
 }
 
@@ -11697,6 +11881,7 @@ mod tests {
         SessionRow {
             session_id: Some("sid-1".to_string()),
             observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
             last_client_name: None,
             last_client_addr: None,
             cwd: Some("G:/codes/rust/codex-helper".to_string()),

@@ -109,6 +109,7 @@ pub struct AttachedStatus {
     pub supports_persisted_station_config: bool,
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
+    pub supports_session_override_reset: bool,
     pub supports_station_api: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
@@ -159,6 +160,7 @@ impl AttachedStatus {
             supports_persisted_station_config: false,
             supports_default_profile_override: false,
             supports_config_runtime_override: false,
+            supports_session_override_reset: false,
             supports_station_api: false,
             shared_capabilities: SharedControlPlaneCapabilities::default(),
             host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
@@ -199,6 +201,7 @@ pub struct GuiRuntimeSnapshot {
     pub supports_persisted_station_config: bool,
     pub supports_default_profile_override: bool,
     pub supports_config_runtime_override: bool,
+    pub supports_session_override_reset: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
     pub remote_admin_access: RemoteAdminAccessCapabilities,
@@ -455,6 +458,7 @@ impl ProxyController {
                 supports_persisted_station_config: true,
                 supports_default_profile_override: true,
                 supports_config_runtime_override: true,
+                supports_session_override_reset: true,
                 shared_capabilities: local_shared_control_plane_capabilities(),
                 host_local_capabilities: local_host_local_control_plane_capabilities(),
                 remote_admin_access: local_remote_admin_access_capabilities(),
@@ -490,6 +494,7 @@ impl ProxyController {
                 supports_persisted_station_config: a.supports_persisted_station_config,
                 supports_default_profile_override: a.supports_default_profile_override,
                 supports_config_runtime_override: a.supports_config_runtime_override,
+                supports_session_override_reset: a.supports_session_override_reset,
                 shared_capabilities: a.shared_capabilities.clone(),
                 host_local_capabilities: a.host_local_capabilities.clone(),
                 remote_admin_access: a.remote_admin_access.clone(),
@@ -872,6 +877,7 @@ impl ProxyController {
                 supports_persisted_station_config: bool,
                 supports_default_profile_override: bool,
                 supports_config_runtime_override: bool,
+                supports_session_override_reset: bool,
                 supports_station_api: bool,
                 shared_capabilities: SharedControlPlaneCapabilities,
                 host_local_capabilities: HostLocalControlPlaneCapabilities,
@@ -919,6 +925,9 @@ impl ProxyController {
                     let supports_default_profile_override = endpoints
                         .iter()
                         .any(|e| e == "/__codex_helper/api/v1/profiles/default");
+                    let supports_session_override_reset = endpoints
+                        .iter()
+                        .any(|e| e == "/__codex_helper/api/v1/overrides/session/reset");
                     let supports_persisted_station_config = endpoints.iter().any(|e| {
                         e == "/__codex_helper/api/v1/stations/config-active"
                             || e == "/__codex_helper/api/v1/stations/{name}"
@@ -1105,6 +1114,7 @@ impl ProxyController {
                             supports_persisted_station_config,
                             supports_default_profile_override,
                             supports_config_runtime_override,
+                            supports_session_override_reset,
                             supports_station_api,
                             shared_capabilities,
                             host_local_capabilities,
@@ -1299,6 +1309,7 @@ impl ProxyController {
                         supports_persisted_station_config,
                         supports_default_profile_override,
                         supports_config_runtime_override,
+                        supports_session_override_reset,
                         supports_station_api,
                         shared_capabilities,
                         host_local_capabilities,
@@ -1371,6 +1382,7 @@ impl ProxyController {
                     supports_persisted_station_config: false,
                     supports_default_profile_override: false,
                     supports_config_runtime_override: false,
+                    supports_session_override_reset: false,
                     supports_station_api: false,
                     shared_capabilities: SharedControlPlaneCapabilities::default(),
                     host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
@@ -1432,6 +1444,7 @@ impl ProxyController {
                     att.supports_default_profile_override =
                         result.supports_default_profile_override;
                     att.supports_config_runtime_override = result.supports_config_runtime_override;
+                    att.supports_session_override_reset = result.supports_session_override_reset;
                     att.supports_station_api = result.supports_station_api;
                     att.shared_capabilities = result.shared_capabilities;
                     att.host_local_capabilities = result.host_local_capabilities;
@@ -1589,6 +1602,93 @@ impl ProxyController {
                             .json(&serde_json::json!({
                                 "session_id": session_id,
                                 "profile_name": profile_name,
+                            })),
+                    )
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
+    pub fn clear_session_profile_binding(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        session_id: String,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                let state = r.state.clone();
+                rt.block_on(async move {
+                    state.clear_session_binding(session_id.as_str()).await;
+                });
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) {
+                    bail!(
+                        "attached proxy does not support session profile binding clear (need api v1)"
+                    );
+                }
+                let base = att.admin_base_url.clone();
+                let client = self.http_client.clone();
+                let fut = async move {
+                    send_admin_request(
+                        client
+                            .post(format!(
+                                "{base}/__codex_helper/api/v1/overrides/session/profile"
+                            ))
+                            .timeout(Duration::from_millis(1200))
+                            .json(&serde_json::json!({
+                                "session_id": session_id,
+                                "profile_name": serde_json::Value::Null,
+                            })),
+                    )
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
+    pub fn clear_session_manual_overrides(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        session_id: String,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                let state = r.state.clone();
+                rt.block_on(async move {
+                    state
+                        .clear_session_manual_overrides(session_id.as_str())
+                        .await;
+                });
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) || !att.supports_session_override_reset {
+                    bail!(
+                        "attached proxy does not support session manual override reset (need api v1)"
+                    );
+                }
+                let base = att.admin_base_url.clone();
+                let client = self.http_client.clone();
+                let fut = async move {
+                    send_admin_request(
+                        client
+                            .post(format!(
+                                "{base}/__codex_helper/api/v1/overrides/session/reset"
+                            ))
+                            .timeout(Duration::from_millis(1200))
+                            .json(&serde_json::json!({
+                                "session_id": session_id,
                             })),
                     )
                     .await?;
@@ -3712,6 +3812,50 @@ mod tests {
             Some("right")
         );
         assert_eq!(*delete_hits.lock().expect("delete hits lock"), 1);
+
+        handle.abort();
+    }
+
+    #[test]
+    fn attached_session_override_reset_uses_v1_reset_endpoint() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let observed_payload = Arc::new(Mutex::new(None::<Value>));
+        let app = Router::new().route(
+            "/__codex_helper/api/v1/overrides/session/reset",
+            post({
+                let observed_payload = observed_payload.clone();
+                move |Json(payload): Json<Value>| {
+                    let observed_payload = observed_payload.clone();
+                    async move {
+                        *observed_payload.lock().expect("reset payload lock") = Some(payload);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4305, ServiceKind::Codex);
+        let mut attached = AttachedStatus::new(4305);
+        attached.api_version = Some(1);
+        attached.admin_base_url = base_url;
+        attached.supports_session_override_reset = true;
+        controller.mode = ProxyMode::Attached(attached);
+
+        controller
+            .clear_session_manual_overrides(&rt, "sid-reset".to_string())
+            .expect("reset session manual overrides");
+
+        let observed_payload = observed_payload
+            .lock()
+            .expect("reset payload lock")
+            .clone()
+            .expect("reset payload");
+        assert_eq!(
+            observed_payload.get("session_id"),
+            Some(&Value::String("sid-reset".to_string()))
+        );
 
         handle.abort();
     }

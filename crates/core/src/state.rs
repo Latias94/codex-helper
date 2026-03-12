@@ -326,6 +326,8 @@ pub struct SessionIdentityCard {
     #[serde(default)]
     pub observation_scope: SessionObservationScope,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_local_transcript_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_client_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_client_addr: Option<String>,
@@ -1686,6 +1688,15 @@ impl ProxyState {
         )
     }
 
+    pub async fn list_session_identity_cards_with_host_transcripts(
+        &self,
+        recent_limit: usize,
+    ) -> Vec<SessionIdentityCard> {
+        let mut cards = self.list_session_identity_cards(recent_limit).await;
+        enrich_session_identity_cards_with_host_transcripts(&mut cards).await;
+        cards
+    }
+
     pub fn spawn_cleanup_task(state: Arc<Self>) {
         // Run periodically; no need to be super frequent.
         tokio::spawn(async move {
@@ -1843,6 +1854,7 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
     SessionIdentityCard {
         session_id,
         observation_scope: SessionObservationScope::ObservedOnly,
+        host_local_transcript_path: None,
         last_client_name: None,
         last_client_addr: None,
         cwd: None,
@@ -2238,6 +2250,32 @@ pub fn build_session_identity_cards_from_parts(
     }
     cards.sort_by_key(|card| std::cmp::Reverse(session_identity_sort_key(card)));
     cards
+}
+
+pub async fn enrich_session_identity_cards_with_host_transcripts(
+    cards: &mut [SessionIdentityCard],
+) {
+    let session_ids = cards
+        .iter()
+        .filter_map(|card| card.session_id.as_deref())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if session_ids.is_empty() {
+        return;
+    }
+
+    let found = match sessions::find_codex_session_files_by_ids(&session_ids).await {
+        Ok(found) => found,
+        Err(_) => return,
+    };
+
+    for card in cards {
+        card.host_local_transcript_path = card
+            .session_id
+            .as_deref()
+            .and_then(|sid| found.get(sid))
+            .map(|path| path.to_string_lossy().to_string());
+    }
 }
 
 #[cfg(test)]

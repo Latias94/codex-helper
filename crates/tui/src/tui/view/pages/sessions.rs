@@ -5,8 +5,9 @@ use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, T
 
 use crate::state::{ResolvedRouteValue, RouteValueSource};
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, now_ms, session_control_posture,
-    session_row_has_any_override, short_sid, shorten, shorten_middle, status_style, tokens_short,
+    Palette, Snapshot, basename, format_age, format_observed_client_identity, now_ms,
+    session_control_posture, session_observation_scope_label, session_row_has_any_override,
+    session_transcript_host_status, short_sid, shorten, shorten_middle, status_style, tokens_short,
     usage_line,
 };
 use crate::tui::state::UiState;
@@ -196,6 +197,17 @@ pub(super) fn render_sessions_page(
             .as_deref()
             .map(|s| shorten_middle(s, 80))
             .unwrap_or_else(|| "-".to_string());
+        let identity_source = session_observation_scope_label(row.observation_scope);
+        let transcript_status = session_transcript_host_status(row);
+        let transcript_path = row
+            .host_local_transcript_path
+            .as_deref()
+            .map(|path| shorten_middle(path, 80));
+        let client_full = format_observed_client_identity(
+            row.last_client_name.as_deref(),
+            row.last_client_addr.as_deref(),
+        )
+        .unwrap_or_else(|| "-".to_string());
         let observed_model = row.last_model.as_deref().unwrap_or("-");
         let provider = row.last_provider_id.as_deref().unwrap_or("-");
         let observed_cfg = row.last_config_name.as_deref().unwrap_or("-");
@@ -235,6 +247,31 @@ pub(super) fn render_sessions_page(
             "session",
             sid_full.to_string(),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ));
+        lines.push(kv_line(
+            p,
+            "identity",
+            identity_source.to_string(),
+            Style::default().fg(p.text),
+        ));
+        lines.push(kv_line(
+            p,
+            "transcript",
+            transcript_status,
+            Style::default().fg(if row.host_local_transcript_path.is_some() {
+                p.good
+            } else {
+                p.muted
+            }),
+        ));
+        if let Some(path) = transcript_path {
+            lines.push(kv_line(p, "tx_path", path, Style::default().fg(p.muted)));
+        }
+        lines.push(kv_line(
+            p,
+            "client(last)",
+            client_full,
+            Style::default().fg(p.text),
         ));
         lines.push(kv_line(p, "cwd", cwd_full, Style::default().fg(p.text)));
         lines.push(kv_line(
@@ -393,7 +430,10 @@ pub(super) fn render_sessions_page(
         lines.push(Line::from("  e toggle errors-only"));
         lines.push(Line::from("  v toggle overrides-only"));
         lines.push(Line::from("  r reset filters"));
-        lines.push(Line::from("  b apply profile"));
+        lines.push(Line::from("  b manage profile binding"));
+        lines.push(Line::from("  M open model menu"));
+        lines.push(Line::from("  f open fast / service tier menu"));
+        lines.push(Line::from("  R reset current session manual overrides"));
         lines.push(Line::from("  t transcript (full-screen)"));
         lines.push(Line::from("  o open session in Requests"));
         lines.push(Line::from("  H open session in History"));

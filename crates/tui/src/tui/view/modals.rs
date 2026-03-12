@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use crate::tui::ProviderOption;
 use crate::tui::model::{Palette, Snapshot, compute_window_stats, now_ms, shorten, shorten_middle};
 use crate::tui::state::UiState;
-use crate::tui::types::{EffortChoice, Overlay};
+use crate::tui::types::{EffortChoice, Overlay, ServiceTierChoice};
 
 use super::widgets::centered_rect;
 
@@ -646,7 +646,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  Tab        切换焦点（总览页）"),
             Line::from("  6 设置     查看运行态与关键配置入口"),
             Line::from(
-                "  总览页     b 打开 profile 菜单；O/H 从会话面板跳到 Requests/History；o/h 从请求面板跳到 Sessions/History",
+                "  总览页     b 打开 profile 菜单；M 打开 model 菜单；f 打开 fast / service tier 菜单；R 重置当前会话 manual overrides；O/H 从会话面板跳到 Requests/History；o/h 从请求面板跳到 Sessions/History",
             ),
             Line::from(""),
             Line::from(vec![Span::styled(
@@ -656,6 +656,23 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  Enter      打开 effort 菜单（会话列表）"),
             Line::from("  l/m/h/X    设置 low/medium/high/xhigh"),
             Line::from("  x          清除 effort 覆盖"),
+            Line::from("  R          重置当前会话 model/station/effort/service_tier 覆盖"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "模型覆盖",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  M          打开 model 菜单（Dashboard/Sessions）"),
+            Line::from("  clear      清除当前会话 model 覆盖"),
+            Line::from("  Custom...  输入任意 model 名称"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Fast / Service Tier",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  f          打开 fast / service tier 菜单（Dashboard/Sessions）"),
+            Line::from("  priority   通常对应 fast mode"),
+            Line::from("  Custom...  输入任意 service_tier"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Provider 覆盖",
@@ -664,6 +681,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  p          会话级 provider 覆盖（固定）"),
             Line::from("  P          全局 active provider（首选，可 failover）"),
             Line::from("  b          打开 session profile 菜单（Dashboard/Sessions）"),
+            Line::from("  Clear binding  清除当前会话已存储的 profile 绑定（保留其他会话覆盖）"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "配置页（Configs）",
@@ -696,6 +714,9 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  e          仅看错误（errors-only）"),
             Line::from("  v          仅看覆盖（overrides-only）"),
             Line::from("  r          重置筛选"),
+            Line::from("  M          打开 model 菜单"),
+            Line::from("  f          打开 fast / service tier 菜单"),
+            Line::from("  R          重置当前会话 manual overrides"),
             Line::from("  t          对话记录（全屏）"),
             Line::from("  o/H        打开到 Requests / History"),
             Line::from(""),
@@ -747,7 +768,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  L          toggle language (zh/en, persisted)"),
             Line::from("  6 Settings show runtime + config overview"),
             Line::from(
-                "  Dashboard  b opens profile menu; O/H jump from Sessions panel to Requests/History; o/h jump from Requests panel to Sessions/History",
+                "  Dashboard  b opens profile menu; M opens model menu; f opens fast / service tier menu; R resets current session manual overrides; O/H jump from Sessions panel to Requests/History; o/h jump from Requests panel to Sessions/History",
             ),
             Line::from(""),
             Line::from(vec![Span::styled(
@@ -757,6 +778,23 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  Enter      open effort menu (on Sessions)"),
             Line::from("  l/m/h/X    set low/medium/high/xhigh"),
             Line::from("  x          clear effort override"),
+            Line::from("  R          reset session model/station/effort/service_tier overrides"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Model override",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  M          open model menu (Dashboard/Sessions)"),
+            Line::from("  clear      clear the session model override"),
+            Line::from("  Custom...  enter any model name"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Fast / Service tier",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from("  f          open fast / service tier menu (Dashboard/Sessions)"),
+            Line::from("  priority   usually maps to fast mode"),
+            Line::from("  Custom...  enter any service_tier"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Provider override",
@@ -765,6 +803,9 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  p          session provider override (pinned)"),
             Line::from("  P          global active provider (preferred, failover enabled)"),
             Line::from("  b          open session profile menu (Dashboard/Sessions)"),
+            Line::from(
+                "  Clear binding  clear the stored session profile binding and keep other session overrides",
+            ),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Configs page",
@@ -797,6 +838,9 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  e          toggle errors-only"),
             Line::from("  v          toggle overrides-only"),
             Line::from("  r          reset filters"),
+            Line::from("  M          open model menu"),
+            Line::from("  f          open fast / service tier menu"),
+            Line::from("  R          reset current session manual overrides"),
             Line::from("  t          transcript (full-screen)"),
             Line::from("  o/H        open in Requests / History"),
             Line::from(""),
@@ -1008,50 +1052,322 @@ pub(super) fn render_effort_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
     f.render_stateful_widget(list, area, &mut ui.menu_list);
 }
 
-pub(super) fn render_profile_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
-    let area = centered_rect(74, 68, f.area());
+pub(super) fn render_model_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
+    let area = centered_rect(68, 64, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(
-            crate::tui::i18n::pick(ui.language, "应用 Session Profile", "Apply session profile"),
+            crate::tui::i18n::pick(ui.language, "设置 Session Model", "Set session model"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.focus))
         .style(Style::default().bg(p.panel));
 
-    let items = ui
-        .session_profile_options
+    let mut items = Vec::with_capacity(ui.session_model_options.len().saturating_add(1));
+    items.push(ListItem::new(Text::from(vec![
+        Line::from(crate::tui::i18n::pick(
+            ui.language,
+            "Clear (清除会话 model 覆盖)",
+            "Clear (remove session model override)",
+        )),
+        Line::from(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "恢复为 request / binding / runtime 的默认路由",
+                "Use request / binding / runtime routing again",
+            ),
+            Style::default().fg(p.muted),
+        )),
+    ])));
+    items.extend(ui.session_model_options.iter().map(|model| {
+        ListItem::new(Text::from(vec![
+            Line::from(shorten_middle(model, 56)),
+            Line::from(Span::styled(
+                crate::tui::i18n::pick(
+                    ui.language,
+                    "应用为当前会话的 model override",
+                    "Apply as the session model override",
+                ),
+                Style::default().fg(p.muted),
+            )),
+        ]))
+    }));
+    items.push(ListItem::new(Text::from(vec![
+        Line::from(crate::tui::i18n::pick(
+            ui.language,
+            "Custom...（输入任意 model）",
+            "Custom... (enter any model)",
+        )),
+        Line::from(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "打开输入框，手动填写 model override",
+                "Open an input box for arbitrary model override",
+            ),
+            Style::default().fg(p.muted),
+        )),
+    ])));
+
+    let max = items.len().saturating_sub(1);
+    ui.menu_list.select(Some(ui.model_menu_idx.min(max)));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
+        .highlight_symbol("  ");
+    f.render_stateful_widget(list, area, &mut ui.menu_list);
+}
+
+pub(super) fn render_model_input_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
+    let area = centered_rect(72, 36, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "输入自定义 Session Model",
+                "Enter custom session model",
+            ),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let current = ui.session_model_input.trim();
+    let current = if current.is_empty() {
+        "<empty>"
+    } else {
+        current
+    };
+    let hint = ui.session_model_input_hint.as_deref().unwrap_or("-");
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                crate::tui::i18n::pick(ui.language, "当前输入: ", "current: "),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled(current.to_string(), Style::default().fg(p.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                crate::tui::i18n::pick(ui.language, "当前会话模型: ", "session hint: "),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled(shorten_middle(hint, 56), Style::default().fg(p.accent)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "输入任意 model 名称。Enter 应用，Esc 返回菜单，Backspace 删除，Delete / Ctrl+U 清空。空值会清除会话 model 覆盖。",
+                "Type any model name. Enter applies, Esc returns to menu, Backspace deletes, Delete / Ctrl+U clears. Empty value clears the session model override.",
+            ),
+            Style::default().fg(p.muted),
+        )),
+    ];
+
+    let content = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(p.text))
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, area);
+}
+
+pub(super) fn render_service_tier_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
+    let area = centered_rect(58, 52, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "设置 Fast / Service Tier",
+                "Set fast / service tier",
+            ),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let choices = [
+        ServiceTierChoice::Clear,
+        ServiceTierChoice::Default,
+        ServiceTierChoice::Priority,
+        ServiceTierChoice::Flex,
+    ];
+    let items = choices
         .iter()
-        .map(|profile| {
-            let mut label = profile.name.clone();
-            if profile.is_default {
-                label.push_str(" *default");
-            }
-            let mut parts = Vec::new();
-            if let Some(station) = profile.station.as_deref() {
-                parts.push(format!("station={station}"));
-            }
-            if let Some(model) = profile.model.as_deref() {
-                parts.push(format!("model={}", shorten_middle(model, 20)));
-            }
-            if let Some(reasoning) = profile.reasoning_effort.as_deref() {
-                parts.push(format!("reasoning={reasoning}"));
-            }
-            if let Some(tier) = profile.service_tier.as_deref() {
-                parts.push(format!("tier={tier}"));
-            }
-            let detail = if parts.is_empty() {
-                crate::tui::i18n::pick(ui.language, "<auto>", "<auto>").to_string()
-            } else {
-                shorten_middle(parts.join("  ").as_str(), 72)
+        .map(|choice| {
+            let detail = match choice {
+                ServiceTierChoice::Clear => crate::tui::i18n::pick(
+                    ui.language,
+                    "移除当前会话的 service tier 覆盖",
+                    "Remove the session service tier override",
+                ),
+                ServiceTierChoice::Default => crate::tui::i18n::pick(
+                    ui.language,
+                    "显式使用 default",
+                    "Explicitly use default",
+                ),
+                ServiceTierChoice::Priority => crate::tui::i18n::pick(
+                    ui.language,
+                    "通常可视为 fast mode",
+                    "Usually maps to fast mode",
+                ),
+                ServiceTierChoice::Flex => {
+                    crate::tui::i18n::pick(ui.language, "显式使用 flex", "Explicitly use flex")
+                }
             };
             ListItem::new(Text::from(vec![
-                Line::from(label),
+                Line::from(choice.label()),
                 Line::from(Span::styled(detail, Style::default().fg(p.muted))),
             ]))
         })
+        .chain(std::iter::once(ListItem::new(Text::from(vec![
+            Line::from(crate::tui::i18n::pick(
+                ui.language,
+                "Custom...（输入任意 service_tier）",
+                "Custom... (enter any service_tier)",
+            )),
+            Line::from(Span::styled(
+                crate::tui::i18n::pick(
+                    ui.language,
+                    "打开输入框，手动填写 service_tier override",
+                    "Open an input box for arbitrary service_tier override",
+                ),
+                Style::default().fg(p.muted),
+            )),
+        ]))))
         .collect::<Vec<_>>();
+
+    let max = items.len().saturating_sub(1);
+    ui.menu_list.select(Some(ui.service_tier_menu_idx.min(max)));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
+        .highlight_symbol("  ");
+    f.render_stateful_widget(list, area, &mut ui.menu_list);
+}
+
+pub(super) fn render_service_tier_input_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
+    let area = centered_rect(72, 36, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "输入自定义 Service Tier",
+                "Enter custom service tier",
+            ),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let current = ui.session_service_tier_input.trim();
+    let current = if current.is_empty() {
+        "<empty>"
+    } else {
+        current
+    };
+    let hint = ui.session_service_tier_input_hint.as_deref().unwrap_or("-");
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                crate::tui::i18n::pick(ui.language, "当前输入: ", "current: "),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled(current.to_string(), Style::default().fg(p.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                crate::tui::i18n::pick(ui.language, "当前会话 tier: ", "session hint: "),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled(shorten_middle(hint, 56), Style::default().fg(p.accent)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "输入任意 service_tier。Enter 应用，Esc 返回菜单，Backspace 删除，Delete / Ctrl+U 清空。空值会清除会话 service_tier 覆盖。",
+                "Type any service_tier. Enter applies, Esc returns to menu, Backspace deletes, Delete / Ctrl+U clears. Empty value clears the session service_tier override.",
+            ),
+            Style::default().fg(p.muted),
+        )),
+    ];
+
+    let content = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(p.text))
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, area);
+}
+
+pub(super) fn render_profile_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
+    let area = centered_rect(74, 68, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "管理 Session Profile Binding",
+                "Manage session profile binding",
+            ),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let mut items = Vec::with_capacity(ui.session_profile_options.len().saturating_add(1));
+    items.push(ListItem::new(Text::from(vec![
+        Line::from(crate::tui::i18n::pick(
+            ui.language,
+            "Clear binding（移除会话已存储的 profile 绑定）",
+            "Clear binding (remove stored session profile binding)",
+        )),
+        Line::from(Span::styled(
+            crate::tui::i18n::pick(
+                ui.language,
+                "只清理 profile binding；保留当前会话的 model / effort / provider / service_tier 覆盖",
+                "Only clears the profile binding; keep current session model / effort / provider / service_tier overrides",
+            ),
+            Style::default().fg(p.muted),
+        )),
+    ])));
+    items.extend(ui.session_profile_options.iter().map(|profile| {
+        let mut label = profile.name.clone();
+        if profile.is_default {
+            label.push_str(" *default");
+        }
+        let mut parts = Vec::new();
+        if let Some(station) = profile.station.as_deref() {
+            parts.push(format!("station={station}"));
+        }
+        if let Some(model) = profile.model.as_deref() {
+            parts.push(format!("model={}", shorten_middle(model, 20)));
+        }
+        if let Some(reasoning) = profile.reasoning_effort.as_deref() {
+            parts.push(format!("reasoning={reasoning}"));
+        }
+        if let Some(tier) = profile.service_tier.as_deref() {
+            parts.push(format!("tier={tier}"));
+        }
+        let detail = if parts.is_empty() {
+            crate::tui::i18n::pick(ui.language, "<auto>", "<auto>").to_string()
+        } else {
+            shorten_middle(parts.join("  ").as_str(), 72)
+        };
+        ListItem::new(Text::from(vec![
+            Line::from(label),
+            Line::from(Span::styled(detail, Style::default().fg(p.muted))),
+        ]))
+    }));
 
     let max = items.len().saturating_sub(1);
     ui.menu_list.select(Some(ui.profile_menu_idx.min(max)));

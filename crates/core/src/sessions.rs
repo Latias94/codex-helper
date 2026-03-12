@@ -636,13 +636,38 @@ pub async fn find_codex_session_cwd_by_id(session_id: &str) -> Result<Option<Str
 /// We first try to match the UUID suffix in the `rollout-...-<uuid>.jsonl` filename (fast path),
 /// then fall back to scanning session_meta records to match `payload.id`.
 pub async fn find_codex_session_file_by_id(session_id: &str) -> Result<Option<PathBuf>> {
-    let root = codex_sessions_dir();
-    if !root.exists() {
-        return Ok(None);
+    Ok(find_codex_session_files_by_ids(&[session_id.to_string()])
+        .await?
+        .remove(session_id))
+}
+
+pub async fn find_codex_session_files_by_ids(
+    session_ids: &[String],
+) -> Result<HashMap<String, PathBuf>> {
+    find_codex_session_files_by_ids_in_dir(&codex_sessions_dir(), session_ids).await
+}
+
+async fn find_codex_session_files_by_ids_in_dir(
+    root: &Path,
+    session_ids: &[String],
+) -> Result<HashMap<String, PathBuf>> {
+    if !root.exists() || session_ids.is_empty() {
+        return Ok(HashMap::new());
     }
 
+    let mut remaining = session_ids
+        .iter()
+        .map(|sid| sid.trim())
+        .filter(|sid| !sid.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<std::collections::HashSet<_>>();
+    if remaining.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut found = HashMap::new();
     let mut scanned_files: usize = 0;
-    let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u32>().ok()).await?;
+    let year_dirs = collect_dirs_desc(root, |s| s.parse::<u32>().ok()).await?;
 
     'outer: for (_year, year_path) in year_dirs {
         let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
@@ -651,29 +676,36 @@ pub async fn find_codex_session_file_by_id(session_id: &str) -> Result<Option<Pa
             for (_day, day_path) in day_dirs {
                 let day_files = collect_rollout_files_sorted(&day_path).await?;
                 for path in day_files {
-                    if scanned_files >= MAX_SCAN_FILES {
+                    if scanned_files >= MAX_SCAN_FILES || remaining.is_empty() {
                         break 'outer;
                     }
                     scanned_files += 1;
 
                     if let Some(name) = path.file_name().and_then(|s| s.to_str())
                         && let Some((_ts, uuid)) = parse_timestamp_and_uuid(name)
-                        && uuid == session_id
+                        && remaining.remove(&uuid)
                     {
-                        return Ok(Some(path));
+                        found.insert(uuid.to_string(), path.clone());
+                        if remaining.is_empty() {
+                            break 'outer;
+                        }
+                        continue;
                     }
 
                     if let Some(meta) = read_codex_session_meta(&path).await?
-                        && meta.id == session_id
+                        && remaining.remove(meta.id.as_str())
                     {
-                        return Ok(Some(path));
+                        found.insert(meta.id, path);
+                        if remaining.is_empty() {
+                            break 'outer;
+                        }
                     }
                 }
             }
         }
     }
 
-    Ok(None)
+    Ok(found)
 }
 
 /// Read the `session_meta` record from a Codex session JSONL file (best-effort).
@@ -1661,5 +1693,70 @@ mod tests {
                 .await
                 .expect("recent ok");
         assert_eq!(none.len(), 0, "since=0 should filter everything out");
+    }
+
+    #[tokio::test]
+    async fn batch_find_session_files_resolves_uuid_and_meta_ids() {
+        let tmp = std::env::temp_dir().join(format!("codex-helper-test-{}", uuid::Uuid::new_v4()));
+        let sessions = tmp.join("sessions").join("2026").join("03").join("12");
+        std::fs::create_dir_all(&sessions).expect("create sessions dir");
+
+        let file_by_uuid =
+            sessions.join("rollout-2026-03-12T00-00-00-11111111-1111-1111-1111-111111111111.jsonl");
+        let file_by_meta =
+            sessions.join("rollout-2026-03-12T00-00-01-22222222-2222-2222-2222-222222222222.jsonl");
+
+        std::fs::write(
+            &file_by_uuid,
+            serde_json::json!({
+                "timestamp": "2026-03-12T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "cwd": "G:/code/by-uuid",
+                    "timestamp": "2026-03-12T00:00:00.000Z"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write uuid file");
+
+        std::fs::write(
+            &file_by_meta,
+            serde_json::json!({
+                "timestamp": "2026-03-12T00:00:01.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "sid-meta",
+                    "cwd": "G:/code/by-meta",
+                    "timestamp": "2026-03-12T00:00:01.000Z"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write meta file");
+
+        let found = find_codex_session_files_by_ids_in_dir(
+            &tmp.join("sessions"),
+            &[
+                "11111111-1111-1111-1111-111111111111".to_string(),
+                "sid-meta".to_string(),
+                "missing".to_string(),
+            ],
+        )
+        .await
+        .expect("batch find ok");
+
+        assert_eq!(
+            found
+                .get("11111111-1111-1111-1111-111111111111")
+                .expect("uuid match"),
+            &file_by_uuid
+        );
+        assert_eq!(found.get("sid-meta").expect("meta match"), &file_by_meta);
+        assert!(
+            !found.contains_key("missing"),
+            "missing session ids should not be included"
+        );
     }
 }
