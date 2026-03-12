@@ -645,6 +645,9 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  L          切换语言（中/英，自动落盘）"),
             Line::from("  Tab        切换焦点（总览页）"),
             Line::from("  6 设置     查看运行态与关键配置入口"),
+            Line::from(
+                "  总览页     O/H 从会话面板跳到 Requests/History；o/h 从请求面板跳到 Sessions/History",
+            ),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "推理强度",
@@ -742,6 +745,9 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
             Line::from("  6 Settings show runtime + config overview"),
+            Line::from(
+                "  Dashboard  O/H jump from Sessions panel to Requests/History; o/h jump from Requests panel to Sessions/History",
+            ),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Effort",

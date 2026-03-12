@@ -299,6 +299,29 @@ fn selected_request_page_request<'a>(
         .nth(ui.selected_request_page_idx)
 }
 
+fn selected_dashboard_request<'a>(
+    snapshot: &'a Snapshot,
+    ui: &UiState,
+) -> Option<&'a FinishedRequest> {
+    let selected_sid = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .and_then(|row| row.session_id.as_deref());
+
+    snapshot
+        .recent
+        .iter()
+        .filter(
+            |request| match (selected_sid, request.session_id.as_deref()) {
+                (Some(sid), Some(request_sid)) => sid == request_sid,
+                (Some(_), None) => false,
+                (None, _) => true,
+            },
+        )
+        .take(60)
+        .nth(ui.selected_request_idx)
+}
+
 fn selected_recent_row(ui: &UiState) -> Option<RecentCodexRow> {
     let now = now_ms();
     let threshold_ms = codex_recent_window_threshold_ms(now, ui.codex_recent_window_idx);
@@ -1665,6 +1688,60 @@ async fn handle_key_normal(
             ));
             true
         }
+        KeyCode::Char('O') if ui.page == Page::Dashboard && ui.focus == Focus::Sessions => {
+            let Some(sid) = ui.selected_session_id.clone() else {
+                ui.toast = Some(("dashboard: no session selected".to_string(), Instant::now()));
+                return true;
+            };
+            let sid_label = short_sid(&sid, 18);
+            prepare_select_requests_for_session(ui, sid);
+            ui.toast = Some((
+                format!("requests: focused session {sid_label}"),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('H') if ui.page == Page::Dashboard && ui.focus == Focus::Sessions => {
+            let Some(row) = snapshot.rows.get(ui.selected_session_idx) else {
+                ui.toast = Some(("dashboard: no session selected".to_string(), Instant::now()));
+                return true;
+            };
+            let Some(sid) = row.session_id.as_deref() else {
+                ui.toast = Some((
+                    "dashboard: selected row has no session id".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let path = match find_codex_session_file_by_id(sid).await {
+                Ok(path) => path,
+                Err(e) => {
+                    ui.toast = Some((
+                        format!("history: resolve session file failed: {e}"),
+                        Instant::now(),
+                    ));
+                    return true;
+                }
+            };
+            let Some(summary) = session_history_summary_from_row(row, path) else {
+                ui.toast = Some((
+                    "history: failed to prepare session focus".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let sid_label = short_sid(sid, 18);
+            prepare_select_history_from_external(
+                ui,
+                summary,
+                CodexHistoryExternalFocusOrigin::Sessions,
+            );
+            ui.toast = Some((
+                format!("history: focused session {sid_label}"),
+                Instant::now(),
+            ));
+            true
+        }
         KeyCode::Char('t') if ui.page == Page::Sessions => {
             let Some(sid) = ui.selected_session_id.clone() else {
                 ui.toast = Some(("no session selected".to_string(), Instant::now()));
@@ -1839,6 +1916,77 @@ async fn handle_key_normal(
                     ui.toast = Some((format!("clipboard failed: {e}"), Instant::now()));
                 }
             }
+            true
+        }
+        KeyCode::Char('o') if ui.page == Page::Dashboard && ui.focus == Focus::Requests => {
+            let Some(request) = selected_dashboard_request(snapshot, ui) else {
+                ui.toast = Some(("dashboard: no request selected".to_string(), Instant::now()));
+                return true;
+            };
+            let Some(sid) = request.session_id.as_deref() else {
+                ui.toast = Some((
+                    "dashboard: selected request has no session id".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            if focus_session_in_sessions(ui, snapshot, sid) {
+                ui.toast = Some((
+                    format!("sessions: focused {}", short_sid(sid, 18)),
+                    Instant::now(),
+                ));
+            } else {
+                ui.toast = Some((
+                    crate::tui::i18n::pick(
+                        ui.language,
+                        "sessions: 当前 runtime 未观测到这个 session",
+                        "sessions: this session is not currently observed in runtime",
+                    )
+                    .to_string(),
+                    Instant::now(),
+                ));
+            }
+            true
+        }
+        KeyCode::Char('h') if ui.page == Page::Dashboard && ui.focus == Focus::Requests => {
+            let Some(request) = selected_dashboard_request(snapshot, ui).cloned() else {
+                ui.toast = Some(("dashboard: no request selected".to_string(), Instant::now()));
+                return true;
+            };
+            let Some(sid) = request.session_id.as_deref() else {
+                ui.toast = Some((
+                    "dashboard: selected request has no session id".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let path = match find_codex_session_file_by_id(sid).await {
+                Ok(path) => path,
+                Err(e) => {
+                    ui.toast = Some((
+                        format!("history: resolve session file failed: {e}"),
+                        Instant::now(),
+                    ));
+                    return true;
+                }
+            };
+            let Some(summary) = request_history_summary_from_request(&request, path) else {
+                ui.toast = Some((
+                    "history: failed to prepare request focus".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let sid_label = short_sid(sid, 18);
+            prepare_select_history_from_external(
+                ui,
+                summary,
+                CodexHistoryExternalFocusOrigin::Requests,
+            );
+            ui.toast = Some((
+                format!("history: focused session {sid_label}"),
+                Instant::now(),
+            ));
             true
         }
         KeyCode::Enter | KeyCode::Char('t') if ui.page == Page::History => {
