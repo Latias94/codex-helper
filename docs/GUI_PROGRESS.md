@@ -87,14 +87,14 @@
 ### M5 — Attach Mode (connect to existing proxy)
 
 - [x] GUI-501 Port-in-use detection UX: prompt + remember choice
-- [x] GUI-502 MVP attach (read-only) using existing endpoints:
-  - `/__codex_helper/status/active`, `/status/recent`, `/config/runtime`
+- [x] GUI-502 MVP attach (read-only) using control-plane endpoints:
+  - `/__codex_helper/api/v1/status/active`, `/status/recent`, `/runtime/status`
 - [x] GUI-503 Extend proxy API to `/__codex_helper/api/v1/...` for full control
 - [~] GUI-504 Full attach via API v1 (Clash Verge style)
   - [x] Config actions: active/enabled/level
   - [x] Provider structure: alias/enabled/auth env refs/endpoints CRUD
   - [x] Retry/failover: persisted retry profile + cooldown policy editor
-  - [x] Overrides: session config/effort + global pinned
+  - [x] Overrides: session station/effort + global station
   - [x] Health checks: start/cancel + status
   - [x] History/transcript: list + tail/all + copy + open file
   - [x] Discovery UI: scan/list existing proxy instances (default 3210-3220)
@@ -146,3 +146,13 @@
 - 2026-03-11: Config v2 station editor now supports structure-level station management too: local mode can add/delete/edit station alias+members in form view, and attached mode can do the same when the proxy exposes `/api/v1/stations/specs` without exposing provider secrets.
 - 2026-03-11: Config v2 provider editor now supports structure-level provider management: local mode can add/delete/edit alias, env auth refs, and endpoints while preserving advanced tags/model mappings; attached mode can do the same when the proxy exposes `/api/v1/providers/specs`, otherwise the section stays read-only.
 - 2026-03-11: Config v2 Profiles now include a linked route preview: while editing a profile, GUI shows the resolved station source (`profile.station` / `active_station` / auto), visible member/provider routes, and capability mismatches for model / fast mode / reasoning when that data is available.
+- 2026-03-12: Continued GUI page split: moved the Settings page into `pages/settings.rs`, moved Stations profile/retry operator panels into `pages/stations.rs`, and cleaned remaining legacy GUI labels like `Configs` / `No config selected` toward station-first wording.
+- 2026-03-12: Continued GUI page split again: moved Config v2 station/provider/profile helper panels and spec builders into `pages/config_v2.rs`, reducing `pages/mod.rs` further while keeping GUI tests green.
+- 2026-03-12: Continued GUI page split once more: moved the advanced raw config editor into `pages/config_raw.rs`, so config-page rendering logic is less concentrated in `pages/mod.rs` while `cargo check -p codex-helper-gui` and `cargo nextest run -p codex-helper-gui` remain green.
+- 2026-03-12: Continued GUI page split again: moved the main Stations page renderer into `pages/stations.rs`, switched the page entrypoint in `pages/mod.rs` to the module renderer, and kept `cargo check -p codex-helper-gui` plus `cargo nextest run -p codex-helper-gui` green while shrinking `pages/mod.rs` by another large chunk.
+- 2026-03-12: Continued GUI page split again: moved the full Config v2 form renderer into `pages/config_v2.rs`, switched the Config form branch in `pages/mod.rs` to the module renderer, and kept `cargo check -p codex-helper-gui` plus `cargo nextest run -p codex-helper-gui` green while cutting `pages/mod.rs` down to the remaining shared helpers plus legacy config form.
+- 2026-03-13: Continued GUI page split again: moved the Overview page renderer and its station-summary helper into `pages/overview.rs`, switched the Overview page entrypoint in `pages/mod.rs` to the module renderer, and kept `cargo check -p codex-helper-gui` plus `cargo nextest run -p codex-helper-gui` green while shrinking `pages/mod.rs` further toward shared helpers plus legacy config form.
+- 2026-03-13: Continued GUI page split again: moved the legacy Config form renderer into `pages/config_legacy.rs`, switched the Config form branch in `pages/mod.rs` to the module renderer, and kept `cargo check -p codex-helper-gui` plus `cargo nextest run -p codex-helper-gui` green while removing the largest remaining page function from `pages/mod.rs`.
+- 2026-03-13: Continued GUI page split again: moved the Stats page renderer into `pages/stats.rs`, switched the Stats page entrypoint in `pages/mod.rs` to the module renderer, and kept `cargo check -p codex-helper-gui` plus `cargo nextest run -p codex-helper-gui` green while pushing `pages/mod.rs` closer to a shared-helper shell.
+- 2026-03-13: Continued GUI page split again: moved the Setup page renderer into `pages/setup.rs`, switched the Setup page entrypoint in `pages/mod.rs` to the module renderer, and kept `cargo check -p codex-helper-gui` plus `cargo nextest run -p codex-helper-gui` green while removing the last large onboarding page from `pages/mod.rs`.
+- 2026-03-13: Continued GUI page split again: moved the Doctor page renderer into `pages/doctor.rs`, switched the Doctor page entrypoint in `pages/mod.rs` to the module renderer, and kept `cargo check -p codex-helper-gui` plus `cargo nextest run -p codex-helper-gui` green while leaving `pages/mod.rs` primarily as navigation plus shared helper code.
