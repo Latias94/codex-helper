@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use tracing::{instrument, warn};
 
 mod admin;
+mod auth_resolution;
 mod classify;
 mod request_body;
 mod retry;
@@ -49,6 +50,7 @@ pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
+use self::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
 use self::classify::{class_is_health_neutral, classify_upstream_response};
 use self::request_body::{
     apply_model_override, apply_reasoning_effort_override, apply_service_tier_override,
@@ -195,50 +197,6 @@ fn effective_active_station_name(mgr: &ServiceConfigManager) -> Option<String> {
     mgr.active_station().map(|cfg| cfg.name.clone())
 }
 
-#[derive(Default)]
-struct JsonFileCache {
-    last_check_at: Option<Instant>,
-    last_path: Option<std::path::PathBuf>,
-    last_mtime: Option<std::time::SystemTime>,
-    value: Option<serde_json::Value>,
-}
-
-fn cached_json_file_value(
-    cache: &'static OnceLock<Mutex<JsonFileCache>>,
-    path: std::path::PathBuf,
-) -> Option<serde_json::Value> {
-    let cache = cache.get_or_init(|| Mutex::new(JsonFileCache::default()));
-    let now = Instant::now();
-    let mut state = match cache.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let path_changed = state.last_path.as_ref() != Some(&path);
-    let should_check = path_changed
-        || state
-            .last_check_at
-            .map(|last| now.saturating_duration_since(last) >= AUTH_FILE_CACHE_MIN_CHECK_INTERVAL)
-            .unwrap_or(true);
-    if !should_check {
-        return state.value.clone();
-    }
-
-    let mtime = std::fs::metadata(&path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok());
-    if !path_changed && mtime == state.last_mtime {
-        state.last_check_at = Some(now);
-        return state.value.clone();
-    }
-
-    let value = read_json_file(&path);
-    state.last_check_at = Some(now);
-    state.last_path = Some(path);
-    state.last_mtime = mtime;
-    state.value = value.clone();
-    value
-}
-
 fn format_reqwest_error_for_retry_chain(e: &reqwest::Error) -> String {
     use std::error::Error as _;
 
@@ -316,129 +274,14 @@ fn lb_state_snapshot_json(lb: &LoadBalancer) -> Option<serde_json::Value> {
     }))
 }
 
-fn read_json_file(path: &std::path::Path) -> Option<serde_json::Value> {
-    let bytes = std::fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    if text.trim().is_empty() {
-        return None;
-    }
-    serde_json::from_str(&text).ok()
-}
-
+#[cfg(test)]
 fn codex_auth_json_value(key: &str) -> Option<String> {
-    static CACHE: OnceLock<Mutex<JsonFileCache>> = OnceLock::new();
-    let v = cached_json_file_value(&CACHE, crate::config::codex_auth_path());
-    let obj = v.as_ref()?.as_object()?;
-    obj.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+    auth_resolution::codex_auth_json_value(key)
 }
 
+#[cfg(test)]
 fn claude_settings_env_value(key: &str) -> Option<String> {
-    static CACHE: OnceLock<Mutex<JsonFileCache>> = OnceLock::new();
-    let v = cached_json_file_value(&CACHE, crate::config::claude_settings_path());
-    let obj = v.as_ref()?.as_object()?;
-    let env_obj = obj.get("env")?.as_object()?;
-    env_obj
-        .get(key)
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-}
-
-fn resolve_auth_token_with_source(
-    service_name: &str,
-    auth: &crate::config::UpstreamAuth,
-    client_has_auth: bool,
-) -> (Option<String>, String) {
-    if let Some(token) = auth.auth_token.as_deref()
-        && !token.trim().is_empty()
-    {
-        return (Some(token.to_string()), "inline".to_string());
-    }
-
-    if let Some(env_name) = auth.auth_token_env.as_deref()
-        && !env_name.trim().is_empty()
-    {
-        if let Ok(v) = std::env::var(env_name)
-            && !v.trim().is_empty()
-        {
-            return (Some(v), format!("env:{env_name}"));
-        }
-
-        let file_value = match service_name {
-            "codex" => codex_auth_json_value(env_name),
-            "claude" => claude_settings_env_value(env_name),
-            _ => None,
-        };
-        if let Some(v) = file_value
-            && !v.trim().is_empty()
-        {
-            let src = match service_name {
-                "codex" => format!("codex_auth_json:{env_name}"),
-                "claude" => format!("claude_settings_env:{env_name}"),
-                _ => format!("file:{env_name}"),
-            };
-            return (Some(v), src);
-        }
-
-        if client_has_auth {
-            return (None, format!("client_passthrough (missing_env:{env_name})"));
-        }
-        return (None, format!("missing_env:{env_name}"));
-    }
-
-    if client_has_auth {
-        (None, "client_passthrough".to_string())
-    } else {
-        (None, "none".to_string())
-    }
-}
-
-fn resolve_api_key_with_source(
-    service_name: &str,
-    auth: &crate::config::UpstreamAuth,
-    client_has_x_api_key: bool,
-) -> (Option<String>, String) {
-    if let Some(key) = auth.api_key.as_deref()
-        && !key.trim().is_empty()
-    {
-        return (Some(key.to_string()), "inline".to_string());
-    }
-
-    if let Some(env_name) = auth.api_key_env.as_deref()
-        && !env_name.trim().is_empty()
-    {
-        if let Ok(v) = std::env::var(env_name)
-            && !v.trim().is_empty()
-        {
-            return (Some(v), format!("env:{env_name}"));
-        }
-
-        let file_value = match service_name {
-            "codex" => codex_auth_json_value(env_name),
-            "claude" => claude_settings_env_value(env_name),
-            _ => None,
-        };
-        if let Some(v) = file_value
-            && !v.trim().is_empty()
-        {
-            let src = match service_name {
-                "codex" => format!("codex_auth_json:{env_name}"),
-                "claude" => format!("claude_settings_env:{env_name}"),
-                _ => format!("file:{env_name}"),
-            };
-            return (Some(v), src);
-        }
-
-        if client_has_x_api_key {
-            return (None, format!("client_passthrough (missing_env:{env_name})"));
-        }
-        return (None, format!("missing_env:{env_name}"));
-    }
-
-    if client_has_x_api_key {
-        (None, "client_passthrough".to_string())
-    } else {
-        (None, "none".to_string())
-    }
+    auth_resolution::claude_settings_env_value(key)
 }
 
 fn is_hop_by_hop_header(name_lower: &str) -> bool {
