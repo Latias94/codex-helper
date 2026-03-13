@@ -27,6 +27,7 @@ mod request_body;
 mod retry;
 mod route_provenance;
 mod runtime_config;
+mod session_overrides;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -79,6 +80,13 @@ use self::retry::{
 };
 use self::route_provenance::build_route_decision_provenance;
 use self::runtime_config::RuntimeConfig;
+use self::session_overrides::{
+    apply_session_manual_overrides, list_session_manual_overrides, list_session_model_overrides,
+    list_session_reasoning_effort_overrides, list_session_service_tier_overrides,
+    list_session_station_overrides, reset_session_manual_overrides, set_session_model_override,
+    set_session_reasoning_effort_override, set_session_service_tier_override,
+    set_session_station_override,
+};
 use self::stream::{SseSuccessMeta, build_sse_success_response};
 
 pub const ADMIN_TOKEN_ENV_VAR: &str = "CODEX_HELPER_ADMIN_TOKEN";
@@ -2932,84 +2940,9 @@ pub async fn handle_proxy(
 pub fn router(proxy: ProxyService) -> Router {
     // In axum 0.8, wildcard segments use `/{*path}` (equivalent to `/*path` from axum 0.7).
     #[derive(serde::Deserialize)]
-    struct SessionReasoningEffortOverrideRequest {
-        session_id: String,
-        #[serde(default, alias = "effort")]
-        reasoning_effort: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct SessionStationOverrideRequest {
-        session_id: String,
-        #[serde(default)]
-        station_name: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct SessionModelOverrideRequest {
-        session_id: String,
-        model: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct SessionServiceTierOverrideRequest {
-        session_id: String,
-        service_tier: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq, Hash)]
-    #[serde(rename_all = "snake_case")]
-    enum SessionOverrideDimension {
-        Model,
-        ReasoningEffort,
-        StationName,
-        ServiceTier,
-        All,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct SessionManualOverridesPatchRequest {
-        session_id: String,
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default, alias = "effort")]
-        reasoning_effort: Option<String>,
-        #[serde(default)]
-        station_name: Option<String>,
-        #[serde(default)]
-        service_tier: Option<String>,
-        #[serde(default)]
-        clear: Vec<SessionOverrideDimension>,
-    }
-
-    #[derive(serde::Deserialize)]
     struct SessionProfileApplyRequest {
         session_id: String,
         profile_name: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct SessionOverrideResetRequest {
-        session_id: String,
-    }
-
-    #[derive(serde::Serialize)]
-    struct SessionOverridePrecedence {
-        request_fields_apply_order: Vec<&'static str>,
-        station_apply_order: Vec<&'static str>,
-    }
-
-    #[derive(serde::Serialize)]
-    struct SessionManualOverridesListResponse {
-        precedence: SessionOverridePrecedence,
-        sessions: std::collections::HashMap<String, crate::state::SessionManualOverrides>,
-    }
-
-    #[derive(serde::Serialize)]
-    struct SessionManualOverridesResponse {
-        session_id: String,
-        overrides: crate::state::SessionManualOverrides,
-        precedence: SessionOverridePrecedence,
     }
 
     #[derive(serde::Deserialize)]
@@ -3039,41 +2972,6 @@ pub fn router(proxy: ProxyService) -> Router {
             ));
         }
         Ok(())
-    }
-
-    fn normalize_session_override_value(
-        field_name: &str,
-        value: Option<String>,
-    ) -> Result<Option<String>, (StatusCode, String)> {
-        match value {
-            Some(value) => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    Err((StatusCode::BAD_REQUEST, format!("{field_name} is empty")))
-                } else {
-                    Ok(Some(trimmed.to_string()))
-                }
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn session_override_precedence() -> SessionOverridePrecedence {
-        SessionOverridePrecedence {
-            request_fields_apply_order: vec![
-                "session_override",
-                "profile_default",
-                "request_payload",
-                "station_mapping",
-                "runtime_fallback",
-            ],
-            station_apply_order: vec![
-                "session_override",
-                "global_station_override",
-                "profile_default",
-                "runtime_fallback",
-            ],
-        }
     }
 
     fn default_persisted_station_enabled() -> bool {
@@ -3470,244 +3368,6 @@ pub fn router(proxy: ProxyService) -> Router {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let status = build_runtime_config_status(&proxy).await;
         Ok(Json(build_reload_result(changed, status)))
-    }
-
-    async fn set_session_reasoning_effort_override(
-        proxy: ProxyService,
-        Json(payload): Json<SessionReasoningEffortOverrideRequest>,
-    ) -> Result<StatusCode, (StatusCode, String)> {
-        require_session_id(payload.session_id.as_str())?;
-        let reasoning_effort =
-            normalize_session_override_value("reasoning_effort", payload.reasoning_effort)?;
-        if let Some(reasoning_effort) = reasoning_effort {
-            proxy
-                .state
-                .set_session_reasoning_effort_override(
-                    payload.session_id,
-                    reasoning_effort,
-                    now_ms(),
-                )
-                .await;
-        } else {
-            proxy
-                .state
-                .clear_session_reasoning_effort_override(payload.session_id.as_str())
-                .await;
-        }
-        Ok(StatusCode::NO_CONTENT)
-    }
-
-    async fn list_session_reasoning_effort_overrides(
-        proxy: ProxyService,
-    ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
-        let map = proxy.state.list_session_reasoning_effort_overrides().await;
-        Ok(Json(map))
-    }
-
-    async fn list_session_manual_overrides(
-        proxy: ProxyService,
-    ) -> Result<Json<SessionManualOverridesListResponse>, (StatusCode, String)> {
-        let sessions = proxy.state.list_session_manual_overrides().await;
-        Ok(Json(SessionManualOverridesListResponse {
-            precedence: session_override_precedence(),
-            sessions,
-        }))
-    }
-
-    async fn apply_session_manual_overrides(
-        proxy: ProxyService,
-        Json(payload): Json<SessionManualOverridesPatchRequest>,
-    ) -> Result<Json<SessionManualOverridesResponse>, (StatusCode, String)> {
-        require_session_id(payload.session_id.as_str())?;
-        let model = normalize_session_override_value("model", payload.model)?;
-        let reasoning_effort =
-            normalize_session_override_value("reasoning_effort", payload.reasoning_effort)?;
-        let station_name = normalize_session_override_value("station_name", payload.station_name)?;
-        let service_tier = normalize_session_override_value("service_tier", payload.service_tier)?;
-        let clear: HashSet<_> = payload.clear.into_iter().collect();
-        if model.is_none()
-            && reasoning_effort.is_none()
-            && station_name.is_none()
-            && service_tier.is_none()
-            && clear.is_empty()
-        {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "expected at least one override value or clear target".to_string(),
-            ));
-        }
-
-        let session_id = payload.session_id;
-        if clear.contains(&SessionOverrideDimension::All) {
-            proxy
-                .state
-                .clear_session_manual_overrides(session_id.as_str())
-                .await;
-        } else {
-            if clear.contains(&SessionOverrideDimension::Model) {
-                proxy
-                    .state
-                    .clear_session_model_override(session_id.as_str())
-                    .await;
-            }
-            if clear.contains(&SessionOverrideDimension::ReasoningEffort) {
-                proxy
-                    .state
-                    .clear_session_reasoning_effort_override(session_id.as_str())
-                    .await;
-            }
-            if clear.contains(&SessionOverrideDimension::StationName) {
-                proxy
-                    .state
-                    .clear_session_station_override(session_id.as_str())
-                    .await;
-            }
-            if clear.contains(&SessionOverrideDimension::ServiceTier) {
-                proxy
-                    .state
-                    .clear_session_service_tier_override(session_id.as_str())
-                    .await;
-            }
-        }
-
-        if let Some(model) = model {
-            proxy
-                .state
-                .set_session_model_override(session_id.clone(), model, now_ms())
-                .await;
-        }
-        if let Some(reasoning_effort) = reasoning_effort {
-            proxy
-                .state
-                .set_session_reasoning_effort_override(
-                    session_id.clone(),
-                    reasoning_effort,
-                    now_ms(),
-                )
-                .await;
-        }
-        if let Some(station_name) = station_name {
-            proxy
-                .state
-                .set_session_station_override(session_id.clone(), station_name, now_ms())
-                .await;
-        }
-        if let Some(service_tier) = service_tier {
-            proxy
-                .state
-                .set_session_service_tier_override(session_id.clone(), service_tier, now_ms())
-                .await;
-        }
-
-        let overrides = proxy
-            .state
-            .get_session_manual_overrides(session_id.as_str())
-            .await;
-        Ok(Json(SessionManualOverridesResponse {
-            session_id,
-            overrides,
-            precedence: session_override_precedence(),
-        }))
-    }
-
-    async fn set_session_station_override(
-        proxy: ProxyService,
-        Json(payload): Json<SessionStationOverrideRequest>,
-    ) -> Result<StatusCode, (StatusCode, String)> {
-        require_session_id(payload.session_id.as_str())?;
-        let station_name = normalize_session_override_value("station_name", payload.station_name)?;
-        if let Some(station_name) = station_name {
-            proxy
-                .state
-                .set_session_station_override(
-                    payload.session_id,
-                    station_name,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0),
-                )
-                .await;
-        } else {
-            proxy
-                .state
-                .clear_session_station_override(payload.session_id.as_str())
-                .await;
-        }
-        Ok(StatusCode::NO_CONTENT)
-    }
-
-    async fn list_session_station_overrides(
-        proxy: ProxyService,
-    ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
-        let map = proxy.state.list_session_station_overrides().await;
-        Ok(Json(map))
-    }
-
-    async fn set_session_model_override(
-        proxy: ProxyService,
-        Json(payload): Json<SessionModelOverrideRequest>,
-    ) -> Result<StatusCode, (StatusCode, String)> {
-        require_session_id(payload.session_id.as_str())?;
-        let model = normalize_session_override_value("model", payload.model)?;
-        if let Some(model) = model {
-            proxy
-                .state
-                .set_session_model_override(payload.session_id, model, now_ms())
-                .await;
-        } else {
-            proxy
-                .state
-                .clear_session_model_override(payload.session_id.as_str())
-                .await;
-        }
-        Ok(StatusCode::NO_CONTENT)
-    }
-
-    async fn list_session_model_overrides(
-        proxy: ProxyService,
-    ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
-        let map = proxy.state.list_session_model_overrides().await;
-        Ok(Json(map))
-    }
-
-    async fn set_session_service_tier_override(
-        proxy: ProxyService,
-        Json(payload): Json<SessionServiceTierOverrideRequest>,
-    ) -> Result<StatusCode, (StatusCode, String)> {
-        require_session_id(payload.session_id.as_str())?;
-        let service_tier = normalize_session_override_value("service_tier", payload.service_tier)?;
-        if let Some(service_tier) = service_tier {
-            proxy
-                .state
-                .set_session_service_tier_override(payload.session_id, service_tier, now_ms())
-                .await;
-        } else {
-            proxy
-                .state
-                .clear_session_service_tier_override(payload.session_id.as_str())
-                .await;
-        }
-        Ok(StatusCode::NO_CONTENT)
-    }
-
-    async fn list_session_service_tier_overrides(
-        proxy: ProxyService,
-    ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
-        let map = proxy.state.list_session_service_tier_overrides().await;
-        Ok(Json(map))
-    }
-
-    async fn reset_session_manual_overrides(
-        proxy: ProxyService,
-        Json(payload): Json<SessionOverrideResetRequest>,
-    ) -> Result<StatusCode, (StatusCode, String)> {
-        require_session_id(payload.session_id.as_str())?;
-        proxy
-            .state
-            .clear_session_manual_overrides(payload.session_id.as_str())
-            .await;
-        Ok(StatusCode::NO_CONTENT)
     }
 
     async fn list_profiles(
