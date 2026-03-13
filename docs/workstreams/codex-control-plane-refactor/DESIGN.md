@@ -208,15 +208,74 @@ For each session, the control plane should expose a compact but complete "effect
 
 This card is the answer to: "What exactly am I controlling?"
 
+Current implementation note:
+
+- the GUI Sessions page is now session-card-first rather than request-row-first
+- the operator view is split into:
+  - session identity list
+  - session identity card
+  - effective route and source explanation
+  - last route decision snapshot with current-vs-decided drift visibility
+  - session control editor for bindings and manual overrides
+
+## Operator Information Architecture
+
+The GUI/WebUI should stop behaving like a flat strip of unrelated pages.
+
+The operator-facing structure should be grouped into consoles/workspaces:
+
+- entry:
+  - overview
+  - setup
+- session console:
+  - sessions
+  - requests
+  - history
+  - stats
+- station/health console:
+  - stations
+  - doctor
+- config/editor workspace:
+  - config
+  - settings
+
+Remote-safe capability surface is a first-class concern rather than a page-local afterthought.
+
+Recommended rule:
+
+- top-level navigation should expose when the current client is remote-attached
+- shared control-plane surfaces stay visible:
+  - session observation/control
+  - station health and failover management
+  - shared observed/config surfaces
+- host-local surfaces stay explicitly gated:
+  - transcript file access
+  - local `cwd` opening
+  - direct `~/.codex/sessions` browsing
+
+Current implementation note:
+
+- GUI top navigation is now grouped by these consoles/workspaces instead of one flat row
+- remote attach state also shows a global remote-safe banner in the top navigation area
+- page-level buttons still keep their own host-local disable reasons and tooltips
+- GUI now has reusable console layout primitives for section cards / kv grids / muted notes, intended to survive into a future WebUI design system
+- the Sessions details pane now uses these primitives to split identity, route snapshot, source explanation, quick actions, and route decision into clearer surfaces instead of one dense linear panel
+
 ### Scope Rules
 
 Immediate changes should be modeled separately from persistent defaults.
 
 Recommended rule set:
 
-- Session action:
+- Manual session override action:
+  - applies now
+  - runtime-scoped
+  - expires after inactivity TTL
+- Session profile/binding action:
   - applies now
   - stored in session binding
+  - remains sticky until explicit clear or proxy restart
+  - optional operator-configured binding TTL may prune dormant bindings
 - Profile/default action:
   - changes future new sessions
   - does not rewrite existing session bindings unless explicitly requested
@@ -266,6 +325,12 @@ Default expectations:
 - after continuity is established:
   - keep session sticky by default
   - cross-station failover disabled unless operator overrides policy
+
+Current implementation note:
+
+- `retry.allow_cross_station_before_first_output` is the explicit HA switch for unpinned requests
+- default behavior keeps cross-station failover disabled
+- curated retry profiles may opt in when their intent is explicitly failover-oriented
 
 ## LAN / Tailscale Topology
 
@@ -382,7 +447,7 @@ Recommended order:
 
 1. Make current semantics visible.
 2. Add missing session override dimensions.
-3. Introduce profiles without breaking legacy config.
+3. Introduce profiles without breaking legacy station/config compatibility.
 4. Add station HA behavior and control surfaces.
 5. Add LAN-ready presentation and lightweight access control.
 
@@ -395,4 +460,4 @@ Recommended order:
 
 ## Immediate Cleanup Candidate
 
-Legacy values like `active = "true"` are dangerous because they look like booleans but semantically behave like config names. The refactor should either reject such values explicitly or migrate them to a valid station/profile identifier.
+Legacy values like `active = "true"` are dangerous because they look like booleans but semantically behave like station selectors. The refactor should either reject such values explicitly or migrate them to a valid station/profile identifier.

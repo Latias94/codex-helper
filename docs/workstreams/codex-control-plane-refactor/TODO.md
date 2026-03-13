@@ -125,6 +125,8 @@ See `CENTRAL_RELAY.md` for the explicit LAN / Tailscale shared-relay operating m
       - [x] TUI page/focus/stats state now uses station-first names (`Page::Stations`, `Focus::Stations`, `StatsFocus::Stations`)
       - [x] `ServiceConfigManager` public serialization now emits `stations`, accepts legacy `configs`, and treats `active_station()` as the canonical accessor
       - [x] core bootstrap/auth-sync/storage/usage/proxy flows now consume station-first manager accessors (`stations()`, `station()`, `contains_station()`)
+      - [x] TUI station page module naming now matches semantics (`view/pages/stations.rs`, `apply_global_active_station`, station-first snapshot fields)
+      - [x] Phase 1 / design docs now describe station-first session identity, override, and fallback terminology
       - [~] remaining closeout tail is now limited to wording/doc/export cleanup on a few operator/admin surfaces
 - [x] CP-402 Add capability summary per station:
   - [x] supported models

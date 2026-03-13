@@ -16,10 +16,9 @@ use crate::config::{
     model_routing_warnings,
 };
 use crate::dashboard_core::{
-    ApiV1Capabilities, ApiV1Snapshot, ConfigOption, ControlProfileOption,
-    HostLocalControlPlaneCapabilities, RemoteAdminAccessCapabilities,
-    SharedControlPlaneCapabilities, WindowStats, build_config_options_from_mgr,
-    build_dashboard_snapshot, build_profile_options_from_mgr,
+    ApiV1Capabilities, ApiV1Snapshot, ControlProfileOption, HostLocalControlPlaneCapabilities,
+    RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationOption, WindowStats,
+    build_dashboard_snapshot, build_profile_options_from_mgr, build_station_options_from_mgr,
 };
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_port_for_proxy_port,
@@ -27,8 +26,9 @@ use crate::proxy::{
     proxy_only_router_with_admin_base_url,
 };
 use crate::state::{
-    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
-    RuntimeConfigState, SessionIdentityCard, SessionStats, UsageRollupView,
+    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
+    RuntimeConfigState, SessionIdentityCard, SessionManualOverrides, SessionStats, StationHealth,
+    UsageRollupView,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,19 +78,19 @@ pub struct AttachedStatus {
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
-    pub global_override: Option<String>,
+    pub global_station_override: Option<String>,
     pub configured_active_station: Option<String>,
     pub effective_active_station: Option<String>,
     pub configured_default_profile: Option<String>,
     pub default_profile: Option<String>,
     pub profiles: Vec<ControlProfileOption>,
     pub session_model_overrides: HashMap<String, String>,
-    pub session_config_overrides: HashMap<String, String>,
+    pub session_station_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
     pub session_service_tier_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
-    pub configs: Vec<ConfigOption>,
-    pub config_health: HashMap<String, ConfigHealth>,
+    pub stations: Vec<StationOption>,
+    pub station_health: HashMap<String, StationHealth>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
@@ -108,7 +108,7 @@ pub struct AttachedStatus {
     pub supports_station_spec_api: bool,
     pub supports_persisted_station_config: bool,
     pub supports_default_profile_override: bool,
-    pub supports_config_runtime_override: bool,
+    pub supports_station_runtime_override: bool,
     pub supports_session_override_reset: bool,
     pub supports_station_api: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
@@ -129,19 +129,19 @@ impl AttachedStatus {
             active: Vec::new(),
             recent: Vec::new(),
             session_cards: Vec::new(),
-            global_override: None,
+            global_station_override: None,
             configured_active_station: None,
             effective_active_station: None,
             configured_default_profile: None,
             default_profile: None,
             profiles: Vec::new(),
             session_model_overrides: HashMap::new(),
-            session_config_overrides: HashMap::new(),
+            session_station_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),
             session_service_tier_overrides: HashMap::new(),
             session_stats: HashMap::new(),
-            configs: Vec::new(),
-            config_health: HashMap::new(),
+            stations: Vec::new(),
+            station_health: HashMap::new(),
             health_checks: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),
@@ -159,7 +159,7 @@ impl AttachedStatus {
             supports_station_spec_api: false,
             supports_persisted_station_config: false,
             supports_default_profile_override: false,
-            supports_config_runtime_override: false,
+            supports_station_runtime_override: false,
             supports_session_override_reset: false,
             supports_station_api: false,
             shared_capabilities: SharedControlPlaneCapabilities::default(),
@@ -179,18 +179,18 @@ pub struct GuiRuntimeSnapshot {
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
-    pub global_override: Option<String>,
+    pub global_station_override: Option<String>,
     pub configured_active_station: Option<String>,
     pub effective_active_station: Option<String>,
     pub configured_default_profile: Option<String>,
     pub default_profile: Option<String>,
     pub profiles: Vec<ControlProfileOption>,
     pub session_model_overrides: HashMap<String, String>,
-    pub session_config_overrides: HashMap<String, String>,
+    pub session_station_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
     pub session_service_tier_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
-    pub configs: Vec<ConfigOption>,
+    pub stations: Vec<StationOption>,
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
@@ -200,7 +200,7 @@ pub struct GuiRuntimeSnapshot {
     pub supports_retry_config_api: bool,
     pub supports_persisted_station_config: bool,
     pub supports_default_profile_override: bool,
-    pub supports_config_runtime_override: bool,
+    pub supports_station_runtime_override: bool,
     pub supports_session_override_reset: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
@@ -218,19 +218,19 @@ pub struct RunningProxy {
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<FinishedRequest>,
     pub session_cards: Vec<SessionIdentityCard>,
-    pub global_override: Option<String>,
+    pub global_station_override: Option<String>,
     pub configured_active_station: Option<String>,
     pub effective_active_station: Option<String>,
     pub configured_default_profile: Option<String>,
     pub default_profile: Option<String>,
     pub profiles: Vec<ControlProfileOption>,
     pub session_model_overrides: HashMap<String, String>,
-    pub session_config_overrides: HashMap<String, String>,
+    pub session_station_overrides: HashMap<String, String>,
     pub session_effort_overrides: HashMap<String, String>,
     pub session_service_tier_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
-    pub configs: Vec<ConfigOption>,
-    pub config_health: HashMap<String, ConfigHealth>,
+    pub stations: Vec<StationOption>,
+    pub station_health: HashMap<String, StationHealth>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
@@ -436,18 +436,18 @@ impl ProxyController {
                 active: r.active.clone(),
                 recent: r.recent.clone(),
                 session_cards: r.session_cards.clone(),
-                global_override: r.global_override.clone(),
+                global_station_override: r.global_station_override.clone(),
                 configured_active_station: r.configured_active_station.clone(),
                 effective_active_station: r.effective_active_station.clone(),
                 configured_default_profile: r.configured_default_profile.clone(),
                 default_profile: r.default_profile.clone(),
                 profiles: r.profiles.clone(),
                 session_model_overrides: r.session_model_overrides.clone(),
-                session_config_overrides: r.session_config_overrides.clone(),
+                session_station_overrides: r.session_station_overrides.clone(),
                 session_effort_overrides: r.session_effort_overrides.clone(),
                 session_service_tier_overrides: r.session_service_tier_overrides.clone(),
                 session_stats: r.session_stats.clone(),
-                configs: r.configs.clone(),
+                stations: r.stations.clone(),
                 usage_rollup: r.usage_rollup.clone(),
                 stats_5m: r.stats_5m.clone(),
                 stats_1h: r.stats_1h.clone(),
@@ -457,7 +457,7 @@ impl ProxyController {
                 supports_retry_config_api: true,
                 supports_persisted_station_config: true,
                 supports_default_profile_override: true,
-                supports_config_runtime_override: true,
+                supports_station_runtime_override: true,
                 supports_session_override_reset: true,
                 shared_capabilities: local_shared_control_plane_capabilities(),
                 host_local_capabilities: local_host_local_control_plane_capabilities(),
@@ -472,18 +472,18 @@ impl ProxyController {
                 active: a.active.clone(),
                 recent: a.recent.clone(),
                 session_cards: a.session_cards.clone(),
-                global_override: a.global_override.clone(),
+                global_station_override: a.global_station_override.clone(),
                 configured_active_station: a.configured_active_station.clone(),
                 effective_active_station: a.effective_active_station.clone(),
                 configured_default_profile: a.configured_default_profile.clone(),
                 default_profile: a.default_profile.clone(),
                 profiles: a.profiles.clone(),
                 session_model_overrides: a.session_model_overrides.clone(),
-                session_config_overrides: a.session_config_overrides.clone(),
+                session_station_overrides: a.session_station_overrides.clone(),
                 session_effort_overrides: a.session_effort_overrides.clone(),
                 session_service_tier_overrides: a.session_service_tier_overrides.clone(),
                 session_stats: a.session_stats.clone(),
-                configs: a.configs.clone(),
+                stations: a.stations.clone(),
                 usage_rollup: a.usage_rollup.clone(),
                 stats_5m: a.stats_5m.clone(),
                 stats_1h: a.stats_1h.clone(),
@@ -493,7 +493,7 @@ impl ProxyController {
                 supports_retry_config_api: a.supports_retry_config_api,
                 supports_persisted_station_config: a.supports_persisted_station_config,
                 supports_default_profile_override: a.supports_default_profile_override,
-                supports_config_runtime_override: a.supports_config_runtime_override,
+                supports_station_runtime_override: a.supports_station_runtime_override,
                 supports_session_override_reset: a.supports_session_override_reset,
                 shared_capabilities: a.shared_capabilities.clone(),
                 host_local_capabilities: a.host_local_capabilities.clone(),
@@ -600,6 +600,19 @@ impl ProxyController {
                 .await?)
         }
 
+        async fn get_runtime_status(
+            client: &Client,
+            base: &str,
+            timeout: Duration,
+        ) -> anyhow::Result<RuntimeConfigStatus> {
+            get_json::<RuntimeConfigStatus>(
+                client,
+                format!("{base}/__codex_helper/api/v1/runtime/status"),
+                timeout,
+            )
+            .await
+        }
+
         async fn scan_port(client: Client, port: u16) -> Option<DiscoveredProxy> {
             let base_url = local_proxy_base_url(port);
             let admin_base_url = local_admin_base_url_for_proxy_port(port);
@@ -613,13 +626,9 @@ impl ProxyController {
             .await;
 
             if let Ok(c) = caps {
-                let runtime = get_json::<RuntimeConfigStatus>(
-                    &client,
-                    format!("{admin_base_url}/__codex_helper/api/v1/config/runtime"),
-                    timeout,
-                )
-                .await
-                .ok();
+                let runtime = get_runtime_status(&client, &admin_base_url, timeout)
+                    .await
+                    .ok();
 
                 return Some(DiscoveredProxy {
                     port,
@@ -644,13 +653,7 @@ impl ProxyController {
             .await;
 
             if let Ok(c) = caps {
-                let runtime = get_json::<RuntimeConfigStatus>(
-                    &client,
-                    format!("{base_url}/__codex_helper/api/v1/config/runtime"),
-                    timeout,
-                )
-                .await
-                .ok();
+                let runtime = get_runtime_status(&client, &base_url, timeout).await.ok();
 
                 return Some(DiscoveredProxy {
                     port,
@@ -688,13 +691,9 @@ impl ProxyController {
                 .await;
 
                 if let Ok(c) = caps {
-                    let runtime = get_json::<RuntimeConfigStatus>(
-                        &client,
-                        format!("{discovered_admin_base}/__codex_helper/api/v1/config/runtime"),
-                        timeout,
-                    )
-                    .await
-                    .ok();
+                    let runtime = get_runtime_status(&client, &discovered_admin_base, timeout)
+                        .await
+                        .ok();
 
                     return Some(DiscoveredProxy {
                         port,
@@ -710,63 +709,9 @@ impl ProxyController {
                         remote_admin_access: c.remote_admin_access,
                     });
                 }
-
-                if let Ok(runtime) = get_json::<RuntimeConfigStatus>(
-                    &client,
-                    format!("{discovered_admin_base}/__codex_helper/config/runtime"),
-                    timeout,
-                )
-                .await
-                {
-                    return Some(DiscoveredProxy {
-                        port,
-                        base_url,
-                        admin_base_url: discovered_admin_base,
-                        api_version: None,
-                        service_name: None,
-                        endpoints: Vec::new(),
-                        runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
-                        last_error: None,
-                        shared_capabilities: SharedControlPlaneCapabilities::default(),
-                        host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
-                        remote_admin_access: RemoteAdminAccessCapabilities::default(),
-                    });
-                }
             }
 
-            let runtime = match get_json::<RuntimeConfigStatus>(
-                &client,
-                format!("{admin_base_url}/__codex_helper/config/runtime"),
-                timeout,
-            )
-            .await
-            {
-                Ok(runtime) => Ok(runtime),
-                Err(_) => {
-                    get_json::<RuntimeConfigStatus>(
-                        &client,
-                        format!("{base_url}/__codex_helper/config/runtime"),
-                        timeout,
-                    )
-                    .await
-                }
-            };
-            match runtime {
-                Ok(r) => Some(DiscoveredProxy {
-                    port,
-                    base_url,
-                    admin_base_url,
-                    api_version: None,
-                    service_name: None,
-                    endpoints: Vec::new(),
-                    runtime_loaded_at_ms: Some(r.loaded_at_ms),
-                    last_error: None,
-                    shared_capabilities: SharedControlPlaneCapabilities::default(),
-                    host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
-                    remote_admin_access: RemoteAdminAccessCapabilities::default(),
-                }),
-                Err(_) => None,
-            }
+            None
         }
 
         let client = self.http_client.clone();
@@ -838,6 +783,45 @@ impl ProxyController {
                     .await?)
             }
 
+            async fn get_v1_runtime_status(
+                client: &Client,
+                base: &str,
+                req_timeout: Duration,
+            ) -> anyhow::Result<RuntimeConfigStatus> {
+                get_json::<RuntimeConfigStatus>(
+                    client,
+                    format!("{base}/__codex_helper/api/v1/runtime/status"),
+                    req_timeout,
+                )
+                .await
+            }
+
+            async fn get_v1_global_station_override(
+                client: &Client,
+                base: &str,
+                req_timeout: Duration,
+            ) -> anyhow::Result<Option<String>> {
+                get_json::<Option<String>>(
+                    client,
+                    format!("{base}/__codex_helper/api/v1/overrides/global-station"),
+                    req_timeout,
+                )
+                .await
+            }
+
+            async fn get_v1_station_health(
+                client: &Client,
+                base: &str,
+                req_timeout: Duration,
+            ) -> anyhow::Result<HashMap<String, StationHealth>> {
+                get_json::<HashMap<String, StationHealth>>(
+                    client,
+                    format!("{base}/__codex_helper/api/v1/status/station-health"),
+                    req_timeout,
+                )
+                .await
+            }
+
             #[derive(Default)]
             struct RefreshResult {
                 management_base_url: String,
@@ -846,19 +830,19 @@ impl ProxyController {
                 active: Vec<ActiveRequest>,
                 recent: Vec<FinishedRequest>,
                 session_cards: Vec<SessionIdentityCard>,
-                global_override: Option<String>,
+                global_station_override: Option<String>,
                 configured_active_station: Option<String>,
                 effective_active_station: Option<String>,
                 configured_default_profile: Option<String>,
                 default_profile: Option<String>,
                 profiles: Vec<ControlProfileOption>,
                 session_model: HashMap<String, String>,
-                session_cfg: HashMap<String, String>,
+                session_station: HashMap<String, String>,
                 session_effort: HashMap<String, String>,
                 session_service_tier: HashMap<String, String>,
                 session_stats: HashMap<String, SessionStats>,
-                configs: Vec<ConfigOption>,
-                config_health: HashMap<String, ConfigHealth>,
+                stations: Vec<StationOption>,
+                station_health: HashMap<String, StationHealth>,
                 health_checks: HashMap<String, HealthCheckStatus>,
                 usage_rollup: UsageRollupView,
                 stats_5m: WindowStats,
@@ -876,12 +860,18 @@ impl ProxyController {
                 supports_station_spec_api: bool,
                 supports_persisted_station_config: bool,
                 supports_default_profile_override: bool,
-                supports_config_runtime_override: bool,
+                supports_station_runtime_override: bool,
                 supports_session_override_reset: bool,
                 supports_station_api: bool,
                 shared_capabilities: SharedControlPlaneCapabilities,
                 host_local_capabilities: HostLocalControlPlaneCapabilities,
                 remote_admin_access: RemoteAdminAccessCapabilities,
+            }
+
+            #[derive(Default, serde::Deserialize)]
+            struct AttachedSessionManualOverridesListResponse {
+                #[serde(default)]
+                sessions: HashMap<String, SessionManualOverrides>,
             }
 
             async fn refresh_from_base(
@@ -894,382 +884,196 @@ impl ProxyController {
                     format!("{base}/__codex_helper/api/v1/capabilities"),
                     req_timeout,
                 )
-                .await;
-                let supports_v1 = matches!(caps.as_ref(), Ok(c) if c.api_version == 1);
+                .await?;
+                if caps.api_version != 1 {
+                    bail!(
+                        "attached proxy reported unsupported api version: {}",
+                        caps.api_version
+                    );
+                }
+                let ApiV1Capabilities {
+                    api_version,
+                    service_name,
+                    endpoints,
+                    shared_capabilities,
+                    host_local_capabilities,
+                    remote_admin_access,
+                } = caps;
+                let supports_snapshot = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/snapshot");
+                let supports_profiles = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/profiles");
+                let supports_retry_config_api = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/retry/config");
+                let supports_provider_spec_api = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/providers/specs");
+                let supports_station_spec_api = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/stations/specs");
+                let supports_default_profile_override = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/profiles/default");
+                let supports_session_override_reset = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/reset");
+                let supports_session_override_aggregate = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/overrides/session");
+                let supports_session_station = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/station");
+                let supports_session_effort = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/effort");
+                let supports_persisted_station_config = endpoints.iter().any(|e| {
+                    e == "/__codex_helper/api/v1/stations/config-active"
+                        || e == "/__codex_helper/api/v1/stations/{name}"
+                });
+                let supports_station_api = endpoints.iter().any(|e| {
+                    e == "/__codex_helper/api/v1/stations"
+                        || e == "/__codex_helper/api/v1/stations/runtime"
+                        || e == "/__codex_helper/api/v1/stations/probe"
+                });
+                let supports_station_runtime_override = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/stations/runtime");
 
-                if supports_v1 {
-                    let caps = caps.expect("checked ok above");
-                    let ApiV1Capabilities {
-                        api_version,
-                        service_name,
-                        endpoints,
-                        shared_capabilities,
-                        host_local_capabilities,
-                        remote_admin_access,
-                    } = caps;
-                    let supports_snapshot = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/snapshot");
-                    let supports_profiles = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/profiles");
-                    let supports_retry_config_api = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/retry/config");
-                    let supports_provider_spec_api = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/providers/specs");
-                    let supports_station_spec_api = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/stations/specs");
-                    let supports_default_profile_override = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/profiles/default");
-                    let supports_session_override_reset = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/overrides/session/reset");
-                    let supports_persisted_station_config = endpoints.iter().any(|e| {
-                        e == "/__codex_helper/api/v1/stations/config-active"
-                            || e == "/__codex_helper/api/v1/stations/{name}"
-                    });
-                    let supports_station_api = endpoints.iter().any(|e| {
-                        e == "/__codex_helper/api/v1/stations"
-                            || e == "/__codex_helper/api/v1/stations/runtime"
-                    });
-                    let supports_config_runtime_override = endpoints.iter().any(|e| {
-                        e == "/__codex_helper/api/v1/configs/runtime"
-                            || e == "/__codex_helper/api/v1/stations/runtime"
-                    });
-
-                    let configured_profiles = if supports_profiles {
-                        #[derive(serde::Deserialize)]
-                        struct ProfilesResponse {
-                            default_profile: Option<String>,
-                            #[serde(default)]
-                            configured_default_profile: Option<String>,
-                            #[serde(default)]
-                            profiles: Vec<ControlProfileOption>,
-                        }
-
-                        get_json::<ProfilesResponse>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/profiles"),
-                            req_timeout,
-                        )
-                        .await
-                        .ok()
-                    } else {
-                        None
-                    };
-                    let configured_retry = if supports_retry_config_api {
-                        #[derive(serde::Deserialize)]
-                        struct RetryConfigResponse {
-                            configured: RetryConfig,
-                            resolved: ResolvedRetryConfig,
-                        }
-
-                        get_json::<RetryConfigResponse>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/retry/config"),
-                            req_timeout,
-                        )
-                        .await
-                        .ok()
-                        .map(|response| (response.configured, response.resolved))
-                    } else {
-                        None
-                    };
-                    let persisted_station_catalog = if supports_station_spec_api {
-                        get_json::<crate::config::PersistedStationsCatalog>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/stations/specs"),
-                            req_timeout,
-                        )
-                        .await
-                        .ok()
-                    } else {
-                        None
-                    };
-                    let persisted_provider_catalog = if supports_provider_spec_api {
-                        get_json::<crate::config::PersistedProvidersCatalog>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/providers/specs"),
-                            req_timeout,
-                        )
-                        .await
-                        .ok()
-                    } else {
-                        None
-                    };
-
-                    if supports_snapshot {
-                        let api = get_json::<ApiV1Snapshot>(
-                            client,
-                            format!(
-                                "{base}/__codex_helper/api/v1/snapshot?recent_limit=600&stats_days=21"
-                            ),
-                            req_timeout,
-                        )
-                        .await?;
-                        let ApiV1Snapshot {
-                            api_version,
-                            service_name,
-                            runtime_loaded_at_ms,
-                            runtime_source_mtime_ms,
-                            configs,
-                            stations,
-                            configured_active_station,
-                            effective_active_station,
-                            default_profile,
-                            profiles,
-                            snapshot,
-                        } = api;
-                        let configs = if stations.is_empty() {
-                            configs
-                        } else {
-                            stations
-                        };
-                        let configured_default_profile = configured_profiles
-                            .as_ref()
-                            .and_then(|response| response.configured_default_profile.clone())
-                            .or_else(|| {
-                                configured_profiles
-                                    .as_ref()
-                                    .and_then(|response| response.default_profile.clone())
-                            });
-                        let profiles = configured_profiles
-                            .as_ref()
-                            .map(|response| response.profiles.clone())
-                            .unwrap_or(profiles);
-
-                        return Ok(RefreshResult {
-                            management_base_url: base.to_string(),
-                            api_version: Some(api_version),
-                            service_name: Some(service_name),
-                            active: snapshot.active,
-                            recent: snapshot.recent,
-                            session_cards: snapshot.session_cards,
-                            global_override: snapshot.global_override,
-                            configured_active_station,
-                            effective_active_station,
-                            configured_default_profile,
-                            default_profile,
-                            profiles,
-                            session_model: snapshot.session_model_overrides,
-                            session_cfg: snapshot.session_config_overrides,
-                            session_effort: snapshot.session_effort_overrides,
-                            session_service_tier: snapshot.session_service_tier_overrides,
-                            session_stats: snapshot.session_stats,
-                            configs,
-                            config_health: snapshot.config_health,
-                            health_checks: snapshot.health_checks,
-                            usage_rollup: snapshot.usage_rollup,
-                            stats_5m: snapshot.stats_5m,
-                            stats_1h: snapshot.stats_1h,
-                            lb_view: snapshot.lb_view,
-                            runtime_loaded_at_ms,
-                            runtime_source_mtime_ms,
-                            configured_retry: configured_retry
-                                .as_ref()
-                                .map(|(configured, _)| configured.clone()),
-                            resolved_retry: configured_retry
-                                .as_ref()
-                                .map(|(_, resolved)| resolved.clone()),
-                            supports_retry_config_api,
-                            persisted_providers: persisted_provider_catalog
-                                .as_ref()
-                                .map(|catalog| {
-                                    catalog
-                                        .providers
-                                        .iter()
-                                        .cloned()
-                                        .map(|provider| (provider.name.clone(), provider))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            supports_provider_spec_api,
-                            persisted_stations: persisted_station_catalog
-                                .as_ref()
-                                .map(|catalog| {
-                                    catalog
-                                        .stations
-                                        .iter()
-                                        .cloned()
-                                        .map(|station| (station.name.clone(), station))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            persisted_station_providers: persisted_station_catalog
-                                .as_ref()
-                                .map(|catalog| {
-                                    catalog
-                                        .providers
-                                        .iter()
-                                        .cloned()
-                                        .map(|provider| (provider.name.clone(), provider))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            supports_station_spec_api,
-                            supports_persisted_station_config,
-                            supports_default_profile_override,
-                            supports_config_runtime_override,
-                            supports_session_override_reset,
-                            supports_station_api,
-                            shared_capabilities,
-                            host_local_capabilities,
-                            remote_admin_access,
-                        });
+                let configured_profiles = if supports_profiles {
+                    #[derive(serde::Deserialize)]
+                    struct ProfilesResponse {
+                        default_profile: Option<String>,
+                        #[serde(default)]
+                        configured_default_profile: Option<String>,
+                        #[serde(default)]
+                        profiles: Vec<ControlProfileOption>,
                     }
 
-                    let (
-                        active,
-                        recent,
-                        runtime,
-                        global_override,
-                        session_cfg,
-                        session_effort,
-                        stats,
-                        configs,
-                        config_health,
-                        health_checks,
-                    ) = tokio::try_join!(
-                        get_json::<Vec<ActiveRequest>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/status/active"),
-                            req_timeout,
-                        ),
-                        get_json::<Vec<FinishedRequest>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/status/recent?limit=200"),
-                            req_timeout,
-                        ),
-                        get_json::<RuntimeConfigStatus>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/config/runtime"),
-                            req_timeout,
-                        ),
-                        get_json::<Option<String>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/overrides/global-config"),
-                            req_timeout,
-                        ),
-                        get_json::<HashMap<String, String>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/overrides/session/config"),
-                            req_timeout,
-                        ),
-                        get_json::<HashMap<String, String>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/overrides/session/effort"),
-                            req_timeout,
-                        ),
-                        get_json::<HashMap<String, SessionStats>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/status/session-stats"),
-                            req_timeout,
-                        ),
-                        get_json::<Vec<ConfigOption>>(
-                            client,
-                            if supports_station_api {
-                                format!("{base}/__codex_helper/api/v1/stations")
-                            } else {
-                                format!("{base}/__codex_helper/api/v1/configs")
-                            },
-                            req_timeout,
-                        ),
-                        get_json::<HashMap<String, ConfigHealth>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/status/config-health"),
-                            req_timeout,
-                        ),
-                        get_json::<HashMap<String, HealthCheckStatus>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/status/health-checks"),
-                            req_timeout,
-                        ),
-                    )?;
+                    get_json::<ProfilesResponse>(
+                        client,
+                        format!("{base}/__codex_helper/api/v1/profiles"),
+                        req_timeout,
+                    )
+                    .await
+                    .ok()
+                } else {
+                    None
+                };
+                let configured_retry = if supports_retry_config_api {
+                    #[derive(serde::Deserialize)]
+                    struct RetryConfigResponse {
+                        configured: RetryConfig,
+                        resolved: ResolvedRetryConfig,
+                    }
 
-                    let supports_session_model = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/overrides/session/model");
-                    let supports_session_service_tier = endpoints
-                        .iter()
-                        .any(|e| e == "/__codex_helper/api/v1/overrides/session/service-tier");
+                    get_json::<RetryConfigResponse>(
+                        client,
+                        format!("{base}/__codex_helper/api/v1/retry/config"),
+                        req_timeout,
+                    )
+                    .await
+                    .ok()
+                    .map(|response| (response.configured, response.resolved))
+                } else {
+                    None
+                };
+                let persisted_station_catalog = if supports_station_spec_api {
+                    get_json::<crate::config::PersistedStationsCatalog>(
+                        client,
+                        format!("{base}/__codex_helper/api/v1/stations/specs"),
+                        req_timeout,
+                    )
+                    .await
+                    .ok()
+                } else {
+                    None
+                };
+                let persisted_provider_catalog = if supports_provider_spec_api {
+                    get_json::<crate::config::PersistedProvidersCatalog>(
+                        client,
+                        format!("{base}/__codex_helper/api/v1/providers/specs"),
+                        req_timeout,
+                    )
+                    .await
+                    .ok()
+                } else {
+                    None
+                };
 
-                    let session_model = if supports_session_model {
-                        get_json::<HashMap<String, String>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/overrides/session/model"),
-                            req_timeout,
-                        )
-                        .await
-                        .ok()
-                        .unwrap_or_default()
-                    } else {
-                        HashMap::new()
-                    };
-
-                    let session_service_tier = if supports_session_service_tier {
-                        get_json::<HashMap<String, String>>(
-                            client,
-                            format!("{base}/__codex_helper/api/v1/overrides/session/service-tier"),
-                            req_timeout,
-                        )
-                        .await
-                        .ok()
-                        .unwrap_or_default()
-                    } else {
-                        HashMap::new()
-                    };
-
-                    let (configured_default_profile, default_profile, profiles) =
-                        match configured_profiles {
-                            Some(response) => (
-                                response
-                                    .configured_default_profile
-                                    .clone()
-                                    .or_else(|| response.default_profile.clone()),
-                                response.default_profile,
-                                response.profiles,
-                            ),
-                            None => (None, None, Vec::new()),
-                        };
+                if supports_snapshot {
+                    let api = get_json::<ApiV1Snapshot>(
+                        client,
+                        format!(
+                            "{base}/__codex_helper/api/v1/snapshot?recent_limit=600&stats_days=21"
+                        ),
+                        req_timeout,
+                    )
+                    .await?;
+                    let ApiV1Snapshot {
+                        api_version,
+                        service_name,
+                        runtime_loaded_at_ms,
+                        runtime_source_mtime_ms,
+                        stations,
+                        configured_active_station,
+                        effective_active_station,
+                        default_profile,
+                        profiles,
+                        snapshot,
+                    } = api;
+                    let configured_default_profile = configured_profiles
+                        .as_ref()
+                        .and_then(|response| response.configured_default_profile.clone())
+                        .or_else(|| {
+                            configured_profiles
+                                .as_ref()
+                                .and_then(|response| response.default_profile.clone())
+                        });
+                    let profiles = configured_profiles
+                        .as_ref()
+                        .map(|response| response.profiles.clone())
+                        .unwrap_or(profiles);
+                    let global_station_override = snapshot
+                        .effective_global_station_override()
+                        .map(str::to_owned);
+                    let station_health = snapshot.effective_station_health().clone();
 
                     return Ok(RefreshResult {
                         management_base_url: base.to_string(),
                         api_version: Some(api_version),
                         service_name: Some(service_name),
-                        active,
-                        recent,
-                        session_cards: Vec::new(),
-                        global_override,
-                        configured_active_station: None,
-                        effective_active_station: None,
+                        active: snapshot.active,
+                        recent: snapshot.recent,
+                        session_cards: snapshot.session_cards,
+                        global_station_override,
+                        configured_active_station,
+                        effective_active_station,
                         configured_default_profile,
                         default_profile,
                         profiles,
-                        session_model,
-                        session_cfg,
-                        session_effort,
-                        session_service_tier,
-                        session_stats: stats,
-                        configs,
-                        config_health,
-                        health_checks,
-                        usage_rollup: UsageRollupView::default(),
-                        stats_5m: WindowStats::default(),
-                        stats_1h: WindowStats::default(),
-                        lb_view: HashMap::new(),
-                        runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
-                        runtime_source_mtime_ms: runtime.source_mtime_ms,
+                        session_model: snapshot.session_model_overrides,
+                        session_station: snapshot.session_station_overrides,
+                        session_effort: snapshot.session_effort_overrides,
+                        session_service_tier: snapshot.session_service_tier_overrides,
+                        session_stats: snapshot.session_stats,
+                        stations,
+                        station_health,
+                        health_checks: snapshot.health_checks,
+                        usage_rollup: snapshot.usage_rollup,
+                        stats_5m: snapshot.stats_5m,
+                        stats_1h: snapshot.stats_1h,
+                        lb_view: snapshot.lb_view,
+                        runtime_loaded_at_ms,
+                        runtime_source_mtime_ms,
                         configured_retry: configured_retry
                             .as_ref()
                             .map(|(configured, _)| configured.clone()),
                         resolved_retry: configured_retry
                             .as_ref()
-                            .map(|(_, resolved)| resolved.clone())
-                            .or(runtime.retry),
+                            .map(|(_, resolved)| resolved.clone()),
                         supports_retry_config_api,
                         persisted_providers: persisted_provider_catalog
                             .as_ref()
@@ -1308,7 +1112,7 @@ impl ProxyController {
                         supports_station_spec_api,
                         supports_persisted_station_config,
                         supports_default_profile_override,
-                        supports_config_runtime_override,
+                        supports_station_runtime_override,
                         supports_session_override_reset,
                         supports_station_api,
                         shared_capabilities,
@@ -1317,77 +1121,237 @@ impl ProxyController {
                     });
                 }
 
-                let (active, recent, runtime) = tokio::try_join!(
+                let (
+                    active,
+                    recent,
+                    runtime,
+                    global_station_override,
+                    stats,
+                    stations,
+                    station_health,
+                    health_checks,
+                ) = tokio::try_join!(
                     get_json::<Vec<ActiveRequest>>(
                         client,
-                        format!("{base}/__codex_helper/status/active"),
+                        format!("{base}/__codex_helper/api/v1/status/active"),
                         req_timeout,
                     ),
                     get_json::<Vec<FinishedRequest>>(
                         client,
-                        format!("{base}/__codex_helper/status/recent?limit=200"),
+                        format!("{base}/__codex_helper/api/v1/status/recent?limit=200"),
                         req_timeout,
                     ),
-                    get_json::<RuntimeConfigStatus>(
+                    get_v1_runtime_status(client, base, req_timeout),
+                    get_v1_global_station_override(client, base, req_timeout),
+                    get_json::<HashMap<String, SessionStats>>(
                         client,
-                        format!("{base}/__codex_helper/config/runtime"),
+                        format!("{base}/__codex_helper/api/v1/status/session-stats"),
+                        req_timeout,
+                    ),
+                    get_json::<Vec<StationOption>>(
+                        client,
+                        format!("{base}/__codex_helper/api/v1/stations"),
+                        req_timeout,
+                    ),
+                    get_v1_station_health(client, base, req_timeout),
+                    get_json::<HashMap<String, HealthCheckStatus>>(
+                        client,
+                        format!("{base}/__codex_helper/api/v1/status/health-checks"),
                         req_timeout,
                     ),
                 )?;
 
-                let session_effort = get_json::<HashMap<String, String>>(
-                    client,
-                    format!("{base}/__codex_helper/override/session"),
-                    req_timeout,
-                )
-                .await
-                .ok()
-                .unwrap_or_default();
+                let supports_session_model = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/model");
+                let supports_session_service_tier = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/service-tier");
+                let (session_station, session_effort, session_model, session_service_tier) =
+                    if supports_session_override_aggregate {
+                        let aggregate = get_json::<AttachedSessionManualOverridesListResponse>(
+                            client,
+                            format!("{base}/__codex_helper/api/v1/overrides/session"),
+                            req_timeout,
+                        )
+                        .await
+                        .ok()
+                        .unwrap_or_default();
+                        let mut session_station = HashMap::new();
+                        let mut session_effort = HashMap::new();
+                        let mut session_model = HashMap::new();
+                        let mut session_service_tier = HashMap::new();
+                        for (session_id, overrides) in aggregate.sessions {
+                            if let Some(station_name) = overrides.station_name {
+                                session_station.insert(session_id.clone(), station_name);
+                            }
+                            if let Some(reasoning_effort) = overrides.reasoning_effort {
+                                session_effort.insert(session_id.clone(), reasoning_effort);
+                            }
+                            if let Some(model) = overrides.model {
+                                session_model.insert(session_id.clone(), model);
+                            }
+                            if let Some(service_tier) = overrides.service_tier {
+                                session_service_tier.insert(session_id, service_tier);
+                            }
+                        }
+                        (
+                            session_station,
+                            session_effort,
+                            session_model,
+                            session_service_tier,
+                        )
+                    } else {
+                        let session_station = if supports_session_station {
+                            get_json::<HashMap<String, String>>(
+                                client,
+                                format!("{base}/__codex_helper/api/v1/overrides/session/station"),
+                                req_timeout,
+                            )
+                            .await
+                            .ok()
+                            .unwrap_or_default()
+                        } else {
+                            HashMap::new()
+                        };
+                        let session_effort = if supports_session_effort {
+                            get_json::<HashMap<String, String>>(
+                                client,
+                                format!("{base}/__codex_helper/api/v1/overrides/session/effort"),
+                                req_timeout,
+                            )
+                            .await
+                            .ok()
+                            .unwrap_or_default()
+                        } else {
+                            HashMap::new()
+                        };
+                        let session_model = if supports_session_model {
+                            get_json::<HashMap<String, String>>(
+                                client,
+                                format!("{base}/__codex_helper/api/v1/overrides/session/model"),
+                                req_timeout,
+                            )
+                            .await
+                            .ok()
+                            .unwrap_or_default()
+                        } else {
+                            HashMap::new()
+                        };
+                        let session_service_tier = if supports_session_service_tier {
+                            get_json::<HashMap<String, String>>(
+                                client,
+                                format!(
+                                    "{base}/__codex_helper/api/v1/overrides/session/service-tier"
+                                ),
+                                req_timeout,
+                            )
+                            .await
+                            .ok()
+                            .unwrap_or_default()
+                        } else {
+                            HashMap::new()
+                        };
+                        (
+                            session_station,
+                            session_effort,
+                            session_model,
+                            session_service_tier,
+                        )
+                    };
 
-                Ok(RefreshResult {
+                let (configured_default_profile, default_profile, profiles) =
+                    match configured_profiles {
+                        Some(response) => (
+                            response
+                                .configured_default_profile
+                                .clone()
+                                .or_else(|| response.default_profile.clone()),
+                            response.default_profile,
+                            response.profiles,
+                        ),
+                        None => (None, None, Vec::new()),
+                    };
+
+                return Ok(RefreshResult {
                     management_base_url: base.to_string(),
-                    api_version: None,
-                    service_name: None,
+                    api_version: Some(api_version),
+                    service_name: Some(service_name),
                     active,
                     recent,
                     session_cards: Vec::new(),
-                    global_override: None,
+                    global_station_override,
                     configured_active_station: None,
                     effective_active_station: None,
-                    configured_default_profile: None,
-                    default_profile: None,
-                    profiles: Vec::new(),
-                    session_model: HashMap::new(),
-                    session_cfg: HashMap::new(),
+                    configured_default_profile,
+                    default_profile,
+                    profiles,
+                    session_model,
+                    session_station,
                     session_effort,
-                    session_service_tier: HashMap::new(),
-                    session_stats: HashMap::new(),
-                    configs: Vec::new(),
-                    config_health: HashMap::new(),
-                    health_checks: HashMap::new(),
+                    session_service_tier,
+                    session_stats: stats,
+                    stations,
+                    station_health,
+                    health_checks,
                     usage_rollup: UsageRollupView::default(),
                     stats_5m: WindowStats::default(),
                     stats_1h: WindowStats::default(),
                     lb_view: HashMap::new(),
                     runtime_loaded_at_ms: Some(runtime.loaded_at_ms),
                     runtime_source_mtime_ms: runtime.source_mtime_ms,
-                    configured_retry: None,
-                    resolved_retry: runtime.retry,
-                    supports_retry_config_api: false,
-                    persisted_providers: BTreeMap::new(),
-                    supports_provider_spec_api: false,
-                    persisted_stations: BTreeMap::new(),
-                    persisted_station_providers: BTreeMap::new(),
-                    supports_station_spec_api: false,
-                    supports_persisted_station_config: false,
-                    supports_default_profile_override: false,
-                    supports_config_runtime_override: false,
-                    supports_session_override_reset: false,
-                    supports_station_api: false,
-                    shared_capabilities: SharedControlPlaneCapabilities::default(),
-                    host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
-                    remote_admin_access: RemoteAdminAccessCapabilities::default(),
-                })
+                    configured_retry: configured_retry
+                        .as_ref()
+                        .map(|(configured, _)| configured.clone()),
+                    resolved_retry: configured_retry
+                        .as_ref()
+                        .map(|(_, resolved)| resolved.clone())
+                        .or(runtime.retry),
+                    supports_retry_config_api,
+                    persisted_providers: persisted_provider_catalog
+                        .as_ref()
+                        .map(|catalog| {
+                            catalog
+                                .providers
+                                .iter()
+                                .cloned()
+                                .map(|provider| (provider.name.clone(), provider))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    supports_provider_spec_api,
+                    persisted_stations: persisted_station_catalog
+                        .as_ref()
+                        .map(|catalog| {
+                            catalog
+                                .stations
+                                .iter()
+                                .cloned()
+                                .map(|station| (station.name.clone(), station))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    persisted_station_providers: persisted_station_catalog
+                        .as_ref()
+                        .map(|catalog| {
+                            catalog
+                                .providers
+                                .iter()
+                                .cloned()
+                                .map(|provider| (provider.name.clone(), provider))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    supports_station_spec_api,
+                    supports_persisted_station_config,
+                    supports_default_profile_override,
+                    supports_station_runtime_override,
+                    supports_session_override_reset,
+                    supports_station_api,
+                    shared_capabilities,
+                    host_local_capabilities,
+                    remote_admin_access,
+                });
             }
 
             let mut last_err: Option<anyhow::Error> = None;
@@ -1411,19 +1375,19 @@ impl ProxyController {
                     att.active = result.active;
                     att.recent = result.recent;
                     att.session_cards = result.session_cards;
-                    att.global_override = result.global_override;
+                    att.global_station_override = result.global_station_override;
                     att.configured_active_station = result.configured_active_station;
                     att.effective_active_station = result.effective_active_station;
                     att.configured_default_profile = result.configured_default_profile;
                     att.default_profile = result.default_profile;
                     att.profiles = result.profiles;
                     att.session_model_overrides = result.session_model;
-                    att.session_config_overrides = result.session_cfg;
+                    att.session_station_overrides = result.session_station;
                     att.session_effort_overrides = result.session_effort;
                     att.session_service_tier_overrides = result.session_service_tier;
                     att.session_stats = result.session_stats;
-                    att.configs = result.configs;
-                    att.config_health = result.config_health;
+                    att.stations = result.stations;
+                    att.station_health = result.station_health;
                     att.health_checks = result.health_checks;
                     att.usage_rollup = result.usage_rollup;
                     att.stats_5m = result.stats_5m;
@@ -1443,7 +1407,8 @@ impl ProxyController {
                         result.supports_persisted_station_config;
                     att.supports_default_profile_override =
                         result.supports_default_profile_override;
-                    att.supports_config_runtime_override = result.supports_config_runtime_override;
+                    att.supports_station_runtime_override =
+                        result.supports_station_runtime_override;
                     att.supports_session_override_reset = result.supports_session_override_reset;
                     att.supports_station_api = result.supports_station_api;
                     att.shared_capabilities = result.shared_capabilities;
@@ -1482,21 +1447,24 @@ impl ProxyController {
                 Ok(())
             }
             ProxyMode::Attached(att) => {
+                if att.api_version != Some(1) {
+                    bail!("attached proxy does not support session effort overrides (need api v1)");
+                }
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
-                let supports_v1 = att.api_version == Some(1);
                 let fut = async move {
-                    let url = if supports_v1 {
-                        format!("{base}/__codex_helper/api/v1/overrides/session/effort")
-                    } else {
-                        format!("{base}/__codex_helper/override/session")
-                    };
-                    send_admin_request(client.post(url).timeout(Duration::from_millis(800)).json(
-                        &serde_json::json!({
-                            "session_id": session_id,
-                            "effort": effort,
-                        }),
-                    ))
+                    let payload = serde_json::json!({
+                        "session_id": session_id,
+                        "effort": effort,
+                    });
+                    send_admin_request(
+                        client
+                            .post(format!(
+                                "{base}/__codex_helper/api/v1/overrides/session/effort"
+                            ))
+                            .timeout(Duration::from_millis(800))
+                            .json(&payload),
+                    )
                     .await?;
                     Ok::<(), anyhow::Error>(())
                 };
@@ -1805,7 +1773,7 @@ impl ProxyController {
             send_admin_request(
                 client
                     .post(format!(
-                        "{base}/__codex_helper/api/v1/profiles/config-default"
+                        "{base}/__codex_helper/api/v1/profiles/default/persisted"
                     ))
                     .timeout(Duration::from_millis(1200))
                     .json(&serde_json::json!({
@@ -2216,10 +2184,10 @@ impl ProxyController {
         Ok(())
     }
 
-    pub fn set_runtime_config_meta(
+    pub fn set_runtime_station_meta(
         &mut self,
         rt: &tokio::runtime::Runtime,
-        config_name: String,
+        station_name: String,
         enabled: Option<Option<bool>>,
         level: Option<Option<u8>>,
         runtime_state: Option<Option<RuntimeConfigState>>,
@@ -2230,22 +2198,22 @@ impl ProxyController {
                 let service_name = r.service_name;
                 let cfg = r.cfg.clone();
                 let now = now_ms();
-                let configs = rt.block_on(async move {
+                let stations = rt.block_on(async move {
                     let mgr = match service_name {
                         "claude" => &cfg.claude,
                         _ => &cfg.codex,
                     };
-                    if !mgr.configs.contains_key(config_name.as_str()) {
-                        bail!("config not found: {config_name}");
+                    if !mgr.contains_station(station_name.as_str()) {
+                        bail!("station not found: {station_name}");
                     }
 
                     if let Some(enabled) = enabled {
                         match enabled {
                             Some(enabled) => {
                                 state
-                                    .set_config_enabled_override(
+                                    .set_station_enabled_override(
                                         service_name,
-                                        config_name.clone(),
+                                        station_name.clone(),
                                         enabled,
                                         now,
                                     )
@@ -2253,9 +2221,9 @@ impl ProxyController {
                             }
                             None => {
                                 state
-                                    .clear_config_enabled_override(
+                                    .clear_station_enabled_override(
                                         service_name,
-                                        config_name.as_str(),
+                                        station_name.as_str(),
                                     )
                                     .await;
                             }
@@ -2266,9 +2234,9 @@ impl ProxyController {
                         match level {
                             Some(level) => {
                                 state
-                                    .set_config_level_override(
+                                    .set_station_level_override(
                                         service_name,
-                                        config_name.clone(),
+                                        station_name.clone(),
                                         level.clamp(1, 10),
                                         now,
                                     )
@@ -2276,7 +2244,10 @@ impl ProxyController {
                             }
                             None => {
                                 state
-                                    .clear_config_level_override(service_name, config_name.as_str())
+                                    .clear_station_level_override(
+                                        service_name,
+                                        station_name.as_str(),
+                                    )
                                     .await;
                             }
                         }
@@ -2286,9 +2257,9 @@ impl ProxyController {
                         match runtime_state {
                             Some(runtime_state) => {
                                 state
-                                    .set_config_runtime_state_override(
+                                    .set_station_runtime_state_override(
                                         service_name,
-                                        config_name.clone(),
+                                        station_name.clone(),
                                         runtime_state,
                                         now,
                                     )
@@ -2296,9 +2267,9 @@ impl ProxyController {
                             }
                             None => {
                                 state
-                                    .clear_config_runtime_state_override(
+                                    .clear_station_runtime_state_override(
                                         service_name,
-                                        config_name.as_str(),
+                                        station_name.as_str(),
                                     )
                                     .await;
                             }
@@ -2306,7 +2277,7 @@ impl ProxyController {
                     }
 
                     Ok::<_, anyhow::Error>(
-                        effective_configs_from_cfg_state(
+                        effective_stations_from_cfg_state(
                             state.as_ref(),
                             service_name,
                             cfg.as_ref(),
@@ -2314,28 +2285,23 @@ impl ProxyController {
                         .await,
                     )
                 })?;
-                r.configs = configs;
+                r.stations = stations;
                 Ok(())
             }
             ProxyMode::Attached(att) => {
-                if !att.supports_config_runtime_override {
-                    bail!("attached proxy does not support runtime config meta control");
+                if !att.supports_station_runtime_override {
+                    bail!("attached proxy does not support runtime station meta control");
                 }
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
-                let use_station_api = att.supports_station_api;
                 let fut = async move {
                     let clear_enabled = matches!(enabled, Some(None));
                     let clear_level = matches!(level, Some(None));
                     let clear_runtime_state = matches!(runtime_state, Some(None));
                     let mut body = serde_json::Map::new();
                     body.insert(
-                        if use_station_api {
-                            "station_name".to_string()
-                        } else {
-                            "config_name".to_string()
-                        },
-                        serde_json::Value::String(config_name),
+                        "station_name".to_string(),
+                        serde_json::Value::String(station_name),
                     );
                     body.insert("enabled".to_string(), serde_json::json!(enabled.flatten()));
                     body.insert("level".to_string(), serde_json::json!(level.flatten()));
@@ -2354,14 +2320,7 @@ impl ProxyController {
                     );
                     send_admin_request(
                         client
-                            .post(format!(
-                                "{base}{}",
-                                if use_station_api {
-                                    "/__codex_helper/api/v1/stations/runtime"
-                                } else {
-                                    "/__codex_helper/api/v1/configs/runtime"
-                                }
-                            ))
+                            .post(format!("{base}/__codex_helper/api/v1/stations/runtime"))
                             .timeout(Duration::from_millis(1200))
                             .json(&serde_json::Value::Object(body)),
                     )
@@ -2375,31 +2334,33 @@ impl ProxyController {
         }
     }
 
-    pub fn apply_session_config_override(
+    pub fn apply_session_station_override(
         &mut self,
         rt: &tokio::runtime::Runtime,
         session_id: String,
-        config_name: Option<String>,
+        station_name: Option<String>,
     ) -> anyhow::Result<()> {
         match &mut self.mode {
             ProxyMode::Running(r) => {
                 let state = r.state.clone();
                 let now = now_ms();
                 rt.block_on(async move {
-                    match config_name {
+                    match station_name {
                         Some(name) => {
                             state
-                                .set_session_config_override(session_id, name, now)
+                                .set_session_station_override(session_id, name, now)
                                 .await
                         }
-                        None => state.clear_session_config_override(&session_id).await,
+                        None => state.clear_session_station_override(&session_id).await,
                     }
                 });
                 Ok(())
             }
             ProxyMode::Attached(att) => {
                 if att.api_version != Some(1) {
-                    bail!("attached proxy does not support session config overrides (need api v1)");
+                    bail!(
+                        "attached proxy does not support session station overrides (need api v1)"
+                    );
                 }
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
@@ -2407,12 +2368,12 @@ impl ProxyController {
                     send_admin_request(
                         client
                             .post(format!(
-                                "{base}/__codex_helper/api/v1/overrides/session/config"
+                                "{base}/__codex_helper/api/v1/overrides/session/station"
                             ))
                             .timeout(Duration::from_millis(800))
                             .json(&serde_json::json!({
                                 "session_id": session_id,
-                                "config_name": config_name,
+                                "station_name": station_name,
                             })),
                     )
                     .await?;
@@ -2477,26 +2438,26 @@ impl ProxyController {
         }
     }
 
-    pub fn apply_global_config_override(
+    pub fn apply_global_station_override(
         &mut self,
         rt: &tokio::runtime::Runtime,
-        config_name: Option<String>,
+        station_name: Option<String>,
     ) -> anyhow::Result<()> {
         match &mut self.mode {
             ProxyMode::Running(r) => {
                 let state = r.state.clone();
                 let now = now_ms();
                 rt.block_on(async move {
-                    match config_name {
-                        Some(name) => state.set_global_config_override(name, now).await,
-                        None => state.clear_global_config_override().await,
+                    match station_name {
+                        Some(name) => state.set_global_station_override(name, now).await,
+                        None => state.clear_global_station_override().await,
                     }
                 });
                 Ok(())
             }
             ProxyMode::Attached(att) => {
                 if att.api_version != Some(1) {
-                    bail!("attached proxy does not support global config override (need api v1)");
+                    bail!("attached proxy does not support global station override (need api v1)");
                 }
                 let base = att.admin_base_url.clone();
                 let client = self.http_client.clone();
@@ -2504,10 +2465,10 @@ impl ProxyController {
                     send_admin_request(
                         client
                             .post(format!(
-                                "{base}/__codex_helper/api/v1/overrides/global-config"
+                                "{base}/__codex_helper/api/v1/overrides/global-station"
                             ))
                             .timeout(Duration::from_millis(800))
-                            .json(&serde_json::json!({ "config_name": config_name })),
+                            .json(&serde_json::json!({ "station_name": station_name })),
                     )
                     .await?;
                     Ok::<(), anyhow::Error>(())
@@ -2520,19 +2481,20 @@ impl ProxyController {
     }
 
     pub fn reload_runtime_config(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
-        let (base, supports_v1) = match &self.mode {
-            ProxyMode::Running(r) => (local_proxy_base_url(r.admin_port), true),
-            ProxyMode::Attached(a) => (a.admin_base_url.clone(), a.api_version == Some(1)),
+        let base = match &self.mode {
+            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
+            ProxyMode::Attached(a) => {
+                if a.api_version != Some(1) {
+                    bail!("attached proxy does not support runtime reload (need api v1)");
+                }
+                a.admin_base_url.clone()
+            }
             _ => bail!("proxy is not running/attached"),
         };
 
         let client = self.http_client.clone();
         let fut = async move {
-            let url = if supports_v1 {
-                format!("{base}/__codex_helper/api/v1/config/reload")
-            } else {
-                format!("{base}/__codex_helper/config/reload")
-            };
+            let url = format!("{base}/__codex_helper/api/v1/runtime/reload");
             send_admin_request(client.post(url).timeout(Duration::from_millis(800))).await?;
             Ok::<(), anyhow::Error>(())
         };
@@ -2545,7 +2507,7 @@ impl ProxyController {
         &mut self,
         rt: &tokio::runtime::Runtime,
         all: bool,
-        config_names: Vec<String>,
+        station_names: Vec<String>,
     ) -> anyhow::Result<()> {
         let base = match &self.mode {
             ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
@@ -2564,7 +2526,48 @@ impl ProxyController {
                 client
                     .post(format!("{base}/__codex_helper/api/v1/healthcheck/start"))
                     .timeout(Duration::from_millis(800))
-                    .json(&serde_json::json!({ "all": all, "config_names": config_names })),
+                    .json(&serde_json::json!({ "all": all, "station_names": station_names })),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
+
+    pub fn probe_station(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        station_name: String,
+    ) -> anyhow::Result<()> {
+        let station_name = station_name.trim().to_string();
+        if station_name.is_empty() {
+            bail!("station_name cannot be empty");
+        }
+
+        let (base, use_station_api) = match &self.mode {
+            ProxyMode::Running(r) => (local_proxy_base_url(r.admin_port), true),
+            ProxyMode::Attached(a) => {
+                if a.api_version != Some(1) {
+                    bail!("attached proxy does not support manual probes (need api v1)");
+                }
+                (a.admin_base_url.clone(), a.supports_station_api)
+            }
+            _ => bail!("proxy is not running/attached"),
+        };
+
+        if !use_station_api {
+            return self.start_health_checks(rt, false, vec![station_name]);
+        }
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            send_admin_request(
+                client
+                    .post(format!("{base}/__codex_helper/api/v1/stations/probe"))
+                    .timeout(Duration::from_millis(800))
+                    .json(&serde_json::json!({ "station_name": station_name })),
             )
             .await?;
             Ok::<(), anyhow::Error>(())
@@ -2578,7 +2581,7 @@ impl ProxyController {
         &mut self,
         rt: &tokio::runtime::Runtime,
         all: bool,
-        config_names: Vec<String>,
+        station_names: Vec<String>,
     ) -> anyhow::Result<()> {
         let base = match &self.mode {
             ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
@@ -2597,7 +2600,7 @@ impl ProxyController {
                 client
                     .post(format!("{base}/__codex_helper/api/v1/healthcheck/cancel"))
                     .timeout(Duration::from_millis(800))
-                    .json(&serde_json::json!({ "all": all, "config_names": config_names })),
+                    .json(&serde_json::json!({ "all": all, "station_names": station_names })),
             )
             .await?;
             Ok::<(), anyhow::Error>(())
@@ -2637,7 +2640,7 @@ impl ProxyController {
                 mgr,
             );
             let configured_active_station = mgr.active.clone();
-            let effective_active_station = mgr.active_config().map(|cfg| cfg.name.clone());
+            let effective_active_station = mgr.active_station().map(|cfg| cfg.name.clone());
             let configured_default_profile = mgr.default_profile.clone();
             let default_profile = effective_default_profile_from_cfg_state(
                 state.as_ref(),
@@ -2650,7 +2653,7 @@ impl ProxyController {
                 service_name.as_str(),
                 default_profile.as_deref(),
             );
-            let configs = effective_configs_from_cfg_state(
+            let stations = effective_stations_from_cfg_state(
                 state.as_ref(),
                 service_name.as_str(),
                 cfg.as_ref(),
@@ -2663,7 +2666,7 @@ impl ProxyController {
                 configured_default_profile,
                 default_profile,
                 profiles,
-                configs,
+                stations,
             ))
         };
 
@@ -2675,25 +2678,28 @@ impl ProxyController {
                 configured_default_profile,
                 default_profile,
                 profiles,
-                configs,
+                stations,
             )) => {
+                let global_station_override =
+                    snap.effective_global_station_override().map(str::to_owned);
+                let station_health = snap.effective_station_health().clone();
                 r.last_error = None;
                 r.configured_active_station = configured_active_station;
                 r.effective_active_station = effective_active_station;
                 r.configured_default_profile = configured_default_profile;
                 r.default_profile = default_profile;
                 r.profiles = profiles;
-                r.configs = configs;
+                r.stations = stations;
                 r.active = snap.active;
                 r.recent = snap.recent;
                 r.session_cards = snap.session_cards;
-                r.global_override = snap.global_override;
+                r.global_station_override = global_station_override;
                 r.session_model_overrides = snap.session_model_overrides;
-                r.session_config_overrides = snap.session_config_overrides;
+                r.session_station_overrides = snap.session_station_overrides;
                 r.session_effort_overrides = snap.session_effort_overrides;
                 r.session_service_tier_overrides = snap.session_service_tier_overrides;
                 r.session_stats = snap.session_stats;
-                r.config_health = snap.config_health;
+                r.station_health = station_health;
                 r.health_checks = snap.health_checks;
                 r.usage_rollup = snap.usage_rollup;
                 r.stats_5m = snap.stats_5m;
@@ -2822,12 +2828,12 @@ impl ProxyController {
             let admin_port = admin_port_for_proxy_port(port);
 
             if service_name == "codex" {
-                if cfg.codex.configs.is_empty() || cfg.codex.active_config().is_none() {
+                if !cfg.codex.has_stations() || cfg.codex.active_station().is_none() {
                     anyhow::bail!(
                         "No valid Codex upstream config; please configure ~/.codex-helper/config.toml (or config.json) first"
                     );
                 }
-            } else if cfg.claude.configs.is_empty() || cfg.claude.active_config().is_none() {
+            } else if !cfg.claude.has_stations() || cfg.claude.active_station().is_none() {
                 anyhow::bail!(
                     "No valid Claude upstream config; please configure ~/.codex-helper/config.toml (or config.json) first"
                 );
@@ -2914,13 +2920,13 @@ impl ProxyController {
             _ => cfg.codex.active.clone(),
         };
         let effective_active_station = match service_name {
-            "claude" => cfg.claude.active_config().map(|cfg| cfg.name.clone()),
-            _ => cfg.codex.active_config().map(|cfg| cfg.name.clone()),
+            "claude" => cfg.claude.active_station().map(|cfg| cfg.name.clone()),
+            _ => cfg.codex.active_station().map(|cfg| cfg.name.clone()),
         };
         let profiles =
             list_profiles_from_cfg(cfg.as_ref(), service_name, default_profile.as_deref());
-        let configs =
-            list_configs_from_cfg(cfg.as_ref(), service_name, HashMap::new(), HashMap::new());
+        let stations =
+            list_stations_from_cfg(cfg.as_ref(), service_name, HashMap::new(), HashMap::new());
         let configured_retry = cfg.retry.clone();
         let resolved_retry = configured_retry.resolve();
 
@@ -2935,19 +2941,19 @@ impl ProxyController {
             active: Vec::new(),
             recent: Vec::new(),
             session_cards: Vec::new(),
-            global_override: None,
+            global_station_override: None,
             configured_active_station,
             effective_active_station,
             configured_default_profile: default_profile.clone(),
             default_profile,
             profiles,
             session_model_overrides: HashMap::new(),
-            session_config_overrides: HashMap::new(),
+            session_station_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),
             session_service_tier_overrides: HashMap::new(),
             session_stats: HashMap::new(),
-            configs,
-            config_health: HashMap::new(),
+            stations,
+            station_health: HashMap::new(),
             health_checks: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),
@@ -2990,27 +2996,29 @@ async fn effective_default_profile_from_cfg_state(
     mgr.default_profile.clone()
 }
 
-async fn effective_configs_from_cfg_state(
+async fn effective_stations_from_cfg_state(
     state: &ProxyState,
     service_name: &str,
     cfg: &ProxyConfig,
-) -> Vec<ConfigOption> {
-    let overrides = state.get_config_meta_overrides(service_name).await;
-    let state_overrides = state.get_config_runtime_state_overrides(service_name).await;
-    list_configs_from_cfg(cfg, service_name, overrides, state_overrides)
+) -> Vec<StationOption> {
+    let overrides = state.get_station_meta_overrides(service_name).await;
+    let state_overrides = state
+        .get_station_runtime_state_overrides(service_name)
+        .await;
+    list_stations_from_cfg(cfg, service_name, overrides, state_overrides)
 }
 
-fn list_configs_from_cfg(
+fn list_stations_from_cfg(
     cfg: &ProxyConfig,
     service_name: &str,
     meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
     state_overrides: HashMap<String, RuntimeConfigState>,
-) -> Vec<ConfigOption> {
+) -> Vec<StationOption> {
     let mgr = match service_name {
         "claude" => &cfg.claude,
         _ => &cfg.codex,
     };
-    build_config_options_from_mgr(mgr, &meta_overrides, &state_overrides)
+    build_station_options_from_mgr(mgr, &meta_overrides, &state_overrides)
 }
 
 fn list_profiles_from_cfg(
@@ -3108,8 +3116,8 @@ mod tests {
         }
     }
 
-    fn sample_station(name: &str) -> ConfigOption {
-        ConfigOption {
+    fn sample_station(name: &str) -> StationOption {
+        StationOption {
             name: name.to_string(),
             alias: None,
             enabled: true,
@@ -3124,13 +3132,12 @@ mod tests {
         }
     }
 
-    fn sample_snapshot(configs: Vec<ConfigOption>, stations: Vec<ConfigOption>) -> ApiV1Snapshot {
+    fn sample_snapshot(stations: Vec<StationOption>) -> ApiV1Snapshot {
         ApiV1Snapshot {
             api_version: 1,
             service_name: "codex".to_string(),
             runtime_loaded_at_ms: Some(1),
             runtime_source_mtime_ms: Some(2),
-            configs,
             stations,
             configured_active_station: None,
             effective_active_station: None,
@@ -3141,13 +3148,13 @@ mod tests {
                 active: Vec::new(),
                 recent: Vec::new(),
                 session_cards: Vec::new(),
-                global_override: None,
+                global_station_override: None,
                 session_model_overrides: HashMap::new(),
-                session_config_overrides: HashMap::new(),
+                session_station_overrides: HashMap::new(),
                 session_effort_overrides: HashMap::new(),
                 session_service_tier_overrides: HashMap::new(),
                 session_stats: HashMap::new(),
-                config_health: HashMap::new(),
+                station_health: HashMap::new(),
                 health_checks: HashMap::new(),
                 lb_view: HashMap::new(),
                 usage_rollup: UsageRollupView::default(),
@@ -3191,10 +3198,7 @@ mod tests {
                 "/__codex_helper/api/v1/stations/runtime"
             ]
         });
-        let snapshot = sample_snapshot(
-            vec![sample_station("legacy-config")],
-            vec![sample_station("preferred-station")],
-        );
+        let snapshot = sample_snapshot(vec![sample_station("preferred-station")]);
         let app = Router::new()
             .route(
                 "/__codex_helper/api/v1/capabilities",
@@ -3223,8 +3227,8 @@ mod tests {
         controller.refresh_attached_if_due(&rt, Duration::ZERO);
 
         let snapshot = controller.snapshot().expect("attached snapshot");
-        assert_eq!(snapshot.configs.len(), 1);
-        assert_eq!(snapshot.configs[0].name, "preferred-station");
+        assert_eq!(snapshot.stations.len(), 1);
+        assert_eq!(snapshot.stations[0].name, "preferred-station");
         assert!(snapshot.shared_capabilities.session_observability);
         assert!(snapshot.shared_capabilities.request_history);
         assert!(snapshot.host_local_capabilities.session_history);
@@ -3241,26 +3245,43 @@ mod tests {
     }
 
     #[test]
-    fn refresh_attached_falls_back_to_legacy_configs_api() {
+    fn refresh_attached_supports_partial_station_surface_with_canonical_effort_api() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let caps = serde_json::json!({
             "api_version": 1,
             "service_name": "codex",
+            "shared_capabilities": {
+                "session_observability": true,
+                "request_history": false
+            },
+            "host_local_capabilities": {
+                "session_history": false,
+                "transcript_read": true,
+                "cwd_enrichment": false
+            },
+            "remote_admin_access": {
+                "loopback_without_token": true,
+                "remote_requires_token": false,
+                "remote_enabled": false,
+                "token_header": crate::proxy::ADMIN_TOKEN_HEADER,
+                "token_env_var": crate::proxy::ADMIN_TOKEN_ENV_VAR
+            },
             "endpoints": [
                 "/__codex_helper/api/v1/status/active",
                 "/__codex_helper/api/v1/status/recent",
                 "/__codex_helper/api/v1/status/session-stats",
                 "/__codex_helper/api/v1/status/health-checks",
-                "/__codex_helper/api/v1/status/config-health",
-                "/__codex_helper/api/v1/config/runtime",
-                "/__codex_helper/api/v1/configs",
-                "/__codex_helper/api/v1/configs/runtime",
-                "/__codex_helper/api/v1/overrides/global-config",
-                "/__codex_helper/api/v1/overrides/session/config",
-                "/__codex_helper/api/v1/overrides/session/effort"
+                "/__codex_helper/api/v1/status/station-health",
+                "/__codex_helper/api/v1/runtime/status",
+                "/__codex_helper/api/v1/stations",
+                "/__codex_helper/api/v1/stations/runtime",
+                "/__codex_helper/api/v1/overrides/global-station",
+                "/__codex_helper/api/v1/overrides/session/station",
+                "/__codex_helper/api/v1/overrides/session/effort",
+                "/__codex_helper/api/v1/overrides/session/model"
             ]
         });
-        let configs = vec![sample_station("legacy-only")];
+        let stations = vec![sample_station("station-partial")];
         let app = Router::new()
             .route(
                 "/__codex_helper/api/v1/capabilities",
@@ -3289,62 +3310,285 @@ mod tests {
                 get(|| async { Json(HashMap::<String, HealthCheckStatus>::new()) }),
             )
             .route(
-                "/__codex_helper/api/v1/status/config-health",
-                get(|| async { Json(HashMap::<String, ConfigHealth>::new()) }),
+                "/__codex_helper/api/v1/status/station-health",
+                get(|| async { Json(HashMap::<String, StationHealth>::new()) }),
             )
             .route(
-                "/__codex_helper/api/v1/config/runtime",
+                "/__codex_helper/api/v1/runtime/status",
                 get(|| async {
                     Json(serde_json::json!({
-                        "loaded_at_ms": 1,
-                        "source_mtime_ms": 2,
+                        "loaded_at_ms": 31,
+                        "source_mtime_ms": 32,
                     }))
                 }),
             )
             .route(
-                "/__codex_helper/api/v1/configs",
+                "/__codex_helper/api/v1/stations",
                 get({
-                    let configs = configs.clone();
+                    let stations = stations.clone();
                     move || {
-                        let configs = configs.clone();
-                        async move { Json(configs) }
+                        let stations = stations.clone();
+                        async move { Json(stations) }
                     }
                 }),
             )
             .route(
-                "/__codex_helper/api/v1/overrides/global-config",
-                get(|| async { Json(Option::<String>::None) }),
+                "/__codex_helper/api/v1/overrides/global-station",
+                get(|| async { Json(Some("station-partial".to_string())) }),
             )
             .route(
-                "/__codex_helper/api/v1/overrides/session/config",
-                get(|| async { Json(HashMap::<String, String>::new()) }),
+                "/__codex_helper/api/v1/overrides/session/station",
+                get(|| async {
+                    Json(HashMap::from([(
+                        "sid-v1".to_string(),
+                        "station-partial".to_string(),
+                    )]))
+                }),
             )
             .route(
                 "/__codex_helper/api/v1/overrides/session/effort",
-                get(|| async { Json(HashMap::<String, String>::new()) }),
+                get(|| async {
+                    Json(HashMap::from([(
+                        "sid-v1".to_string(),
+                        "medium".to_string(),
+                    )]))
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/session/model",
+                get(|| async {
+                    Json(HashMap::from([(
+                        "sid-v1".to_string(),
+                        "gpt-5.4".to_string(),
+                    )]))
+                }),
             );
         let (base_url, handle) = spawn_test_server(&rt, app);
 
-        let mut controller = ProxyController::new(4200, ServiceKind::Codex);
-        controller.request_attach_with_admin_base(4200, Some(base_url));
+        let mut controller = ProxyController::new(4201, ServiceKind::Codex);
+        controller.request_attach_with_admin_base(4201, Some(base_url));
         controller.refresh_attached_if_due(&rt, Duration::ZERO);
 
-        let snapshot = controller.snapshot().expect("legacy attached snapshot");
-        assert_eq!(snapshot.configs.len(), 1);
-        assert_eq!(snapshot.configs[0].name, "legacy-only");
+        let snapshot = controller.snapshot().expect("partial station snapshot");
+        assert!(snapshot.supports_v1);
+        assert_eq!(snapshot.stations.len(), 1);
+        assert_eq!(snapshot.stations[0].name, "station-partial");
         assert_eq!(
-            snapshot.shared_capabilities,
-            SharedControlPlaneCapabilities::default()
+            snapshot.global_station_override.as_deref(),
+            Some("station-partial")
         );
         assert_eq!(
-            snapshot.host_local_capabilities,
-            HostLocalControlPlaneCapabilities::default()
+            snapshot
+                .session_station_overrides
+                .get("sid-v1")
+                .map(String::as_str),
+            Some("station-partial")
         );
-        assert!(
-            !controller
-                .attached()
-                .expect("legacy attached status")
-                .supports_station_api
+        assert_eq!(
+            snapshot
+                .session_effort_overrides
+                .get("sid-v1")
+                .map(String::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            snapshot
+                .session_model_overrides
+                .get("sid-v1")
+                .map(String::as_str),
+            Some("gpt-5.4")
+        );
+        assert!(snapshot.session_service_tier_overrides.is_empty());
+        assert!(snapshot.shared_capabilities.session_observability);
+        assert!(snapshot.host_local_capabilities.transcript_read);
+        assert!(!snapshot.supports_default_profile_override);
+        assert!(!snapshot.supports_session_override_reset);
+        let attached = controller.attached().expect("partial attached status");
+        assert_eq!(attached.api_version, Some(1));
+        assert_eq!(attached.runtime_loaded_at_ms, Some(31));
+        assert_eq!(attached.runtime_source_mtime_ms, Some(32));
+        assert!(attached.supports_station_api);
+        assert!(attached.supports_station_runtime_override);
+        assert!(!attached.remote_admin_access.remote_enabled);
+        assert!(!attached.remote_admin_access.remote_requires_token);
+
+        handle.abort();
+    }
+
+    #[test]
+    fn refresh_attached_rejects_pre_v1_runtime_surface() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let app = Router::new()
+            .route(
+                "/__codex_helper/status/active",
+                get(|| async { Json(Vec::<ActiveRequest>::new()) }),
+            )
+            .route(
+                "/__codex_helper/status/recent",
+                get(|| async { Json(Vec::<FinishedRequest>::new()) }),
+            )
+            .route(
+                "/__codex_helper/config/runtime",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "loaded_at_ms": 51,
+                        "source_mtime_ms": 52,
+                    }))
+                }),
+            )
+            .route(
+                "/__codex_helper/override/session",
+                get(|| async {
+                    Json(HashMap::from([(
+                        "sid-legacy".to_string(),
+                        "low".to_string(),
+                    )]))
+                }),
+            );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4202, ServiceKind::Codex);
+        controller.request_attach_with_admin_base(4202, Some(base_url));
+        controller.refresh_attached_if_due(&rt, Duration::ZERO);
+
+        let snapshot = controller.snapshot().expect("attached snapshot");
+        assert!(!snapshot.supports_v1);
+        assert!(snapshot.stations.is_empty());
+        assert!(snapshot.session_effort_overrides.is_empty());
+        assert!(snapshot.last_error.is_some());
+        let attached = controller.attached().expect("attached status");
+        assert_eq!(attached.api_version, None);
+        assert!(attached.last_error.is_some());
+        assert_eq!(attached.runtime_loaded_at_ms, None);
+        assert_eq!(attached.runtime_source_mtime_ms, None);
+        assert!(!attached.supports_station_api);
+        assert!(!attached.supports_station_runtime_override);
+
+        handle.abort();
+    }
+
+    #[test]
+    fn refresh_attached_prefers_aggregate_session_override_api() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let caps = serde_json::json!({
+            "api_version": 1,
+            "service_name": "codex",
+            "endpoints": [
+                "/__codex_helper/api/v1/status/active",
+                "/__codex_helper/api/v1/status/recent",
+                "/__codex_helper/api/v1/status/session-stats",
+                "/__codex_helper/api/v1/status/health-checks",
+                "/__codex_helper/api/v1/status/station-health",
+                "/__codex_helper/api/v1/runtime/status",
+                "/__codex_helper/api/v1/stations",
+                "/__codex_helper/api/v1/overrides/global-station",
+                "/__codex_helper/api/v1/overrides/session"
+            ]
+        });
+        let stations = vec![sample_station("aggregate-only")];
+        let app = Router::new()
+            .route(
+                "/__codex_helper/api/v1/capabilities",
+                get({
+                    let caps = caps.clone();
+                    move || {
+                        let caps = caps.clone();
+                        async move { Json(caps) }
+                    }
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/active",
+                get(|| async { Json(Vec::<ActiveRequest>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/recent",
+                get(|| async { Json(Vec::<FinishedRequest>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/session-stats",
+                get(|| async { Json(HashMap::<String, SessionStats>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/health-checks",
+                get(|| async { Json(HashMap::<String, HealthCheckStatus>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/station-health",
+                get(|| async { Json(HashMap::<String, StationHealth>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/runtime/status",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "loaded_at_ms": 11,
+                        "source_mtime_ms": 22,
+                    }))
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/stations",
+                get({
+                    let stations = stations.clone();
+                    move || {
+                        let stations = stations.clone();
+                        async move { Json(stations) }
+                    }
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/global-station",
+                get(|| async { Json(Option::<String>::None) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/session",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "sessions": {
+                            "sid-a": {
+                                "reasoning_effort": "high",
+                                "station_name": "aggregate-only",
+                                "model": "gpt-5.4",
+                                "service_tier": "priority"
+                            }
+                        }
+                    }))
+                }),
+            );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4201, ServiceKind::Codex);
+        controller.request_attach_with_admin_base(4201, Some(base_url));
+        controller.refresh_attached_if_due(&rt, Duration::ZERO);
+
+        let snapshot = controller.snapshot().expect("aggregate attached snapshot");
+        assert_eq!(
+            snapshot
+                .session_station_overrides
+                .get("sid-a")
+                .map(String::as_str),
+            Some("aggregate-only")
+        );
+        assert_eq!(
+            snapshot
+                .session_effort_overrides
+                .get("sid-a")
+                .map(String::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            snapshot
+                .session_model_overrides
+                .get("sid-a")
+                .map(String::as_str),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            snapshot
+                .session_service_tier_overrides
+                .get("sid-a")
+                .map(String::as_str),
+            Some("priority")
         );
 
         handle.abort();
@@ -3383,8 +3627,7 @@ mod tests {
                 "/__codex_helper/api/v1/snapshot"
             ]
         });
-        let snapshot =
-            sample_snapshot(vec![sample_station("alpha")], vec![sample_station("alpha")]);
+        let snapshot = sample_snapshot(vec![sample_station("alpha")]);
         let app = Router::new()
             .route(
                 "/__codex_helper/api/v1/capabilities",
@@ -3451,7 +3694,7 @@ mod tests {
     }
 
     #[test]
-    fn attached_runtime_meta_uses_station_and_legacy_endpoints_compatibly() {
+    fn attached_runtime_meta_uses_station_endpoints() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
 
         let station_payload = Arc::new(Mutex::new(None::<Value>));
@@ -3473,11 +3716,11 @@ mod tests {
         let mut station_controller = ProxyController::new(4300, ServiceKind::Codex);
         let mut station_attached = AttachedStatus::new(4300);
         station_attached.admin_base_url = station_base_url;
-        station_attached.supports_config_runtime_override = true;
+        station_attached.supports_station_runtime_override = true;
         station_attached.supports_station_api = true;
         station_controller.mode = ProxyMode::Attached(station_attached);
         station_controller
-            .set_runtime_config_meta(
+            .set_runtime_station_meta(
                 &rt,
                 "alpha".to_string(),
                 Some(Some(false)),
@@ -3495,54 +3738,95 @@ mod tests {
             station_payload.get("station_name"),
             Some(&Value::String("alpha".to_string()))
         );
-        assert_eq!(station_payload.get("config_name"), None);
         assert_eq!(
             station_payload.get("runtime_state"),
             Some(&Value::String("draining".to_string()))
         );
         station_handle.abort();
+    }
 
-        let config_payload = Arc::new(Mutex::new(None::<Value>));
-        let config_app = Router::new().route(
-            "/__codex_helper/api/v1/configs/runtime",
+    #[test]
+    fn attached_probe_station_uses_station_probe_and_legacy_healthcheck_endpoints() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let station_payload = Arc::new(Mutex::new(None::<Value>));
+        let station_app = Router::new().route(
+            "/__codex_helper/api/v1/stations/probe",
             post({
-                let config_payload = config_payload.clone();
+                let station_payload = station_payload.clone();
                 move |Json(payload): Json<Value>| {
-                    let config_payload = config_payload.clone();
+                    let station_payload = station_payload.clone();
                     async move {
-                        *config_payload.lock().expect("config payload lock") = Some(payload);
-                        StatusCode::NO_CONTENT
+                        *station_payload.lock().expect("station payload lock") = Some(payload);
+                        StatusCode::OK
                     }
                 }
             }),
         );
-        let (config_base_url, config_handle) = spawn_test_server(&rt, config_app);
+        let (station_base_url, station_handle) = spawn_test_server(&rt, station_app);
 
-        let mut legacy_controller = ProxyController::new(4301, ServiceKind::Codex);
-        let mut legacy_attached = AttachedStatus::new(4301);
-        legacy_attached.admin_base_url = config_base_url;
-        legacy_attached.supports_config_runtime_override = true;
+        let mut station_controller = ProxyController::new(4306, ServiceKind::Codex);
+        let mut station_attached = AttachedStatus::new(4306);
+        station_attached.admin_base_url = station_base_url;
+        station_attached.api_version = Some(1);
+        station_attached.supports_station_api = true;
+        station_controller.mode = ProxyMode::Attached(station_attached);
+        station_controller
+            .probe_station(&rt, "alpha".to_string())
+            .expect("station probe");
+
+        let station_payload = station_payload
+            .lock()
+            .expect("station payload lock")
+            .clone()
+            .expect("station payload");
+        assert_eq!(
+            station_payload.get("station_name"),
+            Some(&Value::String("alpha".to_string()))
+        );
+        station_handle.abort();
+
+        let legacy_payload = Arc::new(Mutex::new(None::<Value>));
+        let legacy_app = Router::new().route(
+            "/__codex_helper/api/v1/healthcheck/start",
+            post({
+                let legacy_payload = legacy_payload.clone();
+                move |Json(payload): Json<Value>| {
+                    let legacy_payload = legacy_payload.clone();
+                    async move {
+                        *legacy_payload.lock().expect("legacy payload lock") = Some(payload);
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let (legacy_base_url, legacy_handle) = spawn_test_server(&rt, legacy_app);
+
+        let mut legacy_controller = ProxyController::new(4307, ServiceKind::Codex);
+        let mut legacy_attached = AttachedStatus::new(4307);
+        legacy_attached.admin_base_url = legacy_base_url;
+        legacy_attached.api_version = Some(1);
         legacy_attached.supports_station_api = false;
         legacy_controller.mode = ProxyMode::Attached(legacy_attached);
         legacy_controller
-            .set_runtime_config_meta(&rt, "beta".to_string(), Some(Some(true)), None, Some(None))
-            .expect("legacy runtime meta update");
+            .probe_station(&rt, "beta".to_string())
+            .expect("legacy probe fallback");
 
-        let config_payload = config_payload
+        let legacy_payload = legacy_payload
             .lock()
-            .expect("config payload lock")
+            .expect("legacy payload lock")
             .clone()
-            .expect("config payload");
+            .expect("legacy payload");
+        assert_eq!(legacy_payload.get("all"), Some(&Value::Bool(false)));
         assert_eq!(
-            config_payload.get("config_name"),
-            Some(&Value::String("beta".to_string()))
+            legacy_payload
+                .get("station_names")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|value| value.as_str()),
+            Some("beta")
         );
-        assert_eq!(config_payload.get("station_name"), None);
-        assert_eq!(
-            config_payload.get("clear_runtime_state"),
-            Some(&Value::Bool(true))
-        );
-        config_handle.abort();
+        legacy_handle.abort();
     }
 
     #[test]
@@ -3650,6 +3934,7 @@ mod tests {
                                     "on_class": ["upstream_transport_error"],
                                     "strategy": "failover"
                                 },
+                                "allow_cross_station_before_first_output": true,
                                 "never_on_status": "413,415,422",
                                 "never_on_class": ["client_error_non_retryable"],
                                 "cloudflare_challenge_cooldown_secs": 300,
@@ -3725,6 +4010,13 @@ mod tests {
                 .as_ref()
                 .map(|retry| retry.cooldown_backoff_factor),
             Some(3)
+        );
+        assert_eq!(
+            snapshot
+                .resolved_retry
+                .as_ref()
+                .map(|retry| retry.allow_cross_station_before_first_output),
+            Some(true)
         );
 
         handle.abort();
@@ -3855,6 +4147,53 @@ mod tests {
         assert_eq!(
             observed_payload.get("session_id"),
             Some(&Value::String("sid-reset".to_string()))
+        );
+
+        handle.abort();
+    }
+
+    #[test]
+    fn attached_session_effort_override_uses_v1_effort_endpoint() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let observed_payload = Arc::new(Mutex::new(None::<Value>));
+        let app = Router::new().route(
+            "/__codex_helper/api/v1/overrides/session/effort",
+            post({
+                let observed_payload = observed_payload.clone();
+                move |Json(payload): Json<Value>| {
+                    let observed_payload = observed_payload.clone();
+                    async move {
+                        *observed_payload.lock().expect("effort payload lock") = Some(payload);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4308, ServiceKind::Codex);
+        let mut attached = AttachedStatus::new(4308);
+        attached.api_version = Some(1);
+        attached.admin_base_url = base_url;
+        controller.mode = ProxyMode::Attached(attached);
+
+        controller
+            .apply_session_effort_override(&rt, "sid-effort".to_string(), Some("high".to_string()))
+            .expect("set effort via canonical endpoint");
+
+        let observed_payload = observed_payload
+            .lock()
+            .expect("effort payload lock")
+            .clone()
+            .expect("effort payload");
+        assert_eq!(
+            observed_payload.get("session_id"),
+            Some(&Value::String("sid-effort".to_string()))
+        );
+        assert_eq!(
+            observed_payload.get("effort"),
+            Some(&Value::String("high".to_string()))
         );
 
         handle.abort();

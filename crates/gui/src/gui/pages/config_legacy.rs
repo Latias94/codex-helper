@@ -1,5 +1,5 @@
-use super::*;
-
+use super::*;
+
 pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.label(pick(
         ctx.lang,
@@ -270,8 +270,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
                     if matches!(
                         ctx.proxy.kind(),
-                        ProxyModeKind::Running
-                            | ProxyModeKind::Attached
+                        ProxyModeKind::Running | ProxyModeKind::Attached
                     ) && let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt)
                     {
                         *ctx.last_error = Some(format!("reload runtime failed: {e}"));
@@ -333,15 +332,15 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             crate::config::ServiceKind::Claude => &cfg.claude,
             crate::config::ServiceKind::Codex => &cfg.codex,
         };
-        let mut v = mgr.configs.keys().cloned().collect::<Vec<_>>();
+        let mut v = mgr.stations().keys().cloned().collect::<Vec<_>>();
         v.sort_by(|a, b| {
-            let la = mgr.configs.get(a).map(|c| c.level).unwrap_or(1);
-            let lb = mgr.configs.get(b).map(|c| c.level).unwrap_or(1);
+            let la = mgr.station(a).map(|c| c.level).unwrap_or(1);
+            let lb = mgr.station(b).map(|c| c.level).unwrap_or(1);
             la.cmp(&lb).then_with(|| a.cmp(b))
         });
         (
             mgr.active.clone(),
-            mgr.active_config().map(|c| c.name.clone()),
+            mgr.active_station().map(|c| c.name.clone()),
             v,
         )
     };
@@ -391,8 +390,8 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         let is_selected = selected_name.as_deref() == Some(name.as_str());
 
                         let svc = match selected_service_kind {
-                            crate::config::ServiceKind::Claude => cfg.claude.configs.get(name),
-                            crate::config::ServiceKind::Codex => cfg.codex.configs.get(name),
+                            crate::config::ServiceKind::Claude => cfg.claude.station(name),
+                            crate::config::ServiceKind::Codex => cfg.codex.station(name),
                         };
 
                         let (enabled, level, alias, upstreams) = svc
@@ -443,7 +442,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 .clone()
                 .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>").to_string());
             let effective_label = mgr
-                .active_config()
+                .active_station()
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| "-".to_string());
 
@@ -454,7 +453,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ));
             cols[1].add_space(6.0);
 
-            let Some(svc) = mgr.configs.get_mut(&name) else {
+            let Some(svc) = mgr.station_mut(&name) else {
                 cols[1].label(pick(
                     ctx.lang,
                     "配置不存在（可能已被删除）。",
@@ -712,8 +711,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
                 if matches!(
                     ctx.proxy.kind(),
-                    ProxyModeKind::Running
-                        | ProxyModeKind::Attached
+                    ProxyModeKind::Running | ProxyModeKind::Attached
                 ) && let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt)
                 {
                     *ctx.last_error = Some(format!("reload runtime failed: {e}"));
@@ -728,4 +726,3 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
     }
 }
-

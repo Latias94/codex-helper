@@ -10,7 +10,7 @@ This phase covers the first five slices from `TODO.md`:
 - `SLICE-002` Add session override for `model`.
 - `SLICE-003` Add session override for `service_tier`.
 - `SLICE-004` Add explicit source attribution for effective route values.
-- `SLICE-005` Add a default profile skeleton without removing legacy config handling.
+- `SLICE-005` Add a default profile skeleton without removing legacy station/config compatibility handling.
 
 The goal is to improve control semantics without forcing a full schema rewrite or UI redesign in one step.
 
@@ -19,8 +19,8 @@ The goal is to improve control semantics without forcing a full schema rewrite o
 At the end of Phase 1, the system should let an operator answer:
 
 1. Which session is this?
-2. Which config/provider/upstream/model/tier/effort is it effectively using?
-3. Which values came from request payload, session override, or legacy config default?
+2. Which station/provider/upstream/model/tier/effort is it effectively using?
+3. Which values came from request payload, session override, profile default, station mapping, or runtime fallback?
 4. Can I change this session's model or fast mode without mutating future defaults?
 
 ## Current Anchors in the Codebase
@@ -34,19 +34,21 @@ Current request/session observation already records:
   - `cwd`
   - `model`
   - `reasoning_effort`
-  - `config_name`
+  - `station_name`
   - `provider_id`
   - `upstream_base_url`
+  - `route_decision`
 - session stats:
   - `last_model`
   - `last_reasoning_effort`
   - `last_provider_id`
-  - `last_config_name`
+  - `last_station_name`
+  - `last_route_decision`
 
 Current override storage is split into two runtime-only maps:
 
 - `session_effort_overrides`
-- `session_config_overrides`
+- `session_station_overrides`
 
 Relevant files:
 
@@ -67,7 +69,7 @@ Current v1 endpoints already include:
 - `/__codex_helper/api/v1/snapshot`
 - `/__codex_helper/api/v1/status/session-stats`
 - `/__codex_helper/api/v1/overrides/session/effort`
-- `/__codex_helper/api/v1/overrides/session/config`
+- `/__codex_helper/api/v1/overrides/session/station`
 
 ### GUI/TUI
 
@@ -82,7 +84,7 @@ This merge currently produces a `SessionRow` with:
 
 - observed last values
 - `override_effort`
-- `override_config_name`
+- `override_station_name`
 
 Relevant files:
 
@@ -95,6 +97,9 @@ Relevant files:
 ### Recommended approach
 
 Introduce a **structured session control model** internally, while keeping legacy map-based compatibility for existing consumers during this phase.
+
+Implementation note: the shipped design ultimately converged on `SessionBinding` plus
+per-dimension manual override storage, instead of a single monolithic override struct.
 
 This is better than adding more parallel maps because Phase 1 already needs:
 
@@ -110,7 +115,7 @@ Recommended additions in `crates/core/src/state.rs`:
 
 ```rust
 pub struct SessionControlOverride {
-    pub config_name: Option<String>,
+    pub station_name: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
@@ -124,25 +129,32 @@ pub struct EffectiveValue {
 }
 
 pub enum RouteValueSource {
-    Unknown,
-    Request,
+    RequestPayload,
     SessionOverride,
-    LegacyConfigDefault,
-    Mapping,
+    GlobalOverride,
+    ProfileDefault,
+    StationMapping,
+    RuntimeFallback,
 }
 
 pub struct SessionIdentityCard {
-    pub session_id: String,
+    pub session_id: Option<String>,
     pub cwd: Option<String>,
-    pub observed_model: Option<String>,
-    pub observed_reasoning_effort: Option<String>,
-    pub observed_config_name: Option<String>,
-    pub observed_provider_id: Option<String>,
-    pub observed_upstream_base_url: Option<String>,
-    pub effective_model: EffectiveValue,
-    pub effective_reasoning_effort: EffectiveValue,
-    pub effective_service_tier: EffectiveValue,
-    pub binding_config_name: EffectiveValue,
+    pub last_model: Option<String>,
+    pub last_reasoning_effort: Option<String>,
+    pub last_service_tier: Option<String>,
+    pub last_station_name: Option<String>,
+    pub last_provider_id: Option<String>,
+    pub last_upstream_base_url: Option<String>,
+    pub binding_profile_name: Option<String>,
+    pub binding_continuity_mode: Option<SessionContinuityMode>,
+    pub last_route_decision: Option<RouteDecisionProvenance>,
+    pub effective_model: Option<EffectiveValue>,
+    pub effective_reasoning_effort: Option<EffectiveValue>,
+    pub effective_service_tier: Option<EffectiveValue>,
+    pub effective_station: Option<EffectiveValue>,
+    pub effective_upstream_base_url: Option<EffectiveValue>,
+    pub override_station_name: Option<String>,
     pub active_count: u64,
     pub turns_total: u64,
     pub last_status: Option<u16>,
@@ -162,14 +174,14 @@ Phase 1 should not break:
 
 - current attach-mode consumers
 - current GUI/TUI snapshot merge
-- current legacy config loader
+- current legacy config/station compatibility loader
 
 Therefore:
 
 1. Keep existing API routes alive.
 2. Keep current snapshot fields alive:
    - `session_effort_overrides`
-   - `session_config_overrides`
+   - `session_station_overrides`
 3. Derive those legacy fields from the new structured override store.
 4. Add new fields/endpoints instead of replacing old ones immediately.
 
@@ -187,9 +199,9 @@ Therefore:
 - Add `session_control_overrides: RwLock<HashMap<String, SessionControlOverride>>`.
 - Keep compatibility getters:
   - `get_session_effort_override()`
-  - `get_session_config_override()`
+  - `get_session_station_override()`
   - `list_session_effort_overrides()`
-  - `list_session_config_overrides()`
+  - `list_session_station_overrides()`
 - Add new getters/setters:
   - `get_session_model_override()`
   - `set_session_model_override()`
@@ -220,7 +232,7 @@ This removes the biggest source of Phase 1 complexity: override data scattered a
 - Resolve effective values in this order:
   - request payload
   - session override
-  - legacy/default config
+  - profile default / station mapping / runtime fallback
 - Inject overrides into the upstream request body only when a session override exists.
 - Record both observed and effective values for later session-card building.
 
@@ -307,14 +319,14 @@ This allows a gradual GUI migration.
   - effective model
   - effective service tier
   - effective effort
-  - binding config
+  - binding station/profile
 - Keep old last-seen details as secondary context.
 
 ### Why this matters
 
 This is the real semantic upgrade. Without it, model/tier overrides would exist but still be hard to understand in the UI.
 
-## Step F - Add profile skeleton without replacing legacy config
+## Step F - Add profile skeleton without replacing legacy station/config compatibility
 
 ### Files
 
@@ -344,7 +356,7 @@ pub struct CodexProfileConfig {
 ### Rules
 
 - Loading profiles must be optional.
-- Legacy configs keep working unchanged.
+- Legacy `configs` input remains readable while station-first output becomes canonical.
 - No immediate removal of existing `active` / `active_group` semantics.
 - Profiles are used only as a skeleton in Phase 1:
   - define default intent
@@ -352,10 +364,11 @@ pub struct CodexProfileConfig {
 
 ### GUI config bridge
 
-Current GUI routing presets can remain temporarily, but Phase 1 should add a migration direction note:
+Legacy GUI routing presets are no longer a target state. Phase 1 should converge the GUI onto real profiles:
 
-- legacy `RoutingProfile` remains supported
-- future GUI control presets should target real profiles, not just pinned config
+- legacy `RoutingProfile` UI/runtime flow is retired
+- GUI control entry points should target real profiles, not just pinned config
+- `gui.toml` should stop carrying a separate routing-preset layer
 
 ## Detailed Slice Breakdown
 
@@ -435,15 +448,21 @@ Current GUI routing presets can remain temporarily, but Phase 1 should add a mig
 {
   "session_id": "abc123",
   "cwd": "G:/codes/rust/codex-helper",
-  "observed_model": "gpt-5.4",
-  "observed_reasoning_effort": "medium",
-  "observed_config_name": "right",
-  "observed_provider_id": "right",
-  "observed_upstream_base_url": "https://www.right.codes/codex/v1",
+  "last_model": "gpt-5.4",
+  "last_reasoning_effort": "medium",
+  "last_service_tier": "fast",
+  "last_station_name": "right",
+  "last_provider_id": "right",
+  "last_upstream_base_url": "https://www.right.codes/codex/v1",
+  "binding_profile_name": "daily",
   "effective_model": { "value": "gpt-5.4", "source": "session_override" },
   "effective_reasoning_effort": { "value": "low", "source": "session_override" },
   "effective_service_tier": { "value": "fast", "source": "session_override" },
-  "binding_config_name": { "value": "right", "source": "legacy_config_default" },
+  "effective_station": { "value": "right", "source": "profile_default" },
+  "effective_upstream_base_url": {
+    "value": "https://www.right.codes/codex/v1",
+    "source": "runtime_fallback"
+  },
   "active_count": 1,
   "turns_total": 8,
   "last_status": 200,
@@ -492,7 +511,7 @@ The same shape should apply to service tier.
 
 - Add tests for:
   - optional profile loading
-  - legacy config compatibility
+  - legacy `configs` compatibility
   - invalid `default_profile` handling
 
 ### GUI attach compatibility
@@ -506,7 +525,7 @@ The same shape should apply to service tier.
 
 ### Risk: premature full schema rewrite
 
-Avoid rewriting all config terminology in Phase 1. Introduce profiles as additive.
+Avoid rewriting every legacy term at once in Phase 1. Introduce profiles additively while keeping station-first public semantics canonical.
 
 ### Risk: UI depending on new API too early
 
