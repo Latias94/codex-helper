@@ -10,6 +10,7 @@ use tracing::instrument;
 
 mod admin;
 mod api_responses;
+mod attempt_failures;
 mod auth_resolution;
 mod classify;
 mod client_identity;
@@ -21,6 +22,7 @@ mod passive_health;
 mod persisted_config_api;
 mod profile_defaults;
 mod request_body;
+mod request_failures;
 mod request_preparation;
 mod request_routing;
 mod response_finalization;
@@ -41,8 +43,7 @@ use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
     HeaderEntry, HttpDebugLog, ServiceTierLog, http_debug_options, http_warn_options,
-    log_request_with_debug, log_retry_trace, now_ms, should_include_http_warn,
-    should_log_request_body_preview,
+    log_retry_trace, now_ms, should_log_request_body_preview,
 };
 use crate::model_routing;
 use crate::state::{ProxyState, RuntimeConfigState};
@@ -52,6 +53,7 @@ pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
+use self::attempt_failures::apply_terminal_upstream_failure;
 use self::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
 use self::classify::{class_is_health_neutral, classify_upstream_response};
 use self::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
@@ -60,6 +62,10 @@ use self::http_debug::format_reqwest_error_for_retry_chain;
 use self::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use self::profile_defaults::effective_default_profile_name;
 use self::request_body::{apply_model_override, extract_service_tier_from_response_body};
+use self::request_failures::{
+    finish_failed_proxy_request, log_client_body_read_error, log_no_routable_station,
+    no_upstreams_available_error,
+};
 use self::request_preparation::{build_body_previews, detect_request_flavor, prepare_request_body};
 use self::response_finalization::{
     FinalizeForwardResponseParams, finish_and_build_forward_response,
@@ -280,6 +286,7 @@ pub async fn handle_proxy(
     let (parts, body) = req.into_parts();
     let client_addr = extract_client_addr(&parts.extensions);
     let uri = parts.uri;
+    let client_uri = uri.to_string();
     let method = parts.method;
     let client_headers = parts.headers;
     let client_headers_entries_cache: OnceLock<Vec<HeaderEntry>> = OnceLock::new();
@@ -302,56 +309,18 @@ pub async fn handle_proxy(
         .await;
     if lbs.is_empty() {
         let dur = start.elapsed().as_millis() as u64;
-        let status = StatusCode::BAD_GATEWAY;
         let client_headers_entries = client_headers_entries_cache
             .get_or_init(|| header_map_to_entries(&client_headers))
             .clone();
-        let http_debug = if should_include_http_warn(status.as_u16()) {
-            Some(HttpDebugLog {
-                request_body_len: None,
-                upstream_request_body_len: None,
-                upstream_headers_ms: None,
-                upstream_first_chunk_ms: None,
-                upstream_body_read_ms: None,
-                upstream_error_class: Some("no_routable_station".to_string()),
-                upstream_error_hint: Some(
-                    "未找到任何可用的上游站点（active_station 未设置，或目标站点没有可用 upstream）。"
-                        .to_string(),
-                ),
-                upstream_cf_ray: None,
-                client_uri: uri.to_string(),
-                target_url: "-".to_string(),
-                client_headers: client_headers_entries,
-                upstream_request_headers: Vec::new(),
-                auth_resolution: None,
-                client_body: None,
-                upstream_request_body: None,
-                upstream_response_headers: None,
-                upstream_response_body: None,
-                upstream_error: Some("no routable station".to_string()),
-            })
-        } else {
-            None
-        };
-        log_request_with_debug(
-            proxy.service_name,
-            method.as_str(),
+        return Err(log_no_routable_station(
+            &proxy,
+            &method,
             uri.path(),
-            status.as_u16(),
-            dur,
-            None,
-            "-",
-            None,
-            "-",
+            client_uri.as_str(),
             session_id.clone(),
-            None,
-            None,
-            ServiceTierLog::default(),
-            None,
-            None,
-            http_debug,
-        );
-        return Err((status, "no routable station".to_string()));
+            client_headers_entries,
+            dur,
+        ));
     }
     let request_flavor =
         detect_request_flavor(proxy.service_name, &method, &client_headers, uri.path());
@@ -389,56 +358,21 @@ pub async fn handle_proxy(
         Ok(b) => b,
         Err(e) => {
             let dur = start.elapsed().as_millis() as u64;
-            let status = StatusCode::BAD_REQUEST;
             let err_str = e.to_string();
             let client_headers_entries = client_headers_entries_cache
                 .get_or_init(|| header_map_to_entries(&client_headers))
                 .clone();
-            let http_debug = if should_include_http_warn(status.as_u16()) {
-                Some(HttpDebugLog {
-                    request_body_len: None,
-                    upstream_request_body_len: None,
-                    upstream_headers_ms: None,
-                    upstream_first_chunk_ms: None,
-                    upstream_body_read_ms: None,
-                    upstream_error_class: Some("client_body_read_error".to_string()),
-                    upstream_error_hint: Some(
-                        "读取客户端请求 body 失败（可能超过大小限制或连接中断）。".to_string(),
-                    ),
-                    upstream_cf_ray: None,
-                    client_uri: uri.to_string(),
-                    target_url: "-".to_string(),
-                    client_headers: client_headers_entries,
-                    upstream_request_headers: Vec::new(),
-                    auth_resolution: None,
-                    client_body: None,
-                    upstream_request_body: None,
-                    upstream_response_headers: None,
-                    upstream_response_body: None,
-                    upstream_error: Some(err_str.clone()),
-                })
-            } else {
-                None
-            };
-            log_request_with_debug(
-                proxy.service_name,
-                method.as_str(),
+            return Err(log_client_body_read_error(
+                &proxy,
+                &method,
                 uri.path(),
-                status.as_u16(),
-                dur,
-                None,
-                "-",
-                None,
-                "-",
+                client_uri.as_str(),
                 session_id.clone(),
                 cwd.clone(),
-                None,
-                ServiceTierLog::default(),
-                None,
-                None,
-                http_debug,
-            );
-            return Err((status, err_str));
+                client_headers_entries,
+                dur,
+                err_str,
+            ));
         }
     };
     let override_effort = if let Some(id) = session_id.as_deref() {
@@ -749,20 +683,20 @@ pub async fn handle_proxy(
                             err_str,
                             model_note.as_str()
                         ));
-                        record_passive_upstream_failure(
-                            proxy.state.as_ref(),
-                            proxy.service_name,
-                            &selected.station_name,
-                            &selected.upstream.base_url,
-                            Some(StatusCode::BAD_GATEWAY.as_u16()),
-                            Some("target_build_error"),
-                            Some(err_str.clone()),
+                        apply_terminal_upstream_failure(
+                            &proxy,
+                            None,
+                            &selected,
+                            "target_build_error",
+                            None,
+                            plan.transport_cooldown_secs,
+                            cooldown_backoff,
+                            err_str,
+                            avoid_set,
+                            &mut avoided_total,
+                            &mut last_err,
                         )
                         .await;
-                        if avoid_set.insert(selected.index) {
-                            avoided_total = avoided_total.saturating_add(1);
-                        }
-                        last_err = Some((StatusCode::BAD_GATEWAY, err_str));
                         break;
                     }
                 };
@@ -857,26 +791,20 @@ pub async fn handle_proxy(
                             continue;
                         }
 
-                        lb.penalize_with_backoff(
-                            selected.index,
-                            plan.transport_cooldown_secs,
+                        apply_terminal_upstream_failure(
+                            &proxy,
+                            Some(&lb),
+                            &selected,
                             "upstream_transport_error",
-                            cooldown_backoff,
-                        );
-                        record_passive_upstream_failure(
-                            proxy.state.as_ref(),
-                            proxy.service_name,
-                            &selected.station_name,
-                            &selected.upstream.base_url,
-                            Some(StatusCode::BAD_GATEWAY.as_u16()),
                             Some("upstream_transport_error"),
-                            Some(err_str.clone()),
+                            plan.transport_cooldown_secs,
+                            cooldown_backoff,
+                            err_str,
+                            avoid_set,
+                            &mut avoided_total,
+                            &mut last_err,
                         )
                         .await;
-                        if avoid_set.insert(selected.index) {
-                            avoided_total = avoided_total.saturating_add(1);
-                        }
-                        last_err = Some((StatusCode::BAD_GATEWAY, err_str));
                         break;
                     }
                 };
@@ -946,26 +874,20 @@ pub async fn handle_proxy(
                             backoff_sleep(upstream_opt, upstream_attempt).await;
                             continue;
                         }
-                        lb.penalize_with_backoff(
-                            selected.index,
-                            plan.transport_cooldown_secs,
+                        apply_terminal_upstream_failure(
+                            &proxy,
+                            Some(&lb),
+                            &selected,
                             "upstream_body_read_error",
-                            cooldown_backoff,
-                        );
-                        record_passive_upstream_failure(
-                            proxy.state.as_ref(),
-                            proxy.service_name,
-                            &selected.station_name,
-                            &selected.upstream.base_url,
-                            Some(StatusCode::BAD_GATEWAY.as_u16()),
                             Some("upstream_body_read_error"),
-                            Some(err_str.clone()),
+                            plan.transport_cooldown_secs,
+                            cooldown_backoff,
+                            err_str,
+                            avoid_set,
+                            &mut avoided_total,
+                            &mut last_err,
                         )
                         .await;
-                        if avoid_set.insert(selected.index) {
-                            avoided_total = avoided_total.saturating_add(1);
-                        }
-                        last_err = Some((StatusCode::BAD_GATEWAY, err_str));
                         break;
                     }
                 };
@@ -1224,43 +1146,24 @@ pub async fn handle_proxy(
     // If we reach here, all provider attempts are exhausted.
     if let Some((status, msg)) = last_err {
         let dur = start.elapsed().as_millis() as u64;
-        log_request_with_debug(
-            proxy.service_name,
-            method.as_str(),
+        let retry = retry_info_for_chain(&upstream_chain);
+        return Err(finish_failed_proxy_request(
+            &proxy,
+            &method,
             uri.path(),
-            status.as_u16(),
+            request_id,
+            status,
+            msg,
             dur,
-            None,
-            "-",
-            None,
-            "-",
+            started_at_ms,
             session_id.clone(),
             cwd.clone(),
             effective_effort.clone(),
             base_service_tier.clone(),
-            None,
-            retry_info_for_chain(&upstream_chain),
-            None,
-        );
-        let retry = retry_info_for_chain(&upstream_chain);
-        proxy
-            .state
-            .finish_request(crate::state::FinishRequestParams {
-                id: request_id,
-                status_code: status.as_u16(),
-                duration_ms: dur,
-                ended_at_ms: started_at_ms + dur,
-                observed_service_tier: None,
-                usage: None,
-                retry,
-                ttfb_ms: None,
-            })
-            .await;
-        return Err((status, msg));
+            retry,
+        )
+        .await);
     }
 
-    return Err((
-        StatusCode::BAD_GATEWAY,
-        "no upstreams available".to_string(),
-    ));
+    return Err(no_upstreams_available_error());
 }
