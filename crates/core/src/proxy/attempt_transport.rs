@@ -11,9 +11,9 @@ use crate::state::RouteDecisionProvenance;
 
 use super::attempt_failures::apply_terminal_upstream_failure;
 use super::attempt_request::{AttemptRequestSetupParams, prepare_attempt_request};
-use super::http_debug::HttpDebugBase;
+use super::http_debug::{HttpDebugBase, format_reqwest_error_for_retry_chain};
 use super::retry::{RetryLayerOptions, backoff_sleep, should_retry_class};
-use super::{ProxyService, format_reqwest_error_for_retry_chain};
+use super::ProxyService;
 
 pub(super) struct AttemptTransportSuccess {
     pub(super) response: reqwest::Response,
