@@ -191,7 +191,7 @@ pub fn model_routing_warnings(cfg: &ProxyConfig, service_name: &str) -> Vec<Stri
     };
 
     let mut warnings = Vec::new();
-    for (cfg_name, svc) in mgr.configs.iter() {
+    for (cfg_name, svc) in mgr.stations() {
         for (idx, upstream) in svc.upstreams.iter().enumerate() {
             let name = format!(
                 "{service_name}:{cfg_name} upstream[{idx}] ({})",
@@ -241,18 +241,55 @@ pub struct ServiceConfigManager {
     /// 可复用控制模板。
     #[serde(default)]
     pub profiles: BTreeMap<String, ServiceControlProfile>,
-    /// 配置集合
-    #[serde(default)]
+    /// 站点集合。公共序列化使用 `stations`，仍兼容读取 legacy `configs`。
+    #[serde(default, rename = "stations", alias = "configs")]
     pub configs: HashMap<String, ServiceConfig>,
 }
 
 impl ServiceConfigManager {
-    pub fn active_config(&self) -> Option<&ServiceConfig> {
+    pub fn stations(&self) -> &HashMap<String, ServiceConfig> {
+        &self.configs
+    }
+
+    pub fn stations_mut(&mut self) -> &mut HashMap<String, ServiceConfig> {
+        &mut self.configs
+    }
+
+    pub fn station(&self, name: &str) -> Option<&ServiceConfig> {
+        self.stations().get(name)
+    }
+
+    pub fn station_mut(&mut self, name: &str) -> Option<&mut ServiceConfig> {
+        self.stations_mut().get_mut(name)
+    }
+
+    pub fn contains_station(&self, name: &str) -> bool {
+        self.station(name).is_some()
+    }
+
+    pub fn station_count(&self) -> usize {
+        self.stations().len()
+    }
+
+    pub fn has_stations(&self) -> bool {
+        !self.stations().is_empty()
+    }
+
+    pub fn active_station(&self) -> Option<&ServiceConfig> {
         self.active
             .as_ref()
-            .and_then(|name| self.configs.get(name))
+            .and_then(|name| self.station(name))
             // HashMap 的 values().next() 是非确定性的；这里用 key 排序后的最小项作为稳定兜底。
-            .or_else(|| self.configs.iter().min_by_key(|(k, _)| *k).map(|(_, v)| v))
+            .or_else(|| {
+                self.stations()
+                    .iter()
+                    .min_by_key(|(k, _)| *k)
+                    .map(|(_, v)| v)
+            })
+    }
+
+    pub fn active_config(&self) -> Option<&ServiceConfig> {
+        self.active_station()
     }
 
     pub fn profile(&self, name: &str) -> Option<&ServiceControlProfile> {
@@ -414,7 +451,7 @@ pub fn validate_profile_station_compatibility(
         return Ok(());
     };
 
-    let Some(config) = mgr.configs.get(station) else {
+    let Some(config) = mgr.station(station) else {
         anyhow::bail!(
             "[{service_name}] profile '{}' references missing station/config '{}'",
             profile_name,
@@ -1392,11 +1429,11 @@ fn migrate_service_manager_to_v2(mgr: &ServiceConfigManager) -> ServiceViewV2 {
     let mut providers = BTreeMap::new();
     let mut groups = BTreeMap::new();
 
-    let mut group_names = mgr.configs.keys().cloned().collect::<Vec<_>>();
+    let mut group_names = mgr.stations().keys().cloned().collect::<Vec<_>>();
     group_names.sort();
 
     for group_name in group_names {
-        let Some(svc) = mgr.configs.get(&group_name) else {
+        let Some(svc) = mgr.station(&group_name) else {
             continue;
         };
 
@@ -2092,12 +2129,12 @@ fn routing_candidate(
 
 fn active_or_first_config(mgr: &ServiceConfigManager) -> Option<(String, &ServiceConfig)> {
     if let Some(active_name) = mgr.active.as_deref()
-        && let Some(svc) = mgr.configs.get(active_name)
+        && let Some(svc) = mgr.station(active_name)
     {
         return Some((active_name.to_string(), svc));
     }
 
-    mgr.configs
+    mgr.stations()
         .iter()
         .min_by_key(|(name, _)| *name)
         .map(|(name, svc)| (name.clone(), svc))
@@ -2106,7 +2143,7 @@ fn active_or_first_config(mgr: &ServiceConfigManager) -> Option<(String, &Servic
 pub fn explain_service_routing(mgr: &ServiceConfigManager) -> ServiceRoutingExplanation {
     let active_name = mgr.active.as_deref();
     let mut eligible = mgr
-        .configs
+        .stations()
         .iter()
         .filter(|(name, svc)| {
             !svc.upstreams.is_empty()
@@ -2353,6 +2390,44 @@ mod tests {
                 .map(|candidate| candidate.name.as_str()),
             Some("alpha")
         );
+    }
+
+    #[test]
+    fn service_config_manager_serializes_stations_and_reads_legacy_configs_alias() {
+        let mut mgr = ServiceConfigManager::default();
+        mgr.configs.insert(
+            "alpha".to_string(),
+            ServiceConfig {
+                name: "alpha".to_string(),
+                alias: None,
+                enabled: true,
+                level: 1,
+                upstreams: vec![UpstreamConfig {
+                    base_url: "https://alpha.example/v1".to_string(),
+                    auth: UpstreamAuth::default(),
+                    tags: HashMap::new(),
+                    supported_models: HashMap::new(),
+                    model_mapping: HashMap::new(),
+                }],
+            },
+        );
+
+        let json = serde_json::to_value(&mgr).expect("serialize manager");
+        assert!(json.get("stations").is_some());
+        assert!(json.get("configs").is_none());
+
+        let decoded: ServiceConfigManager = serde_json::from_value(serde_json::json!({
+            "configs": {
+                "legacy": {
+                    "name": "legacy",
+                    "enabled": true,
+                    "level": 1,
+                    "upstreams": []
+                }
+            }
+        }))
+        .expect("deserialize legacy configs alias");
+        assert!(decoded.configs.contains_key("legacy"));
     }
 
     struct ScopedEnv {
@@ -2805,7 +2880,7 @@ env_key = "RIGHTCODE_API_KEY"
         bootstrap_from_codex(&mut cfg).expect("bootstrap_from_codex should succeed");
 
         assert!(!cfg.codex.configs.is_empty());
-        let svc = cfg.codex.active_config().expect("active codex config");
+        let svc = cfg.codex.active_station().expect("active codex station");
         assert_eq!(svc.name, "right");
         assert_eq!(svc.upstreams.len(), 1);
         let up = &svc.upstreams[0];
@@ -2837,7 +2912,7 @@ base_url = "https://www.right.codes/codex/v1"
         let mut cfg = ProxyConfig::default();
         bootstrap_from_codex(&mut cfg).expect("bootstrap_from_codex should infer env_key");
 
-        let svc = cfg.codex.active_config().expect("active codex config");
+        let svc = cfg.codex.active_station().expect("active codex station");
         assert_eq!(svc.name, "right");
         let up = &svc.upstreams[0];
         assert!(up.auth.auth_token.is_none());
@@ -2915,7 +2990,7 @@ env_key = "RIGHTCODE_API_KEY"
                 .expect("load_or_bootstrap_for_service should succeed");
 
             // 内存中的配置应包含 right upstream 与正确的 token
-            let svc = cfg.codex.active_config().expect("active codex config");
+            let svc = cfg.codex.active_station().expect("active codex station");
             assert_eq!(svc.name, "right");
             assert_eq!(svc.upstreams.len(), 1);
             assert!(svc.upstreams[0].auth.auth_token.is_none());
@@ -2934,7 +3009,7 @@ env_key = "RIGHTCODE_API_KEY"
                 .join("\n");
             let loaded: ProxyConfig =
                 toml::from_str(&text).expect("config.toml should be valid ProxyConfig");
-            let svc2 = loaded.codex.active_config().expect("active codex config");
+            let svc2 = loaded.codex.active_station().expect("active codex station");
             assert_eq!(svc2.name, "right");
             assert!(svc2.upstreams[0].auth.auth_token.is_none());
             assert_eq!(
@@ -2961,7 +3036,7 @@ base_url = "https://api.openai.com/v1"
         let mut cfg = ProxyConfig::default();
         bootstrap_from_codex(&mut cfg).expect("bootstrap_from_codex should succeed");
 
-        let svc = cfg.codex.active_config().expect("active codex config");
+        let svc = cfg.codex.active_station().expect("active codex station");
         assert_eq!(svc.name, "openai");
         let up = &svc.upstreams[0];
         assert_eq!(up.base_url, "https://api.openai.com/v1");
@@ -2994,7 +3069,7 @@ wire_api = "responses"
         let mut cfg = ProxyConfig::default();
         bootstrap_from_codex(&mut cfg).expect("bootstrap_from_codex should succeed");
 
-        let svc = cfg.codex.active_config().expect("active codex config");
+        let svc = cfg.codex.active_station().expect("active codex station");
         assert_eq!(svc.name, "packycode");
         let up = &svc.upstreams[0];
         assert_eq!(up.base_url, "https://codex-api.packycode.com/v1");

@@ -285,7 +285,7 @@ fn configured_active_station_name(mgr: &ServiceConfigManager) -> Option<String> 
 }
 
 fn effective_active_station_name(mgr: &ServiceConfigManager) -> Option<String> {
-    mgr.active_config().map(|cfg| cfg.name.clone())
+    mgr.active_station().map(|cfg| cfg.name.clone())
 }
 
 #[derive(Default)]
@@ -809,7 +809,7 @@ impl ProxyService {
                 "claude" => &config.claude,
                 _ => &config.codex,
             };
-            for svc in mgr.configs.values() {
+            for svc in mgr.stations().values() {
                 for up in &svc.upstreams {
                     if let Some(pid) = up.tags.get("provider_id") {
                         base_url_to_provider_id.insert(up.base_url.clone(), pid.clone());
@@ -890,7 +890,7 @@ impl ProxyService {
             && let Some(binding) = self.state.get_session_binding(sid).await
             && let Some(name) = binding.station_name
             && !name.trim().is_empty()
-            && mgr.configs.contains_key(name.as_str())
+            && mgr.contains_station(name.as_str())
         {
             return Some((name, "profile_default"));
         }
@@ -923,16 +923,11 @@ impl ProxyService {
                     "pinned_name": name,
                     "runtime_state": "breaker_open",
                     "active_station": mgr.active.as_deref(),
-                    "station_count": mgr.configs.len(),
+                    "station_count": mgr.station_count(),
                 }));
                 return Vec::new();
             }
-            if let Some(svc) = mgr
-                .configs
-                .get(&name)
-                .or_else(|| mgr.active_config())
-                .cloned()
-            {
+            if let Some(svc) = mgr.station(&name).or_else(|| mgr.active_station()).cloned() {
                 log_retry_trace(serde_json::json!({
                     "event": "lbs_for_request",
                     "service": self.service_name,
@@ -945,7 +940,7 @@ impl ProxyService {
                     "selected_level": svc.level.clamp(1, 10),
                     "selected_upstreams": svc.upstreams.len(),
                     "active_station": mgr.active.as_deref(),
-                    "station_count": mgr.configs.len(),
+                    "station_count": mgr.station_count(),
                 }));
                 return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
             }
@@ -958,7 +953,7 @@ impl ProxyService {
                 "pinned_name": name,
                 "selected_station": null,
                 "active_station": mgr.active.as_deref(),
-                "station_count": mgr.configs.len(),
+                "station_count": mgr.station_count(),
                 "note": "pinned_station_not_found",
             }));
             return Vec::new();
@@ -966,7 +961,7 @@ impl ProxyService {
 
         let active_name = mgr.active.as_deref();
         let mut configs = mgr
-            .configs
+            .stations()
             .iter()
             .filter(|(name, svc)| {
                 let (enabled_ovr, _) = meta_overrides
@@ -1053,7 +1048,7 @@ impl ProxyService {
             }
 
             if let Some(svc) = mgr
-                .active_config()
+                .active_station()
                 .filter(|svc| {
                     runtime_state_allows_general_routing(effective_runtime_config_state(
                         &state_overrides,
@@ -1132,7 +1127,7 @@ impl ProxyService {
         }
 
         if let Some(svc) = mgr
-            .active_config()
+            .active_station()
             .filter(|svc| {
                 runtime_state_allows_general_routing(effective_runtime_config_state(
                     &state_overrides,
@@ -4738,7 +4733,7 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &mut cfg.claude,
             _ => &mut cfg.codex,
         };
-        let Some(station) = mgr.configs.get_mut(station_name.as_str()) else {
+        let Some(station) = mgr.station_mut(station_name.as_str()) else {
             return Err((
                 StatusCode::NOT_FOUND,
                 format!("station '{}' not found", station_name),
@@ -4768,7 +4763,7 @@ pub fn router(proxy: ProxyService) -> Router {
             _ => &mut cfg.codex,
         };
         if let Some(station_name) = station_name.as_deref()
-            && !mgr.configs.contains_key(station_name)
+            && !mgr.contains_station(station_name)
         {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -4947,7 +4942,7 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
-        if !mgr.configs.contains_key(station_name.as_str()) {
+        if !mgr.contains_station(station_name.as_str()) {
             return Err((
                 StatusCode::NOT_FOUND,
                 format!("station '{}' not found", station_name),
@@ -5502,7 +5497,7 @@ pub fn router(proxy: ProxyService) -> Router {
         };
 
         let mut targets = if payload.all {
-            mgr.configs.keys().cloned().collect::<Vec<_>>()
+            mgr.stations().keys().cloned().collect::<Vec<_>>()
         } else {
             payload.station_names
         };
@@ -5519,7 +5514,7 @@ pub fn router(proxy: ProxyService) -> Router {
         let mut missing = Vec::new();
         let mut resolved_targets = Vec::new();
         for name in targets {
-            let Some(svc) = mgr.configs.get(&name) else {
+            let Some(svc) = mgr.station(&name) else {
                 missing.push(name);
                 continue;
             };
@@ -5542,7 +5537,7 @@ pub fn router(proxy: ProxyService) -> Router {
         };
 
         let station_name = payload.station_name()?;
-        let Some(station) = mgr.configs.get(&station_name) else {
+        let Some(station) = mgr.station(&station_name) else {
             return Err((
                 StatusCode::NOT_FOUND,
                 format!("station '{}' not found", station_name),
@@ -5568,7 +5563,7 @@ pub fn router(proxy: ProxyService) -> Router {
         };
 
         let mut targets = if payload.all {
-            mgr.configs.keys().cloned().collect::<Vec<_>>()
+            mgr.stations().keys().cloned().collect::<Vec<_>>()
         } else {
             payload.station_names
         };
@@ -5587,7 +5582,7 @@ pub fn router(proxy: ProxyService) -> Router {
         let mut not_running = Vec::new();
         let mut missing = Vec::new();
         for name in targets {
-            if !mgr.configs.contains_key(&name) {
+            if !mgr.contains_station(&name) {
                 missing.push(name);
                 continue;
             }

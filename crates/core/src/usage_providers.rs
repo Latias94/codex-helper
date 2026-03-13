@@ -39,7 +39,7 @@ struct UsageProvidersFile {
 
 #[derive(Debug, Clone)]
 struct UpstreamRef {
-    config_name: String,
+    station_name: String,
     index: usize,
 }
 
@@ -128,7 +128,7 @@ fn resolve_token(
 
     // 否则: 使用绑定 upstream 的 auth_token（当前 Codex 正在使用的 token）
     for uref in upstreams {
-        if let Some(service) = cfg.codex.configs.get(&uref.config_name)
+        if let Some(service) = cfg.codex.station(&uref.station_name)
             && let Some(up) = service.upstreams.get(uref.index)
         {
             if let Some(token) = up.auth.resolve_auth_token() {
@@ -221,14 +221,14 @@ fn update_usage_exhausted(
     };
 
     for uref in upstreams {
-        let service = match cfg.codex.configs.get(&uref.config_name) {
+        let service = match cfg.codex.station(&uref.station_name) {
             Some(s) => s,
             None => continue,
         };
 
         let len = service.upstreams.len();
         let entry = map
-            .entry(uref.config_name.clone())
+            .entry(uref.station_name.clone())
             .or_insert_with(LbState::default);
         if entry.failure_counts.len() != len {
             entry.failure_counts.resize(len, 0);
@@ -246,7 +246,7 @@ fn update_usage_exhausted(
 pub async fn poll_for_codex_upstream(
     cfg: Arc<ProxyConfig>,
     lb_states: Arc<Mutex<HashMap<String, LbState>>>,
-    config_name: &str,
+    station_name: &str,
     upstream_index: usize,
 ) {
     // Tests should be hermetic and should not depend on any real user `usage_providers.json` on
@@ -261,7 +261,7 @@ pub async fn poll_for_codex_upstream(
     }
 
     // Locate the current upstream once; if it no longer exists, bail out quietly.
-    let current_service = match cfg.codex.configs.get(config_name) {
+    let current_service = match cfg.codex.station(station_name) {
         Some(s) => s,
         None => return,
     };
@@ -304,9 +304,9 @@ pub async fn poll_for_codex_upstream(
         }
 
         // For diagnostics, still check whether this provider is associated with
-        // multiple hosts across configs, but only once per poll.
+        // multiple hosts across stations, but only once per poll.
         let mut hosts: Vec<String> = Vec::new();
-        for service in cfg.codex.configs.values() {
+        for service in cfg.codex.stations().values() {
             for upstream in &service.upstreams {
                 if domain_matches(&upstream.base_url, &provider.domains)
                     && let Ok(url) = reqwest::Url::parse(&upstream.base_url)
@@ -328,7 +328,7 @@ pub async fn poll_for_codex_upstream(
 
         // Only the current upstream participates in token resolution and usage update.
         let current_ref = UpstreamRef {
-            config_name: config_name.to_string(),
+            station_name: station_name.to_string(),
             index: upstream_index,
         };
         let upstreams = vec![current_ref];

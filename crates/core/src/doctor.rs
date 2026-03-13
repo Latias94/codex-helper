@@ -49,7 +49,7 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
     // 1) codex-helper main config
     match load_config().await {
         Ok(cfg) => {
-            let codex_count = cfg.codex.configs.len();
+            let codex_count = cfg.codex.station_count();
             if codex_count == 0 {
                 checks.push(DoctorCheck {
                     id: "proxy_config.codex",
@@ -86,7 +86,7 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                 let Some(active_name) = mgr.active.as_deref() else {
                     continue;
                 };
-                let Some(active_cfg) = mgr.active_config() else {
+                let Some(active_cfg) = mgr.active_station() else {
                     continue;
                 };
                 for (idx, up) in active_cfg.upstreams.iter().enumerate() {

@@ -4,17 +4,17 @@ use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamConfig};
 use crate::state::RuntimeConfigState;
 
 use super::types::{
-    CapabilitySupport, ConfigCapabilitySummary, ConfigOption, ControlProfileOption,
-    ModelCatalogKind,
+    CapabilitySupport, ControlProfileOption, ModelCatalogKind, StationCapabilitySummary,
+    StationOption,
 };
 
-pub fn build_config_options_from_mgr(
+pub fn build_station_options_from_mgr(
     mgr: &ServiceConfigManager,
     meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
     state_overrides: &HashMap<String, RuntimeConfigState>,
-) -> Vec<ConfigOption> {
+) -> Vec<StationOption> {
     let mut configs = mgr
-        .configs
+        .stations()
         .iter()
         .map(|(name, c)| {
             let (enabled_override, level_override) = meta_overrides
@@ -22,7 +22,7 @@ pub fn build_config_options_from_mgr(
                 .copied()
                 .unwrap_or((None, None));
             let configured_level = c.level.clamp(1, 10);
-            ConfigOption {
+            StationOption {
                 name: name.clone(),
                 alias: c.alias.clone(),
                 enabled: enabled_override.unwrap_or(c.enabled),
@@ -36,7 +36,7 @@ pub fn build_config_options_from_mgr(
                     .copied()
                     .unwrap_or_default(),
                 runtime_state_override: state_overrides.get(name.as_str()).copied(),
-                capabilities: build_config_capability_summary(c),
+                capabilities: build_station_capability_summary(c),
             }
         })
         .collect::<Vec<_>>();
@@ -53,6 +53,7 @@ pub fn build_profile_options_from_mgr(
         .iter()
         .map(|(name, profile)| ControlProfileOption {
             name: name.clone(),
+            extends: profile.extends.clone(),
             station: profile.station.clone(),
             model: profile.model.clone(),
             reasoning_effort: profile.reasoning_effort.clone(),
@@ -78,14 +79,14 @@ pub fn build_model_options_from_mgr(mgr: &ServiceConfigManager) -> Vec<String> {
         }
     }
 
-    for config in mgr.configs.values() {
-        models.extend(build_config_capability_summary(config).supported_models);
+    for config in mgr.stations().values() {
+        models.extend(build_station_capability_summary(config).supported_models);
     }
 
     models.into_iter().collect()
 }
 
-fn build_config_capability_summary(config: &ServiceConfig) -> ConfigCapabilitySummary {
+fn build_station_capability_summary(config: &ServiceConfig) -> StationCapabilitySummary {
     let mut supported_models = BTreeSet::new();
     let mut has_declared_models = false;
     for upstream in &config.upstreams {
@@ -102,7 +103,7 @@ fn build_config_capability_summary(config: &ServiceConfig) -> ConfigCapabilitySu
         }
     }
 
-    ConfigCapabilitySummary {
+    StationCapabilitySummary {
         model_catalog_kind: if has_declared_models {
             ModelCatalogKind::Declared
         } else {
@@ -171,7 +172,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_config_options_from_mgr_summarizes_station_capabilities() {
+    fn build_station_options_from_mgr_summarizes_station_capabilities() {
         let mut mgr = ServiceConfigManager::default();
         mgr.configs.insert(
             "declared".to_string(),
@@ -235,7 +236,7 @@ mod tests {
             },
         );
 
-        let configs = build_config_options_from_mgr(&mgr, &HashMap::new(), &HashMap::new());
+        let configs = build_station_options_from_mgr(&mgr, &HashMap::new(), &HashMap::new());
 
         let declared = configs
             .iter()
@@ -300,6 +301,7 @@ mod tests {
         mgr.profiles.insert(
             "z-fast".to_string(),
             crate::config::ServiceControlProfile {
+                extends: None,
                 station: Some("z".to_string()),
                 model: Some("gpt-5.4".to_string()),
                 reasoning_effort: Some("low".to_string()),
@@ -309,6 +311,7 @@ mod tests {
         mgr.profiles.insert(
             "a-deep".to_string(),
             crate::config::ServiceControlProfile {
+                extends: Some("base".to_string()),
                 station: Some("a".to_string()),
                 model: Some("gpt-5".to_string()),
                 reasoning_effort: Some("high".to_string()),
@@ -321,6 +324,7 @@ mod tests {
         assert_eq!(profiles.len(), 2);
         assert_eq!(profiles[0].name, "a-deep");
         assert!(!profiles[0].is_default);
+        assert_eq!(profiles[0].extends.as_deref(), Some("base"));
         assert_eq!(profiles[1].name, "z-fast");
         assert!(profiles[1].is_default);
         assert_eq!(profiles[1].reasoning_effort.as_deref(), Some("low"));
@@ -332,6 +336,7 @@ mod tests {
         mgr.profiles.insert(
             "z-fast".to_string(),
             crate::config::ServiceControlProfile {
+                extends: None,
                 station: Some("z".to_string()),
                 model: Some("gpt-5.4".to_string()),
                 reasoning_effort: Some("low".to_string()),
@@ -341,6 +346,7 @@ mod tests {
         mgr.profiles.insert(
             "trimmed".to_string(),
             crate::config::ServiceControlProfile {
+                extends: None,
                 station: None,
                 model: Some("  gpt-5.5-preview  ".to_string()),
                 reasoning_effort: None,

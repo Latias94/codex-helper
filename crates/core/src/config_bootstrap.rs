@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
-    if !cfg.codex.configs.is_empty() {
+    if cfg.codex.has_stations() {
         return Ok(());
     }
 
@@ -175,7 +175,9 @@ pub(crate) fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
             upstreams: vec![upstream],
         };
 
-        cfg.codex.configs.insert(provider_id.to_string(), service);
+        cfg.codex
+            .stations_mut()
+            .insert(provider_id.to_string(), service);
         imported_any = true;
         if provider_id == &current_provider_id {
             imported_active = true;
@@ -187,17 +189,17 @@ pub(crate) fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
     }
 
     // Prefer the Codex CLI current provider as active.
-    if imported_active && cfg.codex.configs.contains_key(&current_provider_id) {
+    if imported_active && cfg.codex.contains_station(&current_provider_id) {
         cfg.codex.active = Some(current_provider_id);
     } else {
-        cfg.codex.active = cfg.codex.configs.keys().min().cloned();
+        cfg.codex.active = cfg.codex.stations().keys().min().cloned();
     }
 
     Ok(())
 }
 
 fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
-    if !cfg.claude.configs.is_empty() {
+    if cfg.claude.has_stations() {
         return Ok(());
     }
 
@@ -294,7 +296,9 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
         upstreams: vec![upstream],
     };
 
-    cfg.claude.configs.insert("default".to_string(), service);
+    cfg.claude
+        .stations_mut()
+        .insert("default".to_string(), service);
     cfg.claude.active = Some("default".to_string());
 
     Ok(())
@@ -303,7 +307,7 @@ fn bootstrap_from_claude(cfg: &mut ProxyConfig) -> Result<()> {
 /// 加载代理配置，如有必要从 ~/.codex 自动初始化 codex 配置。
 pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
     let mut cfg = load_config().await?;
-    if cfg.codex.configs.is_empty() {
+    if !cfg.codex.has_stations() {
         match bootstrap_from_codex(&mut cfg) {
             Ok(()) => {
                 let _ = save_config(&cfg).await;
@@ -320,7 +324,7 @@ pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
         }
     } else {
         // 已存在配置但没有 active，提示用户检查
-        if cfg.codex.active.is_none() && !cfg.codex.configs.is_empty() {
+        if cfg.codex.active.is_none() && cfg.codex.has_stations() {
             warn!(
                 "检测到 Codex 配置但没有激活项，将使用任意一条配置作为默认；如需指定，请使用 `codex-helper config set-active <name>`"
             );
@@ -334,7 +338,7 @@ pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
 /// - 当 force = true 时，将清空现有 codex 段后重新基于 Codex 配置推导。
 pub async fn import_codex_config_from_codex_cli(force: bool) -> Result<ProxyConfig> {
     let mut cfg = load_config().await?;
-    if !cfg.codex.configs.is_empty() && !force {
+    if cfg.codex.has_stations() && !force {
         anyhow::bail!(
             "检测到 ~/.codex-helper/config.json 中已存在 Codex 配置；如需根据 ~/.codex/config.toml 重新导入，请使用 --force 覆盖"
         );
@@ -360,7 +364,7 @@ pub fn overwrite_codex_config_from_codex_cli_in_place(cfg: &mut ProxyConfig) -> 
 }
 pub async fn load_or_bootstrap_from_claude() -> Result<ProxyConfig> {
     let mut cfg = load_config().await?;
-    if cfg.claude.configs.is_empty() {
+    if !cfg.claude.has_stations() {
         match bootstrap_from_claude(&mut cfg) {
             Ok(()) => {
                 let _ = save_config(&cfg).await;
@@ -373,7 +377,7 @@ pub async fn load_or_bootstrap_from_claude() -> Result<ProxyConfig> {
                 );
             }
         }
-    } else if cfg.claude.active.is_none() && !cfg.claude.configs.is_empty() {
+    } else if cfg.claude.active.is_none() && cfg.claude.has_stations() {
         warn!(
             "检测到 Claude 配置但没有激活项，将使用任意一条配置作为默认；如需指定，请使用 `codex-helper config set-active <name>`（后续将扩展对 Claude 的专用子命令）"
         );

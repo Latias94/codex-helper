@@ -190,7 +190,7 @@ merge_window_ms = 10000
 global_cooldown_ms = 60000
 per_thread_cooldown_ms = 180000
 
-# 在 proxy /__codex_helper/status/recent 中向前回看多久（毫秒）。
+# 在 proxy /__codex_helper/api/v1/status/recent 中向前回看多久（毫秒）。
 # codex-helper 会把 Codex 的 "thread-id" 匹配到 proxy 的 FinishedRequest.session_id。
 recent_search_window_ms = 300000
 # 访问 recent endpoint 的 HTTP 超时（毫秒）
@@ -289,7 +289,7 @@ fn codex_bootstrap_snippet() -> Result<Option<String>> {
     if bootstrap_from_codex(&mut cfg).is_err() {
         return Ok(None);
     }
-    if cfg.codex.configs.is_empty() {
+    if !cfg.codex.has_stations() {
         return Ok(None);
     }
 
@@ -452,7 +452,7 @@ fn normalize_proxy_config(cfg: &mut ProxyConfig) {
                 .or_else(|| items.first().map(|(name, _)| (*name).clone()))
         }
 
-        for (key, svc) in mgr.configs.iter_mut() {
+        for (key, svc) in mgr.stations_mut() {
             if svc.name.trim().is_empty() {
                 svc.name = key.clone();
             }
@@ -463,9 +463,9 @@ fn normalize_proxy_config(cfg: &mut ProxyConfig) {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         mgr.active = match normalized_active {
-            Some(active) if mgr.configs.contains_key(active.as_str()) => Some(active),
+            Some(active) if mgr.contains_station(active.as_str()) => Some(active),
             Some(active) => match active.to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" | "on" => select_default_active_name(&mgr.configs),
+                "true" | "1" | "yes" | "on" => select_default_active_name(mgr.stations()),
                 "false" | "0" | "no" | "off" => None,
                 _ => Some(active),
             },
@@ -477,6 +477,11 @@ fn normalize_proxy_config(cfg: &mut ProxyConfig) {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         for profile in mgr.profiles.values_mut() {
+            profile.extends = profile
+                .extends
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
             profile.station = profile
                 .station
                 .as_ref()

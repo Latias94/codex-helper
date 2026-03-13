@@ -200,11 +200,11 @@ pub fn sync_codex_auth_from_codex_cli(
         // Target configs:
         // 1) config key equals provider_id; 2) any upstream tagged with provider_id.
         let mut target_cfg_keys = Vec::new();
-        if cfg.codex.configs.contains_key(pid) {
+        if cfg.codex.contains_station(pid) {
             target_cfg_keys.push(pid.to_string());
         }
 
-        for (cfg_key, svc) in cfg.codex.configs.iter() {
+        for (cfg_key, svc) in cfg.codex.stations() {
             if svc
                 .upstreams
                 .iter()
@@ -258,7 +258,7 @@ pub fn sync_codex_auth_from_codex_cli(
                     upstreams: vec![upstream],
                 };
 
-                cfg.codex.configs.insert(pid.to_string(), service);
+                cfg.codex.stations_mut().insert(pid.to_string(), service);
                 report.added += 1;
             }
             continue;
@@ -277,7 +277,7 @@ pub fn sync_codex_auth_from_codex_cli(
         };
 
         for cfg_key in target_cfg_keys {
-            let Some(service) = cfg.codex.configs.get_mut(&cfg_key) else {
+            let Some(service) = cfg.codex.station_mut(&cfg_key) else {
                 continue;
             };
 
@@ -331,7 +331,7 @@ pub fn sync_codex_auth_from_codex_cli(
 
     if options.set_active
         && current_provider_id != "codex_proxy"
-        && cfg.codex.configs.contains_key(&current_provider_id)
+        && cfg.codex.contains_station(&current_provider_id)
         && cfg.codex.active.as_deref() != Some(current_provider_id.as_str())
     {
         cfg.codex.active = Some(current_provider_id);

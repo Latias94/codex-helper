@@ -106,13 +106,143 @@ pub struct UpstreamHealth {
     pub latency_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passive: Option<PassiveUpstreamHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct ConfigHealth {
+pub struct StationHealth {
     pub checked_at_ms: u64,
     #[serde(default)]
     pub upstreams: Vec<UpstreamHealth>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PassiveHealthState {
+    Healthy,
+    Degraded,
+    Failing,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PassiveUpstreamHealth {
+    pub score: u8,
+    pub state: PassiveHealthState,
+    pub observed_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub consecutive_failures: u32,
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub recent_successes: u32,
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub recent_failures: u32,
+}
+
+fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+impl PassiveUpstreamHealth {
+    const MAX_RECENT_BUCKET: u32 = 6;
+
+    fn record_success(&mut self, now_ms: u64, status_code: Option<u16>) {
+        self.observed_at_ms = now_ms;
+        self.last_success_at_ms = Some(now_ms);
+        self.last_status_code = status_code;
+        self.last_error_class = None;
+        self.last_error = None;
+        self.consecutive_failures = 0;
+        self.recent_successes = self
+            .recent_successes
+            .saturating_add(1)
+            .min(Self::MAX_RECENT_BUCKET);
+        self.recent_failures = self.recent_failures.saturating_sub(1);
+        self.refresh_score();
+    }
+
+    fn record_failure(
+        &mut self,
+        now_ms: u64,
+        status_code: Option<u16>,
+        error_class: Option<String>,
+        error: Option<String>,
+    ) {
+        self.observed_at_ms = now_ms;
+        self.last_failure_at_ms = Some(now_ms);
+        self.last_status_code = status_code;
+        self.last_error_class = error_class;
+        self.last_error = error;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.recent_failures = self
+            .recent_failures
+            .saturating_add(1)
+            .min(Self::MAX_RECENT_BUCKET);
+        self.recent_successes = self.recent_successes.saturating_sub(1);
+        self.refresh_score();
+    }
+
+    fn refresh_score(&mut self) {
+        let mut score = 100_i32;
+        score -= (self.recent_failures.min(4) as i32) * 15;
+
+        if self.consecutive_failures > 0 {
+            let consecutive_penalty =
+                10 + (self.consecutive_failures.saturating_sub(1).min(3) as i32) * 10;
+            score -= consecutive_penalty;
+        }
+
+        let failure_is_latest = match (self.last_failure_at_ms, self.last_success_at_ms) {
+            (Some(failure), Some(success)) => failure >= success,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if failure_is_latest {
+            score -= self.failure_severity();
+        }
+
+        let score = score.clamp(0, 100) as u8;
+        self.score = score;
+        self.state = if score >= 80 {
+            PassiveHealthState::Healthy
+        } else if score >= 45 {
+            PassiveHealthState::Degraded
+        } else {
+            PassiveHealthState::Failing
+        };
+    }
+
+    fn failure_severity(&self) -> i32 {
+        match self.last_error_class.as_deref() {
+            Some("upstream_transport_error")
+            | Some("upstream_transport_error_final")
+            | Some("upstream_body_read_error")
+            | Some("upstream_body_read_error_final")
+            | Some("upstream_stream_error")
+            | Some("cloudflare_timeout") => 25,
+            Some("cloudflare_challenge") => 20,
+            Some("client_error_non_retryable") => 15,
+            Some(_) => 20,
+            None => match self.last_status_code {
+                Some(401 | 403) => 35,
+                Some(429) => 20,
+                Some(500..=599) => 25,
+                Some(400..=499) => 15,
+                _ => 20,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -135,6 +265,7 @@ pub enum RuntimeConfigState {
     Normal,
     Draining,
     BreakerOpen,
+    HalfOpen,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -170,11 +301,13 @@ pub struct ActiveRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_name: Option<String>,
+    pub station_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_decision: Option<RouteDecisionProvenance>,
     pub service: String,
     pub method: String,
     pub path: String,
@@ -199,11 +332,13 @@ pub struct FinishedRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_name: Option<String>,
+    pub station_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_decision: Option<RouteDecisionProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,6 +359,7 @@ pub struct FinishRequestParams {
     pub status_code: u16,
     pub duration_ms: u64,
     pub ended_at_ms: u64,
+    pub observed_service_tier: Option<String>,
     pub usage: Option<UsageMetrics>,
     pub retry: Option<RetryInfo>,
     pub ttfb_ms: Option<u64>,
@@ -245,7 +381,9 @@ pub struct SessionStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_config_name: Option<String>,
+    pub last_station_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_route_decision: Option<RouteDecisionProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<UsageMetrics>,
     pub total_usage: UsageMetrics,
@@ -312,12 +450,33 @@ pub struct ResolvedRouteValue {
 }
 
 impl ResolvedRouteValue {
-    fn new(value: impl Into<String>, source: RouteValueSource) -> Self {
+    pub(crate) fn new(value: impl Into<String>, source: RouteValueSource) -> Self {
         Self {
             value: value.into(),
             source,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RouteDecisionProvenance {
+    pub decided_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_profile_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_continuity_mode: Option<SessionContinuityMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<ResolvedRouteValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_effort: Option<ResolvedRouteValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_service_tier: Option<ResolvedRouteValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_station: Option<ResolvedRouteValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_upstream_base_url: Option<ResolvedRouteValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -351,7 +510,7 @@ pub struct SessionIdentityCard {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_config_name: Option<String>,
+    pub last_station_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_upstream_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -367,23 +526,46 @@ pub struct SessionIdentityCard {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_continuity_mode: Option<SessionContinuityMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_route_decision: Option<RouteDecisionProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_model: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_reasoning_effort: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_service_tier: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_config_name: Option<ResolvedRouteValue>,
+    pub effective_station: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_upstream_base_url: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub override_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub override_config_name: Option<String>,
+    pub override_station_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub override_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub override_service_tier: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SessionManualOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub station_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+}
+
+impl SessionManualOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.reasoning_effort.is_none()
+            && self.station_name.is_none()
+            && self.model.is_none()
+            && self.service_tier.is_none()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -395,8 +577,8 @@ struct SessionEffortOverride {
 }
 
 #[derive(Debug, Clone)]
-struct SessionConfigOverride {
-    config_name: String,
+struct SessionStationOverride {
+    station_name: String,
     #[allow(dead_code)]
     updated_at_ms: u64,
     last_seen_ms: u64,
@@ -451,29 +633,34 @@ struct RuntimeDefaultProfileOverride {
 #[derive(Debug)]
 pub struct ProxyState {
     next_request_id: AtomicU64,
+    // Manual per-session overrides remain runtime-scoped and expire after inactivity.
     session_override_ttl_ms: u64,
+    // Bindings are sticky by default; operators can opt into pruning with a separate TTL.
+    session_binding_ttl_ms: u64,
     session_cwd_cache_ttl_ms: u64,
     session_cwd_cache_max_entries: usize,
     session_effort_overrides: RwLock<HashMap<String, SessionEffortOverride>>,
-    session_config_overrides: RwLock<HashMap<String, SessionConfigOverride>>,
+    session_station_overrides: RwLock<HashMap<String, SessionStationOverride>>,
     session_model_overrides: RwLock<HashMap<String, SessionModelOverride>>,
     session_service_tier_overrides: RwLock<HashMap<String, SessionServiceTierOverride>>,
     session_bindings: RwLock<HashMap<String, SessionBindingEntry>>,
-    global_config_override: RwLock<Option<String>>,
+    global_station_override: RwLock<Option<String>>,
     runtime_default_profiles: RwLock<HashMap<String, RuntimeDefaultProfileOverride>>,
-    config_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
+    station_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
     session_stats: RwLock<HashMap<String, SessionStats>>,
     active_requests: RwLock<HashMap<u64, ActiveRequest>>,
     recent_finished: RwLock<VecDeque<FinishedRequest>>,
     usage_rollups: RwLock<HashMap<String, UsageRollup>>,
-    config_health: RwLock<HashMap<String, HashMap<String, ConfigHealth>>>,
-    health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
+    station_health: RwLock<HashMap<String, HashMap<String, StationHealth>>>,
+    passive_station_health:
+        RwLock<HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>>,
+    station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
     lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
 }
 
 impl ProxyState {
-    const MAX_HEALTH_RECORDS_PER_CONFIG: usize = 200;
+    const MAX_HEALTH_RECORDS_PER_STATION: usize = 200;
 
     #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
@@ -489,6 +676,11 @@ impl ProxyState {
             .filter(|&n| n > 0)
             .unwrap_or(30 * 60);
         let ttl_ms = ttl_secs.saturating_mul(1000);
+        let binding_ttl_secs = std::env::var("CODEX_HELPER_SESSION_BINDING_TTL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let binding_ttl_ms = binding_ttl_secs.saturating_mul(1000);
 
         let cwd_cache_ttl_secs = std::env::var("CODEX_HELPER_SESSION_CWD_CACHE_TTL_SECS")
             .ok()
@@ -500,26 +692,44 @@ impl ProxyState {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(2_000);
 
+        Self::new_with_runtime_policy(
+            lb_states,
+            ttl_ms,
+            binding_ttl_ms,
+            cwd_cache_ttl_ms,
+            cwd_cache_max_entries,
+        )
+    }
+
+    fn new_with_runtime_policy(
+        lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
+        session_override_ttl_ms: u64,
+        session_binding_ttl_ms: u64,
+        session_cwd_cache_ttl_ms: u64,
+        session_cwd_cache_max_entries: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             next_request_id: AtomicU64::new(1),
-            session_override_ttl_ms: ttl_ms,
-            session_cwd_cache_ttl_ms: cwd_cache_ttl_ms,
-            session_cwd_cache_max_entries: cwd_cache_max_entries,
+            session_override_ttl_ms,
+            session_binding_ttl_ms,
+            session_cwd_cache_ttl_ms,
+            session_cwd_cache_max_entries,
             session_effort_overrides: RwLock::new(HashMap::new()),
-            session_config_overrides: RwLock::new(HashMap::new()),
+            session_station_overrides: RwLock::new(HashMap::new()),
             session_model_overrides: RwLock::new(HashMap::new()),
             session_service_tier_overrides: RwLock::new(HashMap::new()),
             session_bindings: RwLock::new(HashMap::new()),
-            global_config_override: RwLock::new(None),
+            global_station_override: RwLock::new(None),
             runtime_default_profiles: RwLock::new(HashMap::new()),
-            config_meta_overrides: RwLock::new(HashMap::new()),
+            station_meta_overrides: RwLock::new(HashMap::new()),
             session_cwd_cache: RwLock::new(HashMap::new()),
             session_stats: RwLock::new(HashMap::new()),
             active_requests: RwLock::new(HashMap::new()),
             recent_finished: RwLock::new(VecDeque::new()),
             usage_rollups: RwLock::new(HashMap::new()),
-            config_health: RwLock::new(HashMap::new()),
-            health_checks: RwLock::new(HashMap::new()),
+            station_health: RwLock::new(HashMap::new()),
+            passive_station_health: RwLock::new(HashMap::new()),
+            station_health_checks: RwLock::new(HashMap::new()),
             lb_states,
         })
     }
@@ -527,6 +737,10 @@ impl ProxyState {
     pub async fn get_session_effort_override(&self, session_id: &str) -> Option<String> {
         let guard = self.session_effort_overrides.read().await;
         guard.get(session_id).map(|v| v.effort.clone())
+    }
+
+    pub async fn get_session_reasoning_effort_override(&self, session_id: &str) -> Option<String> {
+        self.get_session_effort_override(session_id).await
     }
 
     pub async fn set_session_effort_override(
@@ -546,9 +760,23 @@ impl ProxyState {
         );
     }
 
+    pub async fn set_session_reasoning_effort_override(
+        &self,
+        session_id: String,
+        reasoning_effort: String,
+        now_ms: u64,
+    ) {
+        self.set_session_effort_override(session_id, reasoning_effort, now_ms)
+            .await;
+    }
+
     pub async fn clear_session_effort_override(&self, session_id: &str) {
         let mut guard = self.session_effort_overrides.write().await;
         guard.remove(session_id);
+    }
+
+    pub async fn clear_session_reasoning_effort_override(&self, session_id: &str) {
+        self.clear_session_effort_override(session_id).await;
     }
 
     pub async fn list_session_effort_overrides(&self) -> HashMap<String, String> {
@@ -559,6 +787,10 @@ impl ProxyState {
             .collect()
     }
 
+    pub async fn list_session_reasoning_effort_overrides(&self) -> HashMap<String, String> {
+        self.list_session_effort_overrides().await
+    }
+
     pub async fn touch_session_override(&self, session_id: &str, now_ms: u64) {
         let mut guard = self.session_effort_overrides.write().await;
         if let Some(v) = guard.get_mut(session_id) {
@@ -566,9 +798,13 @@ impl ProxyState {
         }
     }
 
-    pub async fn get_session_config_override(&self, session_id: &str) -> Option<String> {
-        let guard = self.session_config_overrides.read().await;
-        guard.get(session_id).map(|v| v.config_name.clone())
+    pub async fn touch_session_reasoning_effort_override(&self, session_id: &str, now_ms: u64) {
+        self.touch_session_override(session_id, now_ms).await;
+    }
+
+    pub async fn get_session_station_override(&self, session_id: &str) -> Option<String> {
+        let guard = self.session_station_overrides.read().await;
+        guard.get(session_id).map(|v| v.station_name.clone())
     }
 
     pub async fn get_session_model_override(&self, session_id: &str) -> Option<String> {
@@ -682,10 +918,51 @@ impl ProxyState {
     }
 
     pub async fn clear_session_manual_overrides(&self, session_id: &str) {
-        self.clear_session_config_override(session_id).await;
+        self.clear_session_station_override(session_id).await;
         self.clear_session_model_override(session_id).await;
         self.clear_session_effort_override(session_id).await;
         self.clear_session_service_tier_override(session_id).await;
+    }
+
+    pub async fn get_session_manual_overrides(&self, session_id: &str) -> SessionManualOverrides {
+        let (reasoning_effort, station_name, model, service_tier) = tokio::join!(
+            self.get_session_reasoning_effort_override(session_id),
+            self.get_session_station_override(session_id),
+            self.get_session_model_override(session_id),
+            self.get_session_service_tier_override(session_id),
+        );
+
+        SessionManualOverrides {
+            reasoning_effort,
+            station_name,
+            model,
+            service_tier,
+        }
+    }
+
+    pub async fn list_session_manual_overrides(&self) -> HashMap<String, SessionManualOverrides> {
+        let (reasoning_effort_map, station_map, model_map, service_tier_map) = tokio::join!(
+            self.list_session_reasoning_effort_overrides(),
+            self.list_session_station_overrides(),
+            self.list_session_model_overrides(),
+            self.list_session_service_tier_overrides(),
+        );
+
+        let mut merged = HashMap::<String, SessionManualOverrides>::new();
+        for (session_id, reasoning_effort) in reasoning_effort_map {
+            merged.entry(session_id).or_default().reasoning_effort = Some(reasoning_effort);
+        }
+        for (session_id, station_name) in station_map {
+            merged.entry(session_id).or_default().station_name = Some(station_name);
+        }
+        for (session_id, model) in model_map {
+            merged.entry(session_id).or_default().model = Some(model);
+        }
+        for (session_id, service_tier) in service_tier_map {
+            merged.entry(session_id).or_default().service_tier = Some(service_tier);
+        }
+        merged.retain(|_, overrides| !overrides.is_empty());
+        merged
     }
 
     pub async fn apply_session_profile_binding(
@@ -696,14 +973,12 @@ impl ProxyState {
         profile_name: String,
         now_ms: u64,
     ) -> anyhow::Result<()> {
-        let profile = mgr
-            .profile(profile_name.as_str())
-            .ok_or_else(|| anyhow::anyhow!("profile not found: {profile_name}"))?;
+        let profile = crate::config::resolve_service_profile(mgr, profile_name.as_str())?;
         crate::config::validate_profile_station_compatibility(
             service_name,
             mgr,
             profile_name.as_str(),
-            profile,
+            &profile,
         )?;
 
         self.set_session_binding(SessionBinding {
@@ -731,55 +1006,55 @@ impl ProxyState {
         }
     }
 
-    pub async fn set_session_config_override(
+    pub async fn set_session_station_override(
         &self,
         session_id: String,
-        config_name: String,
+        station_name: String,
         now_ms: u64,
     ) {
-        let mut guard = self.session_config_overrides.write().await;
+        let mut guard = self.session_station_overrides.write().await;
         guard.insert(
             session_id,
-            SessionConfigOverride {
-                config_name,
+            SessionStationOverride {
+                station_name,
                 updated_at_ms: now_ms,
                 last_seen_ms: now_ms,
             },
         );
     }
 
-    pub async fn clear_session_config_override(&self, session_id: &str) {
-        let mut guard = self.session_config_overrides.write().await;
+    pub async fn clear_session_station_override(&self, session_id: &str) {
+        let mut guard = self.session_station_overrides.write().await;
         guard.remove(session_id);
     }
 
-    pub async fn list_session_config_overrides(&self) -> HashMap<String, String> {
-        let guard = self.session_config_overrides.read().await;
+    pub async fn list_session_station_overrides(&self) -> HashMap<String, String> {
+        let guard = self.session_station_overrides.read().await;
         guard
             .iter()
-            .map(|(k, v)| (k.clone(), v.config_name.clone()))
+            .map(|(k, v)| (k.clone(), v.station_name.clone()))
             .collect()
     }
 
-    pub async fn touch_session_config_override(&self, session_id: &str, now_ms: u64) {
-        let mut guard = self.session_config_overrides.write().await;
+    pub async fn touch_session_station_override(&self, session_id: &str, now_ms: u64) {
+        let mut guard = self.session_station_overrides.write().await;
         if let Some(v) = guard.get_mut(session_id) {
             v.last_seen_ms = now_ms;
         }
     }
 
-    pub async fn get_global_config_override(&self) -> Option<String> {
-        let guard = self.global_config_override.read().await;
+    pub async fn get_global_station_override(&self) -> Option<String> {
+        let guard = self.global_station_override.read().await;
         guard.clone()
     }
 
-    pub async fn set_global_config_override(&self, config_name: String, _now_ms: u64) {
-        let mut guard = self.global_config_override.write().await;
-        *guard = Some(config_name);
+    pub async fn set_global_station_override(&self, station_name: String, _now_ms: u64) {
+        let mut guard = self.global_station_override.write().await;
+        *guard = Some(station_name);
     }
 
-    pub async fn clear_global_config_override(&self) {
-        let mut guard = self.global_config_override.write().await;
+    pub async fn clear_global_station_override(&self) {
+        let mut guard = self.global_station_override.write().await;
         *guard = None;
     }
 
@@ -811,104 +1086,108 @@ impl ProxyState {
         guard.remove(service_name);
     }
 
-    pub async fn set_config_enabled_override(
+    pub async fn set_station_enabled_override(
         &self,
         service_name: &str,
-        config_name: String,
+        station_name: String,
         enabled: bool,
         now_ms: u64,
     ) {
-        let mut guard = self.config_meta_overrides.write().await;
+        let mut guard = self.station_meta_overrides.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(config_name).or_default();
+        let entry = per_service.entry(station_name).or_default();
         entry.enabled = Some(enabled);
         entry.updated_at_ms = now_ms;
     }
 
-    pub async fn set_config_level_override(
+    pub async fn set_station_level_override(
         &self,
         service_name: &str,
-        config_name: String,
+        station_name: String,
         level: u8,
         now_ms: u64,
     ) {
-        let mut guard = self.config_meta_overrides.write().await;
+        let mut guard = self.station_meta_overrides.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(config_name).or_default();
+        let entry = per_service.entry(station_name).or_default();
         entry.level = Some(level.clamp(1, 10));
         entry.updated_at_ms = now_ms;
     }
 
-    pub async fn set_config_runtime_state_override(
+    pub async fn set_station_runtime_state_override(
         &self,
         service_name: &str,
-        config_name: String,
+        station_name: String,
         state: RuntimeConfigState,
         now_ms: u64,
     ) {
-        let mut guard = self.config_meta_overrides.write().await;
+        let mut guard = self.station_meta_overrides.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
-        let entry = per_service.entry(config_name).or_default();
+        let entry = per_service.entry(station_name).or_default();
         entry.state = Some(state);
         entry.updated_at_ms = now_ms;
     }
 
-    pub async fn clear_config_enabled_override(&self, service_name: &str, config_name: &str) {
-        let mut guard = self.config_meta_overrides.write().await;
+    pub async fn clear_station_enabled_override(&self, service_name: &str, station_name: &str) {
+        let mut guard = self.station_meta_overrides.write().await;
         let Some(per_service) = guard.get_mut(service_name) else {
             return;
         };
-        let Some(entry) = per_service.get_mut(config_name) else {
+        let Some(entry) = per_service.get_mut(station_name) else {
             return;
         };
         entry.enabled = None;
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(config_name);
+            per_service.remove(station_name);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
     }
 
-    pub async fn clear_config_level_override(&self, service_name: &str, config_name: &str) {
-        let mut guard = self.config_meta_overrides.write().await;
+    pub async fn clear_station_level_override(&self, service_name: &str, station_name: &str) {
+        let mut guard = self.station_meta_overrides.write().await;
         let Some(per_service) = guard.get_mut(service_name) else {
             return;
         };
-        let Some(entry) = per_service.get_mut(config_name) else {
+        let Some(entry) = per_service.get_mut(station_name) else {
             return;
         };
         entry.level = None;
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(config_name);
+            per_service.remove(station_name);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
     }
 
-    pub async fn clear_config_runtime_state_override(&self, service_name: &str, config_name: &str) {
-        let mut guard = self.config_meta_overrides.write().await;
+    pub async fn clear_station_runtime_state_override(
+        &self,
+        service_name: &str,
+        station_name: &str,
+    ) {
+        let mut guard = self.station_meta_overrides.write().await;
         let Some(per_service) = guard.get_mut(service_name) else {
             return;
         };
-        let Some(entry) = per_service.get_mut(config_name) else {
+        let Some(entry) = per_service.get_mut(station_name) else {
             return;
         };
         entry.state = None;
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
-            per_service.remove(config_name);
+            per_service.remove(station_name);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
     }
 
-    pub async fn get_config_meta_overrides(
+    pub async fn get_station_meta_overrides(
         &self,
         service_name: &str,
     ) -> HashMap<String, (Option<bool>, Option<u8>)> {
-        let guard = self.config_meta_overrides.read().await;
+        let guard = self.station_meta_overrides.read().await;
         guard
             .get(service_name)
             .map(|m| {
@@ -919,11 +1198,11 @@ impl ProxyState {
             .unwrap_or_default()
     }
 
-    pub async fn get_config_runtime_state_overrides(
+    pub async fn get_station_runtime_state_overrides(
         &self,
         service_name: &str,
     ) -> HashMap<String, RuntimeConfigState> {
-        let guard = self.config_meta_overrides.read().await;
+        let guard = self.station_meta_overrides.read().await;
         guard
             .get(service_name)
             .map(|m| {
@@ -934,20 +1213,67 @@ impl ProxyState {
             .unwrap_or_default()
     }
 
-    pub async fn record_config_health(
+    pub async fn record_station_health(
         &self,
         service_name: &str,
-        config_name: String,
-        health: ConfigHealth,
+        station_name: String,
+        health: StationHealth,
     ) {
-        let mut guard = self.config_health.write().await;
+        let mut guard = self.station_health.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
-        per_service.insert(config_name, health);
+        per_service.insert(station_name, health);
     }
 
-    pub async fn get_config_health(&self, service_name: &str) -> HashMap<String, ConfigHealth> {
-        let guard = self.config_health.read().await;
-        guard.get(service_name).cloned().unwrap_or_default()
+    pub async fn get_station_health(&self, service_name: &str) -> HashMap<String, StationHealth> {
+        let active = {
+            let guard = self.station_health.read().await;
+            guard.get(service_name).cloned().unwrap_or_default()
+        };
+        let passive = {
+            let guard = self.passive_station_health.read().await;
+            guard.get(service_name).cloned().unwrap_or_default()
+        };
+        merge_station_health(active, passive)
+    }
+
+    pub async fn record_passive_upstream_success(
+        &self,
+        service_name: &str,
+        station_name: &str,
+        base_url: &str,
+        status_code: Option<u16>,
+        now_ms: u64,
+    ) {
+        let mut guard = self.passive_station_health.write().await;
+        let entry = guard
+            .entry(service_name.to_string())
+            .or_default()
+            .entry(station_name.to_string())
+            .or_default()
+            .entry(base_url.to_string())
+            .or_default();
+        entry.record_success(now_ms, status_code);
+    }
+
+    pub async fn record_passive_upstream_failure(
+        &self,
+        service_name: &str,
+        station_name: &str,
+        base_url: &str,
+        status_code: Option<u16>,
+        error_class: Option<String>,
+        error: Option<String>,
+        now_ms: u64,
+    ) {
+        let mut guard = self.passive_station_health.write().await;
+        let entry = guard
+            .entry(service_name.to_string())
+            .or_default()
+            .entry(station_name.to_string())
+            .or_default()
+            .entry(base_url.to_string())
+            .or_default();
+        entry.record_failure(now_ms, status_code, error_class, error);
     }
 
     pub async fn get_lb_view(&self) -> HashMap<String, LbConfigView> {
@@ -1014,26 +1340,26 @@ impl ProxyState {
         &self,
         service_name: &str,
     ) -> HashMap<String, HealthCheckStatus> {
-        let guard = self.health_checks.read().await;
+        let guard = self.station_health_checks.read().await;
         guard.get(service_name).cloned().unwrap_or_default()
     }
 
-    pub async fn try_begin_health_check(
+    pub async fn try_begin_station_health_check(
         &self,
         service_name: &str,
-        config_name: &str,
+        station_name: &str,
         total: usize,
         now_ms: u64,
     ) -> bool {
-        let mut guard = self.health_checks.write().await;
+        let mut guard = self.station_health_checks.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
-        if let Some(existing) = per_service.get(config_name)
+        if let Some(existing) = per_service.get(station_name)
             && !existing.done
         {
             return false;
         }
         per_service.insert(
-            config_name.to_string(),
+            station_name.to_string(),
             HealthCheckStatus {
                 started_at_ms: now_ms,
                 updated_at_ms: now_ms,
@@ -1050,17 +1376,17 @@ impl ProxyState {
         true
     }
 
-    pub async fn request_cancel_health_check(
+    pub async fn request_cancel_station_health_check(
         &self,
         service_name: &str,
-        config_name: &str,
+        station_name: &str,
         now_ms: u64,
     ) -> bool {
-        let mut guard = self.health_checks.write().await;
+        let mut guard = self.station_health_checks.write().await;
         let Some(per_service) = guard.get_mut(service_name) else {
             return false;
         };
-        let Some(st) = per_service.get_mut(config_name) else {
+        let Some(st) = per_service.get_mut(station_name) else {
             return false;
         };
         if st.done {
@@ -1071,50 +1397,50 @@ impl ProxyState {
         true
     }
 
-    pub async fn is_health_check_cancel_requested(
+    pub async fn is_station_health_check_cancel_requested(
         &self,
         service_name: &str,
-        config_name: &str,
+        station_name: &str,
     ) -> bool {
-        let guard = self.health_checks.read().await;
+        let guard = self.station_health_checks.read().await;
         guard
             .get(service_name)
-            .and_then(|m| m.get(config_name))
+            .and_then(|m| m.get(station_name))
             .is_some_and(|s| s.cancel_requested && !s.done)
     }
 
-    pub async fn record_health_check_result(
+    pub async fn record_station_health_check_result(
         &self,
         service_name: &str,
-        config_name: &str,
+        station_name: &str,
         now_ms: u64,
         upstream: UpstreamHealth,
     ) {
         {
-            let mut guard = self.config_health.write().await;
+            let mut guard = self.station_health.write().await;
             let per_service = guard.entry(service_name.to_string()).or_default();
             let entry = per_service
-                .entry(config_name.to_string())
-                .or_insert_with(|| ConfigHealth {
+                .entry(station_name.to_string())
+                .or_insert_with(|| StationHealth {
                     checked_at_ms: now_ms,
                     upstreams: Vec::new(),
                 });
             entry.checked_at_ms = entry.checked_at_ms.max(now_ms);
             entry.upstreams.push(upstream.clone());
-            if entry.upstreams.len() > Self::MAX_HEALTH_RECORDS_PER_CONFIG {
+            if entry.upstreams.len() > Self::MAX_HEALTH_RECORDS_PER_STATION {
                 let extra = entry
                     .upstreams
                     .len()
-                    .saturating_sub(Self::MAX_HEALTH_RECORDS_PER_CONFIG);
+                    .saturating_sub(Self::MAX_HEALTH_RECORDS_PER_STATION);
                 if extra > 0 {
                     entry.upstreams.drain(0..extra);
                 }
             }
         }
 
-        let mut guard = self.health_checks.write().await;
+        let mut guard = self.station_health_checks.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
-        let st = per_service.entry(config_name.to_string()).or_default();
+        let st = per_service.entry(station_name.to_string()).or_default();
         st.updated_at_ms = now_ms;
         st.completed = st.completed.saturating_add(1);
         match upstream.ok {
@@ -1129,16 +1455,16 @@ impl ProxyState {
         }
     }
 
-    pub async fn finish_health_check(
+    pub async fn finish_station_health_check(
         &self,
         service_name: &str,
-        config_name: &str,
+        station_name: &str,
         now_ms: u64,
         canceled: bool,
     ) {
-        let mut guard = self.health_checks.write().await;
+        let mut guard = self.station_health_checks.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
-        let st = per_service.entry(config_name.to_string()).or_default();
+        let st = per_service.entry(station_name.to_string()).or_default();
         st.updated_at_ms = now_ms;
         st.canceled = canceled;
         st.done = true;
@@ -1309,8 +1635,8 @@ impl ProxyState {
             let ended_at_ms = v.get("timestamp_ms").and_then(|x| x.as_u64()).unwrap_or(0);
             let status_code = v.get("status_code").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
             let duration_ms = v.get("duration_ms").and_then(|x| x.as_u64()).unwrap_or(0);
-            let config_name = v
-                .get("config_name")
+            let station_name = v
+                .get("station_name")
                 .and_then(|x| x.as_str())
                 .unwrap_or("-")
                 .to_string();
@@ -1334,7 +1660,7 @@ impl ProxyState {
                 ended_at_ms,
                 status_code,
                 duration_ms,
-                config_name,
+                station_name,
                 provider_id,
                 usage,
                 ttfb_ms,
@@ -1459,9 +1785,10 @@ impl ProxyState {
             model,
             reasoning_effort,
             service_tier,
-            config_name: None,
+            station_name: None,
             provider_id: None,
             upstream_base_url: None,
+            route_decision: None,
             service: service.to_string(),
             method: method.to_string(),
             path: path.to_string(),
@@ -1475,17 +1802,19 @@ impl ProxyState {
     pub async fn update_request_route(
         &self,
         request_id: u64,
-        config_name: String,
+        station_name: String,
         provider_id: Option<String>,
         upstream_base_url: String,
+        route_decision: Option<RouteDecisionProvenance>,
     ) {
         let mut guard = self.active_requests.write().await;
         let Some(req) = guard.get_mut(&request_id) else {
             return;
         };
-        req.config_name = Some(config_name);
+        req.station_name = Some(station_name);
         req.provider_id = provider_id;
         req.upstream_base_url = Some(upstream_base_url);
+        req.route_decision = route_decision;
     }
 
     pub async fn finish_request(&self, params: FinishRequestParams) {
@@ -1502,10 +1831,11 @@ impl ProxyState {
             cwd: req.cwd,
             model: req.model,
             reasoning_effort: req.reasoning_effort,
-            service_tier: req.service_tier,
-            config_name: req.config_name,
+            service_tier: params.observed_service_tier.or(req.service_tier),
+            station_name: req.station_name,
             provider_id: req.provider_id,
             upstream_base_url: req.upstream_base_url,
+            route_decision: req.route_decision,
             usage: params.usage.clone(),
             retry: params.retry,
             service: req.service,
@@ -1520,7 +1850,7 @@ impl ProxyState {
         {
             let day = (finished.ended_at_ms / 86_400_000) as i32;
             let cfg_key = finished
-                .config_name
+                .station_name
                 .clone()
                 .unwrap_or_else(|| "-".to_string());
             let provider_key = finished
@@ -1610,10 +1940,13 @@ impl ProxyState {
                 .provider_id
                 .clone()
                 .or(entry.last_provider_id.clone());
-            entry.last_config_name = finished
-                .config_name
+            entry.last_station_name = finished
+                .station_name
                 .clone()
-                .or(entry.last_config_name.clone());
+                .or(entry.last_station_name.clone());
+            if finished.route_decision.is_some() {
+                entry.last_route_decision = finished.route_decision.clone();
+            }
             if let Some(u) = finished.usage.as_ref() {
                 entry.last_usage = Some(u.clone());
                 entry.total_usage.add_assign(u);
@@ -1658,32 +1991,32 @@ impl ProxyState {
             active,
             recent,
             overrides,
-            config_overrides,
+            station_overrides,
             model_overrides,
             service_tier_overrides,
             bindings,
-            global_override,
+            global_station_override,
             stats,
         ) = tokio::join!(
             self.list_active_requests(),
             self.list_recent_finished(recent_limit),
             self.list_session_effort_overrides(),
-            self.list_session_config_overrides(),
+            self.list_session_station_overrides(),
             self.list_session_model_overrides(),
             self.list_session_service_tier_overrides(),
             self.list_session_bindings(),
-            self.get_global_config_override(),
+            self.get_global_station_override(),
             self.list_session_stats(),
         );
         build_session_identity_cards_from_parts(
             &active,
             &recent,
             &overrides,
-            &config_overrides,
+            &station_overrides,
             &model_overrides,
             &service_tier_overrides,
             &bindings,
-            global_override.as_deref(),
+            global_station_override.as_deref(),
             &stats,
         )
     }
@@ -1736,7 +2069,7 @@ impl ProxyState {
 
         if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
             let cutoff_override = now_ms - self.session_override_ttl_ms;
-            let mut overrides = self.session_config_overrides.write().await;
+            let mut overrides = self.session_station_overrides.write().await;
             overrides.retain(|sid, v| {
                 if active_sessions.contains_key(sid) {
                     return true;
@@ -1767,8 +2100,8 @@ impl ProxyState {
             });
         }
 
-        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
-            let cutoff_binding = now_ms - self.session_override_ttl_ms;
+        if self.session_binding_ttl_ms > 0 && now_ms >= self.session_binding_ttl_ms {
+            let cutoff_binding = now_ms - self.session_binding_ttl_ms;
             let mut bindings = self.session_bindings.write().await;
             bindings.retain(|sid, entry| {
                 if active_sessions.contains_key(sid) {
@@ -1850,6 +2183,42 @@ impl ProxyState {
     }
 }
 
+fn merge_station_health(
+    mut active: HashMap<String, StationHealth>,
+    passive: HashMap<String, HashMap<String, PassiveUpstreamHealth>>,
+) -> HashMap<String, StationHealth> {
+    for (station_name, passive_upstreams) in passive {
+        let max_observed_at_ms = passive_upstreams
+            .values()
+            .map(|health| health.observed_at_ms)
+            .max()
+            .unwrap_or(0);
+        let entry = active.entry(station_name).or_insert_with(|| StationHealth {
+            checked_at_ms: max_observed_at_ms,
+            upstreams: Vec::new(),
+        });
+        entry.checked_at_ms = entry.checked_at_ms.max(max_observed_at_ms);
+
+        for (base_url, passive_health) in passive_upstreams {
+            if let Some(upstream) = entry
+                .upstreams
+                .iter_mut()
+                .find(|upstream| upstream.base_url == base_url)
+            {
+                upstream.passive = Some(passive_health);
+            } else {
+                entry.upstreams.push(UpstreamHealth {
+                    base_url,
+                    passive: Some(passive_health),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    active
+}
+
 fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCard {
     SessionIdentityCard {
         session_id,
@@ -1867,7 +2236,7 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         last_reasoning_effort: None,
         last_service_tier: None,
         last_provider_id: None,
-        last_config_name: None,
+        last_station_name: None,
         last_upstream_base_url: None,
         last_usage: None,
         total_usage: None,
@@ -1875,13 +2244,14 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         turns_with_usage: None,
         binding_profile_name: None,
         binding_continuity_mode: None,
+        last_route_decision: None,
         effective_model: None,
         effective_reasoning_effort: None,
         effective_service_tier: None,
-        effective_config_name: None,
+        effective_station: None,
         effective_upstream_base_url: None,
         override_effort: None,
-        override_config_name: None,
+        override_station_name: None,
         override_model: None,
         override_service_tier: None,
     }
@@ -1924,18 +2294,18 @@ fn classify_session_observation_scope(card: &SessionIdentityCard) -> SessionObse
     }
 }
 
-fn resolve_effective_config_value(
+fn resolve_effective_station_value(
     card: &SessionIdentityCard,
-    global_config_override: Option<&str>,
+    global_station_override: Option<&str>,
     binding_station_name: Option<&str>,
 ) -> Option<ResolvedRouteValue> {
-    if let Some(value) = non_empty_trimmed(card.override_config_name.as_deref()) {
+    if let Some(value) = non_empty_trimmed(card.override_station_name.as_deref()) {
         return Some(ResolvedRouteValue::new(
             value,
             RouteValueSource::SessionOverride,
         ));
     }
-    if let Some(value) = non_empty_trimmed(global_config_override) {
+    if let Some(value) = non_empty_trimmed(global_station_override) {
         return Some(ResolvedRouteValue::new(
             value,
             RouteValueSource::GlobalOverride,
@@ -1948,13 +2318,13 @@ fn resolve_effective_config_value(
             RouteValueSource::ProfileDefault,
         ));
     }
-    non_empty_trimmed(card.last_config_name.as_deref())
+    non_empty_trimmed(card.last_station_name.as_deref())
         .map(|observed| ResolvedRouteValue::new(observed, RouteValueSource::RuntimeFallback))
 }
 
 fn apply_basic_effective_route(
     card: &mut SessionIdentityCard,
-    global_config_override: Option<&str>,
+    global_station_override: Option<&str>,
     binding: Option<&SessionBinding>,
 ) {
     card.effective_model = resolve_effective_observed_value(
@@ -1974,19 +2344,22 @@ fn apply_basic_effective_route(
     );
     card.binding_profile_name = binding.and_then(|binding| binding.profile_name.clone());
     card.binding_continuity_mode = binding.map(|binding| binding.continuity_mode);
-    card.effective_config_name = resolve_effective_config_value(
+    card.effective_station = resolve_effective_station_value(
         card,
-        global_config_override,
+        global_station_override,
         binding.and_then(|binding| binding.station_name.as_deref()),
     );
     card.effective_upstream_base_url = match (
-        card.effective_config_name.as_ref(),
-        non_empty_trimmed(card.last_config_name.as_deref()),
+        card.effective_station.as_ref(),
+        non_empty_trimmed(card.last_station_name.as_deref()),
         non_empty_trimmed(card.last_upstream_base_url.as_deref()),
     ) {
-        (Some(config), Some(last_config), Some(upstream)) if config.value == last_config => Some(
-            ResolvedRouteValue::new(upstream, RouteValueSource::RuntimeFallback),
-        ),
+        (Some(station), Some(last_station), Some(upstream)) if station.value == last_station => {
+            Some(ResolvedRouteValue::new(
+                upstream,
+                RouteValueSource::RuntimeFallback,
+            ))
+        }
         _ => None,
     };
 }
@@ -1996,26 +2369,26 @@ pub fn enrich_session_identity_cards_with_runtime(
     mgr: &ServiceConfigManager,
 ) {
     for card in cards {
-        if card.effective_config_name.is_none()
-            && let Some(active) = mgr.active_config()
+        if card.effective_station.is_none()
+            && let Some(active) = mgr.active_station()
         {
-            card.effective_config_name = Some(ResolvedRouteValue::new(
+            card.effective_station = Some(ResolvedRouteValue::new(
                 active.name.clone(),
                 RouteValueSource::RuntimeFallback,
             ));
         }
 
-        let effective_config_name = card
-            .effective_config_name
+        let effective_station_name = card
+            .effective_station
             .as_ref()
             .map(|value| value.value.as_str());
         if card.effective_upstream_base_url.is_none()
-            && let Some(config_name) = effective_config_name
-            && let Some(config) = mgr.configs.get(config_name)
-            && config.upstreams.len() == 1
+            && let Some(station_name) = effective_station_name
+            && let Some(station) = mgr.station(station_name)
+            && station.upstreams.len() == 1
         {
             card.effective_upstream_base_url = Some(ResolvedRouteValue::new(
-                config.upstreams[0].base_url.clone(),
+                station.upstreams[0].base_url.clone(),
                 RouteValueSource::RuntimeFallback,
             ));
         }
@@ -2027,22 +2400,22 @@ pub fn enrich_session_identity_cards_with_runtime(
         else {
             continue;
         };
-        let Some(config_name) = effective_config_name else {
+        let Some(station_name) = effective_station_name else {
             continue;
         };
-        let Some(last_config_name) = card.last_config_name.as_deref() else {
+        let Some(last_station_name) = card.last_station_name.as_deref() else {
             continue;
         };
-        if last_config_name != config_name {
+        if last_station_name != station_name {
             continue;
         }
         let Some(last_upstream_base_url) = card.last_upstream_base_url.as_deref() else {
             continue;
         };
-        let Some(config) = mgr.configs.get(config_name) else {
+        let Some(station) = mgr.station(station_name) else {
             continue;
         };
-        let Some(upstream) = config
+        let Some(upstream) = station
             .upstreams
             .iter()
             .find(|upstream| upstream.base_url == last_upstream_base_url)
@@ -2066,15 +2439,34 @@ fn session_identity_sort_key(card: &SessionIdentityCard) -> u64 {
         .max(card.active_started_at_ms_min.unwrap_or(0))
 }
 
+fn route_decision_at_ms(route_decision: Option<&RouteDecisionProvenance>) -> u64 {
+    route_decision
+        .map(|decision| decision.decided_at_ms)
+        .unwrap_or(0)
+}
+
+fn update_card_route_decision(
+    card: &mut SessionIdentityCard,
+    route_decision: Option<&RouteDecisionProvenance>,
+) {
+    let Some(route_decision) = route_decision.cloned() else {
+        return;
+    };
+    let current_at = route_decision_at_ms(card.last_route_decision.as_ref());
+    if current_at <= route_decision.decided_at_ms {
+        card.last_route_decision = Some(route_decision);
+    }
+}
+
 pub fn build_session_identity_cards_from_parts(
     active: &[ActiveRequest],
     recent: &[FinishedRequest],
     overrides: &HashMap<String, String>,
-    config_overrides: &HashMap<String, String>,
+    station_overrides: &HashMap<String, String>,
     model_overrides: &HashMap<String, String>,
     service_tier_overrides: &HashMap<String, String>,
     bindings: &HashMap<String, SessionBinding>,
-    global_config_override: Option<&str>,
+    global_station_override: Option<&str>,
     stats: &HashMap<String, SessionStats>,
 ) -> Vec<SessionIdentityCard> {
     use std::collections::HashMap as StdHashMap;
@@ -2115,12 +2507,13 @@ pub fn build_session_identity_cards_from_parts(
         if entry.last_provider_id.is_none() {
             entry.last_provider_id = req.provider_id.clone();
         }
-        if entry.last_config_name.is_none() {
-            entry.last_config_name = req.config_name.clone();
+        if entry.last_station_name.is_none() {
+            entry.last_station_name = req.station_name.clone();
         }
         if entry.last_upstream_base_url.is_none() {
             entry.last_upstream_base_url = req.upstream_base_url.clone();
         }
+        update_card_route_decision(entry, req.route_decision.as_ref());
     }
 
     for r in recent {
@@ -2145,7 +2538,7 @@ pub fn build_session_identity_cards_from_parts(
                 .or(entry.last_reasoning_effort.clone());
             entry.last_service_tier = r.service_tier.clone().or(entry.last_service_tier.clone());
             entry.last_provider_id = r.provider_id.clone().or(entry.last_provider_id.clone());
-            entry.last_config_name = r.config_name.clone().or(entry.last_config_name.clone());
+            entry.last_station_name = r.station_name.clone().or(entry.last_station_name.clone());
             entry.last_upstream_base_url = r
                 .upstream_base_url
                 .clone()
@@ -2155,6 +2548,7 @@ pub fn build_session_identity_cards_from_parts(
         if entry.cwd.is_none() {
             entry.cwd = r.cwd.clone();
         }
+        update_card_route_decision(entry, r.route_decision.as_ref());
     }
 
     for (sid, st) in stats {
@@ -2193,8 +2587,8 @@ pub fn build_session_identity_cards_from_parts(
         if entry.last_provider_id.is_none() {
             entry.last_provider_id = st.last_provider_id.clone();
         }
-        if entry.last_config_name.is_none() {
-            entry.last_config_name = st.last_config_name.clone();
+        if entry.last_station_name.is_none() {
+            entry.last_station_name = st.last_station_name.clone();
         }
         if entry.last_usage.is_none() {
             entry.last_usage = st.last_usage.clone();
@@ -2205,6 +2599,7 @@ pub fn build_session_identity_cards_from_parts(
         if entry.turns_with_usage.is_none() {
             entry.turns_with_usage = Some(st.turns_with_usage);
         }
+        update_card_route_decision(entry, st.last_route_decision.as_ref());
     }
 
     for (sid, eff) in overrides {
@@ -2215,12 +2610,12 @@ pub fn build_session_identity_cards_from_parts(
         entry.override_effort = Some(eff.clone());
     }
 
-    for (sid, cfg_name) in config_overrides {
+    for (sid, station_name) in station_overrides {
         let key = Some(sid.clone());
         let entry = map
             .entry(key.clone())
             .or_insert_with(|| empty_session_identity_card(key));
-        entry.override_config_name = Some(cfg_name.clone());
+        entry.override_station_name = Some(station_name.clone());
     }
 
     for (sid, model) in model_overrides {
@@ -2245,7 +2640,7 @@ pub fn build_session_identity_cards_from_parts(
             .session_id
             .as_deref()
             .and_then(|session_id| bindings.get(session_id));
-        apply_basic_effective_route(card, global_config_override, binding);
+        apply_basic_effective_route(card, global_station_override, binding);
         card.observation_scope = classify_session_observation_scope(card);
     }
     cards.sort_by_key(|card| std::cmp::Reverse(session_identity_sort_key(card)));
@@ -2295,9 +2690,10 @@ mod tests {
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: Some("medium".to_string()),
             service_tier: Some("priority".to_string()),
-            config_name: Some("right".to_string()),
+            station_name: Some("right".to_string()),
             provider_id: Some("right".to_string()),
             upstream_base_url: Some("https://right.example/v1".to_string()),
+            route_decision: None,
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
@@ -2313,9 +2709,10 @@ mod tests {
                 model: Some("gpt-5.3".to_string()),
                 reasoning_effort: Some("high".to_string()),
                 service_tier: Some("default".to_string()),
-                config_name: Some("vibe".to_string()),
+                station_name: Some("vibe".to_string()),
                 provider_id: Some("vibe".to_string()),
                 upstream_base_url: Some("https://vibe.example/v1".to_string()),
+                route_decision: None,
                 usage: Some(UsageMetrics {
                     input_tokens: 1,
                     output_tokens: 2,
@@ -2340,9 +2737,10 @@ mod tests {
                 model: Some("gpt-5.4".to_string()),
                 reasoning_effort: Some("low".to_string()),
                 service_tier: Some("flex".to_string()),
-                config_name: Some("right".to_string()),
+                station_name: Some("right".to_string()),
                 provider_id: Some("right".to_string()),
                 upstream_base_url: Some("https://right.example/v1".to_string()),
+                route_decision: None,
                 usage: None,
                 retry: None,
                 service: "codex".to_string(),
@@ -2370,7 +2768,8 @@ mod tests {
                 last_reasoning_effort: Some("low".to_string()),
                 last_service_tier: Some("flex".to_string()),
                 last_provider_id: Some("right".to_string()),
-                last_config_name: Some("right".to_string()),
+                last_station_name: Some("right".to_string()),
+                last_route_decision: None,
                 last_usage: None,
                 total_usage: UsageMetrics {
                     input_tokens: 10,
@@ -2416,7 +2815,7 @@ mod tests {
         assert_eq!(cards[1].last_client_addr.as_deref(), Some("100.64.0.8"));
         assert_eq!(cards[1].last_status, Some(429));
         assert_eq!(cards[1].override_effort.as_deref(), Some("xhigh"));
-        assert_eq!(cards[1].override_config_name.as_deref(), Some("temp"));
+        assert_eq!(cards[1].override_station_name.as_deref(), Some("temp"));
         assert_eq!(cards[1].override_model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(cards[1].override_service_tier.as_deref(), Some("priority"));
         assert_eq!(
@@ -2446,7 +2845,7 @@ mod tests {
         );
         assert_eq!(
             cards[1]
-                .effective_config_name
+                .effective_station
                 .as_ref()
                 .map(|value| value.source),
             Some(RouteValueSource::SessionOverride)
@@ -2475,9 +2874,10 @@ mod tests {
             model: Some("gpt-observed".to_string()),
             reasoning_effort: Some("medium".to_string()),
             service_tier: Some("default".to_string()),
-            config_name: Some("right".to_string()),
+            station_name: Some("right".to_string()),
             provider_id: None,
             upstream_base_url: None,
+            route_decision: None,
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
@@ -2543,7 +2943,7 @@ mod tests {
         );
         assert_eq!(
             cards[0]
-                .effective_config_name
+                .effective_station
                 .as_ref()
                 .map(|value| (value.value.as_str(), value.source)),
             Some(("vibe", RouteValueSource::ProfileDefault))
@@ -2551,17 +2951,97 @@ mod tests {
     }
 
     #[test]
+    fn build_session_identity_cards_keeps_binding_values_but_allows_global_config_override() {
+        let active = vec![ActiveRequest {
+            id: 1,
+            session_id: Some("sid-bound".to_string()),
+            client_name: Some("Workstation".to_string()),
+            client_addr: Some("100.64.0.10".to_string()),
+            cwd: None,
+            model: Some("gpt-observed".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: Some("default".to_string()),
+            station_name: Some("vibe".to_string()),
+            provider_id: None,
+            upstream_base_url: Some("https://vibe.example/v1".to_string()),
+            route_decision: None,
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            started_at_ms: 10,
+        }];
+        let bindings = HashMap::from([(
+            "sid-bound".to_string(),
+            SessionBinding {
+                session_id: "sid-bound".to_string(),
+                profile_name: Some("daily".to_string()),
+                station_name: Some("vibe".to_string()),
+                model: Some("gpt-bound".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                service_tier: Some("priority".to_string()),
+                continuity_mode: SessionContinuityMode::DefaultProfile,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                last_seen_ms: 10,
+            },
+        )]);
+
+        let cards = build_session_identity_cards_from_parts(
+            &active,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &bindings,
+            Some("right"),
+            &HashMap::new(),
+        );
+
+        assert_eq!(cards[0].binding_profile_name.as_deref(), Some("daily"));
+        assert_eq!(
+            cards[0]
+                .effective_model
+                .as_ref()
+                .map(|value| (value.value.as_str(), value.source)),
+            Some(("gpt-bound", RouteValueSource::ProfileDefault))
+        );
+        assert_eq!(
+            cards[0]
+                .effective_reasoning_effort
+                .as_ref()
+                .map(|value| (value.value.as_str(), value.source)),
+            Some(("high", RouteValueSource::ProfileDefault))
+        );
+        assert_eq!(
+            cards[0]
+                .effective_service_tier
+                .as_ref()
+                .map(|value| (value.value.as_str(), value.source)),
+            Some(("priority", RouteValueSource::ProfileDefault))
+        );
+        assert_eq!(
+            cards[0]
+                .effective_station
+                .as_ref()
+                .map(|value| (value.value.as_str(), value.source)),
+            Some(("right", RouteValueSource::GlobalOverride))
+        );
+        assert!(cards[0].effective_upstream_base_url.is_none());
+    }
+
+    #[test]
     fn enrich_session_identity_cards_with_runtime_applies_station_mapping_and_single_upstream() {
         let mut cards = vec![SessionIdentityCard {
             session_id: Some("sid-1".to_string()),
             last_model: Some("gpt-5.4".to_string()),
-            last_config_name: Some("right".to_string()),
+            last_station_name: Some("right".to_string()),
             last_upstream_base_url: Some("https://right.example/v1".to_string()),
             effective_model: Some(ResolvedRouteValue::new(
                 "gpt-5.4",
                 RouteValueSource::RequestPayload,
             )),
-            effective_config_name: Some(ResolvedRouteValue::new(
+            effective_station: Some(ResolvedRouteValue::new(
                 "right",
                 RouteValueSource::RuntimeFallback,
             )),
@@ -2643,6 +3123,7 @@ mod tests {
             mgr.profiles.insert(
                 "fast".to_string(),
                 crate::config::ServiceControlProfile {
+                    extends: None,
                     station: Some("right".to_string()),
                     model: Some("gpt-5.4".to_string()),
                     reasoning_effort: Some("low".to_string()),
@@ -2651,7 +3132,7 @@ mod tests {
             );
 
             state
-                .set_session_config_override("sid-1".to_string(), "other".to_string(), 1)
+                .set_session_station_override("sid-1".to_string(), "other".to_string(), 1)
                 .await;
             state
                 .set_session_model_override("sid-1".to_string(), "gpt-x".to_string(), 1)
@@ -2688,7 +3169,7 @@ mod tests {
                 SessionContinuityMode::ManualProfile
             );
             assert_eq!(binding.updated_at_ms, now_ms);
-            assert!(state.get_session_config_override("sid-1").await.is_none());
+            assert!(state.get_session_station_override("sid-1").await.is_none());
             assert!(state.get_session_model_override("sid-1").await.is_none());
             assert!(state.get_session_effort_override("sid-1").await.is_none());
             assert!(
@@ -2697,6 +3178,313 @@ mod tests {
                     .await
                     .is_none()
             );
+        });
+    }
+
+    #[test]
+    fn list_session_manual_overrides_merges_all_dimensions() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            state
+                .set_session_reasoning_effort_override("sid-1".to_string(), "high".to_string(), 1)
+                .await;
+            state
+                .set_session_station_override("sid-1".to_string(), "right".to_string(), 1)
+                .await;
+            state
+                .set_session_model_override("sid-1".to_string(), "gpt-5.4".to_string(), 1)
+                .await;
+            state
+                .set_session_service_tier_override("sid-1".to_string(), "priority".to_string(), 1)
+                .await;
+            state
+                .set_session_model_override("sid-2".to_string(), "gpt-5.4-mini".to_string(), 2)
+                .await;
+
+            let merged = state.list_session_manual_overrides().await;
+            assert_eq!(merged.len(), 2);
+            assert_eq!(
+                merged
+                    .get("sid-1")
+                    .and_then(|overrides| overrides.reasoning_effort.as_deref()),
+                Some("high")
+            );
+            assert_eq!(
+                merged
+                    .get("sid-1")
+                    .and_then(|overrides| overrides.station_name.as_deref()),
+                Some("right")
+            );
+            assert_eq!(
+                merged
+                    .get("sid-1")
+                    .and_then(|overrides| overrides.model.as_deref()),
+                Some("gpt-5.4")
+            );
+            assert_eq!(
+                merged
+                    .get("sid-1")
+                    .and_then(|overrides| overrides.service_tier.as_deref()),
+                Some("priority")
+            );
+            assert_eq!(
+                merged
+                    .get("sid-2")
+                    .and_then(|overrides| overrides.model.as_deref()),
+                Some("gpt-5.4-mini")
+            );
+            assert!(
+                merged
+                    .get("sid-2")
+                    .is_some_and(|overrides| overrides.reasoning_effort.is_none())
+            );
+        });
+    }
+
+    #[test]
+    fn get_station_health_merges_passive_runtime_observations() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            state
+                .record_station_health(
+                    "codex",
+                    "right".to_string(),
+                    StationHealth {
+                        checked_at_ms: 10,
+                        upstreams: vec![UpstreamHealth {
+                            base_url: "https://right.example/v1".to_string(),
+                            ok: Some(true),
+                            status_code: Some(200),
+                            latency_ms: Some(120),
+                            error: None,
+                            passive: None,
+                        }],
+                    },
+                )
+                .await;
+            state
+                .record_passive_upstream_failure(
+                    "codex",
+                    "right",
+                    "https://right.example/v1",
+                    Some(500),
+                    Some("cloudflare_timeout".to_string()),
+                    Some("upstream timed out".to_string()),
+                    20,
+                )
+                .await;
+            state
+                .record_passive_upstream_success(
+                    "codex",
+                    "right",
+                    "https://backup.example/v1",
+                    Some(200),
+                    30,
+                )
+                .await;
+
+            let health = state.get_station_health("codex").await;
+            let right = health.get("right").expect("right health");
+            assert_eq!(right.checked_at_ms, 30);
+            assert_eq!(right.upstreams.len(), 2);
+
+            let primary = right
+                .upstreams
+                .iter()
+                .find(|upstream| upstream.base_url == "https://right.example/v1")
+                .expect("primary upstream");
+            assert_eq!(primary.ok, Some(true));
+            let primary_passive = primary.passive.as_ref().expect("primary passive");
+            assert_eq!(primary_passive.state, PassiveHealthState::Degraded);
+            assert_eq!(primary_passive.score, 50);
+            assert_eq!(primary_passive.last_status_code, Some(500));
+            assert_eq!(
+                primary_passive.last_error_class.as_deref(),
+                Some("cloudflare_timeout")
+            );
+
+            let backup = right
+                .upstreams
+                .iter()
+                .find(|upstream| upstream.base_url == "https://backup.example/v1")
+                .expect("backup upstream");
+            assert_eq!(backup.ok, None);
+            let backup_passive = backup.passive.as_ref().expect("backup passive");
+            assert_eq!(backup_passive.state, PassiveHealthState::Healthy);
+            assert_eq!(backup_passive.score, 100);
+            assert_eq!(backup_passive.last_status_code, Some(200));
+        });
+    }
+
+    #[test]
+    fn passive_health_success_recovers_after_failure() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            state
+                .record_passive_upstream_failure(
+                    "codex",
+                    "right",
+                    "https://right.example/v1",
+                    Some(500),
+                    Some("cloudflare_timeout".to_string()),
+                    Some("upstream timed out".to_string()),
+                    10,
+                )
+                .await;
+            state
+                .record_passive_upstream_success(
+                    "codex",
+                    "right",
+                    "https://right.example/v1",
+                    Some(200),
+                    20,
+                )
+                .await;
+
+            let health = state.get_station_health("codex").await;
+            let right = health.get("right").expect("right health");
+            let upstream = right.upstreams.first().expect("upstream");
+            let passive = upstream.passive.as_ref().expect("passive");
+            assert_eq!(passive.state, PassiveHealthState::Healthy);
+            assert_eq!(passive.score, 100);
+            assert_eq!(passive.consecutive_failures, 0);
+            assert_eq!(passive.last_success_at_ms, Some(20));
+            assert_eq!(passive.last_failure_at_ms, Some(10));
+            assert_eq!(passive.last_error_class, None);
+            assert_eq!(passive.last_error, None);
+        });
+    }
+
+    #[test]
+    fn apply_session_profile_binding_uses_inherited_profile_values() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let mut mgr = ServiceConfigManager::default();
+            mgr.configs.insert(
+                "right".to_string(),
+                ServiceConfig {
+                    name: "right".to_string(),
+                    alias: None,
+                    enabled: true,
+                    level: 1,
+                    upstreams: vec![UpstreamConfig {
+                        base_url: "https://right.example/v1".to_string(),
+                        auth: UpstreamAuth::default(),
+                        tags: HashMap::from([
+                            ("supports_reasoning_effort".to_string(), "true".to_string()),
+                            ("supports_service_tier".to_string(), "true".to_string()),
+                        ]),
+                        supported_models: HashMap::from([("gpt-5.4".to_string(), true)]),
+                        model_mapping: HashMap::new(),
+                    }],
+                },
+            );
+            mgr.profiles.insert(
+                "base".to_string(),
+                crate::config::ServiceControlProfile {
+                    extends: None,
+                    station: Some("right".to_string()),
+                    model: Some("gpt-5.4".to_string()),
+                    reasoning_effort: None,
+                    service_tier: Some("priority".to_string()),
+                },
+            );
+            mgr.profiles.insert(
+                "fast".to_string(),
+                crate::config::ServiceControlProfile {
+                    extends: Some("base".to_string()),
+                    station: None,
+                    model: None,
+                    reasoning_effort: Some("low".to_string()),
+                    service_tier: None,
+                },
+            );
+
+            state
+                .apply_session_profile_binding(
+                    "codex",
+                    &mgr,
+                    "sid-inherited".to_string(),
+                    "fast".to_string(),
+                    100,
+                )
+                .await
+                .expect("apply inherited profile");
+
+            let binding = state
+                .get_session_binding("sid-inherited")
+                .await
+                .expect("binding exists");
+            assert_eq!(binding.profile_name.as_deref(), Some("fast"));
+            assert_eq!(binding.station_name.as_deref(), Some("right"));
+            assert_eq!(binding.model.as_deref(), Some("gpt-5.4"));
+            assert_eq!(binding.reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(binding.service_tier.as_deref(), Some("priority"));
+        });
+    }
+
+    #[test]
+    fn prune_periodic_keeps_sticky_binding_after_manual_override_ttl_expires() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new_with_runtime_policy(None, 1, 0, 0, 0);
+            state
+                .set_session_model_override("sid-sticky".to_string(), "gpt-5.4".to_string(), 0)
+                .await;
+            state
+                .set_session_binding(SessionBinding {
+                    session_id: "sid-sticky".to_string(),
+                    profile_name: Some("daily".to_string()),
+                    station_name: Some("right".to_string()),
+                    model: Some("gpt-5.4".to_string()),
+                    reasoning_effort: Some("medium".to_string()),
+                    service_tier: Some("default".to_string()),
+                    continuity_mode: SessionContinuityMode::DefaultProfile,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    last_seen_ms: 0,
+                })
+                .await;
+
+            state.prune_periodic().await;
+
+            assert!(
+                state
+                    .get_session_model_override("sid-sticky")
+                    .await
+                    .is_none()
+            );
+            assert!(state.get_session_binding("sid-sticky").await.is_some());
+        });
+    }
+
+    #[test]
+    fn prune_periodic_honors_opt_in_binding_ttl() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new_with_runtime_policy(None, 0, 1, 0, 0);
+            state
+                .set_session_binding(SessionBinding {
+                    session_id: "sid-expire".to_string(),
+                    profile_name: Some("daily".to_string()),
+                    station_name: Some("right".to_string()),
+                    model: Some("gpt-5.4".to_string()),
+                    reasoning_effort: Some("medium".to_string()),
+                    service_tier: Some("default".to_string()),
+                    continuity_mode: SessionContinuityMode::DefaultProfile,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    last_seen_ms: 0,
+                })
+                .await;
+
+            state.prune_periodic().await;
+
+            assert!(state.get_session_binding("sid-expire").await.is_none());
         });
     }
 }
