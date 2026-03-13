@@ -2,11 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use axum::middleware;
 use axum::routing::{any, get, post, put};
 use reqwest::Client;
@@ -33,6 +32,7 @@ mod runtime_config;
 mod session_overrides;
 mod stations_api;
 mod stream;
+mod target_builder;
 #[cfg(test)]
 mod tests;
 
@@ -567,49 +567,6 @@ impl ProxyService {
             "active_station": active_name,
         }));
         Vec::new()
-    }
-
-    fn build_target(
-        &self,
-        upstream: &SelectedUpstream,
-        uri: &Uri,
-    ) -> Result<(reqwest::Url, HeaderMap)> {
-        let base = upstream.upstream.base_url.trim_end_matches('/').to_string();
-
-        let base_url = reqwest::Url::parse(&base)
-            .map_err(|e| anyhow!("invalid upstream base_url {base}: {e}"))?;
-        let base_path = base_url.path().trim_end_matches('/').to_string();
-
-        let mut path = uri.path().to_string();
-        if !base_path.is_empty()
-            && base_path != "/"
-            && (path == base_path || path.starts_with(&format!("{base_path}/")))
-        {
-            // If the incoming request path already contains the base_url path prefix,
-            // strip it to avoid double-prefixing (e.g. base_url=/v1 and request=/v1/responses).
-            let rest = &path[base_path.len()..];
-            path = if rest.is_empty() {
-                "/".to_string()
-            } else {
-                rest.to_string()
-            };
-            if !path.starts_with('/') {
-                path = format!("/{path}");
-            }
-        }
-        let path_and_query = if let Some(q) = uri.query() {
-            format!("{path}?{q}")
-        } else {
-            path
-        };
-
-        let full = format!("{base}{path_and_query}");
-        let url =
-            reqwest::Url::parse(&full).map_err(|e| anyhow!("invalid upstream url {full}: {e}"))?;
-
-        // ensure query preserved (Url::parse already includes it)
-        let headers = HeaderMap::new();
-        Ok((url, headers))
     }
 
     pub fn state_handle(&self) -> Arc<ProxyState> {
