@@ -4,7 +4,8 @@ use axum::http::StatusCode;
 
 use crate::lb::{CooldownBackoff, LoadBalancer, SelectedUpstream};
 
-use super::{ProxyService, record_passive_upstream_failure};
+use super::ProxyService;
+use super::passive_health::record_passive_upstream_failure;
 
 pub(super) async fn apply_terminal_upstream_failure(
     proxy: &ProxyService,

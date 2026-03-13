@@ -9,15 +9,17 @@ use tracing::{info, warn};
 
 use crate::lb::LoadBalancer;
 use crate::logging::{
-    HttpDebugLog, RetryInfo, log_request_with_debug, make_body_preview, should_include_http_debug,
-    should_include_http_warn,
+    HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug, make_body_preview,
+    should_include_http_debug, should_include_http_warn,
 };
 use crate::state::ProxyState;
 use crate::usage_providers;
 
 use super::classify::classify_upstream_response;
+use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::{
-    HttpDebugBase, ProxyService, SelectedUpstream, header_map_to_entries, warn_http_debug,
+    HttpDebugBase, ProxyService, SelectedUpstream, header_map_to_entries,
+    scan_service_tier_from_sse_bytes_incremental, warn_http_debug,
 };
 
 fn stream_buffer_max_bytes() -> usize {
@@ -42,6 +44,8 @@ struct StreamUsageState {
     first_chunk_ms: Option<u64>,
     usage: Option<crate::usage::UsageMetrics>,
     usage_scan_pos: usize,
+    service_tier: Option<String>,
+    service_tier_scan_pos: usize,
 }
 
 struct StreamFinalize {
@@ -55,13 +59,14 @@ struct StreamFinalize {
     upstream_headers_ms: u64,
     request_body_len: usize,
     upstream_request_body_len: usize,
-    config_name: String,
+    station_name: String,
     provider_id: Option<String>,
     upstream_base_url: String,
     retry: Option<RetryInfo>,
     session_id: Option<String>,
     cwd: Option<String>,
     reasoning_effort: Option<String>,
+    service_tier: ServiceTierLog,
     request_id: u64,
     state: Arc<ProxyState>,
     resp_headers: HeaderMap,
@@ -148,7 +153,9 @@ impl Drop for StreamFinalize {
         let usage_for_state = guard.usage.clone();
         let retry_for_state = self.retry.clone();
         let ttfb_ms_for_state = guard.first_chunk_ms;
+        let service_tier_for_state = guard.service_tier.clone();
         let stream_error = guard.stream_error;
+        let response_body = guard.buffer.clone();
 
         let dur = self.start.elapsed().as_millis() as u64;
 
@@ -168,6 +175,10 @@ impl Drop for StreamFinalize {
             } else {
                 None
             };
+            let service_tier = ServiceTierLog {
+                actual: guard.service_tier.clone(),
+                ..self.service_tier.clone()
+            };
             log_request_with_debug(
                 &self.service_name,
                 &self.method,
@@ -175,12 +186,13 @@ impl Drop for StreamFinalize {
                 self.status_code,
                 dur,
                 guard.first_chunk_ms,
-                &self.config_name,
+                &self.station_name,
                 self.provider_id.clone(),
                 &self.upstream_base_url,
                 self.session_id.clone(),
                 self.cwd.clone(),
                 self.reasoning_effort.clone(),
+                service_tier,
                 usage,
                 self.retry.clone(),
                 http_debug,
@@ -189,7 +201,7 @@ impl Drop for StreamFinalize {
 
         drop(guard);
 
-        if stream_error {
+        let passive_failure = if stream_error {
             self.lb.record_result_with_backoff(
                 self.upstream_index,
                 false,
@@ -202,15 +214,82 @@ impl Drop for StreamFinalize {
                 "upstream_stream_error",
                 self.cooldown_backoff,
             );
-        }
+            Some((
+                Some(status_code),
+                Some("upstream_stream_error".to_string()),
+                if response_body.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(response_body.as_slice()).to_string())
+                },
+            ))
+        } else if (200..300).contains(&status_code) {
+            self.lb.record_result_with_backoff(
+                self.upstream_index,
+                true,
+                crate::lb::COOLDOWN_SECS,
+                self.cooldown_backoff,
+            );
+            None
+        } else {
+            let (cls, _hint, _cf_ray) = classify_upstream_response(
+                status_code,
+                &self.resp_headers,
+                response_body.as_slice(),
+            );
+            if status_code >= 500 || cls.is_some() {
+                self.lb.record_result_with_backoff(
+                    self.upstream_index,
+                    false,
+                    crate::lb::COOLDOWN_SECS,
+                    self.cooldown_backoff,
+                );
+            }
+            Some((
+                Some(status_code),
+                cls,
+                if response_body.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(response_body.as_slice()).to_string())
+                },
+            ))
+        };
+
+        let state_for_passive = state.clone();
+        let service_name_for_passive = self.service_name.clone();
+        let station_name_for_passive = self.station_name.clone();
+        let base_url_for_passive = self.upstream_base_url.clone();
 
         tokio::spawn(async move {
+            if let Some((status_code, error_class, error)) = passive_failure {
+                record_passive_upstream_failure(
+                    &state_for_passive,
+                    &service_name_for_passive,
+                    &station_name_for_passive,
+                    &base_url_for_passive,
+                    status_code,
+                    error_class.as_deref(),
+                    error,
+                )
+                .await;
+            } else {
+                record_passive_upstream_success(
+                    &state_for_passive,
+                    &service_name_for_passive,
+                    &station_name_for_passive,
+                    &base_url_for_passive,
+                    status_code,
+                )
+                .await;
+            }
             state
                 .finish_request(crate::state::FinishRequestParams {
                     id: request_id,
                     status_code,
                     duration_ms: dur,
                     ended_at_ms: started_at_ms + dur,
+                    observed_service_tier: service_tier_for_state,
                     usage: usage_for_state,
                     retry: retry_for_state,
                     ttfb_ms: ttfb_ms_for_state,
@@ -242,6 +321,7 @@ pub(super) async fn build_sse_success_response(
         session_id,
         cwd,
         effective_effort,
+        service_tier,
         request_id,
         is_user_turn,
         is_codex_service,
@@ -259,10 +339,10 @@ pub(super) async fn build_sse_success_response(
             .map(|s| s.as_str())
             .unwrap_or("-");
         info!(
-            "user turn {} {} using config '{}' upstream[{}] provider_id='{}' base_url='{}'",
+            "user turn {} {} using station '{}' upstream[{}] provider_id='{}' base_url='{}'",
             method,
             path,
-            selected.config_name,
+            selected.station_name,
             selected.index,
             provider_id,
             selected.upstream.base_url
@@ -274,7 +354,7 @@ pub(super) async fn build_sse_success_response(
     let usage_state_inner = usage_state.clone();
     let method_s = method.to_string();
     let path_s = path.clone();
-    let config_name = selected.config_name.clone();
+    let station_name = selected.station_name.clone();
     let provider_id = selected.upstream.tags.get("provider_id").cloned();
     let base_url = selected.upstream.base_url.clone();
     let service_name = proxy.service_name.to_string();
@@ -292,13 +372,14 @@ pub(super) async fn build_sse_success_response(
         upstream_headers_ms,
         request_body_len,
         upstream_request_body_len,
-        config_name: config_name.clone(),
+        station_name: station_name.clone(),
         provider_id: provider_id.clone(),
         upstream_base_url: base_url.clone(),
         retry: retry.clone(),
         session_id: session_id.clone(),
         cwd: cwd.clone(),
         reasoning_effort: effective_effort.clone(),
+        service_tier,
         request_id,
         state: proxy.state.clone(),
         resp_headers: resp_headers.clone(),
@@ -315,13 +396,13 @@ pub(super) async fn build_sse_success_response(
         tokio::spawn({
             let cfg = cfg_snapshot;
             let lb_states = proxy.lb_states.clone();
-            let config_name = selected.config_name.clone();
+            let station_name = selected.station_name.clone();
             let upstream_index = selected.index;
             async move {
                 usage_providers::poll_for_codex_upstream(
                     cfg,
                     lb_states,
-                    &config_name,
+                    &station_name,
                     upstream_index,
                 )
                 .await;
@@ -365,8 +446,8 @@ pub(super) async fn build_sse_success_response(
                         warn_http_debug(status_code, &h);
                     } else {
                         warn!(
-                            "upstream returned non-2xx status {} for {} {} (config: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
-                            status_code, method_s, path_s, config_name
+                            "upstream returned non-2xx status {} for {} {} (station: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
+                            status_code, method_s, path_s, station_name
                         );
                     }
                     guard.warned_non_success = true;
@@ -379,12 +460,19 @@ pub(super) async fn build_sse_success_response(
                         buffer,
                         usage_scan_pos,
                         usage,
+                        service_tier_scan_pos,
+                        service_tier,
                         ..
                     } = &mut *guard;
                     crate::usage::scan_usage_from_sse_bytes_incremental(
                         buffer.as_slice(),
                         usage_scan_pos,
                         usage,
+                    );
+                    scan_service_tier_from_sse_bytes_incremental(
+                        buffer.as_slice(),
+                        service_tier_scan_pos,
+                        service_tier,
                     );
                 }
                 // If the buffer grew large, drop already-scanned bytes to cap memory.
@@ -401,6 +489,10 @@ pub(super) async fn build_sse_success_response(
                     } else {
                         None
                     };
+                    let service_tier = ServiceTierLog {
+                        actual: guard.service_tier.clone(),
+                        .._finalize.service_tier.clone()
+                    };
                     log_request_with_debug(
                         &service_name,
                         &method_s,
@@ -408,12 +500,13 @@ pub(super) async fn build_sse_success_response(
                         status.as_u16(),
                         dur,
                         guard.first_chunk_ms,
-                        &config_name,
+                        &station_name,
                         provider_id.clone(),
                         &base_url,
                         session_id.clone(),
                         cwd.clone(),
                         effective_effort.clone(),
+                        service_tier,
                         Some(usage),
                         retry.clone(),
                         http_debug,
@@ -431,8 +524,8 @@ pub(super) async fn build_sse_success_response(
                     guard.stream_error = true;
                 }
                 warn!(
-                    "upstream stream error: {} {} status={} config={} base_url={} err={}",
-                    method_s, path_s, status_code, config_name, base_url, e
+                    "upstream stream error: {} {} status={} station={} base_url={} err={}",
+                    method_s, path_s, status_code, station_name, base_url, e
                 );
                 Err(e)
             }
@@ -465,6 +558,7 @@ pub(super) struct SseSuccessMeta {
     pub(super) session_id: Option<String>,
     pub(super) cwd: Option<String>,
     pub(super) effective_effort: Option<String>,
+    pub(super) service_tier: ServiceTierLog,
     pub(super) request_id: u64,
     pub(super) is_user_turn: bool,
     pub(super) is_codex_service: bool,
