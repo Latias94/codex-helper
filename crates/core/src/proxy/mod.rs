@@ -18,6 +18,7 @@ use tracing::{instrument, warn};
 mod admin;
 mod auth_resolution;
 mod classify;
+mod headers;
 mod request_body;
 mod retry;
 mod route_provenance;
@@ -52,6 +53,7 @@ pub use self::admin::{
 };
 use self::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
 use self::classify::{class_is_health_neutral, classify_upstream_response};
+use self::headers::{filter_request_headers, filter_response_headers};
 use self::request_body::{
     apply_model_override, apply_reasoning_effort_override, apply_service_tier_override,
     extract_model_from_request_body, extract_reasoning_effort_from_request_body,
@@ -284,101 +286,8 @@ fn claude_settings_env_value(key: &str) -> Option<String> {
     auth_resolution::claude_settings_env_value(key)
 }
 
-fn is_hop_by_hop_header(name_lower: &str) -> bool {
-    matches!(
-        name_lower,
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "trailers"
-            | "transfer-encoding"
-            | "upgrade"
-    )
-}
-
-fn hop_by_hop_connection_tokens(headers: &HeaderMap) -> Vec<String> {
-    let mut out = Vec::new();
-    for value in headers.get_all("connection").iter() {
-        let Ok(s) = value.to_str() else {
-            continue;
-        };
-        for token in s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
-            out.push(token.to_ascii_lowercase());
-        }
-    }
-    out
-}
-
-fn filter_request_headers(src: &HeaderMap) -> HeaderMap {
-    let extra = hop_by_hop_connection_tokens(src);
-    let mut out = HeaderMap::new();
-    for (name, value) in src.iter() {
-        let name_lower = name.as_str().to_ascii_lowercase();
-        if name_lower == "host"
-            || name_lower == "content-length"
-            || is_hop_by_hop_header(&name_lower)
-        {
-            continue;
-        }
-        if extra.iter().any(|t| t == &name_lower) {
-            continue;
-        }
-        out.append(name.clone(), value.clone());
-    }
-    out
-}
-
-fn filter_response_headers(src: &HeaderMap) -> HeaderMap {
-    let extra = hop_by_hop_connection_tokens(src);
-    let mut out = HeaderMap::new();
-    for (name, value) in src.iter() {
-        let name_lower = name.as_str().to_ascii_lowercase();
-        // reqwest 可能会自动解压响应体；为避免 content-length/content-encoding 与实际 body 不一致，这里不透传它们。
-        if is_hop_by_hop_header(&name_lower)
-            || name_lower == "content-length"
-            || name_lower == "content-encoding"
-        {
-            continue;
-        }
-        if extra.iter().any(|t| t == &name_lower) {
-            continue;
-        }
-        out.append(name.clone(), value.clone());
-    }
-    out
-}
-
 fn header_map_to_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
-    fn is_sensitive(name_lower: &str) -> bool {
-        matches!(
-            name_lower,
-            "authorization"
-                | "proxy-authorization"
-                | "cookie"
-                | "set-cookie"
-                | "x-api-key"
-                | "x-forwarded-api-key"
-                | "x-goog-api-key"
-        )
-    }
-
-    let mut out = Vec::new();
-    for (name, value) in headers.iter() {
-        let name_lower = name.as_str().to_ascii_lowercase();
-        let v = if is_sensitive(name_lower.as_str()) {
-            "[REDACTED]".to_string()
-        } else {
-            String::from_utf8_lossy(value.as_bytes()).into_owned()
-        };
-        out.push(HeaderEntry {
-            name: name.as_str().to_string(),
-            value: v,
-        });
-    }
-    out
+    headers::header_map_to_entries(headers)
 }
 
 #[derive(Clone)]
