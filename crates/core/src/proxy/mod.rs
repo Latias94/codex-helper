@@ -20,6 +20,7 @@ mod classify;
 mod client_identity;
 mod headers;
 mod http_debug;
+mod passive_health;
 mod request_body;
 mod retry;
 mod route_provenance;
@@ -57,6 +58,7 @@ use self::classify::{class_is_health_neutral, classify_upstream_response};
 use self::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
 use self::headers::{filter_request_headers, filter_response_headers};
 use self::http_debug::format_reqwest_error_for_retry_chain;
+use self::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use self::request_body::{
     apply_model_override, apply_reasoning_effort_override, apply_service_tier_override,
     extract_model_from_request_body, extract_reasoning_effort_from_request_body,
@@ -132,49 +134,6 @@ fn log_same_station_failover_trace(
     }));
 }
 
-pub(super) async fn record_passive_upstream_success(
-    state: &ProxyState,
-    service_name: &str,
-    station_name: &str,
-    base_url: &str,
-    status_code: u16,
-) {
-    state
-        .record_passive_upstream_success(
-            service_name,
-            station_name,
-            base_url,
-            Some(status_code),
-            now_ms(),
-        )
-        .await;
-}
-
-pub(super) async fn record_passive_upstream_failure(
-    state: &ProxyState,
-    service_name: &str,
-    station_name: &str,
-    base_url: &str,
-    status_code: Option<u16>,
-    error_class: Option<&str>,
-    error: Option<String>,
-) {
-    if class_is_health_neutral(error_class) {
-        return;
-    }
-    state
-        .record_passive_upstream_failure(
-            service_name,
-            station_name,
-            base_url,
-            status_code,
-            error_class.map(ToOwned::to_owned),
-            error,
-            now_ms(),
-        )
-        .await;
-}
-
 async fn effective_default_profile_name(
     state: &ProxyState,
     service_name: &str,
@@ -204,33 +163,7 @@ fn effective_active_station_name(mgr: &ServiceConfigManager) -> Option<String> {
 
 #[allow(dead_code)]
 fn lb_state_snapshot_json(lb: &LoadBalancer) -> Option<serde_json::Value> {
-    let map = match lb.states.lock() {
-        Ok(m) => m,
-        Err(e) => e.into_inner(),
-    };
-    let st = map.get(&lb.service.name)?;
-    let now = std::time::Instant::now();
-    let upstreams = (0..lb.service.upstreams.len())
-        .map(|idx| {
-            let cooldown_remaining_ms = st
-                .cooldown_until
-                .get(idx)
-                .and_then(|x| *x)
-                .map(|until| until.saturating_duration_since(now).as_millis() as u64)
-                .filter(|&ms| ms > 0);
-            serde_json::json!({
-                "idx": idx,
-                "failure_count": st.failure_counts.get(idx).copied(),
-                "penalty_streak": st.penalty_streak.get(idx).copied(),
-                "usage_exhausted": st.usage_exhausted.get(idx).copied(),
-                "cooldown_remaining_ms": cooldown_remaining_ms,
-            })
-        })
-        .collect::<Vec<_>>();
-    Some(serde_json::json!({
-        "last_good_index": st.last_good_index,
-        "upstreams": upstreams,
-    }))
+    passive_health::lb_state_snapshot_json(lb)
 }
 
 #[cfg(test)]
