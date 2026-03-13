@@ -30,6 +30,7 @@ mod retry;
 mod route_provenance;
 mod runtime_config;
 mod session_overrides;
+mod stations_api;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -99,6 +100,7 @@ use self::session_overrides::{
     set_session_reasoning_effort_override, set_session_service_tier_override,
     set_session_station_override,
 };
+use self::stations_api::{apply_station_runtime_meta, list_stations};
 use self::stream::{SseSuccessMeta, build_sse_success_response};
 
 pub const ADMIN_TOKEN_ENV_VAR: &str = "CODEX_HELPER_ADMIN_TOKEN";
@@ -2951,37 +2953,6 @@ pub async fn handle_proxy(
 
 pub fn router(proxy: ProxyService) -> Router {
     // In axum 0.8, wildcard segments use `/{*path}` (equivalent to `/*path` from axum 0.7).
-    #[derive(serde::Deserialize)]
-    struct StationRuntimeMetaRequest {
-        #[serde(default)]
-        station_name: Option<String>,
-        #[serde(default)]
-        enabled: Option<bool>,
-        #[serde(default)]
-        level: Option<u8>,
-        #[serde(default)]
-        clear_enabled: bool,
-        #[serde(default)]
-        clear_level: bool,
-        #[serde(default)]
-        runtime_state: Option<RuntimeConfigState>,
-        #[serde(default)]
-        clear_runtime_state: bool,
-    }
-
-    impl StationRuntimeMetaRequest {
-        fn target_name(&self) -> Result<&str, (StatusCode, String)> {
-            self.station_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .ok_or((
-                    StatusCode::BAD_REQUEST,
-                    "station_name is required".to_string(),
-                ))
-        }
-    }
-
     async fn runtime_config_status(
         proxy: ProxyService,
     ) -> Result<Json<RuntimeConfigStatus>, (StatusCode, String)> {
@@ -3039,115 +3010,6 @@ pub fn router(proxy: ProxyService) -> Router {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         Ok(())
-    }
-
-    async fn apply_station_runtime_meta(
-        proxy: ProxyService,
-        Json(payload): Json<StationRuntimeMetaRequest>,
-    ) -> Result<StatusCode, (StatusCode, String)> {
-        let station_name = payload.target_name()?.to_string();
-
-        if payload.enabled.is_none()
-            && payload.level.is_none()
-            && !payload.clear_enabled
-            && !payload.clear_level
-            && payload.runtime_state.is_none()
-            && !payload.clear_runtime_state
-        {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "at least one runtime station action must be provided".to_string(),
-            ));
-        }
-
-        let cfg = proxy.config.snapshot().await;
-        let mgr = match proxy.service_name {
-            "claude" => &cfg.claude,
-            _ => &cfg.codex,
-        };
-        if !mgr.contains_station(station_name.as_str()) {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("station '{}' not found", station_name),
-            ));
-        }
-
-        let now = now_ms();
-        if payload.clear_enabled {
-            proxy
-                .state
-                .clear_station_enabled_override(proxy.service_name, station_name.as_str())
-                .await;
-        } else if let Some(enabled) = payload.enabled {
-            proxy
-                .state
-                .set_station_enabled_override(
-                    proxy.service_name,
-                    station_name.clone(),
-                    enabled,
-                    now,
-                )
-                .await;
-        }
-
-        if payload.clear_level {
-            proxy
-                .state
-                .clear_station_level_override(proxy.service_name, station_name.as_str())
-                .await;
-        } else if let Some(level) = payload.level {
-            proxy
-                .state
-                .set_station_level_override(
-                    proxy.service_name,
-                    station_name.clone(),
-                    level.clamp(1, 10),
-                    now,
-                )
-                .await;
-        }
-
-        if payload.clear_runtime_state {
-            proxy
-                .state
-                .clear_station_runtime_state_override(proxy.service_name, station_name.as_str())
-                .await;
-        } else if let Some(runtime_state) = payload.runtime_state {
-            proxy
-                .state
-                .set_station_runtime_state_override(
-                    proxy.service_name,
-                    station_name.clone(),
-                    runtime_state,
-                    now,
-                )
-                .await;
-        }
-
-        Ok(StatusCode::NO_CONTENT)
-    }
-
-    async fn list_stations(
-        proxy: ProxyService,
-    ) -> Result<Json<Vec<crate::dashboard_core::StationOption>>, (StatusCode, String)> {
-        let cfg = proxy.config.snapshot().await;
-        let mgr = match proxy.service_name {
-            "claude" => &cfg.claude,
-            _ => &cfg.codex,
-        };
-        let meta_overrides = proxy
-            .state
-            .get_station_meta_overrides(proxy.service_name)
-            .await;
-        let state_overrides = proxy
-            .state
-            .get_station_runtime_state_overrides(proxy.service_name)
-            .await;
-        Ok(Json(crate::dashboard_core::build_station_options_from_mgr(
-            mgr,
-            &meta_overrides,
-            &state_overrides,
-        )))
     }
 
     let admin_access = AdminAccessConfig::from_env();
