@@ -28,6 +28,7 @@ mod profile_defaults;
 mod request_body;
 mod retry;
 mod route_provenance;
+mod runtime_admin_api;
 mod runtime_config;
 mod session_overrides;
 mod stations_api;
@@ -54,10 +55,6 @@ use self::admin::{
 pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
-};
-use self::api_responses::{
-    ProfilesResponse, ReloadResult, RetryConfigResponse, RuntimeConfigStatus, build_reload_result,
-    build_retry_config_response, build_runtime_config_status, make_profiles_response,
 };
 use self::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
 use self::classify::{class_is_health_neutral, classify_upstream_response};
@@ -92,6 +89,9 @@ use self::retry::{
     should_retry_class, should_retry_status,
 };
 use self::route_provenance::build_route_decision_provenance;
+use self::runtime_admin_api::{
+    get_retry_config, list_profiles, reload_runtime_config, runtime_config_status, set_retry_config,
+};
 use self::runtime_config::RuntimeConfig;
 use self::session_overrides::{
     apply_session_manual_overrides, list_session_manual_overrides, list_session_model_overrides,
@@ -2953,65 +2953,6 @@ pub async fn handle_proxy(
 
 pub fn router(proxy: ProxyService) -> Router {
     // In axum 0.8, wildcard segments use `/{*path}` (equivalent to `/*path` from axum 0.7).
-    async fn runtime_config_status(
-        proxy: ProxyService,
-    ) -> Result<Json<RuntimeConfigStatus>, (StatusCode, String)> {
-        Ok(Json(build_runtime_config_status(&proxy).await))
-    }
-
-    async fn get_retry_config(
-        proxy: ProxyService,
-    ) -> Result<Json<RetryConfigResponse>, (StatusCode, String)> {
-        let cfg = proxy.config.snapshot().await;
-        Ok(Json(build_retry_config_response(cfg.as_ref())))
-    }
-
-    async fn set_retry_config(
-        proxy: ProxyService,
-        Json(payload): Json<crate::config::RetryConfig>,
-    ) -> Result<Json<RetryConfigResponse>, (StatusCode, String)> {
-        let cfg_snapshot = proxy.config.snapshot().await;
-        let mut cfg = cfg_snapshot.as_ref().clone();
-        cfg.retry = payload;
-
-        save_proxy_config_and_reload(&proxy, cfg).await?;
-        let cfg = proxy.config.snapshot().await;
-        Ok(Json(build_retry_config_response(cfg.as_ref())))
-    }
-
-    async fn reload_runtime_config(
-        proxy: ProxyService,
-    ) -> Result<Json<ReloadResult>, (StatusCode, String)> {
-        let changed = proxy
-            .config
-            .force_reload_from_disk()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let status = build_runtime_config_status(&proxy).await;
-        Ok(Json(build_reload_result(changed, status)))
-    }
-
-    async fn list_profiles(
-        proxy: ProxyService,
-    ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
-        Ok(Json(make_profiles_response(&proxy).await))
-    }
-
-    async fn save_proxy_config_and_reload(
-        proxy: &ProxyService,
-        cfg: crate::config::ProxyConfig,
-    ) -> Result<(), (StatusCode, String)> {
-        crate::config::save_config(&cfg)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        proxy
-            .config
-            .force_reload_from_disk()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        Ok(())
-    }
-
     let admin_access = AdminAccessConfig::from_env();
 
     let p2 = proxy.clone();
