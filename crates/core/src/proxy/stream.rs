@@ -15,12 +15,12 @@ use crate::logging::{
 use crate::state::ProxyState;
 use crate::usage_providers;
 
+use super::ProxyService;
 use super::classify::classify_upstream_response;
+use super::headers::header_map_to_entries;
+use super::http_debug::{HttpDebugBase, warn_http_debug};
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
-use super::{
-    HttpDebugBase, ProxyService, header_map_to_entries,
-    scan_service_tier_from_sse_bytes_incremental, warn_http_debug,
-};
+use super::request_body::scan_service_tier_from_sse_bytes_incremental;
 
 fn stream_buffer_max_bytes() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();

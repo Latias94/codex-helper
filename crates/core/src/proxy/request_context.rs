@@ -10,6 +10,7 @@ use crate::state::SessionBinding;
 
 use super::ProxyService;
 use super::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
+use super::headers::header_map_to_entries;
 use super::request_failures::{log_client_body_read_error, log_no_routable_station};
 use super::request_preparation::{
     RequestFlavor, build_body_previews, detect_request_flavor, prepare_request_body,
@@ -81,7 +82,7 @@ pub(super) async fn prepare_proxy_request(
     if lbs.is_empty() {
         let dur = start.elapsed().as_millis() as u64;
         let client_headers_entries = client_headers_entries_cache
-            .get_or_init(|| super::header_map_to_entries(&client_headers))
+            .get_or_init(|| header_map_to_entries(&client_headers))
             .clone();
         return Err(log_no_routable_station(
             proxy,
@@ -109,7 +110,7 @@ pub(super) async fn prepare_proxy_request(
         Err(error) => {
             let dur = start.elapsed().as_millis() as u64;
             let client_headers_entries = client_headers_entries_cache
-                .get_or_init(|| super::header_map_to_entries(&client_headers))
+                .get_or_init(|| header_map_to_entries(&client_headers))
                 .clone();
             return Err(log_client_body_read_error(
                 proxy,

@@ -1,13 +1,30 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::{ProxyConfig, ServiceConfigManager};
 use crate::lb::LoadBalancer;
 use crate::logging::log_retry_trace;
+use crate::state::RuntimeConfigState;
 
-use super::{
-    ProxyService, effective_runtime_config_state, runtime_state_allows_general_routing,
-    runtime_state_allows_pinned_routing,
-};
+use super::ProxyService;
+
+fn effective_runtime_config_state(
+    state_overrides: &HashMap<String, RuntimeConfigState>,
+    station_name: &str,
+) -> RuntimeConfigState {
+    state_overrides
+        .get(station_name)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn runtime_state_allows_general_routing(state: RuntimeConfigState) -> bool {
+    state == RuntimeConfigState::Normal
+}
+
+fn runtime_state_allows_pinned_routing(state: RuntimeConfigState) -> bool {
+    state != RuntimeConfigState::BreakerOpen
+}
 
 impl ProxyService {
     pub(super) async fn pinned_config(

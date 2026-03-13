@@ -8,7 +8,9 @@ use crate::lb::{CooldownBackoff, LoadBalancer, SelectedUpstream};
 use crate::logging::ServiceTierLog;
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
 
+use super::ProxyService;
 use super::classify::{class_is_health_neutral, classify_upstream_response};
+use super::http_debug::HttpDebugBase;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::request_body::extract_service_tier_from_response_body;
 use super::response_finalization::{
@@ -19,7 +21,6 @@ use super::retry::{
     should_retry_class, should_retry_status,
 };
 use super::stream::{SseSuccessMeta, build_sse_success_response};
-use super::{HttpDebugBase, ProxyService};
 
 pub(super) enum AttemptResponseOutcome {
     RetrySameUpstream,

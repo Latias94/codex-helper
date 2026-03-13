@@ -49,6 +49,7 @@ pub(super) async fn record_passive_upstream_failure(
         .await;
 }
 
+#[allow(dead_code)]
 pub(super) fn lb_state_snapshot_json(lb: &LoadBalancer) -> Option<serde_json::Value> {
     let map = match lb.states.lock() {
         Ok(guard) => guard,

@@ -5,12 +5,10 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use crate::config::UpstreamAuth;
 use crate::logging::{BodyPreview, HeaderEntry};
 
-use super::{
-    HttpDebugBase, ProxyService,
-    auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source},
-    header_map_to_entries,
-    headers::filter_request_headers,
-};
+use super::ProxyService;
+use super::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
+use super::headers::{filter_request_headers, header_map_to_entries};
+use super::http_debug::HttpDebugBase;
 
 pub(super) struct AttemptRequestSetup {
     pub(super) headers: HeaderMap,
