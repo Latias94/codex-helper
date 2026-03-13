@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -7,7 +6,7 @@ use anyhow::{Result, anyhow};
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::{ConnectInfo, Path, Query};
+use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::middleware;
 use axum::routing::{any, get, post, put};
@@ -18,6 +17,7 @@ use tracing::instrument;
 mod admin;
 mod auth_resolution;
 mod classify;
+mod client_identity;
 mod headers;
 mod http_debug;
 mod request_body;
@@ -54,6 +54,7 @@ pub use self::admin::{
 };
 use self::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
 use self::classify::{class_is_health_neutral, classify_upstream_response};
+use self::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
 use self::headers::{filter_request_headers, filter_response_headers};
 use self::http_debug::format_reqwest_error_for_retry_chain;
 use self::request_body::{
@@ -677,45 +678,6 @@ impl ProxyService {
     pub fn state_handle(&self) -> Arc<ProxyState> {
         self.state.clone()
     }
-}
-
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|v| v.to_str().ok())
-}
-
-fn extract_session_id(headers: &HeaderMap) -> Option<String> {
-    header_str(headers, "session_id")
-        .or_else(|| header_str(headers, "conversation_id"))
-        .map(|s| s.to_string())
-}
-
-fn normalize_client_identity_value(value: &str, max_chars: usize) -> Option<String> {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut out = trimmed.to_string();
-    if out.chars().count() > max_chars {
-        out = out.chars().take(max_chars).collect::<String>();
-    }
-    Some(out)
-}
-
-fn extract_client_name(headers: &HeaderMap) -> Option<String> {
-    header_str(headers, CLIENT_NAME_HEADER)
-        .and_then(|value| normalize_client_identity_value(value, 80))
-        .or_else(|| {
-            header_str(headers, "user-agent")
-                .and_then(|value| normalize_client_identity_value(value, 120))
-        })
-}
-
-fn extract_client_addr(extensions: &axum::http::Extensions) -> Option<String> {
-    extensions
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|info| info.0.ip().to_string())
-        .and_then(|value| normalize_client_identity_value(value.as_str(), 64))
 }
 
 pub(super) fn scan_service_tier_from_sse_bytes_incremental(
