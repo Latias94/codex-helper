@@ -30,12 +30,15 @@ use crate::dashboard_core::{
 use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
-    AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, http_debug_options,
-    http_warn_options, log_request_with_debug, log_retry_trace, make_body_preview,
+    AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, ServiceTierLog, http_debug_options,
+    http_warn_options, log_request_with_debug, log_retry_trace, make_body_preview, now_ms,
     should_include_http_warn, should_log_request_body_preview,
 };
 use crate::model_routing;
-use crate::state::{ActiveRequest, FinishedRequest, ProxyState, RuntimeConfigState};
+use crate::state::{
+    ActiveRequest, FinishedRequest, ProxyState, ResolvedRouteValue, RouteDecisionProvenance,
+    RouteValueSource, RuntimeConfigState,
+};
 use crate::usage::extract_usage_from_bytes;
 
 use self::classify::{class_is_health_neutral, classify_upstream_response};
@@ -58,12 +61,204 @@ const AUTH_FILE_CACHE_MIN_CHECK_INTERVAL: Duration = Duration::from_millis(800);
 
 fn effective_runtime_config_state(
     state_overrides: &HashMap<String, RuntimeConfigState>,
-    config_name: &str,
+    station_name: &str,
 ) -> RuntimeConfigState {
     state_overrides
-        .get(config_name)
+        .get(station_name)
         .copied()
         .unwrap_or_default()
+}
+
+fn runtime_state_allows_general_routing(state: RuntimeConfigState) -> bool {
+    state == RuntimeConfigState::Normal
+}
+
+fn runtime_state_allows_pinned_routing(state: RuntimeConfigState) -> bool {
+    state != RuntimeConfigState::BreakerOpen
+}
+
+fn sorted_avoid_indices(avoid: &HashSet<usize>) -> Vec<usize> {
+    let mut indices = avoid.iter().copied().collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices
+}
+
+fn log_same_station_failover_trace(
+    service_name: &str,
+    request_id: u64,
+    station_name: &str,
+    upstream_total: usize,
+    avoid_set: &HashSet<usize>,
+    exhausted: bool,
+) {
+    let event = if exhausted {
+        "same_station_exhausted"
+    } else {
+        "same_station_failover"
+    };
+    log_retry_trace(serde_json::json!({
+        "event": event,
+        "service": service_name,
+        "request_id": request_id,
+        "station_name": station_name,
+        "upstream_total": upstream_total,
+        "avoided_indices": sorted_avoid_indices(avoid_set),
+        "next_action": if exhausted {
+            "consider_next_station"
+        } else {
+            "retry_another_upstream_within_station"
+        },
+    }));
+}
+
+fn trim_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_request_field_provenance(
+    request_value: Option<&str>,
+    override_value: Option<&str>,
+    binding_value: Option<&str>,
+) -> Option<ResolvedRouteValue> {
+    if let Some(value) = trim_non_empty(override_value) {
+        return Some(ResolvedRouteValue::new(
+            value,
+            RouteValueSource::SessionOverride,
+        ));
+    }
+    if let Some(value) = trim_non_empty(binding_value) {
+        return Some(ResolvedRouteValue::new(
+            value,
+            RouteValueSource::ProfileDefault,
+        ));
+    }
+    trim_non_empty(request_value)
+        .map(|value| ResolvedRouteValue::new(value, RouteValueSource::RequestPayload))
+}
+
+fn resolve_station_provenance(
+    selected_station_name: &str,
+    session_override_config: Option<&str>,
+    global_config_override: Option<&str>,
+    binding_station_name: Option<&str>,
+) -> ResolvedRouteValue {
+    if let Some(value) = trim_non_empty(session_override_config) {
+        return ResolvedRouteValue::new(value, RouteValueSource::SessionOverride);
+    }
+    if let Some(value) = trim_non_empty(global_config_override) {
+        return ResolvedRouteValue::new(value, RouteValueSource::GlobalOverride);
+    }
+    if let Some(value) = trim_non_empty(binding_station_name) {
+        return ResolvedRouteValue::new(value, RouteValueSource::ProfileDefault);
+    }
+    ResolvedRouteValue::new(
+        selected_station_name.to_string(),
+        RouteValueSource::RuntimeFallback,
+    )
+}
+
+fn build_route_decision_provenance(
+    decided_at_ms: u64,
+    session_binding: Option<&crate::state::SessionBinding>,
+    session_override_config: Option<&str>,
+    global_config_override: Option<&str>,
+    override_model: Option<&str>,
+    override_effort: Option<&str>,
+    override_service_tier: Option<&str>,
+    request_model: Option<&str>,
+    effective_effort: Option<&str>,
+    effective_service_tier: Option<&str>,
+    selected: &SelectedUpstream,
+    provider_id: Option<&str>,
+) -> RouteDecisionProvenance {
+    let mut effective_model = resolve_request_field_provenance(
+        request_model,
+        override_model,
+        session_binding.and_then(|binding| binding.model.as_deref()),
+    );
+    if let Some(current) = effective_model.as_mut() {
+        let mapped = model_routing::effective_model(
+            &selected.upstream.model_mapping,
+            current.value.as_str(),
+        );
+        if mapped != current.value {
+            *current = ResolvedRouteValue::new(mapped, RouteValueSource::StationMapping);
+        }
+    }
+
+    RouteDecisionProvenance {
+        decided_at_ms,
+        binding_profile_name: session_binding.and_then(|binding| binding.profile_name.clone()),
+        binding_continuity_mode: session_binding.map(|binding| binding.continuity_mode),
+        effective_model,
+        effective_reasoning_effort: resolve_request_field_provenance(
+            effective_effort,
+            override_effort,
+            session_binding.and_then(|binding| binding.reasoning_effort.as_deref()),
+        ),
+        effective_service_tier: resolve_request_field_provenance(
+            effective_service_tier,
+            override_service_tier,
+            session_binding.and_then(|binding| binding.service_tier.as_deref()),
+        ),
+        effective_station: Some(resolve_station_provenance(
+            selected.station_name.as_str(),
+            session_override_config,
+            global_config_override,
+            session_binding.and_then(|binding| binding.station_name.as_deref()),
+        )),
+        effective_upstream_base_url: Some(ResolvedRouteValue::new(
+            selected.upstream.base_url.clone(),
+            RouteValueSource::RuntimeFallback,
+        )),
+        provider_id: trim_non_empty(provider_id),
+    }
+}
+
+pub(super) async fn record_passive_upstream_success(
+    state: &ProxyState,
+    service_name: &str,
+    station_name: &str,
+    base_url: &str,
+    status_code: u16,
+) {
+    state
+        .record_passive_upstream_success(
+            service_name,
+            station_name,
+            base_url,
+            Some(status_code),
+            now_ms(),
+        )
+        .await;
+}
+
+pub(super) async fn record_passive_upstream_failure(
+    state: &ProxyState,
+    service_name: &str,
+    station_name: &str,
+    base_url: &str,
+    status_code: Option<u16>,
+    error_class: Option<&str>,
+    error: Option<String>,
+) {
+    if class_is_health_neutral(error_class) {
+        return;
+    }
+    state
+        .record_passive_upstream_failure(
+            service_name,
+            station_name,
+            base_url,
+            status_code,
+            error_class.map(ToOwned::to_owned),
+            error,
+            now_ms(),
+        )
+        .await;
 }
 
 async fn effective_default_profile_name(
@@ -658,7 +853,7 @@ impl ProxyService {
 
         let profile_name =
             effective_default_profile_name(self.state.as_ref(), self.service_name, mgr).await?;
-        let profile = mgr.profile(profile_name.as_str())?;
+        let profile = crate::config::resolve_service_profile(mgr, profile_name.as_str()).ok()?;
         let binding = crate::state::SessionBinding {
             session_id: session_id.to_string(),
             profile_name: Some(profile_name),
@@ -681,12 +876,12 @@ impl ProxyService {
         session_id: Option<&str>,
     ) -> Option<(String, &'static str)> {
         if let Some(sid) = session_id
-            && let Some(name) = self.state.get_session_config_override(sid).await
+            && let Some(name) = self.state.get_session_station_override(sid).await
             && !name.trim().is_empty()
         {
             return Some((name, "session"));
         }
-        if let Some(name) = self.state.get_global_config_override().await
+        if let Some(name) = self.state.get_global_station_override().await
             && !name.trim().is_empty()
         {
             return Some((name, "global"));
@@ -710,15 +905,15 @@ impl ProxyService {
         let mgr = self.service_manager(cfg);
         let meta_overrides = self
             .state
-            .get_config_meta_overrides(self.service_name)
+            .get_station_meta_overrides(self.service_name)
             .await;
         let state_overrides = self
             .state
-            .get_config_runtime_state_overrides(self.service_name)
+            .get_station_runtime_state_overrides(self.service_name)
             .await;
         if let Some((name, source)) = self.pinned_config(mgr, session_id).await {
             let runtime_state = effective_runtime_config_state(&state_overrides, name.as_str());
-            if runtime_state == RuntimeConfigState::BreakerOpen {
+            if !runtime_state_allows_pinned_routing(runtime_state) {
                 log_retry_trace(serde_json::json!({
                     "event": "lbs_for_request",
                     "service": self.service_name,
@@ -727,8 +922,8 @@ impl ProxyService {
                     "pinned_source": source,
                     "pinned_name": name,
                     "runtime_state": "breaker_open",
-                    "active_config": mgr.active.as_deref(),
-                    "config_count": mgr.configs.len(),
+                    "active_station": mgr.active.as_deref(),
+                    "station_count": mgr.configs.len(),
                 }));
                 return Vec::new();
             }
@@ -746,11 +941,11 @@ impl ProxyService {
                     "pinned_source": source,
                     "pinned_name": name,
                     "runtime_state": format!("{runtime_state:?}").to_ascii_lowercase(),
-                    "selected_config": svc.name,
+                    "selected_station": svc.name,
                     "selected_level": svc.level.clamp(1, 10),
                     "selected_upstreams": svc.upstreams.len(),
-                    "active_config": mgr.active.as_deref(),
-                    "config_count": mgr.configs.len(),
+                    "active_station": mgr.active.as_deref(),
+                    "station_count": mgr.configs.len(),
                 }));
                 return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
             }
@@ -761,10 +956,10 @@ impl ProxyService {
                 "mode": "pinned",
                 "pinned_source": source,
                 "pinned_name": name,
-                "selected_config": null,
-                "active_config": mgr.active.as_deref(),
-                "config_count": mgr.configs.len(),
-                "note": "pinned_config_not_found",
+                "selected_station": null,
+                "active_station": mgr.active.as_deref(),
+                "station_count": mgr.configs.len(),
+                "note": "pinned_station_not_found",
             }));
             return Vec::new();
         }
@@ -781,7 +976,7 @@ impl ProxyService {
                 let enabled = enabled_ovr.unwrap_or(svc.enabled);
                 let runtime_state = effective_runtime_config_state(&state_overrides, name.as_str());
                 !svc.upstreams.is_empty()
-                    && runtime_state == RuntimeConfigState::Normal
+                    && runtime_state_allows_general_routing(runtime_state)
                     && (enabled || active_name.is_some_and(|n| n == name.as_str()))
             })
             .collect::<Vec<_>>();
@@ -848,26 +1043,35 @@ impl ProxyService {
                     "service": self.service_name,
                     "session_id": session_id,
                     "mode": "single_level_multi",
-                    "active_config": active_name,
-                    "selected_configs": lbs.iter().map(|lb| lb.service.name.clone()).collect::<Vec<_>>(),
-                    "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                    "active_station": active_name,
+                    "selected_stations": lbs.iter().map(|lb| lb.service.name.clone()).collect::<Vec<_>>(),
+                    "eligible_stations": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
                     "eligible_details": eligible_details(),
                     "eligible_count": configs.len(),
                 }));
                 return lbs;
             }
 
-            if let Some(svc) = mgr.active_config().cloned() {
+            if let Some(svc) = mgr
+                .active_config()
+                .filter(|svc| {
+                    runtime_state_allows_general_routing(effective_runtime_config_state(
+                        &state_overrides,
+                        svc.name.as_str(),
+                    ))
+                })
+                .cloned()
+            {
                 log_retry_trace(serde_json::json!({
                     "event": "lbs_for_request",
                     "service": self.service_name,
                     "session_id": session_id,
-                    "mode": "single_level_fallback_active_config",
-                    "active_config": active_name,
-                    "selected_config": svc.name,
+                    "mode": "single_level_fallback_active_station",
+                    "active_station": active_name,
+                    "selected_station": svc.name,
                     "selected_level": svc.level.clamp(1, 10),
                     "selected_upstreams": svc.upstreams.len(),
-                    "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                    "eligible_stations": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
                     "eligible_details": eligible_details(),
                     "eligible_count": configs.len(),
                 }));
@@ -879,8 +1083,8 @@ impl ProxyService {
                 "service": self.service_name,
                 "session_id": session_id,
                 "mode": "single_level_empty",
-                "active_config": active_name,
-                "eligible_configs": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                "active_station": active_name,
+                "eligible_stations": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
                 "eligible_details": eligible_details(),
                 "eligible_count": configs.len(),
             }));
@@ -916,8 +1120,8 @@ impl ProxyService {
                 "service": self.service_name,
                 "session_id": session_id,
                 "mode": "multi_level",
-                "active_config": active_name,
-                "eligible_configs": lbs.iter().map(|lb| serde_json::json!({
+                "active_station": active_name,
+                "eligible_stations": lbs.iter().map(|lb| serde_json::json!({
                     "name": lb.service.name,
                     "level": lb.service.level.clamp(1, 10),
                     "upstreams": lb.service.upstreams.len(),
@@ -927,14 +1131,23 @@ impl ProxyService {
             return lbs;
         }
 
-        if let Some(svc) = mgr.active_config().cloned() {
+        if let Some(svc) = mgr
+            .active_config()
+            .filter(|svc| {
+                runtime_state_allows_general_routing(effective_runtime_config_state(
+                    &state_overrides,
+                    svc.name.as_str(),
+                ))
+            })
+            .cloned()
+        {
             log_retry_trace(serde_json::json!({
                 "event": "lbs_for_request",
                 "service": self.service_name,
                 "session_id": session_id,
-                "mode": "multi_level_fallback_active_config",
-                "active_config": active_name,
-                "selected_config": svc.name,
+                "mode": "multi_level_fallback_active_station",
+                "active_station": active_name,
+                "selected_station": svc.name,
                 "selected_level": svc.level.clamp(1, 10),
                 "selected_upstreams": svc.upstreams.len(),
             }));
@@ -945,7 +1158,7 @@ impl ProxyService {
             "service": self.service_name,
             "session_id": session_id,
             "mode": "multi_level_empty",
-            "active_config": active_name,
+            "active_station": active_name,
         }));
         Vec::new()
     }
@@ -1059,6 +1272,68 @@ fn extract_service_tier_from_request_body(body: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn extract_service_tier_from_response_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("service_tier")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("service_tier"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.to_string())
+}
+
+pub(super) fn extract_service_tier_from_response_body(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    extract_service_tier_from_response_value(&value)
+}
+
+pub(super) fn scan_service_tier_from_sse_bytes_incremental(
+    data: &[u8],
+    scan_pos: &mut usize,
+    last: &mut Option<String>,
+) {
+    let mut i = (*scan_pos).min(data.len());
+
+    while i < data.len() {
+        let Some(rel_end) = data[i..].iter().position(|b| *b == b'\n') else {
+            break;
+        };
+        let end = i + rel_end;
+        let mut line = &data[i..end];
+        i = end.saturating_add(1);
+
+        if line.ends_with(b"\r") {
+            line = &line[..line.len().saturating_sub(1)];
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        const DATA_PREFIX: &[u8] = b"data:";
+        if !line.starts_with(DATA_PREFIX) {
+            continue;
+        }
+        let mut payload = &line[DATA_PREFIX.len()..];
+        while !payload.is_empty() && payload[0].is_ascii_whitespace() {
+            payload = &payload[1..];
+        }
+        if payload.is_empty() || payload == b"[DONE]" {
+            continue;
+        }
+
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload)
+            && let Some(service_tier) = extract_service_tier_from_response_value(&value)
+        {
+            *last = Some(service_tier);
+        }
+    }
+
+    *scan_pos = i;
+}
+
 fn apply_reasoning_effort_override(body: &[u8], effort: &str) -> Option<Vec<u8>> {
     let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let reasoning = v.get_mut("reasoning").and_then(|r| r.as_object_mut());
@@ -1144,9 +1419,10 @@ pub async fn handle_proxy(
                 upstream_headers_ms: None,
                 upstream_first_chunk_ms: None,
                 upstream_body_read_ms: None,
-                upstream_error_class: Some("no_active_upstream_config".to_string()),
+                upstream_error_class: Some("no_routable_station".to_string()),
                 upstream_error_hint: Some(
-                    "未找到任何可用的上游配置（active_config 为空或 upstreams 为空）。".to_string(),
+                    "未找到任何可用的上游站点（active_station 未设置，或目标站点没有可用 upstream）。"
+                        .to_string(),
                 ),
                 upstream_cf_ray: None,
                 client_uri: uri.to_string(),
@@ -1158,7 +1434,7 @@ pub async fn handle_proxy(
                 upstream_request_body: None,
                 upstream_response_headers: None,
                 upstream_response_body: None,
-                upstream_error: Some("no active upstream config".to_string()),
+                upstream_error: Some("no routable station".to_string()),
             })
         } else {
             None
@@ -1176,11 +1452,12 @@ pub async fn handle_proxy(
             session_id.clone(),
             None,
             None,
+            ServiceTierLog::default(),
             None,
             None,
             http_debug,
         );
-        return Err((status, "no active upstream config".to_string()));
+        return Err((status, "no routable station".to_string()));
     }
     let client_content_type = client_headers
         .get("content-type")
@@ -1207,7 +1484,7 @@ pub async fn handle_proxy(
         proxy.state.touch_session_override(id, started_at_ms).await;
         proxy
             .state
-            .touch_session_config_override(id, started_at_ms)
+            .touch_session_station_override(id, started_at_ms)
             .await;
         proxy
             .state
@@ -1219,6 +1496,12 @@ pub async fn handle_proxy(
             .await;
         proxy.state.touch_session_binding(id, started_at_ms).await;
     }
+    let session_override_config = if let Some(id) = session_id.as_deref() {
+        proxy.state.get_session_station_override(id).await
+    } else {
+        None
+    };
+    let global_station_override = proxy.state.get_global_station_override().await;
 
     // Read request body and apply filters.
     let raw_body = match to_bytes(body, 10 * 1024 * 1024).await {
@@ -1269,6 +1552,7 @@ pub async fn handle_proxy(
                 session_id.clone(),
                 cwd.clone(),
                 None,
+                ServiceTierLog::default(),
                 None,
                 None,
                 http_debug,
@@ -1285,27 +1569,20 @@ pub async fn handle_proxy(
     let binding_effort = session_binding
         .as_ref()
         .and_then(|binding| binding.reasoning_effort.as_deref());
-    let mut body_for_upstream = match (override_effort.as_deref(), original_effort.as_deref()) {
+    let mut body_for_upstream = match (override_effort.as_deref(), binding_effort) {
         (Some(effort), _) => Bytes::from(
             apply_reasoning_effort_override(&raw_body, effort)
                 .unwrap_or_else(|| raw_body.as_ref().to_vec()),
         ),
-        (None, None) => {
-            if let Some(effort) = binding_effort {
-                Bytes::from(
-                    apply_reasoning_effort_override(&raw_body, effort)
-                        .unwrap_or_else(|| raw_body.as_ref().to_vec()),
-                )
-            } else {
-                raw_body.clone()
-            }
-        }
-        (None, Some(_)) => raw_body.clone(),
+        (None, Some(effort)) => Bytes::from(
+            apply_reasoning_effort_override(&raw_body, effort)
+                .unwrap_or_else(|| raw_body.as_ref().to_vec()),
+        ),
+        (None, None) => raw_body.clone(),
     };
     let effective_effort = extract_reasoning_effort_from_request_body(body_for_upstream.as_ref())
         .or(original_effort.clone());
 
-    let original_model = extract_model_from_request_body(&raw_body);
     let override_model = if let Some(id) = session_id.as_deref() {
         proxy.state.get_session_model_override(id).await
     } else {
@@ -1319,9 +1596,7 @@ pub async fn handle_proxy(
             apply_model_override(body_for_upstream.as_ref(), model)
                 .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
         );
-    } else if original_model.is_none()
-        && let Some(model) = binding_model
-    {
+    } else if let Some(model) = binding_model {
         body_for_upstream = Bytes::from(
             apply_model_override(body_for_upstream.as_ref(), model)
                 .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
@@ -1342,9 +1617,7 @@ pub async fn handle_proxy(
             apply_service_tier_override(body_for_upstream.as_ref(), service_tier)
                 .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
         );
-    } else if original_service_tier.is_none()
-        && let Some(service_tier) = binding_service_tier
-    {
+    } else if let Some(service_tier) = binding_service_tier {
         body_for_upstream = Bytes::from(
             apply_service_tier_override(body_for_upstream.as_ref(), service_tier)
                 .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
@@ -1354,6 +1627,11 @@ pub async fn handle_proxy(
     let request_model = extract_model_from_request_body(body_for_upstream.as_ref());
     let effective_service_tier = extract_service_tier_from_request_body(body_for_upstream.as_ref())
         .or(original_service_tier.clone());
+    let base_service_tier = ServiceTierLog {
+        requested: original_service_tier.clone(),
+        effective: effective_service_tier.clone(),
+        actual: None,
+    };
     let request_body_len = raw_body.len();
 
     let debug_opt = http_debug_options();
@@ -1434,6 +1712,7 @@ pub async fn handle_proxy(
         "transport_cooldown_secs": plan.transport_cooldown_secs,
         "cooldown_backoff_factor": plan.cooldown_backoff_factor,
         "cooldown_backoff_max_secs": plan.cooldown_backoff_max_secs,
+        "allow_cross_station_before_first_output": plan.allow_cross_station_before_first_output,
     }));
     let total_upstreams = lbs
         .iter()
@@ -1450,16 +1729,24 @@ pub async fn handle_proxy(
     // fail over to another provider/config when eligible.
     //
     // Guardrails: never_on_status / never_on_class prevent amplifying obvious client-side mistakes.
-    let mut tried_configs: HashSet<String> = HashSet::new();
+    let mut tried_stations: HashSet<String> = HashSet::new();
     let strict_multi_config = lbs.len() > 1;
+    let cross_station_failover_enabled = strict_multi_config
+        && plan.allow_cross_station_before_first_output
+        && provider_opt.strategy == RetryStrategy::Failover;
+    let provider_attempt_limit = if cross_station_failover_enabled {
+        provider_opt.max_attempts
+    } else {
+        1
+    };
     let mut global_attempt: u32 = 0;
     let mut last_err: Option<(StatusCode, String)> = None;
 
-    for provider_attempt in 0..provider_opt.max_attempts {
-        // Pick the next provider/config in the precomputed order, skipping ones we've already tried.
+    for provider_attempt in 0..provider_attempt_limit {
+        // Pick the next station in the precomputed order, skipping ones we've already tried.
         let mut provider_lb: Option<LoadBalancer> = None;
         for lb in &lbs {
-            if tried_configs.contains(&lb.service.name) {
+            if tried_stations.contains(&lb.service.name) {
                 continue;
             }
             provider_lb = Some(lb.clone());
@@ -1468,17 +1755,26 @@ pub async fn handle_proxy(
         let Some(lb) = provider_lb else {
             break;
         };
-        let config_name = lb.service.name.clone();
+        let station_name = lb.service.name.clone();
 
-        // Try all upstreams under this provider/config (respecting in-request avoid set).
+        // Try all upstreams under this station first. Cross-station failover is only
+        // considered after the current station has no remaining eligible upstreams.
         'upstreams: loop {
-            let avoid_set = avoid.entry(config_name.clone()).or_default();
+            let avoid_set = avoid.entry(station_name.clone()).or_default();
             let upstream_total = lb.service.upstreams.len();
             if upstream_total > 0 && avoid_set.len() >= upstream_total {
+                log_same_station_failover_trace(
+                    proxy.service_name,
+                    request_id,
+                    station_name.as_str(),
+                    upstream_total,
+                    avoid_set,
+                    true,
+                );
                 break 'upstreams;
             }
 
-            // Select an eligible upstream inside this provider/config (skip unsupported models).
+            // Select an eligible upstream inside this station (skip unsupported models).
             let selected = loop {
                 let upstream_total = lb.service.upstreams.len();
                 if upstream_total > 0 && avoid_set.len() >= upstream_total {
@@ -1505,7 +1801,7 @@ pub async fn handle_proxy(
                     if !supported {
                         upstream_chain.push(format!(
                             "{}:{} (idx={}) skipped_unsupported_model={}",
-                            selected.config_name,
+                            selected.station_name,
                             selected.upstream.base_url,
                             selected.index,
                             requested_model
@@ -1542,6 +1838,21 @@ pub async fn handle_proxy(
                     model_note = requested_model.clone();
                 }
             }
+            let provider_id = selected.upstream.tags.get("provider_id").cloned();
+            let route_decision = build_route_decision_provenance(
+                now_ms(),
+                session_binding.as_ref(),
+                session_override_config.as_deref(),
+                global_station_override.as_deref(),
+                override_model.as_deref(),
+                override_effort.as_deref(),
+                override_service_tier.as_deref(),
+                request_model.as_deref(),
+                effective_effort.as_deref(),
+                effective_service_tier.as_deref(),
+                &selected,
+                provider_id.as_deref(),
+            );
 
             let filtered_body = proxy.filter.apply_bytes(body_for_selected);
             let upstream_request_body_len = filtered_body.len();
@@ -1567,9 +1878,8 @@ pub async fn handle_proxy(
             // Layer 1: retry the same upstream a small number of times.
             for upstream_attempt in 0..upstream_opt.max_attempts {
                 global_attempt = global_attempt.saturating_add(1);
-                let provider_id = selected.upstream.tags.get("provider_id").cloned();
-                let mut avoid_for_config = avoid_set.iter().copied().collect::<Vec<_>>();
-                avoid_for_config.sort_unstable();
+                let mut avoid_for_station = avoid_set.iter().copied().collect::<Vec<_>>();
+                avoid_for_station.sort_unstable();
 
                 log_retry_trace(serde_json::json!({
                     "event": "attempt_select",
@@ -1580,11 +1890,11 @@ pub async fn handle_proxy(
                     "upstream_attempt": upstream_attempt + 1,
                     "provider_max_attempts": provider_opt.max_attempts,
                     "upstream_max_attempts": upstream_opt.max_attempts,
-                    "config_name": selected.config_name.as_str(),
+                    "station_name": selected.station_name.as_str(),
                     "upstream_index": selected.index,
                     "upstream_base_url": selected.upstream.base_url.as_str(),
                     "provider_id": provider_id.as_deref(),
-                    "avoid_for_config": avoid_for_config,
+                    "avoid_for_station": avoid_for_station,
                     "avoided_total": avoided_total,
                     "total_upstreams": total_upstreams,
                     "model": model_note.as_str(),
@@ -1596,12 +1906,22 @@ pub async fn handle_proxy(
                         let err_str = e.to_string();
                         upstream_chain.push(format!(
                             "{}:{} (idx={}) target_build_error={} model={}",
-                            selected.config_name,
+                            selected.station_name,
                             selected.upstream.base_url,
                             selected.index,
                             err_str,
                             model_note.as_str()
                         ));
+                        record_passive_upstream_failure(
+                            proxy.state.as_ref(),
+                            proxy.service_name,
+                            &selected.station_name,
+                            &selected.upstream.base_url,
+                            Some(StatusCode::BAD_GATEWAY.as_u16()),
+                            Some("target_build_error"),
+                            Some(err_str.clone()),
+                        )
+                        .await;
                         if avoid_set.insert(selected.index) {
                             avoided_total = avoided_total.saturating_add(1);
                         }
@@ -1644,9 +1964,10 @@ pub async fn handle_proxy(
                     .state
                     .update_request_route(
                         request_id,
-                        selected.config_name.clone(),
+                        selected.station_name.clone(),
                         provider_id.clone(),
                         selected.upstream.base_url.clone(),
+                        Some(route_decision.clone()),
                     )
                     .await;
 
@@ -1685,7 +2006,7 @@ pub async fn handle_proxy(
                         let err_str = format_reqwest_error_for_retry_chain(&e);
                         upstream_chain.push(format!(
                             "{}:{} (idx={}) transport_error={} model={}",
-                            selected.config_name,
+                            selected.station_name,
                             selected.upstream.base_url,
                             selected.index,
                             err_str,
@@ -1705,6 +2026,16 @@ pub async fn handle_proxy(
                             "upstream_transport_error",
                             cooldown_backoff,
                         );
+                        record_passive_upstream_failure(
+                            proxy.state.as_ref(),
+                            proxy.service_name,
+                            &selected.station_name,
+                            &selected.upstream.base_url,
+                            Some(StatusCode::BAD_GATEWAY.as_u16()),
+                            Some("upstream_transport_error"),
+                            Some(err_str.clone()),
+                        )
+                        .await;
                         if avoid_set.insert(selected.index) {
                             avoided_total = avoided_total.saturating_add(1);
                         }
@@ -1747,6 +2078,7 @@ pub async fn handle_proxy(
                             session_id: session_id.clone(),
                             cwd: cwd.clone(),
                             effective_effort: effective_effort.clone(),
+                            service_tier: base_service_tier.clone(),
                             request_id,
                             is_user_turn,
                             is_codex_service,
@@ -1765,7 +2097,7 @@ pub async fn handle_proxy(
                         let err_str = format_reqwest_error_for_retry_chain(&e);
                         upstream_chain.push(format!(
                             "{}:{} (idx={}) body_read_error={} model={}",
-                            selected.config_name,
+                            selected.station_name,
                             selected.upstream.base_url,
                             selected.index,
                             err_str,
@@ -1783,6 +2115,16 @@ pub async fn handle_proxy(
                             "upstream_body_read_error",
                             cooldown_backoff,
                         );
+                        record_passive_upstream_failure(
+                            proxy.state.as_ref(),
+                            proxy.service_name,
+                            &selected.station_name,
+                            &selected.upstream.base_url,
+                            Some(StatusCode::BAD_GATEWAY.as_u16()),
+                            Some("upstream_body_read_error"),
+                            Some(err_str.clone()),
+                        )
+                        .await;
                         if avoid_set.insert(selected.index) {
                             avoided_total = avoided_total.saturating_add(1);
                         }
@@ -1798,6 +2140,7 @@ pub async fn handle_proxy(
                 let (cls, _hint, _cf_ray) =
                     classify_upstream_response(status_code, &resp_headers, bytes.as_ref());
                 let never_retry = should_never_retry(&plan, status_code, cls.as_deref());
+                let observed_service_tier = extract_service_tier_from_response_body(bytes.as_ref());
 
                 upstream_chain.push(format!(
                     "{} (idx={}) status={} class={} model={}",
@@ -1815,11 +2158,23 @@ pub async fn handle_proxy(
                         crate::lb::COOLDOWN_SECS,
                         cooldown_backoff,
                     );
+                    record_passive_upstream_success(
+                        proxy.state.as_ref(),
+                        proxy.service_name,
+                        &selected.station_name,
+                        &selected.upstream.base_url,
+                        status_code,
+                    )
+                    .await;
 
                     let usage = extract_usage_from_bytes(&bytes);
                     let usage_for_log = usage.clone();
                     let retry = retry_info_for_chain(&upstream_chain);
                     let retry_for_log = retry.clone();
+                    let service_tier_for_log = ServiceTierLog {
+                        actual: observed_service_tier.clone(),
+                        ..base_service_tier.clone()
+                    };
                     proxy
                         .state
                         .finish_request(crate::state::FinishRequestParams {
@@ -1827,6 +2182,7 @@ pub async fn handle_proxy(
                             status_code,
                             duration_ms: dur,
                             ended_at_ms: started_at_ms + dur,
+                            observed_service_tier: observed_service_tier.clone(),
                             usage,
                             retry,
                             ttfb_ms: Some(upstream_headers_ms),
@@ -1840,12 +2196,13 @@ pub async fn handle_proxy(
                         status_code,
                         dur,
                         Some(upstream_headers_ms),
-                        &selected.config_name,
+                        &selected.station_name,
                         provider_id.clone(),
                         &selected.upstream.base_url,
                         session_id.clone(),
                         cwd.clone(),
                         effective_effort.clone(),
+                        service_tier_for_log,
                         usage_for_log,
                         retry_for_log,
                         None,
@@ -1867,9 +2224,23 @@ pub async fn handle_proxy(
                             cooldown_backoff,
                         );
                     }
+                    record_passive_upstream_failure(
+                        proxy.state.as_ref(),
+                        proxy.service_name,
+                        &selected.station_name,
+                        &selected.upstream.base_url,
+                        Some(status_code),
+                        cls.as_deref(),
+                        Some(String::from_utf8_lossy(bytes.as_ref()).to_string()),
+                    )
+                    .await;
 
                     let retry = retry_info_for_chain(&upstream_chain);
                     let retry_for_log = retry.clone();
+                    let service_tier_for_log = ServiceTierLog {
+                        actual: observed_service_tier.clone(),
+                        ..base_service_tier.clone()
+                    };
                     proxy
                         .state
                         .finish_request(crate::state::FinishRequestParams {
@@ -1877,6 +2248,7 @@ pub async fn handle_proxy(
                             status_code,
                             duration_ms: dur,
                             ended_at_ms: started_at_ms + dur,
+                            observed_service_tier: observed_service_tier.clone(),
                             usage: None,
                             retry,
                             ttfb_ms: Some(upstream_headers_ms),
@@ -1890,12 +2262,13 @@ pub async fn handle_proxy(
                         status_code,
                         dur,
                         Some(upstream_headers_ms),
-                        &selected.config_name,
+                        &selected.station_name,
                         provider_id.clone(),
                         &selected.upstream.base_url,
                         session_id.clone(),
                         cwd.clone(),
                         effective_effort.clone(),
+                        service_tier_for_log,
                         None,
                         retry_for_log,
                         None,
@@ -1929,6 +2302,16 @@ pub async fn handle_proxy(
                             cooldown_backoff,
                         );
                     }
+                    record_passive_upstream_failure(
+                        proxy.state.as_ref(),
+                        proxy.service_name,
+                        &selected.station_name,
+                        &selected.upstream.base_url,
+                        Some(status_code),
+                        cls.as_deref(),
+                        Some(String::from_utf8_lossy(bytes.as_ref()).to_string()),
+                    )
+                    .await;
                     last_err = Some((status, String::from_utf8_lossy(bytes.as_ref()).to_string()));
 
                     if avoid_set.insert(selected.index) {
@@ -1940,6 +2323,16 @@ pub async fn handle_proxy(
                 // Not retryable for provider failover either: return the error as-is.
                 let retry = retry_info_for_chain(&upstream_chain);
                 let retry_for_log = retry.clone();
+                record_passive_upstream_failure(
+                    proxy.state.as_ref(),
+                    proxy.service_name,
+                    &selected.station_name,
+                    &selected.upstream.base_url,
+                    Some(status_code),
+                    cls.as_deref(),
+                    Some(String::from_utf8_lossy(bytes.as_ref()).to_string()),
+                )
+                .await;
                 proxy
                     .state
                     .finish_request(crate::state::FinishRequestParams {
@@ -1947,12 +2340,17 @@ pub async fn handle_proxy(
                         status_code,
                         duration_ms: dur,
                         ended_at_ms: started_at_ms + dur,
+                        observed_service_tier: observed_service_tier.clone(),
                         usage: None,
                         retry,
                         ttfb_ms: Some(upstream_headers_ms),
                     })
                     .await;
 
+                let service_tier_for_log = ServiceTierLog {
+                    actual: observed_service_tier,
+                    ..base_service_tier.clone()
+                };
                 log_request_with_debug(
                     proxy.service_name,
                     method.as_str(),
@@ -1960,12 +2358,13 @@ pub async fn handle_proxy(
                     status_code,
                     dur,
                     Some(upstream_headers_ms),
-                    &selected.config_name,
+                    &selected.station_name,
                     provider_id.clone(),
                     &selected.upstream.base_url,
                     session_id.clone(),
                     cwd.clone(),
                     effective_effort.clone(),
+                    service_tier_for_log,
                     None,
                     retry_for_log,
                     None,
@@ -1978,19 +2377,54 @@ pub async fn handle_proxy(
                 return Ok(builder.body(Body::from(bytes)).unwrap());
             }
 
-            // If we don't have any more upstreams under this provider/config, move to next provider;
-            // otherwise, continue selecting another upstream under the same provider/config.
+            // If we don't have any more upstreams under this station, move to next station;
+            // otherwise, continue selecting another upstream under the same station.
             let upstream_total = lb.service.upstreams.len();
             if upstream_total > 0 && avoid_set.len() >= upstream_total {
+                log_same_station_failover_trace(
+                    proxy.service_name,
+                    request_id,
+                    station_name.as_str(),
+                    upstream_total,
+                    avoid_set,
+                    true,
+                );
                 break 'upstreams;
+            }
+            if !avoid_set.is_empty() {
+                log_same_station_failover_trace(
+                    proxy.service_name,
+                    request_id,
+                    station_name.as_str(),
+                    upstream_total,
+                    avoid_set,
+                    false,
+                );
             }
             continue 'upstreams;
         }
 
-        tried_configs.insert(config_name);
+        tried_stations.insert(station_name.clone());
+
+        if strict_multi_config
+            && provider_attempt == 0
+            && !cross_station_failover_enabled
+            && provider_opt.max_attempts > 1
+        {
+            log_retry_trace(serde_json::json!({
+                "event": "cross_station_failover_blocked",
+                "service": proxy.service_name,
+                "request_id": request_id,
+                "station_name": station_name,
+                "provider_strategy": if provider_opt.strategy == RetryStrategy::Failover { "failover" } else { "same_upstream" },
+                "configured_provider_max_attempts": provider_opt.max_attempts,
+                "effective_provider_max_attempts": provider_attempt_limit,
+                "allow_cross_station_before_first_output": plan.allow_cross_station_before_first_output,
+            }));
+        }
 
         // Provider layer: optional backoff between providers (usually 0).
-        if provider_opt.base_backoff_ms > 0 {
+        if provider_opt.base_backoff_ms > 0 && provider_attempt + 1 < provider_attempt_limit {
             backoff_sleep(provider_opt, provider_attempt).await;
         }
     }
@@ -2011,6 +2445,7 @@ pub async fn handle_proxy(
             session_id.clone(),
             cwd.clone(),
             effective_effort.clone(),
+            base_service_tier.clone(),
             None,
             retry_info_for_chain(&upstream_chain),
             None,
@@ -2023,6 +2458,7 @@ pub async fn handle_proxy(
                 status_code: status.as_u16(),
                 duration_ms: dur,
                 ended_at_ms: started_at_ms + dur,
+                observed_service_tier: None,
                 usage: None,
                 retry,
                 ttfb_ms: None,
@@ -2077,7 +2513,7 @@ pub async fn handle_proxy(
                         if !supported {
                             upstream_chain.push(format!(
                                 "{}:{} (idx={}) skipped_unsupported_model={}",
-                                selected.config_name,
+                                selected.station_name,
                                 selected.upstream.base_url,
                                 selected.index,
                                 requested_model
@@ -2095,13 +2531,13 @@ pub async fn handle_proxy(
                 }
             }
 
-            // When we have multiple config candidates, prefer skipping configs that are fully cooled down.
-            // However, if *all* configs are cooled/unavailable, fall back to the original "always pick one"
+            // When we have multiple station candidates, prefer skipping stations that are fully cooled down.
+            // However, if *all* stations are cooled/unavailable, fall back to the original "always pick one"
             // behavior to avoid a hard outage.
             if chosen.is_none() && strict_multi_config {
                 for lb in &lbs {
-                    let cfg_name = lb.service.name.clone();
-                    let avoid_set = avoid.entry(cfg_name.clone()).or_default();
+                    let station_name = lb.service.name.clone();
+                    let avoid_set = avoid.entry(station_name.clone()).or_default();
                     let upstream_total = lb.service.upstreams.len();
                     if upstream_total > 0 && avoid_set.len() >= upstream_total {
                         continue;
@@ -2122,7 +2558,7 @@ pub async fn handle_proxy(
                     "attempt": attempt_index + 1,
                     "max_attempts": retry_opt.max_attempts,
                     "avoid": avoid.iter().map(|(k, v)| serde_json::json!({
-                        "config": k,
+                        "station": k,
                         "indices": v.iter().copied().collect::<Vec<_>>(),
                     })).collect::<Vec<_>>(),
                     "total_upstreams": total_upstreams,
@@ -2173,7 +2609,7 @@ pub async fn handle_proxy(
                 return Err((status, "no upstreams available".to_string()));
             };
 
-            let selected_config_name = selected.config_name.clone();
+            let selected_station_name = selected.station_name.clone();
             let selected_upstream_index = selected.index;
             let selected_upstream_base_url = selected.upstream.base_url.clone();
             let provider_id = selected.upstream.tags.get("provider_id").cloned();
@@ -2184,13 +2620,13 @@ pub async fn handle_proxy(
                 "attempt": attempt_index + 1,
                 "max_attempts": retry_opt.max_attempts,
                 "strategy": if retry_failover { "failover" } else { "same_upstream" },
-                "config_name": selected_config_name,
+                "station_name": selected_station_name,
                 "upstream_index": selected_upstream_index,
                 "upstream_base_url": selected_upstream_base_url,
                 "provider_id": provider_id.clone(),
                 "model": request_model.clone(),
                 "lb_state": lb_state_snapshot_json(&lb),
-                "avoid_for_config": avoid.get(&selected.config_name).map(|s| s.iter().copied().collect::<Vec<_>>()),
+                "avoid_for_station": avoid.get(&selected.station_name).map(|s| s.iter().copied().collect::<Vec<_>>()),
                 "avoided_total": avoid.values().map(|s| s.len()).sum::<usize>(),
                 "total_upstreams": total_upstreams,
             }));
@@ -2213,6 +2649,20 @@ pub async fn handle_proxy(
                     model_note = requested_model.clone();
                 }
             }
+            let route_decision = build_route_decision_provenance(
+                now_ms(),
+                session_binding.as_ref(),
+                session_override_config.as_deref(),
+                global_config_override.as_deref(),
+                override_model.as_deref(),
+                override_effort.as_deref(),
+                override_service_tier.as_deref(),
+                request_model.as_deref(),
+                effective_effort.as_deref(),
+                effective_service_tier.as_deref(),
+                &selected,
+                provider_id.as_deref(),
+            );
 
             let filtered_body = proxy.filter.apply_bytes(body_for_selected);
             let upstream_request_body_len = filtered_body.len();
@@ -2247,14 +2697,24 @@ pub async fn handle_proxy(
                     let err_str = e.to_string();
                     upstream_chain.push(format!(
                         "{}:{} (idx={}) target_build_error={} model={}",
-                        selected.config_name,
+                        selected.station_name,
                         selected.upstream.base_url,
                         selected.index,
                         err_str,
                         model_note.as_str()
                     ));
+                    record_passive_upstream_failure(
+                        proxy.state.as_ref(),
+                        proxy.service_name,
+                        &selected.station_name,
+                        &selected.upstream.base_url,
+                        Some(StatusCode::BAD_GATEWAY.as_u16()),
+                        Some("target_build_error"),
+                        Some(err_str.clone()),
+                    )
+                    .await;
                     avoid
-                        .entry(selected.config_name.clone())
+                        .entry(selected.station_name.clone())
                         .or_default()
                         .insert(selected.index);
 
@@ -2303,7 +2763,7 @@ pub async fn handle_proxy(
                         status.as_u16(),
                         dur,
                         None,
-                        &selected.config_name,
+                        &selected.station_name,
                         selected.upstream.tags.get("provider_id").cloned(),
                         &selected.upstream.base_url,
                         session_id.clone(),
@@ -2364,9 +2824,10 @@ pub async fn handle_proxy(
                 .state
                 .update_request_route(
                     request_id,
-                    selected.config_name.clone(),
+                    selected.station_name.clone(),
                     provider_id.clone(),
                     selected.upstream.base_url.clone(),
+                    Some(route_decision.clone()),
                 )
                 .await;
             let auth_resolution = AuthResolutionLog {
@@ -2402,7 +2863,7 @@ pub async fn handle_proxy(
                 method,
                 uri.path(),
                 target_url,
-                selected.config_name
+                selected.station_name
             );
 
             let builder = proxy
@@ -2422,7 +2883,7 @@ pub async fn handle_proxy(
                         "attempt": attempt_index + 1,
                         "max_attempts": retry_opt.max_attempts,
                         "strategy": if retry_failover { "failover" } else { "same_upstream" },
-                        "config_name": selected.config_name.as_str(),
+                        "station_name": selected.station_name.as_str(),
                         "upstream_index": selected.index,
                         "upstream_base_url": selected.upstream.base_url.as_str(),
                         "provider_id": provider_id.as_deref(),
@@ -2439,7 +2900,7 @@ pub async fn handle_proxy(
                     let err_str = format_reqwest_error_for_retry_chain(&e);
                     upstream_chain.push(format!(
                         "{}:{} (idx={}) transport_error={} model={}",
-                        selected.config_name,
+                        selected.station_name,
                         selected.upstream.base_url,
                         selected.index,
                         err_str,
@@ -2455,8 +2916,18 @@ pub async fn handle_proxy(
                                 "upstream_transport_error",
                                 cooldown_backoff,
                             );
+                            record_passive_upstream_failure(
+                                proxy.state.as_ref(),
+                                proxy.service_name,
+                                &selected.station_name,
+                                &selected.upstream.base_url,
+                                Some(StatusCode::BAD_GATEWAY.as_u16()),
+                                Some("upstream_transport_error"),
+                                Some(err_str.clone()),
+                            )
+                            .await;
                             avoid
-                                .entry(selected.config_name.clone())
+                                .entry(selected.station_name.clone())
                                 .or_default()
                                 .insert(selected.index);
                         }
@@ -2474,6 +2945,16 @@ pub async fn handle_proxy(
                             cooldown_backoff,
                         );
                     }
+                    record_passive_upstream_failure(
+                        proxy.state.as_ref(),
+                        proxy.service_name,
+                        &selected.station_name,
+                        &selected.upstream.base_url,
+                        Some(StatusCode::BAD_GATEWAY.as_u16()),
+                        Some("upstream_transport_error_final"),
+                        Some(err_str.clone()),
+                    )
+                    .await;
 
                     let dur = start.elapsed().as_millis() as u64;
                     let status_code = StatusCode::BAD_GATEWAY.as_u16();
@@ -2551,7 +3032,7 @@ pub async fn handle_proxy(
                         status_code,
                         dur,
                         None,
-                        &selected.config_name,
+                        &selected.station_name,
                         selected.upstream.tags.get("provider_id").cloned(),
                         &selected.upstream.base_url,
                         session_id.clone(),
@@ -2621,6 +3102,7 @@ pub async fn handle_proxy(
                         session_id: session_id.clone(),
                         cwd: cwd.clone(),
                         effective_effort: effective_effort.clone(),
+                        service_tier: base_service_tier.clone(),
                         request_id,
                         is_user_turn,
                         is_codex_service,
@@ -2642,7 +3124,7 @@ pub async fn handle_proxy(
                             "attempt": attempt_index + 1,
                             "max_attempts": retry_opt.max_attempts,
                             "strategy": if retry_failover { "failover" } else { "same_upstream" },
-                            "config_name": selected.config_name.as_str(),
+                            "station_name": selected.station_name.as_str(),
                             "upstream_index": selected.index,
                             "upstream_base_url": selected.upstream.base_url.as_str(),
                             "provider_id": provider_id.as_deref(),
@@ -2659,7 +3141,7 @@ pub async fn handle_proxy(
                         let err_str = format_reqwest_error_for_retry_chain(&e);
                         upstream_chain.push(format!(
                             "{}:{} (idx={}) body_read_error={} model={}",
-                            selected.config_name,
+                            selected.station_name,
                             selected.upstream.base_url,
                             selected.index,
                             err_str,
@@ -2675,8 +3157,18 @@ pub async fn handle_proxy(
                                     "upstream_body_read_error",
                                     cooldown_backoff,
                                 );
+                                record_passive_upstream_failure(
+                                    proxy.state.as_ref(),
+                                    proxy.service_name,
+                                    &selected.station_name,
+                                    &selected.upstream.base_url,
+                                    Some(StatusCode::BAD_GATEWAY.as_u16()),
+                                    Some("upstream_body_read_error"),
+                                    Some(err_str.clone()),
+                                )
+                                .await;
                                 avoid
-                                    .entry(selected.config_name.clone())
+                                    .entry(selected.station_name.clone())
                                     .or_default()
                                     .insert(selected.index);
                             }
@@ -2694,6 +3186,16 @@ pub async fn handle_proxy(
                                 cooldown_backoff,
                             );
                         }
+                        record_passive_upstream_failure(
+                            proxy.state.as_ref(),
+                            proxy.service_name,
+                            &selected.station_name,
+                            &selected.upstream.base_url,
+                            Some(StatusCode::BAD_GATEWAY.as_u16()),
+                            Some("upstream_body_read_error_final"),
+                            Some(err_str.clone()),
+                        )
+                        .await;
 
                         let dur = start.elapsed().as_millis() as u64;
                         let status = StatusCode::BAD_GATEWAY;
@@ -2733,7 +3235,7 @@ pub async fn handle_proxy(
                             status.as_u16(),
                             dur,
                             Some(upstream_headers_ms),
-                            &selected.config_name,
+                            &selected.station_name,
                             selected.upstream.tags.get("provider_id").cloned(),
                             &selected.upstream.base_url,
                             session_id.clone(),
@@ -2797,7 +3299,7 @@ pub async fn handle_proxy(
                         "class": cls.as_deref(),
                         "hint": hint.as_deref(),
                         "cf_ray": cf_ray.as_deref(),
-                        "config_name": selected.config_name.as_str(),
+                        "station_name": selected.station_name.as_str(),
                         "upstream_index": selected.index,
                         "upstream_base_url": selected.upstream.base_url.as_str(),
                         "provider_id": provider_id.as_deref(),
@@ -2846,7 +3348,7 @@ pub async fn handle_proxy(
                         "class": cls.as_deref(),
                         "hint": hint.as_deref(),
                         "cf_ray": cf_ray.as_deref(),
-                        "config_name": selected.config_name.as_str(),
+                        "station_name": selected.station_name.as_str(),
                         "upstream_index": selected.index,
                         "upstream_base_url": selected.upstream.base_url.as_str(),
                         "provider_id": provider_id.as_deref(),
@@ -2859,12 +3361,12 @@ pub async fn handle_proxy(
                     }));
                     let cls_s = cls.as_deref().unwrap_or("-");
                     info!(
-                        "retrying after non-2xx status {} (class={}) for {} {} (config: {}, mode={}, next_attempt={}/{})",
+                        "retrying after non-2xx status {} (class={}) for {} {} (station: {}, mode={}, next_attempt={}/{})",
                         status_code,
                         cls_s,
                         method,
                         uri.path(),
-                        selected.config_name,
+                        selected.station_name,
                         if retry_failover {
                             "failover"
                         } else {
@@ -2909,9 +3411,19 @@ pub async fn handle_proxy(
                             }
                         }
                         avoid
-                            .entry(selected.config_name.clone())
+                            .entry(selected.station_name.clone())
                             .or_default()
                             .insert(selected.index);
+                        record_passive_upstream_failure(
+                            proxy.state.as_ref(),
+                            proxy.service_name,
+                            &selected.station_name,
+                            &selected.upstream.base_url,
+                            Some(status_code),
+                            cls.as_deref(),
+                            Some(String::from_utf8_lossy(bytes.as_ref()).to_string()),
+                        )
+                        .await;
                     }
                     let skip_sleep = status_code >= 400 && status_code < 500 && status_code != 429;
                     if !skip_sleep {
@@ -2932,6 +3444,14 @@ pub async fn handle_proxy(
                         crate::lb::COOLDOWN_SECS,
                         cooldown_backoff,
                     );
+                    record_passive_upstream_success(
+                        proxy.state.as_ref(),
+                        proxy.service_name,
+                        &selected.station_name,
+                        &selected.upstream.base_url,
+                        status_code,
+                    )
+                    .await;
                 } else if (status_code >= 500 || cls.is_some())
                     && !class_is_health_neutral(cls.as_deref())
                 {
@@ -2941,6 +3461,16 @@ pub async fn handle_proxy(
                         crate::lb::COOLDOWN_SECS,
                         cooldown_backoff,
                     );
+                    record_passive_upstream_failure(
+                        proxy.state.as_ref(),
+                        proxy.service_name,
+                        &selected.station_name,
+                        &selected.upstream.base_url,
+                        Some(status_code),
+                        cls.as_deref(),
+                        Some(String::from_utf8_lossy(bytes.as_ref()).to_string()),
+                    )
+                    .await;
                 }
 
                 let retry = retry_info_for_chain(&upstream_chain);
@@ -2953,10 +3483,10 @@ pub async fn handle_proxy(
                         .map(|s| s.as_str())
                         .unwrap_or("-");
                     info!(
-                        "user turn {} {} using config '{}' upstream[{}] provider_id='{}' base_url='{}'",
+                        "user turn {} {} using station '{}' upstream[{}] provider_id='{}' base_url='{}'",
                         method,
                         uri.path(),
-                        selected.config_name,
+                        selected.station_name,
                         selected.index,
                         provider_id,
                         selected.upstream.base_url
@@ -3005,13 +3535,13 @@ pub async fn handle_proxy(
                         let cls_s = cls.as_deref().unwrap_or("-");
                         let cf_ray_s = cf_ray.as_deref().unwrap_or("-");
                         warn!(
-                            "upstream returned non-2xx status {} (class={}, cf_ray={}) for {} {} (config: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
+                            "upstream returned non-2xx status {} (class={}, cf_ray={}) for {} {} (station: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
                             status_code,
                             cls_s,
                             cf_ray_s,
                             method,
                             uri.path(),
-                            selected.config_name
+                            selected.station_name
                         );
                     }
                 }
@@ -3060,7 +3590,7 @@ pub async fn handle_proxy(
                     status_code,
                     dur,
                     Some(upstream_headers_ms),
-                    &selected.config_name,
+                    &selected.station_name,
                     selected.upstream.tags.get("provider_id").cloned(),
                     &selected.upstream.base_url,
                     session_id.clone(),
@@ -3088,7 +3618,7 @@ pub async fn handle_proxy(
                     usage_providers::poll_for_codex_upstream(
                         cfg_snapshot.clone(),
                         proxy.lb_states.clone(),
-                        &selected.config_name,
+                        &selected.station_name,
                         selected.index,
                     )
                     .await;
@@ -3171,15 +3701,17 @@ pub async fn handle_proxy(
 pub fn router(proxy: ProxyService) -> Router {
     // In axum 0.8, wildcard segments use `/{*path}` (equivalent to `/*path` from axum 0.7).
     #[derive(serde::Deserialize)]
-    struct SessionOverrideRequest {
+    struct SessionReasoningEffortOverrideRequest {
         session_id: String,
-        effort: Option<String>,
+        #[serde(default, alias = "effort")]
+        reasoning_effort: Option<String>,
     }
 
     #[derive(serde::Deserialize)]
-    struct SessionConfigOverrideRequest {
+    struct SessionStationOverrideRequest {
         session_id: String,
-        config_name: Option<String>,
+        #[serde(default)]
+        station_name: Option<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -3194,6 +3726,31 @@ pub fn router(proxy: ProxyService) -> Router {
         service_tier: Option<String>,
     }
 
+    #[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq, Hash)]
+    #[serde(rename_all = "snake_case")]
+    enum SessionOverrideDimension {
+        Model,
+        ReasoningEffort,
+        StationName,
+        ServiceTier,
+        All,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SessionManualOverridesPatchRequest {
+        session_id: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default, alias = "effort")]
+        reasoning_effort: Option<String>,
+        #[serde(default)]
+        station_name: Option<String>,
+        #[serde(default)]
+        service_tier: Option<String>,
+        #[serde(default)]
+        clear: Vec<SessionOverrideDimension>,
+    }
+
     #[derive(serde::Deserialize)]
     struct SessionProfileApplyRequest {
         session_id: String,
@@ -3205,6 +3762,25 @@ pub fn router(proxy: ProxyService) -> Router {
         session_id: String,
     }
 
+    #[derive(serde::Serialize)]
+    struct SessionOverridePrecedence {
+        request_fields_apply_order: Vec<&'static str>,
+        station_apply_order: Vec<&'static str>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct SessionManualOverridesListResponse {
+        precedence: SessionOverridePrecedence,
+        sessions: std::collections::HashMap<String, crate::state::SessionManualOverrides>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct SessionManualOverridesResponse {
+        session_id: String,
+        overrides: crate::state::SessionManualOverrides,
+        precedence: SessionOverridePrecedence,
+    }
+
     #[derive(serde::Deserialize)]
     struct DefaultProfileRequest {
         profile_name: Option<String>,
@@ -3212,6 +3788,8 @@ pub fn router(proxy: ProxyService) -> Router {
 
     #[derive(serde::Deserialize)]
     struct PersistedProfileUpsertRequest {
+        #[serde(default)]
+        extends: Option<String>,
         #[serde(default, alias = "config")]
         station: Option<String>,
         #[serde(default)]
@@ -3220,6 +3798,51 @@ pub fn router(proxy: ProxyService) -> Router {
         reasoning_effort: Option<String>,
         #[serde(default)]
         service_tier: Option<String>,
+    }
+
+    fn require_session_id(session_id: &str) -> Result<(), (StatusCode, String)> {
+        if session_id.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "session_id is required".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn normalize_session_override_value(
+        field_name: &str,
+        value: Option<String>,
+    ) -> Result<Option<String>, (StatusCode, String)> {
+        match value {
+            Some(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    Err((StatusCode::BAD_REQUEST, format!("{field_name} is empty")))
+                } else {
+                    Ok(Some(trimmed.to_string()))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn session_override_precedence() -> SessionOverridePrecedence {
+        SessionOverridePrecedence {
+            request_fields_apply_order: vec![
+                "session_override",
+                "profile_default",
+                "request_payload",
+                "station_mapping",
+                "runtime_fallback",
+            ],
+            station_apply_order: vec![
+                "session_override",
+                "global_station_override",
+                "profile_default",
+                "runtime_fallback",
+            ],
+        }
     }
 
     fn default_persisted_station_enabled() -> bool {
@@ -3276,45 +3899,27 @@ pub fn router(proxy: ProxyService) -> Router {
     struct PersistedStationActiveRequest {
         #[serde(default)]
         station_name: Option<String>,
-        #[serde(default)]
-        config_name: Option<String>,
     }
 
     impl PersistedStationActiveRequest {
         fn station_name(&self) -> Result<Option<String>, (StatusCode, String)> {
-            let station_name = self
+            Ok(self
                 .station_name
                 .as_deref()
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
-                .map(ToOwned::to_owned);
-            let config_name = self
-                .config_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(ToOwned::to_owned);
-            match (station_name, config_name) {
-                (Some(station_name), Some(config_name)) if station_name != config_name => Err((
-                    StatusCode::BAD_REQUEST,
-                    "station_name and config_name must match when both are provided".to_string(),
-                )),
-                (Some(station_name), _) => Ok(Some(station_name)),
-                (_, Some(config_name)) => Ok(Some(config_name)),
-                _ => Ok(None),
-            }
+                .map(ToOwned::to_owned))
         }
     }
 
     #[derive(serde::Deserialize)]
-    struct GlobalConfigOverrideRequest {
-        config_name: Option<String>,
+    struct GlobalStationOverrideRequest {
+        #[serde(default)]
+        station_name: Option<String>,
     }
 
     #[derive(serde::Deserialize)]
-    struct ConfigRuntimeMetaRequest {
-        #[serde(default)]
-        config_name: Option<String>,
+    struct StationRuntimeMetaRequest {
         #[serde(default)]
         station_name: Option<String>,
         #[serde(default)]
@@ -3331,30 +3936,16 @@ pub fn router(proxy: ProxyService) -> Router {
         clear_runtime_state: bool,
     }
 
-    impl ConfigRuntimeMetaRequest {
+    impl StationRuntimeMetaRequest {
         fn target_name(&self) -> Result<&str, (StatusCode, String)> {
-            let station_name = self
-                .station_name
+            self.station_name
                 .as_deref()
                 .map(str::trim)
-                .filter(|name| !name.is_empty());
-            let config_name = self
-                .config_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty());
-            match (station_name, config_name) {
-                (Some(station_name), Some(config_name)) if station_name != config_name => Err((
+                .filter(|name| !name.is_empty())
+                .ok_or((
                     StatusCode::BAD_REQUEST,
-                    "station_name and config_name must match when both are provided".to_string(),
-                )),
-                (Some(station_name), _) => Ok(station_name),
-                (_, Some(config_name)) => Ok(config_name),
-                _ => Err((
-                    StatusCode::BAD_REQUEST,
-                    "station_name or config_name is required".to_string(),
-                )),
-            }
+                    "station_name is required".to_string(),
+                ))
         }
     }
 
@@ -3410,6 +4001,7 @@ pub fn router(proxy: ProxyService) -> Router {
         }
 
         crate::config::ServiceControlProfile {
+            extends: normalize(payload.extends),
             station: normalize(payload.station),
             model: normalize(payload.model),
             reasoning_effort: normalize(payload.reasoning_effort),
@@ -3711,66 +4303,156 @@ pub fn router(proxy: ProxyService) -> Router {
         }))
     }
 
-    async fn set_session_override(
+    async fn set_session_reasoning_effort_override(
         proxy: ProxyService,
-        Json(payload): Json<SessionOverrideRequest>,
+        Json(payload): Json<SessionReasoningEffortOverrideRequest>,
     ) -> Result<StatusCode, (StatusCode, String)> {
-        if payload.session_id.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "session_id is required".to_string(),
-            ));
-        }
-        if let Some(effort) = payload.effort {
-            if effort.trim().is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "effort is empty".to_string()));
-            }
+        require_session_id(payload.session_id.as_str())?;
+        let reasoning_effort =
+            normalize_session_override_value("reasoning_effort", payload.reasoning_effort)?;
+        if let Some(reasoning_effort) = reasoning_effort {
             proxy
                 .state
-                .set_session_effort_override(
+                .set_session_reasoning_effort_override(
                     payload.session_id,
-                    effort,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0),
+                    reasoning_effort,
+                    now_ms(),
                 )
                 .await;
         } else {
             proxy
                 .state
-                .clear_session_effort_override(payload.session_id.as_str())
+                .clear_session_reasoning_effort_override(payload.session_id.as_str())
                 .await;
         }
         Ok(StatusCode::NO_CONTENT)
     }
 
-    async fn list_session_overrides(
+    async fn list_session_reasoning_effort_overrides(
         proxy: ProxyService,
     ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
-        let map = proxy.state.list_session_effort_overrides().await;
+        let map = proxy.state.list_session_reasoning_effort_overrides().await;
         Ok(Json(map))
     }
 
-    async fn set_session_config_override(
+    async fn list_session_manual_overrides(
         proxy: ProxyService,
-        Json(payload): Json<SessionConfigOverrideRequest>,
-    ) -> Result<StatusCode, (StatusCode, String)> {
-        if payload.session_id.trim().is_empty() {
+    ) -> Result<Json<SessionManualOverridesListResponse>, (StatusCode, String)> {
+        let sessions = proxy.state.list_session_manual_overrides().await;
+        Ok(Json(SessionManualOverridesListResponse {
+            precedence: session_override_precedence(),
+            sessions,
+        }))
+    }
+
+    async fn apply_session_manual_overrides(
+        proxy: ProxyService,
+        Json(payload): Json<SessionManualOverridesPatchRequest>,
+    ) -> Result<Json<SessionManualOverridesResponse>, (StatusCode, String)> {
+        require_session_id(payload.session_id.as_str())?;
+        let model = normalize_session_override_value("model", payload.model)?;
+        let reasoning_effort =
+            normalize_session_override_value("reasoning_effort", payload.reasoning_effort)?;
+        let station_name = normalize_session_override_value("station_name", payload.station_name)?;
+        let service_tier = normalize_session_override_value("service_tier", payload.service_tier)?;
+        let clear: HashSet<_> = payload.clear.into_iter().collect();
+        if model.is_none()
+            && reasoning_effort.is_none()
+            && station_name.is_none()
+            && service_tier.is_none()
+            && clear.is_empty()
+        {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "session_id is required".to_string(),
+                "expected at least one override value or clear target".to_string(),
             ));
         }
-        if let Some(config_name) = payload.config_name {
-            if config_name.trim().is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "config_name is empty".to_string()));
-            }
+
+        let session_id = payload.session_id;
+        if clear.contains(&SessionOverrideDimension::All) {
             proxy
                 .state
-                .set_session_config_override(
+                .clear_session_manual_overrides(session_id.as_str())
+                .await;
+        } else {
+            if clear.contains(&SessionOverrideDimension::Model) {
+                proxy
+                    .state
+                    .clear_session_model_override(session_id.as_str())
+                    .await;
+            }
+            if clear.contains(&SessionOverrideDimension::ReasoningEffort) {
+                proxy
+                    .state
+                    .clear_session_reasoning_effort_override(session_id.as_str())
+                    .await;
+            }
+            if clear.contains(&SessionOverrideDimension::StationName) {
+                proxy
+                    .state
+                    .clear_session_station_override(session_id.as_str())
+                    .await;
+            }
+            if clear.contains(&SessionOverrideDimension::ServiceTier) {
+                proxy
+                    .state
+                    .clear_session_service_tier_override(session_id.as_str())
+                    .await;
+            }
+        }
+
+        if let Some(model) = model {
+            proxy
+                .state
+                .set_session_model_override(session_id.clone(), model, now_ms())
+                .await;
+        }
+        if let Some(reasoning_effort) = reasoning_effort {
+            proxy
+                .state
+                .set_session_reasoning_effort_override(
+                    session_id.clone(),
+                    reasoning_effort,
+                    now_ms(),
+                )
+                .await;
+        }
+        if let Some(station_name) = station_name {
+            proxy
+                .state
+                .set_session_station_override(session_id.clone(), station_name, now_ms())
+                .await;
+        }
+        if let Some(service_tier) = service_tier {
+            proxy
+                .state
+                .set_session_service_tier_override(session_id.clone(), service_tier, now_ms())
+                .await;
+        }
+
+        let overrides = proxy
+            .state
+            .get_session_manual_overrides(session_id.as_str())
+            .await;
+        Ok(Json(SessionManualOverridesResponse {
+            session_id,
+            overrides,
+            precedence: session_override_precedence(),
+        }))
+    }
+
+    async fn set_session_station_override(
+        proxy: ProxyService,
+        Json(payload): Json<SessionStationOverrideRequest>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        require_session_id(payload.session_id.as_str())?;
+        let station_name = normalize_session_override_value("station_name", payload.station_name)?;
+        if let Some(station_name) = station_name {
+            proxy
+                .state
+                .set_session_station_override(
                     payload.session_id,
-                    config_name,
+                    station_name,
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -3780,16 +4462,16 @@ pub fn router(proxy: ProxyService) -> Router {
         } else {
             proxy
                 .state
-                .clear_session_config_override(payload.session_id.as_str())
+                .clear_session_station_override(payload.session_id.as_str())
                 .await;
         }
         Ok(StatusCode::NO_CONTENT)
     }
 
-    async fn list_session_config_overrides(
+    async fn list_session_station_overrides(
         proxy: ProxyService,
     ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
-        let map = proxy.state.list_session_config_overrides().await;
+        let map = proxy.state.list_session_station_overrides().await;
         Ok(Json(map))
     }
 
@@ -3797,16 +4479,9 @@ pub fn router(proxy: ProxyService) -> Router {
         proxy: ProxyService,
         Json(payload): Json<SessionModelOverrideRequest>,
     ) -> Result<StatusCode, (StatusCode, String)> {
-        if payload.session_id.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "session_id is required".to_string(),
-            ));
-        }
-        if let Some(model) = payload.model {
-            if model.trim().is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "model is empty".to_string()));
-            }
+        require_session_id(payload.session_id.as_str())?;
+        let model = normalize_session_override_value("model", payload.model)?;
+        if let Some(model) = model {
             proxy
                 .state
                 .set_session_model_override(payload.session_id, model, now_ms())
@@ -3831,16 +4506,9 @@ pub fn router(proxy: ProxyService) -> Router {
         proxy: ProxyService,
         Json(payload): Json<SessionServiceTierOverrideRequest>,
     ) -> Result<StatusCode, (StatusCode, String)> {
-        if payload.session_id.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "session_id is required".to_string(),
-            ));
-        }
-        if let Some(service_tier) = payload.service_tier {
-            if service_tier.trim().is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "service_tier is empty".to_string()));
-            }
+        require_session_id(payload.session_id.as_str())?;
+        let service_tier = normalize_session_override_value("service_tier", payload.service_tier)?;
+        if let Some(service_tier) = service_tier {
             proxy
                 .state
                 .set_session_service_tier_override(payload.session_id, service_tier, now_ms())
@@ -3865,12 +4533,7 @@ pub fn router(proxy: ProxyService) -> Router {
         proxy: ProxyService,
         Json(payload): Json<SessionOverrideResetRequest>,
     ) -> Result<StatusCode, (StatusCode, String)> {
-        if payload.session_id.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "session_id is required".to_string(),
-            ));
-        }
+        require_session_id(payload.session_id.as_str())?;
         proxy
             .state
             .clear_session_manual_overrides(payload.session_id.as_str())
@@ -3984,14 +4647,16 @@ pub fn router(proxy: ProxyService) -> Router {
             _ => &mut cfg.codex,
         };
 
+        mgr.profiles.insert(profile_name.clone(), profile);
+        let resolved = crate::config::resolve_service_profile(mgr, profile_name.as_str())
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         crate::config::validate_profile_station_compatibility(
             proxy.service_name,
             mgr,
             profile_name.as_str(),
-            &profile,
+            &resolved,
         )
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        mgr.profiles.insert(profile_name, profile);
 
         Ok(Json(save_profiles_config_and_reload(&proxy, cfg).await?))
     }
@@ -4008,6 +4673,24 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &mut cfg.claude,
             _ => &mut cfg.codex,
         };
+
+        let referencing_profiles = mgr
+            .profiles
+            .iter()
+            .filter_map(|(name, profile)| {
+                (profile.extends.as_deref() == Some(profile_name.as_str())).then_some(name.clone())
+            })
+            .collect::<Vec<_>>();
+        if !referencing_profiles.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "profile '{}' is extended by profiles: {}",
+                    profile_name,
+                    referencing_profiles.join(", ")
+                ),
+            ));
+        }
 
         if mgr.profiles.remove(profile_name.as_str()).is_none() {
             return Err((
@@ -4240,11 +4923,11 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(StatusCode::NO_CONTENT)
     }
 
-    async fn apply_config_runtime_meta(
+    async fn apply_station_runtime_meta(
         proxy: ProxyService,
-        Json(payload): Json<ConfigRuntimeMetaRequest>,
+        Json(payload): Json<StationRuntimeMetaRequest>,
     ) -> Result<StatusCode, (StatusCode, String)> {
-        let config_name = payload.target_name()?.to_string();
+        let station_name = payload.target_name()?.to_string();
 
         if payload.enabled.is_none()
             && payload.level.is_none()
@@ -4255,7 +4938,7 @@ pub fn router(proxy: ProxyService) -> Router {
         {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "at least one runtime config action must be provided".to_string(),
+                "at least one runtime station action must be provided".to_string(),
             ));
         }
 
@@ -4264,10 +4947,10 @@ pub fn router(proxy: ProxyService) -> Router {
             "claude" => &cfg.claude,
             _ => &cfg.codex,
         };
-        if !mgr.configs.contains_key(config_name.as_str()) {
+        if !mgr.configs.contains_key(station_name.as_str()) {
             return Err((
                 StatusCode::NOT_FOUND,
-                format!("config '{}' not found", config_name),
+                format!("station '{}' not found", station_name),
             ));
         }
 
@@ -4275,26 +4958,31 @@ pub fn router(proxy: ProxyService) -> Router {
         if payload.clear_enabled {
             proxy
                 .state
-                .clear_config_enabled_override(proxy.service_name, config_name.as_str())
+                .clear_station_enabled_override(proxy.service_name, station_name.as_str())
                 .await;
         } else if let Some(enabled) = payload.enabled {
             proxy
                 .state
-                .set_config_enabled_override(proxy.service_name, config_name.clone(), enabled, now)
+                .set_station_enabled_override(
+                    proxy.service_name,
+                    station_name.clone(),
+                    enabled,
+                    now,
+                )
                 .await;
         }
 
         if payload.clear_level {
             proxy
                 .state
-                .clear_config_level_override(proxy.service_name, config_name.as_str())
+                .clear_station_level_override(proxy.service_name, station_name.as_str())
                 .await;
         } else if let Some(level) = payload.level {
             proxy
                 .state
-                .set_config_level_override(
+                .set_station_level_override(
                     proxy.service_name,
-                    config_name.clone(),
+                    station_name.clone(),
                     level.clamp(1, 10),
                     now,
                 )
@@ -4304,14 +4992,14 @@ pub fn router(proxy: ProxyService) -> Router {
         if payload.clear_runtime_state {
             proxy
                 .state
-                .clear_config_runtime_state_override(proxy.service_name, config_name.as_str())
+                .clear_station_runtime_state_override(proxy.service_name, station_name.as_str())
                 .await;
         } else if let Some(runtime_state) = payload.runtime_state {
             proxy
                 .state
-                .set_config_runtime_state_override(
+                .set_station_runtime_state_override(
                     proxy.service_name,
-                    config_name.clone(),
+                    station_name.clone(),
                     runtime_state,
                     now,
                 )
@@ -4340,17 +5028,19 @@ pub fn router(proxy: ProxyService) -> Router {
         };
 
         if let Some(profile_name) = profile_name.as_deref() {
-            let Some(profile) = mgr.profile(profile_name) else {
+            if mgr.profile(profile_name).is_none() {
                 return Err((
                     StatusCode::NOT_FOUND,
                     format!("profile '{}' not found", profile_name),
                 ));
-            };
+            }
+            let resolved = crate::config::resolve_service_profile(mgr, profile_name)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
             crate::config::validate_profile_station_compatibility(
                 proxy.service_name,
                 mgr,
                 profile_name,
-                profile,
+                &resolved,
             )
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         }
@@ -4376,17 +5066,19 @@ pub fn router(proxy: ProxyService) -> Router {
                 "claude" => &cfg.claude,
                 _ => &cfg.codex,
             };
-            let Some(profile) = mgr.profile(profile_name.as_str()) else {
+            if mgr.profile(profile_name.as_str()).is_none() {
                 return Err((
                     StatusCode::NOT_FOUND,
                     format!("profile '{}' not found", profile_name),
                 ));
-            };
+            }
+            let resolved = crate::config::resolve_service_profile(mgr, profile_name.as_str())
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
             crate::config::validate_profile_station_compatibility(
                 proxy.service_name,
                 mgr,
                 profile_name.as_str(),
-                profile,
+                &resolved,
             )
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
             proxy
@@ -4462,24 +5154,24 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(StatusCode::NO_CONTENT)
     }
 
-    async fn get_global_config_override(
+    async fn get_global_station_override(
         proxy: ProxyService,
     ) -> Result<Json<Option<String>>, (StatusCode, String)> {
-        Ok(Json(proxy.state.get_global_config_override().await))
+        Ok(Json(proxy.state.get_global_station_override().await))
     }
 
-    async fn set_global_config_override(
+    async fn set_global_station_override(
         proxy: ProxyService,
-        Json(payload): Json<GlobalConfigOverrideRequest>,
+        Json(payload): Json<GlobalStationOverrideRequest>,
     ) -> Result<StatusCode, (StatusCode, String)> {
-        if let Some(config_name) = payload.config_name {
-            if config_name.trim().is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "config_name is empty".to_string()));
+        if let Some(station_name) = payload.station_name {
+            if station_name.trim().is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "station_name is empty".to_string()));
             }
             proxy
                 .state
-                .set_global_config_override(
-                    config_name,
+                .set_global_station_override(
+                    station_name,
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -4487,7 +5179,7 @@ pub fn router(proxy: ProxyService) -> Router {
                 )
                 .await;
         } else {
-            proxy.state.clear_global_config_override().await;
+            proxy.state.clear_global_station_override().await;
         }
         Ok(StatusCode::NO_CONTENT)
     }
@@ -4509,9 +5201,9 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(Json(map))
     }
 
-    async fn list_session_identity_cards(
-        proxy: ProxyService,
-    ) -> Result<Json<Vec<crate::state::SessionIdentityCard>>, (StatusCode, String)> {
+    async fn load_session_identity_cards(
+        proxy: &ProxyService,
+    ) -> Vec<crate::state::SessionIdentityCard> {
         let mut cards = proxy
             .state
             .list_session_identity_cards_with_host_transcripts(2_000)
@@ -4522,7 +5214,31 @@ pub fn router(proxy: ProxyService) -> Router {
             _ => &cfg.codex,
         };
         crate::state::enrich_session_identity_cards_with_runtime(&mut cards, mgr);
-        Ok(Json(cards))
+        cards
+    }
+
+    async fn list_session_identity_cards(
+        proxy: ProxyService,
+    ) -> Result<Json<Vec<crate::state::SessionIdentityCard>>, (StatusCode, String)> {
+        Ok(Json(load_session_identity_cards(&proxy).await))
+    }
+
+    async fn get_session_identity_card(
+        proxy: ProxyService,
+        Path(session_id): Path<String>,
+    ) -> Result<Json<crate::state::SessionIdentityCard>, (StatusCode, String)> {
+        require_session_id(session_id.as_str())?;
+        let cards = load_session_identity_cards(&proxy).await;
+        cards
+            .into_iter()
+            .find(|card| card.session_id.as_deref() == Some(session_id.as_str()))
+            .map(Json)
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("session '{}' not found", session_id),
+                )
+            })
     }
 
     #[derive(serde::Deserialize)]
@@ -4550,19 +5266,19 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/capabilities",
                 "/__codex_helper/api/v1/snapshot",
                 "/__codex_helper/api/v1/sessions",
+                "/__codex_helper/api/v1/sessions/{session_id}",
                 "/__codex_helper/api/v1/status/active",
                 "/__codex_helper/api/v1/status/recent",
                 "/__codex_helper/api/v1/status/session-stats",
                 "/__codex_helper/api/v1/status/health-checks",
-                "/__codex_helper/api/v1/status/config-health",
-                "/__codex_helper/api/v1/config/runtime",
-                "/__codex_helper/api/v1/config/reload",
+                "/__codex_helper/api/v1/status/station-health",
+                "/__codex_helper/api/v1/runtime/status",
+                "/__codex_helper/api/v1/runtime/reload",
                 "/__codex_helper/api/v1/retry/config",
-                "/__codex_helper/api/v1/configs",
-                "/__codex_helper/api/v1/configs/runtime",
                 "/__codex_helper/api/v1/stations",
                 "/__codex_helper/api/v1/stations/runtime",
                 "/__codex_helper/api/v1/stations/config-active",
+                "/__codex_helper/api/v1/stations/probe",
                 "/__codex_helper/api/v1/stations/{name}",
                 "/__codex_helper/api/v1/stations/specs",
                 "/__codex_helper/api/v1/stations/specs/{name}",
@@ -4570,15 +5286,16 @@ pub fn router(proxy: ProxyService) -> Router {
                 "/__codex_helper/api/v1/providers/specs/{name}",
                 "/__codex_helper/api/v1/profiles",
                 "/__codex_helper/api/v1/profiles/default",
-                "/__codex_helper/api/v1/profiles/config-default",
+                "/__codex_helper/api/v1/profiles/default/persisted",
                 "/__codex_helper/api/v1/profiles/{name}",
+                "/__codex_helper/api/v1/overrides/session",
                 "/__codex_helper/api/v1/overrides/session/profile",
                 "/__codex_helper/api/v1/overrides/session/model",
                 "/__codex_helper/api/v1/overrides/session/effort",
-                "/__codex_helper/api/v1/overrides/session/config",
+                "/__codex_helper/api/v1/overrides/session/station",
                 "/__codex_helper/api/v1/overrides/session/service-tier",
                 "/__codex_helper/api/v1/overrides/session/reset",
-                "/__codex_helper/api/v1/overrides/global-config",
+                "/__codex_helper/api/v1/overrides/global-station",
                 "/__codex_helper/api/v1/healthcheck/start",
                 "/__codex_helper/api/v1/healthcheck/cancel",
             ]
@@ -4618,18 +5335,17 @@ pub fn router(proxy: ProxyService) -> Router {
         };
         let meta_overrides = proxy
             .state
-            .get_config_meta_overrides(proxy.service_name)
+            .get_station_meta_overrides(proxy.service_name)
             .await;
         let state_overrides = proxy
             .state
-            .get_config_runtime_state_overrides(proxy.service_name)
+            .get_station_runtime_state_overrides(proxy.service_name)
             .await;
-        let configs = crate::dashboard_core::build_config_options_from_mgr(
+        let stations = crate::dashboard_core::build_station_options_from_mgr(
             mgr,
             &meta_overrides,
             &state_overrides,
         );
-        let stations = configs.clone();
         let configured_active_station = configured_active_station_name(mgr);
         let effective_active_station = effective_active_station_name(mgr);
         let default_profile =
@@ -4649,7 +5365,6 @@ pub fn router(proxy: ProxyService) -> Router {
             service_name: proxy.service_name.to_string(),
             runtime_loaded_at_ms: Some(proxy.config.last_loaded_at_ms()),
             runtime_source_mtime_ms: proxy.config.last_mtime_ms().await,
-            configs,
             stations,
             configured_active_station,
             effective_active_station,
@@ -4669,13 +5384,13 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(Json(map))
     }
 
-    async fn list_config_health(
+    async fn list_station_health(
         proxy: ProxyService,
     ) -> Result<
-        Json<std::collections::HashMap<String, crate::state::ConfigHealth>>,
+        Json<std::collections::HashMap<String, crate::state::StationHealth>>,
         (StatusCode, String),
     > {
-        let map = proxy.state.get_config_health(proxy.service_name).await;
+        let map = proxy.state.get_station_health(proxy.service_name).await;
         Ok(Json(map))
     }
 
@@ -4684,7 +5399,27 @@ pub fn router(proxy: ProxyService) -> Router {
         #[serde(default)]
         all: bool,
         #[serde(default)]
-        config_names: Vec<String>,
+        station_names: Vec<String>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct StationProbeRequest {
+        #[serde(default)]
+        station_name: Option<String>,
+    }
+
+    impl StationProbeRequest {
+        fn station_name(&self) -> Result<String, (StatusCode, String)> {
+            self.station_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "station_name is required".to_string(),
+                ))
+        }
     }
 
     #[derive(Debug, serde::Serialize)]
@@ -4694,6 +5429,59 @@ pub fn router(proxy: ProxyService) -> Router {
         missing: Vec<String>,
         cancel_requested: Vec<String>,
         not_running: Vec<String>,
+    }
+
+    async fn spawn_health_checks_for_targets(
+        proxy: &ProxyService,
+        targets: Vec<(String, Vec<crate::config::UpstreamConfig>)>,
+    ) -> HealthCheckActionResult {
+        let mut started = Vec::new();
+        let mut already_running = Vec::new();
+        for (name, upstreams) in targets {
+            let now = now_ms();
+            if !proxy
+                .state
+                .try_begin_station_health_check(proxy.service_name, &name, upstreams.len(), now)
+                .await
+            {
+                already_running.push(name);
+                continue;
+            }
+
+            proxy
+                .state
+                .record_station_health(
+                    proxy.service_name,
+                    name.clone(),
+                    crate::state::StationHealth {
+                        checked_at_ms: now,
+                        upstreams: Vec::new(),
+                    },
+                )
+                .await;
+
+            let state = proxy.state.clone();
+            let service_name = proxy.service_name;
+            let station_name = name.clone();
+            tokio::spawn(async move {
+                crate::healthcheck::run_health_check_for_station(
+                    state,
+                    service_name,
+                    station_name,
+                    upstreams,
+                )
+                .await;
+            });
+            started.push(name);
+        }
+
+        HealthCheckActionResult {
+            started,
+            already_running,
+            missing: Vec::new(),
+            cancel_requested: Vec::new(),
+            not_running: Vec::new(),
+        }
     }
 
     fn now_ms() -> u64 {
@@ -4716,7 +5504,7 @@ pub fn router(proxy: ProxyService) -> Router {
         let mut targets = if payload.all {
             mgr.configs.keys().cloned().collect::<Vec<_>>()
         } else {
-            payload.config_names
+            payload.station_names
         };
         targets.retain(|s| !s.trim().is_empty());
         targets.sort();
@@ -4724,64 +5512,49 @@ pub fn router(proxy: ProxyService) -> Router {
         if targets.is_empty() {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "expected { all: true } or non-empty config_names".to_string(),
+                "expected { all: true } or non-empty station_names".to_string(),
             ));
         }
 
-        let mut started = Vec::new();
-        let mut already_running = Vec::new();
         let mut missing = Vec::new();
+        let mut resolved_targets = Vec::new();
         for name in targets {
             let Some(svc) = mgr.configs.get(&name) else {
                 missing.push(name);
                 continue;
             };
-
-            let upstreams = svc.upstreams.clone();
-            let now = now_ms();
-            if !proxy
-                .state
-                .try_begin_health_check(proxy.service_name, &name, upstreams.len(), now)
-                .await
-            {
-                already_running.push(name);
-                continue;
-            }
-
-            proxy
-                .state
-                .record_config_health(
-                    proxy.service_name,
-                    name.clone(),
-                    crate::state::ConfigHealth {
-                        checked_at_ms: now,
-                        upstreams: Vec::new(),
-                    },
-                )
-                .await;
-
-            let state = proxy.state.clone();
-            let service_name = proxy.service_name;
-            let config_name = name.clone();
-            tokio::spawn(async move {
-                crate::healthcheck::run_health_check_for_config(
-                    state,
-                    service_name,
-                    config_name,
-                    upstreams,
-                )
-                .await;
-            });
-            started.push(name);
+            resolved_targets.push((name, svc.upstreams.clone()));
         }
 
-        Ok(Json(HealthCheckActionResult {
-            started,
-            already_running,
-            missing,
-            cancel_requested: Vec::new(),
-            not_running: Vec::new(),
-        }))
+        let mut result = spawn_health_checks_for_targets(&proxy, resolved_targets).await;
+        result.missing = missing;
+        Ok(Json(result))
+    }
+
+    async fn probe_station(
+        proxy: ProxyService,
+        Json(payload): Json<StationProbeRequest>,
+    ) -> Result<Json<HealthCheckActionResult>, (StatusCode, String)> {
+        let cfg = proxy.config.snapshot().await;
+        let mgr = match proxy.service_name {
+            "claude" => &cfg.claude,
+            _ => &cfg.codex,
+        };
+
+        let station_name = payload.station_name()?;
+        let Some(station) = mgr.configs.get(&station_name) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("station '{}' not found", station_name),
+            ));
+        };
+
+        let result = spawn_health_checks_for_targets(
+            &proxy,
+            vec![(station_name, station.upstreams.clone())],
+        )
+        .await;
+        Ok(Json(result))
     }
 
     async fn cancel_health_checks(
@@ -4797,7 +5570,7 @@ pub fn router(proxy: ProxyService) -> Router {
         let mut targets = if payload.all {
             mgr.configs.keys().cloned().collect::<Vec<_>>()
         } else {
-            payload.config_names
+            payload.station_names
         };
         targets.retain(|s| !s.trim().is_empty());
         targets.sort();
@@ -4805,7 +5578,7 @@ pub fn router(proxy: ProxyService) -> Router {
         if targets.is_empty() {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "expected { all: true } or non-empty config_names".to_string(),
+                "expected { all: true } or non-empty station_names".to_string(),
             ));
         }
 
@@ -4820,7 +5593,7 @@ pub fn router(proxy: ProxyService) -> Router {
             }
             let ok = proxy
                 .state
-                .request_cancel_health_check(proxy.service_name, &name, now)
+                .request_cancel_station_health_check(proxy.service_name, &name, now)
                 .await;
             if ok {
                 cancel_requested.push(name);
@@ -4838,9 +5611,9 @@ pub fn router(proxy: ProxyService) -> Router {
         }))
     }
 
-    async fn list_configs(
+    async fn list_stations(
         proxy: ProxyService,
-    ) -> Result<Json<Vec<crate::dashboard_core::ConfigOption>>, (StatusCode, String)> {
+    ) -> Result<Json<Vec<crate::dashboard_core::StationOption>>, (StatusCode, String)> {
         let cfg = proxy.config.snapshot().await;
         let mgr = match proxy.service_name {
             "claude" => &cfg.claude,
@@ -4848,43 +5621,28 @@ pub fn router(proxy: ProxyService) -> Router {
         };
         let meta_overrides = proxy
             .state
-            .get_config_meta_overrides(proxy.service_name)
+            .get_station_meta_overrides(proxy.service_name)
             .await;
         let state_overrides = proxy
             .state
-            .get_config_runtime_state_overrides(proxy.service_name)
+            .get_station_runtime_state_overrides(proxy.service_name)
             .await;
-        Ok(Json(crate::dashboard_core::build_config_options_from_mgr(
+        Ok(Json(crate::dashboard_core::build_station_options_from_mgr(
             mgr,
             &meta_overrides,
             &state_overrides,
         )))
     }
 
-    async fn list_stations(
-        proxy: ProxyService,
-    ) -> Result<Json<Vec<crate::dashboard_core::StationOption>>, (StatusCode, String)> {
-        let Json(configs) = list_configs(proxy).await?;
-        Ok(Json(configs))
-    }
-
     let admin_access = AdminAccessConfig::from_env();
 
-    let p0 = proxy.clone();
-    let p1 = proxy.clone();
     let p2 = proxy.clone();
-    let p3 = proxy.clone();
-    let p4 = proxy.clone();
-    let p5 = proxy.clone();
-    let p6 = proxy.clone();
-    let p7 = proxy.clone();
     let p8 = proxy.clone();
     let p9 = proxy.clone();
     let p10 = proxy.clone();
     let p11 = proxy.clone();
     let p12 = proxy.clone();
     let p13 = proxy.clone();
-    let p14 = proxy.clone();
     let p15 = proxy.clone();
     let p16 = proxy.clone();
     let p17 = proxy.clone();
@@ -4904,7 +5662,6 @@ pub fn router(proxy: ProxyService) -> Router {
     let p31 = proxy.clone();
     let p32 = proxy.clone();
     let p33 = proxy.clone();
-    let p34 = proxy.clone();
     let p35 = proxy.clone();
     let p36 = proxy.clone();
     let p37 = proxy.clone();
@@ -4921,6 +5678,10 @@ pub fn router(proxy: ProxyService) -> Router {
     let p48 = proxy.clone();
     let p49 = proxy.clone();
     let p50 = proxy.clone();
+    let p51 = proxy.clone();
+    let p52 = proxy.clone();
+    let p53 = proxy.clone();
+    let p56 = proxy.clone();
 
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
@@ -4935,6 +5696,10 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/sessions",
             get(move || list_session_identity_cards(p26.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/sessions/{session_id}",
+            get(move |session_id| get_session_identity_card(p56.clone(), session_id)),
         )
         .route(
             "/__codex_helper/api/v1/status/active",
@@ -4953,15 +5718,15 @@ pub fn router(proxy: ProxyService) -> Router {
             get(move || list_health_checks(p21.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/status/config-health",
-            get(move || list_config_health(p22.clone())),
+            "/__codex_helper/api/v1/status/station-health",
+            get(move || list_station_health(p22.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/config/runtime",
+            "/__codex_helper/api/v1/runtime/status",
             get(move || runtime_config_status(p12.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/config/reload",
+            "/__codex_helper/api/v1/runtime/reload",
             post(move || reload_runtime_config(p13.clone())),
         )
         .route(
@@ -4970,24 +5735,20 @@ pub fn router(proxy: ProxyService) -> Router {
                 .post(move |payload| set_retry_config(p44.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/configs",
-            get(move || list_configs(p14.clone())),
-        )
-        .route(
-            "/__codex_helper/api/v1/configs/runtime",
-            post(move |payload| apply_config_runtime_meta(p34.clone(), payload)),
-        )
-        .route(
             "/__codex_helper/api/v1/stations",
             get(move || list_stations(p35.clone())),
         )
         .route(
             "/__codex_helper/api/v1/stations/runtime",
-            post(move |payload| apply_config_runtime_meta(p36.clone(), payload)),
+            post(move |payload| apply_station_runtime_meta(p36.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/stations/config-active",
             post(move |payload| set_persisted_active_station(p41.clone(), payload)),
+        )
+        .route(
+            "/__codex_helper/api/v1/stations/probe",
+            post(move |payload| probe_station(p51.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/stations/{name}",
@@ -5020,13 +5781,18 @@ pub fn router(proxy: ProxyService) -> Router {
             post(move |payload| set_default_profile(p33.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/profiles/config-default",
+            "/__codex_helper/api/v1/profiles/default/persisted",
             post(move |payload| set_persisted_default_profile(p38.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/profiles/{name}",
             put(move |name, payload| upsert_persisted_profile(p39.clone(), name, payload))
                 .delete(move |name| delete_persisted_profile(p40.clone(), name)),
+        )
+        .route(
+            "/__codex_helper/api/v1/overrides/session",
+            get(move || list_session_manual_overrides(p52.clone()))
+                .post(move |payload| apply_session_manual_overrides(p53.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/overrides/session/profile",
@@ -5039,13 +5805,13 @@ pub fn router(proxy: ProxyService) -> Router {
         )
         .route(
             "/__codex_helper/api/v1/overrides/session/effort",
-            get(move || list_session_overrides(p17.clone()))
-                .post(move |payload| set_session_override(p18.clone(), payload)),
+            get(move || list_session_reasoning_effort_overrides(p17.clone()))
+                .post(move |payload| set_session_reasoning_effort_override(p18.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/session/config",
-            get(move || list_session_config_overrides(p19.clone()))
-                .post(move |payload| set_session_config_override(p20.clone(), payload)),
+            "/__codex_helper/api/v1/overrides/session/station",
+            get(move || list_session_station_overrides(p19.clone()))
+                .post(move |payload| set_session_station_override(p20.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/overrides/session/service-tier",
@@ -5057,9 +5823,9 @@ pub fn router(proxy: ProxyService) -> Router {
             post(move |payload| reset_session_manual_overrides(p50.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/global-config",
-            get(move || get_global_config_override(p27.clone()))
-                .post(move |payload| set_global_config_override(p28.clone(), payload)),
+            "/__codex_helper/api/v1/overrides/global-station",
+            get(move || get_global_station_override(p27.clone()))
+                .post(move |payload| set_global_station_override(p28.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/healthcheck/start",
@@ -5068,28 +5834,6 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/healthcheck/cancel",
             post(move |payload| cancel_health_checks(p30.clone(), payload)),
-        )
-        .route(
-            "/__codex_helper/override/session",
-            get(move || list_session_overrides(p0.clone()))
-                .post(move |payload| set_session_override(p1.clone(), payload)),
-        )
-        .route(
-            "/__codex_helper/config/runtime",
-            get(move || runtime_config_status(p5.clone())),
-        )
-        .route(
-            "/__codex_helper/config/reload",
-            get(move || runtime_config_status(p6.clone()))
-                .post(move || reload_runtime_config(p7.clone())),
-        )
-        .route(
-            "/__codex_helper/status/active",
-            get(move || list_active_requests(p3.clone())),
-        )
-        .route(
-            "/__codex_helper/status/recent",
-            get(move |q| list_recent_finished(p4.clone(), q)),
         )
         .layer(middleware::from_fn_with_state(
             admin_access,

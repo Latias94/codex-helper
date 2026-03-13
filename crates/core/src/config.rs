@@ -267,6 +267,8 @@ impl ServiceConfigManager {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ServiceControlProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
     /// Phase 1 keeps legacy runtime terminology underneath, so `station` currently points to
     /// a legacy config/group name.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "config")]
@@ -277,6 +279,80 @@ pub struct ServiceControlProfile {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+}
+
+fn merge_service_control_profile(
+    mut base: ServiceControlProfile,
+    overlay: &ServiceControlProfile,
+) -> ServiceControlProfile {
+    base.extends = overlay.extends.clone();
+    if overlay.station.is_some() {
+        base.station = overlay.station.clone();
+    }
+    if overlay.model.is_some() {
+        base.model = overlay.model.clone();
+    }
+    if overlay.reasoning_effort.is_some() {
+        base.reasoning_effort = overlay.reasoning_effort.clone();
+    }
+    if overlay.service_tier.is_some() {
+        base.service_tier = overlay.service_tier.clone();
+    }
+    base
+}
+
+pub fn resolve_service_profile_from_catalog(
+    profiles: &BTreeMap<String, ServiceControlProfile>,
+    profile_name: &str,
+) -> Result<ServiceControlProfile> {
+    fn resolve_inner(
+        profiles: &BTreeMap<String, ServiceControlProfile>,
+        profile_name: &str,
+        stack: &mut Vec<String>,
+        cache: &mut BTreeMap<String, ServiceControlProfile>,
+    ) -> Result<ServiceControlProfile> {
+        if let Some(profile) = cache.get(profile_name) {
+            return Ok(profile.clone());
+        }
+
+        if let Some(pos) = stack.iter().position(|name| name == profile_name) {
+            let mut cycle = stack[pos..].to_vec();
+            cycle.push(profile_name.to_string());
+            anyhow::bail!("profile inheritance cycle: {}", cycle.join(" -> "));
+        }
+
+        let profile = profiles
+            .get(profile_name)
+            .with_context(|| format!("profile '{}' not found", profile_name))?;
+
+        stack.push(profile_name.to_string());
+        let resolved = if let Some(parent_name) = profile
+            .extends
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let parent = resolve_inner(profiles, parent_name, stack, cache)?;
+            merge_service_control_profile(parent, profile)
+        } else {
+            profile.clone()
+        };
+        stack.pop();
+
+        cache.insert(profile_name.to_string(), resolved.clone());
+        Ok(resolved)
+    }
+
+    let mut stack = Vec::new();
+    let mut cache = BTreeMap::new();
+    resolve_inner(profiles, profile_name, &mut stack, &mut cache)
+}
+
+pub fn resolve_service_profile(
+    mgr: &ServiceConfigManager,
+    profile_name: &str,
+) -> Result<ServiceControlProfile> {
+    resolve_service_profile_from_catalog(&mgr.profiles, profile_name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,8 +500,9 @@ fn validate_service_profiles(service_name: &str, mgr: &ServiceConfigManager) -> 
         );
     }
 
-    for (profile_name, profile) in &mgr.profiles {
-        validate_profile_station_compatibility(service_name, mgr, profile_name, profile)?;
+    for profile_name in mgr.profiles.keys() {
+        let resolved = resolve_service_profile(mgr, profile_name)?;
+        validate_profile_station_compatibility(service_name, mgr, profile_name, &resolved)?;
     }
 
     Ok(())
@@ -455,6 +532,8 @@ pub struct ResolvedRetryLayerConfig {
 pub struct ResolvedRetryConfig {
     pub upstream: ResolvedRetryLayerConfig,
     pub provider: ResolvedRetryLayerConfig,
+    /// Guarded cross-station failover before any upstream output is committed to the client.
+    pub allow_cross_station_before_first_output: bool,
     pub never_on_status: String,
     pub never_on_class: Vec<String>,
     pub cloudflare_challenge_cooldown_secs: u64,
@@ -508,6 +587,10 @@ pub struct RetryConfig {
     pub upstream: Option<RetryLayerConfig>,
     #[serde(default)]
     pub provider: Option<RetryLayerConfig>,
+    /// Allow automatic failover to another station/config, but only before any output has been
+    /// committed to the client. Session-pinned routes remain sticky regardless of this setting.
+    #[serde(default)]
+    pub allow_cross_station_before_first_output: Option<bool>,
     #[serde(default)]
     pub never_on_status: Option<String>,
     #[serde(default)]
@@ -549,6 +632,7 @@ impl Default for RetryConfig {
             strategy: None,
             upstream: None,
             provider: None,
+            allow_cross_station_before_first_output: None,
             never_on_status: None,
             never_on_class: None,
             cloudflare_challenge_cooldown_secs: None,
@@ -589,6 +673,7 @@ impl RetryProfileName {
                     ],
                     strategy: RetryStrategy::Failover,
                 },
+                allow_cross_station_before_first_output: false,
                 never_on_status: "413,415,422".to_string(),
                 never_on_class: vec!["client_error_non_retryable".to_string()],
                 cloudflare_challenge_cooldown_secs: 300,
@@ -634,6 +719,7 @@ impl RetryProfileName {
                     ],
                     strategy: RetryStrategy::Failover,
                 },
+                allow_cross_station_before_first_output: true,
                 ..RetryProfileName::Balanced.defaults()
             },
             RetryProfileName::CostPrimary => ResolvedRetryConfig {
@@ -641,6 +727,7 @@ impl RetryProfileName {
                     max_attempts: 2,
                     ..RetryProfileName::Balanced.defaults().provider
                 },
+                allow_cross_station_before_first_output: true,
                 transport_cooldown_secs: 30,
                 cooldown_backoff_factor: 2,
                 cooldown_backoff_max_secs: 900,
@@ -729,6 +816,9 @@ impl RetryConfig {
             if let Some(v) = layer.strategy {
                 out.provider.strategy = v;
             }
+        }
+        if let Some(v) = self.allow_cross_station_before_first_output {
+            out.allow_cross_station_before_first_output = v;
         }
         if let Some(v) = self.never_on_status.as_deref() {
             out.never_on_status = v.to_string();
@@ -1072,10 +1162,13 @@ pub struct RoutingCandidate {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServiceRoutingExplanation {
-    pub active_config: Option<String>,
+    #[serde(rename = "active_station")]
+    pub active_station: Option<String>,
     pub mode: &'static str,
-    pub eligible_configs: Vec<RoutingCandidate>,
-    pub fallback_config: Option<RoutingCandidate>,
+    #[serde(rename = "eligible_stations")]
+    pub eligible_stations: Vec<RoutingCandidate>,
+    #[serde(rename = "fallback_station")]
+    pub fallback_station: Option<RoutingCandidate>,
 }
 
 fn merge_string_maps(
@@ -2045,22 +2138,22 @@ pub fn explain_service_routing(mgr: &ServiceConfigManager) -> ServiceRoutingExpl
 
         if !eligible.is_empty() {
             return ServiceRoutingExplanation {
-                active_config: mgr.active.clone(),
+                active_station: mgr.active.clone(),
                 mode: "single_level_multi",
-                eligible_configs: eligible,
-                fallback_config: None,
+                eligible_stations: eligible,
+                fallback_station: None,
             };
         }
 
         return ServiceRoutingExplanation {
-            active_config: mgr.active.clone(),
+            active_station: mgr.active.clone(),
             mode: if active_or_first_config(mgr).is_some() {
-                "single_level_fallback_active_config"
+                "single_level_fallback_active_station"
             } else {
                 "single_level_empty"
             },
-            eligible_configs: Vec::new(),
-            fallback_config: active_or_first_config(mgr)
+            eligible_stations: Vec::new(),
+            fallback_station: active_or_first_config(mgr)
                 .map(|(name, svc)| routing_candidate(&name, svc, active_name)),
         };
     }
@@ -2074,22 +2167,22 @@ pub fn explain_service_routing(mgr: &ServiceConfigManager) -> ServiceRoutingExpl
 
     if !eligible.is_empty() {
         return ServiceRoutingExplanation {
-            active_config: mgr.active.clone(),
+            active_station: mgr.active.clone(),
             mode: "multi_level",
-            eligible_configs: eligible,
-            fallback_config: None,
+            eligible_stations: eligible,
+            fallback_station: None,
         };
     }
 
     ServiceRoutingExplanation {
-        active_config: mgr.active.clone(),
+        active_station: mgr.active.clone(),
         mode: if active_or_first_config(mgr).is_some() {
-            "multi_level_fallback_active_config"
+            "multi_level_fallback_active_station"
         } else {
             "multi_level_empty"
         },
-        eligible_configs: Vec::new(),
-        fallback_config: active_or_first_config(mgr)
+        eligible_stations: Vec::new(),
+        fallback_station: active_or_first_config(mgr)
             .map(|(name, svc)| routing_candidate(&name, svc, active_name)),
     }
 }
@@ -2195,6 +2288,71 @@ mod tests {
         let auth = Some(json);
         let inferred = infer_env_key_from_auth_json(&auth);
         assert!(inferred.is_none());
+    }
+
+    #[test]
+    fn service_routing_explanation_serializes_station_first_fields() {
+        let mut mgr = ServiceConfigManager {
+            active: Some("alpha".to_string()),
+            ..Default::default()
+        };
+        mgr.configs.insert(
+            "alpha".to_string(),
+            ServiceConfig {
+                name: "alpha".to_string(),
+                alias: None,
+                enabled: true,
+                level: 1,
+                upstreams: vec![UpstreamConfig {
+                    base_url: "https://alpha.example/v1".to_string(),
+                    auth: UpstreamAuth::default(),
+                    tags: HashMap::new(),
+                    supported_models: HashMap::new(),
+                    model_mapping: HashMap::new(),
+                }],
+            },
+        );
+
+        let explanation = explain_service_routing(&mgr);
+        let json = serde_json::to_value(&explanation).expect("serialize routing explanation");
+
+        assert_eq!(
+            json.get("active_station").and_then(|v| v.as_str()),
+            Some("alpha")
+        );
+        assert!(json.get("active_config").is_none());
+        assert!(json.get("eligible_stations").is_some());
+        assert!(json.get("eligible_configs").is_none());
+        assert!(json.get("fallback_station").is_some_and(|v| v.is_null()));
+        assert!(json.get("fallback_config").is_none());
+    }
+
+    #[test]
+    fn service_routing_explanation_uses_station_first_fallback_mode_names() {
+        let mut mgr = ServiceConfigManager {
+            active: Some("alpha".to_string()),
+            ..Default::default()
+        };
+        mgr.configs.insert(
+            "alpha".to_string(),
+            ServiceConfig {
+                name: "alpha".to_string(),
+                alias: None,
+                enabled: true,
+                level: 1,
+                upstreams: Vec::new(),
+            },
+        );
+
+        let explanation = explain_service_routing(&mgr);
+        assert_eq!(explanation.mode, "single_level_fallback_active_station");
+        assert_eq!(
+            explanation
+                .fallback_station
+                .as_ref()
+                .map(|candidate| candidate.name.as_str()),
+            Some("alpha")
+        );
     }
 
     struct ScopedEnv {
@@ -2537,6 +2695,7 @@ env_key = "RIGHTCODE_API_KEY"
         assert_eq!(resolved.transport_cooldown_secs, 30);
         assert_eq!(resolved.cooldown_backoff_factor, 1);
         assert_eq!(resolved.cooldown_backoff_max_secs, 600);
+        assert!(!resolved.allow_cross_station_before_first_output);
     }
 
     #[test]
@@ -2550,6 +2709,7 @@ env_key = "RIGHTCODE_API_KEY"
         assert_eq!(resolved.cooldown_backoff_factor, 2);
         assert_eq!(resolved.cooldown_backoff_max_secs, 900);
         assert_eq!(resolved.transport_cooldown_secs, 30);
+        assert!(resolved.allow_cross_station_before_first_output);
     }
 
     #[test]
@@ -2579,6 +2739,7 @@ env_key = "RIGHTCODE_API_KEY"
                 .iter()
                 .any(|c| c == "client_error_non_retryable")
         );
+        assert!(resolved.allow_cross_station_before_first_output);
     }
 
     #[test]
@@ -2593,6 +2754,18 @@ env_key = "RIGHTCODE_API_KEY"
         let resolved = cfg.resolve();
         assert_eq!(resolved.upstream.max_attempts, 5);
         assert_eq!(resolved.upstream.strategy, RetryStrategy::Failover);
+        assert!(!resolved.allow_cross_station_before_first_output);
+    }
+
+    #[test]
+    fn retry_profile_allows_explicit_cross_station_override() {
+        let cfg = RetryConfig {
+            profile: Some(RetryProfileName::AggressiveFailover),
+            allow_cross_station_before_first_output: Some(false),
+            ..RetryConfig::default()
+        };
+        let resolved = cfg.resolve();
+        assert!(!resolved.allow_cross_station_before_first_output);
     }
 
     #[test]
@@ -3395,6 +3568,93 @@ preferred = true
                 svc.upstreams[0].tags.get("provider_id").map(|s| s.as_str()),
                 Some("openai")
             );
+        });
+    }
+
+    #[test]
+    fn load_config_supports_profile_extends() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 2
+
+[codex]
+default_profile = "fast"
+
+[codex.profiles.base]
+station = "primary"
+model = "gpt-5.4"
+service_tier = "priority"
+
+[codex.profiles.fast]
+extends = "base"
+reasoning_effort = "low"
+
+[codex.providers.openai]
+[codex.providers.openai.auth]
+auth_token_env = "OPENAI_API_KEY"
+[codex.providers.openai.endpoints.default]
+base_url = "https://api.example.com/v1"
+
+[codex.stations.primary]
+level = 1
+
+[[codex.stations.primary.members]]
+provider = "openai"
+endpoint_names = ["default"]
+"#,
+            );
+
+            let cfg = super::load_config().await.expect("load inherited profiles");
+            let fast = cfg.codex.profiles.get("fast").expect("fast profile");
+            assert_eq!(fast.extends.as_deref(), Some("base"));
+            assert_eq!(fast.reasoning_effort.as_deref(), Some("low"));
+
+            let resolved =
+                super::resolve_service_profile(&cfg.codex, "fast").expect("resolve fast profile");
+            assert_eq!(resolved.station.as_deref(), Some("primary"));
+            assert_eq!(resolved.model.as_deref(), Some("gpt-5.4"));
+            assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(resolved.service_tier.as_deref(), Some("priority"));
+        });
+    }
+
+    #[test]
+    fn load_config_rejects_profile_extends_cycle() {
+        let _env = setup_temp_codex_home();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async move {
+            let dir = super::proxy_home_dir();
+            let toml_path = dir.join("config.toml");
+            write_file(
+                &toml_path,
+                r#"
+version = 2
+
+[codex.profiles.alpha]
+extends = "beta"
+
+[codex.profiles.beta]
+extends = "alpha"
+"#,
+            );
+
+            let err = super::load_config().await.expect_err("load should fail");
+            assert!(err.to_string().contains("profile inheritance cycle"));
+            assert!(err.to_string().contains("alpha -> beta -> alpha"));
         });
     }
 

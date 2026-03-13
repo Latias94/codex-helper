@@ -41,7 +41,7 @@ pub(crate) fn infer_env_key_from_auth_json(
 pub struct SyncCodexAuthFromCodexOptions {
     /// Add missing providers found in ~/.codex/config.toml into ~/.codex-helper/config.
     pub add_missing: bool,
-    /// Also set codex-helper active config to match Codex CLI's current model_provider.
+    /// Also set codex-helper active station to match Codex CLI's current model_provider.
     pub set_active: bool,
     /// Override existing inline secrets and non-codex-source upstreams (use with care).
     pub force: bool,

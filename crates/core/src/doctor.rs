@@ -67,11 +67,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                     status: DoctorStatus::Ok,
                     message: match lang {
                         DoctorLang::Zh => format!(
-                            "已从 ~/.codex-helper/config.json 读取到 {} 条 Codex 配置（active = {:?}）",
+                            "已从 ~/.codex-helper/config.json 读取到 {} 条 Codex 站点配置（active_station = {:?}）",
                             codex_count, cfg.codex.active
                         ),
                         DoctorLang::En => format!(
-                            "Loaded {} Codex configs from ~/.codex-helper/config.json (active = {:?})",
+                            "Loaded {} Codex stations from ~/.codex-helper/config.json (active_station = {:?})",
                             codex_count, cfg.codex.active
                         ),
                     },
@@ -98,11 +98,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                             status: DoctorStatus::Warn,
                             message: match lang {
                                 DoctorLang::Zh => format!(
-                                    "{} active config '{}' upstream[{}] 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
+                                    "{} active station '{}' upstream[{}] 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
                                     svc_label, active_name, idx, env_name
                                 ),
                                 DoctorLang::En => format!(
-                                    "{} active config '{}' upstream[{}] is missing env var {} (Bearer token); set it before running codex-helper",
+                                    "{} active station '{}' upstream[{}] is missing env var {} (Bearer token); set it before running codex-helper",
                                     svc_label, active_name, idx, env_name
                                 ),
                             },
@@ -116,11 +116,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                             status: DoctorStatus::Warn,
                             message: match lang {
                                 DoctorLang::Zh => format!(
-                                    "{} active config '{}' upstream[{}] 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
+                                    "{} active station '{}' upstream[{}] 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
                                     svc_label, active_name, idx, env_name
                                 ),
                                 DoctorLang::En => format!(
-                                    "{} active config '{}' upstream[{}] is missing env var {} (X-API-Key); set it before running codex-helper",
+                                    "{} active station '{}' upstream[{}] is missing env var {} (X-API-Key); set it before running codex-helper",
                                     svc_label, active_name, idx, env_name
                                 ),
                             },
@@ -142,11 +142,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                             status: DoctorStatus::Warn,
                             message: match lang {
                                 DoctorLang::Zh => format!(
-                                    "{} active config '{}' upstream[{}] 在 ~/.codex-helper/config.json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
+                                    "{} active station '{}' upstream[{}] 在 ~/.codex-helper/config.json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
                                     svc_label, active_name, idx
                                 ),
                                 DoctorLang::En => format!(
-                                    "{} active config '{}' upstream[{}] contains plaintext secrets in ~/.codex-helper/config.json (prefer auth_token_env/api_key_env)",
+                                    "{} active station '{}' upstream[{}] contains plaintext secrets in ~/.codex-helper/config.json (prefer auth_token_env/api_key_env)",
                                     svc_label, active_name, idx
                                 ),
                             },
