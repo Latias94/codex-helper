@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::body::{Body, Bytes, to_bytes};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
+use axum::body::{Body, to_bytes};
+use axum::http::{HeaderMap, Request, Response, StatusCode};
 use reqwest::Client;
 use std::sync::OnceLock;
 use tracing::instrument;
@@ -11,6 +11,7 @@ use tracing::instrument;
 mod admin;
 mod api_responses;
 mod attempt_failures;
+mod attempt_request;
 mod auth_resolution;
 mod classify;
 mod client_identity;
@@ -31,6 +32,7 @@ mod route_provenance;
 mod router_setup;
 mod runtime_admin_api;
 mod runtime_config;
+mod selected_upstream_request;
 mod session_overrides;
 mod stations_api;
 mod stream;
@@ -54,14 +56,14 @@ pub use self::admin::{
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
 use self::attempt_failures::apply_terminal_upstream_failure;
-use self::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
+use self::attempt_request::{AttemptRequestSetupParams, prepare_attempt_request};
 use self::classify::{class_is_health_neutral, classify_upstream_response};
 use self::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
-use self::headers::{filter_request_headers, filter_response_headers};
+use self::headers::filter_response_headers;
 use self::http_debug::format_reqwest_error_for_retry_chain;
 use self::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use self::profile_defaults::effective_default_profile_name;
-use self::request_body::{apply_model_override, extract_service_tier_from_response_body};
+use self::request_body::extract_service_tier_from_response_body;
 use self::request_failures::{
     finish_failed_proxy_request, log_client_body_read_error, log_no_routable_station,
     no_upstreams_available_error,
@@ -74,11 +76,13 @@ use self::retry::{
     backoff_sleep, retry_info_for_chain, retry_plan, retry_sleep, should_never_retry,
     should_retry_class, should_retry_status,
 };
-use self::route_provenance::build_route_decision_provenance;
 pub use self::router_setup::{
     admin_listener_router, proxy_only_router, proxy_only_router_with_admin_base_url, router,
 };
 use self::runtime_config::RuntimeConfig;
+use self::selected_upstream_request::{
+    SelectedUpstreamRequestSetupParams, prepare_selected_upstream_request,
+};
 use self::stream::{SseSuccessMeta, build_sse_success_response};
 
 pub const ADMIN_TOKEN_ENV_VAR: &str = "CODEX_HELPER_ADMIN_TOKEN";
@@ -600,51 +604,32 @@ pub async fn handle_proxy(
                 break 'upstreams;
             };
 
-            let mut model_note = "-".to_string();
-            let mut body_for_selected = body_for_upstream.clone();
-            if let Some(ref requested_model) = request_model {
-                let effective_model = model_routing::effective_model(
-                    &selected.upstream.model_mapping,
-                    requested_model,
-                );
-                if effective_model != *requested_model {
-                    if let Some(modified) =
-                        apply_model_override(body_for_upstream.as_ref(), effective_model.as_str())
-                    {
-                        body_for_selected = Bytes::from(modified);
-                    }
-                    model_note = format!("{requested_model}->{effective_model}");
-                } else {
-                    model_note = requested_model.clone();
-                }
-            }
-            let provider_id = selected.upstream.tags.get("provider_id").cloned();
-            let route_decision = build_route_decision_provenance(
-                now_ms(),
-                session_binding.as_ref(),
-                session_override_config.as_deref(),
-                global_station_override.as_deref(),
-                override_model.as_deref(),
-                override_effort.as_deref(),
-                override_service_tier.as_deref(),
-                request_model.as_deref(),
-                effective_effort.as_deref(),
-                effective_service_tier.as_deref(),
-                &selected,
-                provider_id.as_deref(),
-            );
-
-            let filtered_body = proxy.filter.apply_bytes(body_for_selected);
-            let upstream_request_body_len = filtered_body.len();
-            let upstream_body_previews = build_body_previews(
-                &filtered_body,
-                request_flavor.client_content_type.as_deref(),
-                request_body_previews,
-                debug_max,
-                warn_max,
-            );
-            let upstream_request_body_debug = upstream_body_previews.debug.clone();
-            let upstream_request_body_warn = upstream_body_previews.warn.clone();
+            let selected_setup =
+                prepare_selected_upstream_request(SelectedUpstreamRequestSetupParams {
+                    proxy: &proxy,
+                    selected: &selected,
+                    body_for_upstream: &body_for_upstream,
+                    request_model: request_model.as_deref(),
+                    session_binding: session_binding.as_ref(),
+                    session_override_config: session_override_config.as_deref(),
+                    global_station_override: global_station_override.as_deref(),
+                    override_model: override_model.as_deref(),
+                    override_effort: override_effort.as_deref(),
+                    override_service_tier: override_service_tier.as_deref(),
+                    effective_effort: effective_effort.as_deref(),
+                    effective_service_tier: effective_service_tier.as_deref(),
+                    client_content_type: request_flavor.client_content_type.as_deref(),
+                    request_body_previews,
+                    debug_max,
+                    warn_max,
+                });
+            let model_note = selected_setup.model_note;
+            let provider_id = selected_setup.provider_id;
+            let route_decision = selected_setup.route_decision;
+            let filtered_body = selected_setup.filtered_body;
+            let upstream_request_body_len = selected_setup.upstream_request_body_len;
+            let upstream_request_body_debug = selected_setup.upstream_request_body_debug;
+            let upstream_request_body_warn = selected_setup.upstream_request_body_warn;
 
             // Layer 1: retry the same upstream a small number of times.
             for upstream_attempt in 0..upstream_opt.max_attempts {
@@ -701,36 +686,23 @@ pub async fn handle_proxy(
                     }
                 };
 
-                // copy headers, stripping host/content-length and hop-by-hop.
-                // auth headers:
-                // - if upstream config provides a token/key, override client values;
-                // - otherwise, preserve client Authorization / X-API-Key (required for requires_openai_auth=true providers).
-                let mut headers = filter_request_headers(&client_headers);
-                let client_has_auth = headers.contains_key("authorization");
-                let (token, _token_src) = resolve_auth_token_with_source(
-                    proxy.service_name,
-                    &selected.upstream.auth,
-                    client_has_auth,
-                );
-                if let Some(token) = token
-                    && let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}"))
-                {
-                    headers.insert(HeaderName::from_static("authorization"), v);
-                }
-
-                let client_has_x_api_key = headers.contains_key("x-api-key");
-                let (api_key, _api_key_src) = resolve_api_key_with_source(
-                    proxy.service_name,
-                    &selected.upstream.auth,
-                    client_has_x_api_key,
-                );
-                if let Some(key) = api_key
-                    && let Ok(v) = HeaderValue::from_str(&key)
-                {
-                    headers.insert(HeaderName::from_static("x-api-key"), v);
-                }
-
-                let upstream_request_headers = headers.clone();
+                let attempt_request = prepare_attempt_request(AttemptRequestSetupParams {
+                    proxy: &proxy,
+                    auth: &selected.upstream.auth,
+                    client_headers: &client_headers,
+                    client_headers_entries_cache: &client_headers_entries_cache,
+                    request_body_len,
+                    upstream_request_body_len,
+                    debug_max,
+                    warn_max,
+                    client_uri: client_uri.as_str(),
+                    target_url: target_url.as_str(),
+                    client_body_debug: client_body_debug.as_ref(),
+                    upstream_request_body_debug: upstream_request_body_debug.as_ref(),
+                    client_body_warn: client_body_warn.as_ref(),
+                    upstream_request_body_warn: upstream_request_body_warn.as_ref(),
+                });
+                let headers = attempt_request.headers;
                 proxy
                     .state
                     .update_request_route(
@@ -741,28 +713,7 @@ pub async fn handle_proxy(
                         Some(route_decision.clone()),
                     )
                     .await;
-
-                let debug_base = if debug_max > 0 || warn_max > 0 {
-                    Some(HttpDebugBase {
-                        debug_max_body_bytes: debug_max,
-                        warn_max_body_bytes: warn_max,
-                        request_body_len,
-                        upstream_request_body_len,
-                        client_uri: uri.to_string(),
-                        target_url: target_url.to_string(),
-                        client_headers: client_headers_entries_cache
-                            .get_or_init(|| header_map_to_entries(&client_headers))
-                            .clone(),
-                        upstream_request_headers: header_map_to_entries(&upstream_request_headers),
-                        auth_resolution: None,
-                        client_body_debug: client_body_debug.clone(),
-                        upstream_request_body_debug: upstream_request_body_debug.clone(),
-                        client_body_warn: client_body_warn.clone(),
-                        upstream_request_body_warn: upstream_request_body_warn.clone(),
-                    })
-                } else {
-                    None
-                };
+                let debug_base = attempt_request.debug_base;
 
                 let builder = proxy
                     .client
