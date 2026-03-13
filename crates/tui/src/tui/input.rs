@@ -14,14 +14,12 @@ use crate::config::{
     proxy_home_dir,
     storage::{load_config, save_config},
 };
-use crate::dashboard_core::{
-    ControlProfileOption, build_model_options_from_mgr, build_profile_options_from_mgr,
-};
+use crate::dashboard_core::{ControlProfileOption, build_model_options_from_mgr};
 use crate::sessions::{
     SessionSummary, SessionSummarySource, find_codex_session_file_by_id, read_codex_session_meta,
     read_codex_session_transcript,
 };
-use crate::state::{ConfigHealth, FinishedRequest, ProxyState, UpstreamHealth};
+use crate::state::{FinishedRequest, ProxyState, StationHealth, UpstreamHealth};
 
 use super::Language;
 use super::model::{
@@ -35,6 +33,13 @@ use super::state::{
     CodexHistoryExternalFocusOrigin, RecentCodexRow, UiState, adjust_table_selection,
 };
 use super::types::{EffortChoice, Focus, Overlay, Page, ServiceTierChoice, StatsFocus};
+
+#[derive(Debug, serde::Deserialize)]
+struct ProfileControlResponse {
+    configured_default_profile: Option<String>,
+    default_profile: Option<String>,
+    profiles: Vec<ControlProfileOption>,
+}
 
 pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
     matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -148,33 +153,33 @@ pub(in crate::tui) async fn handle_key_event(
             }
             _ => false,
         },
-        Overlay::ConfigInfo => match key.code {
+        Overlay::StationInfo => match key.code {
             KeyCode::Esc | KeyCode::Char('i') => {
                 ui.overlay = Overlay::None;
                 true
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                ui.config_info_scroll = ui.config_info_scroll.saturating_sub(1);
+                ui.station_info_scroll = ui.station_info_scroll.saturating_sub(1);
                 true
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                ui.config_info_scroll = ui.config_info_scroll.saturating_add(1);
+                ui.station_info_scroll = ui.station_info_scroll.saturating_add(1);
                 true
             }
             KeyCode::PageUp => {
-                ui.config_info_scroll = ui.config_info_scroll.saturating_sub(10);
+                ui.station_info_scroll = ui.station_info_scroll.saturating_sub(10);
                 true
             }
             KeyCode::PageDown => {
-                ui.config_info_scroll = ui.config_info_scroll.saturating_add(10);
+                ui.station_info_scroll = ui.station_info_scroll.saturating_add(10);
                 true
             }
             KeyCode::Home | KeyCode::Char('g') => {
-                ui.config_info_scroll = 0;
+                ui.station_info_scroll = 0;
                 true
             }
             KeyCode::End | KeyCode::Char('G') => {
-                ui.config_info_scroll = u16::MAX;
+                ui.station_info_scroll = u16::MAX;
                 true
             }
             KeyCode::Char('L') => {
@@ -192,7 +197,11 @@ pub(in crate::tui) async fn handle_key_event(
         Overlay::ServiceTierInputSession => {
             handle_key_service_tier_input(&state, ui, snapshot, key).await
         }
-        Overlay::ProfileMenuSession => handle_key_profile_menu(&state, ui, snapshot, key).await,
+        Overlay::ProfileMenuSession
+        | Overlay::ProfileMenuDefaultRuntime
+        | Overlay::ProfileMenuDefaultPersisted => {
+            handle_key_profile_menu(&state, ui, snapshot, key).await
+        }
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             handle_key_provider_menu(&state, providers, ui, snapshot, key).await
         }
@@ -202,7 +211,7 @@ pub(in crate::tui) async fn handle_key_event(
 fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
     let page = match code {
         KeyCode::Char('1') => Some(Page::Dashboard),
-        KeyCode::Char('2') => Some(Page::Configs),
+        KeyCode::Char('2') => Some(Page::Stations),
         KeyCode::Char('3') => Some(Page::Sessions),
         KeyCode::Char('4') => Some(Page::Requests),
         KeyCode::Char('5') => Some(Page::Stats),
@@ -213,14 +222,14 @@ fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
     };
     if let Some(p) = page {
         ui.page = p;
-        if ui.page == Page::Configs {
-            ui.focus = Focus::Configs;
+        if ui.page == Page::Stations {
+            ui.focus = Focus::Stations;
         } else if ui.page == Page::Requests {
             ui.focus = Focus::Requests;
         } else if ui.page == Page::Sessions
             || ui.page == Page::History
             || ui.page == Page::Recent
-            || (ui.page == Page::Dashboard && ui.focus == Focus::Configs)
+            || (ui.page == Page::Dashboard && ui.focus == Focus::Stations)
         {
             ui.focus = Focus::Sessions;
         }
@@ -258,18 +267,29 @@ fn apply_selected_session(ui: &mut UiState, snapshot: &Snapshot, idx: usize) {
         .select(if req_len == 0 { None } else { Some(0) });
 }
 
-async fn load_profile_options_for_service(
-    service_name: &str,
-) -> anyhow::Result<Vec<ControlProfileOption>> {
-    let cfg = load_config().await?;
-    let mgr = match service_name {
-        "claude" => &cfg.claude,
-        _ => &cfg.codex,
-    };
-    Ok(build_profile_options_from_mgr(
-        mgr,
-        mgr.default_profile.as_deref(),
-    ))
+pub(in crate::tui) async fn refresh_profile_control_state(ui: &mut UiState) -> anyhow::Result<()> {
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/__codex_helper/api/v1/profiles",
+            ui.admin_port
+        ))
+        .timeout(Duration::from_millis(1200))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<ProfileControlResponse>()
+        .await?;
+
+    ui.configured_default_profile = response.configured_default_profile.clone();
+    ui.effective_default_profile = response.default_profile.clone();
+    ui.runtime_default_profile_override =
+        if response.default_profile != response.configured_default_profile {
+            response.default_profile.clone()
+        } else {
+            None
+        };
+    ui.profile_options = response.profiles;
+    Ok(())
 }
 
 fn default_profile_menu_idx(
@@ -284,6 +304,62 @@ fn default_profile_menu_idx(
             .unwrap_or(0),
         None => usize::from(!profiles.is_empty()),
     }
+}
+
+fn runtime_default_profile_menu_idx(
+    profiles: &[ControlProfileOption],
+    runtime_default_profile_override: Option<&str>,
+) -> usize {
+    match runtime_default_profile_override {
+        Some(name) => default_profile_menu_idx(profiles, Some(name)),
+        None => 0,
+    }
+}
+
+async fn apply_runtime_default_profile(
+    ui: &UiState,
+    profile_name: Option<String>,
+) -> anyhow::Result<()> {
+    reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{}/__codex_helper/api/v1/profiles/default",
+            ui.admin_port
+        ))
+        .timeout(Duration::from_millis(1200))
+        .json(&serde_json::json!({
+            "profile_name": profile_name,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+async fn apply_persisted_default_profile(
+    ui: &UiState,
+    profile_name: Option<String>,
+) -> anyhow::Result<()> {
+    reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{}/__codex_helper/api/v1/profiles/default/persisted",
+            ui.admin_port
+        ))
+        .timeout(Duration::from_millis(1200))
+        .json(&serde_json::json!({
+            "profile_name": profile_name,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+fn default_profile_label(value: Option<&str>, fallback: &str) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 fn profile_menu_max_idx(profiles: &[ControlProfileOption]) -> usize {
@@ -439,10 +515,10 @@ fn session_history_bridge_summary(row: &SessionRow) -> String {
     let mut parts = vec![
         format!(
             "station={}",
-            row.effective_config_name
+            row.effective_station
                 .as_ref()
                 .map(|value| value.value.as_str())
-                .or(row.last_config_name.as_deref())
+                .or(row.last_station_name.as_deref())
                 .unwrap_or("auto")
         ),
         format!(
@@ -475,7 +551,7 @@ fn request_history_bridge_summary(request: &FinishedRequest) -> String {
     let mut parts = vec![
         format!(
             "station={}",
-            request.config_name.as_deref().unwrap_or("auto")
+            request.station_name.as_deref().unwrap_or("auto")
         ),
         format!("model={}", request.model.as_deref().unwrap_or("auto")),
         format!("tier={}", request.service_tier.as_deref().unwrap_or("auto")),
@@ -645,9 +721,9 @@ async fn apply_session_profile(
 async fn apply_session_provider_override(state: &ProxyState, sid: String, cfg: Option<String>) {
     let now = now_ms();
     if let Some(cfg) = cfg {
-        state.set_session_config_override(sid, cfg, now).await;
+        state.set_session_station_override(sid, cfg, now).await;
     } else {
-        state.clear_session_config_override(&sid).await;
+        state.clear_session_station_override(&sid).await;
     }
 }
 
@@ -663,8 +739,8 @@ async fn apply_global_active_config(
     cfg_name: Option<String>,
 ) -> anyhow::Result<()> {
     // Do not pin routing via runtime override; only persist the preferred config (active),
-    // so failover across configs remains possible.
-    state.clear_global_config_override().await;
+    // so failover across stations remains possible.
+    state.clear_global_station_override().await;
 
     let mut cfg = load_config().await?;
     if ui.service_name == "codex" {
@@ -694,7 +770,7 @@ async fn apply_global_active_config(
 
     // Best-effort: ask the running server to reload immediately.
     let url = format!(
-        "http://127.0.0.1:{}/__codex_helper/config/reload",
+        "http://127.0.0.1:{}/__codex_helper/api/v1/runtime/reload",
         ui.admin_port
     );
     let _ = reqwest::Client::new().post(&url).send().await;
@@ -704,9 +780,9 @@ async fn apply_global_active_config(
     Ok(())
 }
 
-async fn persist_config_meta(
+async fn persist_station_meta(
     ui: &UiState,
-    config_name: &str,
+    station_name: &str,
     enabled: Option<bool>,
     level: Option<u8>,
 ) -> anyhow::Result<()> {
@@ -716,8 +792,8 @@ async fn persist_config_meta(
     } else {
         &mut cfg.codex
     };
-    let Some(svc) = mgr.configs.get_mut(config_name) else {
-        anyhow::bail!("config '{config_name}' not found");
+    let Some(svc) = mgr.configs.get_mut(station_name) else {
+        anyhow::bail!("station '{station_name}' not found");
     };
     if let Some(enabled) = enabled {
         svc.enabled = enabled;
@@ -809,7 +885,7 @@ fn health_check_upstream_concurrency() -> usize {
         .min(32)
 }
 
-fn health_check_max_inflight_configs() -> usize {
+fn health_check_max_inflight_stations() -> usize {
     std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
@@ -818,7 +894,7 @@ fn health_check_max_inflight_configs() -> usize {
         .min(16)
 }
 
-fn health_check_config_semaphore() -> &'static OnceCell<Arc<Semaphore>> {
+fn health_check_station_semaphore() -> &'static OnceCell<Arc<Semaphore>> {
     static SEM: OnceCell<Arc<Semaphore>> = OnceCell::const_new();
     &SEM
 }
@@ -872,9 +948,9 @@ async fn probe_upstream(client: &reqwest::Client, upstream: &UpstreamConfig) -> 
     out
 }
 
-async fn load_upstreams_for_config(
+async fn load_upstreams_for_station(
     service_name: &str,
-    config_name: &str,
+    station_name: &str,
 ) -> anyhow::Result<Vec<UpstreamConfig>> {
     let cfg = load_config().await?;
     let mgr = if service_name == "claude" {
@@ -882,16 +958,16 @@ async fn load_upstreams_for_config(
     } else {
         &cfg.codex
     };
-    let Some(svc) = mgr.configs.get(config_name) else {
-        anyhow::bail!("config '{config_name}' not found");
+    let Some(svc) = mgr.configs.get(station_name) else {
+        anyhow::bail!("station '{station_name}' not found");
     };
     Ok(svc.upstreams.clone())
 }
 
-async fn run_health_check_for_config(
+async fn run_health_check_for_station(
     state: Arc<ProxyState>,
     service_name: &'static str,
-    config_name: String,
+    station_name: String,
     upstreams: Vec<UpstreamConfig>,
 ) {
     let timeout = health_check_timeout();
@@ -904,9 +980,9 @@ async fn run_health_check_for_config(
         Err(err) => {
             let now = now_ms();
             state
-                .record_health_check_result(
+                .record_station_health_check_result(
                     service_name,
-                    &config_name,
+                    &station_name,
                     now,
                     UpstreamHealth {
                         base_url: "<client>".to_string(),
@@ -914,11 +990,12 @@ async fn run_health_check_for_config(
                         status_code: None,
                         latency_ms: None,
                         error: Some(shorten_err(&err.to_string(), 140)),
+                        passive: None,
                     },
                 )
                 .await;
             state
-                .finish_health_check(service_name, &config_name, now, false)
+                .finish_station_health_check(service_name, &station_name, now, false)
                 .await;
             return;
         }
@@ -940,10 +1017,10 @@ async fn run_health_check_for_config(
     while let Some(up) = futs.next().await {
         let now = now_ms();
         state
-            .record_health_check_result(service_name, &config_name, now, up)
+            .record_station_health_check_result(service_name, &station_name, now, up)
             .await;
         if state
-            .is_health_check_cancel_requested(service_name, &config_name)
+            .is_station_health_check_cancel_requested(service_name, &station_name)
             .await
         {
             canceled = true;
@@ -953,7 +1030,7 @@ async fn run_health_check_for_config(
 
     let now = now_ms();
     state
-        .finish_health_check(service_name, &config_name, now, canceled)
+        .finish_station_health_check(service_name, &station_name, now, canceled)
         .await;
 }
 
@@ -1148,8 +1225,9 @@ async fn handle_key_normal(
 
                     *providers = crate::tui::build_provider_options(&cfg, ui.service_name);
                     ui.clamp_selection(snapshot, providers.len());
+                    let _ = refresh_profile_control_state(ui).await;
                     ui.toast = Some((
-                        format!("overwrote configs from ~/.codex (n={})", providers.len()),
+                        format!("overwrote stations from ~/.codex (n={})", providers.len()),
                         Instant::now(),
                     ));
                     true
@@ -1163,7 +1241,7 @@ async fn handle_key_normal(
         KeyCode::Char('R') if ui.page == Page::Settings => {
             let now = Instant::now();
             let url = format!(
-                "http://127.0.0.1:{}/__codex_helper/config/reload",
+                "http://127.0.0.1:{}/__codex_helper/api/v1/runtime/reload",
                 ui.admin_port
             );
             let res = async {
@@ -1190,6 +1268,7 @@ async fn handle_key_normal(
                         .and_then(|x| x.get("retry"))
                         .and_then(|x| serde_json::from_value(x.clone()).ok());
                     ui.last_runtime_config_refresh_at = Some(now);
+                    let _ = refresh_profile_control_state(ui).await;
 
                     let changed = v.get("reloaded").and_then(|x| x.as_bool()).unwrap_or(false);
                     ui.toast = Some((
@@ -1221,9 +1300,9 @@ async fn handle_key_normal(
                 }
             }
         }
-        KeyCode::Char('i') if ui.page == Page::Configs => {
-            ui.overlay = Overlay::ConfigInfo;
-            ui.config_info_scroll = 0;
+        KeyCode::Char('i') if ui.page == Page::Stations => {
+            ui.overlay = Overlay::StationInfo;
+            ui.station_info_scroll = 0;
             true
         }
         KeyCode::Tab => {
@@ -1231,20 +1310,20 @@ async fn handle_key_normal(
                 ui.focus = match ui.focus {
                     Focus::Sessions => Focus::Requests,
                     Focus::Requests => Focus::Sessions,
-                    Focus::Configs => Focus::Sessions,
+                    Focus::Stations => Focus::Sessions,
                 };
-            } else if ui.page == Page::Configs {
-                ui.focus = Focus::Configs;
+            } else if ui.page == Page::Stations {
+                ui.focus = Focus::Stations;
             } else if ui.page == Page::Stats {
                 ui.stats_focus = match ui.stats_focus {
-                    StatsFocus::Configs => StatsFocus::Providers,
-                    StatsFocus::Providers => StatsFocus::Configs,
+                    StatsFocus::Stations => StatsFocus::Providers,
+                    StatsFocus::Providers => StatsFocus::Stations,
                 };
                 ui.toast = Some((
                     format!(
                         "stats focus: {}",
                         match ui.stats_focus {
-                            StatsFocus::Configs => "configs",
+                            StatsFocus::Stations => "stations",
                             StatsFocus::Providers => "providers",
                         }
                     ),
@@ -1253,24 +1332,25 @@ async fn handle_key_normal(
             }
             true
         }
-        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Configs => {
-            if let Some(next) = adjust_table_selection(&mut ui.configs_table, -1, providers.len()) {
-                ui.selected_config_idx = next;
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stations => {
+            if let Some(next) = adjust_table_selection(&mut ui.stations_table, -1, providers.len())
+            {
+                ui.selected_station_idx = next;
                 return true;
             }
             false
         }
-        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Configs => {
-            if let Some(next) = adjust_table_selection(&mut ui.configs_table, 1, providers.len()) {
-                ui.selected_config_idx = next;
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stations => {
+            if let Some(next) = adjust_table_selection(&mut ui.stations_table, 1, providers.len()) {
+                ui.selected_station_idx = next;
                 return true;
             }
             false
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stats => {
             let (table, len) = match ui.stats_focus {
-                StatsFocus::Configs => (
-                    &mut ui.stats_configs_table,
+                StatsFocus::Stations => (
+                    &mut ui.stats_stations_table,
                     snapshot.usage_rollup.by_config.len(),
                 ),
                 StatsFocus::Providers => (
@@ -1280,7 +1360,7 @@ async fn handle_key_normal(
             };
             if let Some(next) = adjust_table_selection(table, -1, len) {
                 match ui.stats_focus {
-                    StatsFocus::Configs => ui.selected_stats_config_idx = next,
+                    StatsFocus::Stations => ui.selected_stats_station_idx = next,
                     StatsFocus::Providers => ui.selected_stats_provider_idx = next,
                 }
                 return true;
@@ -1289,8 +1369,8 @@ async fn handle_key_normal(
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stats => {
             let (table, len) = match ui.stats_focus {
-                StatsFocus::Configs => (
-                    &mut ui.stats_configs_table,
+                StatsFocus::Stations => (
+                    &mut ui.stats_stations_table,
                     snapshot.usage_rollup.by_config.len(),
                 ),
                 StatsFocus::Providers => (
@@ -1300,7 +1380,7 @@ async fn handle_key_normal(
             };
             if let Some(next) = adjust_table_selection(table, 1, len) {
                 match ui.stats_focus {
-                    StatsFocus::Configs => ui.selected_stats_config_idx = next,
+                    StatsFocus::Stations => ui.selected_stats_station_idx = next,
                     StatsFocus::Providers => ui.selected_stats_provider_idx = next,
                 }
                 return true;
@@ -1367,9 +1447,9 @@ async fn handle_key_normal(
             }
             true
         }
-        KeyCode::Enter if ui.page == Page::Configs => {
+        KeyCode::Enter if ui.page == Page::Stations => {
             let Some(name) = providers
-                .get(ui.selected_config_idx)
+                .get(ui.selected_station_idx)
                 .map(|p| p.name.clone())
             else {
                 return true;
@@ -1378,7 +1458,7 @@ async fn handle_key_normal(
                 .await
             {
                 Ok(()) => {
-                    ui.toast = Some((format!("active cfg: {name}"), Instant::now()));
+                    ui.toast = Some((format!("active station: {name}"), Instant::now()));
                 }
                 Err(err) => {
                     ui.toast = Some((format!("set active failed: {err}"), Instant::now()));
@@ -1386,10 +1466,10 @@ async fn handle_key_normal(
             }
             true
         }
-        KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Configs => {
+        KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
             match apply_global_active_config(state, providers, ui, snapshot, None).await {
                 Ok(()) => {
-                    ui.toast = Some(("active cfg: <auto>".to_string(), Instant::now()));
+                    ui.toast = Some(("active station: <auto>".to_string(), Instant::now()));
                 }
                 Err(err) => {
                     ui.toast = Some((format!("set active failed: {err}"), Instant::now()));
@@ -1397,8 +1477,8 @@ async fn handle_key_normal(
             }
             true
         }
-        KeyCode::Char('o') if ui.page == Page::Configs => {
-            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+        KeyCode::Char('o') if ui.page == Page::Stations => {
+            let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
             let Some(sid) = snapshot
@@ -1407,40 +1487,43 @@ async fn handle_key_normal(
                 .and_then(|r| r.session_id.clone())
             else {
                 ui.toast = Some((
-                    "session cfg override: <no session>".to_string(),
+                    "session station override: <no session>".to_string(),
                     Instant::now(),
                 ));
                 return true;
             };
             apply_session_provider_override(state, sid, Some(pvd.name.clone())).await;
             ui.toast = Some((
-                format!("session cfg override: {}", pvd.name),
+                format!("session station override: {}", pvd.name),
                 Instant::now(),
             ));
             true
         }
-        KeyCode::Char('O') if ui.page == Page::Configs => {
+        KeyCode::Char('O') if ui.page == Page::Stations => {
             let Some(sid) = snapshot
                 .rows
                 .get(ui.selected_session_idx)
                 .and_then(|r| r.session_id.clone())
             else {
                 ui.toast = Some((
-                    "session cfg override: <no session>".to_string(),
+                    "session station override: <no session>".to_string(),
                     Instant::now(),
                 ));
                 return true;
             };
             apply_session_provider_override(state, sid, None).await;
-            ui.toast = Some(("session cfg override: <clear>".to_string(), Instant::now()));
+            ui.toast = Some((
+                "session station override: <clear>".to_string(),
+                Instant::now(),
+            ));
             true
         }
-        KeyCode::Char('t') if ui.page == Page::Configs => {
-            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+        KeyCode::Char('t') if ui.page == Page::Stations => {
+            let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
             let (enabled_ovr, _) = snapshot
-                .config_meta_overrides
+                .station_meta_overrides
                 .get(pvd.name.as_str())
                 .copied()
                 .unwrap_or((None, None));
@@ -1448,15 +1531,15 @@ async fn handle_key_normal(
             let next = !current;
             let now = now_ms();
             state
-                .set_config_enabled_override(ui.service_name, pvd.name.clone(), next, now)
+                .set_station_enabled_override(ui.service_name, pvd.name.clone(), next, now)
                 .await;
 
-            if let Err(err) = persist_config_meta(ui, &pvd.name, Some(next), None).await {
+            if let Err(err) = persist_station_meta(ui, &pvd.name, Some(next), None).await {
                 ui.toast = Some((format!("save failed: {err}"), Instant::now()));
             } else {
                 ui.toast = Some((
                     format!(
-                        "config {} enabled={}",
+                        "station {} enabled={}",
                         pvd.name,
                         if next { "true" } else { "false" }
                     ),
@@ -1465,12 +1548,12 @@ async fn handle_key_normal(
             }
             true
         }
-        KeyCode::Char('+') | KeyCode::Char('=') if ui.page == Page::Configs => {
-            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+        KeyCode::Char('+') | KeyCode::Char('=') if ui.page == Page::Stations => {
+            let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
             let (_, level_ovr) = snapshot
-                .config_meta_overrides
+                .station_meta_overrides
                 .get(pvd.name.as_str())
                 .copied()
                 .unwrap_or((None, None));
@@ -1478,21 +1561,21 @@ async fn handle_key_normal(
             let next = (current + 1).min(10);
             let now = now_ms();
             state
-                .set_config_level_override(ui.service_name, pvd.name.clone(), next, now)
+                .set_station_level_override(ui.service_name, pvd.name.clone(), next, now)
                 .await;
-            if let Err(err) = persist_config_meta(ui, &pvd.name, None, Some(next)).await {
+            if let Err(err) = persist_station_meta(ui, &pvd.name, None, Some(next)).await {
                 ui.toast = Some((format!("save failed: {err}"), Instant::now()));
             } else {
-                ui.toast = Some((format!("config {} level={next}", pvd.name), Instant::now()));
+                ui.toast = Some((format!("station {} level={next}", pvd.name), Instant::now()));
             }
             true
         }
-        KeyCode::Char('-') if ui.page == Page::Configs => {
-            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+        KeyCode::Char('-') if ui.page == Page::Stations => {
+            let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
             let (_, level_ovr) = snapshot
-                .config_meta_overrides
+                .station_meta_overrides
                 .get(pvd.name.as_str())
                 .copied()
                 .unwrap_or((None, None));
@@ -1500,23 +1583,23 @@ async fn handle_key_normal(
             let next = current.saturating_sub(1).max(1);
             let now = now_ms();
             state
-                .set_config_level_override(ui.service_name, pvd.name.clone(), next, now)
+                .set_station_level_override(ui.service_name, pvd.name.clone(), next, now)
                 .await;
-            if let Err(err) = persist_config_meta(ui, &pvd.name, None, Some(next)).await {
+            if let Err(err) = persist_station_meta(ui, &pvd.name, None, Some(next)).await {
                 ui.toast = Some((format!("save failed: {err}"), Instant::now()));
             } else {
-                ui.toast = Some((format!("config {} level={next}", pvd.name), Instant::now()));
+                ui.toast = Some((format!("station {} level={next}", pvd.name), Instant::now()));
             }
             true
         }
-        KeyCode::Char('h') if ui.page == Page::Configs => {
-            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+        KeyCode::Char('h') if ui.page == Page::Stations => {
+            let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
             let service_name = ui.service_name;
-            let config_name = pvd.name.clone();
+            let station_name = pvd.name.clone();
 
-            let upstreams = match load_upstreams_for_config(service_name, &config_name).await {
+            let upstreams = match load_upstreams_for_station(service_name, &station_name).await {
                 Ok(v) => v,
                 Err(err) => {
                     ui.toast = Some((format!("health check load failed: {err}"), Instant::now()));
@@ -1526,21 +1609,21 @@ async fn handle_key_normal(
 
             let now = now_ms();
             if !state
-                .try_begin_health_check(service_name, &config_name, upstreams.len(), now)
+                .try_begin_station_health_check(service_name, &station_name, upstreams.len(), now)
                 .await
             {
                 ui.toast = Some((
-                    format!("health check already running: {config_name}"),
+                    format!("health check already running: {station_name}"),
                     Instant::now(),
                 ));
                 return true;
             }
 
             state
-                .record_config_health(
+                .record_station_health(
                     service_name,
-                    config_name.clone(),
-                    ConfigHealth {
+                    station_name.clone(),
+                    StationHealth {
                         checked_at_ms: now,
                         upstreams: Vec::new(),
                     },
@@ -1549,34 +1632,34 @@ async fn handle_key_normal(
 
             let state = Arc::clone(state);
             ui.toast = Some((
-                format!("health check queued: {config_name}"),
+                format!("health check queued: {station_name}"),
                 Instant::now(),
             ));
             let upstreams_for_task = upstreams;
             tokio::spawn(async move {
-                let sem = health_check_config_semaphore()
+                let sem = health_check_station_semaphore()
                     .get_or_init(|| async {
-                        Arc::new(Semaphore::new(health_check_max_inflight_configs()))
+                        Arc::new(Semaphore::new(health_check_max_inflight_stations()))
                     })
                     .await;
                 let _permit = sem.clone().acquire_owned().await;
-                run_health_check_for_config(state, service_name, config_name, upstreams_for_task)
+                run_health_check_for_station(state, service_name, station_name, upstreams_for_task)
                     .await;
             });
             true
         }
-        KeyCode::Char('H') if ui.page == Page::Configs => {
+        KeyCode::Char('H') if ui.page == Page::Stations => {
             let service_name = ui.service_name;
-            let configs = providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+            let stations = providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
             let state = Arc::clone(state);
             ui.toast = Some((
-                format!("health check queued: {} configs", configs.len()),
+                format!("health check queued: {} stations", stations.len()),
                 Instant::now(),
             ));
             tokio::spawn(async move {
-                let sem = health_check_config_semaphore()
+                let sem = health_check_station_semaphore()
                     .get_or_init(|| async {
-                        Arc::new(Semaphore::new(health_check_max_inflight_configs()))
+                        Arc::new(Semaphore::new(health_check_max_inflight_stations()))
                     })
                     .await
                     .clone();
@@ -1585,14 +1668,14 @@ async fn handle_key_normal(
                     Ok(c) => c,
                     Err(err) => {
                         let now = now_ms();
-                        for config_name in configs {
+                        for station_name in stations {
                             state
-                                .try_begin_health_check(service_name, &config_name, 1, now)
+                                .try_begin_station_health_check(service_name, &station_name, 1, now)
                                 .await;
                             state
-                                .record_health_check_result(
+                                .record_station_health_check_result(
                                     service_name,
-                                    &config_name,
+                                    &station_name,
                                     now,
                                     UpstreamHealth {
                                         base_url: "<load_config>".to_string(),
@@ -1600,11 +1683,17 @@ async fn handle_key_normal(
                                         status_code: None,
                                         latency_ms: None,
                                         error: Some(shorten_err(&err.to_string(), 140)),
+                                        passive: None,
                                     },
                                 )
                                 .await;
                             state
-                                .finish_health_check(service_name, &config_name, now, false)
+                                .finish_station_health_check(
+                                    service_name,
+                                    &station_name,
+                                    now,
+                                    false,
+                                )
                                 .await;
                         }
                         return;
@@ -1616,23 +1705,28 @@ async fn handle_key_normal(
                 } else {
                     &cfg.codex
                 };
-                for config_name in configs {
-                    let Some(svc) = mgr.configs.get(&config_name) else {
+                for station_name in stations {
+                    let Some(svc) = mgr.configs.get(&station_name) else {
                         continue;
                     };
                     let upstreams = svc.upstreams.clone();
                     let now = now_ms();
                     if !state
-                        .try_begin_health_check(service_name, &config_name, upstreams.len(), now)
+                        .try_begin_station_health_check(
+                            service_name,
+                            &station_name,
+                            upstreams.len(),
+                            now,
+                        )
                         .await
                     {
                         continue;
                     }
                     state
-                        .record_config_health(
+                        .record_station_health(
                             service_name,
-                            config_name.clone(),
-                            ConfigHealth {
+                            station_name.clone(),
+                            StationHealth {
                                 checked_at_ms: now,
                                 upstreams: Vec::new(),
                             },
@@ -1643,7 +1737,7 @@ async fn handle_key_normal(
                     let sem = sem.clone();
                     tokio::spawn(async move {
                         let _permit = sem.acquire_owned().await;
-                        run_health_check_for_config(state, service_name, config_name, upstreams)
+                        run_health_check_for_station(state, service_name, station_name, upstreams)
                             .await;
                     });
 
@@ -1652,13 +1746,13 @@ async fn handle_key_normal(
             });
             true
         }
-        KeyCode::Char('c') if ui.page == Page::Configs => {
-            let Some(pvd) = providers.get(ui.selected_config_idx) else {
+        KeyCode::Char('c') if ui.page == Page::Stations => {
+            let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
             let now = now_ms();
             if state
-                .request_cancel_health_check(ui.service_name, pvd.name.as_str(), now)
+                .request_cancel_station_health_check(ui.service_name, pvd.name.as_str(), now)
                 .await
             {
                 ui.toast = Some((
@@ -1673,19 +1767,19 @@ async fn handle_key_normal(
             }
             true
         }
-        KeyCode::Char('C') if ui.page == Page::Configs => {
+        KeyCode::Char('C') if ui.page == Page::Stations => {
             let now = now_ms();
             let mut count = 0usize;
             for p in providers {
                 if state
-                    .request_cancel_health_check(ui.service_name, p.name.as_str(), now)
+                    .request_cancel_station_health_check(ui.service_name, p.name.as_str(), now)
                     .await
                 {
                     count += 1;
                 }
             }
             ui.toast = Some((
-                format!("health check cancel requested: {count} configs"),
+                format!("health check cancel requested: {count} stations"),
                 Instant::now(),
             ));
             true
@@ -1765,8 +1859,8 @@ async fn handle_key_normal(
                 return true;
             };
 
-            match load_profile_options_for_service(ui.service_name).await {
-                Ok(profiles) if profiles.is_empty() => {
+            match refresh_profile_control_state(ui).await {
+                Ok(()) if ui.profile_options.is_empty() => {
                     ui.toast = Some((
                         crate::tui::i18n::pick(
                             ui.language,
@@ -1777,13 +1871,13 @@ async fn handle_key_normal(
                         Instant::now(),
                     ));
                 }
-                Ok(profiles) => {
+                Ok(()) => {
                     let selected_profile = snapshot
                         .rows
                         .get(ui.selected_session_idx)
                         .and_then(|row| row.binding_profile_name.as_deref());
-                    ui.profile_menu_idx = default_profile_menu_idx(&profiles, selected_profile);
-                    ui.session_profile_options = profiles;
+                    ui.profile_menu_idx =
+                        default_profile_menu_idx(&ui.profile_options, selected_profile);
                     ui.overlay = Overlay::ProfileMenuSession;
                     ui.toast = Some((
                         format!("profile: manage binding for {}", short_sid(sid, 18)),
@@ -1792,6 +1886,82 @@ async fn handle_key_normal(
                 }
                 Err(e) => {
                     ui.toast = Some((format!("profile: load failed: {e}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Char('p') if ui.page == Page::Settings => {
+            match refresh_profile_control_state(ui).await {
+                Ok(()) if ui.profile_options.is_empty() => {
+                    ui.toast = Some((
+                        crate::tui::i18n::pick(
+                            ui.language,
+                            "default profile: 当前服务没有可用 profile",
+                            "default profile: no profiles configured for this service",
+                        )
+                        .to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Ok(()) => {
+                    ui.profile_menu_idx = default_profile_menu_idx(
+                        &ui.profile_options,
+                        ui.configured_default_profile.as_deref(),
+                    );
+                    ui.overlay = Overlay::ProfileMenuDefaultPersisted;
+                    ui.toast = Some((
+                        crate::tui::i18n::pick(
+                            ui.language,
+                            "default profile: 管理配置默认值",
+                            "default profile: manage configured default",
+                        )
+                        .to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(err) => {
+                    ui.toast = Some((
+                        format!("default profile load failed: {err}"),
+                        Instant::now(),
+                    ));
+                }
+            }
+            true
+        }
+        KeyCode::Char('P') if ui.page == Page::Settings => {
+            match refresh_profile_control_state(ui).await {
+                Ok(()) if ui.profile_options.is_empty() => {
+                    ui.toast = Some((
+                        crate::tui::i18n::pick(
+                            ui.language,
+                            "runtime default profile: 当前服务没有可用 profile",
+                            "runtime default profile: no profiles configured for this service",
+                        )
+                        .to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Ok(()) => {
+                    ui.profile_menu_idx = runtime_default_profile_menu_idx(
+                        &ui.profile_options,
+                        ui.runtime_default_profile_override.as_deref(),
+                    );
+                    ui.overlay = Overlay::ProfileMenuDefaultRuntime;
+                    ui.toast = Some((
+                        crate::tui::i18n::pick(
+                            ui.language,
+                            "runtime default profile: 管理运行时默认值",
+                            "runtime default profile: manage runtime default",
+                        )
+                        .to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(err) => {
+                    ui.toast = Some((
+                        format!("runtime default profile load failed: {err}"),
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -2670,7 +2840,7 @@ async fn handle_key_normal(
                 }
                 false
             }
-            Focus::Configs => false,
+            Focus::Stations => false,
         },
         KeyCode::Down | KeyCode::Char('j') => match ui.focus {
             Focus::Sessions => {
@@ -2691,7 +2861,7 @@ async fn handle_key_normal(
                 }
                 false
             }
-            Focus::Configs => false,
+            Focus::Stations => false,
         },
         KeyCode::Enter => {
             if ui.focus != Focus::Sessions {
@@ -2774,7 +2944,7 @@ async fn handle_key_normal(
                 return false;
             };
             let current = snapshot
-                .config_overrides
+                .station_overrides
                 .get(&sid)
                 .map(|s| s.as_str())
                 .unwrap_or("");
@@ -2788,7 +2958,7 @@ async fn handle_key_normal(
         }
         KeyCode::Char('P') => {
             let current = snapshot
-                .global_override
+                .global_station_override
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| providers.iter().find(|p| p.active).map(|p| p.name.as_str()))
@@ -2865,44 +3035,118 @@ async fn handle_key_profile_menu(
             true
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            let max = profile_menu_max_idx(&ui.session_profile_options);
+            let max = profile_menu_max_idx(&ui.profile_options);
             ui.profile_menu_idx = (ui.profile_menu_idx + 1).min(max);
             true
         }
         KeyCode::Enter => {
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|row| row.session_id.clone())
-            else {
-                ui.overlay = Overlay::None;
-                return true;
+            let chosen = if ui.profile_menu_idx == 0 {
+                None
+            } else {
+                ui.profile_options
+                    .get(ui.profile_menu_idx.saturating_sub(1))
+                    .map(|profile| profile.name.clone())
             };
 
-            if ui.profile_menu_idx == 0 {
-                state.clear_session_binding(&sid).await;
-                ui.needs_snapshot_refresh = true;
-                ui.toast = Some(("profile binding cleared".to_string(), Instant::now()));
-            } else {
-                let Some(profile) = ui
-                    .session_profile_options
-                    .get(ui.profile_menu_idx.saturating_sub(1))
-                    .cloned()
-                else {
-                    ui.overlay = Overlay::None;
-                    return true;
-                };
-                match apply_session_profile(state, ui.service_name, sid, profile.name.clone()).await
-                {
-                    Ok(()) => {
+            match ui.overlay {
+                Overlay::ProfileMenuSession => {
+                    let Some(sid) = snapshot
+                        .rows
+                        .get(ui.selected_session_idx)
+                        .and_then(|row| row.session_id.clone())
+                    else {
+                        ui.overlay = Overlay::None;
+                        return true;
+                    };
+
+                    if let Some(profile_name) = chosen {
+                        match apply_session_profile(
+                            state,
+                            ui.service_name,
+                            sid,
+                            profile_name.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                ui.needs_snapshot_refresh = true;
+                                ui.toast = Some((
+                                    format!("profile applied: {profile_name}"),
+                                    Instant::now(),
+                                ));
+                            }
+                            Err(err) => {
+                                ui.toast =
+                                    Some((format!("profile apply failed: {err}"), Instant::now()));
+                            }
+                        }
+                    } else {
+                        state.clear_session_binding(&sid).await;
                         ui.needs_snapshot_refresh = true;
-                        ui.toast =
-                            Some((format!("profile applied: {}", profile.name), Instant::now()));
-                    }
-                    Err(err) => {
-                        ui.toast = Some((format!("profile apply failed: {err}"), Instant::now()));
+                        ui.toast = Some(("profile binding cleared".to_string(), Instant::now()));
                     }
                 }
+                Overlay::ProfileMenuDefaultRuntime => {
+                    match apply_runtime_default_profile(ui, chosen.clone()).await {
+                        Ok(()) => match refresh_profile_control_state(ui).await {
+                            Ok(()) => {
+                                ui.toast = Some((
+                                    format!(
+                                        "runtime default profile: {}",
+                                        default_profile_label(
+                                            ui.runtime_default_profile_override.as_deref(),
+                                            "<configured fallback>",
+                                        )
+                                    ),
+                                    Instant::now(),
+                                ));
+                            }
+                            Err(err) => {
+                                ui.toast = Some((
+                                    format!("runtime default profile refresh failed: {err}"),
+                                    Instant::now(),
+                                ));
+                            }
+                        },
+                        Err(err) => {
+                            ui.toast = Some((
+                                format!("runtime default profile apply failed: {err}"),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                }
+                Overlay::ProfileMenuDefaultPersisted => {
+                    match apply_persisted_default_profile(ui, chosen.clone()).await {
+                        Ok(()) => match refresh_profile_control_state(ui).await {
+                            Ok(()) => {
+                                ui.toast = Some((
+                                    format!(
+                                        "configured default profile: {}",
+                                        default_profile_label(
+                                            ui.configured_default_profile.as_deref(),
+                                            "<none>",
+                                        )
+                                    ),
+                                    Instant::now(),
+                                ));
+                            }
+                            Err(err) => {
+                                ui.toast = Some((
+                                    format!("configured default profile refresh failed: {err}"),
+                                    Instant::now(),
+                                ));
+                            }
+                        },
+                        Err(err) => {
+                            ui.toast = Some((
+                                format!("configured default profile apply failed: {err}"),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
             }
             ui.overlay = Overlay::None;
             true
@@ -2919,6 +3163,7 @@ mod tests {
     fn make_profile(name: &str) -> ControlProfileOption {
         ControlProfileOption {
             name: name.to_string(),
+            extends: None,
             station: None,
             model: None,
             reasoning_effort: None,
@@ -3204,7 +3449,7 @@ async fn handle_key_provider_menu(
                                 .find(|p| p.active)
                                 .map(|p| p.name.as_str())
                                 .unwrap_or("<auto>");
-                            ui.toast = Some((format!("active cfg: {active}"), Instant::now()));
+                            ui.toast = Some((format!("active station: {active}"), Instant::now()));
                         }
                         Err(err) => {
                             ui.toast = Some((format!("set active failed: {err}"), Instant::now()));
@@ -3223,7 +3468,7 @@ async fn handle_key_provider_menu(
                     apply_session_provider_override(state, sid, chosen.clone()).await;
                     ui.toast = Some((
                         format!(
-                            "session cfg override: {}",
+                            "session station override: {}",
                             chosen.as_deref().unwrap_or("<clear>")
                         ),
                         Instant::now(),

@@ -47,7 +47,7 @@ pub(super) fn render_header(
     let updated = snapshot.refreshed_at.elapsed().as_millis();
     let overrides_model = snapshot.model_overrides.len();
     let overrides_effort = snapshot.overrides.len();
-    let overrides_cfg = snapshot.config_overrides.len();
+    let overrides_station = snapshot.station_overrides.len();
     let overrides_tier = snapshot.service_tier_overrides.len();
     let (hc_running, hc_canceling) = {
         let mut running = 0usize;
@@ -63,15 +63,15 @@ pub(super) fn render_header(
         (running, canceling)
     };
 
-    let global_cfg = snapshot
-        .global_override
+    let global_station = snapshot
+        .global_station_override
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
     let focus = match ui.focus {
         Focus::Sessions => crate::tui::i18n::pick(ui.language, "会话", "Sessions"),
         Focus::Requests => crate::tui::i18n::pick(ui.language, "请求", "Requests"),
-        Focus::Configs => crate::tui::i18n::pick(ui.language, "配置", "Configs"),
+        Focus::Stations => crate::tui::i18n::pick(ui.language, "站点", "Stations"),
     };
     let title = Line::from(vec![
         Span::styled(
@@ -99,7 +99,7 @@ pub(super) fn render_header(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
     let last_config = last_req
-        .and_then(|r| r.config_name.as_deref())
+        .and_then(|r| r.station_name.as_deref())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
     let last_attempts = last_req
@@ -216,15 +216,15 @@ pub(super) fn render_header(
             Style::default().fg(p.muted),
         ),
         Span::styled(
-            format!("{overrides_model}/{overrides_effort}/{overrides_cfg}/{overrides_tier}"),
+            format!("{overrides_model}/{overrides_effort}/{overrides_station}/{overrides_tier}"),
             Style::default().fg(p.muted),
         ),
         Span::raw("   "),
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "覆盖(全局) ", "override(global) "),
+            crate::tui::i18n::pick(ui.language, "覆盖(全局站点) ", "override(global station) "),
             Style::default().fg(p.muted),
         ),
-        Span::styled(global_cfg.to_string(), Style::default().fg(p.accent)),
+        Span::styled(global_station.to_string(), Style::default().fg(p.accent)),
         Span::raw("   "),
         Span::styled(
             crate::tui::i18n::pick(ui.language, "刷新 ", "updated "),
@@ -265,13 +265,13 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
         Overlay::None => match ui.page {
             Page::Dashboard => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话配置  P 全局配置  O/H(会话) o/h(请求) 跳转  ? 帮助",
-                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session cfg  P global cfg  O/H(session) o/h(request) jump  ? help",
+                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话站点  P 全局站点  O/H(会话) o/h(请求) 跳转  ? 帮助",
+                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session station  P global station  O/H(session) o/h(request) jump  ? help",
             ),
-            Page::Configs => crate::tui::i18n::pick(
+            Page::Stations => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 设为 active  Backspace 自动  o 会话 override  O 清除  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  i details  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter set active  Backspace auto  o session override  O clear  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 设为 active  Backspace 自动  o 会话站点 override  O 清除  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  i details  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter set active station  Backspace auto  o session station override  O clear  ? help",
             ),
             Page::Requests => crate::tui::i18n::pick(
                 ui.language,
@@ -285,20 +285,20 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Stats => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  Tab 焦点(config/provider)  ↑/↓ 选择  d 天数(7/21/60)  e 仅看错误(recent)  y 复制+导出报告  ? 帮助",
-                "1-8 pages  q quit  L language  Tab focus(config/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  y copy+export report  ? help",
+                "1-8 页面  q 退出  L 语言  Tab 焦点(station/provider)  ↑/↓ 选择  d 天数(7/21/60)  e 仅看错误(recent)  y 复制+导出报告  ? 帮助",
+                "1-8 pages  q quit  L language  Tab focus(station/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  y copy+export report  ? help",
             ),
             Page::Settings => crate::tui::i18n::pick(
                 ui.language,
                 if ui.service_name == "codex" {
-                    "1-8 页面  q 退出  L 语言  R 重载配置  O 覆盖导入(~/.codex，二次确认)  ? 帮助"
+                    "1-8 页面  q 退出  L 语言  p 配置默认profile  P 运行时默认profile  R 重载配置  O 覆盖导入(~/.codex，二次确认)  ? 帮助"
                 } else {
-                    "1-8 页面  q 退出  L 语言  R 重载配置  ? 帮助"
+                    "1-8 页面  q 退出  L 语言  p 配置默认profile  P 运行时默认profile  R 重载配置  ? 帮助"
                 },
                 if ui.service_name == "codex" {
-                    "1-8 pages  q quit  L language  R reload  O overwrite(~/.codex, confirm)  ? help"
+                    "1-8 pages  q quit  L language  p configured-default-profile  P runtime-default-profile  R reload  O overwrite(~/.codex, confirm)  ? help"
                 } else {
-                    "1-8 pages  q quit  L language  R reload  ? help"
+                    "1-8 pages  q quit  L language  p configured-default-profile  P runtime-default-profile  R reload  ? help"
                 },
             ),
             Page::History => crate::tui::i18n::pick(
@@ -347,12 +347,22 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             "↑/↓ 选择 profile 操作  Enter 应用/清除绑定  Esc 取消",
             "↑/↓ select profile action  Enter apply/clear binding  Esc cancel",
         ),
+        Overlay::ProfileMenuDefaultRuntime => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 选择运行时默认 profile  Enter 应用/清除覆盖  Esc 取消",
+            "↑/↓ select runtime default profile  Enter apply/clear override  Esc cancel",
+        ),
+        Overlay::ProfileMenuDefaultPersisted => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 选择配置默认 profile  Enter 应用/清除默认值  Esc 取消",
+            "↑/↓ select configured default profile  Enter apply/clear default  Esc cancel",
+        ),
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => crate::tui::i18n::pick(
             ui.language,
             "↑/↓ 选择  Enter 应用  Esc 取消",
             "↑/↓ select  Enter apply  Esc cancel",
         ),
-        Overlay::ConfigInfo => crate::tui::i18n::pick(
+        Overlay::StationInfo => crate::tui::i18n::pick(
             ui.language,
             "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言",
             "↑/↓ scroll  PgUp/PgDn page  Esc close  L language",

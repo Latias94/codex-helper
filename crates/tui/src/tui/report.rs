@@ -8,7 +8,7 @@ use crate::usage::UsageMetrics;
 
 #[derive(Debug, Clone)]
 pub(in crate::tui) enum StatsTarget {
-    Config(String),
+    Station(String),
     Provider(String),
 }
 
@@ -48,7 +48,7 @@ fn compute_recent_breakdown(
 
     for r in &snapshot.recent {
         let matches = match target {
-            StatsTarget::Config(name) => r.config_name.as_deref() == Some(name.as_str()),
+            StatsTarget::Station(name) => r.station_name.as_deref() == Some(name.as_str()),
             StatsTarget::Provider(name) => r.provider_id.as_deref() == Some(name.as_str()),
         };
         if !matches {
@@ -139,11 +139,11 @@ pub(in crate::tui) fn selected_stats_target(
     snapshot: &super::model::Snapshot,
 ) -> Option<StatsTarget> {
     match ui.stats_focus {
-        StatsFocus::Configs => snapshot
+        StatsFocus::Stations => snapshot
             .usage_rollup
             .by_config
-            .get(ui.selected_stats_config_idx)
-            .map(|(k, _)| StatsTarget::Config(k.clone())),
+            .get(ui.selected_stats_station_idx)
+            .map(|(k, _)| StatsTarget::Station(k.clone())),
         StatsFocus::Providers => snapshot
             .usage_rollup
             .by_provider
@@ -160,7 +160,7 @@ pub(in crate::tui) fn build_stats_report(
     let target = selected_stats_target(ui, snapshot)?;
 
     let (since_start_bucket, window_series) = match &target {
-        StatsTarget::Config(name) => {
+        StatsTarget::Station(name) => {
             let since = snapshot
                 .usage_rollup
                 .by_config
@@ -198,7 +198,7 @@ pub(in crate::tui) fn build_stats_report(
     let recent = compute_recent_breakdown(ui, snapshot, &target);
 
     let (kind, name) = match &target {
-        StatsTarget::Config(n) => ("config", n.as_str()),
+        StatsTarget::Station(n) => ("station", n.as_str()),
         StatsTarget::Provider(n) => ("provider", n.as_str()),
     };
 

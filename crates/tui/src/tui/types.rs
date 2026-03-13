@@ -2,19 +2,19 @@
 pub(in crate::tui) enum Focus {
     Sessions,
     Requests,
-    Configs,
+    Stations,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum StatsFocus {
-    Configs,
+    Stations,
     Providers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum Page {
     Dashboard,
-    Configs,
+    Stations,
     Sessions,
     Requests,
     Stats,
@@ -33,9 +33,11 @@ pub(in crate::tui) enum Overlay {
     ServiceTierMenuSession,
     ServiceTierInputSession,
     ProfileMenuSession,
+    ProfileMenuDefaultRuntime,
+    ProfileMenuDefaultPersisted,
     ProviderMenuSession,
     ProviderMenuGlobal,
-    ConfigInfo,
+    StationInfo,
     SessionTranscript,
 }
 
@@ -101,7 +103,7 @@ impl ServiceTierChoice {
 pub(in crate::tui) fn page_titles(lang: Language) -> [&'static str; 8] {
     [
         crate::tui::i18n::pick(lang, "1 总览", "1 Dashboard"),
-        crate::tui::i18n::pick(lang, "2 配置", "2 Configs"),
+        crate::tui::i18n::pick(lang, "2 站点", "2 Stations"),
         crate::tui::i18n::pick(lang, "3 会话", "3 Sessions"),
         crate::tui::i18n::pick(lang, "4 请求", "4 Requests"),
         crate::tui::i18n::pick(lang, "5 统计", "5 Stats"),
@@ -114,7 +116,7 @@ pub(in crate::tui) fn page_titles(lang: Language) -> [&'static str; 8] {
 pub(in crate::tui) fn page_index(page: Page) -> usize {
     match page {
         Page::Dashboard => 0,
-        Page::Configs => 1,
+        Page::Stations => 1,
         Page::Sessions => 2,
         Page::Requests => 3,
         Page::Stats => 4,

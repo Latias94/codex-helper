@@ -233,11 +233,11 @@ fn render_tables(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, snapshot: &Sna
     render_bucket_table_stateful(
         f,
         p,
-        ui.stats_focus == StatsFocus::Configs,
-        "Top configs (by total tokens)",
+        ui.stats_focus == StatsFocus::Stations,
+        "Top stations (by total tokens)",
         &snapshot.usage_rollup.by_config,
         left[0],
-        &mut ui.stats_configs_table,
+        &mut ui.stats_stations_table,
     );
     render_bucket_table_stateful(
         f,
@@ -324,11 +324,11 @@ fn render_detail_panel(
     area: Rect,
 ) {
     let selected = match ui.stats_focus {
-        StatsFocus::Configs => snapshot
+        StatsFocus::Stations => snapshot
             .usage_rollup
             .by_config
-            .get(ui.selected_stats_config_idx)
-            .map(|(k, v)| ("config", k.as_str(), v)),
+            .get(ui.selected_stats_station_idx)
+            .map(|(k, v)| ("station", k.as_str(), v)),
         StatsFocus::Providers => snapshot
             .usage_rollup
             .by_provider
@@ -358,7 +358,7 @@ fn render_detail_panel(
     };
 
     let series = match kind {
-        "config" => snapshot
+        "station" => snapshot
             .usage_rollup
             .by_config_day
             .get(name)
@@ -515,7 +515,7 @@ fn render_detail_panel(
 
     for r in &snapshot.recent {
         let matches = match ui.stats_focus {
-            StatsFocus::Configs => r.config_name.as_deref() == Some(name),
+            StatsFocus::Stations => r.station_name.as_deref() == Some(name),
             StatsFocus::Providers => r.provider_id.as_deref() == Some(name),
         };
         if !matches {

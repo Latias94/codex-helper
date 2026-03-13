@@ -29,7 +29,7 @@ pub(super) fn render_body(
 
     match ui.page {
         Page::Dashboard => dashboard::render_dashboard(f, p, ui, snapshot, providers, area),
-        Page::Configs => configs::render_configs_page(f, p, ui, snapshot, providers, area),
+        Page::Stations => configs::render_stations_page(f, p, ui, snapshot, providers, area),
         Page::Sessions => sessions::render_sessions_page(f, p, ui, snapshot, area),
         Page::Requests => requests::render_requests_page(f, p, ui, snapshot, area),
         Page::Stats => super::stats::render_stats_page(f, p, ui, snapshot, providers, area),

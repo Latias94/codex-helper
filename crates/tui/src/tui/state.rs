@@ -43,7 +43,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) page: Page,
     pub(in crate::tui) focus: Focus,
     pub(in crate::tui) overlay: Overlay,
-    pub(in crate::tui) selected_config_idx: usize,
+    pub(in crate::tui) selected_station_idx: usize,
     pub(in crate::tui) selected_session_idx: usize,
     pub(in crate::tui) selected_session_id: Option<String>,
     pub(in crate::tui) selected_request_idx: usize,
@@ -65,11 +65,14 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) session_model_input_hint: Option<String>,
     pub(in crate::tui) session_service_tier_input: String,
     pub(in crate::tui) session_service_tier_input_hint: Option<String>,
-    pub(in crate::tui) session_profile_options: Vec<ControlProfileOption>,
+    pub(in crate::tui) profile_options: Vec<ControlProfileOption>,
+    pub(in crate::tui) configured_default_profile: Option<String>,
+    pub(in crate::tui) effective_default_profile: Option<String>,
+    pub(in crate::tui) runtime_default_profile_override: Option<String>,
     pub(in crate::tui) stats_focus: StatsFocus,
     pub(in crate::tui) stats_days: usize,
     pub(in crate::tui) stats_errors_only: bool,
-    pub(in crate::tui) selected_stats_config_idx: usize,
+    pub(in crate::tui) selected_stats_station_idx: usize,
     pub(in crate::tui) selected_stats_provider_idx: usize,
     pub(in crate::tui) needs_snapshot_refresh: bool,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
@@ -102,17 +105,17 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) last_runtime_retry: Option<ResolvedRetryConfig>,
     pub(in crate::tui) last_runtime_config_refresh_at: Option<std::time::Instant>,
     pub(in crate::tui) should_exit: bool,
-    pub(in crate::tui) configs_table: TableState,
+    pub(in crate::tui) stations_table: TableState,
     pub(in crate::tui) sessions_table: TableState,
     pub(in crate::tui) requests_table: TableState,
     pub(in crate::tui) request_page_table: TableState,
     pub(in crate::tui) sessions_page_table: TableState,
     pub(in crate::tui) codex_history_table: TableState,
     pub(in crate::tui) codex_recent_table: TableState,
-    pub(in crate::tui) stats_configs_table: TableState,
+    pub(in crate::tui) stats_stations_table: TableState,
     pub(in crate::tui) stats_providers_table: TableState,
     pub(in crate::tui) menu_list: ListState,
-    pub(in crate::tui) config_info_scroll: u16,
+    pub(in crate::tui) station_info_scroll: u16,
 }
 
 impl Default for UiState {
@@ -125,7 +128,7 @@ impl Default for UiState {
             page: Page::Dashboard,
             focus: Focus::Sessions,
             overlay: Overlay::None,
-            selected_config_idx: 0,
+            selected_station_idx: 0,
             selected_session_idx: 0,
             selected_session_id: None,
             selected_request_idx: 0,
@@ -147,11 +150,14 @@ impl Default for UiState {
             session_model_input_hint: None,
             session_service_tier_input: String::new(),
             session_service_tier_input_hint: None,
-            session_profile_options: Vec::new(),
-            stats_focus: StatsFocus::Configs,
+            profile_options: Vec::new(),
+            configured_default_profile: None,
+            effective_default_profile: None,
+            runtime_default_profile_override: None,
+            stats_focus: StatsFocus::Stations,
             stats_days: 21,
             stats_errors_only: false,
-            selected_stats_config_idx: 0,
+            selected_stats_station_idx: 0,
             selected_stats_provider_idx: 0,
             needs_snapshot_refresh: false,
             toast: None,
@@ -184,17 +190,17 @@ impl Default for UiState {
             last_runtime_retry: None,
             last_runtime_config_refresh_at: None,
             should_exit: false,
-            configs_table: TableState::default(),
+            stations_table: TableState::default(),
             sessions_table: TableState::default(),
             requests_table: TableState::default(),
             request_page_table: TableState::default(),
             sessions_page_table: TableState::default(),
             codex_history_table: TableState::default(),
             codex_recent_table: TableState::default(),
-            stats_configs_table: TableState::default(),
+            stats_stations_table: TableState::default(),
             stats_providers_table: TableState::default(),
             menu_list: ListState::default(),
-            config_info_scroll: 0,
+            station_info_scroll: 0,
         }
     }
 }
@@ -202,11 +208,11 @@ impl Default for UiState {
 impl UiState {
     pub(in crate::tui) fn clamp_selection(&mut self, snapshot: &Snapshot, providers_len: usize) {
         if providers_len == 0 {
-            self.selected_config_idx = 0;
-            self.configs_table.select(None);
+            self.selected_station_idx = 0;
+            self.stations_table.select(None);
         } else {
-            self.selected_config_idx = self.selected_config_idx.min(providers_len - 1);
-            self.configs_table.select(Some(self.selected_config_idx));
+            self.selected_station_idx = self.selected_station_idx.min(providers_len - 1);
+            self.stations_table.select(Some(self.selected_station_idx));
         }
 
         if snapshot.rows.is_empty() {
@@ -241,15 +247,15 @@ impl UiState {
             self.requests_table.select(Some(self.selected_request_idx));
         }
 
-        let stats_configs_len = snapshot.usage_rollup.by_config.len();
-        if stats_configs_len == 0 {
-            self.selected_stats_config_idx = 0;
-            self.stats_configs_table.select(None);
+        let stats_stations_len = snapshot.usage_rollup.by_config.len();
+        if stats_stations_len == 0 {
+            self.selected_stats_station_idx = 0;
+            self.stats_stations_table.select(None);
         } else {
-            self.selected_stats_config_idx =
-                self.selected_stats_config_idx.min(stats_configs_len - 1);
-            self.stats_configs_table
-                .select(Some(self.selected_stats_config_idx));
+            self.selected_stats_station_idx =
+                self.selected_stats_station_idx.min(stats_stations_len - 1);
+            self.stats_stations_table
+                .select(Some(self.selected_stats_station_idx));
         }
 
         let stats_providers_len = snapshot.usage_rollup.by_provider.len();

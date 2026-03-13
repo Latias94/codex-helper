@@ -122,6 +122,7 @@ See `CENTRAL_RELAY.md` for the explicit LAN / Tailscale shared-relay operating m
       - [x] `DashboardSnapshot` now exposes station-first accessors and no longer carries legacy dual fields
       - [x] public v1 request payloads and dashboard-core type aliases now use station-first naming (`station_name` / `station_names`, `StationOption`, `StationCapabilitySummary`)
       - [x] routing explanation output and retry-trace observability now emit station-first field names (`active_station`, `selected_station`, `eligible_stations`)
+      - [x] TUI page/focus/stats state now uses station-first names (`Page::Stations`, `Focus::Stations`, `StatsFocus::Stations`)
       - [~] remaining closeout tail is now limited to wording/doc/export cleanup on a few operator/admin surfaces
 - [x] CP-402 Add capability summary per station:
   - [x] supported models

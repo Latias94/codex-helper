@@ -38,13 +38,15 @@ pub(in crate::tui) fn render_app(
     match ui.overlay {
         Overlay::None => {}
         Overlay::Help => modals::render_help_modal(f, p, ui.language),
-        Overlay::ConfigInfo => modals::render_config_info_modal(f, p, ui, snapshot, providers),
+        Overlay::StationInfo => modals::render_station_info_modal(f, p, ui, snapshot, providers),
         Overlay::EffortMenu => modals::render_effort_modal(f, p, ui),
         Overlay::ModelMenuSession => modals::render_model_modal(f, p, ui),
         Overlay::ModelInputSession => modals::render_model_input_modal(f, p, ui),
         Overlay::ServiceTierMenuSession => modals::render_service_tier_modal(f, p, ui),
         Overlay::ServiceTierInputSession => modals::render_service_tier_input_modal(f, p, ui),
-        Overlay::ProfileMenuSession => modals::render_profile_modal(f, p, ui),
+        Overlay::ProfileMenuSession
+        | Overlay::ProfileMenuDefaultRuntime
+        | Overlay::ProfileMenuDefaultPersisted => modals::render_profile_modal_v2(f, p, ui),
         Overlay::SessionTranscript => modals::render_session_transcript_modal(f, p, ui),
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             let title = match ui.overlay {

@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
+
 use ratatui::Frame;
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
+use crate::dashboard_core::ControlProfileOption;
+use crate::tui::Language;
 use crate::tui::ProviderOption;
 use crate::tui::model::{Palette, Snapshot, compute_window_stats, now_ms, shorten, shorten_middle};
 use crate::tui::state::UiState;
@@ -9,7 +13,98 @@ use crate::tui::types::{EffortChoice, Overlay, ServiceTierChoice};
 
 use super::widgets::centered_rect;
 
-pub(super) fn render_config_info_modal(
+fn profile_option_to_service_profile(
+    profile: &ControlProfileOption,
+) -> crate::config::ServiceControlProfile {
+    crate::config::ServiceControlProfile {
+        extends: profile.extends.clone(),
+        station: profile.station.clone(),
+        model: profile.model.clone(),
+        reasoning_effort: profile.reasoning_effort.clone(),
+        service_tier: profile.service_tier.clone(),
+    }
+}
+
+fn resolve_profile_from_options(
+    profile_name: &str,
+    profiles: &[ControlProfileOption],
+) -> anyhow::Result<crate::config::ServiceControlProfile> {
+    let profile_catalog = profiles
+        .iter()
+        .map(|profile| {
+            (
+                profile.name.clone(),
+                profile_option_to_service_profile(profile),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    crate::config::resolve_service_profile_from_catalog(&profile_catalog, profile_name)
+}
+
+fn format_profile_route_summary(profile: &crate::config::ServiceControlProfile) -> String {
+    format!(
+        "station={}  model={}  reasoning={}  tier={}",
+        profile.station.as_deref().unwrap_or("<auto>"),
+        profile.model.as_deref().unwrap_or("<auto>"),
+        profile.reasoning_effort.as_deref().unwrap_or("<auto>"),
+        profile.service_tier.as_deref().unwrap_or("<auto>"),
+    )
+}
+
+fn profile_declared_summary(profile: &ControlProfileOption, lang: Language) -> String {
+    let mut parts = Vec::new();
+    if let Some(extends) = profile.extends.as_deref() {
+        parts.push(format!("extends={extends}"));
+    }
+    parts.push(format!(
+        "station={}",
+        profile.station.as_deref().unwrap_or("<auto>")
+    ));
+    parts.push(format!(
+        "model={}",
+        profile.model.as_deref().unwrap_or("<auto>")
+    ));
+    parts.push(format!(
+        "reasoning={}",
+        profile.reasoning_effort.as_deref().unwrap_or("<auto>")
+    ));
+    parts.push(format!(
+        "tier={}",
+        profile.service_tier.as_deref().unwrap_or("<auto>")
+    ));
+    format!(
+        "{} {}",
+        crate::tui::i18n::pick(lang, "声明：", "declared:"),
+        shorten_middle(parts.join("  ").as_str(), 72)
+    )
+}
+
+fn profile_resolved_summary(
+    profile_name: &str,
+    profiles: &[ControlProfileOption],
+    lang: Language,
+) -> (String, bool) {
+    match resolve_profile_from_options(profile_name, profiles) {
+        Ok(profile) => (
+            format!(
+                "{} {}",
+                crate::tui::i18n::pick(lang, "生效：", "resolved:"),
+                shorten_middle(format_profile_route_summary(&profile).as_str(), 72)
+            ),
+            false,
+        ),
+        Err(err) => (
+            format!(
+                "{} {}",
+                crate::tui::i18n::pick(lang, "解析失败：", "resolve failed:"),
+                shorten_middle(err.to_string().as_str(), 72)
+            ),
+            true,
+        ),
+    }
+}
+
+pub(super) fn render_station_info_modal(
     f: &mut Frame<'_>,
     p: Palette,
     ui: &mut UiState,
@@ -27,20 +122,20 @@ pub(super) fn render_config_info_modal(
     let session_override = snapshot
         .rows
         .get(ui.selected_session_idx)
-        .and_then(|r| r.override_config_name.as_deref());
-    let global_override = snapshot.global_override.as_deref();
+        .and_then(|r| r.override_station_name.as_deref());
+    let global_station_override = snapshot.global_station_override.as_deref();
 
-    let selected = providers.get(ui.selected_config_idx);
+    let selected = providers.get(ui.selected_station_idx);
     let title = if let Some(cfg) = selected {
         let level = cfg.level.clamp(1, 10);
         format!(
             "{}: {} (L{})",
-            crate::tui::i18n::pick(ui.language, "配置详情", "Config details"),
+            crate::tui::i18n::pick(ui.language, "站点详情", "Station details"),
             cfg.name,
             level
         )
     } else {
-        crate::tui::i18n::pick(ui.language, "配置详情", "Config details").to_string()
+        crate::tui::i18n::pick(ui.language, "站点详情", "Station details").to_string()
     };
 
     let block = Block::default()
@@ -67,16 +162,18 @@ pub(super) fn render_config_info_modal(
         Span::styled(
             if let Some(s) = session_override {
                 format!("session={s}")
-            } else if let Some(g) = global_override {
+            } else if let Some(g) = global_station_override {
                 format!("global={g}")
             } else {
                 "-".to_string()
             },
-            Style::default().fg(if session_override.is_some() || global_override.is_some() {
-                p.accent
-            } else {
-                p.muted
-            }),
+            Style::default().fg(
+                if session_override.is_some() || global_station_override.is_some() {
+                    p.accent
+                } else {
+                    p.muted
+                },
+            ),
         ),
         Span::raw("   "),
         Span::styled(
@@ -98,10 +195,10 @@ pub(super) fn render_config_info_modal(
         let now = now_ms();
 
         let stats_5m_cfg = compute_window_stats(&snapshot.recent, now, 5 * 60_000, |r| {
-            r.config_name.as_deref() == Some(cfg.name.as_str())
+            r.station_name.as_deref() == Some(cfg.name.as_str())
         });
         let stats_1h_cfg = compute_window_stats(&snapshot.recent, now, 60 * 60_000, |r| {
-            r.config_name.as_deref() == Some(cfg.name.as_str())
+            r.station_name.as_deref() == Some(cfg.name.as_str())
         });
 
         let fmt_ok_pct = |ok: usize, total: usize| -> String {
@@ -125,7 +222,7 @@ pub(super) fn render_config_info_modal(
         };
 
         let (enabled_ovr, level_ovr) = snapshot
-            .config_meta_overrides
+            .station_meta_overrides
             .get(cfg.name.as_str())
             .copied()
             .unwrap_or((None, None));
@@ -308,7 +405,7 @@ pub(super) fn render_config_info_modal(
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
 
-        let health = snapshot.config_health.get(cfg.name.as_str());
+        let health = snapshot.station_health.get(cfg.name.as_str());
         let lb = snapshot.lb_view.get(cfg.name.as_str());
 
         let (rt5_by_upstream, rt1_by_upstream) = {
@@ -355,7 +452,7 @@ pub(super) fn render_config_info_modal(
             let cutoff_5 = now.saturating_sub(5 * 60_000);
             let cutoff_1 = now.saturating_sub(60 * 60_000);
             for r in snapshot.recent.iter() {
-                if r.config_name.as_deref() != Some(cfg.name.as_str()) {
+                if r.station_name.as_deref() != Some(cfg.name.as_str()) {
                     continue;
                 }
                 if r.ended_at_ms >= cutoff_5 {
@@ -600,22 +697,22 @@ pub(super) fn render_config_info_modal(
         }
     } else {
         lines.push(Line::from(Span::styled(
-            crate::tui::i18n::pick(ui.language, "未选中任何配置。", "No config selected."),
+            crate::tui::i18n::pick(ui.language, "未选中任何站点。", "No station selected."),
             Style::default().fg(p.muted),
         )));
     }
 
     let inner_height = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(inner_height);
-    ui.config_info_scroll = ui
-        .config_info_scroll
+    ui.station_info_scroll = ui
+        .station_info_scroll
         .min(max_scroll.min(u16::MAX as usize) as u16);
 
     let content = Paragraph::new(Text::from(lines))
         .block(block)
         .style(Style::default().fg(p.muted))
         .wrap(Wrap { trim: false })
-        .scroll((ui.config_info_scroll, 0));
+        .scroll((ui.station_info_scroll, 0));
     f.render_widget(content, area);
 }
 
@@ -643,8 +740,11 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 "            1 总览  2 配置  3 会话  4 请求  5 统计  6 设置  7 历史  8 最近",
             ),
             Line::from("  L          切换语言（中/英，自动落盘）"),
-            Line::from("  Tab        切换焦点（总览页）"),
             Line::from("  6 设置     查看运行态与关键配置入口"),
+            Line::from(
+                "  设置页      p 管理配置默认 profile；P 管理运行时默认 profile；R 重载配置；O 覆盖导入 ~/.codex（仅 codex）",
+            ),
+            Line::from("  Tab        切换焦点（总览页）"),
             Line::from(
                 "  总览页     b 打开 profile 菜单；M 打开 model 菜单；f 打开 fast / service tier 菜单；R 重置当前会话 manual overrides；O/H 从会话面板跳到 Requests/History；o/h 从请求面板跳到 Sessions/History",
             ),
@@ -684,12 +784,12 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  Clear binding  清除当前会话已存储的 profile 绑定（保留其他会话覆盖）"),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "配置页（Configs）",
+                "站点页（Stations）",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  Enter      设置为全局 active config（同 level 可 failover）"),
+            Line::from("  Enter      设置为全局 active station（同 level 可 failover）"),
             Line::from("  Backspace  清除 active（自动）"),
-            Line::from("  o          设置会话 override 为当前 config"),
+            Line::from("  o          设置会话 override 为当前站点"),
             Line::from("  O          清除会话 override"),
             Line::from("  i          查看 Provider 详情（可滚动）"),
             Line::from("  t          切换 enabled（热更新 + 落盘）"),
@@ -741,7 +841,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 "统计页（Stats）",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  Tab        切换焦点（config vs provider）"),
+            Line::from("  Tab        切换焦点（station vs provider）"),
             Line::from("  d          切换窗口（7/21/60 天）"),
             Line::from("  e          recent 仅看错误"),
             Line::from("  y          复制 + 导出报告（当前选中项）"),
@@ -763,10 +863,13 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  ↑/↓, j/k   move selection"),
             Line::from("  1-8        switch page"),
             Line::from(
-                "            1 Dashboard  2 Configs  3 Sessions  4 Requests  5 Stats  6 Settings  7 History  8 Recent",
+                "            1 Dashboard  2 Stations  3 Sessions  4 Requests  5 Stats  6 Settings  7 History  8 Recent",
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
-            Line::from("  6 Settings show runtime + config overview"),
+            Line::from("  6 Settings show runtime + station/config overview"),
+            Line::from(
+                "  Settings   p manage configured default profile; P manage runtime default profile; R reload config; O overwrite-import ~/.codex (codex only)",
+            ),
             Line::from(
                 "  Dashboard  b opens profile menu; M opens model menu; f opens fast / service tier menu; R resets current session manual overrides; O/H jump from Sessions panel to Requests/History; o/h jump from Requests panel to Sessions/History",
             ),
@@ -808,12 +911,12 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             ),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "Configs page",
+                "Stations page",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  Enter      set active config (same-level failover enabled)"),
+            Line::from("  Enter      set active station (same-level failover enabled)"),
             Line::from("  Backspace  clear active (auto)"),
-            Line::from("  o          set session override to selected config"),
+            Line::from("  o          set session override to selected station"),
             Line::from("  O          clear session override"),
             Line::from("  i          open provider details (scrollable)"),
             Line::from("  t          toggle enabled (hot reload + saved)"),
@@ -865,7 +968,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 "Stats page",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  Tab        switch focus (config vs provider)"),
+            Line::from("  Tab        switch focus (station vs provider)"),
             Line::from("  d          cycle time window (7/21/60 days)"),
             Line::from("  e          toggle errors-only (recent breakdown)"),
             Line::from("  y          copy + export report (selected item)"),
@@ -1308,64 +1411,117 @@ pub(super) fn render_service_tier_input_modal(f: &mut Frame<'_>, p: Palette, ui:
     f.render_widget(content, area);
 }
 
-pub(super) fn render_profile_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
-    let area = centered_rect(74, 68, f.area());
+pub(super) fn render_profile_modal_v2(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
+    let area = centered_rect(82, 72, f.area());
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .title(Span::styled(
+    let (title, clear_title, clear_detail) = match ui.overlay {
+        Overlay::ProfileMenuDefaultRuntime => (
+            crate::tui::i18n::pick(
+                ui.language,
+                "管理运行时默认 Profile",
+                "Manage runtime default profile",
+            ),
+            crate::tui::i18n::pick(
+                ui.language,
+                "Clear runtime override（回退到配置默认 profile）",
+                "Clear runtime override (fall back to configured default profile)",
+            ),
+            crate::tui::i18n::pick(
+                ui.language,
+                "只清理运行时 default_profile 覆盖；保留配置文件里的 default_profile",
+                "Only clears the runtime default_profile override; keep the configured default_profile from disk",
+            ),
+        ),
+        Overlay::ProfileMenuDefaultPersisted => (
+            crate::tui::i18n::pick(
+                ui.language,
+                "管理配置默认 Profile",
+                "Manage configured default profile",
+            ),
+            crate::tui::i18n::pick(
+                ui.language,
+                "Clear configured default（移除配置默认 profile）",
+                "Clear configured default (remove configured default profile)",
+            ),
+            crate::tui::i18n::pick(
+                ui.language,
+                "会修改并重载代理配置；新的会话将不再继承配置级 default_profile",
+                "This updates and reloads proxy config; new sessions will no longer inherit a configured default_profile",
+            ),
+        ),
+        _ => (
             crate::tui::i18n::pick(
                 ui.language,
                 "管理 Session Profile Binding",
                 "Manage session profile binding",
             ),
+            crate::tui::i18n::pick(
+                ui.language,
+                "Clear binding（移除会话已存储的 profile 绑定）",
+                "Clear binding (remove stored session profile binding)",
+            ),
+            crate::tui::i18n::pick(
+                ui.language,
+                "只清理 profile binding；保留当前会话的 model / effort / provider / service_tier 覆盖",
+                "Only clears the profile binding; keep current session model / effort / provider / service_tier overrides",
+            ),
+        ),
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.focus))
         .style(Style::default().bg(p.panel));
 
-    let mut items = Vec::with_capacity(ui.session_profile_options.len().saturating_add(1));
+    let mut items = Vec::with_capacity(ui.profile_options.len().saturating_add(1));
     items.push(ListItem::new(Text::from(vec![
-        Line::from(crate::tui::i18n::pick(
-            ui.language,
-            "Clear binding（移除会话已存储的 profile 绑定）",
-            "Clear binding (remove stored session profile binding)",
-        )),
-        Line::from(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "只清理 profile binding；保留当前会话的 model / effort / provider / service_tier 覆盖",
-                "Only clears the profile binding; keep current session model / effort / provider / service_tier overrides",
-            ),
-            Style::default().fg(p.muted),
-        )),
+        Line::from(clear_title),
+        Line::from(Span::styled(clear_detail, Style::default().fg(p.muted))),
     ])));
-    items.extend(ui.session_profile_options.iter().map(|profile| {
+    items.extend(ui.profile_options.iter().map(|profile| {
         let mut label = profile.name.clone();
-        if profile.is_default {
-            label.push_str(" *default");
+        let is_configured_default =
+            ui.configured_default_profile.as_deref() == Some(profile.name.as_str());
+        let is_runtime_override =
+            ui.runtime_default_profile_override.as_deref() == Some(profile.name.as_str());
+        let is_effective_default =
+            ui.effective_default_profile.as_deref() == Some(profile.name.as_str());
+        match ui.overlay {
+            Overlay::ProfileMenuDefaultRuntime => {
+                if is_runtime_override {
+                    label.push_str(" *runtime");
+                } else if is_effective_default {
+                    label.push_str(" *effective");
+                }
+            }
+            Overlay::ProfileMenuDefaultPersisted => {
+                if is_configured_default && is_effective_default {
+                    label.push_str(" *configured/effective");
+                } else if is_configured_default {
+                    label.push_str(" *configured");
+                } else if is_effective_default {
+                    label.push_str(" *effective");
+                }
+            }
+            _ => {
+                if profile.is_default {
+                    label.push_str(" *default");
+                }
+            }
         }
-        let mut parts = Vec::new();
-        if let Some(station) = profile.station.as_deref() {
-            parts.push(format!("station={station}"));
-        }
-        if let Some(model) = profile.model.as_deref() {
-            parts.push(format!("model={}", shorten_middle(model, 20)));
-        }
-        if let Some(reasoning) = profile.reasoning_effort.as_deref() {
-            parts.push(format!("reasoning={reasoning}"));
-        }
-        if let Some(tier) = profile.service_tier.as_deref() {
-            parts.push(format!("tier={tier}"));
-        }
-        let detail = if parts.is_empty() {
-            crate::tui::i18n::pick(ui.language, "<auto>", "<auto>").to_string()
-        } else {
-            shorten_middle(parts.join("  ").as_str(), 72)
-        };
+        let declared = profile_declared_summary(profile, ui.language);
+        let (resolved, resolve_failed) =
+            profile_resolved_summary(profile.name.as_str(), &ui.profile_options, ui.language);
         ListItem::new(Text::from(vec![
             Line::from(label),
-            Line::from(Span::styled(detail, Style::default().fg(p.muted))),
+            Line::from(Span::styled(declared, Style::default().fg(p.muted))),
+            Line::from(Span::styled(
+                resolved,
+                Style::default().fg(if resolve_failed { p.bad } else { p.accent }),
+            )),
         ]))
     }));
 
@@ -1423,4 +1579,74 @@ pub(super) fn render_provider_modal(
         .highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
         .highlight_symbol("  ");
     f.render_stateful_widget(list, area, &mut ui.menu_list);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{profile_declared_summary, profile_resolved_summary};
+    use crate::dashboard_core::ControlProfileOption;
+    use crate::tui::Language;
+
+    fn make_profile(name: &str) -> ControlProfileOption {
+        ControlProfileOption {
+            name: name.to_string(),
+            extends: None,
+            station: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            is_default: false,
+        }
+    }
+
+    #[test]
+    fn profile_declared_summary_includes_extends_and_auto_defaults() {
+        let mut profile = make_profile("fast");
+        profile.extends = Some("base".to_string());
+        profile.reasoning_effort = Some("low".to_string());
+
+        let summary = profile_declared_summary(&profile, Language::En);
+
+        assert!(summary.contains("declared:"));
+        assert!(summary.contains("extends=base"));
+        assert!(summary.contains("station=<auto>"));
+        assert!(summary.contains("reasoning=low"));
+        assert!(summary.contains("tier=<auto>"));
+    }
+
+    #[test]
+    fn profile_resolved_summary_uses_inherited_values() {
+        let mut base = make_profile("base");
+        base.station = Some("primary".to_string());
+        base.model = Some("gpt-5.4".to_string());
+        base.service_tier = Some("priority".to_string());
+
+        let mut fast = make_profile("fast");
+        fast.extends = Some("base".to_string());
+        fast.reasoning_effort = Some("low".to_string());
+
+        let (summary, failed) = profile_resolved_summary("fast", &[base, fast], Language::En);
+
+        assert!(!failed);
+        assert!(summary.contains("resolved:"));
+        assert!(summary.contains("station=primary"));
+        assert!(summary.contains("model=gpt-5.4"));
+        assert!(summary.contains("reasoning=low"));
+        assert!(summary.contains("tier=priority"));
+    }
+
+    #[test]
+    fn profile_resolved_summary_reports_cycle_error() {
+        let mut alpha = make_profile("alpha");
+        alpha.extends = Some("beta".to_string());
+
+        let mut beta = make_profile("beta");
+        beta.extends = Some("alpha".to_string());
+
+        let (summary, failed) = profile_resolved_summary("alpha", &[alpha, beta], Language::En);
+
+        assert!(failed);
+        assert!(summary.contains("resolve failed:"));
+        assert!(summary.contains("profile inheritance cycle"));
+    }
 }

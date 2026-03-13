@@ -7,7 +7,7 @@ use crate::tui::ProviderOption;
 use crate::tui::model::{Palette, Snapshot, format_age, now_ms, shorten, shorten_middle};
 use crate::tui::state::UiState;
 
-pub(super) fn render_configs_page(
+pub(super) fn render_stations_page(
     f: &mut Frame<'_>,
     p: Palette,
     ui: &mut UiState,
@@ -28,12 +28,12 @@ pub(super) fn render_configs_page(
     let session_override = snapshot
         .rows
         .get(ui.selected_session_idx)
-        .and_then(|r| r.override_config_name.as_deref());
-    let global_override = snapshot.global_override.as_deref();
+        .and_then(|r| r.override_station_name.as_deref());
+    let global_station_override = snapshot.global_station_override.as_deref();
 
     let left_block = Block::default()
         .title(Span::styled(
-            format!("Configs  (session: {selected_session})"),
+            format!("Stations  (session: {selected_session})"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -48,7 +48,7 @@ pub(super) fn render_configs_page(
         .iter()
         .map(|cfg| {
             let (enabled_ovr, level_ovr) = snapshot
-                .config_meta_overrides
+                .station_meta_overrides
                 .get(cfg.name.as_str())
                 .copied()
                 .unwrap_or((None, None));
@@ -82,7 +82,7 @@ pub(super) fn render_configs_page(
                 "canceled".to_string()
             } else {
                 snapshot
-                    .config_health
+                    .station_health
                     .get(cfg.name.as_str())
                     .map(|h| {
                         let total = h.upstreams.len().max(1);
@@ -112,7 +112,7 @@ pub(super) fn render_configs_page(
             };
 
             let mut style = Style::default().fg(if enabled { p.text } else { p.muted });
-            if global_override == Some(cfg.name.as_str()) {
+            if global_station_override == Some(cfg.name.as_str()) {
                 style = style.fg(p.accent).add_modifier(Modifier::BOLD);
             }
             if session_override == Some(cfg.name.as_str()) {
@@ -132,10 +132,10 @@ pub(super) fn render_configs_page(
         })
         .collect::<Vec<_>>();
 
-    ui.configs_table.select(if providers.is_empty() {
+    ui.stations_table.select(if providers.is_empty() {
         None
     } else {
-        Some(ui.selected_config_idx)
+        Some(ui.selected_station_idx)
     });
 
     let table = Table::new(
@@ -153,17 +153,17 @@ pub(super) fn render_configs_page(
     .block(left_block)
     .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
     .highlight_symbol("  ");
-    f.render_stateful_widget(table, columns[0], &mut ui.configs_table);
+    f.render_stateful_widget(table, columns[0], &mut ui.stations_table);
 
-    let selected = providers.get(ui.selected_config_idx);
+    let selected = providers.get(ui.selected_station_idx);
     let right_title = selected
-        .map(|c| format!("Config details: {} (L{})", c.name, c.level.clamp(1, 10)))
-        .unwrap_or_else(|| "Config details".to_string());
+        .map(|c| format!("Station details: {} (L{})", c.name, c.level.clamp(1, 10)))
+        .unwrap_or_else(|| "Station details".to_string());
 
     let mut lines = Vec::new();
     if let Some(cfg) = selected {
         let (enabled_ovr, level_ovr) = snapshot
-            .config_meta_overrides
+            .station_meta_overrides
             .get(cfg.name.as_str())
             .copied()
             .unwrap_or((None, None));
@@ -210,8 +210,8 @@ pub(super) fn render_configs_page(
 
         let routing = if let Some(s) = session_override {
             format!("pinned(session)={s}")
-        } else if let Some(g) = global_override {
-            format!("pinned(global)={g}")
+        } else if let Some(g) = global_station_override {
+            format!("pinned(global-station)={g}")
         } else {
             let mut levels = providers
                 .iter()
@@ -264,7 +264,7 @@ pub(super) fn render_configs_page(
             }
         }
 
-        if let Some(health) = snapshot.config_health.get(cfg.name.as_str()) {
+        if let Some(health) = snapshot.station_health.get(cfg.name.as_str()) {
             let age = format_age(now_ms(), Some(health.checked_at_ms));
             lines.push(Line::from(vec![
                 Span::styled("health: ", Style::default().fg(p.muted)),
@@ -350,15 +350,15 @@ pub(super) fn render_configs_page(
             "  i            provider details (scrollable)",
         )));
         lines.push(Line::from(
-            "  Enter        set active config (same-level failover enabled)",
+            "  Enter        set active station (same-level failover enabled)",
         ));
         lines.push(Line::from("  Backspace    clear active (auto)"));
         lines.push(Line::from(
-            "  o            set session override to selected config",
+            "  o            set session override to selected station",
         ));
         lines.push(Line::from("  O            clear session override"));
-        lines.push(Line::from("  h            health check selected config"));
-        lines.push(Line::from("  H            health check all configs"));
+        lines.push(Line::from("  h            health check selected station"));
+        lines.push(Line::from("  H            health check all stations"));
         lines.push(Line::from("  c            cancel health check (selected)"));
         lines.push(Line::from("  C            cancel health check (all)"));
         lines.push(Line::from(""));
@@ -372,7 +372,7 @@ pub(super) fn render_configs_page(
         lines.push(Line::from("  +/-          adjust level (immediate, saved)"));
     } else {
         lines.push(Line::from(Span::styled(
-            "No configs available.",
+            "No stations available.",
             Style::default().fg(p.muted),
         )));
     }
