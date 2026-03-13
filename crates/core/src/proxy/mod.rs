@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::body::{Body, to_bytes};
+use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode};
 use reqwest::Client;
-use std::sync::OnceLock;
 use tracing::instrument;
 
 mod admin;
@@ -29,6 +28,7 @@ mod profile_defaults;
 mod provider_execution;
 mod provider_orchestration;
 mod request_body;
+mod request_context;
 mod request_failures;
 mod request_preparation;
 mod request_routing;
@@ -49,27 +49,20 @@ mod tests;
 use crate::config::{ProxyConfig, ServiceConfigManager};
 use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer};
-use crate::logging::{
-    HeaderEntry, HttpDebugLog, http_debug_options, http_warn_options, now_ms,
-    should_log_request_body_preview,
-};
+use crate::logging::{HeaderEntry, HttpDebugLog, now_ms};
 use crate::state::{ProxyState, RuntimeConfigState};
 
 pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
-use self::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
 use self::profile_defaults::effective_default_profile_name;
 use self::provider_execution::{
     ExecuteProviderChainParams, ProviderExecutionOutcome, execute_provider_chain, log_retry_options,
 };
-use self::request_failures::{
-    finish_failed_proxy_request, log_client_body_read_error, log_no_routable_station,
-    no_upstreams_available_error,
-};
-use self::request_preparation::{build_body_previews, detect_request_flavor, prepare_request_body};
-use self::retry::{retry_info_for_chain, retry_plan};
+use self::request_context::prepare_proxy_request;
+use self::request_failures::{finish_failed_proxy_request, no_upstreams_available_error};
+use self::retry::retry_info_for_chain;
 pub use self::router_setup::{
     admin_listener_router, proxy_only_router, proxy_only_router_with_admin_base_url, router,
 };
@@ -243,218 +236,41 @@ pub async fn handle_proxy(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let (parts, body) = req.into_parts();
-    let client_addr = extract_client_addr(&parts.extensions);
-    let uri = parts.uri;
-    let client_uri = uri.to_string();
-    let method = parts.method;
-    let client_headers = parts.headers;
-    let client_headers_entries_cache: OnceLock<Vec<HeaderEntry>> = OnceLock::new();
-
-    let session_id = extract_session_id(&client_headers);
-    let client_name = extract_client_name(&client_headers);
-
-    proxy.config.maybe_reload_from_disk().await;
-    let cfg_snapshot = proxy.config.snapshot().await;
-    let mgr = proxy.service_manager(cfg_snapshot.as_ref());
-    let session_binding = if let Some(id) = session_id.as_deref() {
-        proxy
-            .ensure_default_session_binding(mgr, id, started_at_ms)
-            .await
-    } else {
-        None
-    };
-    let lbs = proxy
-        .lbs_for_request(cfg_snapshot.as_ref(), session_id.as_deref())
-        .await;
-    if lbs.is_empty() {
-        let dur = start.elapsed().as_millis() as u64;
-        let client_headers_entries = client_headers_entries_cache
-            .get_or_init(|| header_map_to_entries(&client_headers))
-            .clone();
-        return Err(log_no_routable_station(
-            &proxy,
-            &method,
-            uri.path(),
-            client_uri.as_str(),
-            session_id.clone(),
-            client_headers_entries,
-            dur,
-        ));
-    }
-    let request_flavor =
-        detect_request_flavor(proxy.service_name, &method, &client_headers, uri.path());
-
-    let cwd = if let Some(id) = session_id.as_deref() {
-        proxy.state.resolve_session_cwd(id).await
-    } else {
-        None
-    };
-    if let Some(id) = session_id.as_deref() {
-        proxy.state.touch_session_override(id, started_at_ms).await;
-        proxy
-            .state
-            .touch_session_station_override(id, started_at_ms)
-            .await;
-        proxy
-            .state
-            .touch_session_model_override(id, started_at_ms)
-            .await;
-        proxy
-            .state
-            .touch_session_service_tier_override(id, started_at_ms)
-            .await;
-        proxy.state.touch_session_binding(id, started_at_ms).await;
-    }
-    let session_override_config = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_station_override(id).await
-    } else {
-        None
-    };
-    let global_station_override = proxy.state.get_global_station_override().await;
-
-    // Read request body and apply filters.
-    let raw_body = match to_bytes(body, 10 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            let dur = start.elapsed().as_millis() as u64;
-            let err_str = e.to_string();
-            let client_headers_entries = client_headers_entries_cache
-                .get_or_init(|| header_map_to_entries(&client_headers))
-                .clone();
-            return Err(log_client_body_read_error(
-                &proxy,
-                &method,
-                uri.path(),
-                client_uri.as_str(),
-                session_id.clone(),
-                cwd.clone(),
-                client_headers_entries,
-                dur,
-                err_str,
-            ));
-        }
-    };
-    let override_effort = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_effort_override(id).await
-    } else {
-        None
-    };
-    let binding_effort = session_binding
-        .as_ref()
-        .and_then(|binding| binding.reasoning_effort.as_deref());
-    let override_model = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_model_override(id).await
-    } else {
-        None
-    };
-    let binding_model = session_binding
-        .as_ref()
-        .and_then(|binding| binding.model.as_deref());
-    let override_service_tier = if let Some(id) = session_id.as_deref() {
-        proxy.state.get_session_service_tier_override(id).await
-    } else {
-        None
-    };
-    let binding_service_tier = session_binding
-        .as_ref()
-        .and_then(|binding| binding.service_tier.as_deref());
-    let prepared_request = prepare_request_body(
-        &raw_body,
-        override_effort.as_deref(),
-        binding_effort,
-        override_model.as_deref(),
-        binding_model,
-        override_service_tier.as_deref(),
-        binding_service_tier,
-    );
-    let body_for_upstream = prepared_request.body_for_upstream.clone();
-    let request_model = prepared_request.request_model.clone();
-    let effective_effort = prepared_request.effective_effort.clone();
-    let effective_service_tier = prepared_request.base_service_tier.effective.clone();
-    let base_service_tier = prepared_request.base_service_tier.clone();
-    let request_body_len = prepared_request.request_body_len;
-
-    let debug_opt = http_debug_options();
-    let warn_opt = http_warn_options();
-    let debug_max = if debug_opt.enabled {
-        debug_opt.max_body_bytes
-    } else {
-        0
-    };
-    let warn_max = if warn_opt.enabled {
-        warn_opt.max_body_bytes
-    } else {
-        0
-    };
-    let request_body_previews = should_log_request_body_preview();
-    let client_body_previews = build_body_previews(
-        &raw_body,
-        request_flavor.client_content_type.as_deref(),
-        request_body_previews,
-        debug_max,
-        warn_max,
-    );
-    let client_body_debug = client_body_previews.debug.clone();
-    let client_body_warn = client_body_previews.warn.clone();
-
-    let request_id = proxy
-        .state
-        .begin_request(
-            proxy.service_name,
-            method.as_str(),
-            uri.path(),
-            session_id.clone(),
-            client_name.clone(),
-            client_addr.clone(),
-            cwd.clone(),
-            request_model.clone(),
-            effective_effort.clone(),
-            effective_service_tier.clone(),
-            started_at_ms,
-        )
-        .await;
-
-    let retry_cfg = cfg_snapshot.retry.resolve();
-    let plan = retry_plan(&retry_cfg);
-    let cooldown_backoff = crate::lb::CooldownBackoff {
-        factor: plan.cooldown_backoff_factor,
-        max_secs: plan.cooldown_backoff_max_secs,
-    };
-    log_retry_options(proxy.service_name, request_id, &plan);
+    let prepared = prepare_proxy_request(&proxy, req, &start, started_at_ms).await?;
+    log_retry_options(proxy.service_name, prepared.request_id, &prepared.plan);
     let provider_execution = execute_provider_chain(ExecuteProviderChainParams {
         proxy: &proxy,
-        lbs: &lbs,
-        method: &method,
-        uri: &uri,
-        client_headers: &client_headers,
-        client_headers_entries_cache: &client_headers_entries_cache,
-        client_uri: client_uri.as_str(),
+        lbs: &prepared.lbs,
+        method: &prepared.method,
+        uri: &prepared.uri,
+        client_headers: &prepared.client_headers,
+        client_headers_entries_cache: &prepared.client_headers_entries_cache,
+        client_uri: prepared.client_uri.as_str(),
         start: &start,
         started_at_ms,
-        request_id,
-        request_body_len,
-        body_for_upstream: &body_for_upstream,
-        request_model: request_model.as_deref(),
-        session_binding: session_binding.as_ref(),
-        session_override_config: session_override_config.as_deref(),
-        global_station_override: global_station_override.as_deref(),
-        override_model: override_model.as_deref(),
-        override_effort: override_effort.as_deref(),
-        override_service_tier: override_service_tier.as_deref(),
-        effective_effort: effective_effort.as_deref(),
-        effective_service_tier: effective_service_tier.as_deref(),
-        base_service_tier: &base_service_tier,
-        session_id: session_id.as_deref(),
-        cwd: cwd.as_deref(),
-        request_flavor: &request_flavor,
-        request_body_previews,
-        debug_max,
-        warn_max,
-        client_body_debug: client_body_debug.as_ref(),
-        client_body_warn: client_body_warn.as_ref(),
-        plan: &plan,
-        cooldown_backoff,
+        request_id: prepared.request_id,
+        request_body_len: prepared.request_body_len,
+        body_for_upstream: &prepared.body_for_upstream,
+        request_model: prepared.request_model.as_deref(),
+        session_binding: prepared.session_binding.as_ref(),
+        session_override_config: prepared.session_override_config.as_deref(),
+        global_station_override: prepared.global_station_override.as_deref(),
+        override_model: prepared.override_model.as_deref(),
+        override_effort: prepared.override_effort.as_deref(),
+        override_service_tier: prepared.override_service_tier.as_deref(),
+        effective_effort: prepared.effective_effort.as_deref(),
+        effective_service_tier: prepared.effective_service_tier.as_deref(),
+        base_service_tier: &prepared.base_service_tier,
+        session_id: prepared.session_id.as_deref(),
+        cwd: prepared.cwd.as_deref(),
+        request_flavor: &prepared.request_flavor,
+        request_body_previews: prepared.request_body_previews,
+        debug_max: prepared.debug_max,
+        warn_max: prepared.warn_max,
+        client_body_debug: prepared.client_body_debug.as_ref(),
+        client_body_warn: prepared.client_body_warn.as_ref(),
+        plan: &prepared.plan,
+        cooldown_backoff: prepared.cooldown_backoff,
     })
     .await;
     let (upstream_chain, last_err) = match provider_execution {
@@ -468,17 +284,17 @@ pub async fn handle_proxy(
         let retry = retry_info_for_chain(&upstream_chain);
         return Err(finish_failed_proxy_request(
             &proxy,
-            &method,
-            uri.path(),
-            request_id,
+            &prepared.method,
+            prepared.uri.path(),
+            prepared.request_id,
             status,
             msg,
             dur,
             started_at_ms,
-            session_id.clone(),
-            cwd.clone(),
-            effective_effort.clone(),
-            base_service_tier.clone(),
+            prepared.session_id.clone(),
+            prepared.cwd.clone(),
+            prepared.effective_effort.clone(),
+            prepared.base_service_tier.clone(),
             retry,
         )
         .await);
