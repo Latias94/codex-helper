@@ -171,6 +171,16 @@ See `CENTRAL_RELAY.md` for the explicit LAN / Tailscale shared-relay operating m
   - [x] extract Config v2 station/provider/profile helper panels from `pages/mod.rs`
   - [x] extract Config raw editor from `pages/mod.rs`
   - [x] extract shared route/session presentation helpers into focused modules
+  - [x] extract runtime station health/capability helpers into `pages/runtime_station.rs`
+  - [x] extract profile route preview builders/catalog helpers into `pages/profile_preview.rs`
+  - [x] extract retry editor helpers into `pages/retry_editor.rs`
+  - [x] extract config parse/save/sync glue into `pages/config_document.rs`
+  - [x] extract remote attach/admin/token helpers into `pages/remote_attach.rs`
+  - [x] extract shared history/workdir/WT helpers into `pages/history_tools.rs`
+  - [x] extract shared time/string/usage formatting helpers into `pages/formatting.rs`
+  - [x] extract navigation shell into `pages/navigation.rs`
+  - [x] extract Config page shell into `pages/config_shell.rs`
+  - [x] extract remaining page/view state definitions into `pages/view_state.rs`
 - [x] CP-612 Define a cleaner operator information architecture for future GUI/WebUI:
   - [x] session console
   - [x] station/health console
