@@ -12,6 +12,21 @@ The milestones are ordered by semantic leverage:
 4. Make station management and HA trustworthy.
 5. Make the product LAN-ready without over-promising local-only features.
 
+## Current Read
+
+As of the current refactor state:
+
+- `M1`, `M2`, `M5`, and the current GUI/control-plane scope of `M6` are effectively usable.
+- `M3` and `M4` are substantially complete.
+- The main remaining semantic gap is still `M0` plus the final `CP-401` terminology/runtime cleanup.
+- The code-side runtime/UI route is now largely station-first across core / GUI / TUI:
+  - remaining `config` wording is mostly compatibility shims, persisted document concepts, tests, or historical design material
+- Fast mode / priority-processing observability is no longer a blocker:
+  - request logs now distinguish requested / effective / actual `service_tier`
+  - recent/session observed values now prefer the actual upstream response when available
+
+This means the workstream is past "can this direction work" and is now in a structured closeout phase.
+
 ## M0 - Vocabulary and Compatibility Baseline
 
 ### Goal
@@ -158,6 +173,109 @@ GUI and future WebUI can build on stable control semantics rather than inventing
 
 - GUI is no longer a thin wrapper over legacy fields.
 - A future WebUI can be added without redefining control-plane semantics.
+
+## Endgame Priorities
+
+The remaining work should be driven by closeout priority rather than by the original milestone order.
+
+### P0 - Semantic Closeout
+
+Goal:
+
+- reach a point where the refactor can be called semantically complete, not just usable
+
+Scope:
+
+- complete `CP-000` / `CP-001` / `CP-002`
+- complete the remaining `CP-401` runtime/public rename tail
+- finish the vocabulary cleanup from legacy `config` language to station-first language
+- keep `config` only where it literally means persisted config/document concepts or historical design material
+- reduce the remaining compatibility-only tail explicitly:
+  - narrow shims such as `active_config()`
+  - compatibility tests/assertions for legacy fields/routes
+  - migration/docs examples that intentionally show legacy `configs` input
+- finish the remaining runtime/admin wording tail after the proxy routing internals closeout:
+  - exported runtime/admin type naming
+  - finish the last operator/admin wording cleanup on station-first surfaces
+- run a stability pass after the rename:
+  - attach mode
+  - snapshot/recent/session payloads
+  - canonical v1 routes/fields
+- make config templates/docs/UI wording consistently station/provider/profile-first
+
+Definition of done:
+
+- internal/runtime/public UI naming is station-first
+- legacy `config` wording is clearly compatibility-only
+- remaining compatibility shims are explicit and intentionally narrow rather than part of the main operator path
+- operators can explain station/profile/session concepts without ambiguity
+- attach compatibility is still green after the rename cleanup
+
+Why this is `P0`:
+
+- this is the real blocker to declaring the refactor finished
+- the remaining risk is semantic drift, not missing core functionality
+
+### P1 - Maintainability and Hardening
+
+Goal:
+
+- reduce implementation drag before the next round of features or UI expansion
+
+Scope:
+
+- split oversized modules:
+  - `crates/core/src/proxy/mod.rs`
+  - `crates/core/src/state.rs`
+  - large focused test files that are becoming navigation bottlenecks
+- keep the new observability model coherent:
+  - request outcome logging
+  - session/recent views
+  - failover/retry traces
+- tighten the operator information architecture in GUI where the semantic model is already stable
+
+Definition of done:
+
+- the main control-plane modules are no longer concentrated in a few oversized files
+- request/route/observability behavior is easier to reason about and test
+- GUI structure is cleaner without another full redesign being required first
+
+Why this is `P1`:
+
+- not a semantic blocker
+- but it strongly affects velocity, code review cost, and future WebUI readiness
+
+### P2 - Productization and Long-horizon Audit
+
+Goal:
+
+- turn the usable local control plane into a more complete operator product
+
+Scope:
+
+- long-horizon route provenance / audit history beyond runtime snapshot
+- richer request history and route-outcome inspection
+- GUI/WebUI level audit surface if it proves worthwhile
+- optional future relay enhancements:
+  - per-device access model
+  - companion-based remote enrichment
+  - advanced failover policy after first output
+
+Definition of done:
+
+- operators can answer not only "what happened now" but also "what happened over time"
+- multi-device/shared-relay behavior is clearer and more supportable
+- future GUI/WebUI work is building on stable audit/control primitives
+
+Why this is `P2`:
+
+- valuable, but not required to declare the current refactor complete
+
+## Recommended Closeout Sequence
+
+1. Finish `P0` and declare the semantic refactor closed.
+2. Use `P1` to reduce codebase drag before larger UI or API changes.
+3. Treat `P2` as the productization track rather than as a blocker for refactor completion.
 
 ## Exit Criteria for the Workstream
 

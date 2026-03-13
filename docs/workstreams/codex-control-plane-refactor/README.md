@@ -21,7 +21,11 @@ The intended end state is:
 - `TODO.md`
   - Actionable engineering checklist, open questions, and work breakdown.
 - `MILESTONES.md`
-  - Milestone sequencing, deliverables, and definition-of-done gates.
+  - Milestone sequencing, definition-of-done gates, and the current `P0 / P1 / P2` closeout priorities.
+- `CLOSEOUT.md`
+  - Exit-gap assessment for the refactor, including what is already closed and what still blocks a full semantic closeout.
+- `CENTRAL_RELAY.md`
+  - Product-shape notes for LAN / Tailscale shared-relay deployment and remote-safe capability boundaries.
 - `PHASE1_IMPLEMENTATION.md`
   - Concrete implementation plan for `SLICE-001` to `SLICE-005`, including module touch points, API additions, compatibility strategy, and testing guidance.
 - `CONFIG_V2_MIGRATION.md`
