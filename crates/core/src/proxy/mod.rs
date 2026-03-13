@@ -13,12 +13,13 @@ use axum::middleware;
 use axum::routing::{any, get, post, put};
 use reqwest::Client;
 use std::sync::OnceLock;
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 mod admin;
 mod auth_resolution;
 mod classify;
 mod headers;
+mod http_debug;
 mod request_body;
 mod retry;
 mod route_provenance;
@@ -35,9 +36,9 @@ use crate::dashboard_core::{
 use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
-    AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, ServiceTierLog, http_debug_options,
-    http_warn_options, log_request_with_debug, log_retry_trace, make_body_preview, now_ms,
-    should_include_http_warn, should_log_request_body_preview,
+    HeaderEntry, HttpDebugLog, ServiceTierLog, http_debug_options, http_warn_options,
+    log_request_with_debug, log_retry_trace, make_body_preview, now_ms, should_include_http_warn,
+    should_log_request_body_preview,
 };
 use crate::model_routing;
 use crate::state::{ActiveRequest, FinishedRequest, ProxyState, RuntimeConfigState};
@@ -54,6 +55,7 @@ pub use self::admin::{
 use self::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
 use self::classify::{class_is_health_neutral, classify_upstream_response};
 use self::headers::{filter_request_headers, filter_response_headers};
+use self::http_debug::format_reqwest_error_for_retry_chain;
 use self::request_body::{
     apply_model_override, apply_reasoning_effort_override, apply_service_tier_override,
     extract_model_from_request_body, extract_reasoning_effort_from_request_body,
@@ -199,52 +201,6 @@ fn effective_active_station_name(mgr: &ServiceConfigManager) -> Option<String> {
     mgr.active_station().map(|cfg| cfg.name.clone())
 }
 
-fn format_reqwest_error_for_retry_chain(e: &reqwest::Error) -> String {
-    use std::error::Error as _;
-
-    let mut parts: Vec<String> = Vec::new();
-    let first = e.to_string();
-    if !first.trim().is_empty() {
-        parts.push(first);
-    }
-
-    let mut cur = e.source();
-    for _ in 0..4 {
-        let Some(src) = cur else { break };
-        let msg = src.to_string();
-        if !msg.trim().is_empty() && !parts.iter().any(|x| x == &msg) {
-            parts.push(msg);
-        }
-        cur = src.source();
-    }
-
-    let mut flags: Vec<&'static str> = Vec::new();
-    if e.is_timeout() {
-        flags.push("timeout");
-    }
-    if e.is_connect() {
-        flags.push("connect");
-    }
-
-    let mut out = if parts.is_empty() {
-        "reqwest error".to_string()
-    } else {
-        parts.join(" | caused_by: ")
-    };
-    if !flags.is_empty() {
-        out.push_str(" (flags: ");
-        out.push_str(&flags.join(","));
-        out.push(')');
-    }
-    out = out.replace(['\r', '\n'], " ");
-    const MAX_LEN: usize = 360;
-    if out.len() > MAX_LEN {
-        out.truncate(MAX_LEN);
-        out.push('…');
-    }
-    out
-}
-
 #[allow(dead_code)]
 fn lb_state_snapshot_json(lb: &LoadBalancer) -> Option<serde_json::Value> {
     let map = match lb.states.lock() {
@@ -290,34 +246,10 @@ fn header_map_to_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
     headers::header_map_to_entries(headers)
 }
 
-#[derive(Clone)]
-struct HttpDebugBase {
-    debug_max_body_bytes: usize,
-    warn_max_body_bytes: usize,
-    #[allow(dead_code)]
-    request_body_len: usize,
-    #[allow(dead_code)]
-    upstream_request_body_len: usize,
-    client_uri: String,
-    target_url: String,
-    client_headers: Vec<HeaderEntry>,
-    upstream_request_headers: Vec<HeaderEntry>,
-    auth_resolution: Option<AuthResolutionLog>,
-    client_body_debug: Option<BodyPreview>,
-    upstream_request_body_debug: Option<BodyPreview>,
-    client_body_warn: Option<BodyPreview>,
-    upstream_request_body_warn: Option<BodyPreview>,
-}
+type HttpDebugBase = http_debug::HttpDebugBase;
 
 fn warn_http_debug(status_code: u16, http_debug: &HttpDebugLog) {
-    let max_chars = 2048usize;
-    let Ok(mut json) = serde_json::to_string(http_debug) else {
-        return;
-    };
-    if json.chars().count() > max_chars {
-        json = json.chars().take(max_chars).collect::<String>() + "...[TRUNCATED_FOR_LOG]";
-    }
-    warn!("upstream non-2xx http_debug={json} status_code={status_code}");
+    http_debug::warn_http_debug(status_code, http_debug);
 }
 
 /// Generic proxy service; currently used by both Codex and Claude.
