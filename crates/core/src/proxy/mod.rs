@@ -14,6 +14,7 @@ mod attempt_failures;
 mod attempt_request;
 mod attempt_response;
 mod attempt_selection;
+mod attempt_transport;
 mod auth_resolution;
 mod classify;
 mod client_identity;
@@ -56,12 +57,14 @@ pub use self::admin::{
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
 use self::attempt_failures::apply_terminal_upstream_failure;
-use self::attempt_request::{AttemptRequestSetupParams, prepare_attempt_request};
 use self::attempt_response::{
     AttemptResponseOutcome, AttemptResponseParams, StreamingAttemptResponseParams,
     handle_attempt_response, handle_streaming_attempt_success,
 };
 use self::attempt_selection::{select_supported_upstream, station_upstreams_exhausted};
+use self::attempt_transport::{
+    AttemptTransportOutcome, AttemptTransportParams, handle_attempt_transport,
+};
 use self::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
 use self::headers::filter_response_headers;
 use self::http_debug::format_reqwest_error_for_retry_chain;
@@ -618,39 +621,12 @@ pub async fn handle_proxy(
                     "model": model_note.as_str(),
                 }));
 
-                let target_url = match proxy.build_target(&selected, &uri) {
-                    Ok((url, _headers)) => url,
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        upstream_chain.push(format!(
-                            "{}:{} (idx={}) target_build_error={} model={}",
-                            selected.station_name,
-                            selected.upstream.base_url,
-                            selected.index,
-                            err_str,
-                            model_note.as_str()
-                        ));
-                        apply_terminal_upstream_failure(
-                            &proxy,
-                            None,
-                            &selected,
-                            "target_build_error",
-                            None,
-                            plan.transport_cooldown_secs,
-                            cooldown_backoff,
-                            err_str,
-                            avoid_set,
-                            &mut avoided_total,
-                            &mut last_err,
-                        )
-                        .await;
-                        break;
-                    }
-                };
-
-                let attempt_request = prepare_attempt_request(AttemptRequestSetupParams {
+                let transport = handle_attempt_transport(AttemptTransportParams {
                     proxy: &proxy,
-                    auth: &selected.upstream.auth,
+                    lb: &lb,
+                    selected: &selected,
+                    method: &method,
+                    uri: &uri,
                     client_headers: &client_headers,
                     client_headers_entries_cache: &client_headers_entries_cache,
                     request_body_len,
@@ -658,71 +634,35 @@ pub async fn handle_proxy(
                     debug_max,
                     warn_max,
                     client_uri: client_uri.as_str(),
-                    target_url: target_url.as_str(),
                     client_body_debug: client_body_debug.as_ref(),
                     upstream_request_body_debug: upstream_request_body_debug.as_ref(),
                     client_body_warn: client_body_warn.as_ref(),
                     upstream_request_body_warn: upstream_request_body_warn.as_ref(),
-                });
-                let headers = attempt_request.headers;
-                proxy
-                    .state
-                    .update_request_route(
-                        request_id,
-                        selected.station_name.clone(),
-                        provider_id.clone(),
-                        selected.upstream.base_url.clone(),
-                        Some(route_decision.clone()),
-                    )
-                    .await;
-                let debug_base = attempt_request.debug_base;
-
-                let builder = proxy
-                    .client
-                    .request(method.clone(), target_url.clone())
-                    .headers(headers)
-                    .body(filtered_body.clone());
-
-                let upstream_start = Instant::now();
-                let resp = match builder.send().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let err_str = format_reqwest_error_for_retry_chain(&e);
-                        upstream_chain.push(format!(
-                            "{}:{} (idx={}) transport_error={} model={}",
-                            selected.station_name,
-                            selected.upstream.base_url,
-                            selected.index,
-                            err_str,
-                            model_note.as_str()
-                        ));
-                        // Upstream-layer retry only for classified transient transport errors.
-                        let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
-                            && should_retry_class(upstream_opt, Some("upstream_transport_error"));
-                        if can_retry_upstream {
-                            backoff_sleep(upstream_opt, upstream_attempt).await;
-                            continue;
-                        }
-
-                        apply_terminal_upstream_failure(
-                            &proxy,
-                            Some(&lb),
-                            &selected,
-                            "upstream_transport_error",
-                            Some("upstream_transport_error"),
-                            plan.transport_cooldown_secs,
-                            cooldown_backoff,
-                            err_str,
-                            avoid_set,
-                            &mut avoided_total,
-                            &mut last_err,
-                        )
-                        .await;
-                        break;
-                    }
+                    request_id,
+                    provider_id: provider_id.as_deref(),
+                    route_decision: &route_decision,
+                    filtered_body: &filtered_body,
+                    upstream_opt,
+                    upstream_attempt,
+                    transport_cooldown_secs: plan.transport_cooldown_secs,
+                    cooldown_backoff,
+                    avoid_set,
+                    avoided_total: &mut avoided_total,
+                    last_err: &mut last_err,
+                    upstream_chain: &mut upstream_chain,
+                    model_note: model_note.as_str(),
+                })
+                .await;
+                let (resp, upstream_start, upstream_headers_ms, debug_base) = match transport {
+                    AttemptTransportOutcome::RetrySameUpstream => continue,
+                    AttemptTransportOutcome::TryNextUpstream => break,
+                    AttemptTransportOutcome::Continue(success) => (
+                        success.response,
+                        success.upstream_start,
+                        success.upstream_headers_ms,
+                        success.debug_base,
+                    ),
                 };
-
-                let upstream_headers_ms = upstream_start.elapsed().as_millis() as u64;
                 let status = resp.status();
                 let success = status.is_success();
                 let resp_headers = resp.headers().clone();
