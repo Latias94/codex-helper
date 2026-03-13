@@ -28,6 +28,12 @@ pub(super) enum AttemptTransportOutcome {
     Continue(AttemptTransportSuccess),
 }
 
+pub(super) enum AttemptReadBodyOutcome {
+    RetrySameUpstream,
+    TryNextUpstream,
+    Continue(Bytes),
+}
+
 pub(super) struct AttemptTransportParams<'a> {
     pub(super) proxy: &'a ProxyService,
     pub(super) lb: &'a LoadBalancer,
@@ -49,6 +55,22 @@ pub(super) struct AttemptTransportParams<'a> {
     pub(super) provider_id: Option<&'a str>,
     pub(super) route_decision: &'a RouteDecisionProvenance,
     pub(super) filtered_body: &'a Bytes,
+    pub(super) upstream_opt: &'a RetryLayerOptions,
+    pub(super) upstream_attempt: u32,
+    pub(super) transport_cooldown_secs: u64,
+    pub(super) cooldown_backoff: crate::lb::CooldownBackoff,
+    pub(super) avoid_set: &'a mut HashSet<usize>,
+    pub(super) avoided_total: &'a mut usize,
+    pub(super) last_err: &'a mut Option<(StatusCode, String)>,
+    pub(super) upstream_chain: &'a mut Vec<String>,
+    pub(super) model_note: &'a str,
+}
+
+pub(super) struct AttemptReadBodyParams<'a> {
+    pub(super) proxy: &'a ProxyService,
+    pub(super) lb: &'a LoadBalancer,
+    pub(super) selected: &'a SelectedUpstream,
+    pub(super) response: reqwest::Response,
     pub(super) upstream_opt: &'a RetryLayerOptions,
     pub(super) upstream_attempt: u32,
     pub(super) transport_cooldown_secs: u64,
@@ -204,4 +226,61 @@ pub(super) async fn handle_attempt_transport(
         upstream_headers_ms: upstream_start.elapsed().as_millis() as u64,
         debug_base,
     })
+}
+
+pub(super) async fn read_attempt_response_body(
+    params: AttemptReadBodyParams<'_>,
+) -> AttemptReadBodyOutcome {
+    let AttemptReadBodyParams {
+        proxy,
+        lb,
+        selected,
+        response,
+        upstream_opt,
+        upstream_attempt,
+        transport_cooldown_secs,
+        cooldown_backoff,
+        avoid_set,
+        avoided_total,
+        last_err,
+        upstream_chain,
+        model_note,
+    } = params;
+
+    match response.bytes().await {
+        Ok(bytes) => AttemptReadBodyOutcome::Continue(bytes),
+        Err(error) => {
+            let err_str = format_reqwest_error_for_retry_chain(&error);
+            upstream_chain.push(format!(
+                "{}:{} (idx={}) body_read_error={} model={}",
+                selected.station_name,
+                selected.upstream.base_url,
+                selected.index,
+                err_str,
+                model_note
+            ));
+            let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
+                && should_retry_class(upstream_opt, Some("upstream_transport_error"));
+            if can_retry_upstream {
+                backoff_sleep(upstream_opt, upstream_attempt).await;
+                return AttemptReadBodyOutcome::RetrySameUpstream;
+            }
+
+            apply_terminal_upstream_failure(
+                proxy,
+                Some(lb),
+                selected,
+                "upstream_body_read_error",
+                Some("upstream_body_read_error"),
+                transport_cooldown_secs,
+                cooldown_backoff,
+                err_str,
+                avoid_set,
+                avoided_total,
+                last_err,
+            )
+            .await;
+            AttemptReadBodyOutcome::TryNextUpstream
+        }
+    }
 }

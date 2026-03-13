@@ -25,6 +25,7 @@ mod http_debug;
 mod passive_health;
 mod persisted_config_api;
 mod profile_defaults;
+mod provider_orchestration;
 mod request_body;
 mod request_failures;
 mod request_preparation;
@@ -56,25 +57,30 @@ pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
-use self::attempt_failures::apply_terminal_upstream_failure;
 use self::attempt_response::{
     AttemptResponseOutcome, AttemptResponseParams, StreamingAttemptResponseParams,
     handle_attempt_response, handle_streaming_attempt_success,
 };
 use self::attempt_selection::{select_supported_upstream, station_upstreams_exhausted};
 use self::attempt_transport::{
-    AttemptTransportOutcome, AttemptTransportParams, handle_attempt_transport,
+    AttemptReadBodyOutcome, AttemptReadBodyParams, AttemptTransportOutcome, AttemptTransportParams,
+    handle_attempt_transport, read_attempt_response_body,
 };
 use self::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
 use self::headers::filter_response_headers;
 use self::http_debug::format_reqwest_error_for_retry_chain;
 use self::profile_defaults::effective_default_profile_name;
+use self::provider_orchestration::{
+    cross_station_failover_enabled, log_cross_station_failover_blocked,
+    log_same_station_failover_trace, next_provider_load_balancer, provider_attempt_limit,
+    station_loop_action_after_attempt,
+};
 use self::request_failures::{
     finish_failed_proxy_request, log_client_body_read_error, log_no_routable_station,
     no_upstreams_available_error,
 };
 use self::request_preparation::{build_body_previews, detect_request_flavor, prepare_request_body};
-use self::retry::{backoff_sleep, retry_info_for_chain, retry_plan, should_retry_class};
+use self::retry::{backoff_sleep, retry_info_for_chain, retry_plan};
 pub use self::router_setup::{
     admin_listener_router, proxy_only_router, proxy_only_router_with_admin_base_url, router,
 };
@@ -109,40 +115,6 @@ fn runtime_state_allows_general_routing(state: RuntimeConfigState) -> bool {
 
 fn runtime_state_allows_pinned_routing(state: RuntimeConfigState) -> bool {
     state != RuntimeConfigState::BreakerOpen
-}
-
-fn sorted_avoid_indices(avoid: &HashSet<usize>) -> Vec<usize> {
-    let mut indices = avoid.iter().copied().collect::<Vec<_>>();
-    indices.sort_unstable();
-    indices
-}
-
-fn log_same_station_failover_trace(
-    service_name: &str,
-    request_id: u64,
-    station_name: &str,
-    upstream_total: usize,
-    avoid_set: &HashSet<usize>,
-    exhausted: bool,
-) {
-    let event = if exhausted {
-        "same_station_exhausted"
-    } else {
-        "same_station_failover"
-    };
-    log_retry_trace(serde_json::json!({
-        "event": event,
-        "service": service_name,
-        "request_id": request_id,
-        "station_name": station_name,
-        "upstream_total": upstream_total,
-        "avoided_indices": sorted_avoid_indices(avoid_set),
-        "next_action": if exhausted {
-            "consider_next_station"
-        } else {
-            "retry_another_upstream_within_station"
-        },
-    }));
 }
 
 #[allow(dead_code)]
@@ -513,28 +485,15 @@ pub async fn handle_proxy(
     // Guardrails: never_on_status / never_on_class prevent amplifying obvious client-side mistakes.
     let mut tried_stations: HashSet<String> = HashSet::new();
     let strict_multi_config = lbs.len() > 1;
-    let cross_station_failover_enabled = strict_multi_config
-        && plan.allow_cross_station_before_first_output
-        && provider_opt.strategy == RetryStrategy::Failover;
-    let provider_attempt_limit = if cross_station_failover_enabled {
-        provider_opt.max_attempts
-    } else {
-        1
-    };
+    let cross_station_failover_enabled =
+        cross_station_failover_enabled(strict_multi_config, &plan, provider_opt);
+    let provider_attempt_limit =
+        provider_attempt_limit(cross_station_failover_enabled, provider_opt.max_attempts);
     let mut global_attempt: u32 = 0;
     let mut last_err: Option<(StatusCode, String)> = None;
 
     for provider_attempt in 0..provider_attempt_limit {
-        // Pick the next station in the precomputed order, skipping ones we've already tried.
-        let mut provider_lb: Option<LoadBalancer> = None;
-        for lb in &lbs {
-            if tried_stations.contains(&lb.service.name) {
-                continue;
-            }
-            provider_lb = Some(lb.clone());
-            break;
-        }
-        let Some(lb) = provider_lb else {
+        let Some(lb) = next_provider_load_balancer(&lbs, &tried_stations) else {
             break;
         };
         let station_name = lb.service.name.clone();
@@ -702,40 +661,26 @@ pub async fn handle_proxy(
                     );
                 }
 
-                let bytes = match resp.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let err_str = format_reqwest_error_for_retry_chain(&e);
-                        upstream_chain.push(format!(
-                            "{}:{} (idx={}) body_read_error={} model={}",
-                            selected.station_name,
-                            selected.upstream.base_url,
-                            selected.index,
-                            err_str,
-                            model_note.as_str()
-                        ));
-                        let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
-                            && should_retry_class(upstream_opt, Some("upstream_transport_error"));
-                        if can_retry_upstream {
-                            backoff_sleep(upstream_opt, upstream_attempt).await;
-                            continue;
-                        }
-                        apply_terminal_upstream_failure(
-                            &proxy,
-                            Some(&lb),
-                            &selected,
-                            "upstream_body_read_error",
-                            Some("upstream_body_read_error"),
-                            plan.transport_cooldown_secs,
-                            cooldown_backoff,
-                            err_str,
-                            avoid_set,
-                            &mut avoided_total,
-                            &mut last_err,
-                        )
-                        .await;
-                        break;
-                    }
+                let bytes = match read_attempt_response_body(AttemptReadBodyParams {
+                    proxy: &proxy,
+                    lb: &lb,
+                    selected: &selected,
+                    response: resp,
+                    upstream_opt,
+                    upstream_attempt,
+                    transport_cooldown_secs: plan.transport_cooldown_secs,
+                    cooldown_backoff,
+                    avoid_set,
+                    avoided_total: &mut avoided_total,
+                    last_err: &mut last_err,
+                    upstream_chain: &mut upstream_chain,
+                    model_note: model_note.as_str(),
+                })
+                .await
+                {
+                    AttemptReadBodyOutcome::RetrySameUpstream => continue,
+                    AttemptReadBodyOutcome::TryNextUpstream => break,
+                    AttemptReadBodyOutcome::Continue(bytes) => bytes,
                 };
 
                 let dur = start.elapsed().as_millis() as u64;
@@ -780,48 +725,31 @@ pub async fn handle_proxy(
             // If we don't have any more upstreams under this station, move to next station;
             // otherwise, continue selecting another upstream under the same station.
             let upstream_total = lb.service.upstreams.len();
-            if station_upstreams_exhausted(upstream_total, avoid_set) {
-                log_same_station_failover_trace(
-                    proxy.service_name,
-                    request_id,
-                    station_name.as_str(),
-                    upstream_total,
-                    avoid_set,
-                    true,
-                );
+            if station_loop_action_after_attempt(
+                proxy.service_name,
+                request_id,
+                station_name.as_str(),
+                upstream_total,
+                avoid_set,
+            ) {
                 break 'upstreams;
-            }
-            if !avoid_set.is_empty() {
-                log_same_station_failover_trace(
-                    proxy.service_name,
-                    request_id,
-                    station_name.as_str(),
-                    upstream_total,
-                    avoid_set,
-                    false,
-                );
             }
             continue 'upstreams;
         }
 
         tried_stations.insert(station_name.clone());
 
-        if strict_multi_config
-            && provider_attempt == 0
-            && !cross_station_failover_enabled
-            && provider_opt.max_attempts > 1
-        {
-            log_retry_trace(serde_json::json!({
-                "event": "cross_station_failover_blocked",
-                "service": proxy.service_name,
-                "request_id": request_id,
-                "station_name": station_name,
-                "provider_strategy": if provider_opt.strategy == RetryStrategy::Failover { "failover" } else { "same_upstream" },
-                "configured_provider_max_attempts": provider_opt.max_attempts,
-                "effective_provider_max_attempts": provider_attempt_limit,
-                "allow_cross_station_before_first_output": plan.allow_cross_station_before_first_output,
-            }));
-        }
+        log_cross_station_failover_blocked(
+            proxy.service_name,
+            request_id,
+            station_name.as_str(),
+            strict_multi_config,
+            provider_attempt,
+            cross_station_failover_enabled,
+            provider_opt,
+            provider_attempt_limit,
+            plan.allow_cross_station_before_first_output,
+        );
 
         // Provider layer: optional backoff between providers (usually 0).
         if provider_opt.base_backoff_ms > 0 && provider_attempt + 1 < provider_attempt_limit {
