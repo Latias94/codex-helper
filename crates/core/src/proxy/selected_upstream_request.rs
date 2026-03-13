@@ -1,5 +1,6 @@
 use axum::body::Bytes;
 
+use crate::lb::SelectedUpstream;
 use crate::logging::BodyPreview;
 use crate::model_routing;
 use crate::state::{RouteDecisionProvenance, SessionBinding};
@@ -7,7 +8,7 @@ use crate::state::{RouteDecisionProvenance, SessionBinding};
 use super::request_body::apply_model_override;
 use super::request_preparation::build_body_previews;
 use super::route_provenance::build_route_decision_provenance;
-use super::{ProxyService, SelectedUpstream, now_ms};
+use super::{ProxyService, now_ms};
 
 pub(super) struct SelectedUpstreamRequestSetup {
     pub(super) model_note: String,

@@ -13,6 +13,7 @@ mod api_responses;
 mod attempt_failures;
 mod attempt_request;
 mod attempt_response;
+mod attempt_selection;
 mod auth_resolution;
 mod classify;
 mod client_identity;
@@ -43,12 +44,11 @@ mod tests;
 
 use crate::config::{ProxyConfig, RetryStrategy, ServiceConfigManager};
 use crate::filter::RequestFilter;
-use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
+use crate::lb::{LbState, LoadBalancer};
 use crate::logging::{
     HeaderEntry, HttpDebugLog, http_debug_options, http_warn_options, log_retry_trace, now_ms,
     should_log_request_body_preview,
 };
-use crate::model_routing;
 use crate::state::{ProxyState, RuntimeConfigState};
 
 pub use self::admin::{
@@ -61,6 +61,7 @@ use self::attempt_response::{
     AttemptResponseOutcome, AttemptResponseParams, StreamingAttemptResponseParams,
     handle_attempt_response, handle_streaming_attempt_success,
 };
+use self::attempt_selection::{select_supported_upstream, station_upstreams_exhausted};
 use self::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
 use self::headers::filter_response_headers;
 use self::http_debug::format_reqwest_error_for_retry_chain;
@@ -540,7 +541,7 @@ pub async fn handle_proxy(
         'upstreams: loop {
             let avoid_set = avoid.entry(station_name.clone()).or_default();
             let upstream_total = lb.service.upstreams.len();
-            if upstream_total > 0 && avoid_set.len() >= upstream_total {
+            if station_upstreams_exhausted(upstream_total, avoid_set) {
                 log_same_station_failover_trace(
                     proxy.service_name,
                     request_id,
@@ -552,47 +553,14 @@ pub async fn handle_proxy(
                 break 'upstreams;
             }
 
-            // Select an eligible upstream inside this station (skip unsupported models).
-            let selected = loop {
-                let upstream_total = lb.service.upstreams.len();
-                if upstream_total > 0 && avoid_set.len() >= upstream_total {
-                    break None;
-                }
-                let next = {
-                    let avoid_ref: &HashSet<usize> = &*avoid_set;
-                    if strict_multi_config {
-                        lb.select_upstream_avoiding_strict(avoid_ref)
-                    } else {
-                        lb.select_upstream_avoiding(avoid_ref)
-                    }
-                };
-                let Some(selected) = next else {
-                    break None;
-                };
-
-                if let Some(ref requested_model) = request_model {
-                    let supported = model_routing::is_model_supported(
-                        &selected.upstream.supported_models,
-                        &selected.upstream.model_mapping,
-                        requested_model,
-                    );
-                    if !supported {
-                        upstream_chain.push(format!(
-                            "{}:{} (idx={}) skipped_unsupported_model={}",
-                            selected.station_name,
-                            selected.upstream.base_url,
-                            selected.index,
-                            requested_model
-                        ));
-                        if avoid_set.insert(selected.index) {
-                            avoided_total = avoided_total.saturating_add(1);
-                        }
-                        continue;
-                    }
-                }
-
-                break Some(selected);
-            };
+            let selected = select_supported_upstream(
+                &lb,
+                request_model.as_deref(),
+                strict_multi_config,
+                avoid_set,
+                &mut upstream_chain,
+                &mut avoided_total,
+            );
 
             let Some(selected) = selected else {
                 break 'upstreams;
@@ -872,7 +840,7 @@ pub async fn handle_proxy(
             // If we don't have any more upstreams under this station, move to next station;
             // otherwise, continue selecting another upstream under the same station.
             let upstream_total = lb.service.upstreams.len();
-            if upstream_total > 0 && avoid_set.len() >= upstream_total {
+            if station_upstreams_exhausted(upstream_total, avoid_set) {
                 log_same_station_failover_trace(
                     proxy.service_name,
                     request_id,

@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, Method, Response, StatusCode};
 use futures_util::StreamExt;
 use tracing::{info, warn};
 
-use crate::lb::LoadBalancer;
+use crate::lb::{LoadBalancer, SelectedUpstream};
 use crate::logging::{
     HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug, make_body_preview,
     should_include_http_debug, should_include_http_warn,
@@ -18,7 +18,7 @@ use crate::usage_providers;
 use super::classify::classify_upstream_response;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::{
-    HttpDebugBase, ProxyService, SelectedUpstream, header_map_to_entries,
+    HttpDebugBase, ProxyService, header_map_to_entries,
     scan_service_tier_from_sse_bytes_incremental, warn_http_debug,
 };
 
