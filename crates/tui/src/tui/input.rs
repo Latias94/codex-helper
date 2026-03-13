@@ -731,14 +731,14 @@ async fn clear_session_manual_overrides(state: &ProxyState, sid: String) {
     state.clear_session_manual_overrides(&sid).await;
 }
 
-async fn apply_global_active_config(
+async fn apply_global_active_station(
     state: &ProxyState,
     providers: &mut Vec<ProviderOption>,
     ui: &mut UiState,
     snapshot: &Snapshot,
-    cfg_name: Option<String>,
+    station_name: Option<String>,
 ) -> anyhow::Result<()> {
-    // Do not pin routing via runtime override; only persist the preferred config (active),
+    // Do not pin routing via runtime override; only persist the preferred station (active),
     // so failover across stations remains possible.
     state.clear_global_station_override().await;
 
@@ -759,12 +759,12 @@ async fn apply_global_active_config(
     } else {
         &mut cfg.codex
     };
-    if let Some(name) = cfg_name.as_deref()
-        && !mgr.configs.contains_key(name)
+    if let Some(name) = station_name.as_deref()
+        && !mgr.contains_station(name)
     {
-        anyhow::bail!("unknown provider: {name}");
+        anyhow::bail!("unknown station: {name}");
     }
-    mgr.active = cfg_name;
+    mgr.active = station_name;
 
     save_config(&cfg).await?;
 
@@ -792,7 +792,7 @@ async fn persist_station_meta(
     } else {
         &mut cfg.codex
     };
-    let Some(svc) = mgr.configs.get_mut(station_name) else {
+    let Some(svc) = mgr.station_mut(station_name) else {
         anyhow::bail!("station '{station_name}' not found");
     };
     if let Some(enabled) = enabled {
@@ -958,7 +958,7 @@ async fn load_upstreams_for_station(
     } else {
         &cfg.codex
     };
-    let Some(svc) = mgr.configs.get(station_name) else {
+    let Some(svc) = mgr.station(station_name) else {
         anyhow::bail!("station '{station_name}' not found");
     };
     Ok(svc.upstreams.clone())
@@ -1454,7 +1454,7 @@ async fn handle_key_normal(
             else {
                 return true;
             };
-            match apply_global_active_config(state, providers, ui, snapshot, Some(name.clone()))
+            match apply_global_active_station(state, providers, ui, snapshot, Some(name.clone()))
                 .await
             {
                 Ok(()) => {
@@ -1467,7 +1467,7 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
-            match apply_global_active_config(state, providers, ui, snapshot, None).await {
+            match apply_global_active_station(state, providers, ui, snapshot, None).await {
                 Ok(()) => {
                     ui.toast = Some(("active station: <auto>".to_string(), Instant::now()));
                 }
@@ -1706,7 +1706,7 @@ async fn handle_key_normal(
                     &cfg.codex
                 };
                 for station_name in stations {
-                    let Some(svc) = mgr.configs.get(&station_name) else {
+                    let Some(svc) = mgr.station(&station_name) else {
                         continue;
                     };
                     let upstreams = svc.upstreams.clone();
@@ -3440,8 +3440,14 @@ async fn handle_key_provider_menu(
 
             match ui.overlay {
                 Overlay::ProviderMenuGlobal => {
-                    match apply_global_active_config(state, providers, ui, snapshot, chosen.clone())
-                        .await
+                    match apply_global_active_station(
+                        state,
+                        providers,
+                        ui,
+                        snapshot,
+                        chosen.clone(),
+                    )
+                    .await
                     {
                         Ok(()) => {
                             let active = providers

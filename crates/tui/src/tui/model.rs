@@ -9,8 +9,8 @@ use crate::config::ProxyConfig;
 use crate::dashboard_core::WindowStats;
 pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
-    ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState, ResolvedRouteValue,
-    SessionIdentityCard, SessionObservationScope, UsageRollupView,
+    FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState, ResolvedRouteValue,
+    SessionIdentityCard, SessionObservationScope, StationHealth, UsageRollupView,
 };
 use crate::usage::UsageMetrics;
 
@@ -53,7 +53,7 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) last_reasoning_effort: Option<String>,
     pub(in crate::tui) last_service_tier: Option<String>,
     pub(in crate::tui) last_provider_id: Option<String>,
-    pub(in crate::tui) last_config_name: Option<String>,
+    pub(in crate::tui) last_station_name: Option<String>,
     pub(in crate::tui) last_upstream_base_url: Option<String>,
     pub(in crate::tui) last_usage: Option<UsageMetrics>,
     pub(in crate::tui) total_usage: Option<UsageMetrics>,
@@ -64,11 +64,11 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) effective_model: Option<ResolvedRouteValue>,
     pub(in crate::tui) effective_reasoning_effort: Option<ResolvedRouteValue>,
     pub(in crate::tui) effective_service_tier: Option<ResolvedRouteValue>,
-    pub(in crate::tui) effective_config_name: Option<ResolvedRouteValue>,
+    pub(in crate::tui) effective_station: Option<ResolvedRouteValue>,
     pub(in crate::tui) effective_upstream_base_url: Option<ResolvedRouteValue>,
     pub(in crate::tui) override_model: Option<String>,
     pub(in crate::tui) override_effort: Option<String>,
-    pub(in crate::tui) override_config_name: Option<String>,
+    pub(in crate::tui) override_station_name: Option<String>,
     pub(in crate::tui) override_service_tier: Option<String>,
 }
 
@@ -78,12 +78,12 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) recent: Vec<FinishedRequest>,
     pub(in crate::tui) model_overrides: HashMap<String, String>,
     pub(in crate::tui) overrides: HashMap<String, String>,
-    pub(in crate::tui) config_overrides: HashMap<String, String>,
+    pub(in crate::tui) station_overrides: HashMap<String, String>,
     pub(in crate::tui) service_tier_overrides: HashMap<String, String>,
-    pub(in crate::tui) global_override: Option<String>,
-    pub(in crate::tui) config_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
+    pub(in crate::tui) global_station_override: Option<String>,
+    pub(in crate::tui) station_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
     pub(in crate::tui) usage_rollup: UsageRollupView,
-    pub(in crate::tui) config_health: HashMap<String, ConfigHealth>,
+    pub(in crate::tui) station_health: HashMap<String, StationHealth>,
     pub(in crate::tui) health_checks: HashMap<String, HealthCheckStatus>,
     pub(in crate::tui) lb_view: HashMap<String, LbConfigView>,
     pub(in crate::tui) stats_5m: WindowStats,
@@ -305,7 +305,7 @@ pub fn build_provider_options(
     let mut providers: Vec<ProviderOption> = match service_name {
         "claude" => cfg
             .claude
-            .configs
+            .stations()
             .iter()
             .map(|(name, svc)| ProviderOption {
                 name: name.clone(),
@@ -318,7 +318,7 @@ pub fn build_provider_options(
             .collect(),
         _ => cfg
             .codex
-            .configs
+            .stations()
             .iter()
             .map(|(name, svc)| ProviderOption {
                 name: name.clone(),
@@ -417,7 +417,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
             last_reasoning_effort: card.last_reasoning_effort.clone(),
             last_service_tier: card.last_service_tier.clone(),
             last_provider_id: card.last_provider_id.clone(),
-            last_config_name: card.last_config_name.clone(),
+            last_station_name: card.last_station_name.clone(),
             last_upstream_base_url: card.last_upstream_base_url.clone(),
             last_usage: card.last_usage.clone(),
             total_usage: card.total_usage.clone(),
@@ -428,11 +428,11 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
             effective_model: card.effective_model.clone(),
             effective_reasoning_effort: card.effective_reasoning_effort.clone(),
             effective_service_tier: card.effective_service_tier.clone(),
-            effective_config_name: card.effective_config_name.clone(),
+            effective_station: card.effective_station.clone(),
             effective_upstream_base_url: card.effective_upstream_base_url.clone(),
             override_model: card.override_model.clone(),
             override_effort: card.override_effort.clone(),
-            override_config_name: card.override_config_name.clone(),
+            override_station_name: card.override_station_name.clone(),
             override_service_tier: card.override_service_tier.clone(),
         })
         .collect::<Vec<_>>();
@@ -443,7 +443,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
 pub(in crate::tui) fn session_row_has_any_override(row: &SessionRow) -> bool {
     row.override_model.is_some()
         || row.override_effort.is_some()
-        || row.override_config_name.is_some()
+        || row.override_station_name.is_some()
         || row.override_service_tier.is_some()
 }
 
@@ -496,7 +496,7 @@ pub(in crate::tui) fn session_override_fields(row: &SessionRow) -> Vec<&'static 
     if row.override_effort.is_some() {
         fields.push("effort");
     }
-    if row.override_config_name.is_some() {
+    if row.override_station_name.is_some() {
         fields.push("station");
     }
     if row.override_service_tier.is_some() {
@@ -507,7 +507,7 @@ pub(in crate::tui) fn session_override_fields(row: &SessionRow) -> Vec<&'static 
 
 pub(in crate::tui) fn session_control_posture(
     row: &SessionRow,
-    global_cfg: Option<&str>,
+    global_station: Option<&str>,
 ) -> SessionControlPosture {
     if row.session_id.is_none() {
         return SessionControlPosture {
@@ -555,9 +555,11 @@ pub(in crate::tui) fn session_control_posture(
         };
     }
 
-    if let Some(cfg) = global_cfg.filter(|cfg| !cfg.trim().is_empty()) {
+    if let Some(station) = global_station.filter(|station| !station.trim().is_empty()) {
         return SessionControlPosture {
-            headline: format!("no binding; global cfg {cfg} may still influence fallback"),
+            headline: format!(
+                "no binding; global station {station} may still influence fallback"
+            ),
             detail:
                 "Without a stored profile or session override, runtime/global routing explains the effective route."
                     .to_string(),
@@ -582,7 +584,7 @@ pub(in crate::tui) async fn refresh_snapshot(
 ) -> Snapshot {
     let (mut snap, config_meta) = tokio::join!(
         crate::dashboard_core::build_dashboard_snapshot(state, service_name, 2_000, stats_days),
-        state.get_config_meta_overrides(service_name),
+        state.get_station_meta_overrides(service_name),
     );
     let mgr = match service_name {
         "claude" => &cfg.claude,
@@ -590,18 +592,20 @@ pub(in crate::tui) async fn refresh_snapshot(
     };
     crate::state::enrich_session_identity_cards_with_runtime(&mut snap.session_cards, mgr);
 
+    let global_station_override = snap.effective_global_station_override().map(str::to_owned);
+    let station_health = snap.effective_station_health().clone();
     let rows = build_session_rows_from_cards(&snap.session_cards);
     Snapshot {
         rows,
         recent: snap.recent,
         model_overrides: snap.session_model_overrides,
         overrides: snap.session_effort_overrides,
-        config_overrides: snap.session_config_overrides,
+        station_overrides: snap.session_station_overrides,
         service_tier_overrides: snap.session_service_tier_overrides,
-        global_override: snap.global_override,
-        config_meta_overrides: config_meta,
+        global_station_override,
+        station_meta_overrides: config_meta,
         usage_rollup: snap.usage_rollup,
-        config_health: snap.config_health,
+        station_health,
         health_checks: snap.health_checks,
         lb_view: snap.lb_view,
         stats_5m: snap.stats_5m,
@@ -742,7 +746,7 @@ mod tests {
                 last_reasoning_effort: None,
                 last_service_tier: None,
                 last_provider_id: None,
-                last_config_name: None,
+                last_station_name: None,
                 last_upstream_base_url: None,
                 last_usage: None,
                 total_usage: None,
@@ -753,22 +757,22 @@ mod tests {
                 effective_model: None,
                 effective_reasoning_effort: None,
                 effective_service_tier: None,
-                effective_config_name: None,
+                effective_station: None,
                 effective_upstream_base_url: None,
                 override_model: None,
                 override_effort: None,
-                override_config_name: None,
+                override_station_name: None,
                 override_service_tier: None,
             }],
             recent: Vec::new(),
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
-            config_overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
             service_tier_overrides: HashMap::new(),
-            global_override: None,
-            config_meta_overrides: HashMap::new(),
+            global_station_override: None,
+            station_meta_overrides: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
-            config_health: HashMap::new(),
+            station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
             stats_5m: WindowStats::default(),
@@ -802,7 +806,7 @@ mod tests {
                 last_reasoning_effort: None,
                 last_service_tier: None,
                 last_provider_id: None,
-                last_config_name: None,
+                last_station_name: None,
                 last_upstream_base_url: None,
                 last_usage: None,
                 total_usage: None,
@@ -813,11 +817,11 @@ mod tests {
                 effective_model: None,
                 effective_reasoning_effort: None,
                 effective_service_tier: None,
-                effective_config_name: None,
+                effective_station: None,
                 effective_upstream_base_url: None,
                 override_model: None,
                 override_effort: None,
-                override_config_name: None,
+                override_station_name: None,
                 override_service_tier: None,
             }],
             recent: vec![
@@ -830,9 +834,10 @@ mod tests {
                     model: None,
                     reasoning_effort: None,
                     service_tier: None,
-                    config_name: None,
+                    station_name: None,
                     provider_id: None,
                     upstream_base_url: None,
+                    route_decision: None,
                     usage: None,
                     retry: None,
                     service: "codex".to_string(),
@@ -852,9 +857,10 @@ mod tests {
                     model: None,
                     reasoning_effort: None,
                     service_tier: None,
-                    config_name: None,
+                    station_name: None,
                     provider_id: None,
                     upstream_base_url: None,
+                    route_decision: None,
                     usage: None,
                     retry: None,
                     service: "codex".to_string(),
@@ -868,12 +874,12 @@ mod tests {
             ],
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
-            config_overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
             service_tier_overrides: HashMap::new(),
-            global_override: None,
-            config_meta_overrides: HashMap::new(),
+            global_station_override: None,
+            station_meta_overrides: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
-            config_health: HashMap::new(),
+            station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
             stats_5m: WindowStats::default(),
@@ -906,7 +912,7 @@ mod tests {
             last_reasoning_effort: None,
             last_service_tier: None,
             last_provider_id: None,
-            last_config_name: None,
+            last_station_name: None,
             last_upstream_base_url: None,
             last_usage: None,
             total_usage: None,
@@ -917,11 +923,11 @@ mod tests {
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
-            effective_config_name: None,
+            effective_station: None,
             effective_upstream_base_url: None,
             override_model: Some("gpt-5.4".to_string()),
             override_effort: None,
-            override_config_name: None,
+            override_station_name: None,
             override_service_tier: None,
         };
 
