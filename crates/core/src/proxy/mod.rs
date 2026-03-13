@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use tracing::instrument;
 
 mod admin;
+mod api_responses;
 mod auth_resolution;
 mod classify;
 mod client_identity;
@@ -53,6 +54,10 @@ use self::admin::{
 pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
+};
+use self::api_responses::{
+    ProfilesResponse, ReloadResult, RetryConfigResponse, RuntimeConfigStatus, build_reload_result,
+    build_retry_config_response, build_runtime_config_status, make_profiles_response,
 };
 use self::auth_resolution::{resolve_api_key_with_source, resolve_auth_token_with_source};
 use self::classify::{class_is_health_neutral, classify_upstream_response};
@@ -3175,13 +3180,6 @@ pub fn router(proxy: ProxyService) -> Router {
         }
     }
 
-    #[derive(serde::Serialize)]
-    struct ProfilesResponse {
-        default_profile: Option<String>,
-        configured_default_profile: Option<String>,
-        profiles: Vec<crate::dashboard_core::ControlProfileOption>,
-    }
-
     fn sanitize_profile_name(profile_name: &str) -> Result<String, (StatusCode, String)> {
         let profile_name = profile_name.trim();
         if profile_name.is_empty() {
@@ -3429,41 +3427,6 @@ pub fn router(proxy: ProxyService) -> Router {
         Ok(())
     }
 
-    async fn make_profiles_response(proxy: &ProxyService) -> ProfilesResponse {
-        let cfg = proxy.config.snapshot().await;
-        let mgr = match proxy.service_name {
-            "claude" => &cfg.claude,
-            _ => &cfg.codex,
-        };
-        let default_profile =
-            effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr).await;
-        ProfilesResponse {
-            default_profile: default_profile.clone(),
-            configured_default_profile: mgr.default_profile.clone(),
-            profiles: build_profile_options_from_mgr(mgr, default_profile.as_deref()),
-        }
-    }
-
-    #[derive(serde::Serialize)]
-    struct RuntimeConfigStatus {
-        config_path: String,
-        loaded_at_ms: u64,
-        source_mtime_ms: Option<u64>,
-        retry: crate::config::ResolvedRetryConfig,
-    }
-
-    #[derive(serde::Serialize)]
-    struct RetryConfigResponse {
-        configured: crate::config::RetryConfig,
-        resolved: crate::config::ResolvedRetryConfig,
-    }
-
-    #[derive(serde::Serialize)]
-    struct ReloadResult {
-        reloaded: bool,
-        status: RuntimeConfigStatus,
-    }
-
     fn host_local_session_history_available() -> bool {
         let sessions_dir = crate::config::codex_sessions_dir();
         std::fs::metadata(sessions_dir)
@@ -3474,23 +3437,14 @@ pub fn router(proxy: ProxyService) -> Router {
     async fn runtime_config_status(
         proxy: ProxyService,
     ) -> Result<Json<RuntimeConfigStatus>, (StatusCode, String)> {
-        let cfg = proxy.config.snapshot().await;
-        Ok(Json(RuntimeConfigStatus {
-            config_path: crate::config::config_file_path().display().to_string(),
-            loaded_at_ms: proxy.config.last_loaded_at_ms(),
-            source_mtime_ms: proxy.config.last_mtime_ms().await,
-            retry: cfg.retry.resolve(),
-        }))
+        Ok(Json(build_runtime_config_status(&proxy).await))
     }
 
     async fn get_retry_config(
         proxy: ProxyService,
     ) -> Result<Json<RetryConfigResponse>, (StatusCode, String)> {
         let cfg = proxy.config.snapshot().await;
-        Ok(Json(RetryConfigResponse {
-            configured: cfg.retry.clone(),
-            resolved: cfg.retry.resolve(),
-        }))
+        Ok(Json(build_retry_config_response(cfg.as_ref())))
     }
 
     async fn set_retry_config(
@@ -3503,10 +3457,7 @@ pub fn router(proxy: ProxyService) -> Router {
 
         save_proxy_config_and_reload(&proxy, cfg).await?;
         let cfg = proxy.config.snapshot().await;
-        Ok(Json(RetryConfigResponse {
-            configured: cfg.retry.clone(),
-            resolved: cfg.retry.resolve(),
-        }))
+        Ok(Json(build_retry_config_response(cfg.as_ref())))
     }
 
     async fn reload_runtime_config(
@@ -3517,16 +3468,8 @@ pub fn router(proxy: ProxyService) -> Router {
             .force_reload_from_disk()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let cfg = proxy.config.snapshot().await;
-        Ok(Json(ReloadResult {
-            reloaded: changed,
-            status: RuntimeConfigStatus {
-                config_path: crate::config::config_file_path().display().to_string(),
-                loaded_at_ms: proxy.config.last_loaded_at_ms(),
-                source_mtime_ms: proxy.config.last_mtime_ms().await,
-                retry: cfg.retry.resolve(),
-            },
-        }))
+        let status = build_runtime_config_status(&proxy).await;
+        Ok(Json(build_reload_result(changed, status)))
     }
 
     async fn set_session_reasoning_effort_override(
