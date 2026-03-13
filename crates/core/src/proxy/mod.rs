@@ -27,6 +27,7 @@ mod profile_defaults;
 mod request_body;
 mod request_preparation;
 mod request_routing;
+mod response_finalization;
 mod retry;
 mod route_provenance;
 mod runtime_admin_api;
@@ -83,6 +84,9 @@ use self::persisted_config_api::{
 use self::profile_defaults::effective_default_profile_name;
 use self::request_body::{apply_model_override, extract_service_tier_from_response_body};
 use self::request_preparation::{build_body_previews, detect_request_flavor, prepare_request_body};
+use self::response_finalization::{
+    FinalizeForwardResponseParams, finish_and_build_forward_response,
+};
 use self::retry::{
     backoff_sleep, retry_info_for_chain, retry_plan, retry_sleep, should_never_retry,
     should_retry_class, should_retry_status,
@@ -1032,51 +1036,35 @@ pub async fn handle_proxy(
                     .await;
 
                     let usage = extract_usage_from_bytes(&bytes);
-                    let usage_for_log = usage.clone();
                     let retry = retry_info_for_chain(&upstream_chain);
-                    let retry_for_log = retry.clone();
                     let service_tier_for_log = ServiceTierLog {
                         actual: observed_service_tier.clone(),
                         ..base_service_tier.clone()
                     };
-                    proxy
-                        .state
-                        .finish_request(crate::state::FinishRequestParams {
-                            id: request_id,
-                            status_code,
+                    return Ok(finish_and_build_forward_response(
+                        &proxy,
+                        &method,
+                        uri.path(),
+                        FinalizeForwardResponseParams {
+                            request_id,
+                            status,
                             duration_ms: dur,
-                            ended_at_ms: started_at_ms + dur,
-                            observed_service_tier: observed_service_tier.clone(),
+                            started_at_ms,
+                            upstream_headers_ms,
+                            station_name: selected.station_name.clone(),
+                            provider_id: provider_id.clone(),
+                            upstream_base_url: selected.upstream.base_url.clone(),
+                            session_id: session_id.clone(),
+                            cwd: cwd.clone(),
+                            effective_effort: effective_effort.clone(),
+                            service_tier: service_tier_for_log,
                             usage,
                             retry,
-                            ttfb_ms: Some(upstream_headers_ms),
-                        })
-                        .await;
-
-                    log_request_with_debug(
-                        proxy.service_name,
-                        method.as_str(),
-                        uri.path(),
-                        status_code,
-                        dur,
-                        Some(upstream_headers_ms),
-                        &selected.station_name,
-                        provider_id.clone(),
-                        &selected.upstream.base_url,
-                        session_id.clone(),
-                        cwd.clone(),
-                        effective_effort.clone(),
-                        service_tier_for_log,
-                        usage_for_log,
-                        retry_for_log,
-                        None,
-                    );
-
-                    let mut builder = Response::builder().status(status);
-                    for (name, value) in resp_headers_filtered.iter() {
-                        builder = builder.header(name, value);
-                    }
-                    return Ok(builder.body(Body::from(bytes)).unwrap());
+                            response_headers: resp_headers_filtered,
+                            response_body: bytes,
+                        },
+                    )
+                    .await);
                 }
 
                 if never_retry {
@@ -1100,49 +1088,34 @@ pub async fn handle_proxy(
                     .await;
 
                     let retry = retry_info_for_chain(&upstream_chain);
-                    let retry_for_log = retry.clone();
                     let service_tier_for_log = ServiceTierLog {
                         actual: observed_service_tier.clone(),
                         ..base_service_tier.clone()
                     };
-                    proxy
-                        .state
-                        .finish_request(crate::state::FinishRequestParams {
-                            id: request_id,
-                            status_code,
+                    return Ok(finish_and_build_forward_response(
+                        &proxy,
+                        &method,
+                        uri.path(),
+                        FinalizeForwardResponseParams {
+                            request_id,
+                            status,
                             duration_ms: dur,
-                            ended_at_ms: started_at_ms + dur,
-                            observed_service_tier: observed_service_tier.clone(),
+                            started_at_ms,
+                            upstream_headers_ms,
+                            station_name: selected.station_name.clone(),
+                            provider_id: provider_id.clone(),
+                            upstream_base_url: selected.upstream.base_url.clone(),
+                            session_id: session_id.clone(),
+                            cwd: cwd.clone(),
+                            effective_effort: effective_effort.clone(),
+                            service_tier: service_tier_for_log,
                             usage: None,
                             retry,
-                            ttfb_ms: Some(upstream_headers_ms),
-                        })
-                        .await;
-
-                    log_request_with_debug(
-                        proxy.service_name,
-                        method.as_str(),
-                        uri.path(),
-                        status_code,
-                        dur,
-                        Some(upstream_headers_ms),
-                        &selected.station_name,
-                        provider_id.clone(),
-                        &selected.upstream.base_url,
-                        session_id.clone(),
-                        cwd.clone(),
-                        effective_effort.clone(),
-                        service_tier_for_log,
-                        None,
-                        retry_for_log,
-                        None,
-                    );
-
-                    let mut builder = Response::builder().status(status);
-                    for (name, value) in resp_headers_filtered.iter() {
-                        builder = builder.header(name, value);
-                    }
-                    return Ok(builder.body(Body::from(bytes)).unwrap());
+                            response_headers: resp_headers_filtered,
+                            response_body: bytes,
+                        },
+                    )
+                    .await);
                 }
 
                 let upstream_retryable = should_retry_status(upstream_opt, status_code)
@@ -1186,7 +1159,6 @@ pub async fn handle_proxy(
 
                 // Not retryable for provider failover either: return the error as-is.
                 let retry = retry_info_for_chain(&upstream_chain);
-                let retry_for_log = retry.clone();
                 record_passive_upstream_failure(
                     proxy.state.as_ref(),
                     proxy.service_name,
@@ -1197,48 +1169,35 @@ pub async fn handle_proxy(
                     Some(String::from_utf8_lossy(bytes.as_ref()).to_string()),
                 )
                 .await;
-                proxy
-                    .state
-                    .finish_request(crate::state::FinishRequestParams {
-                        id: request_id,
-                        status_code,
-                        duration_ms: dur,
-                        ended_at_ms: started_at_ms + dur,
-                        observed_service_tier: observed_service_tier.clone(),
-                        usage: None,
-                        retry,
-                        ttfb_ms: Some(upstream_headers_ms),
-                    })
-                    .await;
 
                 let service_tier_for_log = ServiceTierLog {
                     actual: observed_service_tier,
                     ..base_service_tier.clone()
                 };
-                log_request_with_debug(
-                    proxy.service_name,
-                    method.as_str(),
+                return Ok(finish_and_build_forward_response(
+                    &proxy,
+                    &method,
                     uri.path(),
-                    status_code,
-                    dur,
-                    Some(upstream_headers_ms),
-                    &selected.station_name,
-                    provider_id.clone(),
-                    &selected.upstream.base_url,
-                    session_id.clone(),
-                    cwd.clone(),
-                    effective_effort.clone(),
-                    service_tier_for_log,
-                    None,
-                    retry_for_log,
-                    None,
-                );
-
-                let mut builder = Response::builder().status(status);
-                for (name, value) in resp_headers_filtered.iter() {
-                    builder = builder.header(name, value);
-                }
-                return Ok(builder.body(Body::from(bytes)).unwrap());
+                    FinalizeForwardResponseParams {
+                        request_id,
+                        status,
+                        duration_ms: dur,
+                        started_at_ms,
+                        upstream_headers_ms,
+                        station_name: selected.station_name.clone(),
+                        provider_id: provider_id.clone(),
+                        upstream_base_url: selected.upstream.base_url.clone(),
+                        session_id: session_id.clone(),
+                        cwd: cwd.clone(),
+                        effective_effort: effective_effort.clone(),
+                        service_tier: service_tier_for_log,
+                        usage: None,
+                        retry,
+                        response_headers: resp_headers_filtered,
+                        response_body: bytes,
+                    },
+                )
+                .await);
             }
 
             // If we don't have any more upstreams under this station, move to next station;
