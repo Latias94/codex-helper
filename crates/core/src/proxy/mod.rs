@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use axum::body::Body;
-use axum::http::{HeaderMap, Request, Response, StatusCode};
+use axum::http::HeaderMap;
 use reqwest::Client;
-use tracing::instrument;
 
 mod admin;
 mod api_responses;
@@ -19,6 +17,7 @@ mod auth_resolution;
 mod classify;
 mod client_identity;
 mod control_plane;
+mod entrypoint;
 mod headers;
 mod healthcheck_api;
 mod http_debug;
@@ -56,13 +55,8 @@ pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
+pub use self::entrypoint::handle_proxy;
 use self::profile_defaults::effective_default_profile_name;
-use self::provider_execution::{
-    ExecuteProviderChainParams, ProviderExecutionOutcome, execute_provider_chain, log_retry_options,
-};
-use self::request_context::prepare_proxy_request;
-use self::request_failures::{finish_failed_proxy_request, no_upstreams_available_error};
-use self::retry::retry_info_for_chain;
 pub use self::router_setup::{
     admin_listener_router, proxy_only_router, proxy_only_router_with_admin_base_url, router,
 };
@@ -223,82 +217,4 @@ pub(super) fn scan_service_tier_from_sse_bytes_incremental(
     last: &mut Option<String>,
 ) {
     request_body::scan_service_tier_from_sse_bytes_incremental(data, scan_pos, last);
-}
-
-#[instrument(skip_all, fields(service = %proxy.service_name))]
-pub async fn handle_proxy(
-    proxy: ProxyService,
-    req: Request<Body>,
-) -> Result<Response<Body>, (StatusCode, String)> {
-    let start = Instant::now();
-    let started_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    let prepared = prepare_proxy_request(&proxy, req, &start, started_at_ms).await?;
-    log_retry_options(proxy.service_name, prepared.request_id, &prepared.plan);
-    let provider_execution = execute_provider_chain(ExecuteProviderChainParams {
-        proxy: &proxy,
-        lbs: &prepared.lbs,
-        method: &prepared.method,
-        uri: &prepared.uri,
-        client_headers: &prepared.client_headers,
-        client_headers_entries_cache: &prepared.client_headers_entries_cache,
-        client_uri: prepared.client_uri.as_str(),
-        start: &start,
-        started_at_ms,
-        request_id: prepared.request_id,
-        request_body_len: prepared.request_body_len,
-        body_for_upstream: &prepared.body_for_upstream,
-        request_model: prepared.request_model.as_deref(),
-        session_binding: prepared.session_binding.as_ref(),
-        session_override_config: prepared.session_override_config.as_deref(),
-        global_station_override: prepared.global_station_override.as_deref(),
-        override_model: prepared.override_model.as_deref(),
-        override_effort: prepared.override_effort.as_deref(),
-        override_service_tier: prepared.override_service_tier.as_deref(),
-        effective_effort: prepared.effective_effort.as_deref(),
-        effective_service_tier: prepared.effective_service_tier.as_deref(),
-        base_service_tier: &prepared.base_service_tier,
-        session_id: prepared.session_id.as_deref(),
-        cwd: prepared.cwd.as_deref(),
-        request_flavor: &prepared.request_flavor,
-        request_body_previews: prepared.request_body_previews,
-        debug_max: prepared.debug_max,
-        warn_max: prepared.warn_max,
-        client_body_debug: prepared.client_body_debug.as_ref(),
-        client_body_warn: prepared.client_body_warn.as_ref(),
-        plan: &prepared.plan,
-        cooldown_backoff: prepared.cooldown_backoff,
-    })
-    .await;
-    let (upstream_chain, last_err) = match provider_execution {
-        ProviderExecutionOutcome::Return(response) => return Ok(response),
-        ProviderExecutionOutcome::Exhausted(state) => (state.upstream_chain, state.last_err),
-    };
-
-    // If we reach here, all provider attempts are exhausted.
-    if let Some((status, msg)) = last_err {
-        let dur = start.elapsed().as_millis() as u64;
-        let retry = retry_info_for_chain(&upstream_chain);
-        return Err(finish_failed_proxy_request(
-            &proxy,
-            &prepared.method,
-            prepared.uri.path(),
-            prepared.request_id,
-            status,
-            msg,
-            dur,
-            started_at_ms,
-            prepared.session_id.clone(),
-            prepared.cwd.clone(),
-            prepared.effective_effort.clone(),
-            prepared.base_service_tier.clone(),
-            retry,
-        )
-        .await);
-    }
-
-    return Err(no_upstreams_available_error());
 }
