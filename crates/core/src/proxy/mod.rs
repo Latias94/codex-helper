@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use axum::middleware;
 use axum::routing::{any, get, post, put};
 use reqwest::Client;
@@ -25,6 +25,7 @@ mod passive_health;
 mod persisted_config_api;
 mod profile_defaults;
 mod request_body;
+mod request_preparation;
 mod request_routing;
 mod retry;
 mod route_provenance;
@@ -42,7 +43,7 @@ use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
 use crate::logging::{
     HeaderEntry, HttpDebugLog, ServiceTierLog, http_debug_options, http_warn_options,
-    log_request_with_debug, log_retry_trace, make_body_preview, now_ms, should_include_http_warn,
+    log_request_with_debug, log_retry_trace, now_ms, should_include_http_warn,
     should_log_request_body_preview,
 };
 use crate::model_routing;
@@ -80,11 +81,8 @@ use self::persisted_config_api::{
     upsert_persisted_provider_spec, upsert_persisted_station_spec,
 };
 use self::profile_defaults::effective_default_profile_name;
-use self::request_body::{
-    apply_model_override, apply_reasoning_effort_override, apply_service_tier_override,
-    extract_model_from_request_body, extract_reasoning_effort_from_request_body,
-    extract_service_tier_from_request_body, extract_service_tier_from_response_body,
-};
+use self::request_body::{apply_model_override, extract_service_tier_from_response_body};
+use self::request_preparation::{build_body_previews, detect_request_flavor, prepare_request_body};
 use self::retry::{
     backoff_sleep, retry_info_for_chain, retry_plan, retry_sleep, should_never_retry,
     should_retry_class, should_retry_status,
@@ -382,21 +380,8 @@ pub async fn handle_proxy(
         );
         return Err((status, "no routable station".to_string()));
     }
-    let client_content_type = client_headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok());
-
-    // Detect streaming (SSE).
-    let is_stream = client_headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.contains("text/event-stream"))
-        .unwrap_or(false);
-
-    let path = uri.path();
-    let is_responses_path = path.ends_with("/responses");
-    let is_user_turn = method == Method::POST && is_responses_path;
-    let is_codex_service = proxy.service_name == "codex";
+    let request_flavor =
+        detect_request_flavor(proxy.service_name, &method, &client_headers, uri.path());
 
     let cwd = if let Some(id) = session_id.as_deref() {
         proxy.state.resolve_session_cwd(id).await
@@ -483,7 +468,6 @@ pub async fn handle_proxy(
             return Err((status, err_str));
         }
     };
-    let original_effort = extract_reasoning_effort_from_request_body(&raw_body);
     let override_effort = if let Some(id) = session_id.as_deref() {
         proxy.state.get_session_effort_override(id).await
     } else {
@@ -492,20 +476,6 @@ pub async fn handle_proxy(
     let binding_effort = session_binding
         .as_ref()
         .and_then(|binding| binding.reasoning_effort.as_deref());
-    let mut body_for_upstream = match (override_effort.as_deref(), binding_effort) {
-        (Some(effort), _) => Bytes::from(
-            apply_reasoning_effort_override(&raw_body, effort)
-                .unwrap_or_else(|| raw_body.as_ref().to_vec()),
-        ),
-        (None, Some(effort)) => Bytes::from(
-            apply_reasoning_effort_override(&raw_body, effort)
-                .unwrap_or_else(|| raw_body.as_ref().to_vec()),
-        ),
-        (None, None) => raw_body.clone(),
-    };
-    let effective_effort = extract_reasoning_effort_from_request_body(body_for_upstream.as_ref())
-        .or(original_effort.clone());
-
     let override_model = if let Some(id) = session_id.as_deref() {
         proxy.state.get_session_model_override(id).await
     } else {
@@ -514,19 +484,6 @@ pub async fn handle_proxy(
     let binding_model = session_binding
         .as_ref()
         .and_then(|binding| binding.model.as_deref());
-    if let Some(model) = override_model.as_deref() {
-        body_for_upstream = Bytes::from(
-            apply_model_override(body_for_upstream.as_ref(), model)
-                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
-        );
-    } else if let Some(model) = binding_model {
-        body_for_upstream = Bytes::from(
-            apply_model_override(body_for_upstream.as_ref(), model)
-                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
-        );
-    }
-
-    let original_service_tier = extract_service_tier_from_request_body(&raw_body);
     let override_service_tier = if let Some(id) = session_id.as_deref() {
         proxy.state.get_session_service_tier_override(id).await
     } else {
@@ -535,27 +492,21 @@ pub async fn handle_proxy(
     let binding_service_tier = session_binding
         .as_ref()
         .and_then(|binding| binding.service_tier.as_deref());
-    if let Some(service_tier) = override_service_tier.as_deref() {
-        body_for_upstream = Bytes::from(
-            apply_service_tier_override(body_for_upstream.as_ref(), service_tier)
-                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
-        );
-    } else if let Some(service_tier) = binding_service_tier {
-        body_for_upstream = Bytes::from(
-            apply_service_tier_override(body_for_upstream.as_ref(), service_tier)
-                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
-        );
-    }
-
-    let request_model = extract_model_from_request_body(body_for_upstream.as_ref());
-    let effective_service_tier = extract_service_tier_from_request_body(body_for_upstream.as_ref())
-        .or(original_service_tier.clone());
-    let base_service_tier = ServiceTierLog {
-        requested: original_service_tier.clone(),
-        effective: effective_service_tier.clone(),
-        actual: None,
-    };
-    let request_body_len = raw_body.len();
+    let prepared_request = prepare_request_body(
+        &raw_body,
+        override_effort.as_deref(),
+        binding_effort,
+        override_model.as_deref(),
+        binding_model,
+        override_service_tier.as_deref(),
+        binding_service_tier,
+    );
+    let body_for_upstream = prepared_request.body_for_upstream.clone();
+    let request_model = prepared_request.request_model.clone();
+    let effective_effort = prepared_request.effective_effort.clone();
+    let effective_service_tier = prepared_request.base_service_tier.effective.clone();
+    let base_service_tier = prepared_request.base_service_tier.clone();
+    let request_body_len = prepared_request.request_body_len;
 
     let debug_opt = http_debug_options();
     let warn_opt = http_warn_options();
@@ -570,16 +521,15 @@ pub async fn handle_proxy(
         0
     };
     let request_body_previews = should_log_request_body_preview();
-    let client_body_debug = if request_body_previews && debug_max > 0 {
-        Some(make_body_preview(&raw_body, client_content_type, debug_max))
-    } else {
-        None
-    };
-    let client_body_warn = if request_body_previews && warn_max > 0 {
-        Some(make_body_preview(&raw_body, client_content_type, warn_max))
-    } else {
-        None
-    };
+    let client_body_previews = build_body_previews(
+        &raw_body,
+        request_flavor.client_content_type.as_deref(),
+        request_body_previews,
+        debug_max,
+        warn_max,
+    );
+    let client_body_debug = client_body_previews.debug.clone();
+    let client_body_warn = client_body_previews.warn.clone();
 
     let request_id = proxy
         .state
@@ -779,24 +729,15 @@ pub async fn handle_proxy(
 
             let filtered_body = proxy.filter.apply_bytes(body_for_selected);
             let upstream_request_body_len = filtered_body.len();
-            let upstream_request_body_debug = if request_body_previews && debug_max > 0 {
-                Some(make_body_preview(
-                    &filtered_body,
-                    client_content_type,
-                    debug_max,
-                ))
-            } else {
-                None
-            };
-            let upstream_request_body_warn = if request_body_previews && warn_max > 0 {
-                Some(make_body_preview(
-                    &filtered_body,
-                    client_content_type,
-                    warn_max,
-                ))
-            } else {
-                None
-            };
+            let upstream_body_previews = build_body_previews(
+                &filtered_body,
+                request_flavor.client_content_type.as_deref(),
+                request_body_previews,
+                debug_max,
+                warn_max,
+            );
+            let upstream_request_body_debug = upstream_body_previews.debug.clone();
+            let upstream_request_body_warn = upstream_body_previews.warn.clone();
 
             // Layer 1: retry the same upstream a small number of times.
             for upstream_attempt in 0..upstream_opt.max_attempts {
@@ -973,7 +914,7 @@ pub async fn handle_proxy(
                 let resp_headers = resp.headers().clone();
                 let resp_headers_filtered = filter_response_headers(&resp_headers);
 
-                if is_stream && success {
+                if request_flavor.is_stream && success {
                     lb.record_result_with_backoff(
                         selected.index,
                         true,
@@ -1003,8 +944,8 @@ pub async fn handle_proxy(
                             effective_effort: effective_effort.clone(),
                             service_tier: base_service_tier.clone(),
                             request_id,
-                            is_user_turn,
-                            is_codex_service,
+                            is_user_turn: request_flavor.is_user_turn,
+                            is_codex_service: request_flavor.is_codex_service,
                             transport_cooldown_secs: plan.transport_cooldown_secs,
                             cooldown_backoff,
                             method: method.clone(),
@@ -1589,24 +1530,15 @@ pub async fn handle_proxy(
 
             let filtered_body = proxy.filter.apply_bytes(body_for_selected);
             let upstream_request_body_len = filtered_body.len();
-            let upstream_request_body_debug = if request_body_previews && debug_max > 0 {
-                Some(make_body_preview(
-                    &filtered_body,
-                    client_content_type,
-                    debug_max,
-                ))
-            } else {
-                None
-            };
-            let upstream_request_body_warn = if request_body_previews && warn_max > 0 {
-                Some(make_body_preview(
-                    &filtered_body,
-                    client_content_type,
-                    warn_max,
-                ))
-            } else {
-                None
-            };
+            let upstream_body_previews = build_body_previews(
+                &filtered_body,
+                request_flavor.client_content_type.as_deref(),
+                request_body_previews,
+                debug_max,
+                warn_max,
+            );
+            let upstream_request_body_debug = upstream_body_previews.debug.clone();
+            let upstream_request_body_warn = upstream_body_previews.warn.clone();
 
             let target_url = match proxy.build_target(&selected, &uri) {
                 Ok((url, _headers)) => url,
