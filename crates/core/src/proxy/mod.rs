@@ -19,6 +19,7 @@ mod admin;
 mod classify;
 mod request_body;
 mod retry;
+mod route_provenance;
 mod runtime_config;
 mod stream;
 #[cfg(test)]
@@ -37,10 +38,7 @@ use crate::logging::{
     should_include_http_warn, should_log_request_body_preview,
 };
 use crate::model_routing;
-use crate::state::{
-    ActiveRequest, FinishedRequest, ProxyState, ResolvedRouteValue, RouteDecisionProvenance,
-    RouteValueSource, RuntimeConfigState,
-};
+use crate::state::{ActiveRequest, FinishedRequest, ProxyState, RuntimeConfigState};
 use crate::usage::extract_usage_from_bytes;
 
 use self::admin::{
@@ -61,6 +59,7 @@ use self::retry::{
     backoff_sleep, retry_info_for_chain, retry_plan, retry_sleep, should_never_retry,
     should_retry_class, should_retry_status,
 };
+use self::route_provenance::build_route_decision_provenance;
 use self::runtime_config::RuntimeConfig;
 use self::stream::{SseSuccessMeta, build_sse_success_response};
 
@@ -124,113 +123,6 @@ fn log_same_station_failover_trace(
             "retry_another_upstream_within_station"
         },
     }));
-}
-
-fn trim_non_empty(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn resolve_request_field_provenance(
-    request_value: Option<&str>,
-    override_value: Option<&str>,
-    binding_value: Option<&str>,
-) -> Option<ResolvedRouteValue> {
-    if let Some(value) = trim_non_empty(override_value) {
-        return Some(ResolvedRouteValue::new(
-            value,
-            RouteValueSource::SessionOverride,
-        ));
-    }
-    if let Some(value) = trim_non_empty(binding_value) {
-        return Some(ResolvedRouteValue::new(
-            value,
-            RouteValueSource::ProfileDefault,
-        ));
-    }
-    trim_non_empty(request_value)
-        .map(|value| ResolvedRouteValue::new(value, RouteValueSource::RequestPayload))
-}
-
-fn resolve_station_provenance(
-    selected_station_name: &str,
-    session_override_config: Option<&str>,
-    global_config_override: Option<&str>,
-    binding_station_name: Option<&str>,
-) -> ResolvedRouteValue {
-    if let Some(value) = trim_non_empty(session_override_config) {
-        return ResolvedRouteValue::new(value, RouteValueSource::SessionOverride);
-    }
-    if let Some(value) = trim_non_empty(global_config_override) {
-        return ResolvedRouteValue::new(value, RouteValueSource::GlobalOverride);
-    }
-    if let Some(value) = trim_non_empty(binding_station_name) {
-        return ResolvedRouteValue::new(value, RouteValueSource::ProfileDefault);
-    }
-    ResolvedRouteValue::new(
-        selected_station_name.to_string(),
-        RouteValueSource::RuntimeFallback,
-    )
-}
-
-fn build_route_decision_provenance(
-    decided_at_ms: u64,
-    session_binding: Option<&crate::state::SessionBinding>,
-    session_override_config: Option<&str>,
-    global_config_override: Option<&str>,
-    override_model: Option<&str>,
-    override_effort: Option<&str>,
-    override_service_tier: Option<&str>,
-    request_model: Option<&str>,
-    effective_effort: Option<&str>,
-    effective_service_tier: Option<&str>,
-    selected: &SelectedUpstream,
-    provider_id: Option<&str>,
-) -> RouteDecisionProvenance {
-    let mut effective_model = resolve_request_field_provenance(
-        request_model,
-        override_model,
-        session_binding.and_then(|binding| binding.model.as_deref()),
-    );
-    if let Some(current) = effective_model.as_mut() {
-        let mapped = model_routing::effective_model(
-            &selected.upstream.model_mapping,
-            current.value.as_str(),
-        );
-        if mapped != current.value {
-            *current = ResolvedRouteValue::new(mapped, RouteValueSource::StationMapping);
-        }
-    }
-
-    RouteDecisionProvenance {
-        decided_at_ms,
-        binding_profile_name: session_binding.and_then(|binding| binding.profile_name.clone()),
-        binding_continuity_mode: session_binding.map(|binding| binding.continuity_mode),
-        effective_model,
-        effective_reasoning_effort: resolve_request_field_provenance(
-            effective_effort,
-            override_effort,
-            session_binding.and_then(|binding| binding.reasoning_effort.as_deref()),
-        ),
-        effective_service_tier: resolve_request_field_provenance(
-            effective_service_tier,
-            override_service_tier,
-            session_binding.and_then(|binding| binding.service_tier.as_deref()),
-        ),
-        effective_station: Some(resolve_station_provenance(
-            selected.station_name.as_str(),
-            session_override_config,
-            global_config_override,
-            session_binding.and_then(|binding| binding.station_name.as_deref()),
-        )),
-        effective_upstream_base_url: Some(ResolvedRouteValue::new(
-            selected.upstream.base_url.clone(),
-            RouteValueSource::RuntimeFallback,
-        )),
-        provider_id: trim_non_empty(provider_id),
-    }
 }
 
 pub(super) async fn record_passive_upstream_success(
