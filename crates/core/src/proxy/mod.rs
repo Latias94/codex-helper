@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,7 @@ mod http_debug;
 mod passive_health;
 mod persisted_config_api;
 mod profile_defaults;
+mod provider_execution;
 mod provider_orchestration;
 mod request_body;
 mod request_failures;
@@ -45,11 +46,11 @@ mod target_builder;
 #[cfg(test)]
 mod tests;
 
-use crate::config::{ProxyConfig, RetryStrategy, ServiceConfigManager};
+use crate::config::{ProxyConfig, ServiceConfigManager};
 use crate::filter::RequestFilter;
 use crate::lb::{LbState, LoadBalancer};
 use crate::logging::{
-    HeaderEntry, HttpDebugLog, http_debug_options, http_warn_options, log_retry_trace, now_ms,
+    HeaderEntry, HttpDebugLog, http_debug_options, http_warn_options, now_ms,
     should_log_request_body_preview,
 };
 use crate::state::{ProxyState, RuntimeConfigState};
@@ -58,23 +59,17 @@ pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
-use self::attempt_execution::{
-    ExecuteSelectedUpstreamParams, SelectedUpstreamExecutionOutcome, execute_selected_upstream,
-};
-use self::attempt_selection::{select_supported_upstream, station_upstreams_exhausted};
 use self::client_identity::{extract_client_addr, extract_client_name, extract_session_id};
 use self::profile_defaults::effective_default_profile_name;
-use self::provider_orchestration::{
-    cross_station_failover_enabled, log_cross_station_failover_blocked,
-    log_same_station_failover_trace, next_provider_load_balancer, provider_attempt_limit,
-    station_loop_action_after_attempt,
+use self::provider_execution::{
+    ExecuteProviderChainParams, ProviderExecutionOutcome, execute_provider_chain, log_retry_options,
 };
 use self::request_failures::{
     finish_failed_proxy_request, log_client_body_read_error, log_no_routable_station,
     no_upstreams_available_error,
 };
 use self::request_preparation::{build_body_previews, detect_request_flavor, prepare_request_body};
-use self::retry::{backoff_sleep, retry_info_for_chain, retry_plan};
+use self::retry::{retry_info_for_chain, retry_plan};
 pub use self::router_setup::{
     admin_listener_router, proxy_only_router, proxy_only_router_with_admin_base_url, router,
 };
@@ -422,187 +417,50 @@ pub async fn handle_proxy(
 
     let retry_cfg = cfg_snapshot.retry.resolve();
     let plan = retry_plan(&retry_cfg);
-    let upstream_opt = &plan.upstream;
-    let provider_opt = &plan.provider;
     let cooldown_backoff = crate::lb::CooldownBackoff {
         factor: plan.cooldown_backoff_factor,
         max_secs: plan.cooldown_backoff_max_secs,
     };
-    log_retry_trace(serde_json::json!({
-        "event": "retry_options",
-        "service": proxy.service_name,
-        "request_id": request_id,
-        "upstream": {
-            "max_attempts": upstream_opt.max_attempts,
-            "base_backoff_ms": upstream_opt.base_backoff_ms,
-            "max_backoff_ms": upstream_opt.max_backoff_ms,
-            "jitter_ms": upstream_opt.jitter_ms,
-            "retry_status_ranges": upstream_opt.retry_status_ranges,
-            "retry_error_classes": upstream_opt.retry_error_classes,
-            "strategy": if upstream_opt.strategy == RetryStrategy::Failover { "failover" } else { "same_upstream" },
-        },
-        "provider": {
-            "max_attempts": provider_opt.max_attempts,
-            "base_backoff_ms": provider_opt.base_backoff_ms,
-            "max_backoff_ms": provider_opt.max_backoff_ms,
-            "jitter_ms": provider_opt.jitter_ms,
-            "retry_status_ranges": provider_opt.retry_status_ranges,
-            "retry_error_classes": provider_opt.retry_error_classes,
-            "strategy": if provider_opt.strategy == RetryStrategy::Failover { "failover" } else { "same_upstream" },
-        },
-        "never_status_ranges": plan.never_status_ranges,
-        "never_error_classes": plan.never_error_classes,
-        "cloudflare_challenge_cooldown_secs": plan.cloudflare_challenge_cooldown_secs,
-        "cloudflare_timeout_cooldown_secs": plan.cloudflare_timeout_cooldown_secs,
-        "transport_cooldown_secs": plan.transport_cooldown_secs,
-        "cooldown_backoff_factor": plan.cooldown_backoff_factor,
-        "cooldown_backoff_max_secs": plan.cooldown_backoff_max_secs,
-        "allow_cross_station_before_first_output": plan.allow_cross_station_before_first_output,
-    }));
-    let total_upstreams = lbs
-        .iter()
-        .map(|lb| lb.service.upstreams.len())
-        .sum::<usize>();
-    let mut avoid: HashMap<String, HashSet<usize>> = HashMap::new();
-    let mut upstream_chain: Vec<String> = Vec::new();
-    let mut avoided_total: usize = 0;
-
-    // --- Two-layer retry model ---
-    //
-    // Layer 1 (upstream): retry within the current provider/config (default: same_upstream).
-    // Layer 2 (provider): after upstream retries are exhausted (or failure is not upstream-retryable),
-    // fail over to another provider/config when eligible.
-    //
-    // Guardrails: never_on_status / never_on_class prevent amplifying obvious client-side mistakes.
-    let mut tried_stations: HashSet<String> = HashSet::new();
-    let strict_multi_config = lbs.len() > 1;
-    let cross_station_failover_enabled =
-        cross_station_failover_enabled(strict_multi_config, &plan, provider_opt);
-    let provider_attempt_limit =
-        provider_attempt_limit(cross_station_failover_enabled, provider_opt.max_attempts);
-    let mut global_attempt: u32 = 0;
-    let mut last_err: Option<(StatusCode, String)> = None;
-
-    for provider_attempt in 0..provider_attempt_limit {
-        let Some(lb) = next_provider_load_balancer(&lbs, &tried_stations) else {
-            break;
-        };
-        let station_name = lb.service.name.clone();
-
-        // Try all upstreams under this station first. Cross-station failover is only
-        // considered after the current station has no remaining eligible upstreams.
-        'upstreams: loop {
-            let avoid_set = avoid.entry(station_name.clone()).or_default();
-            let upstream_total = lb.service.upstreams.len();
-            if station_upstreams_exhausted(upstream_total, avoid_set) {
-                log_same_station_failover_trace(
-                    proxy.service_name,
-                    request_id,
-                    station_name.as_str(),
-                    upstream_total,
-                    avoid_set,
-                    true,
-                );
-                break 'upstreams;
-            }
-
-            let selected = select_supported_upstream(
-                &lb,
-                request_model.as_deref(),
-                strict_multi_config,
-                avoid_set,
-                &mut upstream_chain,
-                &mut avoided_total,
-            );
-
-            let Some(selected) = selected else {
-                break 'upstreams;
-            };
-
-            match execute_selected_upstream(ExecuteSelectedUpstreamParams {
-                proxy: &proxy,
-                lb: &lb,
-                selected: &selected,
-                method: &method,
-                uri: &uri,
-                client_headers: &client_headers,
-                client_headers_entries_cache: &client_headers_entries_cache,
-                client_uri: client_uri.as_str(),
-                start: &start,
-                started_at_ms,
-                request_id,
-                request_body_len,
-                body_for_upstream: &body_for_upstream,
-                request_model: request_model.as_deref(),
-                session_binding: session_binding.as_ref(),
-                session_override_config: session_override_config.as_deref(),
-                global_station_override: global_station_override.as_deref(),
-                override_model: override_model.as_deref(),
-                override_effort: override_effort.as_deref(),
-                override_service_tier: override_service_tier.as_deref(),
-                effective_effort: effective_effort.as_deref(),
-                effective_service_tier: effective_service_tier.as_deref(),
-                base_service_tier: &base_service_tier,
-                session_id: session_id.as_deref(),
-                cwd: cwd.as_deref(),
-                request_flavor: &request_flavor,
-                request_body_previews,
-                debug_max,
-                warn_max,
-                client_body_debug: client_body_debug.as_ref(),
-                client_body_warn: client_body_warn.as_ref(),
-                plan: &plan,
-                upstream_opt,
-                provider_opt,
-                provider_attempt,
-                total_upstreams,
-                cooldown_backoff,
-                global_attempt: &mut global_attempt,
-                avoid_set,
-                avoided_total: &mut avoided_total,
-                last_err: &mut last_err,
-                upstream_chain: &mut upstream_chain,
-            })
-            .await
-            {
-                SelectedUpstreamExecutionOutcome::ContinueStation => {}
-                SelectedUpstreamExecutionOutcome::Return(response) => return Ok(response),
-            }
-
-            // If we don't have any more upstreams under this station, move to next station;
-            // otherwise, continue selecting another upstream under the same station.
-            let upstream_total = lb.service.upstreams.len();
-            if station_loop_action_after_attempt(
-                proxy.service_name,
-                request_id,
-                station_name.as_str(),
-                upstream_total,
-                avoid_set,
-            ) {
-                break 'upstreams;
-            }
-            continue 'upstreams;
-        }
-
-        tried_stations.insert(station_name.clone());
-
-        log_cross_station_failover_blocked(
-            proxy.service_name,
-            request_id,
-            station_name.as_str(),
-            strict_multi_config,
-            provider_attempt,
-            cross_station_failover_enabled,
-            provider_opt,
-            provider_attempt_limit,
-            plan.allow_cross_station_before_first_output,
-        );
-
-        // Provider layer: optional backoff between providers (usually 0).
-        if provider_opt.base_backoff_ms > 0 && provider_attempt + 1 < provider_attempt_limit {
-            backoff_sleep(provider_opt, provider_attempt).await;
-        }
-    }
+    log_retry_options(proxy.service_name, request_id, &plan);
+    let provider_execution = execute_provider_chain(ExecuteProviderChainParams {
+        proxy: &proxy,
+        lbs: &lbs,
+        method: &method,
+        uri: &uri,
+        client_headers: &client_headers,
+        client_headers_entries_cache: &client_headers_entries_cache,
+        client_uri: client_uri.as_str(),
+        start: &start,
+        started_at_ms,
+        request_id,
+        request_body_len,
+        body_for_upstream: &body_for_upstream,
+        request_model: request_model.as_deref(),
+        session_binding: session_binding.as_ref(),
+        session_override_config: session_override_config.as_deref(),
+        global_station_override: global_station_override.as_deref(),
+        override_model: override_model.as_deref(),
+        override_effort: override_effort.as_deref(),
+        override_service_tier: override_service_tier.as_deref(),
+        effective_effort: effective_effort.as_deref(),
+        effective_service_tier: effective_service_tier.as_deref(),
+        base_service_tier: &base_service_tier,
+        session_id: session_id.as_deref(),
+        cwd: cwd.as_deref(),
+        request_flavor: &request_flavor,
+        request_body_previews,
+        debug_max,
+        warn_max,
+        client_body_debug: client_body_debug.as_ref(),
+        client_body_warn: client_body_warn.as_ref(),
+        plan: &plan,
+        cooldown_backoff,
+    })
+    .await;
+    let (upstream_chain, last_err) = match provider_execution {
+        ProviderExecutionOutcome::Return(response) => return Ok(response),
+        ProviderExecutionOutcome::Exhausted(state) => (state.upstream_chain, state.last_err),
+    };
 
     // If we reach here, all provider attempts are exhausted.
     if let Some((status, msg)) = last_err {
