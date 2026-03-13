@@ -21,6 +21,7 @@ mod client_identity;
 mod headers;
 mod http_debug;
 mod passive_health;
+mod profile_defaults;
 mod request_body;
 mod retry;
 mod route_provenance;
@@ -59,6 +60,9 @@ use self::client_identity::{extract_client_addr, extract_client_name, extract_se
 use self::headers::{filter_request_headers, filter_response_headers};
 use self::http_debug::format_reqwest_error_for_retry_chain;
 use self::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
+use self::profile_defaults::{
+    configured_active_station_name, effective_active_station_name, effective_default_profile_name,
+};
 use self::request_body::{
     apply_model_override, apply_reasoning_effort_override, apply_service_tier_override,
     extract_model_from_request_body, extract_reasoning_effort_from_request_body,
@@ -132,33 +136,6 @@ fn log_same_station_failover_trace(
             "retry_another_upstream_within_station"
         },
     }));
-}
-
-async fn effective_default_profile_name(
-    state: &ProxyState,
-    service_name: &str,
-    mgr: &ServiceConfigManager,
-) -> Option<String> {
-    if let Some(name) = state
-        .get_runtime_default_profile_override(service_name)
-        .await
-        && mgr.profile(name.as_str()).is_some()
-    {
-        return Some(name);
-    }
-    mgr.default_profile_ref().map(|(name, _)| name.to_string())
-}
-
-fn configured_active_station_name(mgr: &ServiceConfigManager) -> Option<String> {
-    mgr.active
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn effective_active_station_name(mgr: &ServiceConfigManager) -> Option<String> {
-    mgr.active_station().map(|cfg| cfg.name.clone())
 }
 
 #[allow(dead_code)]
