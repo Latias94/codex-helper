@@ -1,3 +1,4 @@
+use super::shared::{build_profile_card_item, render_profile_card_list};
 use super::*;
 
 pub(in super::super::super) struct LocalProfilesSectionArgs<'a> {
@@ -87,29 +88,37 @@ pub(in super::super::super) fn render_config_v2_profiles_local(
 
     ui.add_space(6.0);
     ui.columns(2, |cols| {
-        cols[0].label(pick(lang, "Profile 列表", "Profile list"));
+        cols[0].label(pick(lang, "策略预设", "Strategy presets"));
+        cols[0].small(pick(
+            lang,
+            "左侧更适合快速挑选日常 profile；右侧再做细节编辑。",
+            "Use the left deck for quick daily selection, then edit details on the right.",
+        ));
         cols[0].add_space(4.0);
-        egui::ScrollArea::vertical()
-            .id_salt("config_v2_profiles_scroll")
-            .max_height(240.0)
-            .show(&mut cols[0], |ui| {
-                let names = view.profiles.keys().cloned().collect::<Vec<_>>();
-                if names.is_empty() {
-                    ui.label(pick(lang, "(当前没有 profile)", "(no profiles yet)"));
-                } else {
-                    for name in names {
-                        let is_selected = selected_profile_name.as_deref() == Some(name.as_str());
-                        let label = if view.default_profile.as_deref() == Some(name.as_str()) {
-                            format!("{name} [default]")
-                        } else {
-                            name.clone()
-                        };
-                        if ui.selectable_label(is_selected, label).clicked() {
-                            *selected_profile_name = Some(name);
-                        }
-                    }
-                }
-            });
+        let names = view.profiles.keys().cloned().collect::<Vec<_>>();
+        let cards = names
+            .iter()
+            .filter_map(|name| {
+                view.profiles.get(name).map(|profile| {
+                    build_profile_card_item(
+                        name.as_str(),
+                        profile,
+                        view.default_profile.as_deref() == Some(name.as_str()),
+                        selected_profile_name.as_deref() == Some(name.as_str()),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        render_profile_card_list(
+            &mut cols[0],
+            lang,
+            "config_v2_profiles_scroll",
+            pick(lang, "(当前没有 profile)", "(no profiles yet)"),
+            &cards,
+            |name| {
+                *selected_profile_name = Some(name.to_string());
+            },
+        );
 
         cols[1].label(pick(lang, "Profile 详情", "Profile details"));
         cols[1].add_space(4.0);

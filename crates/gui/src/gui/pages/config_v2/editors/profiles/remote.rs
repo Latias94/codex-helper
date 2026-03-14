@@ -1,3 +1,4 @@
+use super::shared::{build_profile_card_item, render_profile_card_list};
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -100,28 +101,34 @@ pub(in super::super::super) fn render_config_v2_profiles_control_plane(
 
     ui.add_space(6.0);
     ui.columns(2, |cols| {
-        cols[0].label(pick(lang, "Profile 列表", "Profile list"));
+        cols[0].label(pick(lang, "策略预设", "Strategy presets"));
+        cols[0].small(pick(
+            lang,
+            "左侧更适合快速查看 fast mode / 模型 / 思考模式组合，右侧负责细节写回。",
+            "Use the left deck for quick inspection of fast mode, model, and reasoning combos; edit and write back on the right.",
+        ));
         cols[0].add_space(4.0);
-        egui::ScrollArea::vertical()
-            .id_salt("config_v2_profiles_scroll")
-            .max_height(240.0)
-            .show(&mut cols[0], |ui| {
-                if profile_catalog.is_empty() {
-                    ui.label(pick(lang, "(当前没有 profile)", "(no profiles yet)"));
-                } else {
-                    for name in profile_catalog.keys() {
-                        let is_selected = selected_profile_name.as_deref() == Some(name.as_str());
-                        let label = if configured_default_profile == Some(name.as_str()) {
-                            format!("{name} [default]")
-                        } else {
-                            name.clone()
-                        };
-                        if ui.selectable_label(is_selected, label).clicked() {
-                            *selected_profile_name = Some(name.clone());
-                        }
-                    }
-                }
-            });
+        let cards = profile_catalog
+            .iter()
+            .map(|(name, profile)| {
+                build_profile_card_item(
+                    name.as_str(),
+                    profile,
+                    configured_default_profile == Some(name.as_str()),
+                    selected_profile_name.as_deref() == Some(name.as_str()),
+                )
+            })
+            .collect::<Vec<_>>();
+        render_profile_card_list(
+            &mut cols[0],
+            lang,
+            "config_v2_profiles_scroll",
+            pick(lang, "(当前没有 profile)", "(no profiles yet)"),
+            &cards,
+            |name| {
+                *selected_profile_name = Some(name.to_string());
+            },
+        );
 
         if editor_profile_name.as_deref() != selected_profile_name.as_deref() {
             let selected_profile = selected_profile_name

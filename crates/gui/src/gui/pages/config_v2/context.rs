@@ -1,49 +1,52 @@
 use super::*;
 
-pub(super) struct ConfigV2RenderContext {
-    pub(super) schema_version: u32,
-    pub(super) selected_service: &'static str,
-    pub(super) station_names: Vec<String>,
-    pub(super) profile_names: Vec<String>,
-    pub(super) default_profile: Option<String>,
-    pub(super) station_display_names: Vec<String>,
-    pub(super) selected_name: Option<String>,
-    pub(super) station_control_plane_catalog: BTreeMap<String, StationOption>,
-    pub(super) station_control_plane_enabled: bool,
-    pub(super) station_control_plane_configured_active: Option<String>,
-    pub(super) station_control_plane_effective_active: Option<String>,
-    pub(super) station_default_profile: Option<String>,
-    pub(super) attached_station_specs: Option<(
+pub(in crate::gui::pages) struct ConfigV2RenderContext {
+    pub(in crate::gui::pages) schema_version: u32,
+    pub(in crate::gui::pages) selected_service: &'static str,
+    pub(in crate::gui::pages) station_names: Vec<String>,
+    pub(in crate::gui::pages) profile_names: Vec<String>,
+    pub(in crate::gui::pages) default_profile: Option<String>,
+    pub(in crate::gui::pages) station_display_names: Vec<String>,
+    pub(in crate::gui::pages) selected_name: Option<String>,
+    pub(in crate::gui::pages) station_control_plane_catalog: BTreeMap<String, StationOption>,
+    pub(in crate::gui::pages) station_control_plane_enabled: bool,
+    pub(in crate::gui::pages) station_control_plane_configured_active: Option<String>,
+    pub(in crate::gui::pages) station_control_plane_effective_active: Option<String>,
+    pub(in crate::gui::pages) station_default_profile: Option<String>,
+    pub(in crate::gui::pages) attached_station_specs: Option<(
         BTreeMap<String, PersistedStationSpec>,
         BTreeMap<String, PersistedStationProviderRef>,
     )>,
-    pub(super) station_structure_control_plane_enabled: bool,
-    pub(super) station_structure_edit_enabled: bool,
-    pub(super) attached_provider_specs: Option<BTreeMap<String, PersistedProviderSpec>>,
-    pub(super) provider_structure_control_plane_enabled: bool,
-    pub(super) provider_structure_edit_enabled: bool,
-    pub(super) runtime_service: Option<String>,
-    pub(super) supports_v1: bool,
-    pub(super) cfg_health: Option<StationHealth>,
-    pub(super) hc_status: Option<HealthCheckStatus>,
-    pub(super) profile_control_plane_catalog:
+    pub(in crate::gui::pages) station_structure_control_plane_enabled: bool,
+    pub(in crate::gui::pages) station_structure_edit_enabled: bool,
+    pub(in crate::gui::pages) attached_provider_specs:
+        Option<BTreeMap<String, PersistedProviderSpec>>,
+    pub(in crate::gui::pages) provider_structure_control_plane_enabled: bool,
+    pub(in crate::gui::pages) provider_structure_edit_enabled: bool,
+    pub(in crate::gui::pages) runtime_service: Option<String>,
+    pub(in crate::gui::pages) supports_v1: bool,
+    pub(in crate::gui::pages) cfg_health: Option<StationHealth>,
+    pub(in crate::gui::pages) hc_status: Option<HealthCheckStatus>,
+    pub(in crate::gui::pages) profile_control_plane_catalog:
         BTreeMap<String, crate::config::ServiceControlProfile>,
-    pub(super) profile_control_plane_default: Option<String>,
-    pub(super) profile_control_plane_station_names: Vec<String>,
-    pub(super) profile_control_plane_enabled: bool,
-    pub(super) provider_catalog: BTreeMap<String, crate::config::ProviderConfigV2>,
-    pub(super) local_provider_spec_catalog: BTreeMap<String, PersistedProviderSpec>,
-    pub(super) local_station_spec_catalog: BTreeMap<String, PersistedStationSpec>,
-    pub(super) local_provider_ref_catalog: BTreeMap<String, PersistedStationProviderRef>,
-    pub(super) provider_display_names: Vec<String>,
-    pub(super) profile_catalog: BTreeMap<String, crate::config::ServiceControlProfile>,
-    pub(super) configured_active_name: Option<String>,
-    pub(super) effective_active_name: Option<String>,
-    pub(super) attached_mode: bool,
+    pub(in crate::gui::pages) profile_control_plane_default: Option<String>,
+    pub(in crate::gui::pages) profile_control_plane_station_names: Vec<String>,
+    pub(in crate::gui::pages) profile_control_plane_enabled: bool,
+    pub(in crate::gui::pages) provider_catalog: BTreeMap<String, crate::config::ProviderConfigV2>,
+    pub(in crate::gui::pages) local_provider_spec_catalog: BTreeMap<String, PersistedProviderSpec>,
+    pub(in crate::gui::pages) local_station_spec_catalog: BTreeMap<String, PersistedStationSpec>,
+    pub(in crate::gui::pages) local_provider_ref_catalog:
+        BTreeMap<String, PersistedStationProviderRef>,
+    pub(in crate::gui::pages) provider_display_names: Vec<String>,
+    pub(in crate::gui::pages) profile_catalog:
+        BTreeMap<String, crate::config::ServiceControlProfile>,
+    pub(in crate::gui::pages) configured_active_name: Option<String>,
+    pub(in crate::gui::pages) effective_active_name: Option<String>,
+    pub(in crate::gui::pages) attached_mode: bool,
 }
 
 impl ConfigV2RenderContext {
-    pub(super) fn build(ctx: &mut PageCtx<'_>) -> Option<Self> {
+    pub(in crate::gui::pages) fn build(ctx: &mut PageCtx<'_>) -> Option<Self> {
         let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_ref() else {
             return None;
         };
@@ -359,7 +362,9 @@ impl ConfigV2RenderContext {
         }
     }
 
-    pub(super) fn preview_station_specs(&self) -> Option<&BTreeMap<String, PersistedStationSpec>> {
+    pub(in crate::gui::pages) fn preview_station_specs(
+        &self,
+    ) -> Option<&BTreeMap<String, PersistedStationSpec>> {
         if self.station_structure_control_plane_enabled {
             self.attached_station_specs.as_ref().map(|specs| &specs.0)
         } else if self.attached_mode {
@@ -369,7 +374,7 @@ impl ConfigV2RenderContext {
         }
     }
 
-    pub(super) fn preview_provider_catalog(
+    pub(in crate::gui::pages) fn preview_provider_catalog(
         &self,
     ) -> Option<&BTreeMap<String, PersistedStationProviderRef>> {
         if self.station_structure_control_plane_enabled {
@@ -381,7 +386,7 @@ impl ConfigV2RenderContext {
         }
     }
 
-    pub(super) fn preview_runtime_station_catalog(
+    pub(in crate::gui::pages) fn preview_runtime_station_catalog(
         &self,
     ) -> Option<&BTreeMap<String, StationOption>> {
         self.station_control_plane_enabled

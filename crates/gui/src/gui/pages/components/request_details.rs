@@ -1,0 +1,579 @@
+use eframe::egui;
+
+use super::super::super::i18n::{Language, pick};
+use super::super::{
+    EffectiveRouteField, effective_route_field_label, format_age, non_empty_trimmed, now_ms,
+    route_decision_field_value, route_value_source_label, session_binding_mode_label,
+    shorten_middle, usage_line,
+};
+use super::console_layout::{ConsoleTone, console_kv_grid, console_note, console_section};
+use super::route_explanation::format_service_tier_display;
+use crate::state::{FinishedRequest, RouteDecisionProvenance, RouteValueSource};
+
+pub(in super::super) fn render_request_detail_cards(
+    ui: &mut egui::Ui,
+    lang: Language,
+    request: &FinishedRequest,
+) {
+    render_request_summary_card(ui, lang, request);
+    ui.add_space(8.0);
+    render_request_control_trace_card(ui, lang, request);
+    ui.add_space(8.0);
+    render_request_retry_chain_card(ui, lang, request);
+}
+
+pub(in super::super) fn request_service_tier_display(
+    value: Option<&str>,
+    lang: Language,
+) -> String {
+    format_service_tier_display(value, lang, "-")
+}
+
+pub(in super::super) fn request_route_decision_reason(
+    request: &FinishedRequest,
+    decision: &RouteDecisionProvenance,
+    field: EffectiveRouteField,
+    lang: Language,
+) -> String {
+    let Some(resolved) = route_decision_field_value(decision, field) else {
+        return pick(
+            lang,
+            "这个字段没有对应的路由决策信息。",
+            "No route-decision provenance was captured for this field.",
+        )
+        .to_string();
+    };
+    let field_label = effective_route_field_label(field, lang);
+
+    match resolved.source {
+        RouteValueSource::RequestPayload => format!(
+            "{} {}={}.",
+            pick(
+                lang,
+                "这个字段直接来自请求体",
+                "This field came directly from the request payload"
+            ),
+            field_label,
+            resolved.value
+        ),
+        RouteValueSource::SessionOverride => format!(
+            "{} {}={}.",
+            pick(
+                lang,
+                "路由时命中了 session override，因此它覆盖了其他来源并固定为",
+                "Routing hit a session override, so it replaced every lower-priority source with",
+            ),
+            field_label,
+            resolved.value
+        ),
+        RouteValueSource::GlobalOverride => format!(
+            "{} {}.",
+            pick(
+                lang,
+                "当前没有会话级站点覆盖，因此命中了全局 pin",
+                "There was no session-level station override, so routing followed the global pin to",
+            ),
+            resolved.value
+        ),
+        RouteValueSource::ProfileDefault => format!(
+            "{} {}，{} {}={}.",
+            pick(lang, "这个字段来自", "This field came from"),
+            request_binding_reference(decision, lang),
+            pick(lang, "其默认", "whose default"),
+            field_label,
+            resolved.value
+        ),
+        RouteValueSource::StationMapping => {
+            let requested_model = request.model.as_deref().unwrap_or("-");
+            let station = decision
+                .effective_station
+                .as_ref()
+                .map(|value| value.value.as_str())
+                .or(request.station_name.as_deref())
+                .unwrap_or("-");
+            let upstream = decision
+                .effective_upstream_base_url
+                .as_ref()
+                .map(|value| shorten_middle(&value.value, 56))
+                .or_else(|| {
+                    request
+                        .upstream_base_url
+                        .as_deref()
+                        .map(|value| shorten_middle(value, 56))
+                })
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "{} {}，{} {} / upstream {} {} {}.",
+                pick(lang, "请求提交的模型是", "The request submitted model"),
+                requested_model,
+                pick(lang, "但站点", "but station"),
+                station,
+                upstream,
+                pick(
+                    lang,
+                    "的 model mapping 将实际模型改写为",
+                    "rewrote the effective model through model mapping to",
+                ),
+                resolved.value
+            )
+        }
+        RouteValueSource::RuntimeFallback => match field {
+            EffectiveRouteField::Station => format!(
+                "{} {}.",
+                pick(
+                    lang,
+                    "没有更高优先级的 session / global / profile 来源，运行时最终选中了站点",
+                    "No higher-priority session/global/profile source applied, so runtime finally selected station",
+                ),
+                resolved.value
+            ),
+            EffectiveRouteField::Upstream => {
+                let station = decision
+                    .effective_station
+                    .as_ref()
+                    .map(|value| value.value.as_str())
+                    .or(request.station_name.as_deref())
+                    .unwrap_or("-");
+                let provider = decision
+                    .provider_id
+                    .as_deref()
+                    .or(request.provider_id.as_deref())
+                    .unwrap_or("-");
+                format!(
+                    "{} {} / provider {}，{} {}.",
+                    pick(lang, "站点", "After station"),
+                    station,
+                    provider,
+                    pick(lang, "运行时命中的 upstream 是", "runtime hit upstream"),
+                    shorten_middle(&resolved.value, 56)
+                )
+            }
+            _ => format!(
+                "{} {}={}.",
+                pick(
+                    lang,
+                    "没有更高优先级来源，运行时沿用了",
+                    "No higher-priority source applied, so runtime kept",
+                ),
+                field_label,
+                resolved.value
+            ),
+        },
+    }
+}
+
+fn render_request_summary_card(ui: &mut egui::Ui, lang: Language, request: &FinishedRequest) {
+    let request_rows = vec![
+        ("service".to_string(), request.service.clone()),
+        ("method".to_string(), request.method.clone()),
+        ("path".to_string(), request.path.clone()),
+        ("status".to_string(), request.status_code.to_string()),
+        (
+            "duration".to_string(),
+            format!("{} ms", request.duration_ms),
+        ),
+        (
+            "ttfb".to_string(),
+            request
+                .ttfb_ms
+                .filter(|value| *value > 0)
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "session".to_string(),
+            request
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+    ];
+    let mut route_rows = vec![
+        (
+            "model".to_string(),
+            request.model.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "effort".to_string(),
+            request
+                .reasoning_effort
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "service_tier".to_string(),
+            request_service_tier_display(request.service_tier.as_deref(), lang),
+        ),
+        (
+            "station".to_string(),
+            request
+                .station_name
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "provider".to_string(),
+            request
+                .provider_id
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "upstream host".to_string(),
+            request_upstream_host(request).unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "upstream".to_string(),
+            request
+                .upstream_base_url
+                .as_deref()
+                .map(|value| shorten_middle(value, 84))
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+    ];
+    if let Some(usage) = request
+        .usage
+        .as_ref()
+        .filter(|usage| usage.total_tokens > 0)
+    {
+        route_rows.push(("usage".to_string(), usage_line(usage)));
+    }
+    if let Some(rate) = request_output_tok_per_sec(request) {
+        route_rows.push(("out_tok/s".to_string(), format!("{rate:.1}")));
+    }
+
+    let tone = if request.status_code >= 400 {
+        ConsoleTone::Warning
+    } else {
+        ConsoleTone::Neutral
+    };
+    console_section(
+        ui,
+        pick(lang, "请求快照", "Request snapshot"),
+        tone,
+        |ui| {
+            ui.columns(2, |cols| {
+                cols[0].label(pick(lang, "基本", "Request"));
+                console_kv_grid(
+                    &mut cols[0],
+                    ("requests_snapshot_left", request.id),
+                    &request_rows,
+                );
+
+                cols[1].label(pick(lang, "路由结果", "Route result"));
+                console_kv_grid(
+                    &mut cols[1],
+                    ("requests_snapshot_right", request.id),
+                    &route_rows,
+                );
+            });
+
+            if request.route_decision.is_none()
+                && let Some(note) = request_fast_mode_note(request, None, lang)
+            {
+                ui.add_space(6.0);
+                console_note(ui, note);
+            }
+        },
+    );
+}
+
+fn render_request_control_trace_card(ui: &mut egui::Ui, lang: Language, request: &FinishedRequest) {
+    let tone = if request.route_decision.is_some() {
+        ConsoleTone::Accent
+    } else {
+        ConsoleTone::Neutral
+    };
+    console_section(ui, pick(lang, "控制链", "Control trace"), tone, |ui| {
+        let Some(decision) = request.route_decision.as_ref() else {
+            console_note(
+                ui,
+                pick(
+                    lang,
+                    "当前请求还没有 route_decision 快照；可以看到最终观测结果，但无法准确解释它来自 request payload / session override / profile 默认还是全局 pin。",
+                    "This request has no route_decision snapshot yet. The final observed result is still visible, but the exact source chain across request payload, session override, profile default, and global pin cannot be reconstructed precisely.",
+                ),
+            );
+            if let Some(note) = request_fast_mode_note(request, None, lang) {
+                ui.add_space(6.0);
+                console_note(ui, note);
+            }
+            return;
+        };
+
+        ui.small(format!(
+            "{}: {}",
+            pick(lang, "决策时间", "Decided"),
+            format_age(now_ms(), Some(decision.decided_at_ms))
+        ));
+        if let Some(profile_name) = decision.binding_profile_name.as_deref() {
+            ui.small(format!(
+                "{}: {profile_name}",
+                pick(lang, "binding(profile)", "Binding (profile)")
+            ));
+        }
+        if decision.binding_continuity_mode.is_some() {
+            ui.small(format!(
+                "{}: {}",
+                pick(lang, "continuity", "Continuity"),
+                session_binding_mode_label(decision.binding_continuity_mode, lang)
+            ));
+        }
+        if let Some(provider) = decision
+            .provider_id
+            .as_deref()
+            .or(request.provider_id.as_deref())
+        {
+            ui.small(format!("provider(decided): {provider}"));
+        }
+
+        ui.add_space(6.0);
+        egui::Grid::new(("requests_control_trace_grid", request.id))
+            .num_columns(4)
+            .spacing([12.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong(pick(lang, "字段", "Field"));
+                ui.strong(pick(lang, "观测值", "Observed"));
+                ui.strong(pick(lang, "决策值 / 来源", "Decision / source"));
+                ui.strong(pick(lang, "为什么", "Why"));
+                ui.end_row();
+
+                for field in EffectiveRouteField::ALL {
+                    ui.label(effective_route_field_label(field, lang));
+                    ui.monospace(request_observed_route_value(request, field, lang));
+                    ui.monospace(
+                        super::route_explanation::format_resolved_route_value_for_field(
+                            route_decision_field_value(decision, field),
+                            field,
+                            lang,
+                        ),
+                    );
+                    ui.small(request_route_decision_reason(
+                        request, decision, field, lang,
+                    ));
+                    ui.end_row();
+                }
+            });
+
+        let changed = request_route_decision_changed_fields(request, decision, lang);
+        ui.add_space(6.0);
+        if changed.is_empty() {
+            console_note(
+                ui,
+                pick(
+                    lang,
+                    "最终观测结果与路由决策快照一致。",
+                    "The final observed result matches the route decision snapshot.",
+                ),
+            );
+        } else {
+            console_note(
+                ui,
+                format!(
+                    "{}: {}",
+                    pick(
+                        lang,
+                        "下列字段的观测值与决策快照不同，解释时以控制链为准",
+                        "These observed fields differ from the route decision snapshot; prefer the control-trace explanation for source provenance",
+                    ),
+                    changed.join(", ")
+                ),
+            );
+        }
+
+        if let Some(note) = request_fast_mode_note(request, Some(decision), lang) {
+            ui.add_space(4.0);
+            console_note(ui, note);
+        }
+    });
+}
+
+fn render_request_retry_chain_card(ui: &mut egui::Ui, lang: Language, request: &FinishedRequest) {
+    let tone = if request
+        .retry
+        .as_ref()
+        .is_some_and(|retry| retry.attempts > 1)
+    {
+        ConsoleTone::Warning
+    } else {
+        ConsoleTone::Neutral
+    };
+    console_section(
+        ui,
+        pick(lang, "重试 / 熔断链", "Retry / failover chain"),
+        tone,
+        |ui| {
+            if let Some(retry) = request.retry.as_ref() {
+                ui.small(format!("attempts: {}", retry.attempts));
+                if retry.attempts > 1 {
+                    console_note(
+                        ui,
+                        pick(
+                            lang,
+                            "这次请求发生了重试或 provider / upstream 切换。",
+                            "This request retried or switched provider/upstream during execution.",
+                        ),
+                    );
+                    ui.add_space(4.0);
+                }
+                let max = 12usize;
+                for (idx, entry) in retry.upstream_chain.iter().take(max).enumerate() {
+                    ui.monospace(format!("{:>2}. {}", idx + 1, shorten_middle(entry, 120)));
+                }
+                if retry.upstream_chain.len() > max {
+                    ui.small(format!("... +{} more", retry.upstream_chain.len() - max));
+                }
+                return;
+            }
+
+            console_note(
+                ui,
+                pick(
+                    lang,
+                    "这次请求没有可见的重试或熔断切换链。",
+                    "No visible retry or failover chain was recorded for this request.",
+                ),
+            );
+        },
+    );
+}
+
+fn request_upstream_host(request: &FinishedRequest) -> Option<String> {
+    let raw = request.upstream_base_url.as_deref()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let after_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let host = after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn request_output_tok_per_sec(request: &FinishedRequest) -> Option<f64> {
+    let usage = request.usage.as_ref()?;
+    if usage.output_tokens == 0 {
+        return None;
+    }
+    let ttfb_ms = request.ttfb_ms.unwrap_or(0);
+    let gen_ms = if ttfb_ms > 0 && ttfb_ms < request.duration_ms {
+        request.duration_ms.saturating_sub(ttfb_ms)
+    } else {
+        request.duration_ms
+    };
+    if gen_ms == 0 {
+        return None;
+    }
+    let rate = (usage.output_tokens as f64) / (gen_ms as f64 / 1000.0);
+    rate.is_finite().then_some(rate).filter(|rate| *rate > 0.0)
+}
+
+fn request_observed_route_value(
+    request: &FinishedRequest,
+    field: EffectiveRouteField,
+    lang: Language,
+) -> String {
+    match field {
+        EffectiveRouteField::Model => request.model.clone().unwrap_or_else(|| "-".to_string()),
+        EffectiveRouteField::Station => request
+            .station_name
+            .clone()
+            .unwrap_or_else(|| "-".to_string()),
+        EffectiveRouteField::Upstream => request
+            .upstream_base_url
+            .as_deref()
+            .map(|value| shorten_middle(value, 72))
+            .unwrap_or_else(|| "-".to_string()),
+        EffectiveRouteField::Effort => request
+            .reasoning_effort
+            .clone()
+            .unwrap_or_else(|| "-".to_string()),
+        EffectiveRouteField::ServiceTier => {
+            request_service_tier_display(request.service_tier.as_deref(), lang)
+        }
+    }
+}
+
+fn request_observed_route_raw(
+    request: &FinishedRequest,
+    field: EffectiveRouteField,
+) -> Option<String> {
+    match field {
+        EffectiveRouteField::Model => non_empty_trimmed(request.model.as_deref()),
+        EffectiveRouteField::Station => non_empty_trimmed(request.station_name.as_deref()),
+        EffectiveRouteField::Upstream => non_empty_trimmed(request.upstream_base_url.as_deref()),
+        EffectiveRouteField::Effort => non_empty_trimmed(request.reasoning_effort.as_deref()),
+        EffectiveRouteField::ServiceTier => non_empty_trimmed(request.service_tier.as_deref()),
+    }
+}
+
+fn request_binding_reference(decision: &RouteDecisionProvenance, lang: Language) -> String {
+    match decision.binding_profile_name.as_deref() {
+        Some(name) => format!("profile {name}"),
+        None => pick(lang, "当前会话绑定", "the current session binding").to_string(),
+    }
+}
+
+fn request_route_decision_changed_fields(
+    request: &FinishedRequest,
+    decision: &RouteDecisionProvenance,
+    lang: Language,
+) -> Vec<String> {
+    EffectiveRouteField::ALL
+        .into_iter()
+        .filter(|field| {
+            let decided =
+                route_decision_field_value(decision, *field).map(|value| value.value.as_str());
+            let observed = request_observed_route_raw(request, *field);
+            match (decided, observed.as_deref()) {
+                (Some(decided), Some(observed)) => decided != observed,
+                _ => false,
+            }
+        })
+        .map(|field| effective_route_field_label(field, lang).to_string())
+        .collect()
+}
+
+fn request_fast_mode_note(
+    request: &FinishedRequest,
+    decision: Option<&RouteDecisionProvenance>,
+    lang: Language,
+) -> Option<String> {
+    let decided = decision.and_then(|decision| decision.effective_service_tier.as_ref());
+    if let Some(value) = decided
+        && value.value.eq_ignore_ascii_case("priority")
+    {
+        return Some(format!(
+            "{}: service_tier=priority，{} [{}].",
+            pick(lang, "fast mode", "Fast mode"),
+            pick(
+                lang,
+                "这次请求是按快速模式路由的",
+                "this request was routed in fast mode"
+            ),
+            route_value_source_label(value.source, lang)
+        ));
+    }
+    request
+        .service_tier
+        .as_deref()
+        .filter(|value| value.trim().eq_ignore_ascii_case("priority"))
+        .map(|_| {
+            format!(
+                "{}: service_tier=priority，{}。",
+                pick(lang, "fast mode", "Fast mode"),
+                pick(
+                    lang,
+                    "当前观测到快速模式，但缺少来源快照",
+                    "fast mode is visible in the observed request, but source provenance is missing",
+                )
+            )
+        })
+}

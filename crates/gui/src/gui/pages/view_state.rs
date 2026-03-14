@@ -6,6 +6,7 @@ pub struct ViewState {
     pub setup: SetupViewState,
     pub stations: StationsViewState,
     pub doctor: DoctorViewState,
+    pub stats: StatsViewState,
     pub sessions: SessionsViewState,
     pub requests: RequestsViewState,
     pub config: ConfigViewState,
@@ -39,6 +40,63 @@ pub struct DoctorViewState {
     pub loaded_at_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ControlTraceKindFilter {
+    #[default]
+    All,
+    RequestCompleted,
+    RetryTrace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ControlTraceSourceKind {
+    #[default]
+    LocalFile,
+    AttachedApi,
+    AttachedFallbackLocal,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ControlTraceRecordState {
+    pub ts_ms: u64,
+    pub kind: String,
+    pub service: Option<String>,
+    pub request_id: Option<u64>,
+    pub event: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Debug)]
+pub struct StatsViewState {
+    pub control_trace_limit: usize,
+    pub control_trace_loaded_limit: usize,
+    pub control_trace_loaded_signature: Option<String>,
+    pub control_trace_source_kind: ControlTraceSourceKind,
+    pub control_trace_source_detail: Option<String>,
+    pub control_trace_kind: ControlTraceKindFilter,
+    pub control_trace_query: String,
+    pub control_trace_entries: Vec<ControlTraceRecordState>,
+    pub control_trace_last_loaded_ms: Option<u64>,
+    pub control_trace_last_error: Option<String>,
+}
+
+impl Default for StatsViewState {
+    fn default() -> Self {
+        Self {
+            control_trace_limit: 80,
+            control_trace_loaded_limit: 0,
+            control_trace_loaded_signature: None,
+            control_trace_source_kind: ControlTraceSourceKind::LocalFile,
+            control_trace_source_detail: None,
+            control_trace_kind: ControlTraceKindFilter::All,
+            control_trace_query: String::new(),
+            control_trace_entries: Vec::new(),
+            control_trace_last_loaded_ms: None,
+            control_trace_last_error: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SetupViewState {
     pub import_codex_on_init: bool,
@@ -59,9 +117,18 @@ pub(super) enum ConfigMode {
     Raw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ConfigV2Section {
+    Stations,
+    Providers,
+    #[default]
+    Profiles,
+}
+
 #[derive(Debug)]
 pub struct ConfigViewState {
     pub(super) mode: ConfigMode,
+    pub(super) v2_section: ConfigV2Section,
     pub(super) service: crate::config::ServiceKind,
     pub(super) selected_name: Option<String>,
     pub(super) station_editor: ConfigStationEditorState,
@@ -79,6 +146,7 @@ impl Default for ConfigViewState {
     fn default() -> Self {
         Self {
             mode: ConfigMode::Form,
+            v2_section: ConfigV2Section::default(),
             service: crate::config::ServiceKind::Codex,
             selected_name: None,
             station_editor: ConfigStationEditorState::default(),

@@ -74,7 +74,8 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                                 }
                             }
                             Err(e) => {
-                                *ctx.last_info = Some(pick(ctx.lang, "已保存", "Saved").to_string());
+                                *ctx.last_info =
+                                    Some(pick(ctx.lang, "已保存", "Saved").to_string());
                                 *ctx.last_error = Some(format!("re-read failed: {e}"));
                             }
                         }

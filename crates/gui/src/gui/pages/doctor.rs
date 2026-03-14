@@ -1,5 +1,5 @@
-use super::*;
-
+use super::*;
+
 pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.heading(pick(ctx.lang, "诊断", "Doctor"));
     ui.label(pick(
@@ -127,4 +127,3 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
         });
 }
-

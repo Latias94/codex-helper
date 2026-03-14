@@ -61,7 +61,11 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let mut enabled = ctx.gui_cfg.proxy.discovery_scan_fallback;
         ui.checkbox(
             &mut enabled,
-            pick(ctx.lang, "探测失败后扫 3210-3220", "Scan 3210-3220 on failure"),
+            pick(
+                ctx.lang,
+                "探测失败后扫 3210-3220",
+                "Scan 3210-3220 on failure",
+            ),
         );
         if enabled != ctx.gui_cfg.proxy.discovery_scan_fallback {
             ctx.gui_cfg.proxy.discovery_scan_fallback = enabled;
@@ -115,7 +119,11 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let mut remember = ctx.gui_cfg.attach.remember_choice;
         ui.checkbox(
             &mut remember,
-            pick(ctx.lang, "记住选择（不再弹窗）", "Remember choice (no prompt)"),
+            pick(
+                ctx.lang,
+                "记住选择（不再弹窗）",
+                "Remember choice (no prompt)",
+            ),
         );
         if remember != ctx.gui_cfg.attach.remember_choice {
             ctx.gui_cfg.attach.remember_choice = remember;
@@ -182,8 +190,9 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             if let Err(e) = ctx.gui_cfg.save() {
                 *ctx.last_error = Some(format!("save gui config failed: {e}"));
             } else {
-                *ctx.last_info =
-                    Some(pick(ctx.lang, "已保存（下次启动生效）", "Saved (next launch)").to_string());
+                *ctx.last_info = Some(
+                    pick(ctx.lang, "已保存（下次启动生效）", "Saved (next launch)").to_string(),
+                );
             }
         }
     });

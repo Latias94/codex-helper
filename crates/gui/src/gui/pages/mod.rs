@@ -31,25 +31,123 @@ mod config_legacy;
 mod config_raw;
 mod config_shell;
 mod config_v2;
+mod config_v2_header;
 mod doctor;
 mod formatting;
 mod history;
+mod history_all_by_date;
+mod history_all_by_date_loader;
+mod history_all_by_date_transcript;
+mod history_all_by_date_view;
+mod history_controller;
+mod history_controller_filter;
+mod history_controller_refresh;
+mod history_external;
+mod history_git;
+mod history_main_view;
+mod history_observed;
+mod history_observed_card_summary;
+mod history_observed_placeholder;
+mod history_observed_request_summary;
+mod history_observed_runtime;
+mod history_observed_summary;
+mod history_page;
+mod history_state;
+#[cfg(test)]
+mod history_tests;
+mod history_toolbar;
+mod history_toolbar_all_by_date;
+mod history_toolbar_controls;
+mod history_toolbar_header;
+mod history_toolbar_recent;
+mod history_toolbar_shortcuts;
 mod history_tools;
+mod history_transcript_runtime;
 mod navigation;
 mod overview;
+mod overview_connection;
+mod overview_connection_attach;
+mod overview_connection_status;
+mod overview_port_modal;
+mod overview_runtime_status;
+mod overview_runtime_status_attached;
+mod overview_runtime_status_running;
+mod overview_station_summary;
 mod profile_preview;
+mod profile_preview_render;
+mod profile_preview_state;
+#[cfg(test)]
+mod profile_preview_tests;
+mod proxy_discovery;
 mod remote_attach;
+mod remote_attach_admin;
+mod remote_attach_host_local;
+mod remote_attach_utils;
 mod requests;
+mod requests_filters;
+mod requests_header_actions;
+mod requests_page;
 mod retry_editor;
 mod runtime_station;
-mod session_presentation;
+mod session_bridge;
+mod session_control_posture;
+mod session_control_profile;
+mod session_controls;
+mod session_route_explanations;
+mod session_route_fields;
+mod session_route_logic;
+mod session_route_reason_runtime;
+mod session_route_reason_sources;
+mod session_route_reasoning;
+mod session_route_state;
+mod session_row;
+mod session_rows_aggregate;
+mod session_rows_builder;
+mod session_rows_from_cards;
+mod session_rows_sources;
+#[cfg(test)]
+mod session_tests;
+mod session_views;
 mod sessions;
+mod sessions_controller;
+mod sessions_detail_controls;
+mod sessions_override_editors;
+mod sessions_profile_binding_editor;
+mod sessions_quick_actions;
+mod sessions_split_view;
+mod sessions_toolbar;
 mod settings;
 mod setup;
+mod setup_client_step;
+mod setup_config_step;
+mod setup_proxy_step;
 mod stations;
+mod stations_detail_controls;
+mod stations_detail_health;
+mod stations_detail_persisted_config;
+mod stations_detail_quick_switch;
+mod stations_detail_runtime_control;
+mod stations_detail_summary;
+mod stations_empty_state;
+mod stations_list_panel;
+mod stations_panels;
+mod stations_profile_management;
+mod stations_retry_panel;
+mod stations_runtime_summary;
 mod stats;
+mod stats_control_trace;
+mod stats_control_trace_loader;
+mod stats_control_trace_summary;
+mod stats_summary;
 mod view_state;
 
+#[allow(unused_imports)]
+use components::route_explanation::{
+    format_resolved_route_value_for_field, format_route_value_for_field,
+    format_service_tier_display, render_effective_route_explanation_grid,
+    render_last_route_decision_card, render_observed_route_snapshot_card,
+    render_session_route_snapshot_card,
+};
 #[allow(unused_imports)]
 use config_document::{
     parse_proxy_config_document, save_proxy_config_document, sync_codex_auth_into_document,
@@ -74,7 +172,12 @@ use remote_attach::*;
 #[allow(unused_imports)]
 use retry_editor::*;
 use runtime_station::*;
-use session_presentation::*;
+use session_bridge::*;
+use session_controls::*;
+use session_route_logic::*;
+use session_row::*;
+use session_rows_builder::*;
+use session_views::*;
 #[cfg(test)]
 use view_state::SessionOverrideEditor;
 pub use view_state::ViewState;
@@ -138,105 +241,6 @@ pub fn render(ui: &mut egui::Ui, page: Page, ctx: &mut PageCtx<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample_session_row() -> SessionRow {
-        SessionRow {
-            session_id: Some("sid-1".to_string()),
-            observation_scope: SessionObservationScope::ObservedOnly,
-            host_local_transcript_path: None,
-            last_client_name: None,
-            last_client_addr: None,
-            cwd: Some("G:/codes/rust/codex-helper".to_string()),
-            active_count: 0,
-            active_started_at_ms_min: None,
-            last_status: None,
-            last_duration_ms: None,
-            last_ended_at_ms: None,
-            last_model: None,
-            last_reasoning_effort: None,
-            last_service_tier: None,
-            last_provider_id: None,
-            last_station: None,
-            last_upstream_base_url: None,
-            last_usage: None,
-            total_usage: None,
-            turns_total: None,
-            turns_with_usage: None,
-            binding_profile_name: None,
-            binding_continuity_mode: None,
-            last_route_decision: None,
-            effective_model: None,
-            effective_reasoning_effort: None,
-            effective_service_tier: None,
-            effective_station_value: None,
-            effective_upstream_base_url: None,
-            override_model: None,
-            override_effort: None,
-            override_station: None,
-            override_service_tier: None,
-        }
-    }
-
-    #[test]
-    fn explain_effective_route_uses_profile_context() {
-        let mut row = sample_session_row();
-        row.binding_profile_name = Some("fast".to_string());
-        row.effective_service_tier = Some(ResolvedRouteValue {
-            value: "priority".to_string(),
-            source: RouteValueSource::ProfileDefault,
-        });
-
-        let explanation =
-            explain_effective_route_field(&row, EffectiveRouteField::ServiceTier, Language::Zh);
-
-        assert_eq!(explanation.value, "priority");
-        assert_eq!(explanation.source_label, "profile 默认");
-        assert!(explanation.reason.contains("profile fast"));
-        assert!(explanation.reason.contains("service_tier"));
-    }
-
-    #[test]
-    fn explain_effective_route_handles_station_mapping_for_model() {
-        let mut row = sample_session_row();
-        row.last_model = Some("gpt-5.4".to_string());
-        row.last_station = Some("right".to_string());
-        row.last_upstream_base_url = Some("https://www.right.codes/codex/v1".to_string());
-        row.effective_station_value = Some(ResolvedRouteValue {
-            value: "right".to_string(),
-            source: RouteValueSource::RuntimeFallback,
-        });
-        row.effective_model = Some(ResolvedRouteValue {
-            value: "gpt-5.4-fast".to_string(),
-            source: RouteValueSource::StationMapping,
-        });
-
-        let explanation =
-            explain_effective_route_field(&row, EffectiveRouteField::Model, Language::Zh);
-
-        assert_eq!(explanation.source_label, "站点映射");
-        assert!(explanation.reason.contains("gpt-5.4"));
-        assert!(explanation.reason.contains("right"));
-        assert!(explanation.reason.contains("gpt-5.4-fast"));
-    }
-
-    #[test]
-    fn explain_effective_route_marks_upstream_unresolved_after_station_switch() {
-        let mut row = sample_session_row();
-        row.last_station = Some("right".to_string());
-        row.last_upstream_base_url = Some("https://www.right.codes/codex/v1".to_string());
-        row.effective_station_value = Some(ResolvedRouteValue {
-            value: "vibe".to_string(),
-            source: RouteValueSource::GlobalOverride,
-        });
-
-        let explanation =
-            explain_effective_route_field(&row, EffectiveRouteField::Upstream, Language::Zh);
-
-        assert_eq!(explanation.value, "-");
-        assert_eq!(explanation.source_label, "未解析");
-        assert!(explanation.reason.contains("vibe"));
-        assert!(explanation.reason.contains("right"));
-    }
 
     #[test]
     fn management_base_url_loopback_detection_handles_localhosts() {
@@ -360,152 +364,6 @@ mod tests {
     }
 
     #[test]
-    fn session_control_posture_warns_when_bound_profile_is_missing() {
-        let mut row = sample_session_row();
-        row.binding_profile_name = Some("fast".to_string());
-        row.binding_continuity_mode = Some(SessionContinuityMode::ManualProfile);
-
-        let posture = session_control_posture(&row, &[], Language::Zh);
-
-        assert_eq!(posture.tone, SessionControlTone::Warning);
-        assert!(posture.headline.contains("已缺失"));
-        assert!(posture.detail.contains("找不到这个 profile"));
-    }
-
-    #[test]
-    fn session_control_posture_describes_session_overrides_without_binding() {
-        let mut row = sample_session_row();
-        row.override_station = Some("right".to_string());
-        row.override_service_tier = Some("priority".to_string());
-
-        let posture = session_control_posture(&row, &[], Language::En);
-
-        assert_eq!(posture.tone, SessionControlTone::Neutral);
-        assert!(posture.headline.contains("no profile binding"));
-        assert!(posture.detail.contains("station"));
-        assert!(posture.detail.contains("service_tier"));
-    }
-
-    #[test]
-    fn route_decision_changed_fields_reports_effective_drift() {
-        let mut row = sample_session_row();
-        row.effective_model = Some(ResolvedRouteValue {
-            value: "gpt-5.4-fast".to_string(),
-            source: RouteValueSource::SessionOverride,
-        });
-        row.effective_station_value = Some(ResolvedRouteValue {
-            value: "right".to_string(),
-            source: RouteValueSource::RuntimeFallback,
-        });
-        row.last_route_decision = Some(RouteDecisionProvenance {
-            decided_at_ms: 123,
-            effective_model: Some(ResolvedRouteValue {
-                value: "gpt-5.4".to_string(),
-                source: RouteValueSource::ProfileDefault,
-            }),
-            effective_station: Some(ResolvedRouteValue {
-                value: "right".to_string(),
-                source: RouteValueSource::RuntimeFallback,
-            }),
-            ..Default::default()
-        });
-
-        let changed = route_decision_changed_fields(&row, Language::En);
-
-        assert_eq!(changed, vec!["model".to_string()]);
-    }
-
-    #[test]
-    fn session_route_decision_status_line_mentions_changed_fields() {
-        let mut row = sample_session_row();
-        row.effective_service_tier = Some(ResolvedRouteValue {
-            value: "priority".to_string(),
-            source: RouteValueSource::SessionOverride,
-        });
-        row.last_route_decision = Some(RouteDecisionProvenance {
-            decided_at_ms: 456,
-            effective_service_tier: Some(ResolvedRouteValue {
-                value: "default".to_string(),
-                source: RouteValueSource::ProfileDefault,
-            }),
-            ..Default::default()
-        });
-
-        let status = session_route_decision_status_line(&row, Language::En);
-
-        assert!(status.contains("snapshot"));
-        assert!(status.contains("service_tier"));
-    }
-
-    #[test]
-    fn build_session_rows_from_cards_preserves_last_route_decision() {
-        let rows = build_session_rows_from_cards(&[SessionIdentityCard {
-            session_id: Some("sid-1".to_string()),
-            last_route_decision: Some(RouteDecisionProvenance {
-                decided_at_ms: 789,
-                provider_id: Some("right".to_string()),
-                effective_model: Some(ResolvedRouteValue {
-                    value: "gpt-5.4-fast".to_string(),
-                    source: RouteValueSource::StationMapping,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }]);
-
-        assert_eq!(rows.len(), 1);
-        let decision = rows[0]
-            .last_route_decision
-            .as_ref()
-            .expect("route decision");
-        assert_eq!(decision.decided_at_ms, 789);
-        assert_eq!(decision.provider_id.as_deref(), Some("right"));
-        assert_eq!(
-            decision
-                .effective_model
-                .as_ref()
-                .map(|value| value.value.as_str()),
-            Some("gpt-5.4-fast")
-        );
-    }
-
-    #[test]
-    fn session_list_control_label_prefers_profile_binding() {
-        let mut row = sample_session_row();
-        row.binding_profile_name = Some("fast".to_string());
-        row.override_station = Some("right".to_string());
-
-        assert_eq!(session_list_control_label(&row), "pf:fast");
-    }
-
-    #[test]
-    fn focus_session_in_sessions_resets_filters_and_focuses_sid() {
-        let mut state = SessionsViewState {
-            active_only: true,
-            errors_only: true,
-            overrides_only: true,
-            lock_order: true,
-            search: "old".to_string(),
-            default_profile_selection: None,
-            selected_session_id: None,
-            selected_idx: 9,
-            ordered_session_ids: Vec::new(),
-            last_active_set: HashSet::new(),
-            editor: SessionOverrideEditor::default(),
-        };
-
-        focus_session_in_sessions(&mut state, "sid-history".to_string());
-
-        assert!(!state.active_only);
-        assert!(!state.errors_only);
-        assert!(!state.overrides_only);
-        assert_eq!(state.search, "sid-history");
-        assert_eq!(state.selected_session_id.as_deref(), Some("sid-history"));
-        assert_eq!(state.selected_idx, 0);
-        assert!(state.lock_order);
-    }
-
-    #[test]
     fn prepare_select_requests_for_session_sets_explicit_focus() {
         let mut state = RequestsViewState {
             errors_only: true,
@@ -520,6 +378,68 @@ mod tests {
         assert!(state.scope_session);
         assert_eq!(state.focused_session_id.as_deref(), Some("sid-req"));
         assert_eq!(state.selected_idx, 0);
+    }
+
+    #[test]
+    fn request_service_tier_display_marks_priority_as_fast_mode() {
+        assert_eq!(
+            requests::request_service_tier_display(Some("priority"), Language::En),
+            "priority (fast mode)"
+        );
+    }
+
+    #[test]
+    fn request_route_decision_reason_explains_model_mapping() {
+        let request = FinishedRequest {
+            id: 42,
+            session_id: Some("sid-req".to_string()),
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: Some("priority".to_string()),
+            station_name: Some("right".to_string()),
+            provider_id: Some("right".to_string()),
+            upstream_base_url: Some("https://api.example.com/v1".to_string()),
+            route_decision: None,
+            usage: None,
+            retry: None,
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 900,
+            ttfb_ms: Some(120),
+            ended_at_ms: 9_000,
+        };
+        let decision = RouteDecisionProvenance {
+            effective_model: Some(ResolvedRouteValue {
+                value: "gpt-5.4-fast".to_string(),
+                source: RouteValueSource::StationMapping,
+            }),
+            effective_station: Some(ResolvedRouteValue {
+                value: "right".to_string(),
+                source: RouteValueSource::RuntimeFallback,
+            }),
+            effective_upstream_base_url: Some(ResolvedRouteValue {
+                value: "https://api.example.com/v1".to_string(),
+                source: RouteValueSource::RuntimeFallback,
+            }),
+            provider_id: Some("right".to_string()),
+            ..Default::default()
+        };
+
+        let reason = requests::request_route_decision_reason(
+            &request,
+            &decision,
+            EffectiveRouteField::Model,
+            Language::En,
+        );
+
+        assert!(reason.contains("model mapping"));
+        assert!(reason.contains("gpt-5.4"));
+        assert!(reason.contains("gpt-5.4-fast"));
     }
 
     #[test]
@@ -559,174 +479,5 @@ mod tests {
                 |msg| msg.contains("station=vibe") && msg.contains("path=/v1/responses")
             )
         );
-    }
-
-    #[test]
-    fn local_profile_preview_catalogs_from_text_extracts_v2_station_provider_structure() {
-        let text = r#"
-version = 2
-
-[codex]
-active_station = "primary"
-
-[codex.providers.right]
-alias = "Right"
-[codex.providers.right.auth]
-auth_token_env = "RIGHT_API_KEY"
-[codex.providers.right.endpoints.main]
-base_url = "https://right.example.com/v1"
-
-[codex.stations.primary]
-alias = "Primary"
-level = 3
-
-[[codex.stations.primary.members]]
-provider = "right"
-preferred = true
-"#;
-
-        let (stations, providers) =
-            local_profile_preview_catalogs_from_text(text, "codex").expect("catalog");
-
-        let station = stations.get("primary").expect("primary station");
-        assert_eq!(station.alias.as_deref(), Some("Primary"));
-        assert_eq!(station.level, 3);
-        assert_eq!(station.members.len(), 1);
-        assert_eq!(station.members[0].provider, "right");
-
-        let provider = providers.get("right").expect("right provider");
-        assert_eq!(provider.alias.as_deref(), Some("Right"));
-        assert_eq!(provider.endpoints.len(), 1);
-        assert_eq!(provider.endpoints[0].name, "main");
-    }
-
-    #[test]
-    fn build_profile_route_preview_resolves_station_source_in_order() {
-        let explicit = build_profile_route_preview(
-            &crate::config::ServiceControlProfile {
-                station: Some("beta".to_string()),
-                ..Default::default()
-            },
-            Some("alpha"),
-            Some("gamma"),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(
-            explicit.station_source,
-            ProfilePreviewStationSource::Profile
-        );
-        assert_eq!(explicit.resolved_station_name.as_deref(), Some("beta"));
-
-        let configured = build_profile_route_preview(
-            &crate::config::ServiceControlProfile::default(),
-            Some("alpha"),
-            Some("gamma"),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(
-            configured.station_source,
-            ProfilePreviewStationSource::ConfiguredActive
-        );
-        assert_eq!(configured.resolved_station_name.as_deref(), Some("alpha"));
-
-        let auto = build_profile_route_preview(
-            &crate::config::ServiceControlProfile::default(),
-            None,
-            Some("gamma"),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(auto.station_source, ProfilePreviewStationSource::Auto);
-        assert_eq!(auto.resolved_station_name.as_deref(), Some("gamma"));
-    }
-
-    #[test]
-    fn build_profile_route_preview_collects_member_routes_and_capability_checks() {
-        let station_specs = BTreeMap::from([(
-            "primary".to_string(),
-            PersistedStationSpec {
-                name: "primary".to_string(),
-                alias: Some("Primary".to_string()),
-                enabled: true,
-                level: 2,
-                members: vec![GroupMemberRefV2 {
-                    provider: "right".to_string(),
-                    endpoint_names: Vec::new(),
-                    preferred: true,
-                }],
-            },
-        )]);
-        let provider_catalog = BTreeMap::from([(
-            "right".to_string(),
-            PersistedStationProviderRef {
-                name: "right".to_string(),
-                alias: Some("Right".to_string()),
-                enabled: true,
-                endpoints: vec![
-                    crate::config::PersistedStationProviderEndpointRef {
-                        name: "hk".to_string(),
-                        base_url: "https://hk.example.com/v1".to_string(),
-                        enabled: true,
-                    },
-                    crate::config::PersistedStationProviderEndpointRef {
-                        name: "us".to_string(),
-                        base_url: "https://us.example.com/v1".to_string(),
-                        enabled: true,
-                    },
-                ],
-            },
-        )]);
-        let runtime_catalog = BTreeMap::from([(
-            "primary".to_string(),
-            StationOption {
-                name: "primary".to_string(),
-                alias: Some("Primary".to_string()),
-                enabled: true,
-                level: 2,
-                configured_enabled: true,
-                configured_level: 2,
-                runtime_enabled_override: None,
-                runtime_level_override: None,
-                runtime_state: RuntimeConfigState::Normal,
-                runtime_state_override: None,
-                capabilities: StationCapabilitySummary {
-                    model_catalog_kind: ModelCatalogKind::Declared,
-                    supported_models: vec!["gpt-5.4".to_string()],
-                    supports_service_tier: CapabilitySupport::Supported,
-                    supports_reasoning_effort: CapabilitySupport::Unsupported,
-                },
-            },
-        )]);
-        let preview = build_profile_route_preview(
-            &crate::config::ServiceControlProfile {
-                extends: None,
-                station: Some("primary".to_string()),
-                model: Some("gpt-5.4".to_string()),
-                reasoning_effort: Some("high".to_string()),
-                service_tier: Some("priority".to_string()),
-            },
-            None,
-            None,
-            Some(&station_specs),
-            Some(&provider_catalog),
-            Some(&runtime_catalog),
-        );
-
-        assert!(preview.station_exists);
-        assert_eq!(preview.station_alias.as_deref(), Some("Primary"));
-        assert_eq!(preview.members.len(), 1);
-        assert!(preview.members[0].uses_all_endpoints);
-        assert_eq!(
-            preview.members[0].endpoint_names,
-            vec!["hk".to_string(), "us".to_string()]
-        );
-        assert_eq!(preview.model_supported, Some(true));
-        assert_eq!(preview.service_tier_supported, Some(true));
-        assert_eq!(preview.reasoning_supported, Some(false));
     }
 }
