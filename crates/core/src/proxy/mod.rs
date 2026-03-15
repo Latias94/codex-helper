@@ -17,6 +17,7 @@ mod classify;
 mod client_identity;
 mod control_plane;
 mod control_plane_manifest;
+mod control_plane_routes;
 mod control_plane_service;
 mod entrypoint;
 mod headers;
