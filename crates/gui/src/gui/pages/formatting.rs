@@ -74,6 +74,24 @@ pub(super) fn shorten_middle(s: &str, max_chars: usize) -> String {
     out
 }
 
+pub(super) fn summarize_upstream_target(raw: &str, max_chars: usize) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "-".to_string();
+    }
+    let after_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let host = after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .trim();
+    if host.is_empty() {
+        shorten_middle(raw, max_chars)
+    } else {
+        host.to_string()
+    }
+}
+
 fn tokens_short(n: i64) -> String {
     let n = n.max(0) as f64;
     if n >= 1_000_000.0 {

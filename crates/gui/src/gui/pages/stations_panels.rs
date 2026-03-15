@@ -5,6 +5,8 @@ use super::stations_detail_controls::{
 use super::stations_detail_health::{
     render_station_breaker_section, render_station_health_section,
 };
+use super::stations_detail_provider_routes::render_station_provider_routes_section;
+use super::stations_detail_recent_hits::render_station_recent_hits_section;
 use super::stations_detail_summary::render_station_identity_summary;
 use super::stations_list_panel::render_station_list_panel;
 use super::*;
@@ -97,6 +99,10 @@ fn render_station_detail_panel(
 
     ui.add_space(8.0);
     ui.separator();
+    render_station_provider_routes_section(ui, ctx, &cfg, snapshot);
+
+    ui.add_space(8.0);
+    ui.separator();
     render_station_quick_switch_section(ui, ctx, &cfg, snapshot);
 
     ui.add_space(8.0);
@@ -121,4 +127,8 @@ fn render_station_detail_panel(
     ui.add_space(8.0);
     ui.separator();
     render_station_breaker_section(ui, ctx, &cfg, lb);
+
+    ui.add_space(8.0);
+    ui.separator();
+    render_station_recent_hits_section(ui, ctx, &cfg, snapshot);
 }

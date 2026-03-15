@@ -128,6 +128,19 @@ fn session_control_posture_describes_session_overrides_without_binding() {
 }
 
 #[test]
+fn session_effective_route_inline_summary_marks_priority_as_fast_mode() {
+    let mut row = sample_session_row();
+    row.effective_service_tier = Some(ResolvedRouteValue {
+        value: "priority".to_string(),
+        source: RouteValueSource::ProfileDefault,
+    });
+
+    let summary = session_effective_route_inline_summary(&row, Language::En);
+
+    assert!(summary.contains("priority (fast mode)"));
+}
+
+#[test]
 fn session_manual_override_summary_marks_priority_as_fast_mode() {
     let mut row = sample_session_row();
     row.override_station = Some("right".to_string());
@@ -171,6 +184,71 @@ fn session_binding_profile_summary_resolves_inherited_profile() {
     assert!(summary.contains("model=gpt-5.4"));
     assert!(summary.contains("effort=medium"));
     assert!(summary.contains("tier=priority"));
+}
+
+#[test]
+fn session_current_target_summary_uses_decision_provider_when_aligned() {
+    let mut row = sample_session_row();
+    row.effective_station_value = Some(ResolvedRouteValue {
+        value: "right".to_string(),
+        source: RouteValueSource::GlobalOverride,
+    });
+    row.effective_upstream_base_url = Some(ResolvedRouteValue {
+        value: "https://api.right.example/v1".to_string(),
+        source: RouteValueSource::RuntimeFallback,
+    });
+    row.last_route_decision = Some(RouteDecisionProvenance {
+        provider_id: Some("right".to_string()),
+        effective_station: Some(ResolvedRouteValue {
+            value: "right".to_string(),
+            source: RouteValueSource::RuntimeFallback,
+        }),
+        effective_upstream_base_url: Some(ResolvedRouteValue {
+            value: "https://api.right.example/v1".to_string(),
+            source: RouteValueSource::RuntimeFallback,
+        }),
+        ..Default::default()
+    });
+
+    let summary = session_current_target_summary(&row, Language::En);
+
+    assert!(summary.contains("station=right [global override]"));
+    assert!(summary.contains("provider=right [last decision]"));
+    assert!(summary.contains("upstream=api.right.example [runtime fallback]"));
+}
+
+#[test]
+fn session_current_target_summary_marks_provider_as_needing_refresh_after_drift() {
+    let mut row = sample_session_row();
+    row.last_provider_id = Some("right".to_string());
+    row.last_station = Some("right".to_string());
+    row.last_upstream_base_url = Some("https://api.right.example/v1".to_string());
+    row.effective_station_value = Some(ResolvedRouteValue {
+        value: "vibe".to_string(),
+        source: RouteValueSource::GlobalOverride,
+    });
+    row.effective_upstream_base_url = Some(ResolvedRouteValue {
+        value: "https://api.vibe.example/v1".to_string(),
+        source: RouteValueSource::RuntimeFallback,
+    });
+    row.last_route_decision = Some(RouteDecisionProvenance {
+        provider_id: Some("right".to_string()),
+        effective_station: Some(ResolvedRouteValue {
+            value: "right".to_string(),
+            source: RouteValueSource::RuntimeFallback,
+        }),
+        effective_upstream_base_url: Some(ResolvedRouteValue {
+            value: "https://api.right.example/v1".to_string(),
+            source: RouteValueSource::RuntimeFallback,
+        }),
+        ..Default::default()
+    });
+
+    let summary = session_current_target_summary(&row, Language::En);
+
+    assert!(summary.contains("station=vibe [global override]"));
+    assert!(summary.contains("provider=<needs fresh request>"));
+    assert!(summary.contains("upstream=api.vibe.example [runtime fallback]"));
 }
 
 #[test]

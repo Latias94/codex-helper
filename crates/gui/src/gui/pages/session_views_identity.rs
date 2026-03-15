@@ -1,6 +1,7 @@
 use super::components::console_layout::{ConsoleTone, console_section};
 use super::session_views_summary::{
-    session_effective_route_inline_summary, session_last_activity_summary,
+    session_current_target_summary, session_effective_route_inline_summary,
+    session_last_activity_summary, session_last_executed_target_summary,
 };
 use super::*;
 
@@ -26,11 +27,12 @@ pub(super) fn render_session_identity_card(
     let transcript_access =
         session_transcript_access_message(lang, row, host_local_session_features);
     let cwd_full = row.cwd.as_deref().unwrap_or("-");
-    let provider = row.last_provider_id.as_deref().unwrap_or("-");
     let binding_mode = session_binding_mode_label(row.binding_continuity_mode, lang);
     let binding_profile_summary = session_binding_profile_summary(row, profiles, lang);
     let manual_override_summary = session_manual_override_summary(row, lang);
     let route_decision_status = session_route_decision_status_line(row, lang);
+    let current_target_summary = session_current_target_summary(row, lang);
+    let last_executed_target_summary = session_last_executed_target_summary(row, lang);
 
     console_section(
         ui,
@@ -52,7 +54,6 @@ pub(super) fn render_session_identity_card(
             ui.small(transcript_access);
             ui.small(format!("client(last): {client_full}"));
             ui.small(format!("cwd: {cwd_full}"));
-            ui.small(format!("provider(last): {provider}"));
             if let Some(profile_name) = row.binding_profile_name.as_deref() {
                 ui.small(format!(
                     "{}: {profile_name}",
@@ -78,6 +79,14 @@ pub(super) fn render_session_identity_card(
             ));
             ui.colored_label(session_control_tone_color(posture.tone), posture.headline);
             ui.small(posture.detail);
+            ui.small(format!(
+                "{}: {current_target_summary}",
+                pick(lang, "当前目标", "Current target")
+            ));
+            ui.small(format!(
+                "{}: {last_executed_target_summary}",
+                pick(lang, "最近执行目标", "Last executed target")
+            ));
             ui.small(format!(
                 "{}: {}",
                 pick(lang, "当前 effective route", "Current effective route"),

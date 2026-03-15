@@ -1,5 +1,9 @@
 use super::*;
 
+fn resolved_route_value_text(value: Option<&ResolvedRouteValue>) -> Option<&str> {
+    value.map(|value| value.value.as_str())
+}
+
 pub(super) fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
     if q.is_empty() {
         return true;
@@ -42,6 +46,16 @@ pub(super) fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
 }
 
 pub(super) fn session_effective_route_inline_summary(row: &SessionRow, lang: Language) -> String {
+    let service_tier = row
+        .effective_service_tier
+        .as_ref()
+        .map(|value| format_service_tier_display(Some(value.value.as_str()), lang, "-"))
+        .or_else(|| {
+            row.last_service_tier
+                .as_deref()
+                .map(|value| format_service_tier_display(Some(value), lang, "-"))
+        })
+        .unwrap_or_else(|| pick(lang, "<未解析>", "<unresolved>").to_string());
     format!(
         "station={}, model={}, reasoning={}, service_tier={}",
         session_route_preview_value(row.effective_station(), row.last_station_name(), lang),
@@ -55,11 +69,78 @@ pub(super) fn session_effective_route_inline_summary(row: &SessionRow, lang: Lan
             row.last_reasoning_effort.as_deref(),
             lang,
         ),
-        session_route_preview_value(
-            row.effective_service_tier.as_ref(),
-            row.last_service_tier.as_deref(),
-            lang,
-        )
+        service_tier,
+    )
+}
+
+pub(super) fn session_current_target_summary(row: &SessionRow, lang: Language) -> String {
+    let station = format_resolved_route_value_for_field(
+        row.effective_station(),
+        EffectiveRouteField::Station,
+        lang,
+    );
+    let upstream = row
+        .effective_upstream_base_url
+        .as_ref()
+        .map(|value| {
+            format!(
+                "{} [{}]",
+                summarize_upstream_target(&value.value, 56),
+                route_value_source_label(value.source, lang)
+            )
+        })
+        .unwrap_or_else(|| "-".to_string());
+
+    let current_station = resolved_route_value_text(row.effective_station());
+    let current_upstream = resolved_route_value_text(row.effective_upstream_base_url.as_ref());
+    let provider = if let Some(decision) = row.last_route_decision.as_ref() {
+        let decision_station = decision
+            .effective_station
+            .as_ref()
+            .map(|value| value.value.as_str());
+        let decision_upstream = decision
+            .effective_upstream_base_url
+            .as_ref()
+            .map(|value| value.value.as_str());
+        if current_station == decision_station && current_upstream == decision_upstream {
+            decision
+                .provider_id
+                .as_deref()
+                .map(|provider| format!("{provider} [{}]", pick(lang, "最近决策", "last decision")))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .or_else(|| {
+        let observed_station = row.last_station_name();
+        let observed_upstream = row.last_upstream_base_url.as_deref();
+        if current_station == observed_station && current_upstream == observed_upstream {
+            row.last_provider_id.as_deref().map(|provider| {
+                format!("{provider} [{}]", pick(lang, "最近执行", "last execution"))
+            })
+        } else {
+            None
+        }
+    })
+    .unwrap_or_else(|| pick(lang, "<需新请求刷新>", "<needs fresh request>").to_string());
+
+    format!("station={station}, provider={provider}, upstream={upstream}")
+}
+
+pub(super) fn session_last_executed_target_summary(row: &SessionRow, lang: Language) -> String {
+    let upstream = row
+        .last_upstream_base_url
+        .as_deref()
+        .map(|value| summarize_upstream_target(value, 56))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "station={}, provider={}, upstream={}, service_tier={}",
+        row.last_station_name().unwrap_or("-"),
+        row.last_provider_id.as_deref().unwrap_or("-"),
+        upstream,
+        format_service_tier_display(row.last_service_tier.as_deref(), lang, "-"),
     )
 }
 
