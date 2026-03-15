@@ -1,3 +1,5 @@
+use crate::dashboard_core::ControlPlaneSurfaceCapabilities;
+
 pub(super) const API_V1_CAPABILITIES: &str = "/__codex_helper/api/v1/capabilities";
 pub(super) const API_V1_SNAPSHOT: &str = "/__codex_helper/api/v1/snapshot";
 pub(super) const API_V1_SESSIONS: &str = "/__codex_helper/api/v1/sessions";
@@ -95,6 +97,43 @@ pub(super) fn api_v1_endpoint_paths() -> Vec<String> {
         .copied()
         .map(str::to_string)
         .collect()
+}
+
+pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
+    ControlPlaneSurfaceCapabilities {
+        snapshot: true,
+        status_active: true,
+        status_recent: true,
+        status_session_stats: true,
+        status_health_checks: true,
+        status_station_health: true,
+        runtime_status: true,
+        runtime_reload: true,
+        control_trace: true,
+        retry_config: true,
+        stations: true,
+        station_runtime: true,
+        station_persisted_config: true,
+        station_specs: true,
+        station_probe: true,
+        providers: true,
+        provider_runtime: true,
+        provider_specs: true,
+        profiles: true,
+        default_profile_override: true,
+        persisted_default_profile: true,
+        profile_mutation: true,
+        session_overrides: true,
+        session_profile_override: true,
+        session_model_override: true,
+        session_reasoning_effort_override: true,
+        session_station_override: true,
+        session_service_tier_override: true,
+        session_override_reset: true,
+        global_station_override: true,
+        healthcheck_start: true,
+        healthcheck_cancel: true,
+    }
 }
 
 #[cfg(test)]

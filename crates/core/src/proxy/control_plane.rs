@@ -13,7 +13,7 @@ use crate::state::{ActiveRequest, FinishedRequest};
 
 use super::ProxyService;
 use super::admin::admin_access_capabilities;
-use super::control_plane_manifest::api_v1_endpoint_paths;
+use super::control_plane_manifest::{api_v1_endpoint_paths, api_v1_surface_capabilities};
 use super::profile_defaults::{
     configured_active_station_name, effective_active_station_name, effective_default_profile_name,
 };
@@ -248,6 +248,7 @@ pub(super) async fn api_capabilities(
         api_version: 1,
         service_name: proxy.service_name.to_string(),
         endpoints: api_v1_endpoint_paths(),
+        surface_capabilities: api_v1_surface_capabilities(),
         shared_capabilities: SharedControlPlaneCapabilities {
             session_observability: true,
             request_history: true,

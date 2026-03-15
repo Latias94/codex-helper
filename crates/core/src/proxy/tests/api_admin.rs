@@ -164,6 +164,30 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/control-trace"))
     }));
+    assert_eq!(
+        caps["surface_capabilities"]["snapshot"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["providers"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["provider_runtime"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["station_specs"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["session_override_reset"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["control_trace"].as_bool(),
+        Some(true)
+    );
     let host_local_history = crate::config::codex_sessions_dir().is_dir();
     assert_eq!(
         caps["shared_capabilities"]["session_observability"].as_bool(),

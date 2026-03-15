@@ -9,8 +9,9 @@ pub use config_options::{
 };
 pub use snapshot::{ApiV1Snapshot, build_dashboard_snapshot};
 pub use types::{
-    ApiV1Capabilities, CapabilitySupport, ControlProfileOption, HostLocalControlPlaneCapabilities,
-    ModelCatalogKind, ProviderEndpointOption, ProviderOption, RemoteAdminAccessCapabilities,
-    SharedControlPlaneCapabilities, StationCapabilitySummary, StationOption,
+    ApiV1Capabilities, CapabilitySupport, ControlPlaneSurfaceCapabilities, ControlProfileOption,
+    HostLocalControlPlaneCapabilities, ModelCatalogKind, ProviderEndpointOption, ProviderOption,
+    RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationCapabilitySummary,
+    StationOption,
 };
 pub use window_stats::WindowStats;

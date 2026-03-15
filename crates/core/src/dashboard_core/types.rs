@@ -35,6 +35,74 @@ pub struct RemoteAdminAccessCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ControlPlaneSurfaceCapabilities {
+    #[serde(default)]
+    pub snapshot: bool,
+    #[serde(default)]
+    pub status_active: bool,
+    #[serde(default)]
+    pub status_recent: bool,
+    #[serde(default)]
+    pub status_session_stats: bool,
+    #[serde(default)]
+    pub status_health_checks: bool,
+    #[serde(default)]
+    pub status_station_health: bool,
+    #[serde(default)]
+    pub runtime_status: bool,
+    #[serde(default)]
+    pub runtime_reload: bool,
+    #[serde(default)]
+    pub control_trace: bool,
+    #[serde(default)]
+    pub retry_config: bool,
+    #[serde(default)]
+    pub stations: bool,
+    #[serde(default)]
+    pub station_runtime: bool,
+    #[serde(default)]
+    pub station_persisted_config: bool,
+    #[serde(default)]
+    pub station_specs: bool,
+    #[serde(default)]
+    pub station_probe: bool,
+    #[serde(default)]
+    pub providers: bool,
+    #[serde(default)]
+    pub provider_runtime: bool,
+    #[serde(default)]
+    pub provider_specs: bool,
+    #[serde(default)]
+    pub profiles: bool,
+    #[serde(default)]
+    pub default_profile_override: bool,
+    #[serde(default)]
+    pub persisted_default_profile: bool,
+    #[serde(default)]
+    pub profile_mutation: bool,
+    #[serde(default)]
+    pub session_overrides: bool,
+    #[serde(default)]
+    pub session_profile_override: bool,
+    #[serde(default)]
+    pub session_model_override: bool,
+    #[serde(default)]
+    pub session_reasoning_effort_override: bool,
+    #[serde(default)]
+    pub session_station_override: bool,
+    #[serde(default)]
+    pub session_service_tier_override: bool,
+    #[serde(default)]
+    pub session_override_reset: bool,
+    #[serde(default)]
+    pub global_station_override: bool,
+    #[serde(default)]
+    pub healthcheck_start: bool,
+    #[serde(default)]
+    pub healthcheck_cancel: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ApiV1Capabilities {
     #[serde(default)]
     pub api_version: u32,
@@ -42,6 +110,8 @@ pub struct ApiV1Capabilities {
     pub service_name: String,
     #[serde(default)]
     pub endpoints: Vec<String>,
+    #[serde(default)]
+    pub surface_capabilities: ControlPlaneSurfaceCapabilities,
     #[serde(default)]
     pub shared_capabilities: SharedControlPlaneCapabilities,
     #[serde(default)]

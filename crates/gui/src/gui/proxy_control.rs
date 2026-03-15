@@ -17,9 +17,10 @@ use crate::config::{
     model_routing_warnings,
 };
 use crate::dashboard_core::{
-    ApiV1Capabilities, ApiV1Snapshot, ControlProfileOption, HostLocalControlPlaneCapabilities,
-    RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationOption, WindowStats,
-    build_dashboard_snapshot, build_profile_options_from_mgr, build_station_options_from_mgr,
+    ApiV1Capabilities, ApiV1Snapshot, ControlPlaneSurfaceCapabilities, ControlProfileOption,
+    HostLocalControlPlaneCapabilities, RemoteAdminAccessCapabilities,
+    SharedControlPlaneCapabilities, StationOption, WindowStats, build_dashboard_snapshot,
+    build_profile_options_from_mgr, build_station_options_from_mgr,
 };
 use crate::logging::{ControlTraceLogEntry, control_trace_path, read_recent_control_trace_entries};
 use crate::proxy::{
@@ -274,6 +275,7 @@ pub struct DiscoveredProxy {
     pub api_version: Option<u32>,
     pub service_name: Option<String>,
     pub endpoints: Vec<String>,
+    pub surface_capabilities: ControlPlaneSurfaceCapabilities,
     pub runtime_loaded_at_ms: Option<u64>,
     pub last_error: Option<String>,
     pub shared_capabilities: SharedControlPlaneCapabilities,
@@ -355,6 +357,135 @@ fn local_remote_admin_access_capabilities() -> RemoteAdminAccessCapabilities {
             .is_some_and(|value| !value.trim().is_empty()),
         token_header: crate::proxy::ADMIN_TOKEN_HEADER.to_string(),
         token_env_var: crate::proxy::ADMIN_TOKEN_ENV_VAR.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResolvedApiV1Surface {
+    snapshot: bool,
+    profiles: bool,
+    retry_config: bool,
+    provider_specs: bool,
+    station_specs: bool,
+    persisted_station_config: bool,
+    default_profile_override: bool,
+    session_override_reset: bool,
+    control_trace: bool,
+    station_api: bool,
+    station_runtime: bool,
+    session_override_aggregate: bool,
+    session_station: bool,
+    session_reasoning_effort: bool,
+    session_model: bool,
+    session_service_tier: bool,
+}
+
+fn supports_capability_flag(flag: bool, endpoints: &[String], endpoint: &str) -> bool {
+    flag || endpoints.iter().any(|candidate| candidate == endpoint)
+}
+
+fn supports_any_capability_flag(
+    flag: bool,
+    endpoints: &[String],
+    endpoint_candidates: &[&str],
+) -> bool {
+    flag || endpoint_candidates
+        .iter()
+        .any(|endpoint| supports_capability_flag(false, endpoints, endpoint))
+}
+
+fn resolve_api_v1_surface(
+    surface: &ControlPlaneSurfaceCapabilities,
+    endpoints: &[String],
+) -> ResolvedApiV1Surface {
+    ResolvedApiV1Surface {
+        snapshot: supports_capability_flag(
+            surface.snapshot,
+            endpoints,
+            "/__codex_helper/api/v1/snapshot",
+        ),
+        profiles: supports_capability_flag(
+            surface.profiles,
+            endpoints,
+            "/__codex_helper/api/v1/profiles",
+        ),
+        retry_config: supports_capability_flag(
+            surface.retry_config,
+            endpoints,
+            "/__codex_helper/api/v1/retry/config",
+        ),
+        provider_specs: supports_capability_flag(
+            surface.provider_specs,
+            endpoints,
+            "/__codex_helper/api/v1/providers/specs",
+        ),
+        station_specs: supports_capability_flag(
+            surface.station_specs,
+            endpoints,
+            "/__codex_helper/api/v1/stations/specs",
+        ),
+        persisted_station_config: supports_any_capability_flag(
+            surface.station_persisted_config,
+            endpoints,
+            &[
+                "/__codex_helper/api/v1/stations/config-active",
+                "/__codex_helper/api/v1/stations/{name}",
+            ],
+        ),
+        default_profile_override: supports_capability_flag(
+            surface.default_profile_override,
+            endpoints,
+            "/__codex_helper/api/v1/profiles/default",
+        ),
+        session_override_reset: supports_capability_flag(
+            surface.session_override_reset,
+            endpoints,
+            "/__codex_helper/api/v1/overrides/session/reset",
+        ),
+        control_trace: supports_capability_flag(
+            surface.control_trace,
+            endpoints,
+            "/__codex_helper/api/v1/control-trace",
+        ),
+        station_api: supports_any_capability_flag(
+            surface.stations || surface.station_runtime || surface.station_probe,
+            endpoints,
+            &[
+                "/__codex_helper/api/v1/stations",
+                "/__codex_helper/api/v1/stations/runtime",
+                "/__codex_helper/api/v1/stations/probe",
+            ],
+        ),
+        station_runtime: supports_capability_flag(
+            surface.station_runtime,
+            endpoints,
+            "/__codex_helper/api/v1/stations/runtime",
+        ),
+        session_override_aggregate: supports_capability_flag(
+            surface.session_overrides,
+            endpoints,
+            "/__codex_helper/api/v1/overrides/session",
+        ),
+        session_station: supports_capability_flag(
+            surface.session_station_override,
+            endpoints,
+            "/__codex_helper/api/v1/overrides/session/station",
+        ),
+        session_reasoning_effort: supports_capability_flag(
+            surface.session_reasoning_effort_override,
+            endpoints,
+            "/__codex_helper/api/v1/overrides/session/effort",
+        ),
+        session_model: supports_capability_flag(
+            surface.session_model_override,
+            endpoints,
+            "/__codex_helper/api/v1/overrides/session/model",
+        ),
+        session_service_tier: supports_capability_flag(
+            surface.session_service_tier_override,
+            endpoints,
+            "/__codex_helper/api/v1/overrides/session/service-tier",
+        ),
     }
 }
 
@@ -659,12 +790,11 @@ impl ProxyController {
             if let Some(discovered) = self.discovered.iter().find(|candidate| {
                 candidate.port == port && candidate.admin_base_url == admin_base_url
             }) {
+                let resolved_surface =
+                    resolve_api_v1_surface(&discovered.surface_capabilities, &discovered.endpoints);
                 attached.api_version = discovered.api_version;
                 attached.service_name = discovered.service_name.clone();
-                attached.supports_control_trace_api = discovered
-                    .endpoints
-                    .iter()
-                    .any(|endpoint| endpoint == "/__codex_helper/api/v1/control-trace");
+                attached.supports_control_trace_api = resolved_surface.control_trace;
                 attached.shared_capabilities = discovered.shared_capabilities.clone();
                 attached.host_local_capabilities = discovered.host_local_capabilities.clone();
                 attached.remote_admin_access = discovered.remote_admin_access.clone();
@@ -738,6 +868,7 @@ impl ProxyController {
                     api_version: Some(c.api_version),
                     service_name: Some(c.service_name),
                     endpoints: c.endpoints,
+                    surface_capabilities: c.surface_capabilities,
                     runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
                     last_error: None,
                     shared_capabilities: c.shared_capabilities,
@@ -763,6 +894,7 @@ impl ProxyController {
                     api_version: Some(c.api_version),
                     service_name: Some(c.service_name),
                     endpoints: c.endpoints,
+                    surface_capabilities: c.surface_capabilities,
                     runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
                     last_error: None,
                     shared_capabilities: c.shared_capabilities,
@@ -803,6 +935,7 @@ impl ProxyController {
                         api_version: Some(c.api_version),
                         service_name: Some(c.service_name),
                         endpoints: c.endpoints,
+                        surface_capabilities: c.surface_capabilities,
                         runtime_loaded_at_ms: runtime.as_ref().map(|r| r.loaded_at_ms),
                         last_error: None,
                         shared_capabilities: c.shared_capabilities,
@@ -997,55 +1130,28 @@ impl ProxyController {
                     api_version,
                     service_name,
                     endpoints,
+                    surface_capabilities,
                     shared_capabilities,
                     host_local_capabilities,
                     remote_admin_access,
                 } = caps;
-                let supports_snapshot = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/snapshot");
-                let supports_profiles = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/profiles");
-                let supports_retry_config_api = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/retry/config");
-                let supports_provider_spec_api = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/providers/specs");
-                let supports_station_spec_api = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/stations/specs");
-                let supports_default_profile_override = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/profiles/default");
-                let supports_session_override_reset = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/reset");
-                let supports_control_trace_api = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/control-trace");
-                let supports_session_override_aggregate = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/overrides/session");
-                let supports_session_station = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/station");
-                let supports_session_effort = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/effort");
-                let supports_persisted_station_config = endpoints.iter().any(|e| {
-                    e == "/__codex_helper/api/v1/stations/config-active"
-                        || e == "/__codex_helper/api/v1/stations/{name}"
-                });
-                let supports_station_api = endpoints.iter().any(|e| {
-                    e == "/__codex_helper/api/v1/stations"
-                        || e == "/__codex_helper/api/v1/stations/runtime"
-                        || e == "/__codex_helper/api/v1/stations/probe"
-                });
-                let supports_station_runtime_override = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/stations/runtime");
+                let resolved_surface =
+                    resolve_api_v1_surface(&surface_capabilities, endpoints.as_slice());
+                let supports_snapshot = resolved_surface.snapshot;
+                let supports_profiles = resolved_surface.profiles;
+                let supports_retry_config_api = resolved_surface.retry_config;
+                let supports_provider_spec_api = resolved_surface.provider_specs;
+                let supports_station_spec_api = resolved_surface.station_specs;
+                let supports_default_profile_override = resolved_surface.default_profile_override;
+                let supports_session_override_reset = resolved_surface.session_override_reset;
+                let supports_control_trace_api = resolved_surface.control_trace;
+                let supports_session_override_aggregate =
+                    resolved_surface.session_override_aggregate;
+                let supports_session_station = resolved_surface.session_station;
+                let supports_session_effort = resolved_surface.session_reasoning_effort;
+                let supports_persisted_station_config = resolved_surface.persisted_station_config;
+                let supports_station_api = resolved_surface.station_api;
+                let supports_station_runtime_override = resolved_surface.station_runtime;
 
                 let configured_profiles = if supports_profiles {
                     #[derive(serde::Deserialize)]
@@ -1267,12 +1373,8 @@ impl ProxyController {
                     ),
                 )?;
 
-                let supports_session_model = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/model");
-                let supports_session_service_tier = endpoints
-                    .iter()
-                    .any(|e| e == "/__codex_helper/api/v1/overrides/session/service-tier");
+                let supports_session_model = resolved_surface.session_model;
+                let supports_session_service_tier = resolved_surface.session_service_tier;
                 let (session_station, session_effort, session_model, session_service_tier) =
                     if supports_session_override_aggregate {
                         let aggregate = get_json::<AttachedSessionManualOverridesListResponse>(
@@ -3519,6 +3621,158 @@ mod tests {
         assert!(attached.supports_station_runtime_override);
         assert!(!attached.remote_admin_access.remote_enabled);
         assert!(!attached.remote_admin_access.remote_requires_token);
+
+        handle.abort();
+    }
+
+    #[test]
+    fn refresh_attached_prefers_typed_surface_capabilities_over_endpoint_strings() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let caps = serde_json::json!({
+            "api_version": 1,
+            "service_name": "codex",
+            "surface_capabilities": {
+                "status_active": true,
+                "status_recent": true,
+                "status_session_stats": true,
+                "status_health_checks": true,
+                "status_station_health": true,
+                "runtime_status": true,
+                "stations": true,
+                "station_runtime": true,
+                "global_station_override": true,
+                "session_station_override": true,
+                "session_reasoning_effort_override": true,
+                "session_model_override": true
+            },
+            "shared_capabilities": {
+                "session_observability": true,
+                "request_history": false
+            },
+            "host_local_capabilities": {
+                "session_history": false,
+                "transcript_read": false,
+                "cwd_enrichment": false
+            },
+            "endpoints": []
+        });
+        let stations = vec![sample_station("typed-surface")];
+        let app = Router::new()
+            .route(
+                "/__codex_helper/api/v1/capabilities",
+                get({
+                    let caps = caps.clone();
+                    move || {
+                        let caps = caps.clone();
+                        async move { Json(caps) }
+                    }
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/active",
+                get(|| async { Json(Vec::<ActiveRequest>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/recent",
+                get(|| async { Json(Vec::<FinishedRequest>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/session-stats",
+                get(|| async { Json(HashMap::<String, SessionStats>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/health-checks",
+                get(|| async { Json(HashMap::<String, HealthCheckStatus>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/status/station-health",
+                get(|| async { Json(HashMap::<String, StationHealth>::new()) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/runtime/status",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "loaded_at_ms": 41,
+                        "source_mtime_ms": 42,
+                    }))
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/stations",
+                get({
+                    let stations = stations.clone();
+                    move || {
+                        let stations = stations.clone();
+                        async move { Json(stations) }
+                    }
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/global-station",
+                get(|| async { Json(Some("typed-surface".to_string())) }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/session/station",
+                get(|| async {
+                    Json(HashMap::from([(
+                        "sid-typed".to_string(),
+                        "typed-surface".to_string(),
+                    )]))
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/session/effort",
+                get(|| async {
+                    Json(HashMap::from([(
+                        "sid-typed".to_string(),
+                        "high".to_string(),
+                    )]))
+                }),
+            )
+            .route(
+                "/__codex_helper/api/v1/overrides/session/model",
+                get(|| async {
+                    Json(HashMap::from([(
+                        "sid-typed".to_string(),
+                        "gpt-5.4-fast".to_string(),
+                    )]))
+                }),
+            );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4202, ServiceKind::Codex);
+        controller.request_attach_with_admin_base(4202, Some(base_url));
+        controller.refresh_attached_if_due(&rt, Duration::ZERO);
+
+        let snapshot = controller.snapshot().expect("typed surface snapshot");
+        assert!(snapshot.supports_v1);
+        assert_eq!(snapshot.stations.len(), 1);
+        assert_eq!(snapshot.stations[0].name, "typed-surface");
+        assert_eq!(
+            snapshot
+                .session_station_overrides
+                .get("sid-typed")
+                .map(String::as_str),
+            Some("typed-surface")
+        );
+        assert_eq!(
+            snapshot
+                .session_effort_overrides
+                .get("sid-typed")
+                .map(String::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            snapshot
+                .session_model_overrides
+                .get("sid-typed")
+                .map(String::as_str),
+            Some("gpt-5.4-fast")
+        );
+        let attached = controller.attached().expect("typed attached status");
+        assert!(attached.supports_station_api);
+        assert!(attached.supports_station_runtime_override);
+        assert!(!attached.supports_default_profile_override);
 
         handle.abort();
     }
