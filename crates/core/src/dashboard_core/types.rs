@@ -120,3 +120,39 @@ pub struct ControlProfileOption {
     #[serde(default)]
     pub is_default: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderEndpointOption {
+    pub provider_name: String,
+    pub name: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub configured_enabled: bool,
+    #[serde(default)]
+    pub effective_enabled: bool,
+    #[serde(default)]
+    pub routable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_enabled_override: Option<bool>,
+    #[serde(default)]
+    pub runtime_state: RuntimeConfigState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_state_override: Option<RuntimeConfigState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderOption {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default)]
+    pub configured_enabled: bool,
+    #[serde(default)]
+    pub effective_enabled: bool,
+    #[serde(default)]
+    pub routable_endpoints: usize,
+    #[serde(default)]
+    pub endpoints: Vec<ProviderEndpointOption>,
+}

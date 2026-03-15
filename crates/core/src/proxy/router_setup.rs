@@ -25,6 +25,7 @@ use super::persisted_config_api::{
     set_persisted_default_profile, update_persisted_station, upsert_persisted_profile,
     upsert_persisted_provider_spec, upsert_persisted_station_spec,
 };
+use super::providers_api::{apply_provider_runtime_meta, list_providers};
 use super::runtime_admin_api::{
     get_control_trace, get_retry_config, list_profiles, reload_runtime_config,
     runtime_config_status, set_retry_config,
@@ -88,6 +89,8 @@ pub fn router(proxy: ProxyService) -> Router {
     let p51 = proxy.clone();
     let p52 = proxy.clone();
     let p53 = proxy.clone();
+    let p54 = proxy.clone();
+    let p55 = proxy.clone();
     let p56 = proxy.clone();
 
     let admin_routes = Router::new()
@@ -177,6 +180,14 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/providers/specs",
             get(move || list_persisted_provider_specs(p47.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/providers",
+            get(move || list_providers(p54.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/providers/runtime",
+            post(move |payload| apply_provider_runtime_meta(p55.clone(), payload)),
         )
         .route(
             "/__codex_helper/api/v1/providers/specs/{name}",

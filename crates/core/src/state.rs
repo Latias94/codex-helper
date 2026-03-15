@@ -647,6 +647,7 @@ pub struct ProxyState {
     global_station_override: RwLock<Option<String>>,
     runtime_default_profiles: RwLock<HashMap<String, RuntimeDefaultProfileOverride>>,
     station_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
+    upstream_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
     session_stats: RwLock<HashMap<String, SessionStats>>,
     active_requests: RwLock<HashMap<u64, ActiveRequest>>,
@@ -722,6 +723,7 @@ impl ProxyState {
             global_station_override: RwLock::new(None),
             runtime_default_profiles: RwLock::new(HashMap::new()),
             station_meta_overrides: RwLock::new(HashMap::new()),
+            upstream_meta_overrides: RwLock::new(HashMap::new()),
             session_cwd_cache: RwLock::new(HashMap::new()),
             session_stats: RwLock::new(HashMap::new()),
             active_requests: RwLock::new(HashMap::new()),
@@ -1208,6 +1210,83 @@ impl ProxyState {
             .map(|m| {
                 m.iter()
                     .filter_map(|(k, v)| v.state.map(|state| (k.clone(), state)))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default()
+    }
+
+    pub async fn set_upstream_enabled_override(
+        &self,
+        service_name: &str,
+        base_url: String,
+        enabled: bool,
+        now_ms: u64,
+    ) {
+        let mut guard = self.upstream_meta_overrides.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let entry = per_service.entry(base_url).or_default();
+        entry.enabled = Some(enabled);
+        entry.updated_at_ms = now_ms;
+    }
+
+    pub async fn clear_upstream_enabled_override(&self, service_name: &str, base_url: &str) {
+        let mut guard = self.upstream_meta_overrides.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return;
+        };
+        let Some(entry) = per_service.get_mut(base_url) else {
+            return;
+        };
+        entry.enabled = None;
+        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
+            per_service.remove(base_url);
+        }
+        if per_service.is_empty() {
+            guard.remove(service_name);
+        }
+    }
+
+    pub async fn set_upstream_runtime_state_override(
+        &self,
+        service_name: &str,
+        base_url: String,
+        state: RuntimeConfigState,
+        now_ms: u64,
+    ) {
+        let mut guard = self.upstream_meta_overrides.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let entry = per_service.entry(base_url).or_default();
+        entry.state = Some(state);
+        entry.updated_at_ms = now_ms;
+    }
+
+    pub async fn clear_upstream_runtime_state_override(&self, service_name: &str, base_url: &str) {
+        let mut guard = self.upstream_meta_overrides.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return;
+        };
+        let Some(entry) = per_service.get_mut(base_url) else {
+            return;
+        };
+        entry.state = None;
+        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
+            per_service.remove(base_url);
+        }
+        if per_service.is_empty() {
+            guard.remove(service_name);
+        }
+    }
+
+    pub async fn get_upstream_meta_overrides(
+        &self,
+        service_name: &str,
+    ) -> HashMap<String, (Option<bool>, Option<RuntimeConfigState>)> {
+        let guard = self.upstream_meta_overrides.read().await;
+        guard
+            .get(service_name)
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), (v.enabled, v.state)))
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default()

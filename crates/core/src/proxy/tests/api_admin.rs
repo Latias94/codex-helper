@@ -122,6 +122,16 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/providers"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/providers/runtime"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/providers/specs"))
     }));
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
@@ -1578,6 +1588,259 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
     assert!(!persisted_text.contains("[codex.providers.beta]"));
 
     proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_provider_runtime_override_filters_real_routing() {
+    let _env_lock = env_lock();
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let upstream_default = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": "resp-default",
+                    "output": [],
+                })),
+            )
+        }),
+    );
+    let upstream_backup = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": "resp-backup",
+                    "output": [],
+                })),
+            )
+        }),
+    );
+    let (default_addr, default_handle) = spawn_axum_server(upstream_default);
+    let (backup_addr, backup_handle) = spawn_axum_server(upstream_backup);
+
+    let mut cfg = ProxyConfigV2 {
+        version: 2,
+        codex: ServiceViewV2::default(),
+        claude: ServiceViewV2::default(),
+        retry: RetryConfig::default(),
+        notify: Default::default(),
+        default_service: None,
+        ui: UiConfig::default(),
+    };
+    cfg.codex.active_group = Some("main".to_string());
+    cfg.codex.providers.insert(
+        "alpha".to_string(),
+        ProviderConfigV2 {
+            alias: Some("Alpha".to_string()),
+            enabled: true,
+            auth: UpstreamAuth::default(),
+            tags: [("provider_id".to_string(), "alpha".to_string())]
+                .into_iter()
+                .collect(),
+            supported_models: Default::default(),
+            model_mapping: Default::default(),
+            endpoints: [
+                (
+                    "default".to_string(),
+                    ProviderEndpointV2 {
+                        base_url: format!("http://{default_addr}/v1"),
+                        enabled: true,
+                        priority: 0,
+                        tags: Default::default(),
+                        supported_models: Default::default(),
+                        model_mapping: Default::default(),
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    ProviderEndpointV2 {
+                        base_url: format!("http://{backup_addr}/v1"),
+                        enabled: true,
+                        priority: 1,
+                        tags: Default::default(),
+                        supported_models: Default::default(),
+                        model_mapping: Default::default(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        },
+    );
+    cfg.codex.groups.insert(
+        "main".to_string(),
+        GroupConfigV2 {
+            alias: Some("Main".to_string()),
+            enabled: true,
+            level: 1,
+            members: vec![GroupMemberRefV2 {
+                provider: "alpha".to_string(),
+                endpoint_names: Vec::new(),
+                preferred: true,
+            }],
+        },
+    );
+
+    crate::config::save_config_v2(&cfg)
+        .await
+        .expect("write provider runtime v2 config");
+    let loaded = crate::config::load_config()
+        .await
+        .expect("load provider runtime config");
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(loaded),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let initial = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"input":"hello"}"#)
+        .send()
+        .await
+        .expect("initial routed request")
+        .error_for_status()
+        .expect("initial routed request status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("initial routed request json");
+    assert_eq!(
+        initial.get("id").and_then(|value| value.as_str()),
+        Some("resp-default")
+    );
+
+    let initial_provider_surface = client
+        .get(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/providers"
+        ))
+        .send()
+        .await
+        .expect("get providers send")
+        .error_for_status()
+        .expect("get providers status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get providers json");
+    assert_eq!(
+        initial_provider_surface
+            .as_array()
+            .map(|providers| providers.len()),
+        Some(1)
+    );
+    assert_eq!(
+        initial_provider_surface[0]["endpoints"]
+            .as_array()
+            .map(|endpoints| endpoints.len()),
+        Some(2)
+    );
+    let provider_name = initial_provider_surface[0]
+        .get("name")
+        .and_then(|value| value.as_str())
+        .expect("provider name")
+        .to_string();
+    let default_base_url = format!("http://{default_addr}/v1");
+    let default_endpoint_name = initial_provider_surface[0]["endpoints"]
+        .as_array()
+        .and_then(|endpoints| {
+            endpoints.iter().find_map(|endpoint| {
+                (endpoint.get("base_url").and_then(|value| value.as_str())
+                    == Some(default_base_url.as_str()))
+                .then(|| endpoint.get("name").and_then(|value| value.as_str()))
+                .flatten()
+            })
+        })
+        .expect("default endpoint name")
+        .to_string();
+
+    let update = client
+        .post(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/providers/runtime"
+        ))
+        .json(&serde_json::json!({
+            "provider_name": provider_name,
+            "endpoint_name": default_endpoint_name,
+            "enabled": false,
+            "runtime_state": "breaker_open"
+        }))
+        .send()
+        .await
+        .expect("apply provider runtime override send");
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let after_update = client
+        .get(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/providers"
+        ))
+        .send()
+        .await
+        .expect("get providers after update send")
+        .error_for_status()
+        .expect("get providers after update status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get providers after update json");
+    let default_endpoint = after_update[0]["endpoints"]
+        .as_array()
+        .and_then(|endpoints| {
+            endpoints.iter().find(|endpoint| {
+                endpoint.get("base_url").and_then(|value| value.as_str())
+                    == Some(default_base_url.as_str())
+            })
+        })
+        .expect("default endpoint");
+    assert_eq!(
+        default_endpoint
+            .get("runtime_enabled_override")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        default_endpoint
+            .get("runtime_state_override")
+            .and_then(|value| value.as_str()),
+        Some("breaker_open")
+    );
+    assert_eq!(
+        default_endpoint
+            .get("routable")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    let after = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"input":"hello again"}"#)
+        .send()
+        .await
+        .expect("routed request after runtime override")
+        .error_for_status()
+        .expect("routed request after runtime override status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("routed request after runtime override json");
+    assert_eq!(
+        after.get("id").and_then(|value| value.as_str()),
+        Some("resp-backup")
+    );
+
+    proxy_handle.abort();
+    default_handle.abort();
+    backup_handle.abort();
 }
 
 #[tokio::test]

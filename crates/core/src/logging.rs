@@ -234,7 +234,7 @@ pub struct HttpDebugLog {
     pub upstream_error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct ServiceTierLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
@@ -246,6 +246,58 @@ pub struct ServiceTierLog {
 
 fn service_tier_log_is_empty(value: &ServiceTierLog) -> bool {
     value.requested.is_none() && value.effective.is_none() && value.actual.is_none()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlTraceDetail {
+    RequestCompleted {
+        method: Option<String>,
+        path: Option<String>,
+        status_code: Option<u16>,
+        duration_ms: Option<u64>,
+        station_name: Option<String>,
+        provider_id: Option<String>,
+        upstream_base_url: Option<String>,
+        service_tier: ServiceTierLog,
+    },
+    RetryOptions {
+        upstream_max_attempts: Option<u32>,
+        provider_max_attempts: Option<u32>,
+        allow_cross_station_before_first_output: Option<bool>,
+    },
+    AttemptSelect {
+        station_name: Option<String>,
+        upstream_index: Option<u64>,
+        upstream_base_url: Option<String>,
+        provider_id: Option<String>,
+        model: Option<String>,
+    },
+    LoadBalancerSelection {
+        mode: Option<String>,
+        pinned_source: Option<String>,
+        pinned_name: Option<String>,
+        selected_station: Option<String>,
+        selected_stations: Vec<String>,
+        active_station: Option<String>,
+        note: Option<String>,
+    },
+    ProviderRuntimeOverride {
+        provider_name: Option<String>,
+        endpoint_name: Option<String>,
+        base_urls: Vec<String>,
+        enabled: Option<bool>,
+        clear_enabled: bool,
+        runtime_state: Option<String>,
+        clear_runtime_state: bool,
+    },
+    RetryEvent {
+        event_name: String,
+        station_name: Option<String>,
+        upstream_base_url: Option<String>,
+        mode: Option<String>,
+        note: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -346,8 +398,18 @@ pub struct ControlTraceLogEntry {
     pub request_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ControlTraceDetail>,
     #[serde(default)]
     pub payload: JsonValue,
+}
+
+impl ControlTraceLogEntry {
+    pub fn resolved_detail(&self) -> Option<ControlTraceDetail> {
+        self.detail.clone().or_else(|| {
+            infer_control_trace_detail(self.kind.as_str(), self.event.as_deref(), &self.payload)
+        })
+    }
 }
 
 fn log_path() -> PathBuf {
@@ -450,9 +512,16 @@ pub fn read_recent_control_trace_entries(
 
     let mut out = Vec::new();
     for line in ring {
-        let Ok(entry) = serde_json::from_str::<ControlTraceLogEntry>(&line) else {
+        let Ok(mut entry) = serde_json::from_str::<ControlTraceLogEntry>(&line) else {
             continue;
         };
+        if entry.detail.is_none() {
+            entry.detail = infer_control_trace_detail(
+                entry.kind.as_str(),
+                entry.event.as_deref(),
+                &entry.payload,
+            );
+        }
         out.push(entry);
     }
     out.sort_by_key(|entry| std::cmp::Reverse(entry.ts_ms));
@@ -467,6 +536,10 @@ fn json_u64_field(value: &JsonValue, key: &str) -> Option<u64> {
     })
 }
 
+fn json_u16_field(value: &JsonValue, key: &str) -> Option<u16> {
+    json_u64_field(value, key).and_then(|value| u16::try_from(value).ok())
+}
+
 fn json_string_field(value: &JsonValue, key: &str) -> Option<String> {
     value
         .get(key)
@@ -474,6 +547,123 @@ fn json_string_field(value: &JsonValue, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn json_bool_field(value: &JsonValue, key: &str) -> Option<bool> {
+    value.get(key).and_then(|value| value.as_bool())
+}
+
+fn json_nested_u64_field(value: &JsonValue, path: &[&str]) -> Option<u64> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    match current {
+        JsonValue::Number(number) => number.as_u64(),
+        JsonValue::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_string_vec_field(value: &JsonValue, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn json_service_tier_field(value: &JsonValue) -> ServiceTierLog {
+    value
+        .get("service_tier")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ServiceTierLog>(value).ok())
+        .unwrap_or_default()
+}
+
+fn infer_control_trace_detail(
+    kind: &str,
+    event: Option<&str>,
+    payload: &JsonValue,
+) -> Option<ControlTraceDetail> {
+    match kind {
+        "request_completed" => Some(ControlTraceDetail::RequestCompleted {
+            method: json_string_field(payload, "method"),
+            path: json_string_field(payload, "path"),
+            status_code: json_u16_field(payload, "status_code"),
+            duration_ms: json_u64_field(payload, "duration_ms"),
+            station_name: json_string_field(payload, "station_name"),
+            provider_id: json_string_field(payload, "provider_id"),
+            upstream_base_url: json_string_field(payload, "upstream_base_url"),
+            service_tier: json_service_tier_field(payload),
+        }),
+        "retry_trace" => infer_retry_control_trace_detail(event, payload),
+        _ => None,
+    }
+}
+
+fn infer_retry_control_trace_detail(
+    event: Option<&str>,
+    payload: &JsonValue,
+) -> Option<ControlTraceDetail> {
+    let event_name = event
+        .map(str::to_string)
+        .or_else(|| json_string_field(payload, "event"))
+        .unwrap_or_else(|| "retry_trace".to_string());
+
+    match event_name.as_str() {
+        "attempt_select" => Some(ControlTraceDetail::AttemptSelect {
+            station_name: json_string_field(payload, "station_name"),
+            upstream_index: json_u64_field(payload, "upstream_index"),
+            upstream_base_url: json_string_field(payload, "upstream_base_url"),
+            provider_id: json_string_field(payload, "provider_id"),
+            model: json_string_field(payload, "model"),
+        }),
+        "retry_options" => Some(ControlTraceDetail::RetryOptions {
+            upstream_max_attempts: json_nested_u64_field(payload, &["upstream", "max_attempts"])
+                .and_then(|value| u32::try_from(value).ok()),
+            provider_max_attempts: json_nested_u64_field(payload, &["provider", "max_attempts"])
+                .and_then(|value| u32::try_from(value).ok()),
+            allow_cross_station_before_first_output: json_bool_field(
+                payload,
+                "allow_cross_station_before_first_output",
+            ),
+        }),
+        "lbs_for_request" => Some(ControlTraceDetail::LoadBalancerSelection {
+            mode: json_string_field(payload, "mode"),
+            pinned_source: json_string_field(payload, "pinned_source"),
+            pinned_name: json_string_field(payload, "pinned_name"),
+            selected_station: json_string_field(payload, "selected_station"),
+            selected_stations: json_string_vec_field(payload, "selected_stations"),
+            active_station: json_string_field(payload, "active_station"),
+            note: json_string_field(payload, "note"),
+        }),
+        "provider_runtime_override" => Some(ControlTraceDetail::ProviderRuntimeOverride {
+            provider_name: json_string_field(payload, "provider_name"),
+            endpoint_name: json_string_field(payload, "endpoint_name"),
+            base_urls: json_string_vec_field(payload, "base_urls"),
+            enabled: json_bool_field(payload, "enabled"),
+            clear_enabled: json_bool_field(payload, "clear_enabled").unwrap_or(false),
+            runtime_state: json_string_field(payload, "runtime_state"),
+            clear_runtime_state: json_bool_field(payload, "clear_runtime_state").unwrap_or(false),
+        }),
+        _ => Some(ControlTraceDetail::RetryEvent {
+            event_name,
+            station_name: json_string_field(payload, "station_name")
+                .or_else(|| json_string_field(payload, "selected_station")),
+            upstream_base_url: json_string_field(payload, "upstream_base_url"),
+            mode: json_string_field(payload, "mode"),
+            note: json_string_field(payload, "note"),
+        }),
+    }
 }
 
 fn ensure_log_parent(path: &PathBuf) {
@@ -518,12 +708,14 @@ fn make_control_trace_entry(
     ts_ms: u64,
     payload: JsonValue,
 ) -> ControlTraceLogEntry {
+    let detail = infer_control_trace_detail(kind, event, &payload);
     ControlTraceLogEntry {
         ts_ms,
         kind: kind.to_string(),
         service: service.map(str::to_string),
         request_id,
         event: event.map(str::to_string),
+        detail,
         payload,
     }
 }
@@ -816,5 +1008,81 @@ mod tests {
         assert_eq!(value["request_id"].as_u64(), Some(7));
         assert_eq!(value["service"].as_str(), Some("codex"));
         assert_eq!(value["payload"]["event"].as_str(), Some("attempt_select"));
+        assert_eq!(value["detail"]["type"].as_str(), Some("attempt_select"));
+    }
+
+    #[test]
+    fn control_trace_entry_resolved_detail_infers_request_completed_from_legacy_payload() {
+        let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
+            "ts_ms": 1,
+            "kind": "request_completed",
+            "service": "codex",
+            "request_id": 11,
+            "event": "request_completed",
+            "payload": {
+                "method": "POST",
+                "path": "/v1/responses",
+                "status_code": 200,
+                "duration_ms": 321,
+                "station_name": "right",
+                "provider_id": "right",
+                "service_tier": {
+                    "effective": "priority"
+                }
+            }
+        }))
+        .expect("deserialize control trace");
+
+        assert_eq!(
+            entry.resolved_detail(),
+            Some(ControlTraceDetail::RequestCompleted {
+                method: Some("POST".to_string()),
+                path: Some("/v1/responses".to_string()),
+                status_code: Some(200),
+                duration_ms: Some(321),
+                station_name: Some("right".to_string()),
+                provider_id: Some("right".to_string()),
+                upstream_base_url: None,
+                service_tier: ServiceTierLog {
+                    requested: None,
+                    effective: Some("priority".to_string()),
+                    actual: None,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn control_trace_entry_resolved_detail_infers_provider_runtime_override() {
+        let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
+            "ts_ms": 1,
+            "kind": "retry_trace",
+            "service": "codex",
+            "event": "provider_runtime_override",
+            "payload": {
+                "event": "provider_runtime_override",
+                "provider_name": "alpha",
+                "endpoint_name": "default",
+                "base_urls": ["https://alpha.example/v1"],
+                "enabled": false,
+                "clear_enabled": false,
+                "runtime_state": "breaker_open",
+                "clear_runtime_state": false
+            }
+        }))
+        .expect("deserialize provider runtime trace");
+
+        assert_eq!(
+            entry.resolved_detail(),
+            Some(ControlTraceDetail::ProviderRuntimeOverride {
+                provider_name: Some("alpha".to_string()),
+                endpoint_name: Some("default".to_string()),
+                base_urls: vec!["https://alpha.example/v1".to_string()],
+                enabled: Some(false),
+                clear_enabled: false,
+                runtime_state: Some("breaker_open".to_string()),
+                clear_runtime_state: false,
+            })
+        );
     }
 }

@@ -267,6 +267,8 @@ pub(super) async fn api_capabilities(
             "/__codex_helper/api/v1/stations/{name}",
             "/__codex_helper/api/v1/stations/specs",
             "/__codex_helper/api/v1/stations/specs/{name}",
+            "/__codex_helper/api/v1/providers",
+            "/__codex_helper/api/v1/providers/runtime",
             "/__codex_helper/api/v1/providers/specs",
             "/__codex_helper/api/v1/providers/specs/{name}",
             "/__codex_helper/api/v1/profiles",

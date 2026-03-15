@@ -1,11 +1,13 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamConfig};
+use crate::config::{
+    ProviderConfigV2, ServiceConfig, ServiceConfigManager, ServiceViewV2, UpstreamConfig,
+};
 use crate::state::RuntimeConfigState;
 
 use super::types::{
-    CapabilitySupport, ControlProfileOption, ModelCatalogKind, StationCapabilitySummary,
-    StationOption,
+    CapabilitySupport, ControlProfileOption, ModelCatalogKind, ProviderEndpointOption,
+    ProviderOption, StationCapabilitySummary, StationOption,
 };
 
 pub fn build_station_options_from_mgr(
@@ -86,6 +88,52 @@ pub fn build_model_options_from_mgr(mgr: &ServiceConfigManager) -> Vec<String> {
     models.into_iter().collect()
 }
 
+pub fn build_provider_options_from_view(
+    view: &ServiceViewV2,
+    upstream_overrides: &HashMap<String, (Option<bool>, Option<RuntimeConfigState>)>,
+) -> Vec<ProviderOption> {
+    let mut providers = view
+        .providers
+        .iter()
+        .map(|(provider_name, provider)| {
+            let mut endpoints = provider
+                .endpoints
+                .iter()
+                .map(|(endpoint_name, endpoint)| {
+                    build_provider_endpoint_option(
+                        provider_name,
+                        provider,
+                        endpoint_name,
+                        endpoint,
+                        upstream_overrides,
+                    )
+                })
+                .collect::<Vec<_>>();
+            endpoints.sort_by(|a, b| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| a.name.cmp(&b.name))
+                    .then_with(|| a.base_url.cmp(&b.base_url))
+            });
+
+            ProviderOption {
+                name: provider_name.clone(),
+                alias: provider.alias.clone(),
+                configured_enabled: provider.enabled,
+                effective_enabled: provider.enabled
+                    && endpoints.iter().any(|endpoint| endpoint.effective_enabled),
+                routable_endpoints: endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.routable)
+                    .count(),
+                endpoints,
+            }
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|a, b| a.name.cmp(&b.name));
+    providers
+}
+
 fn build_station_capability_summary(config: &ServiceConfig) -> StationCapabilitySummary {
     let mut supported_models = BTreeSet::new();
     let mut has_declared_models = false;
@@ -123,6 +171,36 @@ fn build_station_capability_summary(config: &ServiceConfig) -> StationCapability
             &config.upstreams,
             &["supports_reasoning_effort", "supports_reasoning"],
         ),
+    }
+}
+
+fn build_provider_endpoint_option(
+    provider_name: &str,
+    provider: &ProviderConfigV2,
+    endpoint_name: &str,
+    endpoint: &crate::config::ProviderEndpointV2,
+    upstream_overrides: &HashMap<String, (Option<bool>, Option<RuntimeConfigState>)>,
+) -> ProviderEndpointOption {
+    let (runtime_enabled_override, runtime_state_override) = upstream_overrides
+        .get(endpoint.base_url.as_str())
+        .copied()
+        .unwrap_or((None, None));
+    let runtime_state = runtime_state_override.unwrap_or_default();
+    let configured_enabled = provider.enabled && endpoint.enabled;
+    let effective_enabled = configured_enabled && runtime_enabled_override.unwrap_or(true);
+    let routable = effective_enabled && runtime_state == RuntimeConfigState::Normal;
+
+    ProviderEndpointOption {
+        provider_name: provider_name.to_string(),
+        name: endpoint_name.to_string(),
+        base_url: endpoint.base_url.clone(),
+        priority: endpoint.priority,
+        configured_enabled,
+        effective_enabled,
+        routable,
+        runtime_enabled_override,
+        runtime_state,
+        runtime_state_override,
     }
 }
 
@@ -387,5 +465,84 @@ mod tests {
                 "gpt-5.5-preview".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn build_provider_options_from_view_merges_runtime_endpoint_overrides() {
+        let mut view = crate::config::ServiceViewV2::default();
+        view.providers.insert(
+            "alpha".to_string(),
+            crate::config::ProviderConfigV2 {
+                alias: Some("Alpha".to_string()),
+                enabled: true,
+                auth: UpstreamAuth::default(),
+                tags: Default::default(),
+                supported_models: Default::default(),
+                model_mapping: Default::default(),
+                endpoints: [
+                    (
+                        "default".to_string(),
+                        crate::config::ProviderEndpointV2 {
+                            base_url: "https://alpha.example/v1".to_string(),
+                            enabled: true,
+                            priority: 0,
+                            tags: Default::default(),
+                            supported_models: Default::default(),
+                            model_mapping: Default::default(),
+                        },
+                    ),
+                    (
+                        "backup".to_string(),
+                        crate::config::ProviderEndpointV2 {
+                            base_url: "https://alpha-backup.example/v1".to_string(),
+                            enabled: true,
+                            priority: 1,
+                            tags: Default::default(),
+                            supported_models: Default::default(),
+                            model_mapping: Default::default(),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let options = build_provider_options_from_view(
+            &view,
+            &HashMap::from([
+                (
+                    "https://alpha.example/v1".to_string(),
+                    (Some(false), Some(RuntimeConfigState::BreakerOpen)),
+                ),
+                (
+                    "https://alpha-backup.example/v1".to_string(),
+                    (None, Some(RuntimeConfigState::Draining)),
+                ),
+            ]),
+        );
+
+        assert_eq!(options.len(), 1);
+        let provider = &options[0];
+        assert_eq!(provider.name, "alpha");
+        assert!(provider.configured_enabled);
+        assert!(provider.effective_enabled);
+        assert_eq!(provider.routable_endpoints, 0);
+        assert_eq!(provider.endpoints.len(), 2);
+        assert_eq!(provider.endpoints[0].name, "default");
+        assert_eq!(provider.endpoints[0].runtime_enabled_override, Some(false));
+        assert_eq!(
+            provider.endpoints[0].runtime_state_override,
+            Some(RuntimeConfigState::BreakerOpen)
+        );
+        assert!(!provider.endpoints[0].effective_enabled);
+        assert!(!provider.endpoints[0].routable);
+        assert_eq!(provider.endpoints[1].name, "backup");
+        assert_eq!(
+            provider.endpoints[1].runtime_state_override,
+            Some(RuntimeConfigState::Draining)
+        );
+        assert!(provider.endpoints[1].effective_enabled);
+        assert!(!provider.endpoints[1].routable);
     }
 }

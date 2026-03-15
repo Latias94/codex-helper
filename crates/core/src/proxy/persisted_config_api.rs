@@ -4,6 +4,11 @@ use axum::http::StatusCode;
 
 use super::ProxyService;
 use super::api_responses::{ProfilesResponse, make_profiles_response};
+use super::control_plane_service::{
+    load_persisted_config_v2, runtime_service_manager_mut, save_proxy_config_v2_and_reload,
+    save_runtime_config_and_reload, save_runtime_profiles_config_and_reload, service_view_v2,
+    service_view_v2_mut,
+};
 
 fn default_persisted_station_enabled() -> bool {
     true
@@ -286,26 +291,6 @@ fn merge_persisted_provider_spec(
     }
 }
 
-fn service_view_v2<'a>(
-    cfg: &'a crate::config::ProxyConfigV2,
-    service_name: &str,
-) -> &'a crate::config::ServiceViewV2 {
-    match service_name {
-        "claude" => &cfg.claude,
-        _ => &cfg.codex,
-    }
-}
-
-fn service_view_v2_mut<'a>(
-    cfg: &'a mut crate::config::ProxyConfigV2,
-    service_name: &str,
-) -> &'a mut crate::config::ServiceViewV2 {
-    match service_name {
-        "claude" => &mut cfg.claude,
-        _ => &mut cfg.codex,
-    }
-}
-
 fn validate_station_members_for_view(
     service_name: &str,
     station_name: &str,
@@ -341,72 +326,6 @@ fn validate_station_members_for_view(
     Ok(())
 }
 
-async fn save_runtime_config_and_reload(
-    proxy: &ProxyService,
-    cfg: crate::config::ProxyConfig,
-) -> Result<(), (StatusCode, String)> {
-    crate::config::save_config(&cfg)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    proxy
-        .config
-        .force_reload_from_disk()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(())
-}
-
-async fn save_runtime_profiles_config_and_reload(
-    proxy: &ProxyService,
-    cfg: crate::config::ProxyConfig,
-) -> Result<ProfilesResponse, (StatusCode, String)> {
-    save_runtime_config_and_reload(proxy, cfg).await?;
-    Ok(make_profiles_response(proxy).await)
-}
-
-async fn load_persisted_config_v2() -> Result<crate::config::ProxyConfigV2, (StatusCode, String)> {
-    let path = crate::config::config_file_path();
-    if path.exists()
-        && path
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
-    {
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let version = toml::from_str::<toml::Value>(&text)
-            .ok()
-            .and_then(|value| value.get("version").and_then(|v| v.as_integer()))
-            .map(|value| value as u32);
-        if version == Some(2) {
-            return toml::from_str::<crate::config::ProxyConfigV2>(&text)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-        }
-    }
-
-    let runtime = crate::config::load_config()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    crate::config::compact_v2_config(&crate::config::migrate_legacy_to_v2(&runtime))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-async fn save_proxy_config_v2_and_reload(
-    proxy: &ProxyService,
-    cfg: crate::config::ProxyConfigV2,
-) -> Result<(), (StatusCode, String)> {
-    crate::config::save_config_v2(&cfg)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    proxy
-        .config
-        .force_reload_from_disk()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(())
-}
-
 pub(super) async fn list_persisted_station_specs(
     proxy: ProxyService,
 ) -> Result<Json<crate::config::PersistedStationsCatalog>, (StatusCode, String)> {
@@ -435,10 +354,7 @@ pub(super) async fn upsert_persisted_profile(
 
     let cfg_snapshot = proxy.config.snapshot().await;
     let mut cfg = cfg_snapshot.as_ref().clone();
-    let mgr = match proxy.service_name {
-        "claude" => &mut cfg.claude,
-        _ => &mut cfg.codex,
-    };
+    let mgr = runtime_service_manager_mut(&mut cfg, proxy.service_name);
 
     mgr.profiles.insert(profile_name.clone(), profile);
     let resolved = crate::config::resolve_service_profile(mgr, profile_name.as_str())
@@ -464,10 +380,7 @@ pub(super) async fn delete_persisted_profile(
 
     let cfg_snapshot = proxy.config.snapshot().await;
     let mut cfg = cfg_snapshot.as_ref().clone();
-    let mgr = match proxy.service_name {
-        "claude" => &mut cfg.claude,
-        _ => &mut cfg.codex,
-    };
+    let mgr = runtime_service_manager_mut(&mut cfg, proxy.service_name);
 
     let referencing_profiles = mgr
         .profiles
@@ -529,10 +442,7 @@ pub(super) async fn update_persisted_station(
 
     let cfg_snapshot = proxy.config.snapshot().await;
     let mut cfg = cfg_snapshot.as_ref().clone();
-    let mgr = match proxy.service_name {
-        "claude" => &mut cfg.claude,
-        _ => &mut cfg.codex,
-    };
+    let mgr = runtime_service_manager_mut(&mut cfg, proxy.service_name);
     let Some(station) = mgr.station_mut(station_name.as_str()) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -558,10 +468,7 @@ pub(super) async fn set_persisted_active_station(
 
     let cfg_snapshot = proxy.config.snapshot().await;
     let mut cfg = cfg_snapshot.as_ref().clone();
-    let mgr = match proxy.service_name {
-        "claude" => &mut cfg.claude,
-        _ => &mut cfg.codex,
-    };
+    let mgr = runtime_service_manager_mut(&mut cfg, proxy.service_name);
     if let Some(station_name) = station_name.as_deref()
         && !mgr.contains_station(station_name)
     {
@@ -731,10 +638,7 @@ pub(super) async fn set_persisted_default_profile(
 
     let cfg_snapshot = proxy.config.snapshot().await;
     let mut cfg = cfg_snapshot.as_ref().clone();
-    let mgr = match proxy.service_name {
-        "claude" => &mut cfg.claude,
-        _ => &mut cfg.codex,
-    };
+    let mgr = runtime_service_manager_mut(&mut cfg, proxy.service_name);
 
     if let Some(profile_name) = profile_name.as_deref() {
         if mgr.profile(profile_name).is_none() {

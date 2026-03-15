@@ -3813,6 +3813,7 @@ mod tests {
                     service: Some("codex".to_string()),
                     request_id: Some(9),
                     event: Some("request_completed".to_string()),
+                    detail: None,
                     payload: serde_json::json!({
                         "method": "POST",
                         "path": "/v1/responses"

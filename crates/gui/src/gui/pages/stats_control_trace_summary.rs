@@ -1,110 +1,69 @@
-use serde_json::Value as JsonValue;
-
 use super::*;
-use crate::logging::ControlTraceLogEntry;
+use crate::logging::{ControlTraceDetail, ControlTraceLogEntry};
 
 pub(super) fn control_trace_summary(entry: &ControlTraceLogEntry, lang: Language) -> String {
-    match entry.kind.as_str() {
-        "request_completed" => control_trace_request_completed_summary(&entry.payload, lang),
-        "retry_trace" => control_trace_retry_summary(entry, lang),
-        _ => {
-            let event = entry
-                .event
-                .clone()
-                .or_else(|| json_field_string(&entry.payload, "event"))
-                .unwrap_or_else(|| "-".to_string());
-            format!("event={event}")
-        }
-    }
-}
-
-pub(super) fn json_field_string(value: &JsonValue, key: &str) -> Option<String> {
-    value.get(key)?.as_str().map(str::to_string)
-}
-
-fn json_field_u64(value: &JsonValue, key: &str) -> Option<u64> {
-    value.get(key).and_then(|value| match value {
-        JsonValue::Number(number) => number.as_u64(),
-        JsonValue::String(text) => text.trim().parse::<u64>().ok(),
-        _ => None,
-    })
-}
-
-fn json_nested_string(value: &JsonValue, path: &[&str]) -> Option<String> {
-    let mut current = value;
-    for segment in path {
-        current = current.get(*segment)?;
-    }
-    current.as_str().map(str::to_string)
-}
-
-fn json_nested_u64(value: &JsonValue, path: &[&str]) -> Option<u64> {
-    let mut current = value;
-    for segment in path {
-        current = current.get(*segment)?;
-    }
-    match current {
-        JsonValue::Number(number) => number.as_u64(),
-        JsonValue::String(text) => text.trim().parse::<u64>().ok(),
-        _ => None,
-    }
-}
-
-fn control_trace_request_completed_summary(payload: &JsonValue, lang: Language) -> String {
-    let method = json_field_string(payload, "method").unwrap_or_else(|| "-".to_string());
-    let path = json_field_string(payload, "path").unwrap_or_else(|| "-".to_string());
-    let status = json_field_u64(payload, "status_code")
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let duration = json_field_u64(payload, "duration_ms")
-        .map(|value| format!("{value}ms"))
-        .unwrap_or_else(|| "-".to_string());
-    let station = json_field_string(payload, "station_name").unwrap_or_else(|| "-".to_string());
-    let provider = json_field_string(payload, "provider_id").unwrap_or_else(|| "-".to_string());
-    let tier = json_nested_string(payload, &["service_tier", "actual"])
-        .or_else(|| json_nested_string(payload, &["service_tier", "effective"]))
-        .map(|value| super::format_service_tier_display(Some(value.as_str()), lang, "-"))
-        .unwrap_or_else(|| "-".to_string());
-
-    format!(
-        "{} {}  st={}  dur={}  station={}  provider={}  tier={}",
-        method, path, status, duration, station, provider, tier
-    )
-}
-
-fn control_trace_retry_summary(entry: &ControlTraceLogEntry, lang: Language) -> String {
-    let event = entry
-        .event
-        .clone()
-        .or_else(|| json_field_string(&entry.payload, "event"))
-        .unwrap_or_else(|| "retry_trace".to_string());
-    match event.as_str() {
-        "attempt_select" => {
-            let station = json_field_string(&entry.payload, "station_name")
-                .unwrap_or_else(|| "-".to_string());
-            let upstream = json_field_u64(&entry.payload, "upstream_index")
+    match entry.resolved_detail() {
+        Some(ControlTraceDetail::RequestCompleted {
+            method,
+            path,
+            status_code,
+            duration_ms,
+            station_name,
+            provider_id,
+            service_tier,
+            ..
+        }) => {
+            let method = method.unwrap_or_else(|| "-".to_string());
+            let path = path.unwrap_or_else(|| "-".to_string());
+            let status = status_code
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let provider =
-                json_field_string(&entry.payload, "provider_id").unwrap_or_else(|| "-".to_string());
-            let model =
-                json_field_string(&entry.payload, "model").unwrap_or_else(|| "-".to_string());
+            let duration = duration_ms
+                .map(|value| format!("{value}ms"))
+                .unwrap_or_else(|| "-".to_string());
+            let station = station_name.unwrap_or_else(|| "-".to_string());
+            let provider = provider_id.unwrap_or_else(|| "-".to_string());
+            let tier = service_tier
+                .actual
+                .or(service_tier.effective)
+                .map(|value| super::format_service_tier_display(Some(value.as_str()), lang, "-"))
+                .unwrap_or_else(|| "-".to_string());
+
+            format!(
+                "{} {}  st={}  dur={}  station={}  provider={}  tier={}",
+                method, path, status, duration, station, provider, tier
+            )
+        }
+        Some(ControlTraceDetail::AttemptSelect {
+            station_name,
+            upstream_index,
+            provider_id,
+            model,
+            ..
+        }) => {
+            let station = station_name.unwrap_or_else(|| "-".to_string());
+            let upstream = upstream_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let provider = provider_id.unwrap_or_else(|| "-".to_string());
+            let model = model.unwrap_or_else(|| "-".to_string());
             format!(
                 "select station={} upstream#{} provider={} model={}",
                 station, upstream, provider, model
             )
         }
-        "retry_options" => {
-            let upstream_max = json_nested_u64(&entry.payload, &["upstream", "max_attempts"])
+        Some(ControlTraceDetail::RetryOptions {
+            upstream_max_attempts,
+            provider_max_attempts,
+            allow_cross_station_before_first_output,
+        }) => {
+            let upstream_max = upstream_max_attempts
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let provider_max = json_nested_u64(&entry.payload, &["provider", "max_attempts"])
+            let provider_max = provider_max_attempts
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let cross = entry
-                .payload
-                .get("allow_cross_station_before_first_output")
-                .and_then(|value| value.as_bool())
+            let cross = allow_cross_station_before_first_output
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
             format!(
@@ -112,39 +71,75 @@ fn control_trace_retry_summary(entry: &ControlTraceLogEntry, lang: Language) -> 
                 upstream_max, provider_max, cross
             )
         }
-        "lbs_for_request" => {
-            let mode = json_field_string(&entry.payload, "mode").unwrap_or_else(|| "-".to_string());
-            let pinned = json_field_string(&entry.payload, "pinned_source")
+        Some(ControlTraceDetail::LoadBalancerSelection {
+            mode,
+            pinned_source,
+            pinned_name,
+            selected_station,
+            selected_stations,
+            ..
+        }) => {
+            let selected = selected_station
+                .or(pinned_name)
+                .or_else(|| selected_stations.first().cloned())
                 .unwrap_or_else(|| "-".to_string());
-            let selected_station = json_field_string(&entry.payload, "selected_station")
-                .or_else(|| json_field_string(&entry.payload, "pinned_name"))
-                .unwrap_or_else(|| "-".to_string());
+            let mode = mode.unwrap_or_else(|| "-".to_string());
+            let pinned = pinned_source.unwrap_or_else(|| "-".to_string());
             format!(
                 "{} mode={} selected={} pinned={}",
                 pick(lang, "路由入口", "LB selection"),
                 mode,
-                selected_station,
+                selected,
                 pinned
             )
         }
-        _ => {
-            let station = json_field_string(&entry.payload, "station_name")
-                .or_else(|| json_field_string(&entry.payload, "selected_station"))
+        Some(ControlTraceDetail::ProviderRuntimeOverride {
+            provider_name,
+            endpoint_name,
+            enabled,
+            runtime_state,
+            base_urls,
+            ..
+        }) => {
+            let provider = provider_name.unwrap_or_else(|| "-".to_string());
+            let endpoint = endpoint_name.unwrap_or_else(|| "*".to_string());
+            let enabled = enabled
+                .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let base_url = json_field_string(&entry.payload, "upstream_base_url")
-                .unwrap_or_else(|| "-".to_string());
-            let mode = json_field_string(&entry.payload, "mode").unwrap_or_default();
-            let note = json_field_string(&entry.payload, "note").unwrap_or_default();
+            let state = runtime_state.unwrap_or_else(|| "-".to_string());
+            format!(
+                "{} provider={} endpoint={} enabled={} state={} urls={}",
+                pick(lang, "运行时覆盖", "Runtime override"),
+                provider,
+                endpoint,
+                enabled,
+                state,
+                base_urls.len()
+            )
+        }
+        Some(ControlTraceDetail::RetryEvent {
+            event_name,
+            station_name,
+            upstream_base_url,
+            mode,
+            note,
+        }) => {
+            let station = station_name.unwrap_or_else(|| "-".to_string());
+            let base_url = upstream_base_url.unwrap_or_else(|| "-".to_string());
             format!(
                 "event={} station={} upstream={} {} {}",
-                event,
+                event_name,
                 station,
                 super::shorten_middle(base_url.as_str(), 48),
-                mode,
-                note
+                mode.unwrap_or_default(),
+                note.unwrap_or_default()
             )
             .trim()
             .to_string()
+        }
+        None => {
+            let event = entry.event.clone().unwrap_or_else(|| "-".to_string());
+            format!("event={event}")
         }
     }
 }
@@ -155,18 +150,29 @@ mod tests {
 
     #[test]
     fn control_trace_request_completed_summary_marks_fast_mode() {
-        let summary = control_trace_request_completed_summary(
-            &serde_json::json!({
-                "method": "POST",
-                "path": "/v1/responses",
-                "status_code": 200,
-                "duration_ms": 512,
-                "station_name": "right",
-                "provider_id": "right",
-                "service_tier": {
-                    "effective": "priority"
-                }
-            }),
+        let summary = control_trace_summary(
+            &ControlTraceLogEntry {
+                ts_ms: 1,
+                kind: "request_completed".to_string(),
+                service: Some("codex".to_string()),
+                request_id: Some(1),
+                event: Some("request_completed".to_string()),
+                detail: Some(ControlTraceDetail::RequestCompleted {
+                    method: Some("POST".to_string()),
+                    path: Some("/v1/responses".to_string()),
+                    status_code: Some(200),
+                    duration_ms: Some(512),
+                    station_name: Some("right".to_string()),
+                    provider_id: Some("right".to_string()),
+                    upstream_base_url: None,
+                    service_tier: crate::logging::ServiceTierLog {
+                        requested: None,
+                        effective: Some("priority".to_string()),
+                        actual: None,
+                    },
+                }),
+                payload: serde_json::json!({}),
+            },
             Language::En,
         );
 
@@ -183,19 +189,47 @@ mod tests {
             service: Some("codex".to_string()),
             request_id: Some(7),
             event: Some("attempt_select".to_string()),
-            payload: serde_json::json!({
-                "event": "attempt_select",
-                "station_name": "right",
-                "upstream_index": 1,
-                "provider_id": "right",
-                "model": "gpt-5.4-fast"
+            detail: Some(ControlTraceDetail::AttemptSelect {
+                station_name: Some("right".to_string()),
+                upstream_index: Some(1),
+                upstream_base_url: None,
+                provider_id: Some("right".to_string()),
+                model: Some("gpt-5.4-fast".to_string()),
             }),
+            payload: serde_json::json!({}),
         };
 
-        let summary = control_trace_retry_summary(&entry, Language::En);
+        let summary = control_trace_summary(&entry, Language::En);
 
         assert!(summary.contains("station=right"));
         assert!(summary.contains("upstream#1"));
         assert!(summary.contains("gpt-5.4-fast"));
+    }
+
+    #[test]
+    fn control_trace_provider_runtime_override_summary_mentions_endpoint() {
+        let entry = ControlTraceLogEntry {
+            ts_ms: 1,
+            kind: "retry_trace".to_string(),
+            service: Some("codex".to_string()),
+            request_id: None,
+            event: Some("provider_runtime_override".to_string()),
+            detail: Some(ControlTraceDetail::ProviderRuntimeOverride {
+                provider_name: Some("alpha".to_string()),
+                endpoint_name: Some("default".to_string()),
+                base_urls: vec!["https://alpha.example/v1".to_string()],
+                enabled: Some(false),
+                clear_enabled: false,
+                runtime_state: Some("breaker_open".to_string()),
+                clear_runtime_state: false,
+            }),
+            payload: serde_json::json!({}),
+        };
+
+        let summary = control_trace_summary(&entry, Language::En);
+
+        assert!(summary.contains("provider=alpha"));
+        assert!(summary.contains("endpoint=default"));
+        assert!(summary.contains("breaker_open"));
     }
 }

@@ -1,9 +1,9 @@
 use super::components::console_layout::console_note;
-use super::stats_control_trace_summary::{control_trace_summary, json_field_string};
+use super::stats_control_trace_summary::control_trace_summary;
 use super::view_state::{ControlTraceRecordState, ControlTraceSourceKind, StatsViewState};
 use super::*;
 use crate::gui::proxy_control::{ControlTraceDataSource, ProxyController};
-use crate::logging::ControlTraceLogEntry;
+use crate::logging::{ControlTraceDetail, ControlTraceLogEntry};
 
 pub(super) fn render_control_trace_source_summary(
     ui: &mut egui::Ui,
@@ -113,10 +113,22 @@ fn control_trace_record_from_entry(
         kind: entry.kind.clone(),
         service: entry.service.clone(),
         request_id: entry.request_id,
-        event: entry
-            .event
-            .clone()
-            .or_else(|| json_field_string(&entry.payload, "event")),
+        event: resolved_control_trace_event(entry),
         summary: control_trace_summary(entry, lang),
     }
+}
+
+fn resolved_control_trace_event(entry: &ControlTraceLogEntry) -> Option<String> {
+    entry.event.clone().or_else(|| {
+        entry.resolved_detail().map(|detail| match detail {
+            ControlTraceDetail::RequestCompleted { .. } => "request_completed".to_string(),
+            ControlTraceDetail::RetryOptions { .. } => "retry_options".to_string(),
+            ControlTraceDetail::AttemptSelect { .. } => "attempt_select".to_string(),
+            ControlTraceDetail::LoadBalancerSelection { .. } => "lbs_for_request".to_string(),
+            ControlTraceDetail::ProviderRuntimeOverride { .. } => {
+                "provider_runtime_override".to_string()
+            }
+            ControlTraceDetail::RetryEvent { event_name, .. } => event_name,
+        })
+    })
 }
