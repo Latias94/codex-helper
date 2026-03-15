@@ -128,6 +128,52 @@ fn session_control_posture_describes_session_overrides_without_binding() {
 }
 
 #[test]
+fn session_manual_override_summary_marks_priority_as_fast_mode() {
+    let mut row = sample_session_row();
+    row.override_station = Some("right".to_string());
+    row.override_service_tier = Some("priority".to_string());
+
+    let summary = session_manual_override_summary(&row, Language::En);
+
+    assert!(summary.contains("station=right"));
+    assert!(summary.contains("priority (fast mode)"));
+}
+
+#[test]
+fn session_binding_profile_summary_resolves_inherited_profile() {
+    let mut row = sample_session_row();
+    row.binding_profile_name = Some("fast".to_string());
+    let profiles = vec![
+        ControlProfileOption {
+            name: "base".to_string(),
+            extends: None,
+            station: Some("right".to_string()),
+            model: None,
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: None,
+            is_default: false,
+        },
+        ControlProfileOption {
+            name: "fast".to_string(),
+            extends: Some("base".to_string()),
+            station: None,
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: None,
+            service_tier: Some("priority".to_string()),
+            is_default: false,
+        },
+    ];
+
+    let summary =
+        session_binding_profile_summary(&row, &profiles, Language::En).expect("profile summary");
+
+    assert!(summary.contains("station=right"));
+    assert!(summary.contains("model=gpt-5.4"));
+    assert!(summary.contains("effort=medium"));
+    assert!(summary.contains("tier=priority"));
+}
+
+#[test]
 fn route_decision_changed_fields_reports_effective_drift() {
     let mut row = sample_session_row();
     row.effective_model = Some(ResolvedRouteValue {

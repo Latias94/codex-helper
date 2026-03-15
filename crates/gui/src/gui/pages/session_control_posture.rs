@@ -38,6 +38,16 @@ pub(super) fn session_override_field_labels(row: &SessionRow, lang: Language) ->
     fields
 }
 
+pub(super) fn session_manual_override_summary(row: &SessionRow, lang: Language) -> String {
+    format!(
+        "station={}, model={}, reasoning={}, service_tier={}",
+        row.override_station_name().unwrap_or("-"),
+        row.override_model.as_deref().unwrap_or("-"),
+        row.override_effort.as_deref().unwrap_or("-"),
+        format_service_tier_display(row.override_service_tier.as_deref(), lang, "-"),
+    )
+}
+
 pub(super) fn session_binding_mode_label(
     mode: Option<SessionContinuityMode>,
     lang: Language,

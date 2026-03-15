@@ -28,6 +28,8 @@ pub(super) fn render_session_identity_card(
     let cwd_full = row.cwd.as_deref().unwrap_or("-");
     let provider = row.last_provider_id.as_deref().unwrap_or("-");
     let binding_mode = session_binding_mode_label(row.binding_continuity_mode, lang);
+    let binding_profile_summary = session_binding_profile_summary(row, profiles, lang);
+    let manual_override_summary = session_manual_override_summary(row, lang);
     let route_decision_status = session_route_decision_status_line(row, lang);
 
     console_section(
@@ -51,9 +53,25 @@ pub(super) fn render_session_identity_card(
             ui.small(format!("client(last): {client_full}"));
             ui.small(format!("cwd: {cwd_full}"));
             ui.small(format!("provider(last): {provider}"));
+            if let Some(profile_name) = row.binding_profile_name.as_deref() {
+                ui.small(format!(
+                    "{}: {profile_name}",
+                    pick(lang, "binding(profile)", "Binding (profile)")
+                ));
+            }
             if row.binding_profile_name.is_some() || row.binding_continuity_mode.is_some() {
                 ui.small(format!("binding mode: {binding_mode}"));
             }
+            if let Some(profile_summary) = binding_profile_summary {
+                ui.small(format!(
+                    "{}: {profile_summary}",
+                    pick(lang, "binding(profile spec)", "Binding (profile spec)")
+                ));
+            }
+            ui.small(format!(
+                "{}: {manual_override_summary}",
+                pick(lang, "manual overrides", "Manual overrides")
+            ));
             ui.small(format!(
                 "{}: {route_decision_status}",
                 pick(lang, "route decision", "Route decision")

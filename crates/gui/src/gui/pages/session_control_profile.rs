@@ -17,6 +17,17 @@ pub(super) fn format_profile_summary(profile: &ControlProfileOption) -> String {
     format!("extends={extends}, station={station}, model={model}, effort={effort}, tier={tier}")
 }
 
+pub(super) fn format_service_profile_summary(
+    profile: &crate::config::ServiceControlProfile,
+) -> String {
+    let extends = profile.extends.as_deref().unwrap_or("<none>");
+    let station = profile.station.as_deref().unwrap_or("auto");
+    let model = profile.model.as_deref().unwrap_or("auto");
+    let effort = profile.reasoning_effort.as_deref().unwrap_or("auto");
+    let tier = profile.service_tier.as_deref().unwrap_or("auto");
+    format!("extends={extends}, station={station}, model={model}, effort={effort}, tier={tier}")
+}
+
 pub(super) fn service_profile_from_option(
     profile: &ControlProfileOption,
 ) -> crate::config::ServiceControlProfile {
@@ -38,6 +49,30 @@ pub(super) fn resolve_service_profile_from_options(
         .map(|profile| (profile.name.clone(), service_profile_from_option(profile)))
         .collect::<BTreeMap<_, _>>();
     crate::config::resolve_service_profile_from_catalog(&profile_catalog, profile_name)
+}
+
+pub(super) fn session_binding_profile_summary(
+    row: &SessionRow,
+    profiles: &[ControlProfileOption],
+    lang: Language,
+) -> Option<String> {
+    let profile_name = row.binding_profile_name.as_deref()?;
+    let raw_profile = profiles.iter().find(|profile| profile.name == profile_name);
+    if raw_profile.is_none() {
+        return Some(
+            pick(
+                lang,
+                "当前配置中已缺失该 profile",
+                "This profile is missing from the current config",
+            )
+            .to_string(),
+        );
+    }
+
+    match resolve_service_profile_from_options(profile_name, profiles) {
+        Ok(profile) => Some(format_service_profile_summary(&profile)),
+        Err(_) => raw_profile.map(format_profile_summary),
+    }
 }
 
 pub(super) fn render_session_profile_apply_preview(
