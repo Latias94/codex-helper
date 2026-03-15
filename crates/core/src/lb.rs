@@ -64,7 +64,7 @@ impl LbState {
 /// Upstream selection result
 #[derive(Debug, Clone)]
 pub struct SelectedUpstream {
-    pub config_name: String,
+    pub station_name: String,
     pub index: usize,
     pub upstream: UpstreamConfig,
 }
@@ -137,7 +137,7 @@ impl LoadBalancer {
         {
             let upstream = self.service.upstreams[idx].clone();
             return Some(SelectedUpstream {
-                config_name: self.service.name.clone(),
+                station_name: self.service.name.clone(),
                 index: idx,
                 upstream,
             });
@@ -164,7 +164,7 @@ impl LoadBalancer {
         {
             let upstream = self.service.upstreams[idx].clone();
             return Some(SelectedUpstream {
-                config_name: self.service.name.clone(),
+                station_name: self.service.name.clone(),
                 index: idx,
                 upstream,
             });
@@ -189,7 +189,7 @@ impl LoadBalancer {
         {
             let upstream = self.service.upstreams[idx].clone();
             return Some(SelectedUpstream {
-                config_name: self.service.name.clone(),
+                station_name: self.service.name.clone(),
                 index: idx,
                 upstream,
             });
@@ -206,7 +206,7 @@ impl LoadBalancer {
             .unwrap_or(0);
         let upstream = self.service.upstreams[idx].clone();
         Some(SelectedUpstream {
-            config_name: self.service.name.clone(),
+            station_name: self.service.name.clone(),
             index: idx,
             upstream,
         })
@@ -431,5 +431,126 @@ mod tests {
             .select_upstream()
             .expect("should select backup after failures");
         assert_eq!(selected.index, 1);
+    }
+
+    #[test]
+    fn lb_cooldown_expiry_restores_upstream_selection() {
+        let service = make_service(
+            "codex-main",
+            &["https://primary.example", "https://backup.example"],
+        );
+        let states = Arc::new(Mutex::new(HashMap::new()));
+        let lb = LoadBalancer::new(Arc::new(service), states.clone());
+
+        let disabled_backoff = CooldownBackoff {
+            factor: 1,
+            max_secs: 0,
+        };
+
+        for _ in 0..FAILURE_THRESHOLD {
+            lb.record_result_with_backoff(0, false, 2, disabled_backoff);
+        }
+
+        {
+            let guard = states.lock().unwrap();
+            let entry = guard.get("codex-main").expect("lb state exists");
+            assert_eq!(entry.failure_counts[0], FAILURE_THRESHOLD);
+            assert!(entry.cooldown_until[0].is_some());
+        }
+
+        let during_cooldown = lb
+            .select_upstream()
+            .expect("should select backup while primary cools down");
+        assert_eq!(during_cooldown.index, 1);
+
+        {
+            let mut guard = states.lock().unwrap();
+            let entry = guard.get_mut("codex-main").expect("lb state exists");
+            entry.cooldown_until[0] =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        }
+
+        let recovered = lb
+            .select_upstream()
+            .expect("should select primary after cooldown expiry");
+        assert_eq!(recovered.index, 0);
+
+        {
+            let guard = states.lock().unwrap();
+            let entry = guard.get("codex-main").expect("lb state exists");
+            assert_eq!(entry.failure_counts[0], 0);
+            assert!(entry.cooldown_until[0].is_none());
+        }
+    }
+
+    #[test]
+    fn lb_threshold_cooldown_backoff_grows_and_success_resets_streak() {
+        let service = make_service(
+            "codex-main",
+            &["https://primary.example", "https://backup.example"],
+        );
+        let states = Arc::new(Mutex::new(HashMap::new()));
+        let lb = LoadBalancer::new(Arc::new(service), states.clone());
+
+        let backoff = CooldownBackoff {
+            factor: 2,
+            max_secs: 10,
+        };
+
+        for _ in 0..FAILURE_THRESHOLD {
+            lb.record_result_with_backoff(0, false, 2, backoff);
+        }
+
+        let first_remaining_secs = {
+            let guard = states.lock().unwrap();
+            let entry = guard.get("codex-main").expect("lb state exists");
+            assert_eq!(entry.penalty_streak[0], 1);
+            entry.cooldown_until[0]
+                .map(|until| {
+                    until
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
+                })
+                .expect("first cooldown exists")
+        };
+        assert!(first_remaining_secs <= 2);
+
+        {
+            let mut guard = states.lock().unwrap();
+            let entry = guard.get_mut("codex-main").expect("lb state exists");
+            entry.cooldown_until[0] =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        }
+        let _ = lb.select_upstream();
+
+        for _ in 0..FAILURE_THRESHOLD {
+            lb.record_result_with_backoff(0, false, 2, backoff);
+        }
+
+        let second_remaining_secs = {
+            let guard = states.lock().unwrap();
+            let entry = guard.get("codex-main").expect("lb state exists");
+            assert_eq!(entry.penalty_streak[0], 2);
+            entry.cooldown_until[0]
+                .map(|until| {
+                    until
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
+                })
+                .expect("second cooldown exists")
+        };
+        assert!(second_remaining_secs <= 4);
+        assert!(second_remaining_secs >= first_remaining_secs);
+
+        lb.record_result_with_backoff(0, true, 2, backoff);
+
+        {
+            let guard = states.lock().unwrap();
+            let entry = guard.get("codex-main").expect("lb state exists");
+            assert_eq!(entry.failure_counts[0], 0);
+            assert!(entry.cooldown_until[0].is_none());
+            assert_eq!(entry.penalty_streak[0], 0);
+            assert_eq!(entry.last_good_index, Some(0));
+        }
     }
 }

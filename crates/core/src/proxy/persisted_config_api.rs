@@ -39,6 +39,8 @@ pub(super) struct PersistedProviderEndpointSpecUpsertRequest {
     base_url: String,
     #[serde(default = "default_persisted_station_enabled")]
     enabled: bool,
+    #[serde(default)]
+    priority: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -219,6 +221,7 @@ fn sanitize_provider_spec_request(
             name: endpoint_name.to_string(),
             base_url: base_url.to_string(),
             enabled: endpoint.enabled,
+            priority: endpoint.priority,
         });
     }
 
@@ -266,6 +269,7 @@ fn merge_persisted_provider_spec(
                     crate::config::ProviderEndpointV2 {
                         base_url: endpoint.base_url.clone(),
                         enabled: endpoint.enabled,
+                        priority: endpoint.priority,
                         tags: existing_endpoint
                             .map(|endpoint| endpoint.tags.clone())
                             .unwrap_or_default(),

@@ -228,13 +228,13 @@ async fn fetch_recent_finished(
 
     let mut last_err: Option<anyhow::Error> = None;
     for base_url in base_candidates {
-        let url = format!("{base_url}/__codex_helper/status/recent?limit=200");
+        let url = format!("{base_url}/__codex_helper/api/v1/status/recent?limit=200");
         match client.get(url).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
                     last_err = Some(anyhow::anyhow!(
-                        "proxy status/recent returned {}",
+                        "proxy api/v1/status/recent returned {}",
                         status.as_u16()
                     ));
                     continue;
@@ -248,7 +248,7 @@ async fn fetch_recent_finished(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("proxy status/recent unavailable")))
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("proxy api/v1/status/recent unavailable")))
 }
 
 async fn queue_event_and_spawn_flush(

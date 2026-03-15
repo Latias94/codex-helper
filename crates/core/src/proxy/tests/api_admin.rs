@@ -149,6 +149,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/overrides/session/reset"))
     }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/control-trace"))
+    }));
     let host_local_history = crate::config::codex_sessions_dir().is_dir();
     assert_eq!(
         caps["shared_capabilities"]["session_observability"].as_bool(),
@@ -189,6 +194,74 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert_eq!(
         caps["remote_admin_access"]["token_env_var"].as_str(),
         Some(crate::proxy::ADMIN_TOKEN_ENV_VAR)
+    );
+
+    let trace_dir = make_temp_test_dir();
+    let trace_path = trace_dir.join("control_trace.jsonl");
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_CONTROL_TRACE_PATH", &trace_path);
+    }
+    std::fs::write(
+        &trace_path,
+        [
+            serde_json::json!({
+                "ts_ms": 100,
+                "kind": "retry_trace",
+                "service": "codex",
+                "request_id": 5,
+                "event": "attempt_select",
+                "payload": {
+                    "event": "attempt_select",
+                    "station_name": "right"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "ts_ms": 200,
+                "kind": "request_completed",
+                "service": "codex",
+                "request_id": 5,
+                "event": "request_completed",
+                "payload": {
+                    "method": "POST",
+                    "path": "/v1/responses"
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n"),
+    )
+    .expect("write control trace");
+
+    let control_trace = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/control-trace?limit=40",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("control trace send")
+        .error_for_status()
+        .expect("control trace status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("control trace json");
+    assert_eq!(
+        control_trace
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|value| value.get("ts_ms"))
+            .and_then(|value| value.as_u64()),
+        Some(200)
+    );
+    assert_eq!(
+        control_trace
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|value| value.get("kind"))
+            .and_then(|value| value.as_str()),
+        Some("request_completed")
     );
 
     let set_global = client
@@ -1079,6 +1152,7 @@ async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
                     ProviderEndpointV2 {
                         base_url: "https://right.example.com/v1".to_string(),
                         enabled: true,
+                        priority: 0,
                         tags: Default::default(),
                         supported_models: Default::default(),
                         model_mapping: Default::default(),
@@ -1089,6 +1163,7 @@ async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
                     ProviderEndpointV2 {
                         base_url: "https://hk.right.example.com/v1".to_string(),
                         enabled: true,
+                        priority: 1,
                         tags: Default::default(),
                         supported_models: Default::default(),
                         model_mapping: Default::default(),
@@ -1285,6 +1360,7 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
                 ProviderEndpointV2 {
                     base_url: "https://alpha.example.com/v1".to_string(),
                     enabled: true,
+                    priority: 0,
                     tags: [("region".to_string(), "hk".to_string())]
                         .into_iter()
                         .collect(),

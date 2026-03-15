@@ -5,9 +5,11 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
-### ?? / Added
-- ?????? `v2` ?????`config.toml` ???? `version = 2` ? `service -> providers + groups` ???????????????????????????????????? provider / ? endpoint ??????? Add a clearer `v2` config view: `config.toml` now supports a `version = 2` `service -> providers + groups` layout that compiles into the existing runtime routing model, improving readability for multi-provider / multi-endpoint setups without changing current load-balancing behavior.
-- ?? `codex-helper config explain` ? `codex-helper config migrate --to v2`??? `--compact` ???????? `--write --yes` ???????? legacy ?????????? TOML? Add `codex-helper config explain` and `codex-helper config migrate --to v2`: supports compact previews via `--compact` and safe write-back via `--write --yes`, making it easier to migrate legacy configs into a more maintainable TOML format.
+## [0.13.0] - 2026-03-07
+
+### 新增 / Added
+- 新增更清晰的 `v2` 配置视图：`config.toml` 现在支持 `version = 2` 的 `service -> providers + groups` 结构，并编译到现有运行时路由模型，在不改变当前负载均衡行为的前提下提升多 provider / 多 endpoint 场景的可读性。 Add a clearer `v2` config view: `config.toml` now supports a `version = 2` `service -> providers + groups` layout that compiles into the existing runtime routing model, improving readability for multi-provider / multi-endpoint setups without changing current load-balancing behavior.
+- 新增 `codex-helper config explain` 与 `codex-helper config migrate --to v2`：支持 `--compact` 紧凑化预览，以及 `--write --yes` 安全写回，便于把 legacy 配置迁移成更易维护的 TOML。 Add `codex-helper config explain` and `codex-helper config migrate --to v2`: supports compact previews via `--compact` and safe write-back via `--write --yes`, making it easier to migrate legacy configs into a more maintainable TOML format.
 
 ### 改进 / Improved
 - 配置模块内部做了一轮收口重构：把 Codex / Claude 客户端配置的路径、备份、sentinel 判断收口到 `client_config`，并在 `config` 下新增 `storage` / `bootstrap` / `auth_sync` 门面，为后续继续拆分配置管理做好边界，同时保持现有 CLI / GUI / TUI 调用方式兼容。  Internal config management refactor: consolidate Codex / Claude client-config path, backup, and sentinel handling into `client_config`, and add `storage` / `bootstrap` / `auth_sync` facades under `config` to prepare for further modularization while keeping existing CLI / GUI / TUI call sites compatible.

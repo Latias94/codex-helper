@@ -27,22 +27,18 @@
   - Run an Axum proxy on `127.0.0.1:<port>`.
   - Optionally launch an interactive TUI when running in a terminal.
   - Maintain runtime state in `ProxyState` (sessions, requests, overrides, usage rollups, health checks, LB states).
-  - Expose a small local control/status API:
-    - `GET/POST /__codex_helper/override/session` (effort override)
-    - `GET /__codex_helper/status/active`
-    - `GET /__codex_helper/status/recent`
-    - `GET /__codex_helper/config/runtime`
-    - `POST /__codex_helper/config/reload`
-    - Versioned attach-friendly API (v1):
-      - `GET /__codex_helper/api/v1/capabilities`
-      - `GET /__codex_helper/api/v1/status/active`
-      - `GET /__codex_helper/api/v1/status/recent?limit=...`
-      - `GET /__codex_helper/api/v1/status/session-stats`
-      - `GET /__codex_helper/api/v1/config/runtime`
-      - `POST /__codex_helper/api/v1/config/reload`
-      - `GET /__codex_helper/api/v1/configs`
-      - `GET/POST /__codex_helper/api/v1/overrides/session/effort`
-      - `GET/POST /__codex_helper/api/v1/overrides/session/config`
+  - Expose a versioned local control/status API (v1):
+    - `GET /__codex_helper/api/v1/capabilities`
+    - `GET /__codex_helper/api/v1/status/active`
+    - `GET /__codex_helper/api/v1/status/recent?limit=...`
+    - `GET /__codex_helper/api/v1/status/session-stats`
+    - `GET /__codex_helper/api/v1/status/station-health`
+    - `GET /__codex_helper/api/v1/runtime/status`
+    - `POST /__codex_helper/api/v1/runtime/reload`
+    - `GET /__codex_helper/api/v1/stations`
+    - `POST /__codex_helper/api/v1/stations/runtime`
+    - `GET/POST /__codex_helper/api/v1/overrides/session/effort`
+    - `GET/POST /__codex_helper/api/v1/overrides/session/station`
       - `GET/POST /__codex_helper/api/v1/overrides/global-config`
 
 ## Target UX / IA (Clash Verge-like)

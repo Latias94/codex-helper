@@ -22,6 +22,7 @@ pub(super) struct RetryLayerOptions {
 pub(super) struct RetryPlan {
     pub(super) upstream: RetryLayerOptions,
     pub(super) provider: RetryLayerOptions,
+    pub(super) allow_cross_station_before_first_output: bool,
     pub(super) never_status_ranges: Vec<(u16, u16)>,
     pub(super) never_error_classes: Vec<String>,
     pub(super) cloudflare_challenge_cooldown_secs: u64,
@@ -80,6 +81,7 @@ pub(super) fn retry_plan(cfg: &ResolvedRetryConfig) -> RetryPlan {
     RetryPlan {
         upstream,
         provider,
+        allow_cross_station_before_first_output: cfg.allow_cross_station_before_first_output,
         never_status_ranges,
         never_error_classes,
         cloudflare_challenge_cooldown_secs,

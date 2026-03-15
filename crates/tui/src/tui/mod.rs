@@ -66,6 +66,7 @@ pub async fn run_dashboard(
         refresh_ms,
         ..Default::default()
     };
+    let _ = input::refresh_profile_control_state(&mut ui).await;
     let palette = Palette::default();
 
     let mut events = EventStream::new();
@@ -120,8 +121,10 @@ pub async fn run_dashboard(
                         .last_runtime_config_refresh_at
                         .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
                 {
-                    let url =
-                        format!("http://127.0.0.1:{}/__codex_helper/config/runtime", ui.admin_port);
+                    let url = format!(
+                        "http://127.0.0.1:{}/__codex_helper/api/v1/runtime/status",
+                        ui.admin_port
+                    );
                     let fetch = async {
                         let client = reqwest::Client::new();
                         client

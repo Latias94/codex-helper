@@ -3,7 +3,7 @@
 > Put Codex behind a small local “bumper”:  
 > centralize all your relays / keys / quotas, auto-switch when an upstream is exhausted or failing, and get handy CLI helpers for sessions, filtering, and diagnostics.
 
-Current version: `v0.11.0`
+Current version: `v0.13.0`
 
 > 中文说明: `README.md`
 
@@ -68,6 +68,126 @@ This will:
 - On Ctrl+C, attempt to restore the original Codex config from the backup.
 
 After that, you keep using your usual `codex ...` commands; codex-helper just sits in the middle.
+
+---
+
+## What The Product Is Now
+
+As of the current release, `codex-helper` is no longer just “a local proxy with multi-upstream failover”.
+
+It is now a **Codex-first local control plane**:
+
+- `station` / `provider` management for relays and upstream inventory;
+- `profile`-driven intent such as `daily`, `fast`, or `deep`;
+- session identity cards that answer which station / upstream / model / fast mode / reasoning setting a Codex session is actually using;
+- session-scoped overrides for `model`, `reasoning_effort`, `service_tier`, and station selection;
+- runtime health, breaker, and same-station failover semantics;
+- an honest LAN / Tailscale “central relay” shape, without pretending remote devices automatically gain access to host-local transcript/session files.
+
+The practical mental model is now:
+
+> `Codex CLI -> codex-helper data plane -> station/profile/session control plane`
+
+---
+
+## Three Core Concepts
+
+### 1. Station
+
+A `station` is the operator-facing routing target: a relay or a grouped provider target that you enable, disable, probe, drain, or quick-switch.
+
+Compatibility note:
+
+- older config/runtime naming still uses `config` in places;
+- on current public API / GUI / docs surfaces, you should read that as `station` first.
+
+### 2. Profile
+
+A `profile` is a reusable control template:
+
+- target station
+- target model
+- `service_tier` / fast mode
+- `reasoning_effort`
+
+Think of profiles as intent presets, not just provider presets.
+
+### 3. Session Binding / Override
+
+The session is now the main control object. You can:
+
+- inspect a single-session identity card;
+- apply a profile to one session;
+- override `model / reasoning_effort / service_tier / station` per session;
+- inspect where each effective value came from:
+  - session override
+  - profile default
+  - request payload
+  - station mapping
+  - runtime fallback
+
+This is the reason session control is now meaningful instead of “guess which Codex process this maps to”.
+
+---
+
+## Control Plane Quick Entry Points
+
+If you want the shortest path to the current feature set, these are the main entry points:
+
+- TUI / GUI
+  - `Stations`: station capability, health, breaker, quick switch
+  - `Sessions`: session identity, effective route, session overrides
+  - `Profiles` / Config v2: profile and station/provider structure management
+- Read APIs
+  - `GET /__codex_helper/api/v1/capabilities`
+  - `GET /__codex_helper/api/v1/snapshot`
+  - `GET /__codex_helper/api/v1/sessions`
+  - `GET /__codex_helper/api/v1/sessions/{session_id}`
+- Control APIs
+  - `GET/POST /__codex_helper/api/v1/overrides/session`
+  - `POST /__codex_helper/api/v1/overrides/session/profile`
+  - `GET /__codex_helper/api/v1/profiles`
+  - `GET /__codex_helper/api/v1/stations`
+  - `GET/POST /__codex_helper/api/v1/retry/config`
+
+For design/runtime boundaries, read:
+
+- `docs/workstreams/codex-control-plane-refactor/README.md`
+- `docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md`
+- `docs/workstreams/codex-control-plane-refactor/CONFIG_V2_MIGRATION.md`
+
+---
+
+## LAN / Tailscale Central Relay Mode
+
+The recommended shared deployment shape is not “remote desktop attachment”.
+
+It is:
+
+1. one always-on host runs `codex-helper`;
+2. other devices send Codex traffic to that host’s proxy port;
+3. GUI or future WebUI attaches to the admin/control-plane port.
+
+Current capability boundary:
+
+- Shareable:
+  - station/profile management
+  - session identity
+  - observed request history
+  - session overrides
+  - health / breaker / probe visibility
+- Host-local only:
+  - `~/.codex/sessions`
+  - transcript browsing
+  - local path opening
+
+Remote admin security boundary:
+
+- loopback access does not require a token;
+- non-loopback admin access requires `CODEX_HELPER_ADMIN_TOKEN` on the host;
+- clients must send the same token via header `x-codex-helper-admin-token`.
+
+If you plan to use codex-helper across LAN / Tailscale devices, this section matters more than the older “multi-upstream failover” framing below.
 
 ---
 

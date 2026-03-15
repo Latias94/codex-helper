@@ -1,4 +1,5 @@
 use axum::Json;
+use axum::extract::Query;
 use axum::http::StatusCode;
 
 use super::ProxyService;
@@ -20,6 +21,11 @@ async fn save_proxy_config_and_reload(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct ControlTraceQuery {
+    limit: Option<usize>,
 }
 
 pub(super) async fn runtime_config_status(
@@ -64,4 +70,14 @@ pub(super) async fn list_profiles(
     proxy: ProxyService,
 ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
     Ok(Json(make_profiles_response(&proxy).await))
+}
+
+pub(super) async fn get_control_trace(
+    _proxy: ProxyService,
+    Query(q): Query<ControlTraceQuery>,
+) -> Result<Json<Vec<crate::logging::ControlTraceLogEntry>>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(80).clamp(20, 400);
+    crate::logging::read_recent_control_trace_entries(limit)
+        .map(Json)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }

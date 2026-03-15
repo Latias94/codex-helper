@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ use crate::dashboard_core::{
     RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationOption, WindowStats,
     build_dashboard_snapshot, build_profile_options_from_mgr, build_station_options_from_mgr,
 };
+use crate::logging::{ControlTraceLogEntry, control_trace_path, read_recent_control_trace_entries};
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_port_for_proxy_port,
     local_admin_base_url_for_proxy_port, local_proxy_base_url,
@@ -110,6 +112,7 @@ pub struct AttachedStatus {
     pub supports_default_profile_override: bool,
     pub supports_station_runtime_override: bool,
     pub supports_session_override_reset: bool,
+    pub supports_control_trace_api: bool,
     pub supports_station_api: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
@@ -161,6 +164,7 @@ impl AttachedStatus {
             supports_default_profile_override: false,
             supports_station_runtime_override: false,
             supports_session_override_reset: false,
+            supports_control_trace_api: false,
             supports_station_api: false,
             shared_capabilities: SharedControlPlaneCapabilities::default(),
             host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
@@ -275,6 +279,41 @@ pub struct DiscoveredProxy {
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
     pub remote_admin_access: RemoteAdminAccessCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlTraceDataSource {
+    LocalFile {
+        path: PathBuf,
+    },
+    AttachedApi {
+        admin_base_url: String,
+    },
+    AttachedFallbackLocal {
+        admin_base_url: String,
+        path: PathBuf,
+    },
+}
+
+impl ControlTraceDataSource {
+    pub fn signature(&self) -> String {
+        match self {
+            ControlTraceDataSource::LocalFile { path } => format!("local:{}", path.display()),
+            ControlTraceDataSource::AttachedApi { admin_base_url } => {
+                format!("attached-api:{admin_base_url}")
+            }
+            ControlTraceDataSource::AttachedFallbackLocal {
+                admin_base_url,
+                path,
+            } => format!("attached-fallback:{admin_base_url}:{}", path.display()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlTraceReadResult {
+    pub source: ControlTraceDataSource,
+    pub entries: Vec<ControlTraceLogEntry>,
 }
 
 struct PortInUseModal {
@@ -425,6 +464,64 @@ impl ProxyController {
         }
     }
 
+    pub fn control_trace_source(&self) -> Option<ControlTraceDataSource> {
+        match &self.mode {
+            ProxyMode::Running(_) => Some(ControlTraceDataSource::LocalFile {
+                path: control_trace_path(),
+            }),
+            ProxyMode::Attached(att) if att.supports_control_trace_api => {
+                Some(ControlTraceDataSource::AttachedApi {
+                    admin_base_url: att.admin_base_url.clone(),
+                })
+            }
+            ProxyMode::Attached(att) => Some(ControlTraceDataSource::AttachedFallbackLocal {
+                admin_base_url: att.admin_base_url.clone(),
+                path: control_trace_path(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn control_trace_source_signature(&self) -> Option<String> {
+        self.control_trace_source().map(|source| source.signature())
+    }
+
+    pub fn read_control_trace_entries(
+        &self,
+        rt: &tokio::runtime::Runtime,
+        limit: usize,
+    ) -> anyhow::Result<ControlTraceReadResult> {
+        let limit = limit.clamp(20, 400);
+        let source = self
+            .control_trace_source()
+            .ok_or_else(|| anyhow::anyhow!("proxy is not running/attached"))?;
+
+        let entries = match &source {
+            ControlTraceDataSource::LocalFile { .. }
+            | ControlTraceDataSource::AttachedFallbackLocal { .. } => {
+                read_recent_control_trace_entries(limit)?
+            }
+            ControlTraceDataSource::AttachedApi { admin_base_url } => {
+                let client = self.http_client.clone();
+                let admin_base_url = admin_base_url.clone();
+                rt.block_on(async move {
+                    let response = send_admin_request(
+                        client
+                            .get(format!(
+                                "{admin_base_url}/__codex_helper/api/v1/control-trace?limit={limit}"
+                            ))
+                            .timeout(Duration::from_millis(800)),
+                    )
+                    .await?;
+                    let entries = response.json::<Vec<ControlTraceLogEntry>>().await?;
+                    Ok::<Vec<ControlTraceLogEntry>, anyhow::Error>(entries)
+                })?
+            }
+        };
+
+        Ok(ControlTraceReadResult { source, entries })
+    }
+
     pub fn snapshot(&self) -> Option<GuiRuntimeSnapshot> {
         match &self.mode {
             ProxyMode::Running(r) => Some(GuiRuntimeSnapshot {
@@ -564,6 +661,10 @@ impl ProxyController {
             }) {
                 attached.api_version = discovered.api_version;
                 attached.service_name = discovered.service_name.clone();
+                attached.supports_control_trace_api = discovered
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint == "/__codex_helper/api/v1/control-trace");
                 attached.shared_capabilities = discovered.shared_capabilities.clone();
                 attached.host_local_capabilities = discovered.host_local_capabilities.clone();
                 attached.remote_admin_access = discovered.remote_admin_access.clone();
@@ -862,6 +963,7 @@ impl ProxyController {
                 supports_default_profile_override: bool,
                 supports_station_runtime_override: bool,
                 supports_session_override_reset: bool,
+                supports_control_trace_api: bool,
                 supports_station_api: bool,
                 shared_capabilities: SharedControlPlaneCapabilities,
                 host_local_capabilities: HostLocalControlPlaneCapabilities,
@@ -920,6 +1022,9 @@ impl ProxyController {
                 let supports_session_override_reset = endpoints
                     .iter()
                     .any(|e| e == "/__codex_helper/api/v1/overrides/session/reset");
+                let supports_control_trace_api = endpoints
+                    .iter()
+                    .any(|e| e == "/__codex_helper/api/v1/control-trace");
                 let supports_session_override_aggregate = endpoints
                     .iter()
                     .any(|e| e == "/__codex_helper/api/v1/overrides/session");
@@ -1114,6 +1219,7 @@ impl ProxyController {
                         supports_default_profile_override,
                         supports_station_runtime_override,
                         supports_session_override_reset,
+                        supports_control_trace_api,
                         supports_station_api,
                         shared_capabilities,
                         host_local_capabilities,
@@ -1347,6 +1453,7 @@ impl ProxyController {
                     supports_default_profile_override,
                     supports_station_runtime_override,
                     supports_session_override_reset,
+                    supports_control_trace_api,
                     supports_station_api,
                     shared_capabilities,
                     host_local_capabilities,
@@ -1410,6 +1517,7 @@ impl ProxyController {
                     att.supports_station_runtime_override =
                         result.supports_station_runtime_override;
                     att.supports_session_override_reset = result.supports_session_override_reset;
+                    att.supports_control_trace_api = result.supports_control_trace_api;
                     att.supports_station_api = result.supports_station_api;
                     att.shared_capabilities = result.shared_capabilities;
                     att.host_local_capabilities = result.host_local_capabilities;
@@ -3694,6 +3802,124 @@ mod tests {
     }
 
     #[test]
+    fn read_control_trace_entries_prefers_attached_api_when_supported() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let app = Router::new().route(
+            "/__codex_helper/api/v1/control-trace",
+            get(|| async {
+                Json(vec![ControlTraceLogEntry {
+                    ts_ms: 300,
+                    kind: "request_completed".to_string(),
+                    service: Some("codex".to_string()),
+                    request_id: Some(9),
+                    event: Some("request_completed".to_string()),
+                    payload: serde_json::json!({
+                        "method": "POST",
+                        "path": "/v1/responses"
+                    }),
+                }])
+            }),
+        );
+        let (base_url, handle) = spawn_test_server(&rt, app);
+
+        let mut controller = ProxyController::new(4290, ServiceKind::Codex);
+        let mut attached = AttachedStatus::new(4290);
+        attached.admin_base_url = base_url.clone();
+        attached.supports_control_trace_api = true;
+        controller.mode = ProxyMode::Attached(attached);
+
+        let result = controller
+            .read_control_trace_entries(&rt, 80)
+            .expect("read attached control trace");
+
+        assert_eq!(
+            result.source,
+            ControlTraceDataSource::AttachedApi {
+                admin_base_url: base_url
+            }
+        );
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].ts_ms, 300);
+        assert_eq!(result.entries[0].kind, "request_completed");
+
+        handle.abort();
+    }
+
+    #[test]
+    fn read_control_trace_entries_falls_back_to_local_file_when_api_is_unavailable() {
+        let _env_lock = env_lock();
+        let mut scoped = ScopedEnv::default();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let trace_path = std::env::temp_dir()
+            .join("codex-helper-gui-tests")
+            .join(format!("control-trace-{unique}.jsonl"));
+        std::fs::create_dir_all(trace_path.parent().expect("trace parent"))
+            .expect("create trace parent");
+        unsafe {
+            scoped.set(
+                "CODEX_HELPER_CONTROL_TRACE_PATH",
+                trace_path.to_string_lossy().as_ref(),
+            );
+        }
+        std::fs::write(
+            &trace_path,
+            [
+                serde_json::json!({
+                    "ts_ms": 100,
+                    "kind": "retry_trace",
+                    "service": "codex",
+                    "request_id": 4,
+                    "event": "attempt_select",
+                    "payload": {
+                        "event": "attempt_select",
+                        "station_name": "right"
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts_ms": 200,
+                    "kind": "request_completed",
+                    "service": "codex",
+                    "request_id": 4,
+                    "event": "request_completed",
+                    "payload": {
+                        "method": "POST",
+                        "path": "/v1/responses"
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write local control trace");
+
+        let mut controller = ProxyController::new(4291, ServiceKind::Codex);
+        let mut attached = AttachedStatus::new(4291);
+        attached.admin_base_url = "http://100.88.0.5:4101".to_string();
+        attached.supports_control_trace_api = false;
+        controller.mode = ProxyMode::Attached(attached);
+
+        let result = controller
+            .read_control_trace_entries(&rt, 80)
+            .expect("fallback local control trace");
+
+        assert_eq!(
+            result.source,
+            ControlTraceDataSource::AttachedFallbackLocal {
+                admin_base_url: "http://100.88.0.5:4101".to_string(),
+                path: trace_path.clone(),
+            }
+        );
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.entries[0].ts_ms, 200);
+        assert_eq!(result.entries[0].kind, "request_completed");
+    }
+
+    #[test]
     fn attached_runtime_meta_uses_station_endpoints() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
 
@@ -4254,11 +4480,13 @@ mod tests {
                             name: "hk".to_string(),
                             base_url: "https://right-hk.example.com/v1".to_string(),
                             enabled: true,
+                            priority: 0,
                         },
                         crate::config::PersistedProviderEndpointSpec {
                             name: "us".to_string(),
                             base_url: "https://right-us.example.com/v1".to_string(),
                             enabled: false,
+                            priority: 1,
                         },
                     ],
                 },

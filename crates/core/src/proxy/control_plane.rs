@@ -258,6 +258,7 @@ pub(super) async fn api_capabilities(
             "/__codex_helper/api/v1/status/station-health",
             "/__codex_helper/api/v1/runtime/status",
             "/__codex_helper/api/v1/runtime/reload",
+            "/__codex_helper/api/v1/control-trace",
             "/__codex_helper/api/v1/retry/config",
             "/__codex_helper/api/v1/stations",
             "/__codex_helper/api/v1/stations/runtime",

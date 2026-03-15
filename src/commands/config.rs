@@ -151,15 +151,15 @@ fn print_explain_text(
     println!("Service: {}", label);
     println!(
         "Active station: {}",
-        routing.active_config.as_deref().unwrap_or("<none>")
+        routing.active_station.as_deref().unwrap_or("<none>")
     );
     println!("Routing mode: {}", routing.mode);
 
-    if routing.eligible_configs.is_empty() {
+    if routing.eligible_stations.is_empty() {
         println!("Candidate order: <empty>");
     } else {
         println!("Candidate order:");
-        for (idx, candidate) in routing.eligible_configs.iter().enumerate() {
+        for (idx, candidate) in routing.eligible_stations.iter().enumerate() {
             let active = if candidate.active { " active" } else { "" };
             if let Some(alias) = candidate.alias.as_deref() {
                 println!(
@@ -186,7 +186,7 @@ fn print_explain_text(
         }
     }
 
-    if let Some(fallback) = &routing.fallback_config {
+    if let Some(fallback) = &routing.fallback_station {
         println!(
             "Fallback: {} (level={}, enabled={}, upstreams={})",
             fallback.name, fallback.level, fallback.enabled, fallback.upstreams

@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-core"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-gui"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-tui"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "codex-helper-core",
@@ -1041,6 +1041,7 @@ dependencies = [
  "futures-util",
  "ratatui",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "unicode-width",

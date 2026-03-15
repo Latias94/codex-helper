@@ -4,7 +4,7 @@ use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::config::RetryStrategy;
-use crate::tui::model::{Palette, Snapshot, now_ms};
+use crate::tui::model::{Palette, Snapshot, now_ms, shorten_middle};
 use crate::tui::state::UiState;
 
 pub(super) fn render_settings_page(
@@ -105,7 +105,7 @@ pub(super) fn render_settings_page(
     }
     if let Some((cfg, n)) = s5.top_config.as_ref() {
         lines.push(Line::from(vec![
-            Span::styled("5m top config: ", Style::default().fg(p.muted)),
+            Span::styled("5m top station: ", Style::default().fg(p.muted)),
             Span::styled(cfg.to_string(), Style::default().fg(p.text)),
             Span::styled(format!("  n={n}"), Style::default().fg(p.muted)),
         ]));
@@ -165,6 +165,72 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
+        crate::tui::i18n::pick(ui.language, "Profile 控制", "Profile control"),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "配置默认：", "configured default: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            ui.configured_default_profile.as_deref().unwrap_or("<none>"),
+            Style::default().fg(p.text),
+        ),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "  (按 p 管理)", "  (press p to manage)"),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "运行时覆盖：", "runtime override: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            ui.runtime_default_profile_override
+                .as_deref()
+                .unwrap_or("<none>"),
+            Style::default().fg(p.text),
+        ),
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "  (按 P 管理)", "  (press P to manage)"),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "当前生效：", "effective default: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            ui.effective_default_profile.as_deref().unwrap_or("<none>"),
+            Style::default().fg(p.text),
+        ),
+    ]));
+    let profile_list = if ui.profile_options.is_empty() {
+        crate::tui::i18n::pick(ui.language, "<no profiles>", "<no profiles>").to_string()
+    } else {
+        shorten_middle(
+            ui.profile_options
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+                .as_str(),
+            110,
+        )
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            crate::tui::i18n::pick(ui.language, "可用 profile：", "available profiles: "),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(profile_list, Style::default().fg(p.text)),
+    ]));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
         crate::tui::i18n::pick(ui.language, "Health Check", "Health Check"),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
@@ -184,7 +250,7 @@ pub(super) fn render_settings_page(
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![
-        Span::styled("config: ", Style::default().fg(p.muted)),
+        Span::styled("config file: ", Style::default().fg(p.muted)),
         Span::styled(
             crate::config::config_file_path().display().to_string(),
             Style::default().fg(p.text),
@@ -288,14 +354,14 @@ pub(super) fn render_settings_page(
     lines.push(Line::from(crate::tui::i18n::pick(
         ui.language,
         if ui.service_name == "codex" {
-            "  1-8 切页  ? 帮助  q 退出  L 语言  (Configs: i 详情  Stats: y 导出/复制  Settings: R 重载配置  O 覆盖导入(二次确认))"
+            "  1-8 切页  ? 帮助  q 退出  L 语言  (Stations: i 详情  Stats: y 导出/复制  Settings: R 重载配置  O 覆盖导入(二次确认))"
         } else {
-            "  1-8 切页  ? 帮助  q 退出  L 语言  (Configs: i 详情  Stats: y 导出/复制)"
+            "  1-8 切页  ? 帮助  q 退出  L 语言  (Stations: i 详情  Stats: y 导出/复制)"
         },
         if ui.service_name == "codex" {
-            "  1-8 pages  ? help  q quit  L language  (Configs: i details  Stats: y export/copy  Settings: R reload  O overwrite(confirm))"
+            "  1-8 pages  ? help  q quit  L language  (Stations: i details  Stats: y export/copy  Settings: R reload  O overwrite(confirm))"
         } else {
-            "  1-8 pages  ? help  q quit  L language  (Configs: i details  Stats: y export/copy)"
+            "  1-8 pages  ? help  q quit  L language  (Stations: i details  Stats: y export/copy)"
         },
     )));
 

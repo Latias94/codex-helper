@@ -75,7 +75,7 @@ pub(super) fn render_requests_page(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["Age", "St", "Dur", "Att", "Model", "Cfg", "Pid", "Path"])
+    let header = Row::new(["Age", "St", "Dur", "Att", "Model", "Stn", "Pid", "Path"])
         .style(Style::default().fg(p.muted))
         .height(1);
 
@@ -92,7 +92,7 @@ pub(super) fn render_requests_page(
             let attempts_n = r.retry.as_ref().map(|x| x.attempts).unwrap_or(1);
             let attempts = attempts_n.to_string();
             let model = r.model.as_deref().unwrap_or("-").to_string();
-            let cfg = r.config_name.as_deref().unwrap_or("-").to_string();
+            let cfg = r.station_name.as_deref().unwrap_or("-").to_string();
             let pid = r.provider_id.as_deref().unwrap_or("-").to_string();
             let path = shorten_middle(&r.path, 60);
 
@@ -185,9 +185,9 @@ pub(super) fn render_requests_page(
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("config: ", Style::default().fg(p.muted)),
+            Span::styled("station: ", Style::default().fg(p.muted)),
             Span::styled(
-                r.config_name.as_deref().unwrap_or("-").to_string(),
+                r.station_name.as_deref().unwrap_or("-").to_string(),
                 Style::default().fg(p.accent),
             ),
         ]));

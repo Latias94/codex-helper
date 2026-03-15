@@ -66,6 +66,7 @@ pub(super) async fn finish_and_build_forward_response(
         .await;
 
     log_request_with_debug(
+        Some(request_id),
         proxy.service_name,
         method.as_str(),
         path,

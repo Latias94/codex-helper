@@ -3,7 +3,7 @@
 > 让 Codex CLI 走一层本地“保险杠”：  
 > 集中管理所有中转站 / key / 配额，在额度用完或上游挂掉时自动切换，并提供会话与脱敏辅助工具。
 
-当前版本：`v0.11.0`
+当前版本：`v0.13.0`
 
 > English version: `README_EN.md`
 
@@ -68,6 +68,122 @@ ch
 - 用 Ctrl+C 或在 TUI 中按 `q` 退出时，尝试从备份恢复原始 Codex 配置。
 
 从此之后，你继续用原来的 `codex` 命令即可，所有请求会自动经过 codex-helper。
+
+---
+
+## 当前产品定位
+
+从当前版本开始，`codex-helper` 不再只是“本地代理 + 多上游切换工具”，而是一个 **Codex-first 本地控制平面**：
+
+- 用 `station` / `provider` 管理中转站与上游，而不是只靠零散 `base_url` 记忆配置；
+- 用 `profile` 表达常用意图，例如 `daily` / `fast` / `deep`；
+- 用 **session identity card** 回答“这个 Codex 会话现在到底走哪个 station / upstream / model / fast mode / reasoning”；
+- 支持 **session 级覆盖**：`model`、`reasoning_effort`、`service_tier`、`station`；
+- 内置 runtime health、breaker、same-station failover，可在失败时先耗尽当前 station 内其他 eligible upstream，再考虑下一站点；
+- 支持局域网 / Tailscale 下的 **central relay** 形态，但不会假装远程设备天然拥有宿主机的 transcript/session 文件访问能力。
+
+如果你之前把它理解成“一个帮我切换 config.toml 的本地代理”，现在可以把它理解成：
+
+> `Codex CLI -> codex-helper data plane -> station/profile/session control plane`
+
+---
+
+## 三个核心概念
+
+### 1. Station
+
+`station` 是操作层面对“一个中转站 / 一组 provider 成员”的抽象。你平时做的启用、禁用、切换、探活、熔断，核心都发生在这一层。
+
+兼容说明：
+
+- 代码和部分旧配置里仍然会看到 `config` 这个名字；
+- 在当前公开 API / GUI / 文档语义里，优先把它理解为 `station`。
+
+### 2. Profile
+
+`profile` 是可复用的控制模板，用来表达“我想怎么跑这类会话”，例如：
+
+- 目标 station
+- 目标 model
+- `service_tier` / fast mode
+- `reasoning_effort`
+
+适合理解为“意图模板”，而不是单纯的 provider 预设。
+
+### 3. Session Binding / Override
+
+`session` 是控制平面的核心对象。你现在可以：
+
+- 看单会话 identity card；
+- 对单会话应用 profile；
+- 对单会话覆盖 `model / reasoning_effort / service_tier / station`；
+- 区分值到底来自：
+  - session override
+  - profile default
+  - request payload
+  - station mapping
+  - runtime fallback
+
+这也是为什么“先知道当前 Codex 会话对应哪个对象”现在已经变成一等能力，而不是靠猜。
+
+---
+
+## 控制平面快速入口
+
+如果你只是想直接用功能，不想先翻完整文档，可以先记住这几个入口：
+
+- TUI / GUI
+  - `Stations`：看 station、能力、健康、breaker、快速切换
+  - `Sessions`：看 session identity、effective route、session override
+  - `Profiles` / Config v2：管理 profile、station/provider 结构
+- 只读 API
+  - `GET /__codex_helper/api/v1/capabilities`
+  - `GET /__codex_helper/api/v1/snapshot`
+  - `GET /__codex_helper/api/v1/sessions`
+  - `GET /__codex_helper/api/v1/sessions/{session_id}`
+- 控制 API
+  - `GET/POST /__codex_helper/api/v1/overrides/session`
+  - `POST /__codex_helper/api/v1/overrides/session/profile`
+  - `GET /__codex_helper/api/v1/profiles`
+  - `GET /__codex_helper/api/v1/stations`
+  - `GET/POST /__codex_helper/api/v1/retry/config`
+
+如果你正在做重构对照或想看设计边界，建议直接读：
+
+- `docs/workstreams/codex-control-plane-refactor/README.md`
+- `docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md`
+- `docs/workstreams/codex-control-plane-refactor/CONFIG_V2_MIGRATION.md`
+
+---
+
+## LAN / Tailscale 中央中转模式
+
+推荐的共享形态不是“远程附着桌面”，而是：
+
+1. 一台常开机器运行 `codex-helper`，同时提供 proxy 和 admin/control-plane；
+2. 其他设备把 Codex 请求发到这台机器的 proxy 端口；
+3. GUI 或未来 WebUI 连接 admin 端口做控制。
+
+当前边界很明确：
+
+- 可以共享：
+  - station/profile 管理
+  - session identity
+  - observed request history
+  - session override
+  - health / breaker / probe
+- 不能天然共享：
+  - 宿主机 `~/.codex/sessions`
+  - transcript 文件浏览
+  - 本地路径打开
+
+远程 admin 的安全边界：
+
+- loopback 默认不需要 token；
+- 非 loopback 访问需要在宿主机设置 `CODEX_HELPER_ADMIN_TOKEN`；
+- 客户端通过请求头 `x-codex-helper-admin-token` 发送同一个 token。
+
+如果你要把它放到局域网 / Tailscale 里，这一段比下面的“多上游切换”更值得先读。
 
 ---
 

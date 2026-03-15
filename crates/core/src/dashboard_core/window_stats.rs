@@ -79,7 +79,7 @@ where
             {
                 *by_provider.entry(pid.to_string()).or_insert(0) += 1;
             }
-            if let Some(cfg) = r.config_name.as_deref()
+            if let Some(cfg) = r.station_name.as_deref()
                 && !cfg.trim().is_empty()
             {
                 *by_config.entry(cfg.to_string()).or_insert(0) += 1;

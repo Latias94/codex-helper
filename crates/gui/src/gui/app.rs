@@ -434,7 +434,7 @@ impl eframe::App for GuiApp {
                     TrayAction::ApplyPinnedConfig { name } => {
                         match self
                             .proxy
-                            .apply_global_config_override(&self.rt, name.clone())
+                            .apply_global_station_override(&self.rt, name.clone())
                         {
                             Ok(()) => {
                                 self.proxy.refresh_current_if_due(
@@ -598,7 +598,7 @@ impl eframe::App for GuiApp {
         self.proxy.refresh_running_if_due(&self.rt, refresh);
 
         egui::TopBottomPanel::top("top_nav").show(ctx, |ui| {
-            super::pages::nav(ui, lang, &mut self.page);
+            super::pages::nav(ui, lang, &mut self.page, &self.proxy);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -636,11 +636,11 @@ fn tray_menu_model(proxy: &ProxyController) -> TrayMenuModel {
     let kind = proxy.kind();
     let snapshot = proxy.snapshot();
 
-    let mut configs = snapshot
+    let mut stations = snapshot
         .as_ref()
-        .map(|s| s.configs.clone())
+        .map(|s| s.stations.clone())
         .unwrap_or_default();
-    configs.sort_by(|a, b| a.name.cmp(&b.name));
+    stations.sort_by(|a, b| a.name.cmp(&b.name));
 
     let active_display = if kind == super::proxy_control::ProxyModeKind::Running {
         proxy.running().map(|r| {
@@ -649,8 +649,8 @@ fn tray_menu_model(proxy: &ProxyController) -> TrayMenuModel {
                 _ => r.cfg.codex.active.clone(),
             };
             let active_fallback = match r.service_name {
-                "claude" => r.cfg.claude.active_config().map(|c| c.name.clone()),
-                _ => r.cfg.codex.active_config().map(|c| c.name.clone()),
+                "claude" => r.cfg.claude.active_station().map(|c| c.name.clone()),
+                _ => r.cfg.codex.active_station().map(|c| c.name.clone()),
             };
             active_name
                 .or(active_fallback)
@@ -667,8 +667,10 @@ fn tray_menu_model(proxy: &ProxyController) -> TrayMenuModel {
         port: snapshot.as_ref().and_then(|s| s.port),
         supports_v1: snapshot.as_ref().is_some_and(|s| s.supports_v1),
         active_display,
-        configs,
-        global_override: snapshot.as_ref().and_then(|s| s.global_override.clone()),
+        stations,
+        global_station_override: snapshot
+            .as_ref()
+            .and_then(|s| s.global_station_override.clone()),
     }
 }
 

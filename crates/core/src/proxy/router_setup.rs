@@ -26,7 +26,8 @@ use super::persisted_config_api::{
     upsert_persisted_provider_spec, upsert_persisted_station_spec,
 };
 use super::runtime_admin_api::{
-    get_retry_config, list_profiles, reload_runtime_config, runtime_config_status, set_retry_config,
+    get_control_trace, get_retry_config, list_profiles, reload_runtime_config,
+    runtime_config_status, set_retry_config,
 };
 use super::session_overrides::{
     apply_session_manual_overrides, list_session_manual_overrides, list_session_model_overrides,
@@ -48,6 +49,7 @@ pub fn router(proxy: ProxyService) -> Router {
     let p11 = proxy.clone();
     let p12 = proxy.clone();
     let p13 = proxy.clone();
+    let p14 = proxy.clone();
     let p15 = proxy.clone();
     let p16 = proxy.clone();
     let p17 = proxy.clone();
@@ -133,6 +135,10 @@ pub fn router(proxy: ProxyService) -> Router {
         .route(
             "/__codex_helper/api/v1/runtime/reload",
             post(move || reload_runtime_config(p13.clone())),
+        )
+        .route(
+            "/__codex_helper/api/v1/control-trace",
+            get(move |q| get_control_trace(p14.clone(), q)),
         )
         .route(
             "/__codex_helper/api/v1/retry/config",

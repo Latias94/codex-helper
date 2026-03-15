@@ -38,8 +38,8 @@ pub struct TrayMenuModel {
     pub port: Option<u16>,
     pub supports_v1: bool,
     pub active_display: Option<String>,
-    pub configs: Vec<crate::dashboard_core::ConfigOption>,
-    pub global_override: Option<String>,
+    pub stations: Vec<crate::dashboard_core::StationOption>,
+    pub global_station_override: Option<String>,
 }
 
 pub struct TrayController {
@@ -220,9 +220,9 @@ fn compute_menu_sig(m: &TrayMenuModel) -> String {
     s.push_str("|active=");
     s.push_str(m.active_display.as_deref().unwrap_or("-"));
     s.push_str("|pinned=");
-    s.push_str(m.global_override.as_deref().unwrap_or("<auto>"));
+    s.push_str(m.global_station_override.as_deref().unwrap_or("<auto>"));
     s.push_str("|cfgs=");
-    for c in m.configs.iter() {
+    for c in m.stations.iter() {
         s.push_str(&c.name);
         s.push(',');
         s.push_str(if c.enabled { "1" } else { "0" });
@@ -303,7 +303,7 @@ fn build_menu_base(
 
         if model.proxy_kind != super::proxy_control::ProxyModeKind::Stopped {
             let pinned = model
-                .global_override
+                .global_station_override
                 .as_deref()
                 .unwrap_or_else(|| pick(lang, "<自动>", "<auto>"));
             menu.append(&MenuItem::new(
@@ -328,7 +328,7 @@ fn build_menu_base(
             .service_name
             .as_deref()
             .is_some_and(|s| s == "codex" || s == "claude")
-            && !model.configs.is_empty();
+            && !model.stations.is_empty();
         let active_menu = Submenu::new(
             pick(lang, "默认站点(active)", "Default station (active)"),
             can_set_active,
@@ -340,23 +340,23 @@ fn build_menu_base(
                 crate::config::ServiceKind::Codex
             };
             let active = model.active_display.as_deref().unwrap_or("");
-            for cfg in model.configs.iter() {
-                let label = format_config_label(cfg);
+            for station in model.stations.iter() {
+                let label = format_station_label(station);
                 let id = menu_id(
                     if svc == crate::config::ServiceKind::Claude {
                         "codex-helper-gui.tray.active.claude"
                     } else {
                         "codex-helper-gui.tray.active.codex"
                     },
-                    cfg.name.as_str(),
+                    station.name.as_str(),
                 );
-                let checked = cfg.name == active;
+                let checked = station.name == active;
                 let item = CheckMenuItem::with_id(id.clone(), label, true, checked, None);
                 dynamic_actions.insert(
                     id,
                     TrayAction::SetActiveConfig {
                         service: svc,
-                        name: cfg.name.clone(),
+                        name: station.name.clone(),
                     },
                 );
                 active_menu.append(&item)?;
@@ -370,7 +370,7 @@ fn build_menu_base(
             super::proxy_control::ProxyModeKind::Running
                 | super::proxy_control::ProxyModeKind::Attached
         )) && model.supports_v1
-            && !model.configs.is_empty();
+            && !model.stations.is_empty();
         let pinned_menu = Submenu::new(
             pick(
                 lang,
@@ -380,7 +380,7 @@ fn build_menu_base(
             can_pinned,
         );
         if can_pinned {
-            let cur = model.global_override.as_deref();
+            let cur = model.global_station_override.as_deref();
             let id_auto = MenuId::new("codex-helper-gui.tray.pinned.auto");
             let auto_item = CheckMenuItem::with_id(
                 id_auto.clone(),
@@ -392,15 +392,15 @@ fn build_menu_base(
             dynamic_actions.insert(id_auto, TrayAction::ApplyPinnedConfig { name: None });
             pinned_menu.append(&auto_item)?;
             pinned_menu.append(&PredefinedMenuItem::separator())?;
-            for cfg in model.configs.iter().filter(|c| c.enabled) {
-                let label = format_config_label(cfg);
-                let id = menu_id("codex-helper-gui.tray.pinned", cfg.name.as_str());
-                let checked = cur == Some(cfg.name.as_str());
+            for station in model.stations.iter().filter(|c| c.enabled) {
+                let label = format_station_label(station);
+                let id = menu_id("codex-helper-gui.tray.pinned", station.name.as_str());
+                let checked = cur == Some(station.name.as_str());
                 let item = CheckMenuItem::with_id(id.clone(), label, true, checked, None);
                 dynamic_actions.insert(
                     id,
                     TrayAction::ApplyPinnedConfig {
-                        name: Some(cfg.name.clone()),
+                        name: Some(station.name.clone()),
                     },
                 );
                 pinned_menu.append(&item)?;
@@ -506,14 +506,14 @@ fn build_menu_base(
     Ok(menu)
 }
 
-fn format_config_label(cfg: &crate::dashboard_core::ConfigOption) -> String {
-    let mut label = format!("L{} {}", cfg.level.clamp(1, 10), cfg.name);
-    if let Some(alias) = cfg.alias.as_deref()
+fn format_station_label(station: &crate::dashboard_core::StationOption) -> String {
+    let mut label = format!("L{} {}", station.level.clamp(1, 10), station.name);
+    if let Some(alias) = station.alias.as_deref()
         && !alias.trim().is_empty()
     {
         label.push_str(&format!(" ({alias})"));
     }
-    if !cfg.enabled {
+    if !station.enabled {
         label.push_str(" [off]");
     }
     label

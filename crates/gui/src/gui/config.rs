@@ -15,8 +15,6 @@ pub struct GuiConfig {
     #[serde(default)]
     pub history: HistoryConfig,
     #[serde(default)]
-    pub routing: RoutingConfig,
-    #[serde(default)]
     pub window: WindowConfig,
     #[serde(default)]
     pub tray: TrayConfig,
@@ -125,43 +123,6 @@ impl Default for HistoryConfig {
             group_open_recent_n: default_history_group_open_recent_n(),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingConfig {
-    /// Saved presets for proxy routing (service/port/pinned config).
-    #[serde(default)]
-    pub profiles: Vec<RoutingProfile>,
-    /// Selected preset name (if any).
-    #[serde(default)]
-    pub selected_profile: Option<String>,
-    /// Apply the selected profile automatically after start/attach.
-    #[serde(default = "default_true")]
-    pub apply_on_connect: bool,
-}
-
-impl Default for RoutingConfig {
-    fn default() -> Self {
-        Self {
-            profiles: Vec::new(),
-            selected_profile: None,
-            apply_on_connect: default_true(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingProfile {
-    pub name: String,
-    /// `codex` or `claude`
-    #[serde(default = "default_service")]
-    pub service: String,
-    /// Preferred port to start/attach (optional).
-    #[serde(default)]
-    pub port: Option<u16>,
-    /// Pinned config name for API v1 (optional). `None` means auto.
-    #[serde(default)]
-    pub pinned_config: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

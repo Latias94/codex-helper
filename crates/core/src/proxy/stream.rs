@@ -180,6 +180,7 @@ impl Drop for StreamFinalize {
                 ..self.service_tier.clone()
             };
             log_request_with_debug(
+                Some(request_id),
                 &self.service_name,
                 &self.method,
                 &self.path,
@@ -494,6 +495,7 @@ pub(super) async fn build_sse_success_response(
                         .._finalize.service_tier.clone()
                     };
                     log_request_with_debug(
+                        Some(request_id),
                         &service_name,
                         &method_s,
                         &path_s,

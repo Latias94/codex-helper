@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dashboard_core::WindowStats;
-use crate::dashboard_core::types::{ConfigOption, ControlProfileOption, StationOption};
+use crate::dashboard_core::types::{ControlProfileOption, StationOption};
 use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
-    ActiveRequest, ConfigHealth, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
-    SessionIdentityCard, SessionStats, UsageRollupView, build_session_identity_cards_from_parts,
-    enrich_session_identity_cards_with_host_transcripts,
+    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
+    SessionIdentityCard, SessionStats, StationHealth, UsageRollupView,
+    build_session_identity_cards_from_parts, enrich_session_identity_cards_with_host_transcripts,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,22 +18,34 @@ pub struct DashboardSnapshot {
     pub recent: Vec<FinishedRequest>,
     #[serde(default)]
     pub session_cards: Vec<SessionIdentityCard>,
-    pub global_override: Option<String>,
+    #[serde(default)]
+    pub global_station_override: Option<String>,
     #[serde(default)]
     pub session_model_overrides: HashMap<String, String>,
     #[serde(default)]
-    pub session_config_overrides: HashMap<String, String>,
+    pub session_station_overrides: HashMap<String, String>,
     #[serde(default)]
     pub session_effort_overrides: HashMap<String, String>,
     #[serde(default)]
     pub session_service_tier_overrides: HashMap<String, String>,
     pub session_stats: HashMap<String, SessionStats>,
-    pub config_health: HashMap<String, ConfigHealth>,
+    #[serde(default)]
+    pub station_health: HashMap<String, StationHealth>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
     pub lb_view: HashMap<String, LbConfigView>,
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
+}
+
+impl DashboardSnapshot {
+    pub fn effective_global_station_override(&self) -> Option<&str> {
+        self.global_station_override.as_deref()
+    }
+
+    pub fn effective_station_health(&self) -> &HashMap<String, StationHealth> {
+        &self.station_health
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +54,6 @@ pub struct ApiV1Snapshot {
     pub service_name: String,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
-    pub configs: Vec<ConfigOption>,
     #[serde(default)]
     pub stations: Vec<StationOption>,
     #[serde(default)]
@@ -75,7 +86,7 @@ pub async fn build_dashboard_snapshot(
     let (
         active,
         mut recent_all,
-        global_override,
+        global_station_override,
         session_model,
         session_cfg,
         session_effort,
@@ -83,21 +94,21 @@ pub async fn build_dashboard_snapshot(
         session_bindings,
         session_stats,
         usage_rollup,
-        config_health,
+        station_health,
         health_checks,
         lb_view,
     ) = tokio::join!(
         state.list_active_requests(),
         state.list_recent_finished(recent_for_stats),
-        state.get_global_config_override(),
+        state.get_global_station_override(),
         state.list_session_model_overrides(),
-        state.list_session_config_overrides(),
+        state.list_session_station_overrides(),
         state.list_session_effort_overrides(),
         state.list_session_service_tier_overrides(),
         state.list_session_bindings(),
         state.list_session_stats(),
         state.get_usage_rollup_view(service_name, 12, stats_days),
-        state.get_config_health(service_name),
+        state.get_station_health(service_name),
         state.list_health_checks(service_name),
         state.get_lb_view(),
     );
@@ -112,7 +123,7 @@ pub async fn build_dashboard_snapshot(
         &session_model,
         &session_service_tier,
         &session_bindings,
-        global_override.as_deref(),
+        global_station_override.as_deref(),
         &session_stats,
     );
     enrich_session_identity_cards_with_host_transcripts(&mut session_cards).await;
@@ -126,13 +137,13 @@ pub async fn build_dashboard_snapshot(
         active,
         recent: recent_all,
         session_cards,
-        global_override,
+        global_station_override,
         session_model_overrides: session_model,
-        session_config_overrides: session_cfg,
+        session_station_overrides: session_cfg,
         session_effort_overrides: session_effort,
         session_service_tier_overrides: session_service_tier,
         session_stats,
-        config_health,
+        station_health,
         health_checks,
         lb_view,
         usage_rollup,

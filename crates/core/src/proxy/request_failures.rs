@@ -35,6 +35,7 @@ pub(super) fn log_no_routable_station(
     );
 
     log_request_with_debug(
+        None,
         proxy.service_name,
         method.as_str(),
         path,
@@ -78,6 +79,7 @@ pub(super) fn log_client_body_read_error(
     );
 
     log_request_with_debug(
+        None,
         proxy.service_name,
         method.as_str(),
         path,
@@ -129,6 +131,7 @@ pub(super) async fn finish_failed_proxy_request(
         .await;
 
     log_request_with_debug(
+        Some(request_id),
         proxy.service_name,
         method.as_str(),
         path,

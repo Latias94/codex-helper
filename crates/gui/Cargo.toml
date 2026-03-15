@@ -1,6 +1,6 @@
 [package]
 name = "codex-helper-gui"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Desktop GUI crate for codex-helper."
@@ -8,7 +8,7 @@ repository = "https://github.com/Latias94/codex-helper"
 
 [dependencies]
 anyhow = "1.0.100"
-codex-helper-core = { path = "../core", version = "0.12.1", features = ["gui"] }
+codex-helper-core = { path = "../core", version = "0.13.0", features = ["gui"] }
 eframe = "0.33.3"
 tray-icon = "0.21.3"
 fontdb = "0.16.2"

@@ -116,7 +116,7 @@ fn render_sessions_panel(
             if r.override_effort.is_some() {
                 badges.push(Span::styled("E", Style::default().fg(p.accent)));
             }
-            if r.override_config_name.is_some() {
+            if r.override_station_name.is_some() {
                 badges.push(Span::styled("C", Style::default().fg(p.accent)));
             }
             if r.override_model.is_some() {
@@ -229,7 +229,7 @@ fn render_session_details(
         .and_then(|r| r.override_effort.as_deref())
         .unwrap_or("-");
     let override_cfg = selected
-        .and_then(|r| r.override_config_name.as_deref())
+        .and_then(|r| r.override_station_name.as_deref())
         .unwrap_or("-");
     let override_model = selected
         .and_then(|r| r.override_model.as_deref())
@@ -247,7 +247,7 @@ fn render_session_details(
         .and_then(|r| r.last_provider_id.as_deref())
         .unwrap_or("-");
     let cfg = selected
-        .and_then(|r| r.last_config_name.as_deref())
+        .and_then(|r| r.last_station_name.as_deref())
         .unwrap_or("-");
     let effort = selected
         .and_then(|r| r.override_effort.as_deref())
@@ -291,8 +291,8 @@ fn render_session_details(
         .filter(|u| u.total_tokens > 0)
         .map(usage_line)
         .unwrap_or_else(|| "tok in/out/rsn/ttl: -".to_string());
-    let posture =
-        selected.map(|row| session_control_posture(row, snapshot.global_override.as_deref()));
+    let posture = selected
+        .map(|row| session_control_posture(row, snapshot.global_station_override.as_deref()));
 
     let lines = vec![
         kv_line(
@@ -344,7 +344,7 @@ fn render_session_details(
             provider.to_string(),
             Style::default().fg(p.text),
         ),
-        kv_line(p, "config", cfg.to_string(), Style::default().fg(p.text)),
+        kv_line(p, "station", cfg.to_string(), Style::default().fg(p.text)),
         kv_line(
             p,
             "effort",
@@ -369,7 +369,7 @@ fn render_session_details(
             p,
             "override",
             format!(
-                "model={override_model}, effort={override_effort}, cfg={override_cfg}, tier={override_service_tier}"
+                "model={override_model}, effort={override_effort}, station={override_cfg}, tier={override_service_tier}"
             ),
             Style::default().fg(
                 if override_model != "-"

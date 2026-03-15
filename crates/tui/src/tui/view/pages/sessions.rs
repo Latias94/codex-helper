@@ -123,7 +123,7 @@ pub(super) fn render_sessions_page(
                 .map(|u| tokens_short(u.total_tokens))
                 .unwrap_or_else(|| "-".to_string());
             let pin = row
-                .override_config_name
+                .override_station_name
                 .as_deref()
                 .map(|s| shorten(s, 12))
                 .unwrap_or_else(|| "-".to_string());
@@ -155,7 +155,7 @@ pub(super) fn render_sessions_page(
                 Cell::from(Span::styled(tok, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(
                     pin,
-                    Style::default().fg(if row.override_config_name.is_some() {
+                    Style::default().fg(if row.override_station_name.is_some() {
                         p.accent
                     } else {
                         p.muted
@@ -210,7 +210,7 @@ pub(super) fn render_sessions_page(
         .unwrap_or_else(|| "-".to_string());
         let observed_model = row.last_model.as_deref().unwrap_or("-");
         let provider = row.last_provider_id.as_deref().unwrap_or("-");
-        let observed_cfg = row.last_config_name.as_deref().unwrap_or("-");
+        let observed_cfg = row.last_station_name.as_deref().unwrap_or("-");
         let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
         let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");
         let observed_service_tier = row.last_service_tier.as_deref().unwrap_or("-");
@@ -220,7 +220,7 @@ pub(super) fn render_sessions_page(
             .map(|mode| format!("{mode:?}").to_ascii_lowercase())
             .unwrap_or_else(|| "-".to_string());
         let effective_model = format_resolved_route_value(row.effective_model.as_ref());
-        let effective_cfg = format_resolved_route_value(row.effective_config_name.as_ref());
+        let effective_cfg = format_resolved_route_value(row.effective_station.as_ref());
         let effective_upstream =
             format_resolved_route_value(row.effective_upstream_base_url.as_ref());
         let effective_effort = format_resolved_route_value(row.effective_reasoning_effort.as_ref());
@@ -228,16 +228,16 @@ pub(super) fn render_sessions_page(
             format_resolved_route_value(row.effective_service_tier.as_ref());
         let override_model = row.override_model.as_deref().unwrap_or("-");
         let override_effort = row.override_effort.as_deref().unwrap_or("-");
-        let override_cfg = row.override_config_name.as_deref().unwrap_or("-");
+        let override_cfg = row.override_station_name.as_deref().unwrap_or("-");
         let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
-        let global_cfg = snapshot.global_override.as_deref().unwrap_or("-");
-        let posture = session_control_posture(row, snapshot.global_override.as_deref());
+        let global_cfg = snapshot.global_station_override.as_deref().unwrap_or("-");
+        let posture = session_control_posture(row, snapshot.global_station_override.as_deref());
         let routing = if session_row_has_any_override(row) {
             format!(
-                "session(model={override_model}, cfg={override_cfg}, tier={override_service_tier})"
+                "session(model={override_model}, station={override_cfg}, tier={override_service_tier})"
             )
         } else if global_cfg != "-" {
-            format!("pinned(global)={global_cfg}")
+            format!("pinned(global-station)={global_cfg}")
         } else {
             "auto".to_string()
         };
@@ -311,7 +311,7 @@ pub(super) fn render_sessions_page(
         ));
         lines.push(kv_line(
             p,
-            "config(last)",
+            "station(last)",
             observed_cfg.to_string(),
             Style::default().fg(p.text),
         ));
@@ -346,7 +346,7 @@ pub(super) fn render_sessions_page(
         ));
         lines.push(kv_line(
             p,
-            "config",
+            "station",
             effective_cfg,
             Style::default().fg(p.text),
         ));
@@ -372,7 +372,7 @@ pub(super) fn render_sessions_page(
             p,
             "override",
             format!(
-                "model={override_model}, effort={override_effort}, cfg={override_cfg}, tier={override_service_tier}, global={global_cfg}"
+                "model={override_model}, effort={override_effort}, station={override_cfg}, tier={override_service_tier}, global_station={global_cfg}"
             ),
             Style::default().fg(if session_row_has_any_override(row) || global_cfg != "-" {
                 p.accent

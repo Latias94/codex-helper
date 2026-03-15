@@ -21,6 +21,20 @@ pub struct HostLocalControlPlaneCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RemoteAdminAccessCapabilities {
+    #[serde(default)]
+    pub loopback_without_token: bool,
+    #[serde(default)]
+    pub remote_requires_token: bool,
+    #[serde(default)]
+    pub remote_enabled: bool,
+    #[serde(default)]
+    pub token_header: String,
+    #[serde(default)]
+    pub token_env_var: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ApiV1Capabilities {
     #[serde(default)]
     pub api_version: u32,
@@ -32,6 +46,8 @@ pub struct ApiV1Capabilities {
     pub shared_capabilities: SharedControlPlaneCapabilities,
     #[serde(default)]
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
+    #[serde(default)]
+    pub remote_admin_access: RemoteAdminAccessCapabilities,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -52,7 +68,7 @@ pub enum ModelCatalogKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ConfigCapabilitySummary {
+pub struct StationCapabilitySummary {
     #[serde(default)]
     pub model_catalog_kind: ModelCatalogKind,
     #[serde(default)]
@@ -64,7 +80,7 @@ pub struct ConfigCapabilitySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigOption {
+pub struct StationOption {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
@@ -85,14 +101,14 @@ pub struct ConfigOption {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_state_override: Option<RuntimeConfigState>,
     #[serde(default)]
-    pub capabilities: ConfigCapabilitySummary,
+    pub capabilities: StationCapabilitySummary,
 }
-
-pub type StationOption = ConfigOption;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlProfileOption {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub station: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -230,6 +230,14 @@ fn default_service_config_level() -> u8 {
     1
 }
 
+fn default_provider_endpoint_priority() -> u32 {
+    0
+}
+
+fn is_default_provider_endpoint_priority(value: &u32) -> bool {
+    *value == default_provider_endpoint_priority()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServiceConfigManager {
     /// 当前激活配置名
@@ -1070,6 +1078,11 @@ pub struct ProviderEndpointV2 {
     pub base_url: String,
     #[serde(default = "default_service_config_enabled")]
     pub enabled: bool,
+    #[serde(
+        default = "default_provider_endpoint_priority",
+        skip_serializing_if = "is_default_provider_endpoint_priority"
+    )]
+    pub priority: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
     #[serde(
@@ -1164,6 +1177,11 @@ pub struct PersistedProviderEndpointSpec {
     pub base_url: String,
     #[serde(default = "default_service_config_enabled")]
     pub enabled: bool,
+    #[serde(
+        default = "default_provider_endpoint_priority",
+        skip_serializing_if = "is_default_provider_endpoint_priority"
+    )]
+    pub priority: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1236,6 +1254,29 @@ fn merge_bool_maps(
     merged
 }
 
+fn compare_provider_endpoints(
+    left_name: &str,
+    left: &ProviderEndpointV2,
+    right_name: &str,
+    right: &ProviderEndpointV2,
+) -> std::cmp::Ordering {
+    left.priority
+        .cmp(&right.priority)
+        .then_with(|| left_name.cmp(right_name))
+        .then_with(|| left.base_url.cmp(&right.base_url))
+}
+
+fn ordered_provider_endpoint_names(provider: &ProviderConfigV2) -> Vec<String> {
+    let mut endpoints = provider.endpoints.iter().collect::<Vec<_>>();
+    endpoints.sort_by(|(left_name, left), (right_name, right)| {
+        compare_provider_endpoints(left_name, left, right_name, right)
+    });
+    endpoints
+        .into_iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>()
+}
+
 fn compile_service_view_v2(
     service_name: &str,
     view: &ServiceViewV2,
@@ -1274,7 +1315,7 @@ fn compile_service_view_v2(
             }
 
             let endpoint_names = if member.endpoint_names.is_empty() {
-                provider.endpoints.keys().cloned().collect::<Vec<_>>()
+                ordered_provider_endpoint_names(provider)
             } else {
                 member.endpoint_names.clone()
             };
@@ -1336,27 +1377,22 @@ pub fn build_persisted_station_catalog(view: &ServiceViewV2) -> PersistedStation
             name: name.clone(),
             alias: provider.alias.clone(),
             enabled: provider.enabled,
-            endpoints: provider
-                .endpoints
-                .iter()
-                .map(
-                    |(endpoint_name, endpoint)| PersistedStationProviderEndpointRef {
-                        name: endpoint_name.clone(),
-                        base_url: endpoint.base_url.clone(),
-                        enabled: endpoint.enabled,
-                    },
-                )
+            endpoints: ordered_provider_endpoint_names(provider)
+                .into_iter()
+                .filter_map(|endpoint_name| {
+                    provider
+                        .endpoints
+                        .get(endpoint_name.as_str())
+                        .map(|endpoint| PersistedStationProviderEndpointRef {
+                            name: endpoint_name,
+                            base_url: endpoint.base_url.clone(),
+                            enabled: endpoint.enabled,
+                        })
+                })
                 .collect(),
         })
         .collect::<Vec<_>>();
     providers.sort_by(|a, b| a.name.cmp(&b.name));
-    for provider in &mut providers {
-        provider.endpoints.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| a.base_url.cmp(&b.base_url))
-        });
-    }
 
     let mut stations = view
         .groups
@@ -1394,6 +1430,7 @@ pub fn build_persisted_provider_catalog(view: &ServiceViewV2) -> PersistedProvid
                     name: endpoint_name.clone(),
                     base_url: endpoint.base_url.clone(),
                     enabled: endpoint.enabled,
+                    priority: endpoint.priority,
                 })
                 .collect(),
         })
@@ -1401,9 +1438,11 @@ pub fn build_persisted_provider_catalog(view: &ServiceViewV2) -> PersistedProvid
     providers.sort_by(|a, b| a.name.cmp(&b.name));
     for provider in &mut providers {
         provider.endpoints.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| a.base_url.cmp(&b.base_url))
+            a.priority.cmp(&b.priority).then_with(|| {
+                a.name
+                    .cmp(&b.name)
+                    .then_with(|| a.base_url.cmp(&b.base_url))
+            })
         });
     }
     PersistedProvidersCatalog { providers }
@@ -1448,6 +1487,7 @@ fn migrate_service_manager_to_v2(mgr: &ServiceConfigManager) -> ServiceViewV2 {
                 ProviderEndpointV2 {
                     base_url: upstream.base_url.clone(),
                     enabled: true,
+                    priority: 0,
                     tags: upstream
                         .tags
                         .iter()
@@ -1542,6 +1582,7 @@ struct EndpointCompactBuild {
     key: EndpointBucketKey,
     upstream: UpstreamConfig,
     original_names: Vec<String>,
+    priority: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1920,10 +1961,14 @@ fn compact_service_view_v2(view: &ServiceViewV2) -> Result<ServiceViewV2> {
                     key: key.clone(),
                     upstream: effective.clone(),
                     original_names: Vec::new(),
+                    priority: endpoint.priority,
                 });
                 build.endpoint_index.insert(key.clone(), index);
                 index
             };
+            if endpoint.priority < build.endpoints[index].priority {
+                build.endpoints[index].priority = endpoint.priority;
+            }
             build.endpoints[index]
                 .original_names
                 .push(original_endpoint_name.clone());
@@ -1938,6 +1983,11 @@ fn compact_service_view_v2(view: &ServiceViewV2) -> Result<ServiceViewV2> {
     }
 
     for build in builds.values_mut() {
+        build.endpoints.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.upstream.base_url.cmp(&right.upstream.base_url))
+        });
         let mut counters = HashMap::new();
         let total = build.endpoints.len();
         for endpoint in &build.endpoints {
@@ -1991,6 +2041,7 @@ fn compact_service_view_v2(view: &ServiceViewV2) -> Result<ServiceViewV2> {
                 ProviderEndpointV2 {
                     base_url: endpoint.upstream.base_url.clone(),
                     enabled: endpoint.key.enabled,
+                    priority: endpoint.priority,
                     tags: string_map_without_common(&endpoint.upstream.tags, &common_tags),
                     supported_models: bool_map_without_common(
                         &endpoint.upstream.supported_models,
@@ -2032,7 +2083,7 @@ fn compact_service_view_v2(view: &ServiceViewV2) -> Result<ServiceViewV2> {
                 )
             })?;
             let endpoint_names = if member.endpoint_names.is_empty() {
-                provider.endpoints.keys().cloned().collect::<Vec<_>>()
+                ordered_provider_endpoint_names(provider)
             } else {
                 member.endpoint_names.clone()
             };
@@ -3252,6 +3303,7 @@ env_key = "RIGHTCODE_API_KEY"
             ProviderEndpointV2 {
                 base_url: "https://hk.example.com/v1".to_string(),
                 enabled: true,
+                priority: 0,
                 tags: BTreeMap::from([("region".to_string(), "hk".to_string())]),
                 supported_models: BTreeMap::new(),
                 model_mapping: BTreeMap::new(),
@@ -3262,6 +3314,7 @@ env_key = "RIGHTCODE_API_KEY"
             ProviderEndpointV2 {
                 base_url: "https://us.example.com/v1".to_string(),
                 enabled: true,
+                priority: 1,
                 tags: BTreeMap::from([("region".to_string(), "us".to_string())]),
                 supported_models: BTreeMap::new(),
                 model_mapping: BTreeMap::new(),
@@ -3274,6 +3327,7 @@ env_key = "RIGHTCODE_API_KEY"
             ProviderEndpointV2 {
                 base_url: "https://backup.example.com/v1".to_string(),
                 enabled: true,
+                priority: 0,
                 tags: BTreeMap::new(),
                 supported_models: BTreeMap::new(),
                 model_mapping: BTreeMap::new(),
@@ -3369,6 +3423,83 @@ env_key = "RIGHTCODE_API_KEY"
             svc.upstreams[0].tags.get("region").map(|s| s.as_str()),
             Some("hk")
         );
+    }
+
+    #[test]
+    fn compile_v2_to_runtime_orders_provider_endpoints_by_priority() {
+        let mut endpoints = BTreeMap::new();
+        endpoints.insert(
+            "aaa".to_string(),
+            ProviderEndpointV2 {
+                base_url: "https://backup.example.com/v1".to_string(),
+                enabled: true,
+                priority: 10,
+                tags: BTreeMap::new(),
+                supported_models: BTreeMap::new(),
+                model_mapping: BTreeMap::new(),
+            },
+        );
+        endpoints.insert(
+            "zzz".to_string(),
+            ProviderEndpointV2 {
+                base_url: "https://primary.example.com/v1".to_string(),
+                enabled: true,
+                priority: 0,
+                tags: BTreeMap::new(),
+                supported_models: BTreeMap::new(),
+                model_mapping: BTreeMap::new(),
+            },
+        );
+
+        let v2 = ProxyConfigV2 {
+            version: 2,
+            codex: ServiceViewV2 {
+                active_group: Some("primary".to_string()),
+                default_profile: None,
+                profiles: BTreeMap::new(),
+                providers: BTreeMap::from([(
+                    "relay".to_string(),
+                    ProviderConfigV2 {
+                        alias: None,
+                        enabled: true,
+                        auth: UpstreamAuth::default(),
+                        tags: BTreeMap::new(),
+                        supported_models: BTreeMap::new(),
+                        model_mapping: BTreeMap::new(),
+                        endpoints,
+                    },
+                )]),
+                groups: BTreeMap::from([(
+                    "primary".to_string(),
+                    GroupConfigV2 {
+                        alias: None,
+                        enabled: true,
+                        level: 1,
+                        members: vec![GroupMemberRefV2 {
+                            provider: "relay".to_string(),
+                            endpoint_names: Vec::new(),
+                            preferred: true,
+                        }],
+                    },
+                )]),
+            },
+            claude: ServiceViewV2::default(),
+            retry: RetryConfig::default(),
+            notify: NotifyConfig::default(),
+            default_service: Some(ServiceKind::Codex),
+            ui: UiConfig::default(),
+        };
+
+        let runtime = compile_v2_to_runtime(&v2).expect("compile_v2_to_runtime");
+        let svc = runtime
+            .codex
+            .configs
+            .get("primary")
+            .expect("compiled primary group");
+
+        assert_eq!(svc.upstreams.len(), 2);
+        assert_eq!(svc.upstreams[0].base_url, "https://primary.example.com/v1");
+        assert_eq!(svc.upstreams[1].base_url, "https://backup.example.com/v1");
     }
 
     #[test]
@@ -3549,6 +3680,7 @@ env_key = "RIGHTCODE_API_KEY"
                     ProviderEndpointV2 {
                         base_url: "https://alpha.example.com/v1".to_string(),
                         enabled: true,
+                        priority: 0,
                         tags: BTreeMap::new(),
                         supported_models: BTreeMap::new(),
                         model_mapping: BTreeMap::new(),

@@ -42,7 +42,7 @@ fn health_check_upstream_concurrency() -> usize {
         .min(32)
 }
 
-fn health_check_max_inflight_configs() -> usize {
+fn health_check_max_inflight_stations() -> usize {
     std::env::var("CODEX_HELPER_HEALTHCHECK_MAX_INFLIGHT")
         .or_else(|_| std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT"))
         .ok()
@@ -52,9 +52,9 @@ fn health_check_max_inflight_configs() -> usize {
         .min(16)
 }
 
-fn health_check_config_semaphore() -> &'static Arc<Semaphore> {
+fn health_check_station_semaphore() -> &'static Arc<Semaphore> {
     static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SEM.get_or_init(|| Arc::new(Semaphore::new(health_check_max_inflight_configs())))
+    SEM.get_or_init(|| Arc::new(Semaphore::new(health_check_max_inflight_stations())))
 }
 
 fn health_check_url(base_url: &str) -> anyhow::Result<Url> {
@@ -107,13 +107,13 @@ async fn probe_upstream(client: &reqwest::Client, upstream: &UpstreamConfig) -> 
     out
 }
 
-pub async fn run_health_check_for_config(
+pub async fn run_health_check_for_station(
     state: Arc<ProxyState>,
     service_name: &'static str,
-    config_name: String,
+    station_name: String,
     upstreams: Vec<UpstreamConfig>,
 ) {
-    let _permit = health_check_config_semaphore().acquire().await;
+    let _permit = health_check_station_semaphore().acquire().await;
 
     let timeout = std::time::Duration::from_millis(health_check_timeout_ms());
     let client = match reqwest::Client::builder()
@@ -125,9 +125,9 @@ pub async fn run_health_check_for_config(
         Err(err) => {
             let now = now_ms();
             state
-                .record_health_check_result(
+                .record_station_health_check_result(
                     service_name,
-                    &config_name,
+                    &station_name,
                     now,
                     UpstreamHealth {
                         base_url: "<client>".to_string(),
@@ -135,11 +135,12 @@ pub async fn run_health_check_for_config(
                         status_code: None,
                         latency_ms: None,
                         error: Some(shorten_err(&err.to_string(), 140)),
+                        passive: None,
                     },
                 )
                 .await;
             state
-                .finish_health_check(service_name, &config_name, now, false)
+                .finish_station_health_check(service_name, &station_name, now, false)
                 .await;
             return;
         }
@@ -162,10 +163,10 @@ pub async fn run_health_check_for_config(
     while let Some(up) = futures_util::StreamExt::next(&mut futs).await {
         let now = now_ms();
         state
-            .record_health_check_result(service_name, &config_name, now, up)
+            .record_station_health_check_result(service_name, &station_name, now, up)
             .await;
         if state
-            .is_health_check_cancel_requested(service_name, &config_name)
+            .is_station_health_check_cancel_requested(service_name, &station_name)
             .await
         {
             canceled = true;
@@ -175,6 +176,6 @@ pub async fn run_health_check_for_config(
 
     let now = now_ms();
     state
-        .finish_health_check(service_name, &config_name, now, canceled)
+        .finish_station_health_check(service_name, &station_name, now, canceled)
         .await;
 }
