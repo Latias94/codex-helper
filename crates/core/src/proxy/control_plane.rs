@@ -13,6 +13,7 @@ use crate::state::{ActiveRequest, FinishedRequest};
 
 use super::ProxyService;
 use super::admin::admin_access_capabilities;
+use super::control_plane_manifest::api_v1_endpoint_paths;
 use super::profile_defaults::{
     configured_active_station_name, effective_active_station_name, effective_default_profile_name,
 };
@@ -246,49 +247,7 @@ pub(super) async fn api_capabilities(
     Ok(Json(ApiV1Capabilities {
         api_version: 1,
         service_name: proxy.service_name.to_string(),
-        endpoints: vec![
-            "/__codex_helper/api/v1/capabilities",
-            "/__codex_helper/api/v1/snapshot",
-            "/__codex_helper/api/v1/sessions",
-            "/__codex_helper/api/v1/sessions/{session_id}",
-            "/__codex_helper/api/v1/status/active",
-            "/__codex_helper/api/v1/status/recent",
-            "/__codex_helper/api/v1/status/session-stats",
-            "/__codex_helper/api/v1/status/health-checks",
-            "/__codex_helper/api/v1/status/station-health",
-            "/__codex_helper/api/v1/runtime/status",
-            "/__codex_helper/api/v1/runtime/reload",
-            "/__codex_helper/api/v1/control-trace",
-            "/__codex_helper/api/v1/retry/config",
-            "/__codex_helper/api/v1/stations",
-            "/__codex_helper/api/v1/stations/runtime",
-            "/__codex_helper/api/v1/stations/config-active",
-            "/__codex_helper/api/v1/stations/probe",
-            "/__codex_helper/api/v1/stations/{name}",
-            "/__codex_helper/api/v1/stations/specs",
-            "/__codex_helper/api/v1/stations/specs/{name}",
-            "/__codex_helper/api/v1/providers",
-            "/__codex_helper/api/v1/providers/runtime",
-            "/__codex_helper/api/v1/providers/specs",
-            "/__codex_helper/api/v1/providers/specs/{name}",
-            "/__codex_helper/api/v1/profiles",
-            "/__codex_helper/api/v1/profiles/default",
-            "/__codex_helper/api/v1/profiles/default/persisted",
-            "/__codex_helper/api/v1/profiles/{name}",
-            "/__codex_helper/api/v1/overrides/session",
-            "/__codex_helper/api/v1/overrides/session/profile",
-            "/__codex_helper/api/v1/overrides/session/model",
-            "/__codex_helper/api/v1/overrides/session/effort",
-            "/__codex_helper/api/v1/overrides/session/station",
-            "/__codex_helper/api/v1/overrides/session/service-tier",
-            "/__codex_helper/api/v1/overrides/session/reset",
-            "/__codex_helper/api/v1/overrides/global-station",
-            "/__codex_helper/api/v1/healthcheck/start",
-            "/__codex_helper/api/v1/healthcheck/cancel",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
+        endpoints: api_v1_endpoint_paths(),
         shared_capabilities: SharedControlPlaneCapabilities {
             session_observability: true,
             request_history: true,

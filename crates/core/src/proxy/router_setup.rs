@@ -14,6 +14,20 @@ use super::control_plane::{
     list_session_identity_cards, list_session_stats, set_default_profile,
     set_global_station_override,
 };
+use super::control_plane_manifest::{
+    API_V1_CAPABILITIES, API_V1_CONTROL_TRACE, API_V1_GLOBAL_STATION_OVERRIDE,
+    API_V1_HEALTHCHECK_CANCEL, API_V1_HEALTHCHECK_START, API_V1_PROFILE_BY_NAME, API_V1_PROFILES,
+    API_V1_PROFILES_DEFAULT, API_V1_PROFILES_DEFAULT_PERSISTED, API_V1_PROVIDER_SPEC_BY_NAME,
+    API_V1_PROVIDER_SPECS, API_V1_PROVIDERS, API_V1_PROVIDERS_RUNTIME, API_V1_RETRY_CONFIG,
+    API_V1_RUNTIME_RELOAD, API_V1_RUNTIME_STATUS, API_V1_SESSION_BY_ID,
+    API_V1_SESSION_OVERRIDE_EFFORT, API_V1_SESSION_OVERRIDE_MODEL, API_V1_SESSION_OVERRIDE_PROFILE,
+    API_V1_SESSION_OVERRIDE_RESET, API_V1_SESSION_OVERRIDE_SERVICE_TIER,
+    API_V1_SESSION_OVERRIDE_STATION, API_V1_SESSION_OVERRIDES, API_V1_SESSIONS, API_V1_SNAPSHOT,
+    API_V1_STATION_BY_NAME, API_V1_STATION_SPEC_BY_NAME, API_V1_STATION_SPECS, API_V1_STATIONS,
+    API_V1_STATIONS_CONFIG_ACTIVE, API_V1_STATIONS_PROBE, API_V1_STATIONS_RUNTIME,
+    API_V1_STATUS_ACTIVE, API_V1_STATUS_HEALTH_CHECKS, API_V1_STATUS_RECENT,
+    API_V1_STATUS_SESSION_STATS, API_V1_STATUS_STATION_HEALTH,
+};
 use super::handle_proxy;
 use super::healthcheck_api::{
     cancel_health_checks, list_health_checks, list_station_health, probe_station,
@@ -96,165 +110,156 @@ pub fn router(proxy: ProxyService) -> Router {
     let admin_routes = Router::new()
         // Versioned API (v1): attach-friendly, safe-by-default (no secrets).
         .route(
-            "/__codex_helper/api/v1/capabilities",
+            API_V1_CAPABILITIES,
             get(move || api_capabilities(p8.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/snapshot",
+            API_V1_SNAPSHOT,
             get(move |q| api_v1_snapshot(p25.clone(), q)),
         )
         .route(
-            "/__codex_helper/api/v1/sessions",
+            API_V1_SESSIONS,
             get(move || list_session_identity_cards(p26.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/sessions/{session_id}",
+            API_V1_SESSION_BY_ID,
             get(move |session_id| get_session_identity_card(p56.clone(), session_id)),
         )
         .route(
-            "/__codex_helper/api/v1/status/active",
+            API_V1_STATUS_ACTIVE,
             get(move || list_active_requests(p9.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/status/recent",
+            API_V1_STATUS_RECENT,
             get(move |q| list_recent_finished(p10.clone(), q)),
         )
         .route(
-            "/__codex_helper/api/v1/status/session-stats",
+            API_V1_STATUS_SESSION_STATS,
             get(move || list_session_stats(p11.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/status/health-checks",
+            API_V1_STATUS_HEALTH_CHECKS,
             get(move || list_health_checks(p21.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/status/station-health",
+            API_V1_STATUS_STATION_HEALTH,
             get(move || list_station_health(p22.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/runtime/status",
+            API_V1_RUNTIME_STATUS,
             get(move || runtime_config_status(p12.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/runtime/reload",
+            API_V1_RUNTIME_RELOAD,
             post(move || reload_runtime_config(p13.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/control-trace",
+            API_V1_CONTROL_TRACE,
             get(move |q| get_control_trace(p14.clone(), q)),
         )
         .route(
-            "/__codex_helper/api/v1/retry/config",
+            API_V1_RETRY_CONFIG,
             get(move || get_retry_config(p43.clone()))
                 .post(move |payload| set_retry_config(p44.clone(), payload)),
         )
+        .route(API_V1_STATIONS, get(move || list_stations(p35.clone())))
         .route(
-            "/__codex_helper/api/v1/stations",
-            get(move || list_stations(p35.clone())),
-        )
-        .route(
-            "/__codex_helper/api/v1/stations/runtime",
+            API_V1_STATIONS_RUNTIME,
             post(move |payload| apply_station_runtime_meta(p36.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/stations/config-active",
+            API_V1_STATIONS_CONFIG_ACTIVE,
             post(move |payload| set_persisted_active_station(p41.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/stations/probe",
+            API_V1_STATIONS_PROBE,
             post(move |payload| probe_station(p51.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/stations/{name}",
+            API_V1_STATION_BY_NAME,
             put(move |name, payload| update_persisted_station(p42.clone(), name, payload)),
         )
         .route(
-            "/__codex_helper/api/v1/stations/specs",
+            API_V1_STATION_SPECS,
             get(move || list_persisted_station_specs(p37.clone())),
         )
         .route(
-            "/__codex_helper/api/v1/stations/specs/{name}",
+            API_V1_STATION_SPEC_BY_NAME,
             put(move |name, payload| upsert_persisted_station_spec(p45.clone(), name, payload))
                 .delete(move |name| delete_persisted_station_spec(p46.clone(), name)),
         )
         .route(
-            "/__codex_helper/api/v1/providers/specs",
+            API_V1_PROVIDER_SPECS,
             get(move || list_persisted_provider_specs(p47.clone())),
         )
+        .route(API_V1_PROVIDERS, get(move || list_providers(p54.clone())))
         .route(
-            "/__codex_helper/api/v1/providers",
-            get(move || list_providers(p54.clone())),
-        )
-        .route(
-            "/__codex_helper/api/v1/providers/runtime",
+            API_V1_PROVIDERS_RUNTIME,
             post(move |payload| apply_provider_runtime_meta(p55.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/providers/specs/{name}",
+            API_V1_PROVIDER_SPEC_BY_NAME,
             put(move |name, payload| upsert_persisted_provider_spec(p48.clone(), name, payload))
                 .delete(move |name| delete_persisted_provider_spec(p49.clone(), name)),
         )
+        .route(API_V1_PROFILES, get(move || list_profiles(p31.clone())))
         .route(
-            "/__codex_helper/api/v1/profiles",
-            get(move || list_profiles(p31.clone())),
-        )
-        .route(
-            "/__codex_helper/api/v1/profiles/default",
+            API_V1_PROFILES_DEFAULT,
             post(move |payload| set_default_profile(p33.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/profiles/default/persisted",
+            API_V1_PROFILES_DEFAULT_PERSISTED,
             post(move |payload| set_persisted_default_profile(p38.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/profiles/{name}",
+            API_V1_PROFILE_BY_NAME,
             put(move |name, payload| upsert_persisted_profile(p39.clone(), name, payload))
                 .delete(move |name| delete_persisted_profile(p40.clone(), name)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/session",
+            API_V1_SESSION_OVERRIDES,
             get(move || list_session_manual_overrides(p52.clone()))
                 .post(move |payload| apply_session_manual_overrides(p53.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/session/profile",
+            API_V1_SESSION_OVERRIDE_PROFILE,
             post(move |payload| apply_session_profile(p32.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/session/model",
+            API_V1_SESSION_OVERRIDE_MODEL,
             get(move || list_session_model_overrides(p15.clone()))
                 .post(move |payload| set_session_model_override(p16.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/session/effort",
+            API_V1_SESSION_OVERRIDE_EFFORT,
             get(move || list_session_reasoning_effort_overrides(p17.clone()))
                 .post(move |payload| set_session_reasoning_effort_override(p18.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/session/station",
+            API_V1_SESSION_OVERRIDE_STATION,
             get(move || list_session_station_overrides(p19.clone()))
                 .post(move |payload| set_session_station_override(p20.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/session/service-tier",
+            API_V1_SESSION_OVERRIDE_SERVICE_TIER,
             get(move || list_session_service_tier_overrides(p23.clone()))
                 .post(move |payload| set_session_service_tier_override(p24.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/session/reset",
+            API_V1_SESSION_OVERRIDE_RESET,
             post(move |payload| reset_session_manual_overrides(p50.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/overrides/global-station",
+            API_V1_GLOBAL_STATION_OVERRIDE,
             get(move || get_global_station_override(p27.clone()))
                 .post(move |payload| set_global_station_override(p28.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/healthcheck/start",
+            API_V1_HEALTHCHECK_START,
             post(move |payload| start_health_checks(p29.clone(), payload)),
         )
         .route(
-            "/__codex_helper/api/v1/healthcheck/cancel",
+            API_V1_HEALTHCHECK_CANCEL,
             post(move |payload| cancel_health_checks(p30.clone(), payload)),
         )
         .layer(middleware::from_fn_with_state(
