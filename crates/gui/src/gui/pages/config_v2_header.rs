@@ -12,11 +12,12 @@ enum ControlSurfaceMode {
 
 pub(super) fn render_config_v2_workspace_header(
     ui: &mut egui::Ui,
-    lang: Language,
-    proxy_kind: ProxyModeKind,
+    ctx: &mut PageCtx<'_>,
     render_ctx: &ConfigV2RenderContext,
-    section: &mut ConfigV2Section,
 ) {
+    let lang = ctx.lang;
+    let proxy_kind = ctx.proxy.kind();
+    let current_section = ctx.view.config.v2_section;
     let station_count = render_ctx.station_display_names.len();
     let provider_count = render_ctx.provider_display_names.len();
     let profile_count = if render_ctx.profile_control_plane_enabled {
@@ -30,7 +31,7 @@ pub(super) fn render_config_v2_workspace_header(
         ProxyModeKind::Starting => pick(lang, "启动中", "Starting"),
         ProxyModeKind::Stopped => pick(lang, "本地文件", "Local file"),
     };
-    let focus_hint = match section {
+    let focus_hint = match current_section {
         ConfigV2Section::Stations => pick(
             lang,
             "适合调整默认路由、成员组合、健康检查与 active station。",
@@ -150,7 +151,11 @@ pub(super) fn render_config_v2_workspace_header(
         });
 
         ui.add_space(8.0);
+        render_control_deck_actions(ui, ctx, proxy_kind, render_ctx);
+
+        ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
+            let section = &mut ctx.view.config.v2_section;
             ui.selectable_value(
                 section,
                 ConfigV2Section::Profiles,
@@ -179,6 +184,115 @@ fn render_config_v2_summary_card(ui: &mut egui::Ui, title: &str, value: String, 
         ui.small(title);
         ui.heading(value);
         ui.small(hint);
+    });
+}
+
+fn render_control_deck_actions(
+    ui: &mut egui::Ui,
+    ctx: &mut PageCtx<'_>,
+    proxy_kind: ProxyModeKind,
+    render_ctx: &ConfigV2RenderContext,
+) {
+    let can_reload_runtime = matches!(proxy_kind, ProxyModeKind::Running | ProxyModeKind::Attached);
+    let can_refresh_runtime = can_reload_runtime;
+    let runtime_target = match proxy_kind {
+        ProxyModeKind::Attached => pick(
+            ctx.lang,
+            "当前动作会直接作用于附着代理。",
+            "Actions target the attached proxy directly.",
+        ),
+        ProxyModeKind::Running => pick(
+            ctx.lang,
+            "当前动作会直接作用于本机运行中的代理。",
+            "Actions target the locally running proxy directly.",
+        ),
+        ProxyModeKind::Starting => pick(
+            ctx.lang,
+            "代理正在启动，暂时只能切换工作台或编辑本地文稿。",
+            "The proxy is starting; use deck navigation or edit the local draft for now.",
+        ),
+        ProxyModeKind::Stopped => pick(
+            ctx.lang,
+            "当前没有活动代理，页头动作会导航或编辑本地文稿，不会刷新运行态。",
+            "There is no active proxy; deck actions navigate or edit the local draft only.",
+        ),
+    };
+
+    ui.group(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.small(format!(
+                "{}: {}",
+                pick(ctx.lang, "快捷入口", "Quick jump"),
+                runtime_target
+            ));
+        });
+
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(pick(ctx.lang, "总览", "Overview")).clicked() {
+                ctx.view.requested_page = Some(Page::Overview);
+            }
+            if ui.button(pick(ctx.lang, "站点台", "Stations")).clicked() {
+                ctx.view.requested_page = Some(Page::Stations);
+            }
+            if ui.button(pick(ctx.lang, "会话台", "Sessions")).clicked() {
+                ctx.view.requested_page = Some(Page::Sessions);
+            }
+            if ui.button(pick(ctx.lang, "请求台", "Requests")).clicked() {
+                ctx.view.requested_page = Some(Page::Requests);
+            }
+
+            ui.separator();
+
+            if ui
+                .add_enabled(
+                    can_refresh_runtime,
+                    egui::Button::new(pick(ctx.lang, "刷新运行态", "Refresh runtime")),
+                )
+                .clicked()
+            {
+                ctx.proxy
+                    .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+                *ctx.last_info = Some(
+                    pick(
+                        ctx.lang,
+                        "已请求刷新当前运行态",
+                        "Requested runtime refresh",
+                    )
+                    .to_string(),
+                );
+            }
+
+            if ui
+                .add_enabled(
+                    can_reload_runtime,
+                    egui::Button::new(pick(ctx.lang, "重载代理", "Reload proxy")),
+                )
+                .clicked()
+            {
+                if let Err(error) = ctx.proxy.reload_runtime_config(ctx.rt) {
+                    *ctx.last_error = Some(format!("reload runtime failed: {error}"));
+                } else {
+                    *ctx.last_info = Some(
+                        pick(
+                            ctx.lang,
+                            "已重载当前代理运行态",
+                            "Reloaded current proxy runtime",
+                        )
+                        .to_string(),
+                    );
+                }
+            }
+
+            if !render_ctx.profile_control_plane_enabled
+                && !render_ctx.station_control_plane_enabled
+                && ui
+                    .button(pick(ctx.lang, "回到设置", "Open Setup"))
+                    .clicked()
+            {
+                ctx.view.requested_page = Some(Page::Setup);
+            }
+        });
     });
 }
 

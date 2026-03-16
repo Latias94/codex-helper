@@ -40,13 +40,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         return;
     };
 
-    render_config_v2_workspace_header(
-        ui,
-        ctx.lang,
-        ctx.proxy.kind(),
-        &render_ctx,
-        &mut ctx.view.config.v2_section,
-    );
+    render_config_v2_workspace_header(ui, ctx, &render_ctx);
     ui.add_space(10.0);
 
     let mut actions = ConfigV2PendingActions::default();
