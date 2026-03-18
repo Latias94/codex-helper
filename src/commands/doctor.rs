@@ -170,7 +170,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                 let Some(active_name) = mgr.active.as_deref() else {
                     continue;
                 };
-                let Some(active_cfg) = mgr.active_config() else {
+                let Some(active_cfg) = mgr.active_station() else {
                     continue;
                 };
                 for (idx, up) in active_cfg.upstreams.iter().enumerate() {

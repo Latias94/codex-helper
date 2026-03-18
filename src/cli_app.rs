@@ -351,13 +351,13 @@ async fn run_server(
     // Require at least one valid upstream config, so we fail fast instead of discovering
     // it during an actual user request.
     if service_name == "codex" {
-        if cfg.codex.configs.is_empty() || cfg.codex.active_config().is_none() {
+        if cfg.codex.configs.is_empty() || cfg.codex.active_station().is_none() {
             anyhow::bail!(
                 "未找到任何可用的 Codex 上游配置，请先确保 ~/.codex/config.toml 与 ~/.codex/auth.json 配置完整，或手动编辑 ~/.codex-helper/config.toml（或 config.json）添加配置"
             );
         }
     } else if service_name == "claude"
-        && (cfg.claude.configs.is_empty() || cfg.claude.active_config().is_none())
+        && (cfg.claude.configs.is_empty() || cfg.claude.active_station().is_none())
     {
         anyhow::bail!(
             "未找到任何可用的 Claude 上游配置，请先确保 ~/.claude/settings.json 配置完整，\

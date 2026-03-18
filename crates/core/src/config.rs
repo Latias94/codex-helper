@@ -324,7 +324,6 @@ impl ServiceConfigManager {
 
     /// 兼容层：保留给历史调用方，新的主路径应使用 `active_station()`。
     #[doc(hidden)]
-    #[deprecated(note = "compatibility-only shim; prefer active_station()")]
     pub fn active_config(&self) -> Option<&ServiceConfig> {
         self.active_station()
     }
