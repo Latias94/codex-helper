@@ -399,3 +399,100 @@ impl ProxyService {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ServiceConfig, UpstreamAuth};
+
+    fn test_service(upstreams: Vec<&str>) -> ServiceConfig {
+        ServiceConfig {
+            name: "primary".to_string(),
+            alias: None,
+            enabled: true,
+            level: 1,
+            upstreams: upstreams
+                .into_iter()
+                .map(|base_url| UpstreamConfig {
+                    base_url: base_url.to_string(),
+                    auth: UpstreamAuth::default(),
+                    tags: HashMap::new(),
+                    supported_models: HashMap::new(),
+                    model_mapping: HashMap::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn runtime_state_policy_keeps_half_open_pinned_only() {
+        assert!(runtime_state_allows_general_routing(
+            RuntimeConfigState::Normal
+        ));
+        assert!(runtime_state_allows_pinned_routing(
+            RuntimeConfigState::Normal
+        ));
+
+        assert!(!runtime_state_allows_general_routing(
+            RuntimeConfigState::Draining
+        ));
+        assert!(runtime_state_allows_pinned_routing(
+            RuntimeConfigState::Draining
+        ));
+
+        assert!(!runtime_state_allows_general_routing(
+            RuntimeConfigState::HalfOpen
+        ));
+        assert!(runtime_state_allows_pinned_routing(
+            RuntimeConfigState::HalfOpen
+        ));
+
+        assert!(!runtime_state_allows_general_routing(
+            RuntimeConfigState::BreakerOpen
+        ));
+        assert!(!runtime_state_allows_pinned_routing(
+            RuntimeConfigState::BreakerOpen
+        ));
+    }
+
+    #[test]
+    fn filtered_service_for_routing_respects_upstream_runtime_state_for_general_and_pinned_modes() {
+        let svc = test_service(vec![
+            "https://normal.example/v1",
+            "https://half-open.example/v1",
+            "https://breaker-open.example/v1",
+        ]);
+        let upstream_overrides = HashMap::from([
+            (
+                "https://half-open.example/v1".to_string(),
+                (None, Some(RuntimeConfigState::HalfOpen)),
+            ),
+            (
+                "https://breaker-open.example/v1".to_string(),
+                (None, Some(RuntimeConfigState::BreakerOpen)),
+            ),
+        ]);
+
+        let general = filtered_service_for_routing(&svc, &upstream_overrides, false)
+            .expect("general routing should keep the normal upstream");
+        let pinned = filtered_service_for_routing(&svc, &upstream_overrides, true)
+            .expect("pinned routing should keep normal and half-open upstreams");
+
+        assert_eq!(
+            general
+                .upstreams
+                .iter()
+                .map(|upstream| upstream.base_url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://normal.example/v1"]
+        );
+        assert_eq!(
+            pinned
+                .upstreams
+                .iter()
+                .map(|upstream| upstream.base_url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://normal.example/v1", "https://half-open.example/v1"]
+        );
+    }
+}

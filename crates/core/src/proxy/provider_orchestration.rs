@@ -202,8 +202,22 @@ mod tests {
         };
 
         assert!(cross_station_failover_enabled(true, &plan, &provider_opt));
+        assert!(!cross_station_failover_enabled(false, &plan, &provider_opt));
 
         plan.allow_cross_station_before_first_output = false;
         assert!(!cross_station_failover_enabled(true, &plan, &provider_opt));
+
+        let same_upstream_provider = RetryLayerOptions {
+            strategy: RetryStrategy::SameUpstream,
+            ..provider_opt
+        };
+        assert!(!cross_station_failover_enabled(
+            true,
+            &RetryPlan {
+                allow_cross_station_before_first_output: true,
+                ..plan
+            },
+            &same_upstream_provider,
+        ));
     }
 }
