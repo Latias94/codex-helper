@@ -6,7 +6,7 @@
 
 `codex-helper` already has a strong local proxy core:
 
-- provider/config selection
+- station/provider selection
 - upstream retry and routing
 - model mapping
 - runtime session/request observation
@@ -16,9 +16,9 @@ However, the current product shape still behaves more like a local router plus o
 
 The main gaps are semantic rather than mechanical:
 
-1. The user cannot reliably answer: "Which station/provider/config is this Codex session actually using?"
+1. The user cannot reliably answer: "Which station/provider/upstream path is this Codex session actually using?"
 2. Session overrides exist, but only partially:
-   - `config`
+   - `station`
    - `reasoning effort`
 3. Override scope is runtime-only and not clearly modeled as product behavior.
 4. Presets are too weak to represent a real control template:
@@ -58,7 +58,7 @@ It should optimize for:
   - `service_tier` / fast mode
   - `reasoning_effort`
   - optional future `verbosity`
-- Introduce structured control templates (`profiles`) rather than relying on ad hoc pinned config.
+- Introduce structured control templates (`profiles`) rather than relying on ad hoc pinned station choices.
 - Add provider/station management with health, drain, breaker, and recovery semantics.
 - Support LAN-shared central relay usage without over-promising host-local history features to remote devices.
 
@@ -163,7 +163,7 @@ Examples:
 
 - `session_id`
 - client/device identifier
-- last config/provider/upstream
+- last station/provider/upstream
 - last model / effort / service tier
 - request counts
 - last error / last success timestamps
@@ -247,7 +247,7 @@ Recommended rule:
 - shared control-plane surfaces stay visible:
   - session observation/control
   - station health and failover management
-  - shared observed/config surfaces
+  - shared observed/control surfaces
 - host-local surfaces stay explicitly gated:
   - transcript file access
   - local `cwd` opening

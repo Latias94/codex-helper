@@ -62,8 +62,8 @@ pub(super) fn session_binding_profile_summary(
         return Some(
             pick(
                 lang,
-                "当前配置中已缺失该 profile",
-                "This profile is missing from the current config",
+                "当前工作台中已缺失该 profile",
+                "This profile is missing from the current workspace",
             )
             .to_string(),
         );

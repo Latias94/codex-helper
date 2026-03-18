@@ -4,7 +4,7 @@ mod capabilities;
 mod session_mutations;
 mod session_observability;
 
-pub(super) use self::capabilities::{api_capabilities, api_v1_snapshot};
+pub(super) use self::capabilities::{api_capabilities, api_operator_summary, api_v1_snapshot};
 pub(super) use self::session_mutations::{
     apply_session_profile, get_global_station_override, set_default_profile,
     set_global_station_override,

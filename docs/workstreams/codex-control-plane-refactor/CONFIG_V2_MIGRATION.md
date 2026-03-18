@@ -210,14 +210,14 @@ reasoning_effort = "high"
 Current compatibility rules:
 
 - `profile.station` is the public name to use.
-- legacy `profile.config` is still accepted as an alias when reading older files.
-- profile/station capability compatibility is validated when the config is loaded.
+- legacy `profile.config` is still accepted as a deserialize-only alias when reading older files.
+- profile/station capability compatibility is validated when the persisted config file is loaded.
 
 ## Compatibility Rules
 
 - Legacy `version = 1` TOML still loads.
 - Legacy `v2` names `active_group` and `groups` still load.
-- Public control-plane APIs now prefer `station` naming, but legacy `config` API paths remain as compatibility aliases.
+- Public control-plane APIs now prefer `station` naming, while legacy `config` API paths remain hidden compatibility aliases.
 
 ## Recommended Upgrade Path
 

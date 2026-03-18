@@ -16,7 +16,7 @@ pub(super) fn format_runtime_station_source(lang: Language, cfg: &StationOption)
         parts.push(format!("{}=rt", pick(lang, "状态", "state")));
     }
     if parts.is_empty() {
-        pick(lang, "站点配置", "station config").to_string()
+        pick(lang, "站点设置", "station settings").to_string()
     } else {
         parts.join(", ")
     }

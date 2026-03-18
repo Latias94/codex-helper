@@ -18,12 +18,14 @@ As of the current refactor state:
 
 - `M1`, `M2`, `M5`, and the current GUI/control-plane scope of `M6` are effectively usable.
 - `M3` and `M4` are substantially complete.
-- The main remaining semantic gap is still `M0` plus the final `CP-401` terminology/runtime cleanup.
+- `CP-000` / `CP-001` are now documented explicitly via `VOCABULARY.md`.
+- The main remaining semantic gap is now the last `CP-002` / `CP-401` compatibility-only terminology/export cleanup.
 - The code-side runtime/UI route is now largely station-first across core / GUI / TUI:
   - remaining `config` wording is mostly compatibility shims, persisted document concepts, tests, or historical design material
 - Fast mode / priority-processing observability is no longer a blocker:
   - request logs now distinguish requested / effective / actual `service_tier`
   - recent/session observed values now prefer the actual upstream response when available
+- `operator/summary` is now strong enough to act as a real operator home payload, including lightweight runtime health/failover posture
 
 This means the workstream is past "can this direction work" and is now in a structured closeout phase.
 
@@ -66,7 +68,7 @@ Every active or recent session can be mapped to an effective route and a clear s
   - model
   - service tier
   - reasoning effort
-  - station/config selection
+  - station selection
 - GUI/TUI session view update
 
 ### Definition of Done
@@ -99,7 +101,7 @@ Session-level changes become explicit, complete, and operationally safe.
 
 ### Goal
 
-Reusable operator intent moves out of ad hoc pinned config into a first-class profile layer.
+Reusable operator intent moves out of ad hoc pinned station choices into a first-class profile layer.
 
 ### Deliverables
 
@@ -167,11 +169,13 @@ GUI and future WebUI can build on stable control semantics rather than inventing
 - Sessions page centered on effective route card
 - Profiles/stations management views
 - Remote-safe capability badges
+- `operator/summary` stable enough to serve as the WebUI/attach home payload
 - Optional future WebUI design starting from the same API
 
 ### Definition of Done
 
 - GUI is no longer a thin wrapper over legacy fields.
+- top-level operator context does not need to be recomposed independently by each client
 - A future WebUI can be added without redefining control-plane semantics.
 
 ## Endgame Priorities
@@ -186,14 +190,16 @@ Goal:
 
 Scope:
 
-- complete `CP-000` / `CP-001` / `CP-002`
-- complete the remaining `CP-401` runtime/public rename tail
+- complete the remaining `CP-002` application of the documented vocabulary contract
+- apply the documented `CP-000` / `CP-001` vocabulary contract consistently across the remaining surfaces
+- complete the remaining `CP-002` / `CP-401` compatibility-only runtime/public rename tail
 - finish the vocabulary cleanup from legacy `config` language to station-first language
 - keep `config` only where it literally means persisted config/document concepts or historical design material
 - reduce the remaining compatibility-only tail explicitly:
   - narrow shims such as `active_config()`
   - compatibility tests/assertions for legacy fields/routes
   - migration/docs examples that intentionally show legacy `configs` input
+- treat runtime/operator-facing code paths as effectively closed, with the remaining work focused on docs/examples/export wording and explicit compatibility boundaries
 - finish the remaining runtime/admin wording tail after the proxy routing internals closeout:
   - exported runtime/admin type naming
   - finish the last operator/admin wording cleanup on station-first surfaces
@@ -227,7 +233,25 @@ Scope:
 - split oversized modules:
   - `crates/core/src/proxy/mod.rs`
   - `crates/core/src/state.rs`
+    - shared public/internal state types are now split into `state/runtime_types.rs` and `state/session_identity.rs`
   - large focused test files that are becoming navigation bottlenecks
+    - `crates/gui/src/gui/proxy_control/tests.rs` has been split into themed `tests/` modules with shared helpers
+    - `crates/gui/src/gui/proxy_control/tests/attached_refresh.rs` has been split into themed `attached_refresh/` modules with shared helpers
+    - `crates/core/src/proxy/tests/failover.rs` has been split into `failover/mod.rs`, `failover/response_semantics.rs`, and `failover/config_failover.rs`
+    - `crates/core/src/proxy/tests/api_admin.rs` has been split into `api_admin/mod.rs`, `api_admin/capabilities.rs`, `api_admin/persisted_crud.rs`, `api_admin/runtime_overrides.rs`, and `api_admin/sessions.rs`
+    - `crates/core/src/config.rs` tests have been split into `config/tests/` themed modules with shared helpers
+  - `crates/core/src/sessions.rs` now delegates session stats cache support and tests to `sessions/stats_cache.rs` and `sessions/tests.rs`
+  - `crates/core/src/sessions.rs` now delegates transcript extraction/search support to `sessions/transcript.rs`
+  - `crates/core/src/config.rs` now delegates retry policy types and resolution to `config_retry.rs`
+  - `crates/core/src/config.rs` now delegates v2 compile/migrate/compact helpers to `config_v2.rs`
+  - `crates/core/src/config.rs` now delegates profile inheritance and station-compatibility validation to `config_profiles.rs`
+  - `crates/core/src/config.rs` now delegates routing explanation types/helpers to `config_routing.rs`
+  - `crates/core/src/proxy/control_plane_routes.rs` is now split into themed `control_plane_routes/` modules
+  - `crates/core/src/logging.rs` now delegates control-trace parsing/write helpers to `logging/control_trace.rs`, with request-log tests moved to `logging/tests.rs`
+  - `crates/gui/src/gui/pages/config_v2/editors/stations.rs` is now split into `stations/mod.rs`, `stations/member_editor.rs`, and `stations/section.rs`
+  - `crates/gui/src/gui/pages/components/history_sessions.rs` is now split into `history_sessions/mod.rs`, `history_sessions/session_panels.rs`, and `history_sessions/all_by_date.rs`
+  - `crates/gui/src/gui/pages/config_v2_header.rs` is now split into `config_v2_header/mod.rs`, `config_v2_header/actions.rs`, `config_v2_header/focus_targets.rs`, `config_v2_header/surface_mode.rs`, and `config_v2_header/runtime_card.rs`
+  - `crates/gui/src/gui/proxy_control/attached_refresh.rs` is now split into `attached_refresh/mod.rs`, `attached_refresh/fetch.rs`, and `attached_refresh/state_apply.rs`
 - keep the new observability model coherent:
   - request outcome logging
   - session/recent views

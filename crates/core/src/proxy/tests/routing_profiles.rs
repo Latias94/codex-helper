@@ -961,7 +961,7 @@ async fn proxy_runtime_config_state_override_controls_routing() {
         }))
         .send()
         .await
-        .expect("set session config override send");
+        .expect("set session station override send");
     assert_eq!(set_session_cfg.status(), StatusCode::NO_CONTENT);
 
     let resp = send_responses_json(&client, proxy_addr, Some("sid-runtime-state")).await;

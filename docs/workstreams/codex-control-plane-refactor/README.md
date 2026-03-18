@@ -18,12 +18,18 @@ The intended end state is:
 
 - `DESIGN.md`
   - Product definition, object model, configuration semantics, API shape, HA and multi-device constraints.
+- `VOCABULARY.md`
+  - Canonical control-plane vocabulary, legacy-to-target mapping, and compatibility-only wording rules.
+- `OPERATOR_SUMMARY_CONTRACT.md`
+  - Read-side home-payload contract for `GET /__codex_helper/api/v1/operator/summary`, including layering and compatibility rules for future GUI/WebUI/external clients.
 - `TODO.md`
   - Actionable engineering checklist, open questions, and work breakdown.
 - `MILESTONES.md`
   - Milestone sequencing, definition-of-done gates, and the current `P0 / P1 / P2` closeout priorities.
 - `CLOSEOUT.md`
   - Exit-gap assessment for the refactor, including what is already closed and what still blocks a full semantic closeout.
+- `BACKEND_GAP_MATRIX.md`
+  - Backend-focused readiness assessment for session/profile/station/provider/retry/LAN control-plane surfaces, plus the remaining productization gaps for future external clients.
 - `CENTRAL_RELAY.md`
   - Product-shape notes for LAN / Tailscale shared-relay deployment and remote-safe capability boundaries.
 - `PHASE1_IMPLEMENTATION.md`

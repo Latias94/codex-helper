@@ -2,26 +2,21 @@ use std::time::Duration;
 
 use anyhow::bail;
 
-use crate::proxy::local_proxy_base_url;
-
+use super::control_mutations::mode_control_url;
 use super::{ProxyController, ProxyMode, send_admin_request};
 
 impl ProxyController {
     pub fn reload_runtime_config(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
-        let base = match &self.mode {
-            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
-            ProxyMode::Attached(a) => {
-                if a.api_version != Some(1) {
-                    bail!("attached proxy does not support runtime reload (need api v1)");
-                }
-                a.admin_base_url.clone()
-            }
-            _ => bail!("proxy is not running/attached"),
-        };
+        let url = mode_control_url(
+            &self.mode,
+            |att| att.api_version == Some(1),
+            "attached proxy does not support runtime reload (need api v1)",
+            |links| Some(links.runtime_reload.as_str()),
+            "/__codex_helper/api/v1/runtime/reload",
+        )?;
 
         let client = self.http_client.clone();
         let fut = async move {
-            let url = format!("{base}/__codex_helper/api/v1/runtime/reload");
             send_admin_request(client.post(url).timeout(Duration::from_millis(800))).await?;
             Ok::<(), anyhow::Error>(())
         };
@@ -36,22 +31,19 @@ impl ProxyController {
         all: bool,
         station_names: Vec<String>,
     ) -> anyhow::Result<()> {
-        let base = match &self.mode {
-            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
-            ProxyMode::Attached(a) => {
-                if a.api_version != Some(1) {
-                    bail!("attached proxy does not support health checks (need api v1)");
-                }
-                a.admin_base_url.clone()
-            }
-            _ => bail!("proxy is not running/attached"),
-        };
+        let url = mode_control_url(
+            &self.mode,
+            |att| att.api_version == Some(1),
+            "attached proxy does not support health checks (need api v1)",
+            |links| Some(links.healthcheck_start.as_str()),
+            "/__codex_helper/api/v1/healthcheck/start",
+        )?;
 
         let client = self.http_client.clone();
         let fut = async move {
             send_admin_request(
                 client
-                    .post(format!("{base}/__codex_helper/api/v1/healthcheck/start"))
+                    .post(url)
                     .timeout(Duration::from_millis(800))
                     .json(&serde_json::json!({ "all": all, "station_names": station_names })),
             )
@@ -73,13 +65,13 @@ impl ProxyController {
             bail!("station_name cannot be empty");
         }
 
-        let (base, use_station_api) = match &self.mode {
-            ProxyMode::Running(r) => (local_proxy_base_url(r.admin_port), true),
+        let use_station_api = match &self.mode {
+            ProxyMode::Running(_) => true,
             ProxyMode::Attached(a) => {
                 if a.api_version != Some(1) {
                     bail!("attached proxy does not support manual probes (need api v1)");
                 }
-                (a.admin_base_url.clone(), a.supports_station_api)
+                a.supports_station_api
             }
             _ => bail!("proxy is not running/attached"),
         };
@@ -88,11 +80,19 @@ impl ProxyController {
             return self.start_health_checks(rt, false, vec![station_name]);
         }
 
+        let url = mode_control_url(
+            &self.mode,
+            |att| att.api_version == Some(1) && att.supports_station_api,
+            "attached proxy does not support manual probes (need api v1)",
+            |links| Some(links.station_probe.as_str()),
+            "/__codex_helper/api/v1/stations/probe",
+        )?;
+
         let client = self.http_client.clone();
         let fut = async move {
             send_admin_request(
                 client
-                    .post(format!("{base}/__codex_helper/api/v1/stations/probe"))
+                    .post(url)
                     .timeout(Duration::from_millis(800))
                     .json(&serde_json::json!({ "station_name": station_name })),
             )
@@ -110,22 +110,19 @@ impl ProxyController {
         all: bool,
         station_names: Vec<String>,
     ) -> anyhow::Result<()> {
-        let base = match &self.mode {
-            ProxyMode::Running(r) => local_proxy_base_url(r.admin_port),
-            ProxyMode::Attached(a) => {
-                if a.api_version != Some(1) {
-                    bail!("attached proxy does not support health checks (need api v1)");
-                }
-                a.admin_base_url.clone()
-            }
-            _ => bail!("proxy is not running/attached"),
-        };
+        let url = mode_control_url(
+            &self.mode,
+            |att| att.api_version == Some(1),
+            "attached proxy does not support health checks (need api v1)",
+            |links| Some(links.healthcheck_cancel.as_str()),
+            "/__codex_helper/api/v1/healthcheck/cancel",
+        )?;
 
         let client = self.http_client.clone();
         let fut = async move {
             send_admin_request(
                 client
-                    .post(format!("{base}/__codex_helper/api/v1/healthcheck/cancel"))
+                    .post(url)
                     .timeout(Duration::from_millis(800))
                     .json(&serde_json::json!({ "all": all, "station_names": station_names })),
             )

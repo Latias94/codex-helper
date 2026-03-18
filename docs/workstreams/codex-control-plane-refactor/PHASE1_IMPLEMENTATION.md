@@ -174,7 +174,7 @@ Phase 1 should not break:
 
 - current attach-mode consumers
 - current GUI/TUI snapshot merge
-- current legacy config/station compatibility loader
+- current legacy configs-to-stations compatibility loader
 
 Therefore:
 
@@ -367,7 +367,7 @@ pub struct CodexProfileConfig {
 Legacy GUI routing presets are no longer a target state. Phase 1 should converge the GUI onto real profiles:
 
 - legacy `RoutingProfile` UI/runtime flow is retired
-- GUI control entry points should target real profiles, not just pinned config
+- GUI control entry points should target real profiles, not just ad hoc pinned station choices
 - `gui.toml` should stop carrying a separate routing-preset layer
 
 ## Detailed Slice Breakdown

@@ -15,7 +15,7 @@ pub fn build_station_options_from_mgr(
     meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
     state_overrides: &HashMap<String, RuntimeConfigState>,
 ) -> Vec<StationOption> {
-    let mut configs = mgr
+    let mut stations = mgr
         .stations()
         .iter()
         .map(|(name, c)| {
@@ -42,8 +42,8 @@ pub fn build_station_options_from_mgr(
             }
         })
         .collect::<Vec<_>>();
-    configs.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
-    configs
+    stations.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
+    stations
 }
 
 pub fn build_profile_options_from_mgr(
@@ -60,6 +60,7 @@ pub fn build_profile_options_from_mgr(
             model: profile.model.clone(),
             reasoning_effort: profile.reasoning_effort.clone(),
             service_tier: profile.service_tier.clone(),
+            fast_mode: profile.service_tier.as_deref() == Some("priority"),
             is_default: default_name == Some(name.as_str()),
         })
         .collect::<Vec<_>>();
@@ -81,8 +82,8 @@ pub fn build_model_options_from_mgr(mgr: &ServiceConfigManager) -> Vec<String> {
         }
     }
 
-    for config in mgr.stations().values() {
-        models.extend(build_station_capability_summary(config).supported_models);
+    for station in mgr.stations().values() {
+        models.extend(build_station_capability_summary(station).supported_models);
     }
 
     models.into_iter().collect()
@@ -134,10 +135,10 @@ pub fn build_provider_options_from_view(
     providers
 }
 
-fn build_station_capability_summary(config: &ServiceConfig) -> StationCapabilitySummary {
+fn build_station_capability_summary(station: &ServiceConfig) -> StationCapabilitySummary {
     let mut supported_models = BTreeSet::new();
     let mut has_declared_models = false;
-    for upstream in &config.upstreams {
+    for upstream in &station.upstreams {
         if !upstream.supported_models.is_empty() || !upstream.model_mapping.is_empty() {
             has_declared_models = true;
         }
@@ -159,7 +160,7 @@ fn build_station_capability_summary(config: &ServiceConfig) -> StationCapability
         },
         supported_models: supported_models.into_iter().collect(),
         supports_service_tier: aggregate_capability_support(
-            &config.upstreams,
+            &station.upstreams,
             &[
                 "supports_service_tier",
                 "supports_service_tiers",
@@ -168,7 +169,7 @@ fn build_station_capability_summary(config: &ServiceConfig) -> StationCapability
             ],
         ),
         supports_reasoning_effort: aggregate_capability_support(
-            &config.upstreams,
+            &station.upstreams,
             &["supports_reasoning_effort", "supports_reasoning"],
         ),
     }
@@ -314,12 +315,12 @@ mod tests {
             },
         );
 
-        let configs = build_station_options_from_mgr(&mgr, &HashMap::new(), &HashMap::new());
+        let stations = build_station_options_from_mgr(&mgr, &HashMap::new(), &HashMap::new());
 
-        let declared = configs
+        let declared = stations
             .iter()
             .find(|cfg| cfg.name == "declared")
-            .expect("declared config");
+            .expect("declared station");
         assert_eq!(
             declared.capabilities.model_catalog_kind,
             ModelCatalogKind::Declared
@@ -341,10 +342,10 @@ mod tests {
             CapabilitySupport::Supported
         );
 
-        let implicit = configs
+        let implicit = stations
             .iter()
             .find(|cfg| cfg.name == "implicit")
-            .expect("implicit config");
+            .expect("implicit station");
         assert_eq!(
             implicit.capabilities.model_catalog_kind,
             ModelCatalogKind::ImplicitAny
@@ -359,10 +360,10 @@ mod tests {
             CapabilitySupport::Unknown
         );
 
-        let blocked = configs
+        let blocked = stations
             .iter()
             .find(|cfg| cfg.name == "blocked")
-            .expect("blocked config");
+            .expect("blocked station");
         assert_eq!(
             blocked.capabilities.supports_service_tier,
             CapabilitySupport::Unsupported
@@ -402,9 +403,11 @@ mod tests {
         assert_eq!(profiles.len(), 2);
         assert_eq!(profiles[0].name, "a-deep");
         assert!(!profiles[0].is_default);
+        assert!(profiles[0].fast_mode);
         assert_eq!(profiles[0].extends.as_deref(), Some("base"));
         assert_eq!(profiles[1].name, "z-fast");
         assert!(profiles[1].is_default);
+        assert!(!profiles[1].fast_mode);
         assert_eq!(profiles[1].reasoning_effort.as_deref(), Some("low"));
     }
 

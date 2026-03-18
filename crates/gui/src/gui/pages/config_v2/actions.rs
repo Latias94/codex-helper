@@ -74,13 +74,13 @@ impl ConfigV2PendingActions {
                         match default_profile_name {
                             Some(_) => pick(
                                 ctx.lang,
-                                "已更新配置默认 profile。",
-                                "Configured default profile updated.",
+                                "已更新持久化默认 profile。",
+                                "Persisted default profile updated.",
                             ),
                             None => pick(
                                 ctx.lang,
-                                "已清除配置默认 profile。",
-                                "Configured default profile cleared.",
+                                "已清除持久化默认 profile。",
+                                "Persisted default profile cleared.",
                             ),
                         }
                         .to_string(),

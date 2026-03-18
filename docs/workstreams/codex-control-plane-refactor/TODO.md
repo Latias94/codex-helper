@@ -30,20 +30,17 @@
 See `CLOSEOUT.md` for the recommended closeout buckets and exit-gap assessment.
 See `MILESTONES.md` for the current `P0 / P1 / P2` closeout priority ladder.
 See `CENTRAL_RELAY.md` for the explicit LAN / Tailscale shared-relay operating model.
+See `VOCABULARY.md` for the canonical term mapping and compatibility-only wording rules.
 
 ## WS0 - Baseline Semantics and Naming
 
-- [ ] CP-000 Audit current terminology:
-  - `config`
-  - `active`
-  - `pinned`
-  - `override`
-  - `session`
-- [ ] CP-001 Define vocabulary mapping from legacy terms to target terms:
-  - legacy config -> station/profile/legacy-config bridge
+- [x] CP-000 Audit current terminology:
+  - documented the canonical vs compatibility-only use of `config`, `active`, `pinned`, `override`, and `session` in `VOCABULARY.md`
+- [x] CP-001 Define vocabulary mapping from legacy terms to target terms:
+  - documented the legacy `config` -> station/profile/persisted-config bridge in `VOCABULARY.md`
 - [~] CP-002 Decide whether `config` remains public API language or becomes compatibility-only wording
   - [x] public attach/API surface is now station-first and canonical-v1-only
-  - [~] internal runtime/public UI model is now station-first; a narrow wording/doc/export tail still remains
+  - [~] internal runtime/public UI model is now station-first; the remaining tail is now mostly compatibility-only wording, docs/examples, and export cleanup
 - [x] CP-003 Reject or migrate invalid values like `active = "true"`
 - [x] CP-004 Add migration note for legacy TOML layout
 
@@ -117,17 +114,21 @@ See `CENTRAL_RELAY.md` for the explicit LAN / Tailscale shared-relay operating m
       - [x] built-in GUI attach now targets station-first v1 routes only and explicitly rejects pre-v1 attach surfaces
       - [x] GUI/TUI runtime snapshot, tray, and page-facing models now propagate `global_station_override` / `station_health` / `StationHealth`
       - [x] compatibility tests now cover the station-first v1 surface and explicit pre-v1 attach rejection
-      - [~] exported type naming is largely done; the remaining internal/public cleanup tail is now narrow
+      - [~] exported type naming is largely done; the remaining internal/public cleanup tail is now mostly compatibility-only exports plus docs/examples wording
       - [x] core health type now exports station-first `StationHealth`, with legacy `ConfigHealth` removed
       - [x] `DashboardSnapshot` now exposes station-first accessors and no longer carries legacy dual fields
       - [x] public v1 request payloads and dashboard-core type aliases now use station-first naming (`station_name` / `station_names`, `StationOption`, `StationCapabilitySummary`)
       - [x] routing explanation output and retry-trace observability now emit station-first field names (`active_station`, `selected_station`, `eligible_stations`)
       - [x] TUI page/focus/stats state now uses station-first names (`Page::Stations`, `Focus::Stations`, `StatsFocus::Stations`)
       - [x] `ServiceConfigManager` public serialization now emits `stations`, accepts legacy `configs`, and treats `active_station()` as the canonical accessor
+      - [x] `dashboard_core` internal module naming is now station-first (`station_options`), and `active_config()` is reduced to a compatibility-only shim
+      - [x] persisted active-station mutation now uses canonical `/api/v1/stations/active`, while legacy `/stations/config-active` remains a compatibility alias only
+      - [x] control-plane capability payload now emits canonical `station_persisted_settings`, while legacy `station_persisted_config` remains a deserialize-only compatibility alias
+      - [x] GUI station detail module naming is now settings-first (`stations_detail_persisted_settings.rs`)
       - [x] core bootstrap/auth-sync/storage/usage/proxy flows now consume station-first manager accessors (`stations()`, `station()`, `contains_station()`)
       - [x] TUI station page module naming now matches semantics (`view/pages/stations.rs`, `apply_global_active_station`, station-first snapshot fields)
       - [x] Phase 1 / design docs now describe station-first session identity, override, and fallback terminology
-      - [~] remaining closeout tail is now limited to wording/doc/export cleanup on a few operator/admin surfaces
+      - [~] remaining closeout tail is now limited to wording/doc/export cleanup on a few operator/admin surfaces plus historical docs/examples
 - [x] CP-402 Add capability summary per station:
   - [x] supported models
   - [x] fast/service tier support
@@ -192,10 +193,33 @@ See `CENTRAL_RELAY.md` for the explicit LAN / Tailscale shared-relay operating m
   - [x] station/health console
   - [x] config/editor workspace
   - [x] remote-safe capability surface
+  - [x] `operator/summary` now acts as the top-level home payload with session/station/profile/provider catalogs for attach-mode clients
+  - [x] `operator/summary` now also carries lightweight runtime health/failover posture for home-card style clients
+  - [x] attach-mode GUI write surfaces now prefer `operator_summary.links` for retry/profile/station/provider/session mutations and derive child mutation routes from semantic parent links where needed
+  - [x] local discovery/attach entrypoints now preload and surface `operator/summary` runtime/count/health context instead of acting as a port-only scanner
 - [x] CP-613 Refresh GUI layout/design where needed after semantic closeout:
   - [x] reduce dense single-column operator panels
   - [x] make current binding/effective route/last decision visually distinct
   - [x] establish reusable layout/style primitives for future WebUI
+- [~] CP-614 Split oversized control-plane support modules where semantics are already stable
+  - [x] split `crates/gui/src/gui/proxy_control/tests.rs` into themed `tests/` modules with shared helpers
+  - [x] split `crates/core/src/state.rs` shared types into `state/runtime_types.rs` and `state/session_identity.rs`
+  - [x] split `crates/core/src/proxy/tests/failover.rs` into `failover/mod.rs`, `failover/response_semantics.rs`, and `failover/config_failover.rs`
+  - [x] split `crates/core/src/proxy/tests/api_admin.rs` into `api_admin/mod.rs`, `api_admin/capabilities.rs`, `api_admin/persisted_crud.rs`, `api_admin/runtime_overrides.rs`, and `api_admin/sessions.rs`
+  - [x] split `crates/core/src/sessions.rs` support code into `sessions/stats_cache.rs` and `sessions/tests.rs`
+  - [x] split `crates/core/src/sessions.rs` transcript support into `sessions/transcript.rs`
+  - [x] split `crates/core/src/config.rs` tests into `config/tests/` themed modules with shared helpers
+  - [x] split `crates/core/src/config.rs` retry policy types/resolution into `config_retry.rs`
+  - [x] split `crates/core/src/config.rs` v2 compile/migrate/compact helpers into `config_v2.rs`
+  - [x] split `crates/core/src/config.rs` profile inheritance/compatibility validation into `config_profiles.rs`
+  - [x] split `crates/core/src/config.rs` routing explanation helpers into `config_routing.rs`
+  - [x] split `crates/core/src/proxy/control_plane_routes.rs` into themed `control_plane_routes/` modules
+  - [x] split `crates/core/src/logging.rs` control-trace parsing/write path into `logging/control_trace.rs` and move request-log tests into `logging/tests.rs`
+  - [x] split `crates/gui/src/gui/pages/config_v2/editors/stations.rs` into `stations/mod.rs`, `stations/member_editor.rs`, and `stations/section.rs`
+  - [x] split `crates/gui/src/gui/pages/components/history_sessions.rs` into `history_sessions/mod.rs`, `history_sessions/session_panels.rs`, and `history_sessions/all_by_date.rs`
+  - [x] split `crates/gui/src/gui/pages/config_v2_header.rs` into `config_v2_header/mod.rs`, `config_v2_header/actions.rs`, `config_v2_header/focus_targets.rs`, `config_v2_header/surface_mode.rs`, and `config_v2_header/runtime_card.rs`
+  - [x] split `crates/gui/src/gui/proxy_control/attached_refresh.rs` into `attached_refresh/mod.rs`, `attached_refresh/fetch.rs`, and `attached_refresh/state_apply.rs`
+  - [x] split `crates/gui/src/gui/proxy_control/tests/attached_refresh.rs` into themed `attached_refresh/` modules with shared helpers
 - [x] CP-603 Add Stations page with:
   - [x] expose station quick switch and common station metadata in Overview / Config forms
   - [x] dedicated station-focused page for health / drain / breaker / quick switch
@@ -239,9 +263,13 @@ See `CENTRAL_RELAY.md` for the explicit LAN / Tailscale shared-relay operating m
 
 ## Definition of Ready for Implementation
 
-- [ ] The team agrees on:
-  - station vs profile naming
-  - resume/fork inheritance rules
-  - default failover policy
-- [ ] The first API payload sketches are stable enough for GUI consumption
-- [ ] Legacy compatibility plan is written down before schema churn begins
+- [x] The team agrees on:
+  - station vs profile naming: locked via `VOCABULARY.md`
+  - resume/fork inheritance rules: locked in `Locked Decisions` and `DESIGN.md`
+  - default failover policy: locked in `DESIGN.md` / `MILESTONES.md`
+- [x] The first API payload sketches are stable enough for GUI consumption
+  - `operator/summary` is now documented as the read-side home payload in `OPERATOR_SUMMARY_CONTRACT.md`
+  - backend regression coverage pins the canonical station-first home payload shape
+- [x] Legacy compatibility plan is written down before schema churn begins
+  - vocabulary and compatibility-only wording rules live in `VOCABULARY.md`
+  - migration and persisted-config compatibility rules live in `CONFIG_V2_MIGRATION.md`

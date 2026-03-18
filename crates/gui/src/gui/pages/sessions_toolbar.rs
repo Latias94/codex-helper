@@ -95,7 +95,7 @@ pub(super) fn render_default_profile_section(
             }
 
             if ui
-                .button(pick(ctx.lang, "回到配置默认", "Use config default"))
+                .button(pick(ctx.lang, "回到持久化默认", "Use persisted default"))
                 .clicked()
             {
                 if !snapshot.supports_default_profile_override {
@@ -114,8 +114,8 @@ pub(super) fn render_default_profile_section(
                             *ctx.last_info = Some(
                                 pick(
                                     ctx.lang,
-                                    "已恢复配置文件默认 profile",
-                                    "Fell back to config default profile",
+                                    "已恢复持久化默认 profile",
+                                    "Fell back to persisted default profile",
                                 )
                                 .to_string(),
                             );
@@ -170,8 +170,8 @@ pub(super) fn render_session_filter_controls(ui: &mut egui::Ui, ctx: &mut PageCt
             [320.0, 20.0],
             egui::TextEdit::singleline(&mut ctx.view.sessions.search).hint_text(pick(
                 ctx.lang,
-                "按 session_id / cwd / model / station / config 过滤…",
-                "Filter by session_id / cwd / model / station / config...",
+                "按 session_id / cwd / model / station / profile 过滤…",
+                "Filter by session_id / cwd / model / station / profile...",
             )),
         );
         if ui.button(pick(ctx.lang, "清空", "Clear")).clicked() {

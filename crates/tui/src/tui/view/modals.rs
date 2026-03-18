@@ -1595,6 +1595,7 @@ mod tests {
             model: None,
             reasoning_effort: None,
             service_tier: None,
+            fast_mode: false,
             is_default: false,
         }
     }

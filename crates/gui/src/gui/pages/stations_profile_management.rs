@@ -6,8 +6,8 @@ pub(super) fn render_profile_management_entrypoint(ui: &mut egui::Ui, ctx: &mut 
         egui::Color32::from_rgb(120, 120, 120),
         pick(
             ctx.lang,
-            "旧版 GUI routing preset 已停用。现在统一使用代理配置里的 [codex.profiles.*]；默认 profile 在“配置”页管理，单会话覆盖在“会话”页管理。",
-            "Legacy GUI routing presets are retired. Use [codex.profiles.*] in proxy config instead; manage default profiles in Config and per-session overrides in Sessions.",
+            "旧版 GUI routing preset 已停用。现在统一使用代理配置文件里的 [codex.profiles.*]；持久化默认 profile 在“配置”页管理，单会话覆盖在“会话”页管理。",
+            "Legacy GUI routing presets are retired. Use [codex.profiles.*] in the proxy config file instead; manage persisted default profiles in Config and per-session overrides in Sessions.",
         ),
     );
     ui.horizontal(|ui| {

@@ -164,6 +164,7 @@ fn session_binding_profile_summary_resolves_inherited_profile() {
             model: None,
             reasoning_effort: Some("medium".to_string()),
             service_tier: None,
+            fast_mode: false,
             is_default: false,
         },
         ControlProfileOption {
@@ -173,6 +174,7 @@ fn session_binding_profile_summary_resolves_inherited_profile() {
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: None,
             service_tier: Some("priority".to_string()),
+            fast_mode: true,
             is_default: false,
         },
     ];

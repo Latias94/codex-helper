@@ -1,4 +1,4 @@
-pub(super) use super::stations_detail_persisted_config::*;
+pub(super) use super::stations_detail_persisted_settings::*;
 pub(super) use super::stations_detail_quick_switch::*;
 pub(super) use super::stations_detail_runtime_control::*;
 

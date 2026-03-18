@@ -30,7 +30,7 @@ fn station_provider_catalogs(
     let service_name = runtime_service_name(snapshot, ctx);
     if let Some(attached) = ctx.proxy.attached()
         && attached.service_name.as_deref() == Some(service_name)
-        && attached.supports_persisted_station_config
+        && attached.supports_persisted_station_settings
     {
         return Some((
             attached.persisted_stations.clone(),
@@ -156,8 +156,8 @@ pub(super) fn render_station_provider_routes_section(
             egui::Color32::from_rgb(120, 120, 120),
             pick(
                 ctx.lang,
-                "当前无法读取 station/provider 结构；这通常表示远端附着未开放 persisted station config API，或本地当前不是 v2 station/provider 配置。",
-                "The station/provider structure is unavailable right now. This usually means the remote attach does not expose the persisted station-config API, or the local config is not using the v2 station/provider schema.",
+                "当前无法读取 station/provider 结构；这通常表示远端附着未开放持久化站点设置 API，或本地当前不是 v2 station/provider 配置。",
+                "The station/provider structure is unavailable right now. This usually means the remote attach does not expose the persisted station-settings API, or the local config is not using the v2 station/provider schema.",
             ),
         );
         ui.horizontal(|ui| {

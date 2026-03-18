@@ -284,6 +284,7 @@ pub(in super::super::super) fn render_config_v2_profiles_local(
             model: declared_profile.model.clone(),
             reasoning_effort: declared_profile.reasoning_effort.clone(),
             service_tier: declared_profile.service_tier.clone(),
+            fast_mode: declared_profile.service_tier.as_deref() == Some("priority"),
             is_default,
         }));
         cols[1].small(pick(

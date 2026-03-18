@@ -290,6 +290,7 @@ impl ProxyController {
             configured_default_profile: default_profile.clone(),
             default_profile,
             profiles,
+            providers: Vec::new(),
             session_model_overrides: HashMap::new(),
             session_station_overrides: HashMap::new(),
             session_effort_overrides: HashMap::new(),

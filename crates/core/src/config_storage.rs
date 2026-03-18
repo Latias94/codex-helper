@@ -94,7 +94,7 @@ version = 2
 # - `providers` 负责账号、认证、模型能力、endpoint 列表。
 # - `stations` 负责调度入口、优先级(level)、启停，以及引用哪些 provider/endpoint。
 # - 同一个 provider 可以被多个 station 复用；同一个 station 也可以组合多个 provider/endpoint。
-# - 旧的 `[codex.configs.*]` 仍兼容，但新写法更适合做中转站管理和未来 GUI。
+# - 旧的 `[codex.configs.*]` 仍作为兼容输入被接受，但新写法更适合做中转站管理和未来 GUI。
 #
 # [codex]
 # active_station = "main"
@@ -219,8 +219,8 @@ profile = "balanced"
 # 下面这些字段是“覆盖项”（在 profile 默认值之上进行覆盖）。
 #
 # 两层模型：
-# - retry.upstream：在当前 provider/config 内，对单个 upstream 的内部重试（默认更偏向同一 upstream）。
-# - retry.provider：当 upstream 层无法恢复时，决定是否切换到其他 upstream / 其他同级 config/provider。
+# - retry.upstream：在当前 station 已选中的 provider/endpoint 内，对单个 upstream 的内部重试（默认更偏向同一 upstream）。
+# - retry.provider：当 upstream 层无法恢复时，决定是否切换到其他 upstream / 同一 station 可用的其他 provider 路径。
 #
 # 覆盖示例（可按需取消注释）：
 #

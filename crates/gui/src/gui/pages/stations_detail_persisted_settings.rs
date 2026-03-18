@@ -1,22 +1,26 @@
 use super::stations_detail_controls::refresh_runtime_snapshot;
 use super::*;
 
-pub(super) fn render_station_persisted_config_section(
+pub(super) fn render_station_persisted_settings_section(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
     cfg: &StationOption,
     snapshot: &GuiRuntimeSnapshot,
     configured_active_station: Option<&str>,
-    supports_persisted_station_config: bool,
+    supports_persisted_station_settings: bool,
 ) {
-    ui.label(pick(ctx.lang, "配置控制", "Persisted config"));
-    if supports_persisted_station_config {
+    ui.label(pick(
+        ctx.lang,
+        "持久化站点设置",
+        "Persisted station settings",
+    ));
+    if supports_persisted_station_settings {
         ui.horizontal(|ui| {
             if ui
                 .button(pick(
                     ctx.lang,
-                    "设为配置 active_station",
-                    "Set configured active_station",
+                    "设为持久化 active_station",
+                    "Set persisted active_station",
                 ))
                 .clicked()
             {
@@ -30,8 +34,8 @@ pub(super) fn render_station_persisted_config_section(
                         *ctx.last_info = Some(
                             pick(
                                 ctx.lang,
-                                "已更新配置 active_station",
-                                "Configured active_station updated",
+                                "已更新持久化 active_station",
+                                "Persisted active_station updated",
                             )
                             .to_string(),
                         );
@@ -48,8 +52,8 @@ pub(super) fn render_station_persisted_config_section(
                     configured_active_station.is_some(),
                     egui::Button::new(pick(
                         ctx.lang,
-                        "清除配置 active_station",
-                        "Clear configured active_station",
+                        "清除持久化 active_station",
+                        "Clear persisted active_station",
                     )),
                 )
                 .clicked()
@@ -61,8 +65,8 @@ pub(super) fn render_station_persisted_config_section(
                         *ctx.last_info = Some(
                             pick(
                                 ctx.lang,
-                                "已清除配置 active_station",
-                                "Configured active_station cleared",
+                                "已清除持久化 active_station",
+                                "Persisted active_station cleared",
                             )
                             .to_string(),
                         );
@@ -81,9 +85,9 @@ pub(super) fn render_station_persisted_config_section(
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut persisted_enabled,
-                pick(ctx.lang, "配置启用", "Configured enabled"),
+                pick(ctx.lang, "持久化启用", "Persisted enabled"),
             );
-            ui.label(pick(ctx.lang, "配置等级", "Configured level"));
+            ui.label(pick(ctx.lang, "持久化等级", "Persisted level"));
             egui::ComboBox::from_id_salt(("stations_persisted_level", cfg.name.as_str()))
                 .selected_text(persisted_level.to_string())
                 .show_ui(ui, |ui| {
@@ -107,7 +111,7 @@ pub(super) fn render_station_persisted_config_section(
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
-                            "已写回站点配置字段",
+                            "已写回持久化站点字段",
                             "Persisted station fields updated",
                         )
                         .to_string(),
@@ -123,14 +127,14 @@ pub(super) fn render_station_persisted_config_section(
         ui.small(if matches!(snapshot.kind, ProxyModeKind::Attached) {
             pick(
                 ctx.lang,
-                "这里直接写回附着代理的配置，不依赖本机文件。",
-                "These controls write back to the attached proxy's config directly and do not rely on this device's local file.",
+                "这里直接写回附着代理的持久化站点设置，不依赖本机文件。",
+                "These controls write back to the attached proxy's persisted station settings directly and do not rely on this device's local file.",
             )
         } else {
             pick(
                 ctx.lang,
-                "这里通过本地 control-plane 写回配置文件，并与运行态保持同步。",
-                "These controls write back through the local control plane and keep runtime in sync.",
+                "这里通过本地 control-plane 写回持久化站点设置，并与运行态保持同步。",
+                "These controls write back through the local control plane to persisted station settings and keep runtime in sync.",
             )
         });
     } else {
@@ -138,8 +142,8 @@ pub(super) fn render_station_persisted_config_section(
             egui::Color32::from_rgb(120, 120, 120),
             pick(
                 ctx.lang,
-                "当前目标没有暴露 persisted station config API，因此这里只能查看配置态，不能直接修改。",
-                "This target does not expose persisted station config APIs yet, so persisted fields are view-only here.",
+                "当前目标没有暴露持久化站点设置 API，因此这里只能查看持久化设置，不能直接修改。",
+                "This target does not expose persisted station settings APIs yet, so persisted fields are view-only here.",
             ),
         );
     }

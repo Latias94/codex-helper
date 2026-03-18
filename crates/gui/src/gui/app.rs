@@ -355,7 +355,7 @@ impl eframe::App for GuiApp {
                                     && match snapshot.kind {
                                         super::proxy_control::ProxyModeKind::Running => true,
                                         super::proxy_control::ProxyModeKind::Attached => {
-                                            snapshot.supports_persisted_station_config
+                                            snapshot.supports_persisted_station_settings
                                         }
                                         _ => false,
                                     }

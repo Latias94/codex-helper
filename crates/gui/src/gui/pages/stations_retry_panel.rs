@@ -136,8 +136,8 @@ pub(super) fn render_retry_panel(
             } else {
                 pick(
                     ctx.lang,
-                    "本地运行模式下，这里通过 control-plane 写回配置文件并触发 reload。",
-                    "In local running mode, this writes through the control plane to persisted config and reloads the runtime.",
+                    "本地运行模式下，这里通过 control-plane 写回持久化 retry 策略并触发 reload。",
+                    "In local running mode, this writes through the control plane to persisted retry policy and reloads the runtime.",
                 )
             });
         } else {

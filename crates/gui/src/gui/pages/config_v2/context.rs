@@ -1,4 +1,8 @@
 use super::*;
+use crate::config::ResolvedRetryConfig;
+use crate::dashboard_core::{
+    OperatorHealthSummary, OperatorRetrySummary, OperatorRuntimeSummary, OperatorSummaryCounts,
+};
 
 pub(in crate::gui::pages) struct ConfigV2RenderContext {
     pub(in crate::gui::pages) schema_version: u32,
@@ -24,6 +28,21 @@ pub(in crate::gui::pages) struct ConfigV2RenderContext {
     pub(in crate::gui::pages) provider_structure_control_plane_enabled: bool,
     pub(in crate::gui::pages) provider_structure_edit_enabled: bool,
     pub(in crate::gui::pages) runtime_service: Option<String>,
+    pub(in crate::gui::pages) runtime_base_url: Option<String>,
+    pub(in crate::gui::pages) runtime_admin_base_url: Option<String>,
+    pub(in crate::gui::pages) runtime_last_error: Option<String>,
+    pub(in crate::gui::pages) runtime_matches_selected_service: bool,
+    pub(in crate::gui::pages) operator_runtime_summary: Option<OperatorRuntimeSummary>,
+    pub(in crate::gui::pages) operator_retry_summary: Option<OperatorRetrySummary>,
+    pub(in crate::gui::pages) operator_health_summary: Option<OperatorHealthSummary>,
+    pub(in crate::gui::pages) operator_counts: Option<OperatorSummaryCounts>,
+    pub(in crate::gui::pages) supports_operator_summary_api: bool,
+    pub(in crate::gui::pages) configured_retry: Option<RetryConfig>,
+    pub(in crate::gui::pages) resolved_retry: Option<ResolvedRetryConfig>,
+    pub(in crate::gui::pages) supports_retry_config_api: bool,
+    pub(in crate::gui::pages) runtime_host_local_capabilities:
+        Option<HostLocalControlPlaneCapabilities>,
+    pub(in crate::gui::pages) runtime_remote_admin_access: Option<RemoteAdminAccessCapabilities>,
     pub(in crate::gui::pages) supports_v1: bool,
     pub(in crate::gui::pages) cfg_health: Option<StationHealth>,
     pub(in crate::gui::pages) hc_status: Option<HealthCheckStatus>,
@@ -79,12 +98,17 @@ impl ConfigV2RenderContext {
             crate::config::ServiceKind::Claude => "claude",
             crate::config::ServiceKind::Codex => "codex",
         };
-        let control_plane_snapshot = ctx.proxy.snapshot().filter(|snapshot| {
+        let runtime_snapshot = ctx.proxy.snapshot();
+        let control_plane_snapshot = runtime_snapshot.clone().filter(|snapshot| {
             snapshot.supports_v1 && snapshot.service_name.as_deref() == Some(selected_service)
         });
+        let runtime_matches_selected_service = runtime_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.service_name.as_deref())
+            .is_some_and(|service_name| service_name == selected_service);
         let station_control_plane_snapshot = control_plane_snapshot
             .clone()
-            .filter(|snapshot| snapshot.supports_persisted_station_config);
+            .filter(|snapshot| snapshot.supports_persisted_station_settings);
         let station_control_plane_catalog = station_control_plane_snapshot
             .as_ref()
             .map(|snapshot| {
@@ -169,40 +193,45 @@ impl ConfigV2RenderContext {
         let selected_name = ctx.view.config.selected_name.clone();
         let selected_station_name = selected_name.clone().unwrap_or_default();
 
-        let (runtime_service, supports_v1, cfg_health, hc_status) = match ctx.proxy.kind() {
-            ProxyModeKind::Running => {
-                if let Some(running) = ctx.proxy.running() {
-                    let state = running.state.clone();
-                    let (health, checks) = ctx.rt.block_on(async {
-                        tokio::join!(
-                            state.get_station_health(running.service_name),
-                            state.list_health_checks(running.service_name)
+        let (runtime_service, runtime_admin_base_url, supports_v1, cfg_health, hc_status) =
+            match ctx.proxy.kind() {
+                ProxyModeKind::Running => {
+                    if let Some(running) = ctx.proxy.running() {
+                        let state = running.state.clone();
+                        let (health, checks) = ctx.rt.block_on(async {
+                            tokio::join!(
+                                state.get_station_health(running.service_name),
+                                state.list_health_checks(running.service_name)
+                            )
+                        });
+                        (
+                            Some(running.service_name.to_string()),
+                            Some(crate::proxy::local_admin_base_url_for_proxy_port(
+                                running.admin_port,
+                            )),
+                            true,
+                            health.get(&selected_station_name).cloned(),
+                            checks.get(&selected_station_name).cloned(),
                         )
-                    });
-                    (
-                        Some(running.service_name.to_string()),
-                        true,
-                        health.get(&selected_station_name).cloned(),
-                        checks.get(&selected_station_name).cloned(),
-                    )
-                } else {
-                    (None, false, None, None)
+                    } else {
+                        (None, None, false, None, None)
+                    }
                 }
-            }
-            ProxyModeKind::Attached => {
-                if let Some(attached) = ctx.proxy.attached() {
-                    (
-                        attached.service_name.clone(),
-                        attached.api_version == Some(1),
-                        attached.station_health.get(&selected_station_name).cloned(),
-                        attached.health_checks.get(&selected_station_name).cloned(),
-                    )
-                } else {
-                    (None, false, None, None)
+                ProxyModeKind::Attached => {
+                    if let Some(attached) = ctx.proxy.attached() {
+                        (
+                            attached.service_name.clone(),
+                            Some(attached.admin_base_url.clone()),
+                            attached.api_version == Some(1),
+                            attached.station_health.get(&selected_station_name).cloned(),
+                            attached.health_checks.get(&selected_station_name).cloned(),
+                        )
+                    } else {
+                        (None, None, false, None, None)
+                    }
                 }
-            }
-            _ => (None, false, None, None),
-        };
+                _ => (None, None, false, None, None),
+            };
 
         let profile_control_plane_catalog = control_plane_snapshot
             .as_ref()
@@ -262,6 +291,15 @@ impl ConfigV2RenderContext {
         let mut provider_display_names =
             if let Some(provider_specs) = attached_provider_specs.as_ref() {
                 provider_specs.keys().cloned().collect::<Vec<_>>()
+            } else if let Some(snapshot) = control_plane_snapshot
+                .as_ref()
+                .filter(|snapshot| !snapshot.providers.is_empty())
+            {
+                snapshot
+                    .providers
+                    .iter()
+                    .map(|provider| provider.name.clone())
+                    .collect::<Vec<_>>()
             } else {
                 local_provider_spec_catalog
                     .keys()
@@ -303,6 +341,44 @@ impl ConfigV2RenderContext {
             provider_structure_control_plane_enabled,
             provider_structure_edit_enabled,
             runtime_service,
+            runtime_base_url: runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.base_url.clone()),
+            runtime_admin_base_url,
+            runtime_last_error: runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.last_error.clone()),
+            runtime_matches_selected_service,
+            operator_runtime_summary: runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.operator_runtime_summary.clone()),
+            operator_retry_summary: runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.operator_retry_summary.clone()),
+            operator_health_summary: runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.operator_health_summary.clone()),
+            operator_counts: runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.operator_counts.clone()),
+            supports_operator_summary_api: runtime_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.supports_operator_summary_api),
+            configured_retry: runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.configured_retry.clone()),
+            resolved_retry: runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.resolved_retry.clone()),
+            supports_retry_config_api: runtime_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.supports_retry_config_api),
+            runtime_host_local_capabilities: runtime_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.host_local_capabilities.clone()),
+            runtime_remote_admin_access: runtime_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.remote_admin_access.clone()),
             supports_v1,
             cfg_health,
             hc_status,

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::bail;
 
+use crate::dashboard_core::OperatorSummaryLinks;
 use crate::proxy::local_proxy_base_url;
 use crate::state::RuntimeConfigState;
 
@@ -25,17 +26,137 @@ fn attached_control_base(
     Ok(att.admin_base_url.clone())
 }
 
-fn mode_control_base<F>(
+pub(super) fn control_url(base: &str, path: &str) -> String {
+    format!("{base}{path}")
+}
+
+fn linked_control_path(
+    links: Option<&OperatorSummaryLinks>,
+    select: impl FnOnce(&OperatorSummaryLinks) -> Option<&str>,
+    fallback: &str,
+) -> String {
+    links
+        .and_then(select)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn linked_child_path(parent: &str, child: &str) -> String {
+    let parent = parent.trim_end_matches('/');
+    let child = child.trim_start_matches('/');
+    format!("{parent}/{child}")
+}
+
+fn apply_path_template(template: &str, placeholder: &str, value: &str) -> String {
+    template.replace(placeholder, value)
+}
+
+pub(super) fn attached_control_url(
+    att: &AttachedStatus,
+    supported: bool,
+    unsupported_message: &'static str,
+    select: impl FnOnce(&OperatorSummaryLinks) -> Option<&str>,
+    fallback: &str,
+) -> anyhow::Result<String> {
+    let base = attached_control_base(att, supported, unsupported_message)?;
+    let path = linked_control_path(att.operator_summary_links.as_ref(), select, fallback);
+    Ok(control_url(&base, &path))
+}
+
+pub(super) fn attached_child_control_url(
+    att: &AttachedStatus,
+    supported: bool,
+    unsupported_message: &'static str,
+    select_parent: impl FnOnce(&OperatorSummaryLinks) -> Option<&str>,
+    fallback_parent: &str,
+    child: &str,
+) -> anyhow::Result<String> {
+    let base = attached_control_base(att, supported, unsupported_message)?;
+    let parent = linked_control_path(
+        att.operator_summary_links.as_ref(),
+        select_parent,
+        fallback_parent,
+    );
+    let path = linked_child_path(&parent, child);
+    Ok(control_url(&base, &path))
+}
+
+pub(super) fn mode_control_url<F>(
     mode: &ProxyMode,
     supported: F,
     unsupported_message: &'static str,
+    select: impl FnOnce(&OperatorSummaryLinks) -> Option<&str>,
+    fallback: &str,
 ) -> anyhow::Result<String>
 where
     F: FnOnce(&AttachedStatus) -> bool,
 {
     match mode {
-        ProxyMode::Running(r) => Ok(local_proxy_base_url(r.admin_port)),
-        ProxyMode::Attached(att) => attached_control_base(att, supported(att), unsupported_message),
+        ProxyMode::Running(r) => Ok(control_url(&local_proxy_base_url(r.admin_port), fallback)),
+        ProxyMode::Attached(att) => {
+            attached_control_url(att, supported(att), unsupported_message, select, fallback)
+        }
+        _ => bail!("proxy is not running/attached"),
+    }
+}
+
+pub(super) fn mode_child_control_url<F>(
+    mode: &ProxyMode,
+    supported: F,
+    unsupported_message: &'static str,
+    select_parent: impl FnOnce(&OperatorSummaryLinks) -> Option<&str>,
+    fallback_parent: &str,
+    child: &str,
+) -> anyhow::Result<String>
+where
+    F: FnOnce(&AttachedStatus) -> bool,
+{
+    match mode {
+        ProxyMode::Running(r) => Ok(control_url(
+            &local_proxy_base_url(r.admin_port),
+            &linked_child_path(fallback_parent, child),
+        )),
+        ProxyMode::Attached(att) => attached_child_control_url(
+            att,
+            supported(att),
+            unsupported_message,
+            select_parent,
+            fallback_parent,
+            child,
+        ),
+        _ => bail!("proxy is not running/attached"),
+    }
+}
+
+pub(super) fn mode_template_control_url<F>(
+    mode: &ProxyMode,
+    supported: F,
+    unsupported_message: &'static str,
+    select_template: impl FnOnce(&OperatorSummaryLinks) -> Option<&str>,
+    fallback_template: &str,
+    placeholder: &str,
+    value: &str,
+) -> anyhow::Result<String>
+where
+    F: FnOnce(&AttachedStatus) -> bool,
+{
+    match mode {
+        ProxyMode::Running(r) => Ok(control_url(
+            &local_proxy_base_url(r.admin_port),
+            &apply_path_template(fallback_template, placeholder, value),
+        )),
+        ProxyMode::Attached(att) => {
+            let base = attached_control_base(att, supported(att), unsupported_message)?;
+            let template = linked_control_path(
+                att.operator_summary_links.as_ref(),
+                select_template,
+                fallback_template,
+            );
+            let path = apply_path_template(&template, placeholder, value);
+            Ok(control_url(&base, &path))
+        }
         _ => bail!("proxy is not running/attached"),
     }
 }
@@ -103,21 +224,20 @@ impl ProxyController {
                 Ok(())
             }
             ProxyMode::Attached(att) => {
-                let base = attached_control_base(
+                let url = attached_control_url(
                     att,
                     att.supports_default_profile_override,
                     "attached proxy does not support runtime default profile switch",
+                    |links| Some(links.default_profile.as_str()),
+                    "/__codex_helper/api/v1/profiles/default",
                 )?;
                 let client = self.http_client.clone();
                 let fut = async move {
-                    send_admin_request(
-                        client
-                            .post(format!("{base}/__codex_helper/api/v1/profiles/default"))
-                            .timeout(Duration::from_millis(1200))
-                            .json(&serde_json::json!({
-                                "profile_name": profile_name,
-                            })),
-                    )
+                    send_admin_request(client.post(url).timeout(Duration::from_millis(1200)).json(
+                        &serde_json::json!({
+                            "profile_name": profile_name,
+                        }),
+                    ))
                     .await?;
                     Ok::<(), anyhow::Error>(())
                 };
@@ -233,10 +353,13 @@ impl ProxyController {
                 Ok(())
             }
             ProxyMode::Attached(att) => {
-                let base = attached_control_base(
+                let url = attached_child_control_url(
                     att,
                     att.supports_station_runtime_override,
                     "attached proxy does not support runtime station meta control",
+                    |links| Some(links.stations.as_str()),
+                    "/__codex_helper/api/v1/stations",
+                    "runtime",
                 )?;
                 let client = self.http_client.clone();
                 let fut = async move {
@@ -265,7 +388,7 @@ impl ProxyController {
                     );
                     send_admin_request(
                         client
-                            .post(format!("{base}/__codex_helper/api/v1/stations/runtime"))
+                            .post(url)
                             .timeout(Duration::from_millis(1200))
                             .json(&serde_json::Value::Object(body)),
                     )

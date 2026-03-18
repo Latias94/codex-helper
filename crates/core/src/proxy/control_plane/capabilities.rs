@@ -3,12 +3,13 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 
 use crate::dashboard_core::{
-    ApiV1Capabilities, ApiV1Snapshot, HostLocalControlPlaneCapabilities,
+    ApiV1Capabilities, ApiV1OperatorSummary, ApiV1Snapshot, HostLocalControlPlaneCapabilities,
     SharedControlPlaneCapabilities, build_profile_options_from_mgr,
 };
 
 use super::super::ProxyService;
 use super::super::admin::admin_access_capabilities;
+use super::super::api_responses::build_operator_summary;
 use super::super::control_plane_manifest::{api_v1_endpoint_paths, api_v1_surface_capabilities};
 use super::super::profile_defaults::{
     configured_active_station_name, effective_active_station_name, effective_default_profile_name,
@@ -85,4 +86,31 @@ pub(in crate::proxy) async fn api_v1_snapshot(
         profiles: build_profile_options_from_mgr(mgr, default_profile.as_deref()),
         snapshot,
     }))
+}
+
+pub(in crate::proxy) async fn api_operator_summary(
+    proxy: ProxyService,
+) -> Result<Json<ApiV1OperatorSummary>, (StatusCode, String)> {
+    let surface_capabilities = api_v1_surface_capabilities();
+    let host_local_history = host_local_session_history_available();
+    let shared_capabilities = SharedControlPlaneCapabilities {
+        session_observability: true,
+        request_history: true,
+    };
+    let host_local_capabilities = HostLocalControlPlaneCapabilities {
+        session_history: host_local_history,
+        transcript_read: host_local_history,
+        cwd_enrichment: host_local_history,
+    };
+    let remote_admin_access = admin_access_capabilities();
+    Ok(Json(
+        build_operator_summary(
+            &proxy,
+            surface_capabilities,
+            shared_capabilities,
+            host_local_capabilities,
+            remote_admin_access,
+        )
+        .await,
+    ))
 }

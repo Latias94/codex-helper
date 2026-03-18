@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::config::{ResolvedRetryConfig, RetryConfig};
 
 use super::super::{ProxyController, ProxyMode, send_admin_request};
-use super::{mode_control_base, refresh_now};
+use super::{mode_control_url, refresh_now};
 
 impl ProxyController {
     #[allow(dead_code)]
@@ -15,10 +15,12 @@ impl ProxyController {
         rt: &tokio::runtime::Runtime,
         retry: RetryConfig,
     ) -> anyhow::Result<()> {
-        let base = mode_control_base(
+        let url = mode_control_url(
             &self.mode,
             |att| att.api_version == Some(1) && att.supports_retry_config_api,
             "attached proxy does not support persisted retry config (need api v1)",
+            |links| Some(links.retry_config.as_str()),
+            "/__codex_helper/api/v1/retry/config",
         )?;
 
         #[derive(serde::Deserialize)]
@@ -31,7 +33,7 @@ impl ProxyController {
         let fut = async move {
             send_admin_request(
                 client
-                    .post(format!("{base}/__codex_helper/api/v1/retry/config"))
+                    .post(url)
                     .timeout(Duration::from_millis(1200))
                     .json(&retry),
             )

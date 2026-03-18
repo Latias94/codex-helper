@@ -163,8 +163,8 @@ pub(super) fn session_control_posture(
             detail: if override_fields.is_empty() {
                 pick(
                     lang,
-                    "当前配置里已经找不到这个 profile；effective route 只能依赖 binding 快照和运行态结果继续解释。",
-                    "The current config no longer contains this profile; the effective route can only be explained from the stored binding snapshot and runtime results.",
+                    "当前工作台里已经找不到这个 profile；effective route 只能依赖 binding 快照和运行态结果继续解释。",
+                    "The current workspace no longer contains this profile; the effective route can only be explained from the stored binding snapshot and runtime results.",
                 )
                 .to_string()
             } else {
@@ -172,8 +172,8 @@ pub(super) fn session_control_posture(
                     "{} {}。{}",
                     pick(
                         lang,
-                        "当前配置里已经找不到这个 profile；另外还有 session overrides:",
-                        "The current config no longer contains this profile; there are also session overrides on:",
+                        "当前工作台里已经找不到这个 profile；另外还有 session overrides:",
+                        "The current workspace no longer contains this profile; there are also session overrides on:",
                     ),
                     override_summary,
                     pick(

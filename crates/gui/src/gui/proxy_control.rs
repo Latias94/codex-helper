@@ -1,7 +1,10 @@
 use std::time::{Duration, Instant};
 
-use crate::config::ServiceKind;
-use crate::dashboard_core::WindowStats;
+use crate::config::{RetryConfig, ServiceKind};
+use crate::dashboard_core::{
+    OperatorHealthSummary, OperatorProfileSummary, OperatorRetrySummary, OperatorRuntimeSummary,
+    OperatorSummaryCounts, WindowStats, build_operator_health_summary,
+};
 use crate::logging::{ControlTraceLogEntry, control_trace_path, read_recent_control_trace_entries};
 use crate::proxy::local_proxy_base_url;
 use anyhow::bail;
@@ -170,13 +173,19 @@ impl ProxyController {
                 read_recent_control_trace_entries(limit)?
             }
             ControlTraceDataSource::AttachedApi { admin_base_url } => {
+                let control_trace_path = self
+                    .attached()
+                    .and_then(|att| att.operator_summary_links.as_ref())
+                    .map(|links| links.control_trace.as_str())
+                    .unwrap_or("/__codex_helper/api/v1/control-trace")
+                    .to_string();
                 let client = self.http_client.clone();
                 let admin_base_url = admin_base_url.clone();
                 rt.block_on(async move {
                     let response = send_admin_request(
                         client
                             .get(format!(
-                                "{admin_base_url}/__codex_helper/api/v1/control-trace?limit={limit}"
+                                "{admin_base_url}{control_trace_path}?limit={limit}"
                             ))
                             .timeout(Duration::from_millis(800)),
                     )
@@ -207,6 +216,7 @@ impl ProxyController {
                 configured_default_profile: r.configured_default_profile.clone(),
                 default_profile: r.default_profile.clone(),
                 profiles: r.profiles.clone(),
+                providers: r.providers.clone(),
                 session_model_overrides: r.session_model_overrides.clone(),
                 session_station_overrides: r.session_station_overrides.clone(),
                 session_effort_overrides: r.session_effort_overrides.clone(),
@@ -216,11 +226,16 @@ impl ProxyController {
                 usage_rollup: r.usage_rollup.clone(),
                 stats_5m: r.stats_5m.clone(),
                 stats_1h: r.stats_1h.clone(),
+                operator_runtime_summary: Some(local_operator_runtime_summary(r)),
+                operator_retry_summary: Some(local_operator_retry_summary(r)),
+                operator_health_summary: Some(local_operator_health_summary(r)),
+                operator_counts: Some(local_operator_counts(r)),
+                supports_operator_summary_api: true,
                 configured_retry: r.configured_retry.clone(),
                 resolved_retry: r.resolved_retry.clone(),
                 supports_v1: true,
                 supports_retry_config_api: true,
-                supports_persisted_station_config: true,
+                supports_persisted_station_settings: true,
                 supports_default_profile_override: true,
                 supports_station_runtime_override: true,
                 supports_session_override_reset: true,
@@ -243,6 +258,7 @@ impl ProxyController {
                 configured_default_profile: a.configured_default_profile.clone(),
                 default_profile: a.default_profile.clone(),
                 profiles: a.profiles.clone(),
+                providers: a.providers.clone(),
                 session_model_overrides: a.session_model_overrides.clone(),
                 session_station_overrides: a.session_station_overrides.clone(),
                 session_effort_overrides: a.session_effort_overrides.clone(),
@@ -252,11 +268,16 @@ impl ProxyController {
                 usage_rollup: a.usage_rollup.clone(),
                 stats_5m: a.stats_5m.clone(),
                 stats_1h: a.stats_1h.clone(),
+                operator_runtime_summary: a.operator_runtime_summary.clone(),
+                operator_retry_summary: a.operator_retry_summary.clone(),
+                operator_health_summary: a.operator_health_summary.clone(),
+                operator_counts: a.operator_counts.clone(),
+                supports_operator_summary_api: a.supports_operator_summary_api,
                 configured_retry: a.configured_retry.clone(),
                 resolved_retry: a.resolved_retry.clone(),
                 supports_v1: a.api_version == Some(1),
                 supports_retry_config_api: a.supports_retry_config_api,
-                supports_persisted_station_config: a.supports_persisted_station_config,
+                supports_persisted_station_settings: a.supports_persisted_station_settings,
                 supports_default_profile_override: a.supports_default_profile_override,
                 supports_station_runtime_override: a.supports_station_runtime_override,
                 supports_session_override_reset: a.supports_session_override_reset,
@@ -325,6 +346,70 @@ impl ProxyController {
         self.last_start_error = None;
         self.port_in_use_modal = None;
     }
+}
+
+fn local_operator_runtime_summary(r: &RunningProxy) -> OperatorRuntimeSummary {
+    let mgr = match r.service_name {
+        "claude" => &r.cfg.claude,
+        _ => &r.cfg.codex,
+    };
+    let default_profile_summary = r.default_profile.as_deref().and_then(|profile_name| {
+        crate::config::resolve_service_profile(mgr, profile_name)
+            .ok()
+            .map(|profile| OperatorProfileSummary {
+                name: profile_name.to_string(),
+                station: profile.station,
+                model: profile.model,
+                reasoning_effort: profile.reasoning_effort,
+                service_tier: profile.service_tier.clone(),
+                fast_mode: profile.service_tier.as_deref() == Some("priority"),
+            })
+    });
+
+    OperatorRuntimeSummary {
+        runtime_loaded_at_ms: None,
+        runtime_source_mtime_ms: None,
+        configured_active_station: r.configured_active_station.clone(),
+        effective_active_station: r.effective_active_station.clone(),
+        global_station_override: r.global_station_override.clone(),
+        configured_default_profile: r.configured_default_profile.clone(),
+        default_profile: r.default_profile.clone(),
+        default_profile_summary,
+    }
+}
+
+fn local_operator_retry_summary(r: &RunningProxy) -> OperatorRetrySummary {
+    let resolved_retry = r
+        .resolved_retry
+        .clone()
+        .or_else(|| r.configured_retry.clone().map(|retry| retry.resolve()))
+        .unwrap_or_else(|| RetryConfig::default().resolve());
+    OperatorRetrySummary {
+        configured_profile: r.configured_retry.as_ref().and_then(|retry| retry.profile),
+        supports_write: true,
+        upstream_max_attempts: resolved_retry.upstream.max_attempts,
+        provider_max_attempts: resolved_retry.provider.max_attempts,
+        allow_cross_station_before_first_output: resolved_retry
+            .allow_cross_station_before_first_output,
+    }
+}
+
+fn local_operator_counts(r: &RunningProxy) -> OperatorSummaryCounts {
+    let mgr = match r.service_name {
+        "claude" => &r.cfg.claude,
+        _ => &r.cfg.codex,
+    };
+    OperatorSummaryCounts {
+        active_requests: r.active.len(),
+        recent_requests: r.recent.len(),
+        sessions: r.session_cards.len(),
+        stations: r.stations.len(),
+        profiles: mgr.profiles.len(),
+    }
+}
+
+fn local_operator_health_summary(r: &RunningProxy) -> OperatorHealthSummary {
+    build_operator_health_summary(&r.stations, &r.station_health, &r.health_checks, &r.lb_view)
 }
 
 fn now_ms() -> u64 {

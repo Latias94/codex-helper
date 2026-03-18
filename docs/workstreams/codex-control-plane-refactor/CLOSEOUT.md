@@ -1,6 +1,6 @@
 # Fearless Refactor Closeout Assessment: Codex Control Plane
 
-> Quick read: the first usable control-plane refactor milestone is closed. Profile/station control, session override aggregation, session identity APIs, precedence alignment, active/passive health, same-station failover, guarded cross-station failover before first output, hybrid session lifecycle semantics, LAN/Tailscale relay boundaries, the session-card-first Sessions page, the first GUI page/helper split, the first grouped operator information architecture, the initial GUI layout refresh/design primitives, and the attach compatibility matrix are all in place. `CP-103`, `CP-408`, `CP-601`, `CP-611`, `CP-612`, `CP-613`, and `CP-704` are now closed. Remaining work is now concentrated in the last compatibility-only terminology/runtime cleanup around `CP-401`, plus explicit vocabulary audit/docs closeout.
+> Quick read: the first usable control-plane refactor milestone is closed. Profile/station control, session override aggregation, session identity APIs, precedence alignment, active/passive health, same-station failover, guarded cross-station failover before first output, hybrid session lifecycle semantics, LAN/Tailscale relay boundaries, the session-card-first Sessions page, the first GUI page/helper split, the first grouped operator information architecture, the initial GUI layout refresh/design primitives, the attach compatibility matrix, and the new `operator/summary` home payload are all in place. `CP-103`, `CP-408`, `CP-601`, `CP-611`, `CP-612`, `CP-613`, and `CP-704` are now closed. The vocabulary audit/mapping is now explicit via `VOCABULARY.md`, and remaining work is concentrated in the last compatibility-only terminology/export/docs cleanup around `CP-002` / `CP-401`; the runtime/operator code path is effectively already in place.
 
 ## Current Position
 
@@ -11,6 +11,7 @@ What is already materially in place:
 - profile-driven control replaced weak preset semantics
 - effective route visibility exists in GUI/TUI
 - session overrides now have a unified aggregate API across `model` / `reasoning_effort` / `service_tier` / station
+- attach-mode clients now have an operator home payload with runtime target, lightweight health/failover posture, and session/station/profile/provider catalogs
 - session identity now has both list and single-session API entry points
 - request-time precedence now aligns with session-card/source-attribution semantics
 - request/session observability now records fast/service-tier intent vs outcome:
@@ -49,14 +50,12 @@ Status: **partial**
 
 Remaining gap:
 
-- CP-000 terminology audit
-- CP-001 legacy-to-target vocabulary mapping
-- CP-002 complete rename away from `config` in internal/runtime/UI surfaces
+- CP-002 complete the last compatibility-only `config` wording/export cleanup in internal/runtime/UI surfaces
 
 Impact:
 
 - not a blocker for a usable beta
-- still a blocker for claiming the refactor is semantically finished
+- the audit/mapping baseline is now explicit, but the final compatibility-only wording/export tail still blocks claiming the refactor is semantically finished
 
 ### M1 - Session Identity and Effective Route
 
@@ -105,7 +104,7 @@ Status: **substantially complete**
 
 Remaining gap:
 
-- CP-401 final internal/runtime rename from `config` to `station`
+- CP-401 final compatibility-only cleanup around the remaining `config` wording/export aliases
 
 Impact:
 
@@ -116,7 +115,7 @@ Impact:
 - shared/core request-session payloads are now station-first across core, GUI, and TUI
 - core proxy routing internals and streaming finalize/logging flow are now station-first and covered by `cargo nextest run -p codex-helper-core`
 - runtime state storage, healthcheck execution flow, and local GUI/TUI operator calls are now station-first and covered by `cargo nextest run -p codex-helper-core -p codex-helper-gui -p codex-helper-tui`
-- the remaining rename work is now mostly compatibility shims, exported type aliases, and a smaller wording/doc cleanup tail; the public attach/API surface already exposes station-first canonical routes/fields with regression coverage
+- the remaining rename work is now mostly compatibility shims, exported type aliases, and docs/examples/historical wording cleanup; the runtime/operator code path and public attach/API surface already expose station-first canonical routes/fields with regression coverage
 - retry/failover guardrails are now explicit: same-station first, cross-station opt-in only before first output
 
 ### M5 - LAN-ready Shared Relay
@@ -153,12 +152,15 @@ The first usable milestone is now fully closed.
 
 These are the items that should land before declaring the control-plane refactor fully complete rather than merely "usable".
 
-- CP-000 / CP-001 / CP-002 vocabulary cleanup completion
-- CP-401 final rename from `config` runtime language to `station`
+- apply the documented vocabulary contract from `VOCABULARY.md` across the last compatibility-only surfaces
+- CP-401 final closeout of the remaining compatibility-only `config` terminology/export tail
 - explicit closeout of the remaining compatibility-only tail:
-  - narrow helper aliases such as `active_config()`
+  - narrow the last helper aliases such as `active_config()` down to explicit compatibility-only shims
+  - keep legacy routes such as `/stations/config-active` as hidden compatibility aliases rather than canonical advertised control-plane paths
+  - keep legacy capability keys such as `station_persisted_config` as deserialize-only aliases while emitting station-first canonical names
   - historical docs/examples that intentionally still mention legacy `configs`
   - tests/assertions that verify old field names are absent or compatibility-only
+  - attach-side endpoint fallback should treat legacy aliases as compatibility-only and avoid over-advertising partial writable surfaces
 
 Why this bucket matters:
 
@@ -172,7 +174,7 @@ If the goal is momentum with minimal rework, the recommended next sequence is:
 
 1. Close the remaining semantic cleanup:
    - terminology cleanup
-   - CP-401
+   - CP-401 compatibility/docs closeout
 
 See `MILESTONES.md` for the more explicit `P0 / P1 / P2` closeout ladder that turns this recommendation into execution priority.
 
@@ -181,7 +183,7 @@ See `MILESTONES.md` for the more explicit `P0 / P1 / P2` closeout ladder that tu
 If we split the remaining work by outcome rather than ticket count:
 
 - **Core usable closeout**: closed
-- **Full semantic closeout**: still a meaningful final phase remains
+- **Full semantic closeout**: a final narrow closeout phase remains
 
 The biggest remaining risks are not raw implementation volume, but semantic coherence:
 
@@ -197,6 +199,26 @@ In other words: the refactor is already past the "can this direction work" stage
 In parallel with the remaining semantic closeout, there is now a justified maintainability/UI track:
 
 - split the oversized GUI page modules, starting with `pages/mod.rs`
+- split large focused control-plane test files once the behavior surface is stable:
+  - `crates/gui/src/gui/proxy_control/tests.rs` is now split into themed `tests/` modules with shared helpers
+  - `crates/gui/src/gui/proxy_control/tests/attached_refresh.rs` is now split into themed `attached_refresh/` modules with shared helpers
+  - `crates/core/src/proxy/tests/failover.rs` is now split into `failover/mod.rs`, `failover/response_semantics.rs`, and `failover/config_failover.rs`
+  - `crates/core/src/proxy/tests/api_admin.rs` is now split into `api_admin/mod.rs`, `api_admin/capabilities.rs`, `api_admin/persisted_crud.rs`, `api_admin/runtime_overrides.rs`, and `api_admin/sessions.rs`
+  - `crates/core/src/config.rs` tests are now split into `config/tests/` themed modules with shared helpers
+- split oversized shared state support types once the exported surface is stable:
+  - `crates/core/src/state.rs` now delegates shared runtime/observability types to `state/runtime_types.rs` and `state/session_identity.rs`
+  - `crates/core/src/sessions.rs` now delegates session stats-cache support and session tests to `sessions/stats_cache.rs` and `sessions/tests.rs`
+  - `crates/core/src/sessions.rs` now delegates transcript extraction/search support to `sessions/transcript.rs`
+  - `crates/core/src/config.rs` now delegates retry policy types and resolution to `config_retry.rs`
+  - `crates/core/src/config.rs` now delegates v2 compile/migrate/compact helpers to `config_v2.rs`
+  - `crates/core/src/config.rs` now delegates profile inheritance and station-compatibility validation to `config_profiles.rs`
+  - `crates/core/src/config.rs` now delegates routing explanation types/helpers to `config_routing.rs`
+  - `crates/core/src/proxy/control_plane_routes.rs` is now split into themed `control_plane_routes/` modules
+  - `crates/core/src/logging.rs` now delegates control-trace parsing/write helpers to `logging/control_trace.rs`, with request-log tests moved to `logging/tests.rs`
+  - `crates/gui/src/gui/pages/config_v2/editors/stations.rs` is now split into `stations/mod.rs`, `stations/member_editor.rs`, and `stations/section.rs`
+  - `crates/gui/src/gui/pages/components/history_sessions.rs` is now split into `history_sessions/mod.rs`, `history_sessions/session_panels.rs`, and `history_sessions/all_by_date.rs`
+  - `crates/gui/src/gui/pages/config_v2_header.rs` is now split into `config_v2_header/mod.rs`, `config_v2_header/actions.rs`, `config_v2_header/focus_targets.rs`, `config_v2_header/surface_mode.rs`, and `config_v2_header/runtime_card.rs`
+  - `crates/gui/src/gui/proxy_control/attached_refresh.rs` is now split into `attached_refresh/mod.rs`, `attached_refresh/fetch.rs`, and `attached_refresh/state_apply.rs`
 - establish a cleaner operator information architecture for Sessions / Stations / Config
 - allow a more intentional GUI refresh once semantics and terminology are stable enough
 

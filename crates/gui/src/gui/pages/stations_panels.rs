@@ -1,5 +1,5 @@
 use super::stations_detail_controls::{
-    render_station_persisted_config_section, render_station_quick_switch_section,
+    render_station_persisted_settings_section, render_station_quick_switch_section,
     render_station_runtime_control_section,
 };
 use super::stations_detail_health::{
@@ -21,7 +21,7 @@ pub(super) fn render_stations_panels(
     active_station: Option<&str>,
     configured_active_station: Option<&str>,
     effective_active_station: Option<&str>,
-    supports_persisted_station_config: bool,
+    supports_persisted_station_settings: bool,
 ) {
     ui.columns(2, |cols| {
         render_station_list_panel(
@@ -42,7 +42,7 @@ pub(super) fn render_stations_panels(
             selected_name.as_deref(),
             configured_active_station,
             effective_active_station,
-            supports_persisted_station_config,
+            supports_persisted_station_settings,
         );
     });
 }
@@ -56,7 +56,7 @@ fn render_station_detail_panel(
     selected_name: Option<&str>,
     configured_active_station: Option<&str>,
     effective_active_station: Option<&str>,
-    supports_persisted_station_config: bool,
+    supports_persisted_station_settings: bool,
 ) {
     ui.heading(pick(ctx.lang, "站点详情", "Station details"));
     ui.add_space(4.0);
@@ -107,13 +107,13 @@ fn render_station_detail_panel(
 
     ui.add_space(8.0);
     ui.separator();
-    render_station_persisted_config_section(
+    render_station_persisted_settings_section(
         ui,
         ctx,
         &cfg,
         snapshot,
         configured_active_station,
-        supports_persisted_station_config,
+        supports_persisted_station_settings,
     );
 
     ui.add_space(8.0);

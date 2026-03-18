@@ -58,7 +58,7 @@ pub(super) fn render_station_quick_switch_section(
     });
     ui.small(pick(
         ctx.lang,
-        "这里的 pin 只影响当前代理运行态，不修改配置文件。",
-        "Pins here only affect the current proxy runtime and do not rewrite persisted config.",
+        "这里的 pin 只影响当前代理运行态，不修改持久化站点设置。",
+        "Pins here only affect the current proxy runtime and do not rewrite persisted station settings.",
     ));
 }

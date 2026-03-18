@@ -18,8 +18,8 @@ pub(super) fn render_session_profile_binding_editor(
     if profiles.is_empty() {
         ui.label(pick(
             ctx.lang,
-            "当前未加载 control profile；可在 config.toml 的 [codex.profiles.*] 中定义。",
-            "No control profiles loaded; define them in config.toml [codex.profiles.*].",
+            "当前未加载 control profile；可在代理配置文件里的 [codex.profiles.*] 中定义。",
+            "No control profiles loaded; define them in the proxy config file under [codex.profiles.*].",
         ));
         return;
     }

@@ -39,6 +39,8 @@ pub struct ControlPlaneSurfaceCapabilities {
     #[serde(default)]
     pub snapshot: bool,
     #[serde(default)]
+    pub operator_summary: bool,
+    #[serde(default)]
     pub status_active: bool,
     #[serde(default)]
     pub status_recent: bool,
@@ -60,8 +62,12 @@ pub struct ControlPlaneSurfaceCapabilities {
     pub stations: bool,
     #[serde(default)]
     pub station_runtime: bool,
-    #[serde(default)]
-    pub station_persisted_config: bool,
+    #[serde(
+        default,
+        rename = "station_persisted_settings",
+        alias = "station_persisted_config"
+    )]
+    pub station_persisted_settings: bool,
     #[serde(default)]
     pub station_specs: bool,
     #[serde(default)]
@@ -149,7 +155,7 @@ pub struct StationCapabilitySummary {
     pub supports_reasoning_effort: CapabilitySupport,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StationOption {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,7 +180,7 @@ pub struct StationOption {
     pub capabilities: StationCapabilitySummary,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlProfileOption {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,6 +193,8 @@ pub struct ControlProfileOption {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    #[serde(default)]
+    pub fast_mode: bool,
     #[serde(default)]
     pub is_default: bool,
 }
@@ -225,4 +233,31 @@ pub struct ProviderOption {
     pub routable_endpoints: usize,
     #[serde(default)]
     pub endpoints: Vec<ProviderEndpointOption>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ControlPlaneSurfaceCapabilities;
+
+    #[test]
+    fn control_plane_surface_capabilities_serializes_station_persisted_settings_canonically() {
+        let caps = ControlPlaneSurfaceCapabilities {
+            station_persisted_settings: true,
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(caps).expect("serialize capabilities");
+        assert_eq!(value["station_persisted_settings"].as_bool(), Some(true));
+        assert!(value.get("station_persisted_config").is_none());
+    }
+
+    #[test]
+    fn control_plane_surface_capabilities_reads_legacy_station_persisted_config_alias() {
+        let caps: ControlPlaneSurfaceCapabilities = serde_json::from_value(serde_json::json!({
+            "station_persisted_config": true
+        }))
+        .expect("deserialize legacy capability alias");
+
+        assert!(caps.station_persisted_settings);
+    }
 }

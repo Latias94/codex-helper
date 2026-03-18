@@ -43,10 +43,10 @@ pub(super) fn remote_safe_surface_status_line(
 
     Some(match lang {
         Language::Zh => format!(
-            "当前是远程附着：会话控制台、站点/健康台和共享观测/配置面仍通过控制面访问；{host_only} 这类 host-local 能力仍只在代理主机本地可用。"
+            "当前是远程附着：会话控制台、站点/健康台和共享观测/控制面仍通过控制面访问；{host_only} 这类 host-local 能力仍只在代理主机本地可用。"
         ),
         Language::En => format!(
-            "Remote attach: the Session Console, station/health console, and shared observed/config surfaces remain available through the control plane; host-local capabilities remain on the proxy host only: {host_only}."
+            "Remote attach: the Session Console, station/health console, and shared observed/control surfaces remain available through the control plane; host-local capabilities remain on the proxy host only: {host_only}."
         ),
     })
 }

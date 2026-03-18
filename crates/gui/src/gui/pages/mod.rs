@@ -143,7 +143,7 @@ mod setup_proxy_step;
 mod stations;
 mod stations_detail_controls;
 mod stations_detail_health;
-mod stations_detail_persisted_config;
+mod stations_detail_persisted_settings;
 mod stations_detail_provider_routes;
 mod stations_detail_quick_switch;
 mod stations_detail_recent_hits;

@@ -24,6 +24,7 @@ pub(super) fn build_profile_card_item(
         model: profile.model.clone(),
         reasoning_effort: profile.reasoning_effort.clone(),
         service_tier: profile.service_tier.clone(),
+        fast_mode: profile.service_tier.as_deref() == Some("priority"),
         is_default,
     };
 

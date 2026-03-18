@@ -48,8 +48,8 @@ pub(in super::super::super) fn render_config_v2_profiles_control_plane(
         } else {
             pick(
                 lang,
-                "下面的 Profiles 直接管理当前运行中的代理配置。",
-                "Profiles below manage the currently running proxy config directly.",
+                "下面的 Profiles 直接管理当前运行代理的持久化 profile 集。",
+                "Profiles below manage the currently running proxy's persisted profiles directly.",
             )
         },
     );
@@ -283,6 +283,7 @@ pub(in super::super::super) fn render_config_v2_profiles_control_plane(
             model: declared_profile.model.clone(),
             reasoning_effort: declared_profile.reasoning_effort.clone(),
             service_tier: declared_profile.service_tier.clone(),
+            fast_mode: declared_profile.service_tier.as_deref() == Some("priority"),
             is_default,
         }));
         cols[1].small(pick(
@@ -322,8 +323,8 @@ pub(in super::super::super) fn render_config_v2_profiles_control_plane(
         {
             cols[1].small(pick(
                 lang,
-                "当前编辑内容尚未写入代理配置。",
-                "Current edits have not been written to the proxy config yet.",
+                "当前编辑内容尚未写入代理的持久化 profile 集。",
+                "Current edits have not been written to the proxy's persisted profiles yet.",
             ));
         }
     });

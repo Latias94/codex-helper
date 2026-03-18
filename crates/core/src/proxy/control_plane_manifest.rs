@@ -1,7 +1,8 @@
-use crate::dashboard_core::ControlPlaneSurfaceCapabilities;
+use crate::dashboard_core::{ControlPlaneSurfaceCapabilities, OperatorSummaryLinks};
 
 pub(super) const API_V1_CAPABILITIES: &str = "/__codex_helper/api/v1/capabilities";
 pub(super) const API_V1_SNAPSHOT: &str = "/__codex_helper/api/v1/snapshot";
+pub(super) const API_V1_OPERATOR_SUMMARY: &str = "/__codex_helper/api/v1/operator/summary";
 pub(super) const API_V1_SESSIONS: &str = "/__codex_helper/api/v1/sessions";
 pub(super) const API_V1_SESSION_BY_ID: &str = "/__codex_helper/api/v1/sessions/{session_id}";
 pub(super) const API_V1_STATUS_ACTIVE: &str = "/__codex_helper/api/v1/status/active";
@@ -16,7 +17,11 @@ pub(super) const API_V1_CONTROL_TRACE: &str = "/__codex_helper/api/v1/control-tr
 pub(super) const API_V1_RETRY_CONFIG: &str = "/__codex_helper/api/v1/retry/config";
 pub(super) const API_V1_STATIONS: &str = "/__codex_helper/api/v1/stations";
 pub(super) const API_V1_STATIONS_RUNTIME: &str = "/__codex_helper/api/v1/stations/runtime";
-pub(super) const API_V1_STATIONS_CONFIG_ACTIVE: &str =
+pub(super) const API_V1_STATIONS_ACTIVE: &str = "/__codex_helper/api/v1/stations/active";
+/// Compatibility-only alias for older clients.
+///
+/// Keep serving this route, but do not advertise it in the canonical v1 endpoint manifest.
+pub(super) const API_V1_STATIONS_CONFIG_ACTIVE_LEGACY: &str =
     "/__codex_helper/api/v1/stations/config-active";
 pub(super) const API_V1_STATIONS_PROBE: &str = "/__codex_helper/api/v1/stations/probe";
 pub(super) const API_V1_STATION_BY_NAME: &str = "/__codex_helper/api/v1/stations/{name}";
@@ -53,6 +58,7 @@ pub(super) const API_V1_HEALTHCHECK_CANCEL: &str = "/__codex_helper/api/v1/healt
 const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_CAPABILITIES,
     API_V1_SNAPSHOT,
+    API_V1_OPERATOR_SUMMARY,
     API_V1_SESSIONS,
     API_V1_SESSION_BY_ID,
     API_V1_STATUS_ACTIVE,
@@ -66,7 +72,7 @@ const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_RETRY_CONFIG,
     API_V1_STATIONS,
     API_V1_STATIONS_RUNTIME,
-    API_V1_STATIONS_CONFIG_ACTIVE,
+    API_V1_STATIONS_ACTIVE,
     API_V1_STATIONS_PROBE,
     API_V1_STATION_BY_NAME,
     API_V1_STATION_SPECS,
@@ -102,6 +108,7 @@ pub(super) fn api_v1_endpoint_paths() -> Vec<String> {
 pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
     ControlPlaneSurfaceCapabilities {
         snapshot: true,
+        operator_summary: true,
         status_active: true,
         status_recent: true,
         status_session_stats: true,
@@ -113,7 +120,7 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
         retry_config: true,
         stations: true,
         station_runtime: true,
-        station_persisted_config: true,
+        station_persisted_settings: true,
         station_specs: true,
         station_probe: true,
         providers: true,
@@ -136,6 +143,39 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
     }
 }
 
+pub(super) fn api_v1_operator_summary_links() -> OperatorSummaryLinks {
+    OperatorSummaryLinks {
+        snapshot: API_V1_SNAPSHOT.to_string(),
+        status_active: API_V1_STATUS_ACTIVE.to_string(),
+        runtime_status: API_V1_RUNTIME_STATUS.to_string(),
+        runtime_reload: API_V1_RUNTIME_RELOAD.to_string(),
+        status_recent: API_V1_STATUS_RECENT.to_string(),
+        status_session_stats: API_V1_STATUS_SESSION_STATS.to_string(),
+        status_health_checks: API_V1_STATUS_HEALTH_CHECKS.to_string(),
+        status_station_health: API_V1_STATUS_STATION_HEALTH.to_string(),
+        control_trace: API_V1_CONTROL_TRACE.to_string(),
+        retry_config: API_V1_RETRY_CONFIG.to_string(),
+        sessions: API_V1_SESSIONS.to_string(),
+        session_by_id_template: API_V1_SESSION_BY_ID.to_string(),
+        session_overrides: API_V1_SESSION_OVERRIDES.to_string(),
+        global_station_override: API_V1_GLOBAL_STATION_OVERRIDE.to_string(),
+        stations: API_V1_STATIONS.to_string(),
+        station_by_name_template: API_V1_STATION_BY_NAME.to_string(),
+        station_specs: API_V1_STATION_SPECS.to_string(),
+        station_spec_by_name_template: API_V1_STATION_SPEC_BY_NAME.to_string(),
+        station_probe: API_V1_STATIONS_PROBE.to_string(),
+        healthcheck_start: API_V1_HEALTHCHECK_START.to_string(),
+        healthcheck_cancel: API_V1_HEALTHCHECK_CANCEL.to_string(),
+        providers: API_V1_PROVIDERS.to_string(),
+        provider_specs: API_V1_PROVIDER_SPECS.to_string(),
+        provider_spec_by_name_template: API_V1_PROVIDER_SPEC_BY_NAME.to_string(),
+        profiles: API_V1_PROFILES.to_string(),
+        profile_by_name_template: API_V1_PROFILE_BY_NAME.to_string(),
+        default_profile: API_V1_PROFILES_DEFAULT.to_string(),
+        persisted_default_profile: API_V1_PROFILES_DEFAULT_PERSISTED.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -148,5 +188,10 @@ mod tests {
         for path in API_V1_ENDPOINT_PATHS {
             assert!(seen.insert(*path), "duplicate endpoint path: {path}");
         }
+    }
+
+    #[test]
+    fn api_v1_endpoint_paths_hide_compatibility_only_aliases() {
+        assert!(!API_V1_ENDPOINT_PATHS.contains(&super::API_V1_STATIONS_CONFIG_ACTIVE_LEGACY));
     }
 }
