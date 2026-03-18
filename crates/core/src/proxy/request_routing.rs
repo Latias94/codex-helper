@@ -196,7 +196,7 @@ impl ProxyService {
         }
 
         let active_name = mgr.active.as_deref();
-        let mut configs = mgr
+        let mut stations = mgr
             .stations()
             .iter()
             .filter_map(|(name, svc)| {
@@ -218,7 +218,7 @@ impl ProxyService {
             .collect::<Vec<_>>();
 
         let has_multi_level = {
-            let mut levels = configs
+            let mut levels = stations
                 .iter()
                 .map(|(name, svc)| {
                     let (_, level_ovr) = meta_overrides
@@ -235,7 +235,7 @@ impl ProxyService {
 
         if !has_multi_level {
             let eligible_details = || {
-                configs
+                stations
                     .iter()
                     .map(|(name, svc)| {
                         let (_, level_ovr) = meta_overrides
@@ -257,7 +257,7 @@ impl ProxyService {
                     .collect::<Vec<_>>()
             };
 
-            let mut ordered = configs
+            let mut ordered = stations
                 .iter()
                 .map(|(name, svc)| (name.clone(), svc.clone()))
                 .collect::<Vec<_>>();
@@ -281,9 +281,9 @@ impl ProxyService {
                     "mode": "single_level_multi",
                     "active_station": active_name,
                     "selected_stations": lbs.iter().map(|lb| lb.service.name.clone()).collect::<Vec<_>>(),
-                    "eligible_stations": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                    "eligible_stations": stations.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
                     "eligible_details": eligible_details(),
-                    "eligible_count": configs.len(),
+                    "eligible_count": stations.len(),
                 }));
                 return lbs;
             }
@@ -307,9 +307,9 @@ impl ProxyService {
                     "selected_station": svc.name,
                     "selected_level": svc.level.clamp(1, 10),
                     "selected_upstreams": svc.upstreams.len(),
-                    "eligible_stations": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                    "eligible_stations": stations.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
                     "eligible_details": eligible_details(),
-                    "eligible_count": configs.len(),
+                    "eligible_count": stations.len(),
                 }));
                 return vec![LoadBalancer::new(Arc::new(svc), self.lb_states.clone())];
             }
@@ -320,14 +320,14 @@ impl ProxyService {
                 "session_id": session_id,
                 "mode": "single_level_empty",
                 "active_station": active_name,
-                "eligible_stations": configs.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
+                "eligible_stations": stations.iter().map(|(n, _)| (*n).clone()).collect::<Vec<_>>(),
                 "eligible_details": eligible_details(),
-                "eligible_count": configs.len(),
+                "eligible_count": stations.len(),
             }));
             return Vec::new();
         }
 
-        configs.sort_by(|(a_name, a), (b_name, b)| {
+        stations.sort_by(|(a_name, a), (b_name, b)| {
             let a_level = meta_overrides
                 .get(a_name.as_str())
                 .and_then(|(_, l)| *l)
@@ -346,7 +346,7 @@ impl ProxyService {
                 .then_with(|| a_name.cmp(b_name))
         });
 
-        let lbs = configs
+        let lbs = stations
             .into_iter()
             .map(|(_, svc)| LoadBalancer::new(Arc::new(svc.clone()), self.lb_states.clone()))
             .collect::<Vec<_>>();
