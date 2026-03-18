@@ -4,6 +4,7 @@ use super::*;
 pub struct ViewState {
     pub requested_page: Option<Page>,
     pub setup: SetupViewState,
+    pub discovery: DiscoveryViewState,
     pub stations: StationsViewState,
     pub doctor: DoctorViewState,
     pub stats: StatsViewState,
@@ -11,6 +12,15 @@ pub struct ViewState {
     pub requests: RequestsViewState,
     pub config: ConfigViewState,
     pub history: HistoryViewState,
+}
+
+#[derive(Debug, Default)]
+pub struct DiscoveryViewState {
+    pub recommended_only: bool,
+    pub station_control_only: bool,
+    pub session_control_only: bool,
+    pub retry_write_only: bool,
+    pub remote_admin_only: bool,
 }
 
 #[derive(Debug, Default)]
