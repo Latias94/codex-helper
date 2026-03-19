@@ -94,7 +94,7 @@ pub(super) fn render_retry_panel(
                                     ctx.rt,
                                     std::time::Duration::from_secs(0),
                                 );
-                                refresh_config_editor_from_disk_if_running(ctx);
+                                refresh_proxy_settings_editor_from_disk_if_running(ctx);
                                 *ctx.last_info = Some(
                                     pick(
                                         ctx.lang,

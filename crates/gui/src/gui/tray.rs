@@ -13,19 +13,19 @@ pub enum TrayAction {
     OpenSetup,
     StartProxy,
     StopProxy,
-    ReloadConfig,
+    ReloadSettings,
     SwitchOn,
     SwitchOff,
     /// Prefer persisted station control-plane; fall back to local config save when no live proxy is manageable.
-    SetActiveConfig {
+    SetActiveStation {
         service: crate::config::ServiceKind,
         name: String,
     },
     /// Apply API v1 global override (pinned). `None` means <auto>.
-    ApplyPinnedConfig {
+    ApplyPinnedStation {
         name: Option<String>,
     },
-    OpenConfig,
+    OpenSettingsFile,
     OpenLogs,
     Quit,
 }
@@ -53,7 +53,7 @@ pub struct TrayController {
     id_reload: MenuId,
     id_switch_on: MenuId,
     id_switch_off: MenuId,
-    id_open_config: MenuId,
+    id_open_settings: MenuId,
     id_open_logs: MenuId,
     id_quit: MenuId,
     dynamic_actions: std::collections::HashMap<MenuId, TrayAction>,
@@ -70,10 +70,10 @@ impl TrayController {
         let id_open_setup = MenuId::new("codex-helper-gui.tray.open_setup");
         let id_start = MenuId::new("codex-helper-gui.tray.start_proxy");
         let id_stop = MenuId::new("codex-helper-gui.tray.stop_proxy");
-        let id_reload = MenuId::new("codex-helper-gui.tray.reload_config");
+        let id_reload = MenuId::new("codex-helper-gui.tray.reload_settings");
         let id_switch_on = MenuId::new("codex-helper-gui.tray.switch_on");
         let id_switch_off = MenuId::new("codex-helper-gui.tray.switch_off");
-        let id_open_config = MenuId::new("codex-helper-gui.tray.open_config");
+        let id_open_settings = MenuId::new("codex-helper-gui.tray.open_settings");
         let id_open_logs = MenuId::new("codex-helper-gui.tray.open_logs");
         let id_quit = MenuId::new("codex-helper-gui.tray.quit");
 
@@ -88,7 +88,7 @@ impl TrayController {
             &id_reload,
             &id_switch_on,
             &id_switch_off,
-            &id_open_config,
+            &id_open_settings,
             &id_open_logs,
             &id_quit,
             None,
@@ -111,7 +111,7 @@ impl TrayController {
             id_reload,
             id_switch_on,
             id_switch_off,
-            id_open_config,
+            id_open_settings,
             id_open_logs,
             id_quit,
             dynamic_actions: std::collections::HashMap::new(),
@@ -138,7 +138,7 @@ impl TrayController {
             &self.id_reload,
             &self.id_switch_on,
             &self.id_switch_off,
-            &self.id_open_config,
+            &self.id_open_settings,
             &self.id_open_logs,
             &self.id_quit,
             Some((&model, &mut dynamic_actions)),
@@ -183,13 +183,13 @@ impl TrayController {
         } else if id == &self.id_stop {
             Some(TrayAction::StopProxy)
         } else if id == &self.id_reload {
-            Some(TrayAction::ReloadConfig)
+            Some(TrayAction::ReloadSettings)
         } else if id == &self.id_switch_on {
             Some(TrayAction::SwitchOn)
         } else if id == &self.id_switch_off {
             Some(TrayAction::SwitchOff)
-        } else if id == &self.id_open_config {
-            Some(TrayAction::OpenConfig)
+        } else if id == &self.id_open_settings {
+            Some(TrayAction::OpenSettingsFile)
         } else if id == &self.id_open_logs {
             Some(TrayAction::OpenLogs)
         } else if id == &self.id_quit {
@@ -258,7 +258,7 @@ fn build_menu_base(
     id_reload: &MenuId,
     id_switch_on: &MenuId,
     id_switch_off: &MenuId,
-    id_open_config: &MenuId,
+    id_open_settings: &MenuId,
     id_open_logs: &MenuId,
     id_quit: &MenuId,
     dynamic: Option<(
@@ -354,7 +354,7 @@ fn build_menu_base(
                 let item = CheckMenuItem::with_id(id.clone(), label, true, checked, None);
                 dynamic_actions.insert(
                     id,
-                    TrayAction::SetActiveConfig {
+                    TrayAction::SetActiveStation {
                         service: svc,
                         name: station.name.clone(),
                     },
@@ -389,7 +389,7 @@ fn build_menu_base(
                 cur.is_none(),
                 None,
             );
-            dynamic_actions.insert(id_auto, TrayAction::ApplyPinnedConfig { name: None });
+            dynamic_actions.insert(id_auto, TrayAction::ApplyPinnedStation { name: None });
             pinned_menu.append(&auto_item)?;
             pinned_menu.append(&PredefinedMenuItem::separator())?;
             for station in model.stations.iter().filter(|c| c.enabled) {
@@ -399,7 +399,7 @@ fn build_menu_base(
                 let item = CheckMenuItem::with_id(id.clone(), label, true, checked, None);
                 dynamic_actions.insert(
                     id,
-                    TrayAction::ApplyPinnedConfig {
+                    TrayAction::ApplyPinnedStation {
                         name: Some(station.name.clone()),
                     },
                 );
@@ -469,8 +469,8 @@ fn build_menu_base(
         true,
         None,
     );
-    let open_config = MenuItem::with_id(
-        id_open_config.clone(),
+    let open_settings = MenuItem::with_id(
+        id_open_settings.clone(),
         pick(lang, "打开设置文件", "Open settings file"),
         true,
         None,
@@ -497,7 +497,7 @@ fn build_menu_base(
         &switch_on,
         &switch_off,
         &PredefinedMenuItem::separator(),
-        &open_config,
+        &open_settings,
         &open_logs,
         &PredefinedMenuItem::separator(),
         &quit,

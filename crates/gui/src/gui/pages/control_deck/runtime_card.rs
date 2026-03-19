@@ -34,19 +34,19 @@ pub(super) fn render_control_deck_runtime_card(
         ui.add_space(6.0);
 
         ui.columns(3, |cols| {
-            super::render_config_v2_summary_card(
+            super::render_control_deck_summary_card(
                 &mut cols[0],
                 pick(lang, "Runtime target", "Runtime target"),
                 target_value,
                 &target_hint,
             );
-            super::render_config_v2_summary_card(
+            super::render_control_deck_summary_card(
                 &mut cols[1],
                 pick(lang, "Retry / Failover", "Retry / Failover"),
                 retry_value,
                 &retry_hint,
             );
-            super::render_config_v2_summary_card(
+            super::render_control_deck_summary_card(
                 &mut cols[2],
                 pick(lang, "Remote admin", "Remote admin"),
                 admin_value,
@@ -138,8 +138,8 @@ fn runtime_card_banner(
             .to_string(),
             ProxyModeKind::Starting => pick(
                 lang,
-                "代理正在启动。工作台仍可继续编辑配置，但运行态信息会在下一次 refresh 后补齐。",
-                "The proxy is starting. You can keep editing config, and runtime details will fill in after the next refresh.",
+                "代理正在启动。工作台仍可继续编辑设置，但运行态信息会在下一次 refresh 后补齐。",
+                "The proxy is starting. You can keep editing settings, and runtime details will fill in after the next refresh.",
             )
             .to_string(),
             ProxyModeKind::Stopped => pick(
@@ -154,8 +154,8 @@ fn runtime_card_banner(
     match proxy_kind {
         ProxyModeKind::Starting => pick(
             lang,
-            "代理正在启动。工作台仍可继续编辑配置，但运行态信息会在下一次 refresh 后补齐。",
-            "The proxy is starting. You can keep editing config, and runtime details will fill in after the next refresh.",
+            "代理正在启动。工作台仍可继续编辑设置，但运行态信息会在下一次 refresh 后补齐。",
+            "The proxy is starting. You can keep editing settings, and runtime details will fill in after the next refresh.",
         )
         .to_string(),
         ProxyModeKind::Stopped => pick(

@@ -26,8 +26,7 @@ use crate::state::{
 use crate::usage::UsageMetrics;
 
 mod components;
-mod config_v2;
-mod config_v2_header;
+mod control_deck;
 mod doctor;
 mod formatting;
 mod history;
@@ -79,6 +78,7 @@ mod proxy_settings_document;
 mod proxy_settings_form;
 mod proxy_settings_raw;
 mod proxy_settings_shell;
+mod proxy_settings_workspace;
 mod remote_attach;
 mod remote_attach_admin;
 mod remote_attach_host_local;

@@ -104,7 +104,7 @@ pub(super) fn sync_provider_editor_from_selected(
             provider
                 .endpoints
                 .iter()
-                .map(super::endpoints::config_provider_endpoint_editor_from_spec)
+                .map(super::endpoints::provider_endpoint_editor_from_spec)
                 .collect()
         })
         .unwrap_or_default();

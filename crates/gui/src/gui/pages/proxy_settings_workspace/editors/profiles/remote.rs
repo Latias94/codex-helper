@@ -2,7 +2,7 @@ use super::shared::{build_profile_card_item, render_profile_card_list};
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
-pub(in super::super::super) fn render_config_v2_profiles_control_plane(
+pub(in super::super::super) fn render_proxy_settings_profiles_control_plane(
     ui: &mut egui::Ui,
     lang: Language,
     selected_service: &str,
@@ -122,7 +122,7 @@ pub(in super::super::super) fn render_config_v2_profiles_control_plane(
         render_profile_card_list(
             &mut cols[0],
             lang,
-            "config_v2_profiles_scroll",
+            "proxy_settings_profiles_scroll",
             pick(lang, "(当前没有 profile)", "(no profiles yet)"),
             &cards,
             |name| {
@@ -201,7 +201,7 @@ pub(in super::super::super) fn render_config_v2_profiles_control_plane(
         cols[1].horizontal(|ui| {
             ui.label("extends");
             egui::ComboBox::from_id_salt(format!(
-                "config_v2_profile_extends_remote_{selected_service}_{profile_name}"
+                "proxy_settings_profile_extends_remote_{selected_service}_{profile_name}"
             ))
             .selected_text(editor_extends.as_deref().unwrap_or("<none>"))
             .show_ui(ui, |ui| {
@@ -219,7 +219,7 @@ pub(in super::super::super) fn render_config_v2_profiles_control_plane(
         cols[1].horizontal(|ui| {
             ui.label(pick(lang, "station", "station"));
             egui::ComboBox::from_id_salt(format!(
-                "config_v2_profile_station_remote_{selected_service}_{profile_name}"
+                "proxy_settings_profile_station_remote_{selected_service}_{profile_name}"
             ))
             .selected_text(
                 editor_station

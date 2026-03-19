@@ -31,7 +31,7 @@ pub(super) fn control_scope_label(
     ) {
         ControlSurfaceMode::DirectRemote => pick(lang, "直写远端", "Remote control-plane").into(),
         ControlSurfaceMode::DirectLocal => pick(lang, "直写本机", "Local control-plane").into(),
-        ControlSurfaceMode::LocalDraft => pick(lang, "本地文稿", "Local config draft").into(),
+        ControlSurfaceMode::LocalDraft => pick(lang, "本地文稿", "Local settings draft").into(),
         ControlSurfaceMode::Unavailable => pick(lang, "远端受限", "Remote-limited").into(),
     }
 }
@@ -69,8 +69,8 @@ pub(super) fn control_scope_hint(
             render_ctx.selected_service,
             pick(
                 lang,
-                "当前编辑本机配置文档，需重新运行或附着后生效",
-                "Editing the local config document; run or attach to apply",
+                "当前编辑本机设置文档，需重新运行或附着后生效",
+                "Editing the local settings document; run or attach to apply",
             )
         ),
         ControlSurfaceMode::Unavailable => format!(

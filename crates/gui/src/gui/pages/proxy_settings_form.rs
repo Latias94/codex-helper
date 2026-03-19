@@ -316,7 +316,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ctx.view.proxy_settings.working.as_ref(),
         Some(ProxySettingsWorkingDocument::V2(_))
     ) {
-        config_v2::render(ui, ctx);
+        proxy_settings_workspace::render(ui, ctx);
         return;
     }
 
@@ -391,7 +391,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             cols[0].heading(pick(ctx.lang, "站点列表", "Stations"));
             cols[0].add_space(4.0);
             egui::ScrollArea::vertical()
-                .id_salt("config_configs_scroll")
+                .id_salt("proxy_settings_legacy_stations_scroll")
                 .max_height(520.0)
                 .show(&mut cols[0], |ui| {
                     for name in names.iter() {

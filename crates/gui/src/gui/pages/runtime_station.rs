@@ -9,8 +9,8 @@ pub(super) use super::runtime_station_health::{
 };
 #[allow(unused_imports)]
 pub(super) use super::runtime_station_maps::{
-    RuntimeStationMaps, current_runtime_active_station, refresh_config_editor_from_disk_if_running,
-    runtime_station_maps,
+    RuntimeStationMaps, current_runtime_active_station,
+    refresh_proxy_settings_editor_from_disk_if_running, runtime_station_maps,
 };
 #[allow(unused_imports)]
 pub(super) use super::runtime_station_options::{

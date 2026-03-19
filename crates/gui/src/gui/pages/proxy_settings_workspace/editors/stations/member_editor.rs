@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn config_station_member_editor_from_member(
+pub(crate) fn station_member_editor_from_member(
     member: &GroupMemberRefV2,
 ) -> StationMemberEditorState {
     StationMemberEditorState {
@@ -21,7 +21,7 @@ fn parse_station_member_endpoint_names(raw: &str) -> Vec<String> {
     out
 }
 
-pub(super) fn build_station_spec_from_config_editor(
+pub(super) fn build_station_spec_from_editor(
     station_name: &str,
     alias: &str,
     enabled: bool,
@@ -55,7 +55,7 @@ pub(super) fn build_station_spec_from_config_editor(
     })
 }
 
-pub(super) fn render_config_station_member_editor(
+pub(super) fn render_station_member_editor(
     ui: &mut egui::Ui,
     lang: Language,
     selected_service: &str,
@@ -73,7 +73,9 @@ pub(super) fn render_config_station_member_editor(
     }
 
     egui::ScrollArea::vertical()
-        .id_salt(format!("config_v2_station_members_edit_{selected_service}"))
+        .id_salt(format!(
+            "proxy_settings_station_members_edit_{selected_service}"
+        ))
         .max_height(180.0)
         .show(ui, |ui| {
             if members.is_empty() {
@@ -98,7 +100,7 @@ pub(super) fn render_config_station_member_editor(
                     ui.horizontal(|ui| {
                         ui.label("provider");
                         egui::ComboBox::from_id_salt(format!(
-                            "config_v2_station_member_provider_{selected_service}_{idx}"
+                            "proxy_settings_station_member_provider_{selected_service}_{idx}"
                         ))
                         .selected_text(if member.provider.trim().is_empty() {
                             pick(lang, "<未选择>", "<unset>")
@@ -159,7 +161,7 @@ pub(super) fn render_config_station_provider_summary(
     }
 
     egui::ScrollArea::vertical()
-        .id_salt("config_v2_station_provider_summary")
+        .id_salt("proxy_settings_station_provider_summary")
         .max_height(140.0)
         .show(ui, |ui| {
             if provider_names.is_empty() {

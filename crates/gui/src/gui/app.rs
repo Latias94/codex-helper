@@ -336,7 +336,7 @@ impl eframe::App for GuiApp {
                             self.last_error = Some(format!("stop failed: {e}"));
                         }
                     }
-                    TrayAction::ReloadConfig => {
+                    TrayAction::ReloadSettings => {
                         if let Err(e) = self.proxy.reload_runtime_config(&self.rt) {
                             self.last_error = Some(format!("reload settings failed: {e}"));
                         } else {
@@ -346,7 +346,7 @@ impl eframe::App for GuiApp {
                             );
                         }
                     }
-                    TrayAction::SetActiveConfig { service, name } => {
+                    TrayAction::SetActiveStation { service, name } => {
                         let service_name = match service {
                             crate::config::ServiceKind::Claude => "claude",
                             crate::config::ServiceKind::Codex => "codex",
@@ -433,7 +433,7 @@ impl eframe::App for GuiApp {
                             }
                         }
                     }
-                    TrayAction::ApplyPinnedConfig { name } => {
+                    TrayAction::ApplyPinnedStation { name } => {
                         match self
                             .proxy
                             .apply_global_station_override(&self.rt, name.clone())
@@ -564,7 +564,7 @@ impl eframe::App for GuiApp {
                             Err(e) => self.last_error = Some(format!("switch off failed: {e}")),
                         }
                     }
-                    TrayAction::OpenConfig => {
+                    TrayAction::OpenSettingsFile => {
                         let path = crate::config::config_file_path();
                         if let Err(e) = open_in_file_manager(&path, true) {
                             self.last_error = Some(format!("open settings failed: {e}"));

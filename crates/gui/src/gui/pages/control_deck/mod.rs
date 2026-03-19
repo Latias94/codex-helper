@@ -1,4 +1,4 @@
-use super::config_v2::context::ProxySettingsRenderContext;
+use super::proxy_settings_workspace::context::ProxySettingsRenderContext;
 use super::view_state::ProxySettingsSection;
 use super::*;
 
@@ -23,7 +23,7 @@ enum ControlSurfaceMode {
     Unavailable,
 }
 
-pub(super) fn render_config_v2_workspace_header(
+pub(super) fn render_control_deck(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
     render_ctx: &ProxySettingsRenderContext,
@@ -88,25 +88,25 @@ pub(super) fn render_config_v2_workspace_header(
 
         ui.add_space(6.0);
         ui.columns(4, |cols| {
-            render_config_v2_summary_card(
+            render_control_deck_summary_card(
                 &mut cols[0],
                 pick(lang, "Scope", "Scope"),
                 scope_label,
                 &scope_hint,
             );
-            render_config_v2_summary_card(
+            render_control_deck_summary_card(
                 &mut cols[1],
                 pick(lang, "Active station", "Active station"),
                 station_value.to_string(),
                 &station_hint,
             );
-            render_config_v2_summary_card(
+            render_control_deck_summary_card(
                 &mut cols[2],
                 pick(lang, "Default profile", "Default profile"),
                 profile_value.to_string(),
                 &profile_hint,
             );
-            render_config_v2_summary_card(
+            render_control_deck_summary_card(
                 &mut cols[3],
                 pick(lang, "Providers", "Providers"),
                 provider_count.to_string(),
@@ -193,7 +193,7 @@ pub(super) fn render_config_v2_workspace_header(
     });
 }
 
-pub(super) fn render_config_v2_summary_card(
+pub(super) fn render_control_deck_summary_card(
     ui: &mut egui::Ui,
     title: &str,
     value: String,

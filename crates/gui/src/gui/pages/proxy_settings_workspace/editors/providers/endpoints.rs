@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn config_provider_endpoint_editor_from_spec(
+pub(crate) fn provider_endpoint_editor_from_spec(
     endpoint: &crate::config::PersistedProviderEndpointSpec,
 ) -> ProviderEndpointEditorState {
     ProviderEndpointEditorState {
@@ -10,7 +10,7 @@ pub(crate) fn config_provider_endpoint_editor_from_spec(
     }
 }
 
-pub(crate) fn build_provider_spec_from_config_editor(
+pub(crate) fn build_provider_spec_from_editor(
     provider_name: &str,
     alias: &str,
     enabled: bool,
@@ -193,7 +193,7 @@ pub(crate) fn render_config_provider_endpoint_editor(
 
     egui::ScrollArea::vertical()
         .id_salt(format!(
-            "config_v2_provider_endpoints_edit_{selected_service}_{provider_name}"
+            "proxy_settings_provider_endpoints_edit_{selected_service}_{provider_name}"
         ))
         .max_height(260.0)
         .show(ui, |ui| {

@@ -1,6 +1,6 @@
 use super::member_editor::{
-    build_station_spec_from_config_editor, render_config_station_member_editor,
-    render_config_station_provider_summary,
+    build_station_spec_from_editor, render_config_station_provider_summary,
+    render_station_member_editor,
 };
 use super::*;
 
@@ -51,7 +51,10 @@ pub(crate) struct StationsSectionArgs<'a> {
     pub station_editor_members: &'a mut Vec<StationMemberEditorState>,
 }
 
-pub(crate) fn render_config_v2_stations_section(ui: &mut egui::Ui, args: StationsSectionArgs<'_>) {
+pub(crate) fn render_proxy_settings_stations_section(
+    ui: &mut egui::Ui,
+    args: StationsSectionArgs<'_>,
+) {
     let StationsSectionArgs {
         lang,
         proxy_kind,
@@ -172,7 +175,7 @@ pub(crate) fn render_config_v2_stations_section(ui: &mut egui::Ui, args: Station
         }
         cols[0].add_space(4.0);
         egui::ScrollArea::vertical()
-            .id_salt("config_v2_stations_scroll")
+            .id_salt("proxy_settings_stations_scroll")
             .max_height(520.0)
             .show(&mut cols[0], |ui| {
                 if station_display_names.is_empty() {
@@ -385,7 +388,7 @@ pub(crate) fn render_config_v2_stations_section(ui: &mut egui::Ui, args: Station
             cols[1].add_space(8.0);
             cols[1].separator();
             cols[1].label(pick(lang, "成员引用", "Members"));
-            render_config_station_member_editor(
+            render_station_member_editor(
                 &mut cols[1],
                 lang,
                 selected_service,
@@ -469,7 +472,7 @@ pub(crate) fn render_config_v2_stations_section(ui: &mut egui::Ui, args: Station
                     ))
                     .clicked()
                 {
-                    match build_station_spec_from_config_editor(
+                    match build_station_spec_from_editor(
                         name.as_str(),
                         station_editor_alias.as_str(),
                         *station_editor_enabled,

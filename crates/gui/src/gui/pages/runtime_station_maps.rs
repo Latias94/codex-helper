@@ -38,7 +38,7 @@ pub(super) fn current_runtime_active_station(proxy: &ProxyController) -> Option<
         .or(snapshot.configured_active_station)
 }
 
-pub(super) fn refresh_config_editor_from_disk_if_running(ctx: &mut PageCtx<'_>) {
+pub(super) fn refresh_proxy_settings_editor_from_disk_if_running(ctx: &mut PageCtx<'_>) {
     if !matches!(ctx.proxy.kind(), ProxyModeKind::Running) {
         return;
     }

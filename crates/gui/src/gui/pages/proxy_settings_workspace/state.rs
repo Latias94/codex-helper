@@ -1,6 +1,4 @@
-use super::editors::{
-    config_provider_endpoint_editor_from_spec, config_station_member_editor_from_member,
-};
+use super::editors::{provider_endpoint_editor_from_spec, station_member_editor_from_member};
 use super::*;
 
 pub(super) struct ProxySettingsEditorDraft {
@@ -86,7 +84,7 @@ impl ProxySettingsEditorDraft {
                 station
                     .members
                     .iter()
-                    .map(config_station_member_editor_from_member)
+                    .map(station_member_editor_from_member)
                     .collect()
             })
             .unwrap_or_default();
@@ -154,7 +152,7 @@ impl ProxySettingsEditorDraft {
                 provider
                     .endpoints
                     .iter()
-                    .map(config_provider_endpoint_editor_from_spec)
+                    .map(provider_endpoint_editor_from_spec)
                     .collect()
             })
             .unwrap_or_default();

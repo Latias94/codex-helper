@@ -1,4 +1,4 @@
-use super::config_v2_header::render_config_v2_workspace_header;
+use super::control_deck::render_control_deck;
 use super::view_state::ProxySettingsSection;
 use super::*;
 
@@ -24,7 +24,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "服务", "Service"));
         let mut svc = ctx.view.proxy_settings.service;
-        egui::ComboBox::from_id_salt("config_form_v2_service")
+        egui::ComboBox::from_id_salt("proxy_settings_workspace_service")
             .selected_text(match svc {
                 crate::config::ServiceKind::Codex => "codex",
                 crate::config::ServiceKind::Claude => "claude",
@@ -40,7 +40,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         return;
     };
 
-    render_config_v2_workspace_header(ui, ctx, &render_ctx);
+    render_control_deck(ui, ctx, &render_ctx);
     ui.add_space(10.0);
 
     let mut actions = ProxySettingsPendingActions::default();
@@ -62,7 +62,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
         match ctx.view.proxy_settings.section {
             ProxySettingsSection::Stations => {
-                render_config_v2_stations_section(
+                render_proxy_settings_stations_section(
                     ui,
                     StationsSectionArgs {
                         lang: ctx.lang,
@@ -111,7 +111,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 );
             }
             ProxySettingsSection::Providers => {
-                render_config_v2_providers_section(
+                render_proxy_settings_providers_section(
                     ui,
                     ctx.lang,
                     ctx.proxy.kind(),
@@ -147,7 +147,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         "Profiles bundle station / model / reasoning_effort / service_tier into reusable control templates for fast mode, model switching, and reasoning mode.",
                     ));
                     if render_ctx.profile_control_plane_enabled {
-                        render_config_v2_profiles_control_plane(
+                        render_proxy_settings_profiles_control_plane(
                             ui,
                             ctx.lang,
                             render_ctx.selected_service,
@@ -179,7 +179,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                             preview_runtime_station_catalog,
                         );
                     } else {
-                        render_config_v2_profiles_local(
+                        render_proxy_settings_profiles_local(
                             ui,
                             LocalProfilesSectionArgs {
                                 lang: ctx.lang,

@@ -50,8 +50,8 @@ impl ProxySettingsPendingActions {
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
-                            "已写入 profile 配置并刷新代理。",
-                            "Profile config saved and proxy refreshed.",
+                            "已写入 profile 设置并刷新代理。",
+                            "Profile settings saved and proxy refreshed.",
                         )
                         .to_string(),
                     );
@@ -161,8 +161,8 @@ impl ProxySettingsPendingActions {
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
-                            "已保存 station 配置并刷新代理。",
-                            "Station config saved and proxy refreshed.",
+                            "已保存 station 设置并刷新代理。",
+                            "Station settings saved and proxy refreshed.",
                         )
                         .to_string(),
                     );
@@ -328,7 +328,7 @@ impl ProxySettingsPendingActions {
 fn refresh_proxy_and_editor(ctx: &mut PageCtx<'_>) {
     ctx.proxy
         .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
-    refresh_config_editor_from_disk_if_running(ctx);
+    refresh_proxy_settings_editor_from_disk_if_running(ctx);
 }
 
 fn set_local_active_group(ctx: &mut PageCtx<'_>, active_group: Option<String>) {

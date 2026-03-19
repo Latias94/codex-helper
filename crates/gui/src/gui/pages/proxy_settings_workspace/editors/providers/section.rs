@@ -1,5 +1,5 @@
 use super::endpoints::{
-    build_provider_spec_from_config_editor, merge_provider_spec_into_provider_config,
+    build_provider_spec_from_editor, merge_provider_spec_into_provider_config,
     render_config_provider_endpoint_editor,
 };
 use super::helpers::{
@@ -11,7 +11,7 @@ use super::shared::{build_provider_card_item, render_provider_card_list};
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn render_config_v2_providers_section(
+pub(crate) fn render_proxy_settings_providers_section(
     ui: &mut egui::Ui,
     lang: Language,
     proxy_kind: ProxyModeKind,
@@ -166,7 +166,7 @@ pub(crate) fn render_config_v2_providers_section(
                 render_provider_card_list(
                     &mut cols[0],
                     lang,
-                    "config_v2_providers_scroll",
+                    "proxy_settings_providers_scroll",
                     pick(
                         lang,
                         "当前没有 provider。可以先新增一个空 provider，再补 endpoint 与 env 引用。",
@@ -363,7 +363,7 @@ pub(crate) fn render_config_v2_providers_section(
                         ))
                         .clicked()
                     {
-                        match build_provider_spec_from_config_editor(
+                        match build_provider_spec_from_editor(
                             name.as_str(),
                             provider_editor_alias.as_str(),
                             *provider_editor_enabled,

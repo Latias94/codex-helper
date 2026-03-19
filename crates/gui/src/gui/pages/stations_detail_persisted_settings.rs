@@ -30,7 +30,7 @@ pub(super) fn render_station_persisted_settings_section(
                 {
                     Ok(()) => {
                         refresh_runtime_snapshot(ctx);
-                        refresh_config_editor_from_disk_if_running(ctx);
+                        refresh_proxy_settings_editor_from_disk_if_running(ctx);
                         *ctx.last_info = Some(
                             pick(
                                 ctx.lang,
@@ -61,7 +61,7 @@ pub(super) fn render_station_persisted_settings_section(
                 match ctx.proxy.set_persisted_active_station(ctx.rt, None) {
                     Ok(()) => {
                         refresh_runtime_snapshot(ctx);
-                        refresh_config_editor_from_disk_if_running(ctx);
+                        refresh_proxy_settings_editor_from_disk_if_running(ctx);
                         *ctx.last_info = Some(
                             pick(
                                 ctx.lang,
@@ -107,7 +107,7 @@ pub(super) fn render_station_persisted_settings_section(
             ) {
                 Ok(()) => {
                     refresh_runtime_snapshot(ctx);
-                    refresh_config_editor_from_disk_if_running(ctx);
+                    refresh_proxy_settings_editor_from_disk_if_running(ctx);
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
