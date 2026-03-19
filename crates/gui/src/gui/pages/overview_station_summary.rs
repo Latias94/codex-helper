@@ -179,10 +179,10 @@ pub(super) fn render_overview_station_summary(ui: &mut egui::Ui, ctx: &mut PageC
             ctx.view.requested_page = Some(Page::Requests);
         }
         if ui
-            .button(pick(ctx.lang, "打开 Config 页", "Open Config page"))
+            .button(pick(ctx.lang, "打开代理设置页", "Open Proxy Settings"))
             .clicked()
         {
-            ctx.view.requested_page = Some(Page::Config);
+            ctx.view.requested_page = Some(Page::ProxySettings);
         }
     });
 
@@ -255,8 +255,8 @@ pub(super) fn render_overview_station_summary(ui: &mut egui::Ui, ctx: &mut PageC
         egui::Color32::from_rgb(120, 120, 120),
         pick(
             ctx.lang,
-            "Overview 只给出控制态势；更细的 quick switch、drain、breaker、provider/member 结构和 retry 细节已经拆到 Stations / Requests / Config。",
-            "Overview only shows control posture. Detailed quick switch, drain, breaker, provider/member structure, and retry details live in Stations / Requests / Config.",
+            "Overview 只给出控制态势；更细的 quick switch、drain、breaker、provider/member 结构和 retry 细节已经拆到 Stations / Requests / Proxy Settings。",
+            "Overview only shows control posture. Detailed quick switch, drain, breaker, provider/member structure, and retry details live in Stations / Requests / Proxy Settings.",
         ),
     );
 }

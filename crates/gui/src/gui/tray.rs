@@ -445,7 +445,7 @@ fn build_menu_base(
     );
     let reload = MenuItem::with_id(
         id_reload.clone(),
-        pick(lang, "重载配置", "Reload config"),
+        pick(lang, "重载设置", "Reload settings"),
         true,
         None,
     );
@@ -471,7 +471,7 @@ fn build_menu_base(
     );
     let open_config = MenuItem::with_id(
         id_open_config.clone(),
-        pick(lang, "打开配置文件", "Open config file"),
+        pick(lang, "打开设置文件", "Open settings file"),
         true,
         None,
     );

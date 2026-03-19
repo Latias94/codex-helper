@@ -1,7 +1,12 @@
 use super::*;
 
 #[derive(Debug, serde::Deserialize)]
-struct RuntimeConfigStatus {
+#[allow(dead_code)]
+struct RuntimeStatusResponse {
+    #[serde(default)]
+    runtime_source_path: Option<String>,
+    #[serde(default)]
+    config_path: Option<String>,
     loaded_at_ms: u64,
     #[serde(default)]
     source_mtime_ms: Option<u64>,
@@ -109,8 +114,8 @@ async fn get_v1_runtime_status(
     base: &str,
     links: Option<&OperatorSummaryLinks>,
     req_timeout: Duration,
-) -> anyhow::Result<RuntimeConfigStatus> {
-    get_json::<RuntimeConfigStatus>(
+) -> anyhow::Result<RuntimeStatusResponse> {
+    get_json::<RuntimeStatusResponse>(
         client,
         linked_url(
             base,

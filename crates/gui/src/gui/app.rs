@@ -108,8 +108,8 @@ struct GuiApp {
     page: Page,
     view: ViewState,
     gui_cfg: GuiConfig,
-    proxy_config_path: std::path::PathBuf,
-    proxy_config_text: String,
+    proxy_settings_path: std::path::PathBuf,
+    proxy_settings_text: String,
     last_error: Option<String>,
     last_info: Option<String>,
     rt: tokio::runtime::Runtime,
@@ -140,11 +140,12 @@ impl GuiApp {
             _ => Some(startup_behavior),
         };
 
-        let proxy_config_path = crate::config::config_file_path();
-        let proxy_config_text = std::fs::read_to_string(&proxy_config_path).unwrap_or_default();
+        let proxy_settings_path = crate::config::config_file_path();
+        let proxy_settings_text = std::fs::read_to_string(&proxy_settings_path).unwrap_or_default();
 
         let initial_page = {
-            let config_ready = proxy_config_path.exists() && !proxy_config_text.trim().is_empty();
+            let config_ready =
+                proxy_settings_path.exists() && !proxy_settings_text.trim().is_empty();
             let svc = gui_cfg.service_kind();
             let switched = match svc {
                 crate::config::ServiceKind::Claude => {
@@ -181,8 +182,8 @@ impl GuiApp {
             page: initial_page,
             view,
             gui_cfg,
-            proxy_config_path,
-            proxy_config_text,
+            proxy_settings_path,
+            proxy_settings_text,
             last_error: None,
             last_info: None,
             rt,
@@ -337,10 +338,11 @@ impl eframe::App for GuiApp {
                     }
                     TrayAction::ReloadConfig => {
                         if let Err(e) = self.proxy.reload_runtime_config(&self.rt) {
-                            self.last_error = Some(format!("reload config failed: {e}"));
+                            self.last_error = Some(format!("reload settings failed: {e}"));
                         } else {
                             self.last_info = Some(
-                                pick(lang, "已重载站点配置", "Station config reloaded").to_string(),
+                                pick(lang, "已重载站点设置", "Station settings reloaded")
+                                    .to_string(),
                             );
                         }
                     }
@@ -420,7 +422,7 @@ impl eframe::App for GuiApp {
                                     }
                                     Err(e) => {
                                         self.last_error =
-                                            Some(format!("reload config failed: {e}"));
+                                            Some(format!("reload settings failed: {e}"));
                                     }
                                 }
                             } else {
@@ -565,7 +567,7 @@ impl eframe::App for GuiApp {
                     TrayAction::OpenConfig => {
                         let path = crate::config::config_file_path();
                         if let Err(e) = open_in_file_manager(&path, true) {
-                            self.last_error = Some(format!("open config failed: {e}"));
+                            self.last_error = Some(format!("open settings failed: {e}"));
                         }
                     }
                     TrayAction::OpenLogs => {
@@ -616,8 +618,8 @@ impl eframe::App for GuiApp {
                 lang,
                 view: &mut self.view,
                 gui_cfg: &mut self.gui_cfg,
-                proxy_config_text: &mut self.proxy_config_text,
-                proxy_config_path: &self.proxy_config_path,
+                proxy_settings_text: &mut self.proxy_settings_text,
+                proxy_settings_path: &self.proxy_settings_path,
                 last_error: &mut self.last_error,
                 last_info: &mut self.last_info,
                 rt: &self.rt,

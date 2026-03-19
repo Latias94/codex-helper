@@ -395,7 +395,12 @@ impl ProxyController {
         ports: std::ops::RangeInclusive<u16>,
     ) -> anyhow::Result<()> {
         #[derive(Debug, serde::Deserialize)]
-        struct RuntimeConfigStatus {
+        #[allow(dead_code)]
+        struct RuntimeStatusResponse {
+            #[serde(default)]
+            runtime_source_path: Option<String>,
+            #[serde(default)]
+            config_path: Option<String>,
             loaded_at_ms: u64,
         }
 
@@ -419,8 +424,8 @@ impl ProxyController {
             client: &Client,
             base: &str,
             timeout: Duration,
-        ) -> anyhow::Result<RuntimeConfigStatus> {
-            get_json::<RuntimeConfigStatus>(
+        ) -> anyhow::Result<RuntimeStatusResponse> {
+            get_json::<RuntimeStatusResponse>(
                 client,
                 format!("{base}/__codex_helper/api/v1/runtime/status"),
                 timeout,
@@ -457,7 +462,7 @@ impl ProxyController {
             base_url: String,
             admin_base_url: String,
             capabilities: ApiV1Capabilities,
-            runtime: Option<RuntimeConfigStatus>,
+            runtime: Option<RuntimeStatusResponse>,
             operator_summary: Option<ApiV1OperatorSummary>,
         ) -> DiscoveredProxy {
             let runtime_loaded_at_ms = operator_summary

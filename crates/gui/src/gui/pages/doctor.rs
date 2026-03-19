@@ -37,12 +37,12 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
 
         if ui
-            .button(pick(ctx.lang, "打开配置文件", "Open config file"))
+            .button(pick(ctx.lang, "打开设置文件", "Open settings file"))
             .clicked()
         {
             let path = crate::config::config_file_path();
             if let Err(e) = open_in_file_manager(&path, true) {
-                *ctx.last_error = Some(format!("open config failed: {e}"));
+                *ctx.last_error = Some(format!("open settings failed: {e}"));
             }
         }
 

@@ -467,6 +467,16 @@ async fn proxy_runtime_config_reports_resolved_retry_profile() {
         .await
         .expect("json");
 
+    assert_eq!(
+        v.get("runtime_source_path").and_then(|x| x.as_str()),
+        v.get("config_path").and_then(|x| x.as_str())
+    );
+    assert!(
+        v.get("runtime_source_path")
+            .and_then(|x| x.as_str())
+            .is_some_and(|value| value.ends_with("config.toml") || value.ends_with("config.json"))
+    );
+
     let retry = v.get("retry").expect("retry field");
     assert!(
         retry.get("profile").is_none(),

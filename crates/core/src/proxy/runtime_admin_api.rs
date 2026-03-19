@@ -4,20 +4,21 @@ use axum::http::StatusCode;
 
 use super::ProxyService;
 use super::api_responses::{
-    ProfilesResponse, ReloadResult, RetryConfigResponse, RuntimeConfigStatus, build_reload_result,
-    build_retry_config_response, build_runtime_config_status, make_profiles_response,
+    ProfilesResponse, ReloadResult, RetryConfigResponse, RuntimeStatusResponse,
+    build_reload_result, build_retry_config_response, build_runtime_status_response,
+    make_profiles_response,
 };
-use super::control_plane_service::save_runtime_config_and_reload;
+use super::control_plane_service::save_runtime_proxy_settings_and_reload;
 
 #[derive(serde::Deserialize)]
 pub(super) struct ControlTraceQuery {
     limit: Option<usize>,
 }
 
-pub(super) async fn runtime_config_status(
+pub(super) async fn runtime_status(
     proxy: ProxyService,
-) -> Result<Json<RuntimeConfigStatus>, (StatusCode, String)> {
-    Ok(Json(build_runtime_config_status(&proxy).await))
+) -> Result<Json<RuntimeStatusResponse>, (StatusCode, String)> {
+    Ok(Json(build_runtime_status_response(&proxy).await))
 }
 
 pub(super) async fn get_retry_config(
@@ -35,7 +36,7 @@ pub(super) async fn set_retry_config(
     let mut cfg = cfg_snapshot.as_ref().clone();
     cfg.retry = payload;
 
-    save_runtime_config_and_reload(&proxy, cfg).await?;
+    save_runtime_proxy_settings_and_reload(&proxy, cfg).await?;
     let cfg = proxy.config.snapshot().await;
     Ok(Json(build_retry_config_response(cfg.as_ref())))
 }
@@ -48,7 +49,7 @@ pub(super) async fn reload_runtime_config(
         .force_reload_from_disk()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let status = build_runtime_config_status(&proxy).await;
+    let status = build_runtime_status_response(&proxy).await;
     Ok(Json(build_reload_result(changed, status)))
 }
 

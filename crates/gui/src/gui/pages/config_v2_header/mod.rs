@@ -1,5 +1,5 @@
-use super::config_v2::context::ConfigV2RenderContext;
-use super::view_state::ConfigV2Section;
+use super::config_v2::context::ProxySettingsRenderContext;
+use super::view_state::ProxySettingsSection;
 use super::*;
 
 mod actions;
@@ -26,11 +26,11 @@ enum ControlSurfaceMode {
 pub(super) fn render_config_v2_workspace_header(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) {
     let lang = ctx.lang;
     let proxy_kind = ctx.proxy.kind();
-    let current_section = ctx.view.config.v2_section;
+    let current_section = ctx.view.proxy_settings.section;
     let station_count = render_ctx.station_display_names.len();
     let provider_count = render_ctx.provider_display_names.len();
     let profile_count = if render_ctx.profile_control_plane_enabled {
@@ -40,17 +40,17 @@ pub(super) fn render_config_v2_workspace_header(
     };
     let mode_label = proxy_mode_label(lang, proxy_kind);
     let focus_hint = match current_section {
-        ConfigV2Section::Stations => pick(
+        ProxySettingsSection::Stations => pick(
             lang,
             "适合调整默认路由、成员组合、健康检查与 active station。",
             "Best for routing topology, health checks, and active station control.",
         ),
-        ConfigV2Section::Providers => pick(
+        ProxySettingsSection::Providers => pick(
             lang,
             "适合管理中转来源、认证引用、endpoint 集合和后续故障切换基础。",
             "Best for relay sources, auth references, endpoint sets, and future failover basics.",
         ),
-        ConfigV2Section::Profiles => pick(
+        ProxySettingsSection::Profiles => pick(
             lang,
             "最适合日常切换 fast mode、模型、reasoning_effort 与 service_tier。",
             "Best for daily switching of fast mode, model, reasoning_effort, and service_tier.",
@@ -169,20 +169,20 @@ pub(super) fn render_config_v2_workspace_header(
 
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            let section = &mut ctx.view.config.v2_section;
+            let section = &mut ctx.view.proxy_settings.section;
             ui.selectable_value(
                 section,
-                ConfigV2Section::Profiles,
+                ProxySettingsSection::Profiles,
                 format!("{} · {}", pick(lang, "Profiles", "Profiles"), profile_count),
             );
             ui.selectable_value(
                 section,
-                ConfigV2Section::Stations,
+                ProxySettingsSection::Stations,
                 format!("{} · {}", pick(lang, "Stations", "Stations"), station_count),
             );
             ui.selectable_value(
                 section,
-                ConfigV2Section::Providers,
+                ProxySettingsSection::Providers,
                 format!(
                     "{} · {}",
                     pick(lang, "Providers", "Providers"),

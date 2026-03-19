@@ -89,10 +89,11 @@ pub(crate) enum Command {
         #[arg(long)]
         claude: bool,
     },
-    /// Manage proxy configs for Codex / Claude
-    Config {
+    /// Manage proxy stations for Codex / Claude
+    #[command(name = "station", visible_alias = "config")]
+    Station {
         #[command(subcommand)]
-        cmd: ConfigCommand,
+        cmd: StationCommand,
     },
     /// Session-related helper commands (Codex sessions)
     Session {
@@ -105,7 +106,7 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show a brief status summary of codex-helper and upstream configs
+    /// Show a brief status summary of codex-helper and upstream stations
     Status {
         /// Output status as JSON (machine-readable), without ANSI colors
         #[arg(long)]
@@ -186,7 +187,7 @@ pub(crate) enum SwitchCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum ConfigCommand {
+pub enum StationCommand {
     /// Initialize a commented config template (TOML)
     Init {
         /// Overwrite existing config.toml (backing up to config.toml.bak)
@@ -196,32 +197,32 @@ pub enum ConfigCommand {
         #[arg(long)]
         no_import: bool,
     },
-    /// List configs in ~/.codex-helper/config.toml (or config.json)
+    /// List stations in ~/.codex-helper/config.toml (or config.json)
     List {
-        /// Target Codex configs (default if neither flag is set)
+        /// Target Codex stations (default if neither flag is set)
         #[arg(long)]
         codex: bool,
-        /// Target Claude configs
+        /// Target Claude stations
         #[arg(long)]
         claude: bool,
     },
 
     /// Explain effective routing order for a service
     Explain {
-        /// Target Codex configs (default if neither flag is set)
+        /// Target Codex stations (default if neither flag is set)
         #[arg(long)]
         codex: bool,
-        /// Target Claude configs
+        /// Target Claude stations
         #[arg(long)]
         claude: bool,
         /// Output JSON instead of text
         #[arg(long)]
         json: bool,
-        /// Show details for a single station/config
-        #[arg(long, visible_alias = "station")]
-        group: Option<String>,
+        /// Show details for a single station
+        #[arg(long, alias = "group")]
+        station: Option<String>,
     },
-    /// Add a new config
+    /// Add a new station
     Add {
         name: String,
         #[arg(long)]
@@ -237,61 +238,61 @@ pub enum ConfigCommand {
         /// Read X-API-Key header value from an environment variable
         #[arg(long, conflicts_with = "api_key")]
         api_key_env: Option<String>,
-        /// Optional alias for this config
+        /// Optional alias for this station
         #[arg(long)]
         alias: Option<String>,
-        /// Priority group for level-based config routing (1..=10, lower is higher priority)
+        /// Priority group for level-based station routing (1..=10, lower is higher priority)
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=10))]
         level: u8,
-        /// Exclude this config from automatic routing (unless it is active)
+        /// Exclude this station from automatic routing (unless it is active)
         #[arg(long)]
         disabled: bool,
-        /// Target Codex configs (default if neither flag is set)
+        /// Target Codex stations (default if neither flag is set)
         #[arg(long)]
         codex: bool,
-        /// Target Claude configs
+        /// Target Claude stations
         #[arg(long)]
         claude: bool,
     },
-    /// Set active config
+    /// Set active station
     SetActive {
         name: String,
-        /// Target Codex configs (default if neither flag is set)
+        /// Target Codex stations (default if neither flag is set)
         #[arg(long)]
         codex: bool,
-        /// Target Claude configs
+        /// Target Claude stations
         #[arg(long)]
         claude: bool,
     },
-    /// Set a config's level (1..=10, lower is higher priority)
+    /// Set a station's level (1..=10, lower is higher priority)
     SetLevel {
         name: String,
         #[arg(value_parser = clap::value_parser!(u8).range(1..=10))]
         level: u8,
-        /// Target Codex configs (default if neither flag is set)
+        /// Target Codex stations (default if neither flag is set)
         #[arg(long)]
         codex: bool,
-        /// Target Claude configs
+        /// Target Claude stations
         #[arg(long)]
         claude: bool,
     },
-    /// Enable a config for automatic routing
+    /// Enable a station for automatic routing
     Enable {
         name: String,
-        /// Target Codex configs (default if neither flag is set)
+        /// Target Codex stations (default if neither flag is set)
         #[arg(long)]
         codex: bool,
-        /// Target Claude configs
+        /// Target Claude stations
         #[arg(long)]
         claude: bool,
     },
-    /// Disable a config for automatic routing (unless it is active)
+    /// Disable a station for automatic routing (unless it is active)
     Disable {
         name: String,
-        /// Target Codex configs (default if neither flag is set)
+        /// Target Codex stations (default if neither flag is set)
         #[arg(long)]
         codex: bool,
-        /// Target Claude configs
+        /// Target Claude stations
         #[arg(long)]
         claude: bool,
     },
@@ -301,21 +302,21 @@ pub enum ConfigCommand {
         #[arg(value_enum)]
         profile: RetryProfile,
     },
-    /// Import Codex upstream config from ~/.codex/config.toml + auth.json into ~/.codex-helper/config (toml/json)
+    /// Import Codex upstream stations from ~/.codex/config.toml + auth.json into ~/.codex-helper/config (toml/json)
     ImportFromCodex {
-        /// Overwrite existing Codex configs in ~/.codex-helper/config (toml/json)
+        /// Overwrite existing Codex stations in ~/.codex-helper/config (toml/json)
         #[arg(long)]
         force: bool,
     },
-    /// Overwrite Codex upstream configs from ~/.codex/config.toml + auth.json
+    /// Overwrite Codex upstream stations from ~/.codex/config.toml + auth.json
     ///
-    /// This resets Codex configs in codex-helper back to Codex CLI defaults (including grouping/levels).
+    /// This resets Codex stations in codex-helper back to Codex CLI defaults (including grouping/levels).
     #[command(name = "overwrite-from-codex")]
     OverwriteFromCodex {
         /// Preview changes without writing ~/.codex-helper/config (toml/json)
         #[arg(long)]
         dry_run: bool,
-        /// Confirm overwriting configs (required unless --dry-run)
+        /// Confirm overwriting stations (required unless --dry-run)
         #[arg(long)]
         yes: bool,
     },
@@ -490,10 +491,12 @@ pub enum UsageCommand {
         #[arg(long)]
         raw: bool,
     },
-    /// Summarize total token usage per config from ~/.codex-helper/logs/requests.jsonl
+    /// Summarize total token usage per station from ~/.codex-helper/logs/requests.jsonl
     Summary {
-        /// Maximum number of configs to show (sorted by total_tokens desc)
+        /// Maximum number of stations to show (sorted by total_tokens desc)
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
 }
+
+pub type ConfigCommand = StationCommand;

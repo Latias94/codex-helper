@@ -1,4 +1,4 @@
-use super::config_document::parse_proxy_config_document;
+use super::proxy_settings_document::parse_proxy_settings_document;
 use super::*;
 use crate::gui::proxy_control::ProxyController;
 
@@ -44,9 +44,9 @@ pub(super) fn refresh_config_editor_from_disk_if_running(ctx: &mut PageCtx<'_>) 
     }
     let new_path = crate::config::config_file_path();
     if let Ok(text) = std::fs::read_to_string(&new_path) {
-        *ctx.proxy_config_text = text.clone();
-        if let Ok(parsed) = parse_proxy_config_document(&text) {
-            ctx.view.config.working = Some(parsed);
+        *ctx.proxy_settings_text = text.clone();
+        if let Ok(parsed) = parse_proxy_settings_document(&text) {
+            ctx.view.proxy_settings.working = Some(parsed);
         }
     }
 }

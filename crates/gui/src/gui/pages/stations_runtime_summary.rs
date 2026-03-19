@@ -114,10 +114,10 @@ pub(super) fn render_stations_runtime_summary(
                 }
             }
             if ui
-                .button(pick(ctx.lang, "打开配置页", "Open Config page"))
+                .button(pick(ctx.lang, "打开代理设置页", "Open Proxy Settings"))
                 .clicked()
             {
-                ctx.view.requested_page = Some(Page::Config);
+                ctx.view.requested_page = Some(Page::ProxySettings);
             }
             if ui
                 .button(pick(ctx.lang, "回到总览", "Back to Overview"))

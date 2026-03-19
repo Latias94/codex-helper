@@ -4,7 +4,7 @@ pub(super) fn render_control_deck_actions(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
     proxy_kind: ProxyModeKind,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) {
     let can_reload_runtime = matches!(proxy_kind, ProxyModeKind::Running | ProxyModeKind::Attached);
     let can_refresh_runtime = can_reload_runtime;

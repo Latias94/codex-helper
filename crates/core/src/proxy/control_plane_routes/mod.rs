@@ -29,7 +29,7 @@ use super::healthcheck_api::{
     cancel_health_checks, list_health_checks, list_station_health, probe_station,
     start_health_checks,
 };
-use super::persisted_config_api::{
+use super::persisted_registry_api::{
     delete_persisted_profile, delete_persisted_provider_spec, delete_persisted_station_spec,
     list_persisted_provider_specs, list_persisted_station_specs, set_persisted_active_station,
     set_persisted_default_profile, update_persisted_station, upsert_persisted_profile,
@@ -37,8 +37,8 @@ use super::persisted_config_api::{
 };
 use super::providers_api::{apply_provider_runtime_meta, list_providers};
 use super::runtime_admin_api::{
-    get_control_trace, get_retry_config, list_profiles, reload_runtime_config,
-    runtime_config_status, set_retry_config,
+    get_control_trace, get_retry_config, list_profiles, reload_runtime_config, runtime_status,
+    set_retry_config,
 };
 use super::session_overrides::{
     apply_session_manual_overrides, list_session_manual_overrides, list_session_model_overrides,

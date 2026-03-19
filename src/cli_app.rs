@@ -59,7 +59,7 @@ pub async fn run_cli() -> CliResult<()> {
         } => {
             eprintln!(
                 "{}",
-                "Warning: `switch-on` is deprecated, please use `switch on` instead.".yellow()
+                "Warning: `switch-on` is a legacy alias; please use `switch on` instead.".yellow()
             );
             do_switch_on(port, codex, claude)?;
             return Ok(());
@@ -67,13 +67,14 @@ pub async fn run_cli() -> CliResult<()> {
         Command::SwitchOff { codex, claude } => {
             eprintln!(
                 "{}",
-                "Warning: `switch-off` is deprecated, please use `switch off` instead.".yellow()
+                "Warning: `switch-off` is a legacy alias; please use `switch off` instead."
+                    .yellow()
             );
             do_switch_off(codex, claude)?;
             return Ok(());
         }
-        Command::Config { cmd } => {
-            commands::config::handle_config_cmd(cmd).await?;
+        Command::Station { cmd } => {
+            commands::station::handle_station_cmd(cmd).await?;
             return Ok(());
         }
         Command::Session { cmd } => {

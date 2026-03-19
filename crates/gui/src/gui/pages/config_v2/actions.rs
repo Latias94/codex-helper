@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Default)]
-pub(super) struct ConfigV2PendingActions {
+pub(super) struct ProxySettingsPendingActions {
     pub(super) set_active: Option<String>,
     pub(super) clear_active: bool,
     pub(super) set_active_remote: Option<Option<String>>,
@@ -19,7 +19,7 @@ pub(super) struct ConfigV2PendingActions {
     pub(super) profile_set_persisted_default_remote: Option<Option<String>>,
 }
 
-impl ConfigV2PendingActions {
+impl ProxySettingsPendingActions {
     pub(super) fn apply(self, ctx: &mut PageCtx<'_>) {
         let Self {
             set_active,
@@ -46,7 +46,7 @@ impl ConfigV2PendingActions {
             {
                 Ok(()) => {
                     refresh_proxy_and_editor(ctx);
-                    ctx.view.config.selected_profile_name = Some(profile_name);
+                    ctx.view.proxy_settings.selected_profile_name = Some(profile_name);
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
@@ -99,8 +99,8 @@ impl ConfigV2PendingActions {
             match ctx.proxy.delete_persisted_profile(ctx.rt, profile_name) {
                 Ok(()) => {
                     refresh_proxy_and_editor(ctx);
-                    ctx.view.config.selected_profile_name = None;
-                    ctx.view.config.profile_editor = ConfigProfileEditorState::default();
+                    ctx.view.proxy_settings.selected_profile_name = None;
+                    ctx.view.proxy_settings.profile_editor = ProfileEditorState::default();
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
@@ -182,7 +182,7 @@ impl ConfigV2PendingActions {
             ) {
                 Ok(()) => {
                     refresh_proxy_and_editor(ctx);
-                    ctx.view.config.selected_name = Some(station_name);
+                    ctx.view.proxy_settings.selected_name = Some(station_name);
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
@@ -208,8 +208,8 @@ impl ConfigV2PendingActions {
             {
                 Ok(()) => {
                     refresh_proxy_and_editor(ctx);
-                    ctx.view.config.selected_name = None;
-                    ctx.view.config.station_editor = ConfigStationEditorState::default();
+                    ctx.view.proxy_settings.selected_name = None;
+                    ctx.view.proxy_settings.station_editor = StationEditorState::default();
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
@@ -236,7 +236,7 @@ impl ConfigV2PendingActions {
             ) {
                 Ok(()) => {
                     refresh_proxy_and_editor(ctx);
-                    ctx.view.config.selected_provider_name = Some(provider_name);
+                    ctx.view.proxy_settings.selected_provider_name = Some(provider_name);
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
@@ -262,8 +262,8 @@ impl ConfigV2PendingActions {
             {
                 Ok(()) => {
                     refresh_proxy_and_editor(ctx);
-                    ctx.view.config.selected_provider_name = None;
-                    ctx.view.config.provider_editor = ConfigProviderEditorState::default();
+                    ctx.view.proxy_settings.selected_provider_name = None;
+                    ctx.view.proxy_settings.provider_editor = ProviderEditorState::default();
                     *ctx.last_info = Some(
                         pick(
                             ctx.lang,
@@ -332,10 +332,11 @@ fn refresh_proxy_and_editor(ctx: &mut PageCtx<'_>) {
 }
 
 fn set_local_active_group(ctx: &mut PageCtx<'_>, active_group: Option<String>) {
-    let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_mut() else {
+    let Some(ProxySettingsWorkingDocument::V2(cfg)) = ctx.view.proxy_settings.working.as_mut()
+    else {
         return;
     };
-    let view = match ctx.view.config.service {
+    let view = match ctx.view.proxy_settings.service {
         crate::config::ServiceKind::Claude => &mut cfg.claude,
         crate::config::ServiceKind::Codex => &mut cfg.codex,
     };
@@ -344,19 +345,24 @@ fn set_local_active_group(ctx: &mut PageCtx<'_>, active_group: Option<String>) {
 
 fn save_apply_local(ctx: &mut PageCtx<'_>) {
     let save_res = {
-        let cfg = ctx.view.config.working.as_ref().expect("checked above");
-        save_proxy_config_document(ctx.rt, cfg)
+        let cfg = ctx
+            .view
+            .proxy_settings
+            .working
+            .as_ref()
+            .expect("checked above");
+        save_proxy_settings_document(ctx.rt, cfg)
     };
     match save_res {
         Ok(()) => {
             let new_path = crate::config::config_file_path();
             if let Ok(t) = std::fs::read_to_string(&new_path) {
-                *ctx.proxy_config_text = t;
+                *ctx.proxy_settings_text = t;
             }
             if let Ok(t) = std::fs::read_to_string(&new_path)
-                && let Ok(parsed) = parse_proxy_config_document(&t)
+                && let Ok(parsed) = parse_proxy_settings_document(&t)
             {
-                ctx.view.config.working = Some(parsed);
+                ctx.view.proxy_settings.working = Some(parsed);
             }
 
             if matches!(

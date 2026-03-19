@@ -4,7 +4,7 @@ use crate::dashboard_core::{
     OperatorHealthSummary, OperatorRetrySummary, OperatorRuntimeSummary, OperatorSummaryCounts,
 };
 
-pub(in crate::gui::pages) struct ConfigV2RenderContext {
+pub(in crate::gui::pages) struct ProxySettingsRenderContext {
     pub(in crate::gui::pages) schema_version: u32,
     pub(in crate::gui::pages) selected_service: &'static str,
     pub(in crate::gui::pages) station_names: Vec<String>,
@@ -64,14 +64,15 @@ pub(in crate::gui::pages) struct ConfigV2RenderContext {
     pub(in crate::gui::pages) attached_mode: bool,
 }
 
-impl ConfigV2RenderContext {
+impl ProxySettingsRenderContext {
     pub(in crate::gui::pages) fn build(ctx: &mut PageCtx<'_>) -> Option<Self> {
-        let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_ref() else {
+        let Some(ProxySettingsWorkingDocument::V2(cfg)) = ctx.view.proxy_settings.working.as_ref()
+        else {
             return None;
         };
 
         let runtime = crate::config::compile_v2_to_runtime(cfg).ok();
-        let view = match ctx.view.config.service {
+        let view = match ctx.view.proxy_settings.service {
             crate::config::ServiceKind::Claude => &cfg.claude,
             crate::config::ServiceKind::Codex => &cfg.codex,
         };
@@ -84,7 +85,7 @@ impl ConfigV2RenderContext {
         });
         let profile_names = view.profiles.keys().cloned().collect::<Vec<_>>();
         let active_name = view.active_group.clone();
-        let active_fallback = match ctx.view.config.service {
+        let active_fallback = match ctx.view.proxy_settings.service {
             crate::config::ServiceKind::Claude => runtime
                 .as_ref()
                 .and_then(|compiled| compiled.claude.active_station().map(|cfg| cfg.name.clone())),
@@ -94,7 +95,7 @@ impl ConfigV2RenderContext {
         };
         let default_profile = view.default_profile.clone();
 
-        let selected_service = match ctx.view.config.service {
+        let selected_service = match ctx.view.proxy_settings.service {
             crate::config::ServiceKind::Claude => "claude",
             crate::config::ServiceKind::Codex => "codex",
         };
@@ -183,14 +184,14 @@ impl ConfigV2RenderContext {
 
         if ctx
             .view
-            .config
+            .proxy_settings
             .selected_name
             .as_ref()
             .is_none_or(|name| !station_display_names.iter().any(|item| item == name))
         {
-            ctx.view.config.selected_name = station_display_names.first().cloned();
+            ctx.view.proxy_settings.selected_name = station_display_names.first().cloned();
         }
-        let selected_name = ctx.view.config.selected_name.clone();
+        let selected_name = ctx.view.proxy_settings.selected_name.clone();
         let selected_station_name = selected_name.clone().unwrap_or_default();
 
         let (runtime_service, runtime_admin_base_url, supports_v1, cfg_health, hc_status) =
@@ -398,7 +399,7 @@ impl ConfigV2RenderContext {
         })
     }
 
-    pub(super) fn sync_draft(&self, draft: &mut ConfigV2EditorDraft) {
+    pub(super) fn sync_draft(&self, draft: &mut ProxySettingsEditorDraft) {
         if self.station_structure_control_plane_enabled {
             if let Some((station_specs, _)) = self.attached_station_specs.as_ref() {
                 draft.sync_station_editor_from_specs(self.selected_name.as_deref(), station_specs);

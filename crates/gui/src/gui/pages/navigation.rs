@@ -84,9 +84,9 @@ const NAV_STATION_HEALTH_ITEMS: [NavItemDef; 2] = [
 
 const NAV_WORKSPACE_ITEMS: [NavItemDef; 2] = [
     NavItemDef {
-        page: Page::Config,
-        zh: "配置",
-        en: "Config",
+        page: Page::ProxySettings,
+        zh: "代理设置",
+        en: "Proxy Settings",
     },
     NavItemDef {
         page: Page::Settings,
@@ -112,8 +112,8 @@ const NAV_GROUPS: [NavGroupDef; 4] = [
         items: &NAV_STATION_HEALTH_ITEMS,
     },
     NavGroupDef {
-        title_zh: "配置工作区",
-        title_en: "Config Workspace",
+        title_zh: "代理设置工作区",
+        title_en: "Proxy Settings Workspace",
         items: &NAV_WORKSPACE_ITEMS,
     },
 ];

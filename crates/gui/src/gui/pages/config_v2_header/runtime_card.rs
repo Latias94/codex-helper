@@ -4,7 +4,7 @@ pub(super) fn render_control_deck_runtime_card(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
     proxy_kind: ProxyModeKind,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) {
     let lang = ctx.lang;
     let banner = runtime_card_banner(lang, proxy_kind, render_ctx);
@@ -107,7 +107,7 @@ pub(super) fn proxy_mode_label(lang: Language, proxy_kind: ProxyModeKind) -> &'s
 fn runtime_card_banner(
     lang: Language,
     proxy_kind: ProxyModeKind,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> String {
     if let Some(runtime_service) = render_ctx.runtime_service.as_deref() {
         if !render_ctx.runtime_matches_selected_service {
@@ -173,7 +173,7 @@ fn runtime_card_banner(
     }
 }
 
-fn runtime_target_value(lang: Language, render_ctx: &ConfigV2RenderContext) -> String {
+fn runtime_target_value(lang: Language, render_ctx: &ProxySettingsRenderContext) -> String {
     render_ctx
         .runtime_service
         .clone()
@@ -183,7 +183,7 @@ fn runtime_target_value(lang: Language, render_ctx: &ConfigV2RenderContext) -> S
 fn runtime_target_hint(
     lang: Language,
     proxy_kind: ProxyModeKind,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> String {
     let mode = proxy_mode_label(lang, proxy_kind);
     let base_url = render_ctx
@@ -225,7 +225,7 @@ fn runtime_target_hint(
     }
 }
 
-fn runtime_retry_value(lang: Language, render_ctx: &ConfigV2RenderContext) -> String {
+fn runtime_retry_value(lang: Language, render_ctx: &ProxySettingsRenderContext) -> String {
     if render_ctx.runtime_service.is_none() {
         return pick(lang, "<未加载>", "<not loaded>").to_string();
     }
@@ -253,7 +253,7 @@ fn runtime_retry_value(lang: Language, render_ctx: &ConfigV2RenderContext) -> St
 fn runtime_retry_hint(
     lang: Language,
     proxy_kind: ProxyModeKind,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> String {
     let supports_write = render_ctx
         .operator_retry_summary
@@ -329,7 +329,7 @@ fn runtime_retry_hint(
     .to_string()
 }
 
-fn runtime_admin_value(lang: Language, render_ctx: &ConfigV2RenderContext) -> String {
+fn runtime_admin_value(lang: Language, render_ctx: &ProxySettingsRenderContext) -> String {
     let Some(admin_base_url) = render_ctx.runtime_admin_base_url.as_deref() else {
         return pick(lang, "<未连接>", "<offline>").to_string();
     };
@@ -346,7 +346,7 @@ fn runtime_admin_value(lang: Language, render_ctx: &ConfigV2RenderContext) -> St
     })
 }
 
-fn runtime_admin_hint(lang: Language, render_ctx: &ConfigV2RenderContext) -> String {
+fn runtime_admin_hint(lang: Language, render_ctx: &ProxySettingsRenderContext) -> String {
     let Some(admin_base_url) = render_ctx.runtime_admin_base_url.as_deref() else {
         return pick(
             lang,
@@ -387,7 +387,7 @@ fn runtime_admin_hint(lang: Language, render_ctx: &ConfigV2RenderContext) -> Str
 
 fn runtime_host_local_warning(
     lang: Language,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> Option<String> {
     let admin_base_url = render_ctx.runtime_admin_base_url.as_deref()?;
     let caps = render_ctx.runtime_host_local_capabilities.as_ref()?;
@@ -404,7 +404,10 @@ fn runtime_host_local_warning(
     )
 }
 
-fn runtime_admin_message(lang: Language, render_ctx: &ConfigV2RenderContext) -> Option<String> {
+fn runtime_admin_message(
+    lang: Language,
+    render_ctx: &ProxySettingsRenderContext,
+) -> Option<String> {
     let admin_base_url = render_ctx.runtime_admin_base_url.as_deref()?;
     let caps = render_ctx.runtime_remote_admin_access.as_ref()?;
     remote_admin_access_message(admin_base_url, caps, lang)
@@ -412,7 +415,7 @@ fn runtime_admin_message(lang: Language, render_ctx: &ConfigV2RenderContext) -> 
 
 fn operator_counts_status_line(
     lang: Language,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> Option<String> {
     if let Some(counts) = render_ctx.operator_counts.as_ref() {
         return Some(format!(
@@ -446,7 +449,7 @@ fn operator_counts_status_line(
 
 fn operator_health_status_line(
     lang: Language,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> Option<String> {
     if let Some(summary) = render_ctx.operator_health_summary.as_ref() {
         let is_stable = summary.stations_draining == 0
@@ -507,7 +510,7 @@ fn operator_health_status_line(
 
 fn append_operator_runtime_scope(
     lang: Language,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
     base_hint: String,
 ) -> String {
     let Some(scope_hint) = operator_runtime_scope_hint(lang, render_ctx) else {
@@ -518,7 +521,7 @@ fn append_operator_runtime_scope(
 
 fn operator_runtime_scope_hint(
     lang: Language,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> Option<String> {
     let summary = render_ctx.operator_runtime_summary.as_ref()?;
     let mut parts = Vec::new();

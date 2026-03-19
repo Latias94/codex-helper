@@ -32,7 +32,7 @@ pub(super) fn service_view_v2_mut<'a>(
     }
 }
 
-pub(super) async fn save_runtime_config_and_reload(
+pub(super) async fn save_runtime_proxy_settings_and_reload(
     proxy: &ProxyService,
     cfg: ProxyConfig,
 ) -> Result<(), (StatusCode, String)> {
@@ -47,15 +47,16 @@ pub(super) async fn save_runtime_config_and_reload(
     Ok(())
 }
 
-pub(super) async fn save_runtime_profiles_config_and_reload(
+pub(super) async fn save_runtime_profile_settings_and_reload(
     proxy: &ProxyService,
     cfg: ProxyConfig,
 ) -> Result<ProfilesResponse, (StatusCode, String)> {
-    save_runtime_config_and_reload(proxy, cfg).await?;
+    save_runtime_proxy_settings_and_reload(proxy, cfg).await?;
     Ok(make_profiles_response(proxy).await)
 }
 
-pub(super) async fn load_persisted_config_v2() -> Result<ProxyConfigV2, (StatusCode, String)> {
+pub(super) async fn load_persisted_proxy_settings_v2() -> Result<ProxyConfigV2, (StatusCode, String)>
+{
     let path = crate::config::config_file_path();
     if path.exists()
         && path
@@ -87,7 +88,7 @@ pub(super) async fn load_persisted_config_v2() -> Result<ProxyConfigV2, (StatusC
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
-pub(super) async fn save_proxy_config_v2_and_reload(
+pub(super) async fn save_persisted_proxy_settings_v2_and_reload(
     proxy: &ProxyService,
     cfg: ProxyConfigV2,
 ) -> Result<(), (StatusCode, String)> {

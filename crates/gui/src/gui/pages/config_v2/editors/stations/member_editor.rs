@@ -2,8 +2,8 @@ use super::*;
 
 pub(crate) fn config_station_member_editor_from_member(
     member: &GroupMemberRefV2,
-) -> ConfigStationMemberEditorState {
-    ConfigStationMemberEditorState {
+) -> StationMemberEditorState {
+    StationMemberEditorState {
         provider: member.provider.clone(),
         endpoint_names: member.endpoint_names.join(", "),
         preferred: member.preferred,
@@ -26,7 +26,7 @@ pub(super) fn build_station_spec_from_config_editor(
     alias: &str,
     enabled: bool,
     level: u8,
-    members: &[ConfigStationMemberEditorState],
+    members: &[StationMemberEditorState],
 ) -> Result<PersistedStationSpec, String> {
     let station_name = station_name.trim();
     if station_name.is_empty() {
@@ -60,12 +60,12 @@ pub(super) fn render_config_station_member_editor(
     lang: Language,
     selected_service: &str,
     provider_catalog: &BTreeMap<String, PersistedStationProviderRef>,
-    members: &mut Vec<ConfigStationMemberEditorState>,
+    members: &mut Vec<StationMemberEditorState>,
 ) {
     let default_provider = provider_catalog.keys().next().cloned().unwrap_or_default();
 
     if ui.button(pick(lang, "新增成员", "Add member")).clicked() {
-        members.push(ConfigStationMemberEditorState {
+        members.push(StationMemberEditorState {
             provider: default_provider,
             endpoint_names: String::new(),
             preferred: false,
@@ -144,7 +144,7 @@ pub(super) fn render_config_station_provider_summary(
     ui: &mut egui::Ui,
     lang: Language,
     provider_catalog: &BTreeMap<String, PersistedStationProviderRef>,
-    members: &[ConfigStationMemberEditorState],
+    members: &[StationMemberEditorState],
 ) {
     let mut provider_names = members
         .iter()

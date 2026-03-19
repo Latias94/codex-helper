@@ -26,10 +26,6 @@ use crate::state::{
 use crate::usage::UsageMetrics;
 
 mod components;
-mod config_document;
-mod config_legacy;
-mod config_raw;
-mod config_shell;
 mod config_v2;
 mod config_v2_header;
 mod doctor;
@@ -79,6 +75,10 @@ mod profile_preview_state;
 #[cfg(test)]
 mod profile_preview_tests;
 mod proxy_discovery;
+mod proxy_settings_document;
+mod proxy_settings_form;
+mod proxy_settings_raw;
+mod proxy_settings_shell;
 mod remote_attach;
 mod remote_attach_admin;
 mod remote_attach_host_local;
@@ -170,11 +170,6 @@ use components::route_explanation::{
     render_session_route_snapshot_card,
 };
 #[allow(unused_imports)]
-use config_document::{
-    parse_proxy_config_document, save_proxy_config_document, sync_codex_auth_into_document,
-    working_legacy_config, working_legacy_config_mut,
-};
-#[allow(unused_imports)]
 use formatting::*;
 pub use history::HistoryViewState;
 #[allow(unused_imports)]
@@ -187,6 +182,12 @@ use profile_preview::{
     local_profile_preview_catalogs_from_text, render_profile_route_preview,
     session_profile_target_station_value, session_profile_target_value,
     session_route_preview_value,
+};
+#[allow(unused_imports)]
+use proxy_settings_document::{
+    parse_proxy_settings_document, save_proxy_settings_document,
+    sync_codex_auth_into_settings_document, working_legacy_proxy_settings,
+    working_legacy_proxy_settings_mut,
 };
 #[allow(unused_imports)]
 use remote_attach::*;
@@ -203,10 +204,9 @@ use session_views::*;
 use view_state::SessionOverrideEditor;
 pub use view_state::ViewState;
 use view_state::{
-    ConfigMode, ConfigProfileEditorState, ConfigProviderEditorState,
-    ConfigProviderEndpointEditorState, ConfigStationEditorState, ConfigStationMemberEditorState,
-    ConfigViewState, ConfigWorkingDocument, RequestsViewState, SessionsViewState,
-    StationsRetryEditorState,
+    ProfileEditorState, ProviderEditorState, ProviderEndpointEditorState, ProxySettingsMode,
+    ProxySettingsViewState, ProxySettingsWorkingDocument, RequestsViewState, SessionsViewState,
+    StationEditorState, StationMemberEditorState, StationsRetryEditorState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,7 +215,7 @@ pub enum Page {
     Overview,
     Stations,
     Doctor,
-    Config,
+    ProxySettings,
     Sessions,
     Requests,
     Stats,
@@ -227,8 +227,8 @@ pub struct PageCtx<'a> {
     pub lang: Language,
     pub view: &'a mut ViewState,
     pub gui_cfg: &'a mut GuiConfig,
-    pub proxy_config_text: &'a mut String,
-    pub proxy_config_path: &'a std::path::Path,
+    pub proxy_settings_text: &'a mut String,
+    pub proxy_settings_path: &'a std::path::Path,
     pub last_error: &'a mut Option<String>,
     pub last_info: &'a mut Option<String>,
     pub rt: &'a tokio::runtime::Runtime,
@@ -250,7 +250,7 @@ pub fn render(ui: &mut egui::Ui, page: Page, ctx: &mut PageCtx<'_>) {
         Page::Overview => overview::render(ui, ctx),
         Page::Stations => stations::render(ui, ctx),
         Page::Doctor => doctor::render(ui, ctx),
-        Page::Config => config_shell::render(ui, ctx),
+        Page::ProxySettings => proxy_settings_shell::render(ui, ctx),
         Page::Sessions => sessions::render(ui, ctx),
         Page::Requests => requests::render(ui, ctx),
         Page::Stats => stats::render(ui, ctx),
@@ -301,7 +301,7 @@ mod tests {
             Page::Overview,
             Page::Stations,
             Page::Doctor,
-            Page::Config,
+            Page::ProxySettings,
             Page::Sessions,
             Page::Requests,
             Page::Stats,

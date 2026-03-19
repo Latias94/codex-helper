@@ -24,7 +24,7 @@ mod headers;
 mod healthcheck_api;
 mod http_debug;
 mod passive_health;
-mod persisted_config_api;
+mod persisted_registry_api;
 mod profile_defaults;
 mod provider_execution;
 mod provider_orchestration;

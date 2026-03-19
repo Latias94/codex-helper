@@ -3,12 +3,12 @@ use super::editors::{
 };
 use super::*;
 
-pub(super) struct ConfigV2EditorDraft {
+pub(super) struct ProxySettingsEditorDraft {
     pub(super) station_editor_name: Option<String>,
     pub(super) station_editor_alias: String,
     pub(super) station_editor_enabled: bool,
     pub(super) station_editor_level: u8,
-    pub(super) station_editor_members: Vec<ConfigStationMemberEditorState>,
+    pub(super) station_editor_members: Vec<StationMemberEditorState>,
     pub(super) new_station_name: String,
     pub(super) selected_provider_name: Option<String>,
     pub(super) provider_editor_name: Option<String>,
@@ -16,7 +16,7 @@ pub(super) struct ConfigV2EditorDraft {
     pub(super) provider_editor_enabled: bool,
     pub(super) provider_editor_auth_token_env: String,
     pub(super) provider_editor_api_key_env: String,
-    pub(super) provider_editor_endpoints: Vec<ConfigProviderEndpointEditorState>,
+    pub(super) provider_editor_endpoints: Vec<ProviderEndpointEditorState>,
     pub(super) new_provider_name: String,
     pub(super) selected_profile_name: Option<String>,
     pub(super) new_profile_name: String,
@@ -30,8 +30,8 @@ pub(super) struct ConfigV2EditorDraft {
     pub(super) profile_error: Option<String>,
 }
 
-impl ConfigV2EditorDraft {
-    pub(super) fn from_view(view: &ConfigViewState) -> Self {
+impl ProxySettingsEditorDraft {
+    pub(super) fn from_view(view: &ProxySettingsViewState) -> Self {
         Self {
             station_editor_name: view.station_editor.station_name.clone(),
             station_editor_alias: view.station_editor.alias.clone(),
@@ -220,7 +220,7 @@ impl ConfigV2EditorDraft {
 
     pub(super) fn persist_into_view(
         self,
-        view: &mut ConfigViewState,
+        view: &mut ProxySettingsViewState,
     ) -> (Option<String>, Option<String>) {
         view.selected_provider_name = self.selected_provider_name;
         view.selected_profile_name = self.selected_profile_name;

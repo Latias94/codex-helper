@@ -3,12 +3,12 @@ use super::*;
 pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.label(pick(
         ctx.lang,
-        "表单视图：优先做常用项（active / enabled / level）。复杂字段仍建议用“原始”视图。",
-        "Form view: focuses on common fields (active / enabled / level). Use Raw view for advanced edits.",
+        "表单视图：优先做常用代理设置（active / enabled / level）。复杂字段仍建议用“原始”视图。",
+        "Form view focuses on common proxy settings (active / enabled / level). Use Raw view for advanced edits.",
     ));
 
-    let mut needs_load = ctx.view.config.working.is_none();
-    if let Some(err) = ctx.view.config.load_error.as_deref() {
+    let mut needs_load = ctx.view.proxy_settings.working.is_none();
+    if let Some(err) = ctx.view.proxy_settings.load_error.as_deref() {
         ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
         needs_load = true;
     }
@@ -36,27 +36,27 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .button(pick(ctx.lang, "从 Codex 导入", "Import from Codex"))
             .clicked()
         {
-            ctx.view.config.import_codex.open = true;
-            ctx.view.config.import_codex.last_error = None;
-            ctx.view.config.import_codex.preview = None;
+            ctx.view.proxy_settings.import_codex.open = true;
+            ctx.view.proxy_settings.import_codex.last_error = None;
+            ctx.view.proxy_settings.import_codex.preview = None;
         }
     });
 
     if needs_load {
-        match std::fs::read_to_string(ctx.proxy_config_path) {
-            Ok(t) => match parse_proxy_config_document(&t) {
+        match std::fs::read_to_string(ctx.proxy_settings_path) {
+            Ok(t) => match parse_proxy_settings_document(&t) {
                 Ok(cfg) => {
-                    ctx.view.config.working = Some(cfg);
-                    ctx.view.config.load_error = None;
+                    ctx.view.proxy_settings.working = Some(cfg);
+                    ctx.view.proxy_settings.load_error = None;
                 }
                 Err(e) => {
-                    ctx.view.config.working = None;
-                    ctx.view.config.load_error = Some(format!("parse failed: {e}"));
+                    ctx.view.proxy_settings.working = None;
+                    ctx.view.proxy_settings.load_error = Some(format!("parse failed: {e}"));
                 }
             },
             Err(e) => {
-                ctx.view.config.working = None;
-                ctx.view.config.load_error = Some(format!("read config failed: {e}"));
+                ctx.view.proxy_settings.working = None;
+                ctx.view.proxy_settings.load_error = Some(format!("read settings failed: {e}"));
             }
         }
     }
@@ -64,7 +64,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     // Modal: import/sync providers from Codex CLI.
     let mut do_preview = false;
     let mut do_apply = false;
-    if ctx.view.config.import_codex.open {
+    if ctx.view.proxy_settings.import_codex.open {
         let mut open = true;
         let mut close_clicked = false;
         egui::Window::new(pick(
@@ -84,11 +84,11 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ui.add_space(6.0);
 
             ui.checkbox(
-                &mut ctx.view.config.import_codex.add_missing,
+                &mut ctx.view.proxy_settings.import_codex.add_missing,
                 pick(ctx.lang, "添加缺失的 provider", "Add missing providers"),
             );
             ui.checkbox(
-                &mut ctx.view.config.import_codex.set_active,
+                &mut ctx.view.proxy_settings.import_codex.set_active,
                 pick(
                     ctx.lang,
                     "同步 active 为 Codex 当前 model_provider",
@@ -96,10 +96,10 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 ),
             );
             ui.checkbox(
-                &mut ctx.view.config.import_codex.force,
+                &mut ctx.view.proxy_settings.import_codex.force,
                 pick(ctx.lang, "强制覆盖（谨慎）", "Force overwrite (careful)"),
             );
-            if ctx.view.config.import_codex.force {
+            if ctx.view.proxy_settings.import_codex.force {
                 ui.colored_label(
                     egui::Color32::from_rgb(200, 120, 40),
                     pick(
@@ -123,12 +123,12 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 }
             });
 
-            if let Some(err) = ctx.view.config.import_codex.last_error.as_deref() {
+            if let Some(err) = ctx.view.proxy_settings.import_codex.last_error.as_deref() {
                 ui.add_space(6.0);
                 ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
             }
 
-            if let Some(report) = ctx.view.config.import_codex.preview.as_ref() {
+            if let Some(report) = ctx.view.proxy_settings.import_codex.preview.as_ref() {
                 ui.add_space(6.0);
                 ui.label(format!(
                     "{}: updated={} added={} active_set={}",
@@ -152,92 +152,96 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         if close_clicked {
             open = false;
         }
-        ctx.view.config.import_codex.open = open;
+        ctx.view.proxy_settings.import_codex.open = open;
     }
 
     if do_preview {
         let options = crate::config::SyncCodexAuthFromCodexOptions {
-            add_missing: ctx.view.config.import_codex.add_missing,
-            set_active: ctx.view.config.import_codex.set_active,
-            force: ctx.view.config.import_codex.force,
+            add_missing: ctx.view.proxy_settings.import_codex.add_missing,
+            set_active: ctx.view.proxy_settings.import_codex.set_active,
+            force: ctx.view.proxy_settings.import_codex.force,
         };
 
-        let tmp_opt = if let Some(cfg) = ctx.view.config.working.as_ref() {
+        let tmp_opt = if let Some(cfg) = ctx.view.proxy_settings.working.as_ref() {
             Some(cfg.clone())
         } else {
-            match std::fs::read_to_string(ctx.proxy_config_path) {
-                Ok(t) => match parse_proxy_config_document(&t) {
+            match std::fs::read_to_string(ctx.proxy_settings_path) {
+                Ok(t) => match parse_proxy_settings_document(&t) {
                     Ok(cfg) => Some(cfg),
                     Err(e) => {
-                        ctx.view.config.import_codex.last_error =
-                            Some(format!("parse config failed: {e}"));
+                        ctx.view.proxy_settings.import_codex.last_error =
+                            Some(format!("parse settings failed: {e}"));
                         None
                     }
                 },
                 Err(e) => {
-                    ctx.view.config.import_codex.last_error =
-                        Some(format!("read config failed: {e}"));
+                    ctx.view.proxy_settings.import_codex.last_error =
+                        Some(format!("read settings failed: {e}"));
                     None
                 }
             }
         };
 
         if let Some(mut tmp) = tmp_opt {
-            match sync_codex_auth_into_document(&mut tmp, options) {
+            match sync_codex_auth_into_settings_document(&mut tmp, options) {
                 Ok(report) => {
-                    ctx.view.config.import_codex.preview = Some(report);
-                    ctx.view.config.import_codex.last_error = None;
+                    ctx.view.proxy_settings.import_codex.preview = Some(report);
+                    ctx.view.proxy_settings.import_codex.last_error = None;
                     *ctx.last_info =
                         Some(pick(ctx.lang, "已生成预览", "Preview ready").to_string());
                 }
                 Err(e) => {
-                    ctx.view.config.import_codex.preview = None;
-                    ctx.view.config.import_codex.last_error = Some(e.to_string());
+                    ctx.view.proxy_settings.import_codex.preview = None;
+                    ctx.view.proxy_settings.import_codex.last_error = Some(e.to_string());
                 }
             }
         } else {
-            ctx.view.config.import_codex.preview = None;
+            ctx.view.proxy_settings.import_codex.preview = None;
         }
     }
 
     if do_apply {
         let options = crate::config::SyncCodexAuthFromCodexOptions {
-            add_missing: ctx.view.config.import_codex.add_missing,
-            set_active: ctx.view.config.import_codex.set_active,
-            force: ctx.view.config.import_codex.force,
+            add_missing: ctx.view.proxy_settings.import_codex.add_missing,
+            set_active: ctx.view.proxy_settings.import_codex.set_active,
+            force: ctx.view.proxy_settings.import_codex.force,
         };
 
         let mut can_apply = true;
-        if ctx.view.config.working.is_none() {
-            match std::fs::read_to_string(ctx.proxy_config_path) {
-                Ok(t) => match parse_proxy_config_document(&t) {
+        if ctx.view.proxy_settings.working.is_none() {
+            match std::fs::read_to_string(ctx.proxy_settings_path) {
+                Ok(t) => match parse_proxy_settings_document(&t) {
                     Ok(cfg) => {
-                        ctx.view.config.working = Some(cfg);
-                        ctx.view.config.load_error = None;
+                        ctx.view.proxy_settings.working = Some(cfg);
+                        ctx.view.proxy_settings.load_error = None;
                     }
                     Err(e) => {
-                        ctx.view.config.import_codex.last_error =
-                            Some(format!("parse config failed: {e}"));
+                        ctx.view.proxy_settings.import_codex.last_error =
+                            Some(format!("parse settings failed: {e}"));
                         can_apply = false;
                     }
                 },
                 Err(e) => {
-                    ctx.view.config.import_codex.last_error =
-                        Some(format!("read config failed: {e}"));
+                    ctx.view.proxy_settings.import_codex.last_error =
+                        Some(format!("read settings failed: {e}"));
                     can_apply = false;
                 }
             }
         }
 
         let report = if can_apply {
-            match sync_codex_auth_into_document(
-                ctx.view.config.working.as_mut().expect("loaded above"),
+            match sync_codex_auth_into_settings_document(
+                ctx.view
+                    .proxy_settings
+                    .working
+                    .as_mut()
+                    .expect("loaded above"),
                 options,
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    ctx.view.config.import_codex.last_error = Some(e.to_string());
-                    ctx.view.config.import_codex.preview = None;
+                    ctx.view.proxy_settings.import_codex.last_error = Some(e.to_string());
+                    ctx.view.proxy_settings.import_codex.preview = None;
                     None
                 }
             }
@@ -252,20 +256,25 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             );
 
             let save_res = {
-                let cfg = ctx.view.config.working.as_ref().expect("checked above");
-                save_proxy_config_document(ctx.rt, cfg)
+                let cfg = ctx
+                    .view
+                    .proxy_settings
+                    .working
+                    .as_ref()
+                    .expect("checked above");
+                save_proxy_settings_document(ctx.rt, cfg)
             };
 
             match save_res {
                 Ok(()) => {
                     let new_path = crate::config::config_file_path();
                     if let Ok(t) = std::fs::read_to_string(&new_path) {
-                        *ctx.proxy_config_text = t;
+                        *ctx.proxy_settings_text = t;
                     }
                     if let Ok(t) = std::fs::read_to_string(&new_path)
-                        && let Ok(parsed) = parse_proxy_config_document(&t)
+                        && let Ok(parsed) = parse_proxy_settings_document(&t)
                     {
-                        ctx.view.config.working = Some(parsed);
+                        ctx.view.proxy_settings.working = Some(parsed);
                     }
 
                     if matches!(
@@ -276,35 +285,36 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         *ctx.last_error = Some(format!("reload runtime failed: {e}"));
                     }
 
-                    ctx.view.config.import_codex.preview = Some(report);
-                    ctx.view.config.import_codex.last_error = None;
+                    ctx.view.proxy_settings.import_codex.preview = Some(report);
+                    ctx.view.proxy_settings.import_codex.last_error = None;
                     *ctx.last_info = Some(format!(
                         "{}: {summary}",
                         pick(ctx.lang, "已导入并保存", "Imported & saved")
                     ));
                 }
                 Err(e) => {
-                    ctx.view.config.import_codex.preview = Some(report);
-                    ctx.view.config.import_codex.last_error = Some(format!("save failed: {e}"));
+                    ctx.view.proxy_settings.import_codex.preview = Some(report);
+                    ctx.view.proxy_settings.import_codex.last_error =
+                        Some(format!("save failed: {e}"));
                     *ctx.last_error = Some(format!("save failed: {e}"));
                 }
             }
         }
     }
 
-    if ctx.view.config.working.is_none() {
+    if ctx.view.proxy_settings.working.is_none() {
         ui.add_space(6.0);
         ui.label(pick(
             ctx.lang,
-            "未加载配置。你可以切换到“原始”视图，或点击“从磁盘加载”。",
-            "Config not loaded. Switch to Raw view, or click Load from disk.",
+            "未加载设置。你可以切换到“原始”视图，或点击“从磁盘加载”。",
+            "Settings not loaded. Switch to Raw view, or click Load from disk.",
         ));
         return;
     }
 
     if matches!(
-        ctx.view.config.working.as_ref(),
-        Some(ConfigWorkingDocument::V2(_))
+        ctx.view.proxy_settings.working.as_ref(),
+        Some(ProxySettingsWorkingDocument::V2(_))
     ) {
         config_v2::render(ui, ctx);
         return;
@@ -313,7 +323,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "服务", "Service"));
-        let mut svc = ctx.view.config.service;
+        let mut svc = ctx.view.proxy_settings.service;
         egui::ComboBox::from_id_salt("config_form_service")
             .selected_text(match svc {
                 crate::config::ServiceKind::Codex => "codex",
@@ -323,12 +333,12 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 ui.selectable_value(&mut svc, crate::config::ServiceKind::Codex, "codex");
                 ui.selectable_value(&mut svc, crate::config::ServiceKind::Claude, "claude");
             });
-        ctx.view.config.service = svc;
+        ctx.view.proxy_settings.service = svc;
     });
 
     let (active_name, active_fallback, names) = {
-        let cfg = working_legacy_config(&ctx.view.config).expect("legacy branch");
-        let mgr = match ctx.view.config.service {
+        let cfg = working_legacy_proxy_settings(&ctx.view.proxy_settings).expect("legacy branch");
+        let mgr = match ctx.view.proxy_settings.service {
             crate::config::ServiceKind::Claude => &cfg.claude,
             crate::config::ServiceKind::Codex => &cfg.codex,
         };
@@ -357,16 +367,16 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     if ctx
         .view
-        .config
+        .proxy_settings
         .selected_name
         .as_ref()
         .is_none_or(|n| !names.iter().any(|x| x == n))
     {
-        ctx.view.config.selected_name = names.first().cloned();
+        ctx.view.proxy_settings.selected_name = names.first().cloned();
     }
 
-    let selected_service_kind = ctx.view.config.service;
-    let mut selected_name = ctx.view.config.selected_name.clone();
+    let selected_service_kind = ctx.view.proxy_settings.service;
+    let mut selected_name = ctx.view.proxy_settings.selected_name.clone();
     let mut action_set_active: Option<String> = None;
     let mut action_clear_active = false;
     let mut action_probe_selected: Option<String> = None;
@@ -375,7 +385,8 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let mut action_save_apply = false;
 
     {
-        let cfg = working_legacy_config_mut(&mut ctx.view.config).expect("legacy branch");
+        let cfg =
+            working_legacy_proxy_settings_mut(&mut ctx.view.proxy_settings).expect("legacy branch");
         ui.columns(2, |cols| {
             cols[0].heading(pick(ctx.lang, "站点列表", "Stations"));
             cols[0].add_space(4.0);
@@ -456,8 +467,8 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             let Some(svc) = mgr.station_mut(&name) else {
                 cols[1].label(pick(
                     ctx.lang,
-                    "配置不存在（可能已被删除）。",
-                    "Config missing.",
+                    "设置不存在（可能已被删除）。",
+                    "Settings missing.",
                 ));
                 return;
             };
@@ -643,11 +654,12 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         });
     }
 
-    ctx.view.config.selected_name = selected_name;
+    ctx.view.proxy_settings.selected_name = selected_name;
 
     if let Some(name) = action_set_active {
-        let selected_service_kind = ctx.view.config.service;
-        let cfg = working_legacy_config_mut(&mut ctx.view.config).expect("legacy branch");
+        let selected_service_kind = ctx.view.proxy_settings.service;
+        let cfg =
+            working_legacy_proxy_settings_mut(&mut ctx.view.proxy_settings).expect("legacy branch");
         let mgr = match selected_service_kind {
             crate::config::ServiceKind::Claude => &mut cfg.claude,
             crate::config::ServiceKind::Codex => &mut cfg.codex,
@@ -657,8 +669,9 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     }
 
     if action_clear_active {
-        let selected_service_kind = ctx.view.config.service;
-        let cfg = working_legacy_config_mut(&mut ctx.view.config).expect("legacy branch");
+        let selected_service_kind = ctx.view.proxy_settings.service;
+        let cfg =
+            working_legacy_proxy_settings_mut(&mut ctx.view.proxy_settings).expect("legacy branch");
         let mgr = match selected_service_kind {
             crate::config::ServiceKind::Claude => &mut cfg.claude,
             crate::config::ServiceKind::Codex => &mut cfg.codex,
@@ -694,19 +707,24 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     if action_save_apply {
         let save_res = {
-            let cfg = ctx.view.config.working.as_ref().expect("checked above");
-            save_proxy_config_document(ctx.rt, cfg)
+            let cfg = ctx
+                .view
+                .proxy_settings
+                .working
+                .as_ref()
+                .expect("checked above");
+            save_proxy_settings_document(ctx.rt, cfg)
         };
         match save_res {
             Ok(()) => {
                 let new_path = crate::config::config_file_path();
                 if let Ok(t) = std::fs::read_to_string(&new_path) {
-                    *ctx.proxy_config_text = t;
+                    *ctx.proxy_settings_text = t;
                 }
                 if let Ok(t) = std::fs::read_to_string(&new_path)
-                    && let Ok(parsed) = parse_proxy_config_document(&t)
+                    && let Ok(parsed) = parse_proxy_settings_document(&t)
                 {
-                    ctx.view.config.working = Some(parsed);
+                    ctx.view.proxy_settings.working = Some(parsed);
                 }
 
                 if matches!(

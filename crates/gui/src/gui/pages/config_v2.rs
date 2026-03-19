@@ -1,5 +1,5 @@
 use super::config_v2_header::render_config_v2_workspace_header;
-use super::view_state::ConfigV2Section;
+use super::view_state::ProxySettingsSection;
 use super::*;
 
 mod actions;
@@ -23,7 +23,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "服务", "Service"));
-        let mut svc = ctx.view.config.service;
+        let mut svc = ctx.view.proxy_settings.service;
         egui::ComboBox::from_id_salt("config_form_v2_service")
             .selected_text(match svc {
                 crate::config::ServiceKind::Codex => "codex",
@@ -33,25 +33,26 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 ui.selectable_value(&mut svc, crate::config::ServiceKind::Codex, "codex");
                 ui.selectable_value(&mut svc, crate::config::ServiceKind::Claude, "claude");
             });
-        ctx.view.config.service = svc;
+        ctx.view.proxy_settings.service = svc;
     });
 
-    let Some(render_ctx) = ConfigV2RenderContext::build(ctx) else {
+    let Some(render_ctx) = ProxySettingsRenderContext::build(ctx) else {
         return;
     };
 
     render_config_v2_workspace_header(ui, ctx, &render_ctx);
     ui.add_space(10.0);
 
-    let mut actions = ConfigV2PendingActions::default();
-    let mut draft = ConfigV2EditorDraft::from_view(&ctx.view.config);
+    let mut actions = ProxySettingsPendingActions::default();
+    let mut draft = ProxySettingsEditorDraft::from_view(&ctx.view.proxy_settings);
     render_ctx.sync_draft(&mut draft);
 
     {
-        let Some(ConfigWorkingDocument::V2(cfg)) = ctx.view.config.working.as_mut() else {
+        let Some(ProxySettingsWorkingDocument::V2(cfg)) = ctx.view.proxy_settings.working.as_mut()
+        else {
             return;
         };
-        let view = match ctx.view.config.service {
+        let view = match ctx.view.proxy_settings.service {
             crate::config::ServiceKind::Claude => &mut cfg.claude,
             crate::config::ServiceKind::Codex => &mut cfg.codex,
         };
@@ -59,8 +60,8 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         let preview_provider_catalog = render_ctx.preview_provider_catalog();
         let preview_runtime_station_catalog = render_ctx.preview_runtime_station_catalog();
 
-        match ctx.view.config.v2_section {
-            ConfigV2Section::Stations => {
+        match ctx.view.proxy_settings.section {
+            ProxySettingsSection::Stations => {
                 render_config_v2_stations_section(
                     ui,
                     StationsSectionArgs {
@@ -72,7 +73,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         selected_service: render_ctx.selected_service,
                         schema_version: render_ctx.schema_version,
                         station_display_names: &render_ctx.station_display_names,
-                        selected_name: &mut ctx.view.config.selected_name,
+                        selected_name: &mut ctx.view.proxy_settings.selected_name,
                         station_control_plane_enabled: render_ctx.station_control_plane_enabled,
                         station_structure_control_plane_enabled: render_ctx
                             .station_structure_control_plane_enabled,
@@ -109,7 +110,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     },
                 );
             }
-            ConfigV2Section::Providers => {
+            ProxySettingsSection::Providers => {
                 render_config_v2_providers_section(
                     ui,
                     ctx.lang,
@@ -137,7 +138,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     &mut actions.save_apply,
                 );
             }
-            ConfigV2Section::Profiles => {
+            ProxySettingsSection::Profiles => {
                 ui.group(|ui| {
                     ui.heading(pick(ctx.lang, "Profiles", "Profiles"));
                     ui.label(pick(
@@ -203,7 +204,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         }
     }
 
-    let (profile_info, profile_error) = draft.persist_into_view(&mut ctx.view.config);
+    let (profile_info, profile_error) = draft.persist_into_view(&mut ctx.view.proxy_settings);
     if let Some(message) = profile_info {
         *ctx.last_info = Some(message);
     }

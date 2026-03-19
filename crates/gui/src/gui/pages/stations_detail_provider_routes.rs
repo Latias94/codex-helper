@@ -1,12 +1,12 @@
 use super::profile_preview_state::ProfilePreviewMemberRoute;
-use super::view_state::ConfigV2Section;
+use super::view_state::ProxySettingsSection;
 use super::*;
 
 fn runtime_service_name(snapshot: &GuiRuntimeSnapshot, ctx: &PageCtx<'_>) -> &'static str {
     match snapshot.service_name.as_deref() {
         Some("claude") => "claude",
         Some("codex") => "codex",
-        _ => match ctx.view.config.service {
+        _ => match ctx.view.proxy_settings.service {
             crate::config::ServiceKind::Claude => "claude",
             crate::config::ServiceKind::Codex => "codex",
         },
@@ -42,7 +42,7 @@ fn station_provider_catalogs(
         return None;
     }
 
-    local_profile_preview_catalogs_from_text(ctx.proxy_config_text, service_name)
+    local_profile_preview_catalogs_from_text(ctx.proxy_settings_text, service_name)
 }
 
 fn station_provider_preview(
@@ -162,10 +162,10 @@ pub(super) fn render_station_provider_routes_section(
         );
         ui.horizontal(|ui| {
             if ui
-                .button(pick(ctx.lang, "前往配置页", "Open Config page"))
+                .button(pick(ctx.lang, "前往代理设置页", "Open Proxy Settings"))
                 .clicked()
             {
-                ctx.view.requested_page = Some(Page::Config);
+                ctx.view.requested_page = Some(Page::ProxySettings);
             }
         });
         return;
@@ -181,9 +181,10 @@ pub(super) fn render_station_provider_routes_section(
             .button(pick(ctx.lang, "前往 Providers", "Open Providers"))
             .clicked()
         {
-            ctx.view.requested_page = Some(Page::Config);
-            ctx.view.config.service = runtime_service_kind(runtime_service_name(snapshot, ctx));
-            ctx.view.config.v2_section = ConfigV2Section::Providers;
+            ctx.view.requested_page = Some(Page::ProxySettings);
+            ctx.view.proxy_settings.service =
+                runtime_service_kind(runtime_service_name(snapshot, ctx));
+            ctx.view.proxy_settings.section = ProxySettingsSection::Providers;
         }
         return;
     }
@@ -228,11 +229,12 @@ pub(super) fn render_station_provider_routes_section(
                     .button(pick(ctx.lang, "打开 Provider", "Open Provider"))
                     .clicked()
                 {
-                    ctx.view.requested_page = Some(Page::Config);
-                    ctx.view.config.service =
+                    ctx.view.requested_page = Some(Page::ProxySettings);
+                    ctx.view.proxy_settings.service =
                         runtime_service_kind(runtime_service_name(snapshot, ctx));
-                    ctx.view.config.v2_section = ConfigV2Section::Providers;
-                    ctx.view.config.selected_provider_name = Some(member.provider_name.clone());
+                    ctx.view.proxy_settings.section = ProxySettingsSection::Providers;
+                    ctx.view.proxy_settings.selected_provider_name =
+                        Some(member.provider_name.clone());
                 }
             });
             ui.small(format!(

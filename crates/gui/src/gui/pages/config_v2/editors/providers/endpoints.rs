@@ -2,8 +2,8 @@ use super::*;
 
 pub(crate) fn config_provider_endpoint_editor_from_spec(
     endpoint: &crate::config::PersistedProviderEndpointSpec,
-) -> ConfigProviderEndpointEditorState {
-    ConfigProviderEndpointEditorState {
+) -> ProviderEndpointEditorState {
+    ProviderEndpointEditorState {
         name: endpoint.name.clone(),
         base_url: endpoint.base_url.clone(),
         enabled: endpoint.enabled,
@@ -16,7 +16,7 @@ pub(crate) fn build_provider_spec_from_config_editor(
     enabled: bool,
     auth_token_env: &str,
     api_key_env: &str,
-    endpoints: &[ConfigProviderEndpointEditorState],
+    endpoints: &[ProviderEndpointEditorState],
 ) -> Result<PersistedProviderSpec, String> {
     let provider_name = provider_name.trim();
     if provider_name.is_empty() {
@@ -111,7 +111,7 @@ pub(crate) fn render_config_provider_endpoint_editor(
     lang: Language,
     selected_service: &str,
     provider_name: &str,
-    endpoints: &mut Vec<ConfigProviderEndpointEditorState>,
+    endpoints: &mut Vec<ProviderEndpointEditorState>,
 ) {
     let enabled_count = endpoints.iter().filter(|endpoint| endpoint.enabled).count();
     let standby_count = endpoints.len().saturating_sub(enabled_count);
@@ -160,7 +160,7 @@ pub(crate) fn render_config_provider_endpoint_editor(
             .button(pick(lang, "新增 endpoint", "Add endpoint"))
             .clicked()
         {
-            endpoints.push(ConfigProviderEndpointEditorState {
+            endpoints.push(ProviderEndpointEditorState {
                 enabled: true,
                 ..Default::default()
             });

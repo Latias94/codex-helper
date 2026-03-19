@@ -48,7 +48,7 @@ pub(crate) struct StationsSectionArgs<'a> {
     pub station_editor_alias: &'a mut String,
     pub station_editor_enabled: &'a mut bool,
     pub station_editor_level: &'a mut u8,
-    pub station_editor_members: &'a mut Vec<ConfigStationMemberEditorState>,
+    pub station_editor_members: &'a mut Vec<StationMemberEditorState>,
 }
 
 pub(crate) fn render_config_v2_stations_section(ui: &mut egui::Ui, args: StationsSectionArgs<'_>) {

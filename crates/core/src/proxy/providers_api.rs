@@ -8,7 +8,7 @@ use crate::logging::{log_retry_trace, now_ms};
 use crate::state::RuntimeConfigState;
 
 use super::ProxyService;
-use super::control_plane_service::{load_persisted_config_v2, service_view_v2};
+use super::control_plane_service::{load_persisted_proxy_settings_v2, service_view_v2};
 
 #[derive(serde::Deserialize)]
 pub(super) struct ProviderRuntimeMetaRequest {
@@ -86,7 +86,7 @@ fn resolve_target_base_urls(
 pub(super) async fn list_providers(
     proxy: ProxyService,
 ) -> Result<Json<Vec<ProviderOption>>, (StatusCode, String)> {
-    let cfg = load_persisted_config_v2().await?;
+    let cfg = load_persisted_proxy_settings_v2().await?;
     let upstream_overrides = proxy
         .state
         .get_upstream_meta_overrides(proxy.service_name)
@@ -114,7 +114,7 @@ pub(super) async fn apply_provider_runtime_meta(
 
     let provider_name = normalize_provider_name(payload.provider_name.as_str())?;
     let endpoint_name = normalize_optional_endpoint_name(payload.endpoint_name);
-    let cfg = load_persisted_config_v2().await?;
+    let cfg = load_persisted_proxy_settings_v2().await?;
     let base_urls = resolve_target_base_urls(
         service_view_v2(&cfg, proxy.service_name),
         provider_name.as_str(),

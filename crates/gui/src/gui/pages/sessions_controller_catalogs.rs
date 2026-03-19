@@ -33,7 +33,7 @@ pub(super) fn resolve_session_preview_catalogs(
                 None
             } else {
                 local_profile_preview_catalogs_from_text(
-                    ctx.proxy_config_text,
+                    ctx.proxy_settings_text,
                     session_preview_service_name,
                 )
             }

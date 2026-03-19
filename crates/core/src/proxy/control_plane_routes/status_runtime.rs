@@ -34,7 +34,7 @@ pub(super) fn status_and_runtime_routes(proxy: ProxyService) -> Router {
         )
         .route(
             API_V1_RUNTIME_STATUS,
-            get(move || runtime_config_status(runtime_status_proxy.clone())),
+            get(move || runtime_status(runtime_status_proxy.clone())),
         )
         .route(
             API_V1_RUNTIME_RELOAD,

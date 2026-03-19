@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::config_document::parse_proxy_config_document;
+use super::proxy_settings_document::parse_proxy_settings_document;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +169,7 @@ pub(super) fn local_profile_preview_catalogs_from_text(
     BTreeMap<String, PersistedStationSpec>,
     BTreeMap<String, PersistedStationProviderRef>,
 )> {
-    let ConfigWorkingDocument::V2(cfg) = parse_proxy_config_document(text).ok()? else {
+    let ProxySettingsWorkingDocument::V2(cfg) = parse_proxy_settings_document(text).ok()? else {
         return None;
     };
     let view = match service_name {

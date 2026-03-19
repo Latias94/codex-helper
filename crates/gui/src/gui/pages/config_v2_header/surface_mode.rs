@@ -22,7 +22,7 @@ pub(super) fn control_surface_mode(
 pub(super) fn control_scope_label(
     lang: Language,
     proxy_kind: ProxyModeKind,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> String {
     match control_surface_mode(
         proxy_kind,
@@ -39,7 +39,7 @@ pub(super) fn control_scope_label(
 pub(super) fn control_scope_hint(
     lang: Language,
     proxy_kind: ProxyModeKind,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> String {
     match control_surface_mode(
         proxy_kind,
@@ -87,7 +87,7 @@ pub(super) fn control_scope_hint(
 
 pub(super) fn station_summary_hint(
     lang: Language,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
     station_count: usize,
 ) -> String {
     let configured = render_ctx
@@ -112,7 +112,7 @@ pub(super) fn station_summary_hint(
 pub(super) fn profile_summary_hint(
     lang: Language,
     proxy_kind: ProxyModeKind,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
     profile_count: usize,
 ) -> String {
     let surface = surface_mode_short_label(
@@ -134,7 +134,7 @@ pub(super) fn profile_summary_hint(
 pub(super) fn provider_summary_hint(
     lang: Language,
     proxy_kind: ProxyModeKind,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
     provider_count: usize,
 ) -> String {
     let surface = surface_mode_short_label(

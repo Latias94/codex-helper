@@ -19,15 +19,15 @@ pub(super) fn render_stations_runtime_empty_state(ui: &mut egui::Ui, ctx: &mut P
     ui.add_space(8.0);
     ui.label(pick(
         ctx.lang,
-        "当前运行态没有可见站点。你可以先去“配置”页或原始配置文件里定义 station/provider。",
-        "No stations are visible in the current runtime. Define stations/providers in Config first.",
+        "当前运行态没有可见站点。你可以先去“代理设置”页或设置文件里定义 station/provider。",
+        "No stations are visible in the current runtime. Define stations/providers in Proxy Settings first.",
     ));
     ui.horizontal(|ui| {
         if ui
-            .button(pick(ctx.lang, "前往配置页", "Open Config page"))
+            .button(pick(ctx.lang, "前往代理设置页", "Open Proxy Settings"))
             .clicked()
         {
-            ctx.view.requested_page = Some(Page::Config);
+            ctx.view.requested_page = Some(Page::ProxySettings);
         }
         if ui
             .button(pick(ctx.lang, "返回总览", "Back to Overview"))

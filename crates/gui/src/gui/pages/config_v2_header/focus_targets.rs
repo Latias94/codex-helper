@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn render_control_deck_focus_targets(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) {
     let active_station_name = render_ctx
         .effective_active_name
@@ -31,8 +31,8 @@ pub(super) fn render_control_deck_focus_targets(
                     ))
                     .clicked()
             {
-                ctx.view.config.v2_section = ConfigV2Section::Stations;
-                ctx.view.config.selected_name = Some(station_name.to_string());
+                ctx.view.proxy_settings.section = ProxySettingsSection::Stations;
+                ctx.view.proxy_settings.selected_name = Some(station_name.to_string());
             }
 
             if let Some(profile_name) = default_profile_name.as_deref()
@@ -44,8 +44,8 @@ pub(super) fn render_control_deck_focus_targets(
                     ))
                     .clicked()
             {
-                ctx.view.config.v2_section = ConfigV2Section::Profiles;
-                ctx.view.config.selected_profile_name = Some(profile_name.to_string());
+                ctx.view.proxy_settings.section = ProxySettingsSection::Profiles;
+                ctx.view.proxy_settings.selected_profile_name = Some(profile_name.to_string());
             }
 
             if let Some(provider_name) = focus_provider_name.as_deref()
@@ -57,8 +57,8 @@ pub(super) fn render_control_deck_focus_targets(
                     ))
                     .clicked()
             {
-                ctx.view.config.v2_section = ConfigV2Section::Providers;
-                ctx.view.config.selected_provider_name = Some(provider_name.to_string());
+                ctx.view.proxy_settings.section = ProxySettingsSection::Providers;
+                ctx.view.proxy_settings.selected_provider_name = Some(provider_name.to_string());
             }
         });
 
@@ -96,7 +96,7 @@ pub(super) fn render_control_deck_focus_targets(
 }
 
 fn resolve_profile_for_deck(
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
     profile_name: &str,
 ) -> Option<(String, crate::config::ServiceControlProfile)> {
     let profile = crate::config::resolve_service_profile_from_catalog(
@@ -113,7 +113,7 @@ fn resolve_profile_for_deck(
 }
 
 fn current_profile_catalog(
-    render_ctx: &ConfigV2RenderContext,
+    render_ctx: &ProxySettingsRenderContext,
 ) -> &BTreeMap<String, crate::config::ServiceControlProfile> {
     if render_ctx.profile_control_plane_enabled {
         &render_ctx.profile_control_plane_catalog
@@ -122,7 +122,7 @@ fn current_profile_catalog(
     }
 }
 
-fn focus_provider_name(render_ctx: &ConfigV2RenderContext) -> Option<String> {
+fn focus_provider_name(render_ctx: &ProxySettingsRenderContext) -> Option<String> {
     let active_station_name = render_ctx
         .effective_active_name
         .as_deref()

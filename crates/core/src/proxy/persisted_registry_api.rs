@@ -5,9 +5,9 @@ use axum::http::StatusCode;
 use super::ProxyService;
 use super::api_responses::{ProfilesResponse, make_profiles_response};
 use super::control_plane_service::{
-    load_persisted_config_v2, runtime_service_manager_mut, save_proxy_config_v2_and_reload,
-    save_runtime_config_and_reload, save_runtime_profiles_config_and_reload, service_view_v2,
-    service_view_v2_mut,
+    load_persisted_proxy_settings_v2, runtime_service_manager_mut,
+    save_persisted_proxy_settings_v2_and_reload, save_runtime_profile_settings_and_reload,
+    save_runtime_proxy_settings_and_reload, service_view_v2, service_view_v2_mut,
 };
 
 fn default_persisted_station_enabled() -> bool {
@@ -329,7 +329,7 @@ fn validate_station_members_for_view(
 pub(super) async fn list_persisted_station_specs(
     proxy: ProxyService,
 ) -> Result<Json<crate::config::PersistedStationsCatalog>, (StatusCode, String)> {
-    let cfg = load_persisted_config_v2().await?;
+    let cfg = load_persisted_proxy_settings_v2().await?;
     Ok(Json(crate::config::build_persisted_station_catalog(
         service_view_v2(&cfg, proxy.service_name),
     )))
@@ -338,7 +338,7 @@ pub(super) async fn list_persisted_station_specs(
 pub(super) async fn list_persisted_provider_specs(
     proxy: ProxyService,
 ) -> Result<Json<crate::config::PersistedProvidersCatalog>, (StatusCode, String)> {
-    let cfg = load_persisted_config_v2().await?;
+    let cfg = load_persisted_proxy_settings_v2().await?;
     Ok(Json(crate::config::build_persisted_provider_catalog(
         service_view_v2(&cfg, proxy.service_name),
     )))
@@ -368,7 +368,7 @@ pub(super) async fn upsert_persisted_profile(
     .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     Ok(Json(
-        save_runtime_profiles_config_and_reload(&proxy, cfg).await?,
+        save_runtime_profile_settings_and_reload(&proxy, cfg).await?,
     ))
 }
 
@@ -410,7 +410,7 @@ pub(super) async fn delete_persisted_profile(
         mgr.default_profile = None;
     }
 
-    save_runtime_profiles_config_and_reload(&proxy, cfg).await?;
+    save_runtime_profile_settings_and_reload(&proxy, cfg).await?;
     if proxy
         .state
         .get_runtime_default_profile_override(proxy.service_name)
@@ -456,7 +456,7 @@ pub(super) async fn update_persisted_station(
         station.level = level.clamp(1, 10);
     }
 
-    save_runtime_config_and_reload(&proxy, cfg).await?;
+    save_runtime_proxy_settings_and_reload(&proxy, cfg).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -479,7 +479,7 @@ pub(super) async fn set_persisted_active_station(
     }
     mgr.active = station_name;
 
-    save_runtime_config_and_reload(&proxy, cfg).await?;
+    save_runtime_proxy_settings_and_reload(&proxy, cfg).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -492,7 +492,7 @@ pub(super) async fn upsert_persisted_station_spec(
     let mut station = sanitize_station_spec_request(payload)?;
     station.name = station_name.clone();
 
-    let mut cfg = load_persisted_config_v2().await?;
+    let mut cfg = load_persisted_proxy_settings_v2().await?;
     let view = service_view_v2_mut(&mut cfg, proxy.service_name);
     validate_station_members_for_view(
         proxy.service_name,
@@ -512,7 +512,7 @@ pub(super) async fn upsert_persisted_station_spec(
 
     crate::config::compile_v2_to_runtime(&cfg)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    save_proxy_config_v2_and_reload(&proxy, cfg).await?;
+    save_persisted_proxy_settings_v2_and_reload(&proxy, cfg).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -521,7 +521,7 @@ pub(super) async fn delete_persisted_station_spec(
     Path(station_name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let station_name = sanitize_station_name(station_name.as_str())?;
-    let mut cfg = load_persisted_config_v2().await?;
+    let mut cfg = load_persisted_proxy_settings_v2().await?;
     let view = service_view_v2_mut(&mut cfg, proxy.service_name);
 
     let referencing_profiles = view
@@ -555,7 +555,7 @@ pub(super) async fn delete_persisted_station_spec(
 
     crate::config::compile_v2_to_runtime(&cfg)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    save_proxy_config_v2_and_reload(&proxy, cfg).await?;
+    save_persisted_proxy_settings_v2_and_reload(&proxy, cfg).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -568,7 +568,7 @@ pub(super) async fn upsert_persisted_provider_spec(
     let mut provider = sanitize_provider_spec_request(payload)?;
     provider.name = provider_name.clone();
 
-    let mut cfg = load_persisted_config_v2().await?;
+    let mut cfg = load_persisted_proxy_settings_v2().await?;
     let view = service_view_v2_mut(&mut cfg, proxy.service_name);
     let existing_provider = view.providers.get(provider_name.as_str()).cloned();
     view.providers.insert(
@@ -578,7 +578,7 @@ pub(super) async fn upsert_persisted_provider_spec(
 
     crate::config::compile_v2_to_runtime(&cfg)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    save_proxy_config_v2_and_reload(&proxy, cfg).await?;
+    save_persisted_proxy_settings_v2_and_reload(&proxy, cfg).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -587,7 +587,7 @@ pub(super) async fn delete_persisted_provider_spec(
     Path(provider_name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let provider_name = sanitize_provider_name(provider_name.as_str())?;
-    let mut cfg = load_persisted_config_v2().await?;
+    let mut cfg = load_persisted_proxy_settings_v2().await?;
     let view = service_view_v2_mut(&mut cfg, proxy.service_name);
 
     let referencing_stations = view
@@ -621,7 +621,7 @@ pub(super) async fn delete_persisted_provider_spec(
 
     crate::config::compile_v2_to_runtime(&cfg)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    save_proxy_config_v2_and_reload(&proxy, cfg).await?;
+    save_persisted_proxy_settings_v2_and_reload(&proxy, cfg).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -660,6 +660,6 @@ pub(super) async fn set_persisted_default_profile(
     mgr.default_profile = profile_name;
 
     Ok(Json(
-        save_runtime_profiles_config_and_reload(&proxy, cfg).await?,
+        save_runtime_profile_settings_and_reload(&proxy, cfg).await?,
     ))
 }

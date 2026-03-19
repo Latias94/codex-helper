@@ -76,7 +76,7 @@ pub(super) fn sync_provider_editor_from_selected(
     provider_editor_enabled: &mut bool,
     provider_editor_auth_token_env: &mut String,
     provider_editor_api_key_env: &mut String,
-    provider_editor_endpoints: &mut Vec<ConfigProviderEndpointEditorState>,
+    provider_editor_endpoints: &mut Vec<ProviderEndpointEditorState>,
     provider_specs: &BTreeMap<String, PersistedProviderSpec>,
 ) {
     if provider_editor_name.as_deref() == selected_provider_name.as_deref() {

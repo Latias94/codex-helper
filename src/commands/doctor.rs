@@ -48,11 +48,14 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
     if cfg.codex.configs.is_empty() {
         println!(
             "{} none in ~/.codex-helper/config.json",
-            "Codex configs:".bold()
+            "Codex stations:".bold()
         );
     } else {
         let active = cfg.codex.active.as_deref();
-        println!("{}", "Codex configs in ~/.codex-helper/config.json:".bold());
+        println!(
+            "{}",
+            "Codex stations in ~/.codex-helper/config.json:".bold()
+        );
         for (name, svc) in &cfg.codex.configs {
             let marker = if Some(name.as_str()) == active {
                 "*"
@@ -84,13 +87,13 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
     if cfg.claude.configs.is_empty() {
         println!(
             "{} none in ~/.codex-helper/config.json",
-            "Claude configs:".bold()
+            "Claude stations:".bold()
         );
     } else {
         let active = cfg.claude.active.as_deref();
         println!(
             "{}",
-            "Claude configs in ~/.codex-helper/config.json:".bold()
+            "Claude stations in ~/.codex-helper/config.json:".bold()
         );
         for (name, svc) in &cfg.claude.configs {
             let marker = if Some(name.as_str()) == active {
@@ -134,7 +137,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         Ok(cfg) => {
             let codex_count = cfg.codex.configs.len();
             if codex_count == 0 {
-                let msg = "检测到 ~/.codex-helper/config.json 中尚无 Codex upstream 配置；建议使用 `codex-helper config add` 手动添加，或运行 `codex-helper config import-from-codex` 从 Codex CLI 配置导入。".to_string();
+                let msg = "检测到 ~/.codex-helper/config.json 中尚无 Codex 站点；建议使用 `codex-helper station add` 手动添加，或运行 `codex-helper station import-from-codex` 从 Codex CLI 配置导入。".to_string();
                 if !json {
                     println!("{} {}", "[WARN]".yellow(), msg);
                 }
@@ -145,7 +148,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                 });
             } else {
                 let msg = format!(
-                    "已从 ~/.codex-helper/config.json 读取到 {} 条 Codex 配置（active = {:?}）",
+                    "已从 ~/.codex-helper/config.json 读取到 {} 个 Codex 站点（active_station = {:?}）",
                     codex_count, cfg.codex.active
                 );
                 if !json {
@@ -178,7 +181,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                         && !env_is_set(env_name)
                     {
                         let msg = format!(
-                            "{} active config '{}' upstream[{}] 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
+                            "{} active station '{}' upstream[{}] 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
                             svc_label, active_name, idx, env_name
                         );
                         if !json {
@@ -194,7 +197,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                         && !env_is_set(env_name)
                     {
                         let msg = format!(
-                            "{} active config '{}' upstream[{}] 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
+                            "{} active station '{}' upstream[{}] 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
                             svc_label, active_name, idx, env_name
                         );
                         if !json {
@@ -220,7 +223,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                             .unwrap_or(false)
                     {
                         let msg = format!(
-                            "{} active config '{}' upstream[{}] 在 ~/.codex-helper/config.json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
+                            "{} active station '{}' upstream[{}] 在 ~/.codex-helper/config.json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
                             svc_label, active_name, idx
                         );
                         if !json {
@@ -424,7 +427,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
     // 3) 尝试模拟一次从 Codex CLI 配置推导上游（不落盘），用于验证整体链路
     match probe_codex_bootstrap_from_cli().await {
         Ok(()) => {
-            let msg = "成功从 ~/.codex/config.toml 与 ~/.codex/auth.json 模拟推导 Codex 上游；如需导入，可运行 `codex-helper config import-from-codex`".to_string();
+            let msg = "成功从 ~/.codex/config.toml 与 ~/.codex/auth.json 模拟推导 Codex 上游；如需导入，可运行 `codex-helper station import-from-codex`".to_string();
             if !json {
                 println!("{}   {}", "[OK]".green(), msg);
             }
@@ -436,7 +439,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         }
         Err(err) => {
             let msg = format!(
-                "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-helper/config.json 中配置上游，但自动导入功能将不可用。",
+                "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-helper/config.json 中配置站点/上游，但自动导入功能将不可用。",
                 err
             );
             if !json {

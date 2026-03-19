@@ -10,7 +10,7 @@ use crate::state::build_session_identity_cards_from_parts;
 
 use super::ProxyService;
 use super::control_plane_manifest::api_v1_operator_summary_links;
-use super::control_plane_service::{load_persisted_config_v2, service_view_v2};
+use super::control_plane_service::{load_persisted_proxy_settings_v2, service_view_v2};
 use super::profile_defaults::{
     configured_active_station_name, effective_active_station_name, effective_default_profile_name,
 };
@@ -23,7 +23,8 @@ pub(super) struct ProfilesResponse {
 }
 
 #[derive(serde::Serialize)]
-pub(super) struct RuntimeConfigStatus {
+pub(super) struct RuntimeStatusResponse {
+    runtime_source_path: String,
     config_path: String,
     loaded_at_ms: u64,
     source_mtime_ms: Option<u64>,
@@ -39,7 +40,7 @@ pub(super) struct RetryConfigResponse {
 #[derive(serde::Serialize)]
 pub(super) struct ReloadResult {
     reloaded: bool,
-    status: RuntimeConfigStatus,
+    status: RuntimeStatusResponse,
 }
 
 pub(super) async fn build_operator_summary(
@@ -123,7 +124,7 @@ pub(super) async fn build_operator_summary(
     let profiles = build_profile_options_from_mgr(mgr, default_profile.as_deref());
     let health =
         build_operator_health_summary(&stations, &station_health, &health_checks, &lb_view);
-    let providers = load_persisted_config_v2()
+    let providers = load_persisted_proxy_settings_v2()
         .await
         .ok()
         .map(|persisted_cfg| {
@@ -187,10 +188,12 @@ pub(super) async fn make_profiles_response(proxy: &ProxyService) -> ProfilesResp
     }
 }
 
-pub(super) async fn build_runtime_config_status(proxy: &ProxyService) -> RuntimeConfigStatus {
+pub(super) async fn build_runtime_status_response(proxy: &ProxyService) -> RuntimeStatusResponse {
     let cfg = proxy.config.snapshot().await;
-    RuntimeConfigStatus {
-        config_path: crate::config::config_file_path().display().to_string(),
+    let runtime_source_path = crate::config::config_file_path().display().to_string();
+    RuntimeStatusResponse {
+        runtime_source_path: runtime_source_path.clone(),
+        config_path: runtime_source_path,
         loaded_at_ms: proxy.config.last_loaded_at_ms(),
         source_mtime_ms: proxy.config.last_mtime_ms().await,
         retry: cfg.retry.resolve(),
@@ -204,6 +207,6 @@ pub(super) fn build_retry_config_response(cfg: &ProxyConfig) -> RetryConfigRespo
     }
 }
 
-pub(super) fn build_reload_result(reloaded: bool, status: RuntimeConfigStatus) -> ReloadResult {
+pub(super) fn build_reload_result(reloaded: bool, status: RuntimeStatusResponse) -> ReloadResult {
     ReloadResult { reloaded, status }
 }

@@ -33,7 +33,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         snapshot
             .service_name
             .as_deref()
-            .unwrap_or(match ctx.view.config.service {
+            .unwrap_or(match ctx.view.proxy_settings.service {
                 crate::config::ServiceKind::Claude => "claude",
                 crate::config::ServiceKind::Codex => "codex",
             });

@@ -8,7 +8,7 @@ use crate::config::{
     compact_v2_config, compile_v2_to_runtime, explain_service_routing, migrate_legacy_to_v2,
     storage::{config_file_path, init_config_toml, load_config, save_config, save_config_v2},
 };
-use crate::{CliError, CliResult, ConfigCommand, RetryProfile};
+use crate::{CliError, CliResult, RetryProfile, StationCommand};
 use serde::Serialize;
 use tokio::fs;
 
@@ -122,18 +122,18 @@ fn select_service_manager<'a>(
 
 fn build_group_explain(
     mgr: &ServiceConfigManager,
-    group_name: Option<&str>,
+    station_name: Option<&str>,
 ) -> anyhow::Result<Option<ConfigExplainStation>> {
-    let Some(group_name) = group_name else {
+    let Some(station_name) = station_name else {
         return Ok(None);
     };
 
     let svc = mgr
         .configs
-        .get(group_name)
-        .ok_or_else(|| anyhow::anyhow!("station/config '{}' not found", group_name))?;
+        .get(station_name)
+        .ok_or_else(|| anyhow::anyhow!("station '{}' not found", station_name))?;
     Ok(Some(ConfigExplainStation {
-        name: group_name.to_string(),
+        name: station_name.to_string(),
         alias: svc.alias.clone(),
         enabled: svc.enabled,
         level: svc.level.clamp(1, 10),
@@ -211,15 +211,15 @@ fn print_explain_text(
     }
 }
 
-pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
+pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
     match cmd {
-        ConfigCommand::Init { force, no_import } => {
+        StationCommand::Init { force, no_import } => {
             let path = init_config_toml(force, !no_import)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!("Wrote TOML config template to {:?}", path);
         }
-        ConfigCommand::List { codex, claude } => {
+        StationCommand::List { codex, claude } => {
             let service = resolve_service(codex, claude)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -234,10 +234,10 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             let cfg_path = config_file_path();
 
             if mgr.configs.is_empty() {
-                println!("No {} configs in {:?}", label, cfg_path);
+                println!("No {} stations in {:?}", label, cfg_path);
             } else {
                 let active = mgr.active.clone();
-                println!("{} configs (from {:?}):", label, cfg_path);
+                println!("{} stations (from {:?}):", label, cfg_path);
                 let mut items = mgr
                     .configs
                     .iter()
@@ -281,11 +281,11 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             }
         }
 
-        ConfigCommand::Explain {
+        StationCommand::Explain {
             codex,
             claude,
             json,
-            group,
+            station,
         } => {
             let service = resolve_service(codex, claude)
                 .await
@@ -298,7 +298,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let (mgr, label) = select_service_manager(&runtime, service);
             let routing = explain_service_routing(mgr);
-            let group_detail = build_group_explain(mgr, group.as_deref())
+            let group_detail = build_group_explain(mgr, station.as_deref())
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
 
             if json {
@@ -321,7 +321,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 );
             }
         }
-        ConfigCommand::Add {
+        StationCommand::Add {
             name,
             base_url,
             auth_token,
@@ -369,7 +369,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 save_config(&cfg)
                     .await
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                println!("Added Claude config '{}'", name);
+                println!("Added Claude station '{}'", name);
             } else {
                 cfg.codex.configs.insert(name.clone(), service_cfg);
                 if cfg.codex.active.is_none() {
@@ -378,10 +378,10 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 save_config(&cfg)
                     .await
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                println!("Added Codex config '{}'", name);
+                println!("Added Codex station '{}'", name);
             }
         }
-        ConfigCommand::SetActive {
+        StationCommand::SetActive {
             name,
             codex,
             claude,
@@ -395,25 +395,25 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
 
             if service == "claude" {
                 if !cfg.claude.configs.contains_key(&name) {
-                    println!("Claude config '{}' not found", name);
+                    println!("Claude station '{}' not found", name);
                 } else {
                     cfg.claude.active = Some(name.clone());
                     save_config(&cfg)
                         .await
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                    println!("Active Claude config set to '{}'", name);
+                    println!("Active Claude station set to '{}'", name);
                 }
             } else if !cfg.codex.configs.contains_key(&name) {
-                println!("Codex config '{}' not found", name);
+                println!("Codex station '{}' not found", name);
             } else {
                 cfg.codex.active = Some(name.clone());
                 save_config(&cfg)
                     .await
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                println!("Active Codex config set to '{}'", name);
+                println!("Active Codex station set to '{}'", name);
             }
         }
-        ConfigCommand::SetLevel {
+        StationCommand::SetLevel {
             name,
             level,
             codex,
@@ -439,7 +439,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
 
             let Some(svc) = mgr.configs.get_mut(&name) else {
                 println!(
-                    "{} config '{}' not found",
+                    "{} station '{}' not found",
                     if service == "claude" {
                         "Claude"
                     } else {
@@ -454,7 +454,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!(
-                "Set {} config '{}' level to {}",
+                "Set {} station '{}' level to {}",
                 if service == "claude" {
                     "Claude"
                 } else {
@@ -464,7 +464,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 level
             );
         }
-        ConfigCommand::Enable {
+        StationCommand::Enable {
             name,
             codex,
             claude,
@@ -483,7 +483,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
 
             let Some(svc) = mgr.configs.get_mut(&name) else {
                 println!(
-                    "{} config '{}' not found",
+                    "{} station '{}' not found",
                     if service == "claude" {
                         "Claude"
                     } else {
@@ -498,7 +498,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!(
-                "Enabled {} config '{}'",
+                "Enabled {} station '{}'",
                 if service == "claude" {
                     "Claude"
                 } else {
@@ -507,7 +507,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 name
             );
         }
-        ConfigCommand::Disable {
+        StationCommand::Disable {
             name,
             codex,
             claude,
@@ -527,7 +527,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
 
                 let Some(svc) = mgr.configs.get_mut(&name) else {
                     println!(
-                        "{} config '{}' not found",
+                        "{} station '{}' not found",
                         if service == "claude" {
                             "Claude"
                         } else {
@@ -547,7 +547,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
 
             if is_active {
                 println!(
-                    "Disabled {} config '{}' (note: active config is still eligible for routing)",
+                    "Disabled {} station '{}' (note: active station is still eligible for routing)",
                     if service == "claude" {
                         "Claude"
                     } else {
@@ -557,7 +557,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 );
             } else {
                 println!(
-                    "Disabled {} config '{}'",
+                    "Disabled {} station '{}'",
                     if service == "claude" {
                         "Claude"
                     } else {
@@ -567,7 +567,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 );
             }
         }
-        ConfigCommand::SetRetryProfile { profile } => {
+        StationCommand::SetRetryProfile { profile } => {
             let mut cfg = load_config()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -608,26 +608,26 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 resolved.cooldown_backoff_max_secs,
             );
         }
-        ConfigCommand::ImportFromCodex { force } => {
+        StationCommand::ImportFromCodex { force } => {
             let cfg = import_codex_config_from_codex_cli(force)
                 .await
                 .map_err(|e| CliError::CodexConfig(e.to_string()))?;
             if cfg.codex.configs.is_empty() {
                 println!(
-                    "No Codex configs were imported from ~/.codex; please ensure ~/.codex/config.toml and ~/.codex/auth.json are valid."
+                    "No Codex stations were imported from ~/.codex; please ensure ~/.codex/config.toml and ~/.codex/auth.json are valid."
                 );
             } else {
                 let names: Vec<_> = cfg.codex.configs.keys().cloned().collect();
                 println!(
-                    "Imported Codex configs from ~/.codex (force = {}): {:?}",
+                    "Imported Codex stations from ~/.codex (force = {}): {:?}",
                     force, names
                 );
             }
         }
-        ConfigCommand::OverwriteFromCodex { dry_run, yes } => {
+        StationCommand::OverwriteFromCodex { dry_run, yes } => {
             if !dry_run && !yes {
                 return Err(CliError::ProxyConfig(
-                    "该操作会覆盖并重建 Codex 配置（active/enabled/level 会重置），请使用 --yes 确认，或先用 --dry-run 预览".to_string(),
+                    "该操作会覆盖并重建 Codex 站点配置（active/enabled/level 会重置），请使用 --yes 确认，或先用 --dry-run 预览".to_string(),
                 ));
             }
             let cfg = load_config()
@@ -648,11 +648,11 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
 
             let names: Vec<_> = working.codex.configs.keys().cloned().collect();
             println!(
-                "Overwrote Codex configs from ~/.codex (dry_run = {}): {:?}",
+                "Overwrote Codex stations from ~/.codex (dry_run = {}): {:?}",
                 dry_run, names
             );
         }
-        ConfigCommand::Migrate {
+        StationCommand::Migrate {
             to,
             dry_run,
             write,

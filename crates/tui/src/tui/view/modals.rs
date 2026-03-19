@@ -866,7 +866,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 "            1 Dashboard  2 Stations  3 Sessions  4 Requests  5 Stats  6 Settings  7 History  8 Recent",
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
-            Line::from("  6 Settings show runtime + station/config overview"),
+            Line::from("  6 Settings show runtime + station overview"),
             Line::from(
                 "  Settings   p manage configured default profile; P manage runtime default profile; R reload config; O overwrite-import ~/.codex (codex only)",
             ),
