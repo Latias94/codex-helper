@@ -405,6 +405,7 @@ fn local_operator_counts(r: &RunningProxy) -> OperatorSummaryCounts {
         sessions: r.session_cards.len(),
         stations: r.stations.len(),
         profiles: mgr.profiles.len(),
+        providers: r.providers.len(),
     }
 }
 

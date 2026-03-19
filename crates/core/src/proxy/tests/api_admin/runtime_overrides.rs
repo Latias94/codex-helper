@@ -260,6 +260,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
     assert_eq!(summary["counts"]["sessions"].as_u64(), Some(1));
     assert_eq!(summary["counts"]["stations"].as_u64(), Some(1));
     assert_eq!(summary["counts"]["profiles"].as_u64(), Some(1));
+    assert_eq!(summary["counts"]["providers"].as_u64(), Some(1));
     assert_eq!(
         summary["retry"]["configured_profile"].as_str(),
         Some("balanced")

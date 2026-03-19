@@ -59,6 +59,7 @@ fn request_attach_with_discovered_proxy_preloads_surface_capabilities() {
             sessions: 3,
             stations: 4,
             profiles: 5,
+            providers: 6,
         }),
         last_error: None,
         shared_capabilities: crate::dashboard_core::SharedControlPlaneCapabilities {

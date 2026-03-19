@@ -97,6 +97,8 @@ pub struct OperatorSummaryCounts {
     pub stations: usize,
     #[serde(default)]
     pub profiles: usize,
+    #[serde(default)]
+    pub providers: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

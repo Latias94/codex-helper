@@ -419,7 +419,7 @@ fn operator_counts_status_line(
 ) -> Option<String> {
     if let Some(counts) = render_ctx.operator_counts.as_ref() {
         return Some(format!(
-            "{}={} · {}={} · {}={} · {}={} · {}={}",
+            "{}={} · {}={} · {}={} · {}={} · {}={} · {}={}",
             pick(lang, "active", "active"),
             counts.active_requests,
             pick(lang, "recent", "recent"),
@@ -430,6 +430,8 @@ fn operator_counts_status_line(
             counts.stations,
             pick(lang, "profiles", "profiles"),
             counts.profiles,
+            pick(lang, "providers", "providers"),
+            counts.providers,
         ));
     }
 

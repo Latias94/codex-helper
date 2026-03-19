@@ -154,6 +154,7 @@ pub(super) async fn build_operator_summary(
             sessions: session_cards.len(),
             stations: mgr.stations().len(),
             profiles: mgr.profiles.len(),
+            providers: providers.len(),
         },
         retry: OperatorRetrySummary {
             configured_profile: configured_retry.profile,

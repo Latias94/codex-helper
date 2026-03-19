@@ -94,7 +94,7 @@ Already in place:
 - persisted provider structure API exists
 - profile mutation API exists
 - station-first snapshot/runtime payloads already exist
-- `operator/summary` now carries top-level session/station/profile/provider catalogs for read-side clients
+- `operator/summary` now carries top-level session/station/profile/provider catalogs plus lightweight aggregate counts for read-side clients
 
 Remaining gap:
 

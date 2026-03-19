@@ -60,7 +60,8 @@ fn refresh_attached_prefers_operator_summary_for_runtime_card_fields() {
             "recent_requests": 0,
             "sessions": 1,
             "stations": 1,
-            "profiles": 2
+            "profiles": 2,
+            "providers": 1
         },
         "retry": {
             "configured_profile": "balanced",
@@ -293,6 +294,13 @@ fn refresh_attached_prefers_operator_summary_for_runtime_card_fields() {
     );
     assert_eq!(
         snapshot
+            .operator_counts
+            .as_ref()
+            .map(|counts| counts.providers),
+        Some(1)
+    );
+    assert_eq!(
+        snapshot
             .operator_health_summary
             .as_ref()
             .map(|summary| summary.stations_with_failing_passive_health),
@@ -374,7 +382,8 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
             "recent_requests": 0,
             "sessions": 0,
             "stations": 1,
-            "profiles": 1
+            "profiles": 1,
+            "providers": 1
         },
         "retry": {
             "configured_profile": "balanced",

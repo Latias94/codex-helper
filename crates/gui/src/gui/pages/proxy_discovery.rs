@@ -449,12 +449,12 @@ fn discovery_catalog_summary(proxy: &DiscoveredProxy, lang: Language) -> Option<
     let counts = proxy.operator_counts.as_ref()?;
     Some(match lang {
         Language::Zh => format!(
-            "目录: 会话 {} · 站点 {} · 配置档 {}",
-            counts.sessions, counts.stations, counts.profiles
+            "目录: 会话 {} · 站点 {} · 配置档 {} · 提供商 {}",
+            counts.sessions, counts.stations, counts.profiles, counts.providers
         ),
         Language::En => format!(
-            "Catalog: sessions {} · stations {} · profiles {}",
-            counts.sessions, counts.stations, counts.profiles
+            "Catalog: sessions {} · stations {} · profiles {} · providers {}",
+            counts.sessions, counts.stations, counts.profiles, counts.providers
         ),
     })
 }
@@ -643,6 +643,7 @@ mod tests {
                 sessions: 3,
                 stations: 4,
                 profiles: 5,
+                providers: 6,
             }),
             last_error: None,
             shared_capabilities: Default::default(),
@@ -661,7 +662,7 @@ mod tests {
         );
         assert_eq!(
             discovery_catalog_summary(&proxy, Language::Zh).as_deref(),
-            Some("目录: 会话 3 · 站点 4 · 配置档 5")
+            Some("目录: 会话 3 · 站点 4 · 配置档 5 · 提供商 6")
         );
         assert_eq!(
             discovery_retry_summary(&proxy, Language::Zh).as_deref(),

@@ -64,7 +64,7 @@ The payload is station-first and currently exposes these top-level fields:
 | `api_version` | yes | API contract version |
 | `service_name` | yes | current service (`codex`, `claude`, etc.) |
 | `runtime` | yes | current runtime target/default summary |
-| `counts` | yes | lightweight counts for requests/sessions/stations/profiles |
+| `counts` | yes | lightweight counts for requests/sessions/stations/profiles/providers |
 | `retry` | yes | resolved retry/failover posture |
 | `health` | yes in current implementation; clients should still tolerate absence | lightweight aggregated station health posture |
 | `session_cards` | yes | session identity catalog |

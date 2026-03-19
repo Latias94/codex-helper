@@ -340,7 +340,8 @@ fn discovery_catalog_score(proxy: &DiscoveredProxy) -> u32 {
             (counts.active_requests as u32) * 1000
                 + (counts.sessions as u32) * 100
                 + (counts.stations as u32) * 10
-                + counts.profiles as u32
+                + (counts.profiles as u32) * 2
+                + counts.providers as u32
         })
         .unwrap_or(0)
 }
@@ -677,6 +678,7 @@ mod tests {
             sessions: 5,
             stations: 3,
             profiles: 4,
+            providers: 6,
         });
         richest.operator_runtime_summary = Some(OperatorRuntimeSummary {
             runtime_loaded_at_ms: Some(800),
