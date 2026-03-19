@@ -5,9 +5,9 @@ pub mod types;
 pub mod window_stats;
 
 pub use operator_summary::{
-    ApiV1OperatorSummary, OperatorHealthSummary, OperatorProfileSummary, OperatorRetrySummary,
-    OperatorRuntimeSummary, OperatorSummaryCounts, OperatorSummaryLinks,
-    build_operator_health_summary,
+    ApiV1OperatorSummary, OperatorHealthSummary, OperatorProfileSummary, OperatorRetryObservations,
+    OperatorRetrySummary, OperatorRuntimeSummary, OperatorSummaryCounts, OperatorSummaryLinks,
+    build_operator_health_summary, summarize_recent_retry_observations,
 };
 pub use snapshot::{ApiV1Snapshot, build_dashboard_snapshot};
 pub use station_options::{

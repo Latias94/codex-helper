@@ -5,6 +5,7 @@ use crate::dashboard_core::{
     OperatorRuntimeSummary, OperatorSummaryCounts, RemoteAdminAccessCapabilities,
     SharedControlPlaneCapabilities, build_operator_health_summary, build_profile_options_from_mgr,
     build_provider_options_from_view, build_station_options_from_mgr,
+    summarize_recent_retry_observations,
 };
 use crate::state::build_session_identity_cards_from_parts;
 
@@ -134,6 +135,7 @@ pub(super) async fn build_operator_summary(
             )
         })
         .unwrap_or_default();
+    let retry_observations = summarize_recent_retry_observations(&recent);
 
     ApiV1OperatorSummary {
         api_version: 1,
@@ -163,6 +165,9 @@ pub(super) async fn build_operator_summary(
             provider_max_attempts: resolved_retry.provider.max_attempts,
             allow_cross_station_before_first_output: resolved_retry
                 .allow_cross_station_before_first_output,
+            recent_retried_requests: retry_observations.recent_retried_requests,
+            recent_cross_station_failovers: retry_observations.recent_cross_station_failovers,
+            recent_fast_mode_requests: retry_observations.recent_fast_mode_requests,
         },
         health: Some(health),
         session_cards,

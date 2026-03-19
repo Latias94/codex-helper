@@ -97,6 +97,26 @@ Canonical fields:
 `default_profile_summary.fast_mode` is a presentation alias for `service_tier = "priority"`.
 It is not a separate persisted control dimension.
 
+## `retry` Sub-object
+
+The `retry` object is the compact answer to "what retry/failover policy is active, and what has happened recently?"
+
+Canonical fields:
+
+| Field | Meaning |
+| --- | --- |
+| `configured_profile` | configured retry profile name if present |
+| `supports_write` | whether this client can mutate retry config safely |
+| `upstream_max_attempts` | resolved upstream attempt ceiling |
+| `provider_max_attempts` | resolved provider attempt ceiling |
+| `allow_cross_station_before_first_output` | whether retry orchestration may leave the current station before first output |
+| `recent_retried_requests` | recent finished requests that actually used more than one attempt |
+| `recent_cross_station_failovers` | recent retried requests whose retry chain touched a different station than the final routed station |
+| `recent_fast_mode_requests` | recent finished requests observed with `service_tier = "priority"` |
+
+These recent counters are intentionally lightweight read-side posture signals.
+They do not replace deep request history or control-trace export surfaces.
+
 ## `links` Sub-object
 
 The `links` object exists so future clients do not need to rebuild a semantic endpoint map from flat manifest strings.

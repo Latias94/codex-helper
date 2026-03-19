@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::FinishRequestParams;
 
 #[tokio::test]
 async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
@@ -149,6 +150,132 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
             1,
         )
         .await;
+    let recent_same_station = proxy
+        .state
+        .begin_request(
+            "codex",
+            "POST",
+            "/v1/responses",
+            Some("sid-summary".to_string()),
+            None,
+            None,
+            None,
+            Some("gpt-5.4-mini".to_string()),
+            Some("low".to_string()),
+            Some("priority".to_string()),
+            10,
+        )
+        .await;
+    proxy
+        .state
+        .update_request_route(
+            recent_same_station,
+            "test".to_string(),
+            Some("u1".to_string()),
+            "http://127.0.0.1:9/v1".to_string(),
+            None,
+        )
+        .await;
+    proxy
+        .state
+        .finish_request(FinishRequestParams {
+            id: recent_same_station,
+            status_code: 200,
+            duration_ms: 1200,
+            ended_at_ms: 11,
+            observed_service_tier: Some("priority".to_string()),
+            usage: None,
+            retry: Some(crate::logging::RetryInfo {
+                attempts: 2,
+                upstream_chain: vec!["test:http://127.0.0.1:9/v1".to_string()],
+            }),
+            ttfb_ms: Some(180),
+        })
+        .await;
+    let recent_cross_station = proxy
+        .state
+        .begin_request(
+            "codex",
+            "POST",
+            "/v1/responses",
+            Some("sid-summary".to_string()),
+            None,
+            None,
+            None,
+            Some("gpt-5.4".to_string()),
+            Some("medium".to_string()),
+            Some("default".to_string()),
+            12,
+        )
+        .await;
+    proxy
+        .state
+        .update_request_route(
+            recent_cross_station,
+            "test".to_string(),
+            Some("u1".to_string()),
+            "http://127.0.0.1:9/v1".to_string(),
+            None,
+        )
+        .await;
+    proxy
+        .state
+        .finish_request(FinishRequestParams {
+            id: recent_cross_station,
+            status_code: 200,
+            duration_ms: 1400,
+            ended_at_ms: 13,
+            observed_service_tier: Some("default".to_string()),
+            usage: None,
+            retry: Some(crate::logging::RetryInfo {
+                attempts: 3,
+                upstream_chain: vec![
+                    "backup:http://127.0.0.2:9/v1".to_string(),
+                    "test:http://127.0.0.1:9/v1".to_string(),
+                ],
+            }),
+            ttfb_ms: Some(200),
+        })
+        .await;
+    let recent_fast_mode_only = proxy
+        .state
+        .begin_request(
+            "codex",
+            "POST",
+            "/v1/responses",
+            Some("sid-summary".to_string()),
+            None,
+            None,
+            None,
+            Some("gpt-5.4-mini".to_string()),
+            Some("low".to_string()),
+            Some("priority".to_string()),
+            14,
+        )
+        .await;
+    proxy
+        .state
+        .update_request_route(
+            recent_fast_mode_only,
+            "test".to_string(),
+            Some("u1".to_string()),
+            "http://127.0.0.1:9/v1".to_string(),
+            None,
+        )
+        .await;
+    proxy
+        .state
+        .finish_request(FinishRequestParams {
+            id: recent_fast_mode_only,
+            status_code: 200,
+            duration_ms: 800,
+            ended_at_ms: 15,
+            observed_service_tier: Some("priority".to_string()),
+            usage: None,
+            retry: None,
+            ttfb_ms: Some(120),
+        })
+        .await;
 
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
@@ -256,7 +383,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         Some("gpt-5.4-mini")
     );
     assert_eq!(summary["counts"]["active_requests"].as_u64(), Some(1));
-    assert_eq!(summary["counts"]["recent_requests"].as_u64(), Some(0));
+    assert_eq!(summary["counts"]["recent_requests"].as_u64(), Some(3));
     assert_eq!(summary["counts"]["sessions"].as_u64(), Some(1));
     assert_eq!(summary["counts"]["stations"].as_u64(), Some(1));
     assert_eq!(summary["counts"]["profiles"].as_u64(), Some(1));
@@ -269,6 +396,18 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
     assert_eq!(
         summary["retry"]["allow_cross_station_before_first_output"].as_bool(),
         Some(true)
+    );
+    assert_eq!(
+        summary["retry"]["recent_retried_requests"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        summary["retry"]["recent_cross_station_failovers"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        summary["retry"]["recent_fast_mode_requests"].as_u64(),
+        Some(2)
     );
     assert_eq!(summary["health"]["stations_draining"].as_u64(), Some(1));
     assert_eq!(

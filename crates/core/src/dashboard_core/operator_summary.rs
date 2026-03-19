@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::RetryProfileName;
 use crate::state::{
-    HealthCheckStatus, LbConfigView, PassiveHealthState, RuntimeConfigState, SessionIdentityCard,
-    StationHealth,
+    FinishedRequest, HealthCheckStatus, LbConfigView, PassiveHealthState, RuntimeConfigState,
+    SessionIdentityCard, StationHealth,
 };
 
 use super::types::{
@@ -83,6 +83,19 @@ pub struct OperatorRetrySummary {
     pub provider_max_attempts: u32,
     #[serde(default)]
     pub allow_cross_station_before_first_output: bool,
+    #[serde(default)]
+    pub recent_retried_requests: usize,
+    #[serde(default)]
+    pub recent_cross_station_failovers: usize,
+    #[serde(default)]
+    pub recent_fast_mode_requests: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OperatorRetryObservations {
+    pub recent_retried_requests: usize,
+    pub recent_cross_station_failovers: usize,
+    pub recent_fast_mode_requests: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -99,6 +112,61 @@ pub struct OperatorSummaryCounts {
     pub profiles: usize,
     #[serde(default)]
     pub providers: usize,
+}
+
+fn retry_chain_station_prefix(entry: &str) -> Option<&str> {
+    let pos = entry.find(":http")?;
+    let prefix = entry[..pos].trim();
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix)
+    }
+}
+
+fn retry_chain_touched_other_station(
+    retry: &crate::logging::RetryInfo,
+    final_station: Option<&str>,
+) -> bool {
+    let Some(final_station) = final_station.filter(|station| !station.trim().is_empty()) else {
+        return false;
+    };
+
+    retry
+        .upstream_chain
+        .iter()
+        .filter_map(|entry| retry_chain_station_prefix(entry))
+        .any(|station| station != final_station)
+}
+
+pub fn summarize_recent_retry_observations(
+    recent: &[FinishedRequest],
+) -> OperatorRetryObservations {
+    let mut observations = OperatorRetryObservations::default();
+
+    for request in recent {
+        if request
+            .service_tier
+            .as_deref()
+            .is_some_and(|tier| tier.eq_ignore_ascii_case("priority"))
+        {
+            observations.recent_fast_mode_requests += 1;
+        }
+
+        let Some(retry) = request.retry.as_ref() else {
+            continue;
+        };
+        if retry.attempts <= 1 {
+            continue;
+        }
+
+        observations.recent_retried_requests += 1;
+        if retry_chain_touched_other_station(retry, request.station_name.as_deref()) {
+            observations.recent_cross_station_failovers += 1;
+        }
+    }
+
+    observations
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -221,6 +289,73 @@ pub fn build_operator_health_summary(
     }
 
     summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finished_request(
+        station_name: Option<&str>,
+        service_tier: Option<&str>,
+        retry: Option<crate::logging::RetryInfo>,
+    ) -> FinishedRequest {
+        FinishedRequest {
+            id: 1,
+            session_id: None,
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: service_tier.map(str::to_string),
+            station_name: station_name.map(str::to_string),
+            provider_id: None,
+            upstream_base_url: None,
+            route_decision: None,
+            usage: None,
+            retry,
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 100,
+            ttfb_ms: None,
+            ended_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn summarize_recent_retry_observations_reports_retry_failover_and_fast_mode() {
+        let recent = vec![
+            finished_request(
+                Some("alpha"),
+                Some("PRIORITY"),
+                Some(crate::logging::RetryInfo {
+                    attempts: 2,
+                    upstream_chain: vec!["alpha:http://alpha.example/v1".to_string()],
+                }),
+            ),
+            finished_request(
+                Some("alpha"),
+                Some("default"),
+                Some(crate::logging::RetryInfo {
+                    attempts: 3,
+                    upstream_chain: vec![
+                        "beta:http://beta.example/v1".to_string(),
+                        "alpha:http://alpha.example/v1".to_string(),
+                    ],
+                }),
+            ),
+            finished_request(Some("alpha"), Some("priority"), None),
+        ];
+
+        let summary = summarize_recent_retry_observations(&recent);
+
+        assert_eq!(summary.recent_retried_requests, 2);
+        assert_eq!(summary.recent_cross_station_failovers, 1);
+        assert_eq!(summary.recent_fast_mode_requests, 2);
+    }
 }
 
 fn station_has_probe_failures(health: Option<&StationHealth>) -> bool {

@@ -68,7 +68,10 @@ fn refresh_attached_prefers_operator_summary_for_runtime_card_fields() {
             "supports_write": false,
             "upstream_max_attempts": 2,
             "provider_max_attempts": 3,
-            "allow_cross_station_before_first_output": true
+            "allow_cross_station_before_first_output": true,
+            "recent_retried_requests": 2,
+            "recent_cross_station_failovers": 1,
+            "recent_fast_mode_requests": 2
         },
         "health": {
             "stations_draining": 1,
@@ -287,6 +290,27 @@ fn refresh_attached_prefers_operator_summary_for_runtime_card_fields() {
     );
     assert_eq!(
         snapshot
+            .operator_retry_summary
+            .as_ref()
+            .map(|summary| summary.recent_retried_requests),
+        Some(2)
+    );
+    assert_eq!(
+        snapshot
+            .operator_retry_summary
+            .as_ref()
+            .map(|summary| summary.recent_cross_station_failovers),
+        Some(1)
+    );
+    assert_eq!(
+        snapshot
+            .operator_retry_summary
+            .as_ref()
+            .map(|summary| summary.recent_fast_mode_requests),
+        Some(2)
+    );
+    assert_eq!(
+        snapshot
             .operator_counts
             .as_ref()
             .map(|counts| counts.sessions),
@@ -390,7 +414,10 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
             "supports_write": true,
             "upstream_max_attempts": 2,
             "provider_max_attempts": 2,
-            "allow_cross_station_before_first_output": true
+            "allow_cross_station_before_first_output": true,
+            "recent_retried_requests": 1,
+            "recent_cross_station_failovers": 1,
+            "recent_fast_mode_requests": 0
         },
         "health": null,
         "session_cards": [],

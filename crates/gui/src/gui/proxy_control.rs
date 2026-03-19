@@ -4,6 +4,7 @@ use crate::config::{RetryConfig, ServiceKind};
 use crate::dashboard_core::{
     OperatorHealthSummary, OperatorProfileSummary, OperatorRetrySummary, OperatorRuntimeSummary,
     OperatorSummaryCounts, WindowStats, build_operator_health_summary,
+    summarize_recent_retry_observations,
 };
 use crate::logging::{ControlTraceLogEntry, control_trace_path, read_recent_control_trace_entries};
 use crate::proxy::local_proxy_base_url;
@@ -384,6 +385,7 @@ fn local_operator_retry_summary(r: &RunningProxy) -> OperatorRetrySummary {
         .clone()
         .or_else(|| r.configured_retry.clone().map(|retry| retry.resolve()))
         .unwrap_or_else(|| RetryConfig::default().resolve());
+    let retry_observations = summarize_recent_retry_observations(&r.recent);
     OperatorRetrySummary {
         configured_profile: r.configured_retry.as_ref().and_then(|retry| retry.profile),
         supports_write: true,
@@ -391,6 +393,9 @@ fn local_operator_retry_summary(r: &RunningProxy) -> OperatorRetrySummary {
         provider_max_attempts: resolved_retry.provider.max_attempts,
         allow_cross_station_before_first_output: resolved_retry
             .allow_cross_station_before_first_output,
+        recent_retried_requests: retry_observations.recent_retried_requests,
+        recent_cross_station_failovers: retry_observations.recent_cross_station_failovers,
+        recent_fast_mode_requests: retry_observations.recent_fast_mode_requests,
     }
 }
 

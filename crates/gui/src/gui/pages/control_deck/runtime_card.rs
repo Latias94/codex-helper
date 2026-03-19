@@ -282,8 +282,17 @@ fn runtime_retry_hint(
         } else {
             pick(lang, "先耗尽当前 station", "current station first")
         };
+        let recent_observations = format!(
+            " · {} retry={} · {}={} · {}={}",
+            pick(lang, "最近", "recent"),
+            summary.recent_retried_requests,
+            pick(lang, "跨站", "cross-station"),
+            summary.recent_cross_station_failovers,
+            pick(lang, "fast", "fast"),
+            summary.recent_fast_mode_requests,
+        );
         return format!(
-            "{write_mode} · {}={} · {}={} · {failover_scope}",
+            "{write_mode} · {}={} · {}={} · {failover_scope}{recent_observations}",
             pick(lang, "上游尝试", "upstream tries"),
             summary.upstream_max_attempts,
             pick(lang, "Provider 尝试", "provider tries"),
