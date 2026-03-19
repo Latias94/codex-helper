@@ -175,7 +175,7 @@ pub(super) async fn backoff_sleep(opt: &RetryLayerOptions, attempt_index: u32) {
     let jitter = if opt.jitter_ms == 0 {
         0
     } else {
-        rand::thread_rng().gen_range(0..=opt.jitter_ms)
+        rand::rng().random_range(0..=opt.jitter_ms)
     };
     sleep(std::time::Duration::from_millis(
         capped.saturating_add(jitter),
@@ -190,7 +190,7 @@ pub(super) async fn retry_sleep(
 ) {
     if let Some(mut ms) = retry_after_ms(resp_headers, opt) {
         if opt.jitter_ms > 0 {
-            let jitter = rand::thread_rng().gen_range(0..=opt.jitter_ms);
+            let jitter = rand::rng().random_range(0..=opt.jitter_ms);
             let cap = opt.max_backoff_ms.max(opt.base_backoff_ms);
             ms = ms.saturating_add(jitter).min(cap);
         }

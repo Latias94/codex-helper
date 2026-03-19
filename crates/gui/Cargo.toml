@@ -24,5 +24,5 @@ tracing-appender = "0.2.4"
 axum = { version = "0.8.8", features = ["http2", "macros", "ws"] }
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.52.0"
-windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
+winreg = "0.56.0"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
