@@ -260,6 +260,7 @@ pub struct RunningProxy {
     pub(super) server_handle: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum ProxyMode {
     Stopped,
     Starting,

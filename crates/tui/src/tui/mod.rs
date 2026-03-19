@@ -32,6 +32,7 @@ use self::model::{Palette, now_ms, refresh_snapshot};
 use self::state::{UiState, merge_codex_history_external_focus};
 use self::terminal::TerminalGuard;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_dashboard(
     state: Arc<ProxyState>,
     cfg: Arc<ProxyConfig>,

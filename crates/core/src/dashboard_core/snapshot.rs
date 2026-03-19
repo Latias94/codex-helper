@@ -7,8 +7,9 @@ use crate::dashboard_core::types::{ControlProfileOption, StationOption};
 use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
-    SessionIdentityCard, SessionStats, StationHealth, UsageRollupView,
-    build_session_identity_cards_from_parts, enrich_session_identity_cards_with_host_transcripts,
+    SessionIdentityCard, SessionIdentityCardBuildInputs, SessionStats, StationHealth,
+    UsageRollupView, build_session_identity_cards_from_parts,
+    enrich_session_identity_cards_with_host_transcripts,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,17 +116,18 @@ pub async fn build_dashboard_snapshot(
 
     let stats_5m = compute_window_stats(&recent_all, now, 5 * 60_000, |_| true);
     let stats_1h = compute_window_stats(&recent_all, now, 60 * 60_000, |_| true);
-    let mut session_cards = build_session_identity_cards_from_parts(
-        &active,
-        &recent_all,
-        &session_effort,
-        &session_cfg,
-        &session_model,
-        &session_service_tier,
-        &session_bindings,
-        global_station_override.as_deref(),
-        &session_stats,
-    );
+    let mut session_cards =
+        build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
+            active: &active,
+            recent: &recent_all,
+            overrides: &session_effort,
+            station_overrides: &session_cfg,
+            model_overrides: &session_model,
+            service_tier_overrides: &session_service_tier,
+            bindings: &session_bindings,
+            global_station_override: global_station_override.as_deref(),
+            stats: &session_stats,
+        });
     enrich_session_identity_cards_with_host_transcripts(&mut session_cards).await;
 
     if recent_all.len() > recent_limit {

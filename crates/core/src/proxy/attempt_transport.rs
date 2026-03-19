@@ -10,7 +10,7 @@ use crate::logging::{BodyPreview, HeaderEntry};
 use crate::state::RouteDecisionProvenance;
 
 use super::ProxyService;
-use super::attempt_failures::apply_terminal_upstream_failure;
+use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upstream_failure};
 use super::attempt_request::{AttemptRequestSetupParams, prepare_attempt_request};
 use super::http_debug::{HttpDebugBase, format_reqwest_error_for_retry_chain};
 use super::retry::{RetryLayerOptions, backoff_sleep, should_retry_class};
@@ -25,7 +25,7 @@ pub(super) struct AttemptTransportSuccess {
 pub(super) enum AttemptTransportOutcome {
     RetrySameUpstream,
     TryNextUpstream,
-    Continue(AttemptTransportSuccess),
+    Continue(Box<AttemptTransportSuccess>),
 }
 
 pub(super) enum AttemptReadBodyOutcome {
@@ -129,19 +129,19 @@ pub(super) async fn handle_attempt_transport(
                 err_str,
                 model_note
             ));
-            apply_terminal_upstream_failure(
+            apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
-                None,
+                lb: None,
                 selected,
-                "target_build_error",
-                None,
-                transport_cooldown_secs,
+                error_class: "target_build_error",
+                penalize_reason: None,
+                cooldown_secs: transport_cooldown_secs,
                 cooldown_backoff,
-                err_str,
+                error_message: err_str,
                 avoid_set,
                 avoided_total,
                 last_err,
-            )
+            })
             .await;
             return AttemptTransportOutcome::TryNextUpstream;
         }
@@ -202,30 +202,30 @@ pub(super) async fn handle_attempt_transport(
                 return AttemptTransportOutcome::RetrySameUpstream;
             }
 
-            apply_terminal_upstream_failure(
+            apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
-                Some(lb),
+                lb: Some(lb),
                 selected,
-                "upstream_transport_error",
-                Some("upstream_transport_error"),
-                transport_cooldown_secs,
+                error_class: "upstream_transport_error",
+                penalize_reason: Some("upstream_transport_error"),
+                cooldown_secs: transport_cooldown_secs,
                 cooldown_backoff,
-                err_str,
+                error_message: err_str,
                 avoid_set,
                 avoided_total,
                 last_err,
-            )
+            })
             .await;
             return AttemptTransportOutcome::TryNextUpstream;
         }
     };
 
-    AttemptTransportOutcome::Continue(AttemptTransportSuccess {
+    AttemptTransportOutcome::Continue(Box::new(AttemptTransportSuccess {
         response,
         upstream_start,
         upstream_headers_ms: upstream_start.elapsed().as_millis() as u64,
         debug_base,
-    })
+    }))
 }
 
 pub(super) async fn read_attempt_response_body(
@@ -266,19 +266,19 @@ pub(super) async fn read_attempt_response_body(
                 return AttemptReadBodyOutcome::RetrySameUpstream;
             }
 
-            apply_terminal_upstream_failure(
+            apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
-                Some(lb),
+                lb: Some(lb),
                 selected,
-                "upstream_body_read_error",
-                Some("upstream_body_read_error"),
-                transport_cooldown_secs,
+                error_class: "upstream_body_read_error",
+                penalize_reason: Some("upstream_body_read_error"),
+                cooldown_secs: transport_cooldown_secs,
                 cooldown_backoff,
-                err_str,
+                error_message: err_str,
                 avoid_set,
                 avoided_total,
                 last_err,
-            )
+            })
             .await;
             AttemptReadBodyOutcome::TryNextUpstream
         }

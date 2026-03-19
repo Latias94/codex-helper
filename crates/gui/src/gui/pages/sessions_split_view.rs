@@ -3,6 +3,7 @@ use super::sessions_detail_controls::render_session_detail_controls;
 use super::sessions_quick_actions::{render_session_quick_actions, render_source_explanation_card};
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_sessions_split_view(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,

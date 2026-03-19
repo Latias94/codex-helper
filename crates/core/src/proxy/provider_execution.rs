@@ -16,9 +16,9 @@ use super::attempt_execution::{
 };
 use super::attempt_selection::{select_supported_upstream, station_upstreams_exhausted};
 use super::provider_orchestration::{
-    cross_station_failover_enabled, log_cross_station_failover_blocked,
-    log_same_station_failover_trace, next_provider_load_balancer, provider_attempt_limit,
-    station_loop_action_after_attempt,
+    CrossStationFailoverBlockedParams, cross_station_failover_enabled,
+    log_cross_station_failover_blocked, log_same_station_failover_trace,
+    next_provider_load_balancer, provider_attempt_limit, station_loop_action_after_attempt,
 };
 use super::request_preparation::RequestFlavor;
 use super::retry::{RetryPlan, backoff_sleep};
@@ -216,17 +216,17 @@ pub(super) async fn execute_provider_chain(
 
         tried_stations.insert(station_name.clone());
 
-        log_cross_station_failover_blocked(
-            proxy.service_name,
+        log_cross_station_failover_blocked(CrossStationFailoverBlockedParams {
+            service_name: proxy.service_name,
             request_id,
-            station_name.as_str(),
+            station_name: station_name.as_str(),
             strict_multi_config,
             provider_attempt,
             cross_station_failover_enabled,
             provider_opt,
             provider_attempt_limit,
-            plan.allow_cross_station_before_first_output,
-        );
+            allow_cross_station_before_first_output: plan.allow_cross_station_before_first_output,
+        });
 
         if provider_opt.base_backoff_ms > 0 && provider_attempt + 1 < provider_attempt_limit {
             backoff_sleep(provider_opt, provider_attempt).await;

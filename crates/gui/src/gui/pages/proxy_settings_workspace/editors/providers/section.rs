@@ -10,7 +10,7 @@ use super::helpers::{
 use super::shared::{build_provider_card_item, render_provider_card_list};
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn render_proxy_settings_providers_section(
     ui: &mut egui::Ui,
     lang: Language,

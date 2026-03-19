@@ -529,8 +529,7 @@ fn path_endpoint_hint(base_url: &str) -> Option<String> {
     let segment = url
         .path_segments()?
         .filter(|segment| !segment.is_empty())
-        .filter(|segment| !matches!(*segment, "v1" | "v2" | "api"))
-        .next_back()?;
+        .rfind(|segment| !matches!(*segment, "v1" | "v2" | "api"))?;
     Some(sanitize_schema_key(segment, "endpoint"))
 }
 

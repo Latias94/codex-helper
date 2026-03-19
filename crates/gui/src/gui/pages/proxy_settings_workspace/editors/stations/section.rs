@@ -4,6 +4,7 @@ use super::member_editor::{
 };
 use super::*;
 
+#[allow(clippy::type_complexity)]
 pub(crate) struct StationsSectionArgs<'a> {
     pub lang: Language,
     pub proxy_kind: ProxyModeKind,

@@ -69,19 +69,21 @@ pub async fn handle_proxy(
         let dur = start.elapsed().as_millis() as u64;
         let retry = retry_info_for_chain(&upstream_chain);
         return Err(finish_failed_proxy_request(
-            &proxy,
-            &prepared.method,
-            prepared.uri.path(),
-            prepared.request_id,
-            status,
-            msg,
-            dur,
-            started_at_ms,
-            prepared.session_id.clone(),
-            prepared.cwd.clone(),
-            prepared.effective_effort.clone(),
-            prepared.base_service_tier.clone(),
-            retry,
+            super::request_failures::FailedProxyRequestParams {
+                proxy: &proxy,
+                method: &prepared.method,
+                path: prepared.uri.path(),
+                request_id: prepared.request_id,
+                status,
+                message: msg,
+                duration_ms: dur,
+                started_at_ms,
+                session_id: prepared.session_id.clone(),
+                cwd: prepared.cwd.clone(),
+                effective_effort: prepared.effective_effort.clone(),
+                service_tier: prepared.base_service_tier.clone(),
+                retry,
+            },
         )
         .await);
     }

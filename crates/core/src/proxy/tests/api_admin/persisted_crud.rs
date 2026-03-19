@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn proxy_api_v1_profile_config_crud_persists_and_clears_stale_runtime_override() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
     unsafe {
@@ -179,7 +179,7 @@ async fn proxy_api_v1_profile_config_crud_persists_and_clears_stale_runtime_over
 
 #[tokio::test]
 async fn proxy_api_v1_station_settings_crud_persists_active_and_meta() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
     unsafe {
@@ -304,7 +304,7 @@ async fn proxy_api_v1_station_settings_crud_persists_active_and_meta() {
         .expect("zeta station");
     assert!(!zeta.enabled);
     assert_eq!(zeta.level, 7);
-    assert_eq!(zeta.configured_enabled, false);
+    assert!(!zeta.configured_enabled);
     assert_eq!(zeta.configured_level, 7);
 
     let clear_active = client
@@ -370,7 +370,7 @@ async fn proxy_api_v1_station_settings_crud_persists_active_and_meta() {
 
 #[tokio::test]
 async fn proxy_api_v1_retry_config_crud_persists_profile_and_cooldowns() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
     unsafe {
@@ -504,7 +504,7 @@ async fn proxy_api_v1_retry_config_crud_persists_profile_and_cooldowns() {
 
 #[tokio::test]
 async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
     unsafe {
@@ -710,7 +710,7 @@ async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
 
 #[tokio::test]
 async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
     unsafe {

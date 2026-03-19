@@ -292,6 +292,7 @@ pub fn build_operator_health_summary(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

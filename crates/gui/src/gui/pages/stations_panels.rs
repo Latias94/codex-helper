@@ -11,6 +11,7 @@ use super::stations_detail_summary::render_station_identity_summary;
 use super::stations_list_panel::render_station_list_panel;
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_stations_panels(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
@@ -47,6 +48,7 @@ pub(super) fn render_stations_panels(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_station_detail_panel(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,

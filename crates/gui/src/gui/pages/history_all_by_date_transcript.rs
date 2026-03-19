@@ -5,6 +5,7 @@ use super::history_external::{render_open_in_requests_button, render_open_in_ses
 use super::{PageCtx, history_workdir_from_cwd, open_wt_items};
 use crate::sessions::SessionSummarySource;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_all_by_date_transcript_panel(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,

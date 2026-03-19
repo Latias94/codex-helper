@@ -573,17 +573,33 @@ fn update_card_route_decision(
     }
 }
 
+pub struct SessionIdentityCardBuildInputs<'a> {
+    pub active: &'a [ActiveRequest],
+    pub recent: &'a [FinishedRequest],
+    pub overrides: &'a HashMap<String, String>,
+    pub station_overrides: &'a HashMap<String, String>,
+    pub model_overrides: &'a HashMap<String, String>,
+    pub service_tier_overrides: &'a HashMap<String, String>,
+    pub bindings: &'a HashMap<String, SessionBinding>,
+    pub global_station_override: Option<&'a str>,
+    pub stats: &'a HashMap<String, SessionStats>,
+}
+
 pub fn build_session_identity_cards_from_parts(
-    active: &[ActiveRequest],
-    recent: &[FinishedRequest],
-    overrides: &HashMap<String, String>,
-    station_overrides: &HashMap<String, String>,
-    model_overrides: &HashMap<String, String>,
-    service_tier_overrides: &HashMap<String, String>,
-    bindings: &HashMap<String, SessionBinding>,
-    global_station_override: Option<&str>,
-    stats: &HashMap<String, SessionStats>,
+    inputs: SessionIdentityCardBuildInputs<'_>,
 ) -> Vec<SessionIdentityCard> {
+    let SessionIdentityCardBuildInputs {
+        active,
+        recent,
+        overrides,
+        station_overrides,
+        model_overrides,
+        service_tier_overrides,
+        bindings,
+        global_station_override,
+        stats,
+    } = inputs;
+
     use std::collections::HashMap as StdHashMap;
 
     let mut map: StdHashMap<Option<String>, SessionIdentityCard> = StdHashMap::new();

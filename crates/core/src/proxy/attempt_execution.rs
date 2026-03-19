@@ -30,6 +30,22 @@ pub(super) enum SelectedUpstreamExecutionOutcome {
     Return(Response<Body>),
 }
 
+struct AttemptSelectLogParams<'a> {
+    service_name: &'a str,
+    request_id: u64,
+    global_attempt: u32,
+    provider_attempt: u32,
+    upstream_attempt: u32,
+    provider_opt: &'a RetryLayerOptions,
+    upstream_opt: &'a RetryLayerOptions,
+    selected: &'a SelectedUpstream,
+    provider_id: Option<&'a str>,
+    avoid_set: &'a HashSet<usize>,
+    avoided_total: usize,
+    total_upstreams: usize,
+    model_note: &'a str,
+}
+
 pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) proxy: &'a ProxyService,
     pub(super) lb: &'a LoadBalancer,
@@ -151,21 +167,21 @@ pub(super) async fn execute_selected_upstream(
 
     for upstream_attempt in 0..upstream_opt.max_attempts {
         *global_attempt = global_attempt.saturating_add(1);
-        log_attempt_select(
-            proxy.service_name,
+        log_attempt_select(AttemptSelectLogParams {
+            service_name: proxy.service_name,
             request_id,
-            *global_attempt,
+            global_attempt: *global_attempt,
             provider_attempt,
             upstream_attempt,
             provider_opt,
             upstream_opt,
             selected,
-            provider_id.as_deref(),
+            provider_id: provider_id.as_deref(),
             avoid_set,
-            *avoided_total,
+            avoided_total: *avoided_total,
             total_upstreams,
-            model_note.as_str(),
-        );
+            model_note: model_note.as_str(),
+        });
 
         let transport = handle_attempt_transport(AttemptTransportParams {
             proxy,
@@ -224,7 +240,7 @@ pub(super) async fn execute_selected_upstream(
                     status,
                     response_headers: resp_headers,
                     response_headers_filtered: resp_headers_filtered,
-                    start: start.clone(),
+                    start: *start,
                     started_at_ms,
                     upstream_start,
                     upstream_headers_ms,
@@ -314,21 +330,23 @@ pub(super) async fn execute_selected_upstream(
     SelectedUpstreamExecutionOutcome::ContinueStation
 }
 
-fn log_attempt_select(
-    service_name: &str,
-    request_id: u64,
-    global_attempt: u32,
-    provider_attempt: u32,
-    upstream_attempt: u32,
-    provider_opt: &RetryLayerOptions,
-    upstream_opt: &RetryLayerOptions,
-    selected: &SelectedUpstream,
-    provider_id: Option<&str>,
-    avoid_set: &HashSet<usize>,
-    avoided_total: usize,
-    total_upstreams: usize,
-    model_note: &str,
-) {
+fn log_attempt_select(params: AttemptSelectLogParams<'_>) {
+    let AttemptSelectLogParams {
+        service_name,
+        request_id,
+        global_attempt,
+        provider_attempt,
+        upstream_attempt,
+        provider_opt,
+        upstream_opt,
+        selected,
+        provider_id,
+        avoid_set,
+        avoided_total,
+        total_upstreams,
+        model_note,
+    } = params;
+
     let mut avoid_for_station = avoid_set.iter().copied().collect::<Vec<_>>();
     avoid_for_station.sort_unstable();
 

@@ -299,9 +299,8 @@ async fn proxy_api_v1_snapshot_works() {
         snap.get("stations").is_some(),
         "should include stations list"
     );
-    assert_eq!(
+    assert!(
         snap.get("configs").is_none(),
-        true,
         "snapshot should not expose legacy configs alias"
     );
     assert_eq!(
@@ -1112,7 +1111,7 @@ async fn proxy_api_v1_stations_alias_works() {
 
 #[tokio::test]
 async fn proxy_auth_file_cache_refreshes_after_source_change() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let mut scoped = ScopedEnv::default();
     let base = make_temp_test_dir();
     let codex_home = base.join("codex-home");
@@ -1160,7 +1159,7 @@ async fn proxy_auth_file_cache_refreshes_after_source_change() {
 
 #[tokio::test]
 async fn proxy_admin_routes_require_loopback_or_token_for_remote_access() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let mut scoped = ScopedEnv::default();
     unsafe {
         scoped.set(super::ADMIN_TOKEN_ENV_VAR, "remote-secret");

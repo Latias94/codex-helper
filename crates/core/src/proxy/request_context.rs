@@ -113,15 +113,17 @@ pub(super) async fn prepare_proxy_request(
                 .get_or_init(|| header_map_to_entries(&client_headers))
                 .clone();
             return Err(log_client_body_read_error(
-                proxy,
-                &method,
-                uri.path(),
-                client_uri.as_str(),
-                session_id.clone(),
-                cwd.clone(),
-                client_headers_entries,
-                dur,
-                error.to_string(),
+                super::request_failures::ClientBodyReadErrorParams {
+                    proxy,
+                    method: &method,
+                    path: uri.path(),
+                    client_uri: client_uri.as_str(),
+                    session_id: session_id.clone(),
+                    cwd: cwd.clone(),
+                    client_headers: client_headers_entries,
+                    duration_ms: dur,
+                    error_message: error.to_string(),
+                },
             ));
         }
     };

@@ -172,6 +172,7 @@ fn apply_session_overrides(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_session_rows(
     active: Vec<ActiveRequest>,
     recent: &[FinishedRequest],

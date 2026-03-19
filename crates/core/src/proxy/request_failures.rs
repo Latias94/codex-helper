@@ -14,6 +14,34 @@ const NO_ROUTABLE_STATION_HINT: &str =
 const CLIENT_BODY_READ_ERROR_HINT: &str =
     "读取客户端请求 body 失败（可能超过大小限制或连接中断）。";
 
+pub(super) struct ClientBodyReadErrorParams<'a> {
+    pub(super) proxy: &'a ProxyService,
+    pub(super) method: &'a Method,
+    pub(super) path: &'a str,
+    pub(super) client_uri: &'a str,
+    pub(super) session_id: Option<String>,
+    pub(super) cwd: Option<String>,
+    pub(super) client_headers: Vec<HeaderEntry>,
+    pub(super) duration_ms: u64,
+    pub(super) error_message: String,
+}
+
+pub(super) struct FailedProxyRequestParams<'a> {
+    pub(super) proxy: &'a ProxyService,
+    pub(super) method: &'a Method,
+    pub(super) path: &'a str,
+    pub(super) request_id: u64,
+    pub(super) status: StatusCode,
+    pub(super) message: String,
+    pub(super) duration_ms: u64,
+    pub(super) started_at_ms: u64,
+    pub(super) session_id: Option<String>,
+    pub(super) cwd: Option<String>,
+    pub(super) effective_effort: Option<String>,
+    pub(super) service_tier: ServiceTierLog,
+    pub(super) retry: Option<RetryInfo>,
+}
+
 pub(super) fn log_no_routable_station(
     proxy: &ProxyService,
     method: &Method,
@@ -58,16 +86,20 @@ pub(super) fn log_no_routable_station(
 }
 
 pub(super) fn log_client_body_read_error(
-    proxy: &ProxyService,
-    method: &Method,
-    path: &str,
-    client_uri: &str,
-    session_id: Option<String>,
-    cwd: Option<String>,
-    client_headers: Vec<HeaderEntry>,
-    duration_ms: u64,
-    error_message: String,
+    params: ClientBodyReadErrorParams<'_>,
 ) -> (StatusCode, String) {
+    let ClientBodyReadErrorParams {
+        proxy,
+        method,
+        path,
+        client_uri,
+        session_id,
+        cwd,
+        client_headers,
+        duration_ms,
+        error_message,
+    } = params;
+
     let status = StatusCode::BAD_REQUEST;
     let http_debug = build_early_error_http_debug(
         status,
@@ -102,20 +134,24 @@ pub(super) fn log_client_body_read_error(
 }
 
 pub(super) async fn finish_failed_proxy_request(
-    proxy: &ProxyService,
-    method: &Method,
-    path: &str,
-    request_id: u64,
-    status: StatusCode,
-    message: String,
-    duration_ms: u64,
-    started_at_ms: u64,
-    session_id: Option<String>,
-    cwd: Option<String>,
-    effective_effort: Option<String>,
-    service_tier: ServiceTierLog,
-    retry: Option<RetryInfo>,
+    params: FailedProxyRequestParams<'_>,
 ) -> (StatusCode, String) {
+    let FailedProxyRequestParams {
+        proxy,
+        method,
+        path,
+        request_id,
+        status,
+        message,
+        duration_ms,
+        started_at_ms,
+        session_id,
+        cwd,
+        effective_effort,
+        service_tier,
+        retry,
+    } = params;
+
     proxy
         .state
         .finish_request(FinishRequestParams {

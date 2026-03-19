@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crate::lb::LoadBalancer;
 use crate::logging::now_ms;
-use crate::state::ProxyState;
+use crate::state::{PassiveUpstreamFailureRecord, ProxyState};
 
 use super::classify::class_is_health_neutral;
 
@@ -37,15 +37,15 @@ pub(super) async fn record_passive_upstream_failure(
         return;
     }
     state
-        .record_passive_upstream_failure(
-            service_name,
-            station_name,
-            base_url,
+        .record_passive_upstream_failure(PassiveUpstreamFailureRecord {
+            service_name: service_name.to_string(),
+            station_name: station_name.to_string(),
+            base_url: base_url.to_string(),
             status_code,
-            error_class.map(str::to_owned),
+            error_class: error_class.map(str::to_owned),
             error,
-            now_ms(),
-        )
+            now_ms: now_ms(),
+        })
         .await;
 }
 
@@ -158,12 +158,11 @@ mod tests {
                 .and_then(|value| value.as_u64()),
             Some(3)
         );
-        assert_eq!(
+        assert!(
             upstreams[0]
                 .get("cooldown_remaining_ms")
                 .and_then(|value| value.as_u64())
-                .is_some(),
-            true
+                .is_some()
         );
         assert_eq!(
             upstreams[1]

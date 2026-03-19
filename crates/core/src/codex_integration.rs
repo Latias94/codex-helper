@@ -474,6 +474,7 @@ pub fn claude_switch_off() -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::path::Path;

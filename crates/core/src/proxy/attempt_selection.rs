@@ -32,9 +32,7 @@ pub(super) fn select_supported_upstream(
                 lb.select_upstream_avoiding(avoid_ref)
             }
         };
-        let Some(selected) = next else {
-            return None;
-        };
+        let selected = next?;
 
         if let Some(requested_model) = request_model {
             let supported = model_routing::is_model_supported(

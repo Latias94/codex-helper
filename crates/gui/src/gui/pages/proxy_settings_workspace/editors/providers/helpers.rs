@@ -27,6 +27,7 @@ pub(super) fn provider_spec_snapshot<'a>(
     .and_then(|providers| providers.get(name))
 }
 
+#[allow(clippy::type_complexity)]
 pub(super) fn provider_station_refs(
     view: &crate::config::ServiceViewV2,
     attached_station_specs: Option<&(

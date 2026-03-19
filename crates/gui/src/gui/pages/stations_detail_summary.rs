@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_station_identity_summary(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,

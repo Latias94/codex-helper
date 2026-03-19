@@ -3,7 +3,7 @@ use crate::state::FinishRequestParams;
 
 #[tokio::test]
 async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
     unsafe {
@@ -91,27 +91,27 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         .await;
     proxy
         .state
-        .record_passive_upstream_failure(
-            "codex",
-            "test",
-            "http://127.0.0.1:9/v1",
-            Some(503),
-            Some("upstream_transport_error".to_string()),
-            Some("upstream timed out".to_string()),
-            21,
-        )
+        .record_passive_upstream_failure(crate::state::PassiveUpstreamFailureRecord {
+            service_name: "codex".to_string(),
+            station_name: "test".to_string(),
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            status_code: Some(503),
+            error_class: Some("upstream_transport_error".to_string()),
+            error: Some("upstream timed out".to_string()),
+            now_ms: 21,
+        })
         .await;
     proxy
         .state
-        .record_passive_upstream_failure(
-            "codex",
-            "test",
-            "http://127.0.0.1:9/v1",
-            Some(503),
-            Some("upstream_transport_error".to_string()),
-            Some("upstream timed out".to_string()),
-            22,
-        )
+        .record_passive_upstream_failure(crate::state::PassiveUpstreamFailureRecord {
+            service_name: "codex".to_string(),
+            station_name: "test".to_string(),
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            status_code: Some(503),
+            error_class: Some("upstream_transport_error".to_string()),
+            error: Some("upstream timed out".to_string()),
+            now_ms: 22,
+        })
         .await;
     assert!(
         proxy
@@ -551,7 +551,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
 
 #[tokio::test]
 async fn proxy_api_v1_provider_runtime_override_filters_real_routing() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
     unsafe {

@@ -51,20 +51,39 @@ fn resolve_station_provenance(
     )
 }
 
+pub(super) struct RouteDecisionProvenanceParams<'a> {
+    pub(super) decided_at_ms: u64,
+    pub(super) session_binding: Option<&'a SessionBinding>,
+    pub(super) session_override_config: Option<&'a str>,
+    pub(super) global_config_override: Option<&'a str>,
+    pub(super) override_model: Option<&'a str>,
+    pub(super) override_effort: Option<&'a str>,
+    pub(super) override_service_tier: Option<&'a str>,
+    pub(super) request_model: Option<&'a str>,
+    pub(super) effective_effort: Option<&'a str>,
+    pub(super) effective_service_tier: Option<&'a str>,
+    pub(super) selected: &'a SelectedUpstream,
+    pub(super) provider_id: Option<&'a str>,
+}
+
 pub(super) fn build_route_decision_provenance(
-    decided_at_ms: u64,
-    session_binding: Option<&SessionBinding>,
-    session_override_config: Option<&str>,
-    global_config_override: Option<&str>,
-    override_model: Option<&str>,
-    override_effort: Option<&str>,
-    override_service_tier: Option<&str>,
-    request_model: Option<&str>,
-    effective_effort: Option<&str>,
-    effective_service_tier: Option<&str>,
-    selected: &SelectedUpstream,
-    provider_id: Option<&str>,
+    params: RouteDecisionProvenanceParams<'_>,
 ) -> RouteDecisionProvenance {
+    let RouteDecisionProvenanceParams {
+        decided_at_ms,
+        session_binding,
+        session_override_config,
+        global_config_override,
+        override_model,
+        override_effort,
+        override_service_tier,
+        request_model,
+        effective_effort,
+        effective_service_tier,
+        selected,
+        provider_id,
+    } = params;
+
     let mut effective_model = resolve_request_field_provenance(
         request_model,
         override_model,
@@ -113,11 +132,11 @@ pub(super) fn build_route_decision_provenance(
 mod tests {
     use std::collections::HashMap;
 
-    use super::build_route_decision_provenance;
     use super::{
         ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource, SelectedUpstream,
         SessionBinding,
     };
+    use super::{RouteDecisionProvenanceParams, build_route_decision_provenance};
     use crate::config::{UpstreamAuth, UpstreamConfig};
     use crate::state::SessionContinuityMode;
 
@@ -172,20 +191,20 @@ mod tests {
         let binding = make_binding();
         let selected = make_selected_upstream(&[]);
 
-        let decision = build_route_decision_provenance(
-            42,
-            Some(&binding),
-            Some("session-station"),
-            Some("global-station"),
-            Some("override-model"),
-            Some("medium"),
-            Some("flex"),
-            Some("request-model"),
-            Some("request-effort"),
-            Some("request-tier"),
-            &selected,
-            Some(" provider-1 "),
-        );
+        let decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
+            decided_at_ms: 42,
+            session_binding: Some(&binding),
+            session_override_config: Some("session-station"),
+            global_config_override: Some("global-station"),
+            override_model: Some("override-model"),
+            override_effort: Some("medium"),
+            override_service_tier: Some("flex"),
+            request_model: Some("request-model"),
+            effective_effort: Some("request-effort"),
+            effective_service_tier: Some("request-tier"),
+            selected: &selected,
+            provider_id: Some(" provider-1 "),
+        });
 
         assert_eq!(decision.binding_profile_name.as_deref(), Some("default"));
         assert_eq!(
@@ -225,20 +244,20 @@ mod tests {
         let binding = make_binding();
         let selected = make_selected_upstream(&[]);
 
-        let decision = build_route_decision_provenance(
-            7,
-            Some(&binding),
-            Some("   "),
-            None,
-            None,
-            None,
-            None,
-            Some("request-model"),
-            Some("request-effort"),
-            Some("request-tier"),
-            &selected,
-            Some(""),
-        );
+        let decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
+            decided_at_ms: 7,
+            session_binding: Some(&binding),
+            session_override_config: Some("   "),
+            global_config_override: None,
+            override_model: None,
+            override_effort: None,
+            override_service_tier: None,
+            request_model: Some("request-model"),
+            effective_effort: Some("request-effort"),
+            effective_service_tier: Some("request-tier"),
+            selected: &selected,
+            provider_id: Some(""),
+        });
 
         assert_route_value(
             decision.effective_model,
@@ -267,20 +286,20 @@ mod tests {
     fn route_provenance_marks_station_mapping_when_model_is_remapped() {
         let selected = make_selected_upstream(&[("gpt-5", "provider-model")]);
 
-        let decision = build_route_decision_provenance(
-            9,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("gpt-5"),
-            None,
-            None,
-            &selected,
-            None,
-        );
+        let decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
+            decided_at_ms: 9,
+            session_binding: None,
+            session_override_config: None,
+            global_config_override: None,
+            override_model: None,
+            override_effort: None,
+            override_service_tier: None,
+            request_model: Some("gpt-5"),
+            effective_effort: None,
+            effective_service_tier: None,
+            selected: &selected,
+            provider_id: None,
+        });
 
         assert_route_value(
             decision.effective_model,
@@ -298,20 +317,20 @@ mod tests {
     fn route_provenance_keeps_request_payload_when_no_binding_or_override_exists() {
         let selected = make_selected_upstream(&[]);
 
-        let decision = build_route_decision_provenance(
-            11,
-            None,
-            None,
-            Some("global-station"),
-            None,
-            None,
-            None,
-            Some("request-model"),
-            Some("low"),
-            Some("priority"),
-            &selected,
-            None,
-        );
+        let decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
+            decided_at_ms: 11,
+            session_binding: None,
+            session_override_config: None,
+            global_config_override: Some("global-station"),
+            override_model: None,
+            override_effort: None,
+            override_service_tier: None,
+            request_model: Some("request-model"),
+            effective_effort: Some("low"),
+            effective_service_tier: Some("priority"),
+            selected: &selected,
+            provider_id: None,
+        });
 
         assert_eq!(
             decision,

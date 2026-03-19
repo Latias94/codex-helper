@@ -3156,6 +3156,7 @@ async fn handle_key_profile_menu(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::default_profile_menu_idx;
     use crate::dashboard_core::ControlProfileOption;

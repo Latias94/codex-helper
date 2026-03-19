@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn proxy_api_v1_capabilities_and_overrides_work() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let mut cfg = make_proxy_config(
         vec![UpstreamConfig {
             base_url: "http://127.0.0.1:9/v1".to_string(),
@@ -672,7 +672,7 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
 
 #[tokio::test]
 async fn proxy_api_v1_capabilities_report_remote_enabled_when_admin_token_configured() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let mut scoped = ScopedEnv::default();
     unsafe {
         scoped.set(super::ADMIN_TOKEN_ENV_VAR, "remote-secret");

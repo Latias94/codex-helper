@@ -68,17 +68,31 @@ pub(super) fn station_loop_action_after_attempt(
     false
 }
 
-pub(super) fn log_cross_station_failover_blocked(
-    service_name: &str,
-    request_id: u64,
-    station_name: &str,
-    strict_multi_config: bool,
-    provider_attempt: u32,
-    cross_station_failover_enabled: bool,
-    provider_opt: &RetryLayerOptions,
-    provider_attempt_limit: u32,
-    allow_cross_station_before_first_output: bool,
-) {
+pub(super) struct CrossStationFailoverBlockedParams<'a> {
+    pub(super) service_name: &'a str,
+    pub(super) request_id: u64,
+    pub(super) station_name: &'a str,
+    pub(super) strict_multi_config: bool,
+    pub(super) provider_attempt: u32,
+    pub(super) cross_station_failover_enabled: bool,
+    pub(super) provider_opt: &'a RetryLayerOptions,
+    pub(super) provider_attempt_limit: u32,
+    pub(super) allow_cross_station_before_first_output: bool,
+}
+
+pub(super) fn log_cross_station_failover_blocked(params: CrossStationFailoverBlockedParams<'_>) {
+    let CrossStationFailoverBlockedParams {
+        service_name,
+        request_id,
+        station_name,
+        strict_multi_config,
+        provider_attempt,
+        cross_station_failover_enabled,
+        provider_opt,
+        provider_attempt_limit,
+        allow_cross_station_before_first_output,
+    } = params;
+
     if !(strict_multi_config
         && provider_attempt == 0
         && !cross_station_failover_enabled

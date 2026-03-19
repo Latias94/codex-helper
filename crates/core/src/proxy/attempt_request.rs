@@ -15,6 +15,22 @@ pub(super) struct AttemptRequestSetup {
     pub(super) debug_base: Option<HttpDebugBase>,
 }
 
+struct HttpDebugBaseParams<'a> {
+    client_headers: &'a HeaderMap,
+    client_headers_entries_cache: &'a OnceLock<Vec<HeaderEntry>>,
+    upstream_request_headers: &'a HeaderMap,
+    request_body_len: usize,
+    upstream_request_body_len: usize,
+    debug_max: usize,
+    warn_max: usize,
+    client_uri: &'a str,
+    target_url: &'a str,
+    client_body_debug: Option<&'a BodyPreview>,
+    upstream_request_body_debug: Option<&'a BodyPreview>,
+    client_body_warn: Option<&'a BodyPreview>,
+    upstream_request_body_warn: Option<&'a BodyPreview>,
+}
+
 pub(super) struct AttemptRequestSetupParams<'a> {
     pub(super) proxy: &'a ProxyService,
     pub(super) auth: &'a UpstreamAuth,
@@ -56,10 +72,10 @@ pub(super) fn prepare_attempt_request(
     let mut headers = filter_request_headers(client_headers);
     inject_auth_headers(proxy.service_name, auth, &mut headers);
 
-    let debug_base = build_http_debug_base(
+    let debug_base = build_http_debug_base(HttpDebugBaseParams {
         client_headers,
         client_headers_entries_cache,
-        &headers,
+        upstream_request_headers: &headers,
         request_body_len,
         upstream_request_body_len,
         debug_max,
@@ -70,7 +86,7 @@ pub(super) fn prepare_attempt_request(
         upstream_request_body_debug,
         client_body_warn,
         upstream_request_body_warn,
-    );
+    });
 
     AttemptRequestSetup {
         headers,
@@ -97,21 +113,23 @@ fn inject_auth_headers(service_name: &str, auth: &UpstreamAuth, headers: &mut He
     }
 }
 
-fn build_http_debug_base(
-    client_headers: &HeaderMap,
-    client_headers_entries_cache: &OnceLock<Vec<HeaderEntry>>,
-    upstream_request_headers: &HeaderMap,
-    request_body_len: usize,
-    upstream_request_body_len: usize,
-    debug_max: usize,
-    warn_max: usize,
-    client_uri: &str,
-    target_url: &str,
-    client_body_debug: Option<&BodyPreview>,
-    upstream_request_body_debug: Option<&BodyPreview>,
-    client_body_warn: Option<&BodyPreview>,
-    upstream_request_body_warn: Option<&BodyPreview>,
-) -> Option<HttpDebugBase> {
+fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBase> {
+    let HttpDebugBaseParams {
+        client_headers,
+        client_headers_entries_cache,
+        upstream_request_headers,
+        request_body_len,
+        upstream_request_body_len,
+        debug_max,
+        warn_max,
+        client_uri,
+        target_url,
+        client_body_debug,
+        upstream_request_body_debug,
+        client_body_warn,
+        upstream_request_body_warn,
+    } = params;
+
     if debug_max == 0 && warn_max == 0 {
         return None;
     }

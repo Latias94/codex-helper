@@ -28,14 +28,28 @@ pub use self::runtime_types::{
 pub use self::session_identity::{
     ActiveRequest, FinishRequestParams, FinishedRequest, ResolvedRouteValue,
     RouteDecisionProvenance, RouteValueSource, SessionBinding, SessionContinuityMode,
-    SessionIdentityCard, SessionManualOverrides, SessionObservationScope, SessionStats,
-    build_session_identity_cards_from_parts, enrich_session_identity_cards_with_host_transcripts,
+    SessionIdentityCard, SessionIdentityCardBuildInputs, SessionManualOverrides,
+    SessionObservationScope, SessionStats, build_session_identity_cards_from_parts,
+    enrich_session_identity_cards_with_host_transcripts,
     enrich_session_identity_cards_with_runtime,
 };
 use self::session_identity::{
     SessionBindingEntry, SessionCwdCacheEntry, SessionEffortOverride, SessionModelOverride,
     SessionServiceTierOverride, SessionStationOverride,
 };
+
+type PassiveStationHealthMap =
+    HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>;
+
+pub struct PassiveUpstreamFailureRecord {
+    pub service_name: String,
+    pub station_name: String,
+    pub base_url: String,
+    pub status_code: Option<u16>,
+    pub error_class: Option<String>,
+    pub error: Option<String>,
+    pub now_ms: u64,
+}
 
 fn recent_finished_max() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
@@ -76,8 +90,7 @@ pub struct ProxyState {
     recent_finished: RwLock<VecDeque<FinishedRequest>>,
     usage_rollups: RwLock<HashMap<String, UsageRollup>>,
     station_health: RwLock<HashMap<String, HashMap<String, StationHealth>>>,
-    passive_station_health:
-        RwLock<HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>>,
+    passive_station_health: RwLock<PassiveStationHealthMap>,
     station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
     lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
 }
@@ -756,23 +769,24 @@ impl ProxyState {
         entry.record_success(now_ms, status_code);
     }
 
-    pub async fn record_passive_upstream_failure(
-        &self,
-        service_name: &str,
-        station_name: &str,
-        base_url: &str,
-        status_code: Option<u16>,
-        error_class: Option<String>,
-        error: Option<String>,
-        now_ms: u64,
-    ) {
+    pub async fn record_passive_upstream_failure(&self, params: PassiveUpstreamFailureRecord) {
+        let PassiveUpstreamFailureRecord {
+            service_name,
+            station_name,
+            base_url,
+            status_code,
+            error_class,
+            error,
+            now_ms,
+        } = params;
+
         let mut guard = self.passive_station_health.write().await;
         let entry = guard
-            .entry(service_name.to_string())
+            .entry(service_name)
             .or_default()
-            .entry(station_name.to_string())
+            .entry(station_name)
             .or_default()
-            .entry(base_url.to_string())
+            .entry(base_url)
             .or_default();
         entry.record_failure(now_ms, status_code, error_class, error);
     }
@@ -1509,17 +1523,17 @@ impl ProxyState {
             self.get_global_station_override(),
             self.list_session_stats(),
         );
-        build_session_identity_cards_from_parts(
-            &active,
-            &recent,
-            &overrides,
-            &station_overrides,
-            &model_overrides,
-            &service_tier_overrides,
-            &bindings,
-            global_station_override.as_deref(),
-            &stats,
-        )
+        build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
+            active: &active,
+            recent: &recent,
+            overrides: &overrides,
+            station_overrides: &station_overrides,
+            model_overrides: &model_overrides,
+            service_tier_overrides: &service_tier_overrides,
+            bindings: &bindings,
+            global_station_override: global_station_override.as_deref(),
+            stats: &stats,
+        })
     }
 
     pub async fn list_session_identity_cards_with_host_transcripts(
@@ -1796,17 +1810,17 @@ mod tests {
             },
         )]);
 
-        let cards = build_session_identity_cards_from_parts(
-            &active,
-            &recent,
-            &overrides,
-            &config_overrides,
-            &model_overrides,
-            &service_tier_overrides,
-            &HashMap::new(),
-            None,
-            &stats,
-        );
+        let cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
+            active: &active,
+            recent: &recent,
+            overrides: &overrides,
+            station_overrides: &config_overrides,
+            model_overrides: &model_overrides,
+            service_tier_overrides: &service_tier_overrides,
+            bindings: &HashMap::new(),
+            global_station_override: None,
+            stats: &stats,
+        });
 
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].session_id.as_deref(), Some("sid-recent"));
@@ -1910,17 +1924,17 @@ mod tests {
             },
         )]);
 
-        let cards = build_session_identity_cards_from_parts(
-            &active,
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &bindings,
-            None,
-            &HashMap::new(),
-        );
+        let cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
+            active: &active,
+            recent: &[],
+            overrides: &HashMap::new(),
+            station_overrides: &HashMap::new(),
+            model_overrides: &HashMap::new(),
+            service_tier_overrides: &HashMap::new(),
+            bindings: &bindings,
+            global_station_override: None,
+            stats: &HashMap::new(),
+        });
 
         assert_eq!(cards[0].binding_profile_name.as_deref(), Some("daily"));
         assert_eq!(
@@ -1997,17 +2011,17 @@ mod tests {
             },
         )]);
 
-        let cards = build_session_identity_cards_from_parts(
-            &active,
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &bindings,
-            Some("right"),
-            &HashMap::new(),
-        );
+        let cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
+            active: &active,
+            recent: &[],
+            overrides: &HashMap::new(),
+            station_overrides: &HashMap::new(),
+            model_overrides: &HashMap::new(),
+            service_tier_overrides: &HashMap::new(),
+            bindings: &bindings,
+            global_station_override: Some("right"),
+            stats: &HashMap::new(),
+        });
 
         assert_eq!(cards[0].binding_profile_name.as_deref(), Some("daily"));
         assert_eq!(
@@ -2276,15 +2290,15 @@ mod tests {
                 )
                 .await;
             state
-                .record_passive_upstream_failure(
-                    "codex",
-                    "right",
-                    "https://right.example/v1",
-                    Some(500),
-                    Some("cloudflare_timeout".to_string()),
-                    Some("upstream timed out".to_string()),
-                    20,
-                )
+                .record_passive_upstream_failure(PassiveUpstreamFailureRecord {
+                    service_name: "codex".to_string(),
+                    station_name: "right".to_string(),
+                    base_url: "https://right.example/v1".to_string(),
+                    status_code: Some(500),
+                    error_class: Some("cloudflare_timeout".to_string()),
+                    error: Some("upstream timed out".to_string()),
+                    now_ms: 20,
+                })
                 .await;
             state
                 .record_passive_upstream_success(
@@ -2335,15 +2349,15 @@ mod tests {
         runtime.block_on(async {
             let state = ProxyState::new();
             state
-                .record_passive_upstream_failure(
-                    "codex",
-                    "right",
-                    "https://right.example/v1",
-                    Some(500),
-                    Some("cloudflare_timeout".to_string()),
-                    Some("upstream timed out".to_string()),
-                    10,
-                )
+                .record_passive_upstream_failure(PassiveUpstreamFailureRecord {
+                    service_name: "codex".to_string(),
+                    station_name: "right".to_string(),
+                    base_url: "https://right.example/v1".to_string(),
+                    status_code: Some(500),
+                    error_class: Some("cloudflare_timeout".to_string()),
+                    error: Some("upstream timed out".to_string()),
+                    now_ms: 10,
+                })
                 .await;
             state
                 .record_passive_upstream_success(

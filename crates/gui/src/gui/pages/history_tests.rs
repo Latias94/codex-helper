@@ -93,10 +93,12 @@ fn empty_snapshot() -> GuiRuntimeSnapshot {
 
 #[test]
 fn prepare_select_session_from_external_resets_scope_and_focus() {
-    let mut state = HistoryViewState::default();
-    state.scope = HistoryScope::CurrentProject;
-    state.query = "old".to_string();
-    state.applied_query = "old".to_string();
+    let mut state = HistoryViewState {
+        scope: HistoryScope::CurrentProject,
+        query: "old".to_string(),
+        applied_query: "old".to_string(),
+        ..Default::default()
+    };
 
     prepare_select_session_from_external(
         &mut state,
@@ -130,12 +132,14 @@ fn merge_external_focus_session_preserves_local_file_when_richer() {
 
 #[test]
 fn ensure_external_focus_visible_inserts_selected_external_summary() {
-    let mut state = HistoryViewState::default();
-    state.external_focus = Some(ExternalHistoryFocus {
-        summary: sample_summary("sid-ext", SessionSummarySource::ObservedOnly),
-        origin: ExternalHistoryOrigin::Sessions,
-    });
-    state.selected_id = Some("sid-ext".to_string());
+    let mut state = HistoryViewState {
+        external_focus: Some(ExternalHistoryFocus {
+            summary: sample_summary("sid-ext", SessionSummarySource::ObservedOnly),
+            origin: ExternalHistoryOrigin::Sessions,
+        }),
+        selected_id: Some("sid-ext".to_string()),
+        ..Default::default()
+    };
 
     ensure_external_focus_visible(&mut state);
 

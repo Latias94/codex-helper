@@ -7,7 +7,7 @@ use crate::dashboard_core::{
     build_provider_options_from_view, build_station_options_from_mgr,
     summarize_recent_retry_observations,
 };
-use crate::state::build_session_identity_cards_from_parts;
+use crate::state::{SessionIdentityCardBuildInputs, build_session_identity_cards_from_parts};
 
 use super::ProxyService;
 use super::control_plane_manifest::api_v1_operator_summary_links;
@@ -97,17 +97,17 @@ pub(super) async fn build_operator_summary(
         proxy.state.list_health_checks(proxy.service_name),
         proxy.state.get_lb_view(),
     );
-    let session_cards = build_session_identity_cards_from_parts(
-        &active,
-        &recent,
-        &session_effort,
-        &session_station,
-        &session_model,
-        &session_service_tier,
-        &session_bindings,
-        global_station_override.as_deref(),
-        &session_stats,
-    );
+    let session_cards = build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
+        active: &active,
+        recent: &recent,
+        overrides: &session_effort,
+        station_overrides: &session_station,
+        model_overrides: &session_model,
+        service_tier_overrides: &session_service_tier,
+        bindings: &session_bindings,
+        global_station_override: global_station_override.as_deref(),
+        stats: &session_stats,
+    });
     let default_profile_summary = default_profile.as_deref().and_then(|profile_name| {
         resolve_service_profile(mgr, profile_name)
             .ok()

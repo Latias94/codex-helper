@@ -9,7 +9,7 @@ use crate::state::{RouteDecisionProvenance, SessionBinding};
 use super::ProxyService;
 use super::request_body::apply_model_override;
 use super::request_preparation::build_body_previews;
-use super::route_provenance::build_route_decision_provenance;
+use super::route_provenance::{RouteDecisionProvenanceParams, build_route_decision_provenance};
 
 pub(super) struct SelectedUpstreamRequestSetup {
     pub(super) model_note: String,
@@ -65,11 +65,11 @@ pub(super) fn prepare_selected_upstream_request(
     let (model_note, body_for_selected) =
         apply_selected_model_mapping(selected, body_for_upstream, request_model);
     let provider_id = selected.upstream.tags.get("provider_id").cloned();
-    let route_decision = build_route_decision_provenance(
-        now_ms(),
+    let route_decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
+        decided_at_ms: now_ms(),
         session_binding,
         session_override_config,
-        global_station_override,
+        global_config_override: global_station_override,
         override_model,
         override_effort,
         override_service_tier,
@@ -77,8 +77,8 @@ pub(super) fn prepare_selected_upstream_request(
         effective_effort,
         effective_service_tier,
         selected,
-        provider_id.as_deref(),
-    );
+        provider_id: provider_id.as_deref(),
+    });
 
     let filtered_body = proxy.filter.apply_bytes(body_for_selected);
     let upstream_request_body_len = filtered_body.len();
