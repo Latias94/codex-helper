@@ -163,6 +163,14 @@ pub(super) fn render_retry_panel(
         ui.separator();
         ui.label(pick(ctx.lang, "Resolved policy", "Resolved policy"));
         if let Some(retry) = snapshot.resolved_retry.as_ref() {
+            ui.small(retry_policy_preview_text(
+                ctx.lang,
+                snapshot
+                    .configured_retry
+                    .as_ref()
+                    .and_then(|retry| retry.profile),
+                retry,
+            ));
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "upstream: {} / attempts={}",
@@ -216,4 +224,60 @@ pub(super) fn render_retry_panel(
             ));
         }
     });
+}
+
+fn retry_policy_preview_text(
+    lang: Language,
+    configured_profile: Option<RetryProfileName>,
+    retry: &crate::config::ResolvedRetryConfig,
+) -> String {
+    let profile = configured_profile
+        .map(|profile| retry_profile_name_value(profile).to_string())
+        .unwrap_or_else(|| pick(lang, "auto/balanced", "auto/balanced").to_string());
+    let cross_station = if retry.allow_cross_station_before_first_output {
+        pick(lang, "允许", "allowed")
+    } else {
+        pick(lang, "关闭", "disabled")
+    };
+    format!(
+        "{}: profile={} | upstream {} x{} | provider {} x{} | {}={}",
+        pick(lang, "预览", "Preview"),
+        profile,
+        retry_strategy_label(retry.upstream.strategy),
+        retry.upstream.max_attempts,
+        retry_strategy_label(retry.provider.strategy),
+        retry.provider.max_attempts,
+        pick(lang, "首包前跨站", "cross-station before first output"),
+        cross_station
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_policy_preview_mentions_cross_station_boundary() {
+        let retry = RetryProfileName::AggressiveFailover.defaults();
+
+        let text = retry_policy_preview_text(
+            Language::En,
+            Some(RetryProfileName::AggressiveFailover),
+            &retry,
+        );
+
+        assert!(text.contains("profile=aggressive-failover"));
+        assert!(text.contains("cross-station before first output=allowed"));
+        assert!(text.contains("provider failover x3"));
+    }
+
+    #[test]
+    fn retry_policy_preview_marks_default_balanced_when_profile_missing() {
+        let retry = RetryProfileName::Balanced.defaults();
+
+        let text = retry_policy_preview_text(Language::En, None, &retry);
+
+        assert!(text.contains("profile=auto/balanced"));
+        assert!(text.contains("cross-station before first output=disabled"));
+    }
 }
