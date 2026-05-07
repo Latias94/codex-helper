@@ -8,6 +8,11 @@ use tokio::sync::Semaphore;
 use crate::config::UpstreamConfig;
 use crate::state::{ProxyState, UpstreamHealth};
 
+pub const HEALTHCHECK_TIMEOUT_MS_ENV: &str = "CODEX_HELPER_HEALTHCHECK_TIMEOUT_MS";
+pub const HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV: &str =
+    "CODEX_HELPER_HEALTHCHECK_UPSTREAM_CONCURRENCY";
+pub const HEALTHCHECK_MAX_INFLIGHT_ENV: &str = "CODEX_HELPER_HEALTHCHECK_MAX_INFLIGHT";
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -23,8 +28,7 @@ fn shorten_err(err: &str, max: usize) -> String {
 }
 
 fn health_check_timeout_ms() -> u64 {
-    std::env::var("CODEX_HELPER_HEALTHCHECK_TIMEOUT_MS")
-        .or_else(|_| std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_TIMEOUT_MS"))
+    std::env::var(HEALTHCHECK_TIMEOUT_MS_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
@@ -33,8 +37,7 @@ fn health_check_timeout_ms() -> u64 {
 }
 
 fn health_check_upstream_concurrency() -> usize {
-    std::env::var("CODEX_HELPER_HEALTHCHECK_UPSTREAM_CONCURRENCY")
-        .or_else(|_| std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_UPSTREAM_CONCURRENCY"))
+    std::env::var(HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -43,8 +46,7 @@ fn health_check_upstream_concurrency() -> usize {
 }
 
 fn health_check_max_inflight_stations() -> usize {
-    std::env::var("CODEX_HELPER_HEALTHCHECK_MAX_INFLIGHT")
-        .or_else(|_| std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT"))
+    std::env::var(HEALTHCHECK_MAX_INFLIGHT_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)

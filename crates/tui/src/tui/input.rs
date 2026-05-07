@@ -15,6 +15,9 @@ use crate::config::{
     storage::{load_config, save_config},
 };
 use crate::dashboard_core::{ControlProfileOption, build_model_options_from_mgr};
+use crate::healthcheck::{
+    HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
+};
 use crate::sessions::{
     SessionSummary, SessionSummarySource, find_codex_session_file_by_id, read_codex_session_meta,
     read_codex_session_transcript,
@@ -867,7 +870,7 @@ fn shorten_err(err: &str, max: usize) -> String {
 }
 
 fn health_check_timeout() -> Duration {
-    let ms = std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_TIMEOUT_MS")
+    let ms = std::env::var(HEALTHCHECK_TIMEOUT_MS_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
@@ -877,7 +880,7 @@ fn health_check_timeout() -> Duration {
 }
 
 fn health_check_upstream_concurrency() -> usize {
-    std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_UPSTREAM_CONCURRENCY")
+    std::env::var(HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -886,7 +889,7 @@ fn health_check_upstream_concurrency() -> usize {
 }
 
 fn health_check_max_inflight_stations() -> usize {
-    std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT")
+    std::env::var(HEALTHCHECK_MAX_INFLIGHT_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)

@@ -4,6 +4,9 @@ use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::config::{ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryStrategy};
+use crate::healthcheck::{
+    HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
+};
 use crate::tui::model::{Palette, Snapshot, now_ms, shorten_middle};
 use crate::tui::state::UiState;
 
@@ -96,10 +99,9 @@ pub(super) fn render_settings_page(
     };
     let refresh_env = std::env::var("CODEX_HELPER_TUI_REFRESH_MS").ok();
     let recent_max_env = std::env::var("CODEX_HELPER_RECENT_FINISHED_MAX").ok();
-    let health_timeout_env = std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_TIMEOUT_MS").ok();
-    let health_inflight_env = std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_MAX_INFLIGHT").ok();
-    let health_upstream_conc_env =
-        std::env::var("CODEX_HELPER_TUI_HEALTHCHECK_UPSTREAM_CONCURRENCY").ok();
+    let health_timeout_env = std::env::var(HEALTHCHECK_TIMEOUT_MS_ENV).ok();
+    let health_inflight_env = std::env::var(HEALTHCHECK_MAX_INFLIGHT_ENV).ok();
+    let health_upstream_conc_env = std::env::var(HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV).ok();
 
     let effective_recent_max = recent_max_env
         .as_deref()
