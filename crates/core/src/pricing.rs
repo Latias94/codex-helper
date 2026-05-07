@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -366,6 +366,20 @@ pub struct ModelPriceView {
     pub confidence: CostConfidence,
 }
 
+impl ModelPriceView {
+    pub fn matches_model(&self, model: &str) -> bool {
+        let lookup_keys = model_lookup_keys(model);
+        std::iter::once(self.model_id.as_str())
+            .chain(self.aliases.iter().map(String::as_str))
+            .map(normalize_model_key)
+            .any(|price_key| {
+                lookup_keys
+                    .iter()
+                    .any(|lookup_key| lookup_key == &price_key)
+            })
+    }
+}
+
 impl From<&ModelPrice> for ModelPriceView {
     fn from(price: &ModelPrice) -> Self {
         Self {
@@ -390,6 +404,51 @@ pub struct ModelPriceCatalogSnapshot {
     pub model_count: usize,
     #[serde(default)]
     pub models: Vec<ModelPriceView>,
+}
+
+impl ModelPriceCatalogSnapshot {
+    pub fn prioritized_models<'a, I, S>(
+        &'a self,
+        observed_models: I,
+        limit: usize,
+    ) -> Vec<&'a ModelPriceView>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut used = BTreeSet::new();
+        let mut rows = Vec::new();
+
+        for model in observed_models {
+            let model = model.as_ref().trim();
+            if model.is_empty() {
+                continue;
+            }
+            if let Some((idx, row)) = self
+                .models
+                .iter()
+                .enumerate()
+                .find(|(idx, row)| !used.contains(idx) && row.matches_model(model))
+            {
+                used.insert(idx);
+                rows.push(row);
+                if rows.len() >= limit {
+                    return rows;
+                }
+            }
+        }
+
+        for (idx, row) in self.models.iter().enumerate() {
+            if used.insert(idx) {
+                rows.push(row);
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        rows
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -848,6 +907,28 @@ mod tests {
         assert_eq!(gpt5.output_per_1m_usd, "10");
         assert_eq!(gpt5.cache_read_input_per_1m_usd.as_deref(), Some("0.125"));
         assert_eq!(gpt5.confidence, CostConfidence::Estimated);
+    }
+
+    #[test]
+    fn model_price_view_matches_reasoning_suffixed_model() {
+        let snapshot = bundled_model_price_catalog_snapshot();
+        let row = snapshot
+            .models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.3-codex")
+            .expect("gpt-5.3-codex price row");
+
+        assert!(row.matches_model("GPT-5.3-CODEX-HIGH"));
+    }
+
+    #[test]
+    fn catalog_snapshot_prioritizes_observed_models_then_fills_catalog_order() {
+        let snapshot = bundled_model_price_catalog_snapshot();
+        let rows = snapshot.prioritized_models(["gpt-5.4-mini", "unknown-model"], 3);
+
+        assert_eq!(rows[0].model_id, "gpt-5.4-mini");
+        assert_eq!(rows.len(), 3);
+        assert!(rows[1..].iter().all(|row| row.model_id != "gpt-5.4-mini"));
     }
 
     #[test]

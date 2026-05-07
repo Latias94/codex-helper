@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
@@ -72,6 +74,101 @@ fn retry_policy_preview_lines(retry: &ResolvedRetryConfig) -> Vec<String> {
         retry.cooldown_backoff_max_secs
     ));
     lines
+}
+
+fn pricing_catalog_preview_lines(snapshot: &Snapshot, limit: usize) -> Vec<String> {
+    let catalog = &snapshot.pricing_catalog;
+    let mut lines = vec![format!(
+        "source={}  models={}",
+        catalog.source, catalog.model_count
+    )];
+    if catalog.models.is_empty() {
+        lines.push("no price rows".to_string());
+        return lines;
+    }
+
+    for row in prioritized_price_rows(snapshot, limit) {
+        lines.push(format!(
+            "{}  in={} out={} cr={} cc={}  {}/{}",
+            shorten_middle(&price_model_label(row), 24),
+            format_price(&row.input_per_1m_usd),
+            format_price(&row.output_per_1m_usd),
+            format_optional_price(row.cache_read_input_per_1m_usd.as_deref()),
+            format_optional_price(row.cache_creation_input_per_1m_usd.as_deref()),
+            confidence_label(row.confidence),
+            row.source
+        ));
+    }
+
+    lines
+}
+
+fn prioritized_price_rows(
+    snapshot: &Snapshot,
+    limit: usize,
+) -> Vec<&crate::pricing::ModelPriceView> {
+    snapshot
+        .pricing_catalog
+        .prioritized_models(recent_model_order(snapshot), limit)
+}
+
+fn recent_model_order(snapshot: &Snapshot) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for request in &snapshot.recent {
+        if let Some(model) = request
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            *counts.entry(model.to_string()).or_default() += 1;
+        }
+    }
+    for row in &snapshot.rows {
+        if let Some(model) = row
+            .effective_model
+            .as_ref()
+            .map(|value| value.value.as_str())
+            .or(row.last_model.as_deref())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            *counts.entry(model.to_string()).or_default() += 1;
+        }
+    }
+
+    let mut models = counts.into_iter().collect::<Vec<_>>();
+    models.sort_by(|(left_model, left_count), (right_model, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_model.cmp(right_model))
+    });
+    models.into_iter().map(|(model, _)| model).collect()
+}
+
+fn price_model_label(row: &crate::pricing::ModelPriceView) -> String {
+    match row.display_name.as_deref() {
+        Some(display) if display != row.model_id => format!("{display} ({})", row.model_id),
+        Some(display) => display.to_string(),
+        None => row.model_id.clone(),
+    }
+}
+
+fn format_price(value: &str) -> String {
+    format!("${value}")
+}
+
+fn format_optional_price(value: Option<&str>) -> String {
+    value.map(format_price).unwrap_or_else(|| "-".to_string())
+}
+
+fn confidence_label(confidence: crate::pricing::CostConfidence) -> &'static str {
+    match confidence {
+        crate::pricing::CostConfidence::Unknown => "unknown",
+        crate::pricing::CostConfidence::Partial => "partial",
+        crate::pricing::CostConfidence::Estimated => "estimated",
+        crate::pricing::CostConfidence::Exact => "exact",
+    }
 }
 
 pub(super) fn render_settings_page(
@@ -174,6 +271,18 @@ pub(super) fn render_settings_page(
             Span::styled("5m top station: ", Style::default().fg(p.muted)),
             Span::styled(cfg.to_string(), Style::default().fg(p.text)),
             Span::styled(format!("  n={n}"), Style::default().fg(p.muted)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        crate::tui::i18n::pick(ui.language, "价格目录", "Pricing catalog"),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    for line in pricing_catalog_preview_lines(snapshot, 6) {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default().fg(p.muted)),
+            Span::styled(line, Style::default().fg(p.muted)),
         ]));
     }
 

@@ -15,6 +15,7 @@ use crate::dashboard_core::{
     OperatorRuntimeSummary, OperatorSummaryCounts, OperatorSummaryLinks, ProviderOption,
     RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationOption, WindowStats,
 };
+use crate::pricing::{ModelPriceCatalogSnapshot, bundled_model_price_catalog_snapshot};
 use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
     SessionIdentityCard, SessionManualOverrides, SessionStats, StationHealth, UsageRollupView,

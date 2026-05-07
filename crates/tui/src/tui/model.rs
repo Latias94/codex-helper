@@ -8,6 +8,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::config::ProxyConfig;
 use crate::dashboard_core::WindowStats;
 pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
+use crate::pricing::ModelPriceCatalogSnapshot;
 use crate::state::{
     FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot, ProxyState,
     ResolvedRouteValue, SessionIdentityCard, SessionObservationScope, StationHealth,
@@ -90,6 +91,7 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) lb_view: HashMap<String, LbConfigView>,
     pub(in crate::tui) stats_5m: WindowStats,
     pub(in crate::tui) stats_1h: WindowStats,
+    pub(in crate::tui) pricing_catalog: ModelPriceCatalogSnapshot,
     pub(in crate::tui) refreshed_at: Instant,
 }
 
@@ -622,6 +624,7 @@ pub(in crate::tui) async fn refresh_snapshot(
         lb_view: snap.lb_view,
         stats_5m: snap.stats_5m,
         stats_1h: snap.stats_1h,
+        pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
         refreshed_at: Instant::now(),
     }
 }
@@ -790,6 +793,7 @@ mod tests {
             lb_view: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };
 
@@ -906,6 +910,7 @@ mod tests {
             lb_view: HashMap::new(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
             refreshed_at: Instant::now(),
         };
 

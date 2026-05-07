@@ -161,6 +161,7 @@ mod stats;
 mod stats_control_trace;
 mod stats_control_trace_loader;
 mod stats_control_trace_summary;
+mod stats_pricing;
 mod stats_summary;
 mod view_state;
 

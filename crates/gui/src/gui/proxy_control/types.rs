@@ -18,6 +18,7 @@ use crate::dashboard_core::{
     WindowStats,
 };
 use crate::logging::ControlTraceLogEntry;
+use crate::pricing::{ModelPriceCatalogSnapshot, bundled_model_price_catalog_snapshot};
 use crate::proxy::{local_admin_base_url_for_proxy_port, local_proxy_base_url};
 use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
@@ -92,6 +93,7 @@ pub struct AttachedStatus {
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
+    pub pricing_catalog: ModelPriceCatalogSnapshot,
     pub lb_view: HashMap<String, LbConfigView>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
@@ -101,6 +103,7 @@ pub struct AttachedStatus {
     pub operator_counts: Option<OperatorSummaryCounts>,
     pub operator_summary_links: Option<OperatorSummaryLinks>,
     pub supports_operator_summary_api: bool,
+    pub supports_pricing_catalog_api: bool,
     pub configured_retry: Option<RetryConfig>,
     pub resolved_retry: Option<ResolvedRetryConfig>,
     pub supports_retry_config_api: bool,
@@ -152,6 +155,7 @@ impl AttachedStatus {
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
+            pricing_catalog: bundled_model_price_catalog_snapshot(),
             lb_view: HashMap::new(),
             runtime_loaded_at_ms: None,
             runtime_source_mtime_ms: None,
@@ -161,6 +165,7 @@ impl AttachedStatus {
             operator_counts: None,
             operator_summary_links: None,
             supports_operator_summary_api: false,
+            supports_pricing_catalog_api: false,
             configured_retry: None,
             resolved_retry: None,
             supports_retry_config_api: false,
@@ -209,11 +214,13 @@ pub struct GuiRuntimeSnapshot {
     pub provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
+    pub pricing_catalog: ModelPriceCatalogSnapshot,
     pub operator_runtime_summary: Option<OperatorRuntimeSummary>,
     pub operator_retry_summary: Option<OperatorRetrySummary>,
     pub operator_health_summary: Option<OperatorHealthSummary>,
     pub operator_counts: Option<OperatorSummaryCounts>,
     pub supports_operator_summary_api: bool,
+    pub supports_pricing_catalog_api: bool,
     pub configured_retry: Option<RetryConfig>,
     pub resolved_retry: Option<ResolvedRetryConfig>,
     pub supports_v1: bool,

@@ -76,6 +76,7 @@ pub(super) struct ResolvedApiV1Surface {
     pub(super) profiles: bool,
     pub(super) providers: bool,
     pub(super) retry_config: bool,
+    pub(super) pricing_catalog: bool,
     pub(super) provider_specs: bool,
     pub(super) station_specs: bool,
     pub(super) persisted_station_settings: bool,
@@ -110,6 +111,7 @@ const API_V1_SESSION_OVERRIDE_RESET_ENDPOINT: &str =
 const API_V1_CONTROL_TRACE_ENDPOINT: &str = "/__codex_helper/api/v1/control-trace";
 const API_V1_STATION_PERSISTED_SETTINGS_UPDATE_ENDPOINT: &str =
     "/__codex_helper/api/v1/stations/{name}";
+const API_V1_PRICING_CATALOG_ENDPOINT: &str = "/__codex_helper/api/v1/pricing/catalog";
 const API_V1_STATION_PROBE_ENDPOINT: &str = "/__codex_helper/api/v1/stations/probe";
 const API_V1_SESSION_OVERRIDES_ENDPOINT: &str = "/__codex_helper/api/v1/overrides/session";
 const API_V1_GLOBAL_STATION_OVERRIDE_ENDPOINT: &str =
@@ -190,6 +192,11 @@ pub(super) fn resolve_api_v1_surface(
             endpoints,
             API_V1_RETRY_CONFIG_ENDPOINT,
         ),
+        pricing_catalog: supports_capability_flag(
+            surface.pricing_catalog,
+            endpoints,
+            API_V1_PRICING_CATALOG_ENDPOINT,
+        ),
         provider_specs: supports_capability_flag(
             surface.provider_specs,
             endpoints,
@@ -262,6 +269,7 @@ pub(super) fn resolve_api_v1_surface(
 fn apply_resolved_surface(attached: &mut AttachedStatus, resolved_surface: ResolvedApiV1Surface) {
     attached.supports_operator_summary_api = resolved_surface.operator_summary;
     attached.supports_retry_config_api = resolved_surface.retry_config;
+    attached.supports_pricing_catalog_api = resolved_surface.pricing_catalog;
     attached.supports_provider_spec_api = resolved_surface.provider_specs;
     attached.supports_station_spec_api = resolved_surface.station_specs;
     attached.supports_persisted_station_settings = resolved_surface.persisted_station_settings;
@@ -323,6 +331,7 @@ fn discovery_surface_score(surface: &ControlPlaneSurfaceCapabilities) -> u32 {
         surface.session_override_reset,
         surface.global_station_override,
         surface.control_trace,
+        surface.pricing_catalog,
         surface.runtime_reload,
         surface.healthcheck_start,
         surface.healthcheck_cancel,

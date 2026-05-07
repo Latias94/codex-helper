@@ -28,6 +28,7 @@ pub(super) fn apply_refresh_result(att: &mut AttachedStatus, result: RefreshResu
     att.usage_rollup = result.usage_rollup;
     att.stats_5m = result.stats_5m;
     att.stats_1h = result.stats_1h;
+    att.pricing_catalog = result.pricing_catalog;
     att.lb_view = result.lb_view;
     att.runtime_loaded_at_ms = result.runtime_loaded_at_ms;
     att.runtime_source_mtime_ms = result.runtime_source_mtime_ms;
@@ -37,6 +38,7 @@ pub(super) fn apply_refresh_result(att: &mut AttachedStatus, result: RefreshResu
     att.operator_counts = result.operator_counts;
     att.operator_summary_links = result.operator_summary_links;
     att.supports_operator_summary_api = result.supports_operator_summary_api;
+    att.supports_pricing_catalog_api = result.supports_pricing_catalog_api;
     att.configured_retry = result.configured_retry;
     att.resolved_retry = result.resolved_retry;
     att.supports_retry_config_api = result.supports_retry_config_api;

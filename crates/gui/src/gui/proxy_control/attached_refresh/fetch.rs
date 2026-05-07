@@ -61,6 +61,7 @@ pub(super) struct RefreshResult {
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
+    pub pricing_catalog: ModelPriceCatalogSnapshot,
     pub lb_view: HashMap<String, LbConfigView>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
@@ -70,6 +71,7 @@ pub(super) struct RefreshResult {
     pub operator_counts: Option<OperatorSummaryCounts>,
     pub operator_summary_links: Option<OperatorSummaryLinks>,
     pub supports_operator_summary_api: bool,
+    pub supports_pricing_catalog_api: bool,
     pub configured_retry: Option<RetryConfig>,
     pub resolved_retry: Option<ResolvedRetryConfig>,
     pub supports_retry_config_api: bool,
@@ -200,6 +202,7 @@ pub(super) async fn refresh_from_base(
     let supports_profiles = resolved_surface.profiles;
     let supports_providers = resolved_surface.providers;
     let supports_retry_config_api = resolved_surface.retry_config;
+    let supports_pricing_catalog_api = resolved_surface.pricing_catalog;
     let supports_provider_spec_api = resolved_surface.provider_specs;
     let supports_station_spec_api = resolved_surface.station_specs;
     let supports_default_profile_override = resolved_surface.default_profile_override;
@@ -252,6 +255,23 @@ pub(super) async fn refresh_from_base(
         .as_ref()
         .and_then(|summary| summary.links.clone());
     let operator_summary_links_ref = operator_summary_links.as_ref();
+    let pricing_catalog = if supports_pricing_catalog_api {
+        get_json::<ModelPriceCatalogSnapshot>(
+            client,
+            linked_url(
+                base,
+                operator_summary_links_ref,
+                |summary_links| summary_links.pricing_catalog.as_str(),
+                "/__codex_helper/api/v1/pricing/catalog",
+            ),
+            req_timeout,
+        )
+        .await
+        .ok()
+        .unwrap_or_else(bundled_model_price_catalog_snapshot)
+    } else {
+        bundled_model_price_catalog_snapshot()
+    };
     let configured_profiles = if supports_profiles {
         get_json::<ProfilesResponse>(
             client,
@@ -428,6 +448,7 @@ pub(super) async fn refresh_from_base(
             usage_rollup: snapshot.usage_rollup,
             stats_5m: snapshot.stats_5m,
             stats_1h: snapshot.stats_1h,
+            pricing_catalog,
             lb_view: snapshot.lb_view,
             runtime_loaded_at_ms: operator_runtime_summary
                 .as_ref()
@@ -443,6 +464,7 @@ pub(super) async fn refresh_from_base(
             operator_counts,
             operator_summary_links,
             supports_operator_summary_api,
+            supports_pricing_catalog_api,
             configured_retry: configured_retry
                 .as_ref()
                 .map(|(configured, _)| configured.clone()),
@@ -740,6 +762,7 @@ pub(super) async fn refresh_from_base(
         usage_rollup: UsageRollupView::default(),
         stats_5m: WindowStats::default(),
         stats_1h: WindowStats::default(),
+        pricing_catalog,
         lb_view: HashMap::new(),
         runtime_loaded_at_ms: operator_runtime_summary
             .as_ref()
@@ -755,6 +778,7 @@ pub(super) async fn refresh_from_base(
         operator_counts,
         operator_summary_links,
         supports_operator_summary_api,
+        supports_pricing_catalog_api,
         configured_retry: configured_retry
             .as_ref()
             .map(|(configured, _)| configured.clone()),
