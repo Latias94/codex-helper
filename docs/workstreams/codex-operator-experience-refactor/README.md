@@ -58,10 +58,9 @@ Current weak points:
   - resize redraws do not force a full terminal clear
   - the Stations table highlight spacing differs from other tables
   - the header/status bar has long single-line text that can break narrow layouts
-- Usage metrics are not cache-aware enough for Codex/Claude-style billing.
-- Cost estimation is still helper-level and environment-price based in UI code.
-- Balance/usage polling is useful but not yet a first-class provider balance model.
-- Request logs do not yet provide a full explainable request chain with cost, cache, requested/effective model, and attempt-level decision detail.
+- Usage metrics and cost calculation now have a core cache-aware path, but price catalog sync / override UX still needs product polish.
+- Balance/usage polling is now projected as first-class balance snapshots, but more provider adapters and policy weighting are still needed.
+- Request logs and API DTOs expose route/cost/cache facts, but long-horizon audit/search still needs a durable ledger decision.
 - GUI exists, but the operator experience still needs a clearer product contract for requests, costs, balances, and policy editing.
 
 ## Working Principle

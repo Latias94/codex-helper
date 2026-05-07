@@ -624,7 +624,7 @@ pub(in crate::tui) async fn refresh_snapshot(
         lb_view: snap.lb_view,
         stats_5m: snap.stats_5m,
         stats_1h: snap.stats_1h,
-        pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+        pricing_catalog: crate::pricing::operator_model_price_catalog_snapshot(),
         refreshed_at: Instant::now(),
     }
 }

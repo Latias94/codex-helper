@@ -31,7 +31,7 @@ pub(super) async fn get_retry_config(
 pub(super) async fn get_pricing_catalog(
     _proxy: ProxyService,
 ) -> Result<Json<crate::pricing::ModelPriceCatalogSnapshot>, (StatusCode, String)> {
-    Ok(Json(crate::pricing::bundled_model_price_catalog_snapshot()))
+    Ok(Json(crate::pricing::operator_model_price_catalog_snapshot()))
 }
 
 pub(super) async fn set_retry_config(

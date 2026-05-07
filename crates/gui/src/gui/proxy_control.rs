@@ -228,7 +228,7 @@ impl ProxyController {
                 provider_balances: r.provider_balances.clone(),
                 stats_5m: r.stats_5m.clone(),
                 stats_1h: r.stats_1h.clone(),
-                pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+                pricing_catalog: crate::pricing::operator_model_price_catalog_snapshot(),
                 operator_runtime_summary: Some(local_operator_runtime_summary(r)),
                 operator_retry_summary: Some(local_operator_retry_summary(r)),
                 operator_health_summary: Some(local_operator_health_summary(r)),

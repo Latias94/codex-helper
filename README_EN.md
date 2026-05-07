@@ -602,6 +602,7 @@ Most users do not need to touch these. If you want deeper customization, these f
 - Main config: `~/.codex-helper/config.toml` (preferred) or `~/.codex-helper/config.json` (legacy). If both exist, `config.toml` wins.
 - Filter rules: `~/.codex-helper/filter.json`
 - Usage providers: `~/.codex-helper/usage_providers.json`
+- Pricing overrides: `~/.codex-helper/pricing_overrides.toml`
 - Request logs: `~/.codex-helper/logs/requests.jsonl`
 - Detailed debug logs (optional): `~/.codex-helper/logs/requests_debug.jsonl` (only created when `http_debug` split is enabled)
 - Session stats cache (auto-generated): `~/.codex-helper/cache/session_stats.json` (speeds up `session list/search` rounds/timestamps; invalidated by session file `mtime+size`—delete this file to force a full rescan if needed)
@@ -651,6 +652,25 @@ Key ideas:
 - `level`: priority group for level-based config routing (1..=10, lower is higher priority; defaults to 1);
 - `enabled`: whether the config participates in automatic routing (defaults to true);
 - each `upstream` is one endpoint, ordered by priority (primary → backups).
+
+### `pricing_overrides.toml`
+
+The bundled price catalog covers common Codex/OpenAI models. If your relay provider uses custom model aliases, prices, or multipliers, add `~/.codex-helper/pricing_overrides.toml`. Overrides replace bundled rows with the same model id and can also add new models; request cost calculation and GUI/TUI pricing views use the merged catalog.
+
+```toml
+[models.gpt-5]
+display_name = "GPT-5 via relay"
+aliases = ["relay-gpt5"]
+input_per_1m_usd = "1.10"
+output_per_1m_usd = "8.80"
+cache_read_input_per_1m_usd = "0.11"
+cache_creation_input_per_1m_usd = "0"
+confidence = "estimated"
+
+[models.custom-codex]
+input_per_1m_usd = "0.50"
+output_per_1m_usd = "1.50"
+```
 
 ### `usage_providers.json`
 

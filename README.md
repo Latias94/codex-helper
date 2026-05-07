@@ -574,6 +574,7 @@ codex-helper session last --path ~/code/my-app
 - 主配置：`~/.codex-helper/config.toml`（优先）或 `~/.codex-helper/config.json`（兼容）
 - 请求过滤：`~/.codex-helper/filter.json`
 - 用量提供商：`~/.codex-helper/usage_providers.json`
+- 价格覆盖：`~/.codex-helper/pricing_overrides.toml`
 - 请求日志：`~/.codex-helper/logs/requests.jsonl`
 - 详细调试日志（可选）：`~/.codex-helper/logs/requests_debug.jsonl`（仅在启用 `http_debug` 拆分时生成）
 - 会话统计缓存（自动生成）：`~/.codex-helper/cache/session_stats.json`（用于加速 `session list/search` 的轮数/时间统计；以 session 文件 `mtime+size` 作为失效条件，如怀疑不准可直接删除该文件强制重建）
@@ -623,6 +624,25 @@ tags = { source = "codex-config", provider_id = "openai" }
 - `level`：用于跨配置分组路由（1..=10，越小优先级越高；默认 1）；
 - `enabled`：该配置是否参与自动路由（默认 true）；
 - 每个 `upstream` 表示一个上游 endpoint，顺序 = 优先级（primary → backup...）。
+
+### 价格覆盖（Pricing Overrides）
+
+内置价格目录覆盖常见 Codex/OpenAI 模型；如果你使用的中转商模型别名、价格或倍率不同，可以添加 `~/.codex-helper/pricing_overrides.toml`。该文件会覆盖内置同名模型，也可以新增模型，成本计算和 GUI/TUI 价格目录都会使用合并后的结果。
+
+```toml
+[models.gpt-5]
+display_name = "GPT-5 via relay"
+aliases = ["relay-gpt5"]
+input_per_1m_usd = "1.10"
+output_per_1m_usd = "8.80"
+cache_read_input_per_1m_usd = "0.11"
+cache_creation_input_per_1m_usd = "0"
+confidence = "estimated"
+
+[models.custom-codex]
+input_per_1m_usd = "0.50"
+output_per_1m_usd = "1.50"
+```
 
 ### 用量提供商（Usage Providers）
 

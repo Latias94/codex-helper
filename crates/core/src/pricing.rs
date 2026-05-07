@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -349,6 +350,48 @@ impl ModelPrice {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ModelPriceOverridesFile {
+    #[serde(default)]
+    models: BTreeMap<String, ModelPriceOverride>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ModelPriceOverride {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
+    input_per_1m_usd: String,
+    output_per_1m_usd: String,
+    #[serde(default)]
+    cache_read_input_per_1m_usd: Option<String>,
+    #[serde(default)]
+    cache_creation_input_per_1m_usd: Option<String>,
+    #[serde(default)]
+    confidence: Option<CostConfidence>,
+}
+
+impl ModelPriceOverride {
+    fn into_model_price(self, model_id: String, source: &str) -> Result<ModelPrice, String> {
+        let mut price = ModelPrice::from_per_million_usd(
+            model_id,
+            self.display_name,
+            &self.input_per_1m_usd,
+            &self.output_per_1m_usd,
+            self.cache_read_input_per_1m_usd.as_deref(),
+            self.cache_creation_input_per_1m_usd.as_deref(),
+            source.to_string(),
+        )
+        .ok_or_else(|| "invalid USD decimal price".to_string())?
+        .with_aliases(self.aliases);
+        if let Some(confidence) = self.confidence {
+            price.confidence = confidence;
+        }
+        Ok(price)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelPriceView {
     pub model_id: String,
@@ -533,6 +576,78 @@ pub fn bundled_model_price_catalog() -> &'static ModelPriceCatalog {
 
 pub fn bundled_model_price_catalog_snapshot() -> ModelPriceCatalogSnapshot {
     bundled_model_price_catalog().snapshot("bundled")
+}
+
+pub fn model_price_overrides_path() -> PathBuf {
+    crate::config::proxy_home_dir().join("pricing_overrides.toml")
+}
+
+fn parse_model_price_overrides_toml(text: &str, source: &str) -> Result<Vec<ModelPrice>, String> {
+    let parsed: ModelPriceOverridesFile =
+        toml::from_str(text).map_err(|err| format!("invalid pricing override TOML: {err}"))?;
+    let mut prices = Vec::new();
+    for (model_id, override_row) in parsed.models {
+        let model_id = model_id.trim().to_string();
+        if model_id.is_empty() {
+            return Err("pricing override model id cannot be empty".to_string());
+        }
+        let price = override_row
+            .into_model_price(model_id.clone(), source)
+            .map_err(|err| format!("invalid pricing override for model '{model_id}': {err}"))?;
+        prices.push(price);
+    }
+    Ok(prices)
+}
+
+fn load_model_price_overrides_from_disk() -> Result<Vec<ModelPrice>, String> {
+    let path = model_price_overrides_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    parse_model_price_overrides_toml(&text, &format!("local:{}", path.display()))
+}
+
+fn build_operator_model_price_catalog() -> (ModelPriceCatalog, String) {
+    let mut catalog = bundled_model_price_catalog().clone();
+    match load_model_price_overrides_from_disk() {
+        Ok(overrides) if overrides.is_empty() => (catalog, "bundled".to_string()),
+        Ok(overrides) => {
+            let override_count = overrides.len();
+            for price in overrides {
+                catalog.insert(price);
+            }
+            (
+                catalog,
+                format!("bundled+local-overrides({override_count})"),
+            )
+        }
+        Err(err) => {
+            static WARNED: OnceLock<()> = OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::warn!("failed to load model price overrides: {err}");
+            });
+            (catalog, "bundled".to_string())
+        }
+    }
+}
+
+pub fn operator_model_price_catalog_snapshot() -> ModelPriceCatalogSnapshot {
+    let (catalog, source) = build_operator_model_price_catalog();
+    catalog.snapshot(source)
+}
+
+pub fn estimate_request_cost_from_operator_catalog(
+    model: Option<&str>,
+    usage: Option<&UsageMetrics>,
+    adjustments: CostAdjustments,
+) -> CostBreakdown {
+    let (Some(model), Some(usage)) = (model, usage) else {
+        return CostBreakdown::unknown();
+    };
+    let (catalog, _) = build_operator_model_price_catalog();
+    catalog.estimate_usage_cost(model, usage, adjustments)
 }
 
 pub fn estimate_request_cost_from_bundled_catalog(
@@ -929,6 +1044,43 @@ mod tests {
         assert_eq!(rows[0].model_id, "gpt-5.4-mini");
         assert_eq!(rows.len(), 3);
         assert!(rows[1..].iter().all(|row| row.model_id != "gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn parses_local_price_overrides_and_replaces_bundled_rows() {
+        let text = r#"
+[models.gpt-5]
+display_name = "Custom GPT-5"
+aliases = ["custom-gpt5"]
+input_per_1m_usd = "9"
+output_per_1m_usd = "18"
+cache_read_input_per_1m_usd = "0.9"
+cache_creation_input_per_1m_usd = "0.1"
+confidence = "exact"
+
+[models.custom-relay]
+input_per_1m_usd = "0.5"
+output_per_1m_usd = "1.5"
+"#;
+        let overrides = parse_model_price_overrides_toml(text, "local-test").expect("overrides");
+        let mut catalog = bundled_model_price_catalog().clone();
+        for price in overrides {
+            catalog.insert(price);
+        }
+
+        let gpt5 = catalog
+            .price_for_model("custom-gpt5")
+            .expect("override alias");
+        assert_eq!(gpt5.display_name.as_deref(), Some("Custom GPT-5"));
+        assert_eq!(gpt5.input_per_1m.format_usd(), "9");
+        assert_eq!(gpt5.output_per_1m.format_usd(), "18");
+        assert_eq!(gpt5.confidence, CostConfidence::Exact);
+
+        let custom = catalog
+            .price_for_model("custom-relay")
+            .expect("new override model");
+        assert_eq!(custom.input_per_1m.format_usd(), "0.5");
+        assert_eq!(custom.source, "local-test");
     }
 
     #[test]
