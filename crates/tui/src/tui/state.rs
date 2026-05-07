@@ -207,21 +207,20 @@ impl Default for UiState {
 
 impl UiState {
     pub(in crate::tui) fn clamp_selection(&mut self, snapshot: &Snapshot, providers_len: usize) {
-        if providers_len == 0 {
-            self.selected_station_idx = 0;
-            self.stations_table.select(None);
-        } else {
-            self.selected_station_idx = self.selected_station_idx.min(providers_len - 1);
-            self.stations_table.select(Some(self.selected_station_idx));
-        }
+        self.selected_station_idx = clamp_table_selection(
+            &mut self.stations_table,
+            Some(self.selected_station_idx),
+            providers_len,
+        )
+        .unwrap_or(0);
 
         if snapshot.rows.is_empty() {
             self.selected_session_idx = 0;
             self.selected_session_id = None;
-            self.sessions_table.select(None);
+            clamp_table_selection(&mut self.sessions_table, None, 0);
 
             self.selected_request_idx = 0;
-            self.requests_table.select(None);
+            clamp_table_selection(&mut self.requests_table, None, 0);
             return;
         }
 
@@ -236,38 +235,51 @@ impl UiState {
             self.selected_session_idx = self.selected_session_idx.min(snapshot.rows.len() - 1);
             self.selected_session_id = snapshot.rows[self.selected_session_idx].session_id.clone();
         }
-        self.sessions_table.select(Some(self.selected_session_idx));
+        self.selected_session_idx = clamp_table_selection(
+            &mut self.sessions_table,
+            Some(self.selected_session_idx),
+            snapshot.rows.len(),
+        )
+        .unwrap_or(0);
 
         let req_len = filtered_requests_len(snapshot, self.selected_session_idx);
-        if req_len == 0 {
-            self.selected_request_idx = 0;
-            self.requests_table.select(None);
-        } else {
-            self.selected_request_idx = self.selected_request_idx.min(req_len - 1);
-            self.requests_table.select(Some(self.selected_request_idx));
-        }
+        self.selected_request_idx = clamp_table_selection(
+            &mut self.requests_table,
+            Some(self.selected_request_idx),
+            req_len,
+        )
+        .unwrap_or(0);
 
         let stats_stations_len = snapshot.usage_rollup.by_config.len();
-        if stats_stations_len == 0 {
-            self.selected_stats_station_idx = 0;
-            self.stats_stations_table.select(None);
-        } else {
-            self.selected_stats_station_idx =
-                self.selected_stats_station_idx.min(stats_stations_len - 1);
-            self.stats_stations_table
-                .select(Some(self.selected_stats_station_idx));
-        }
+        self.selected_stats_station_idx = clamp_table_selection(
+            &mut self.stats_stations_table,
+            Some(self.selected_stats_station_idx),
+            stats_stations_len,
+        )
+        .unwrap_or(0);
 
         let stats_providers_len = snapshot.usage_rollup.by_provider.len();
-        if stats_providers_len == 0 {
-            self.selected_stats_provider_idx = 0;
-            self.stats_providers_table.select(None);
-        } else {
-            self.selected_stats_provider_idx = self
-                .selected_stats_provider_idx
-                .min(stats_providers_len - 1);
-            self.stats_providers_table
-                .select(Some(self.selected_stats_provider_idx));
+        self.selected_stats_provider_idx = clamp_table_selection(
+            &mut self.stats_providers_table,
+            Some(self.selected_stats_provider_idx),
+            stats_providers_len,
+        )
+        .unwrap_or(0);
+    }
+
+    pub(in crate::tui) fn reset_table_viewports(&mut self) {
+        for table in [
+            &mut self.stations_table,
+            &mut self.sessions_table,
+            &mut self.requests_table,
+            &mut self.request_page_table,
+            &mut self.sessions_page_table,
+            &mut self.codex_history_table,
+            &mut self.codex_recent_table,
+            &mut self.stats_stations_table,
+            &mut self.stats_providers_table,
+        ] {
+            *table.offset_mut() = 0;
         }
     }
 
@@ -288,12 +300,12 @@ impl UiState {
             .codex_history_sessions
             .get(self.selected_codex_history_idx)
             .map(|summary| summary.id.clone());
-        self.codex_history_table
-            .select(if self.codex_history_sessions.is_empty() {
-                None
-            } else {
-                Some(self.selected_codex_history_idx)
-            });
+        self.selected_codex_history_idx = clamp_table_selection(
+            &mut self.codex_history_table,
+            Some(self.selected_codex_history_idx),
+            self.codex_history_sessions.len(),
+        )
+        .unwrap_or(0);
     }
 
     pub(in crate::tui) fn prepare_codex_history_external_focus(
@@ -310,6 +322,23 @@ impl UiState {
         self.selected_codex_history_id = Some(sid);
         self.sync_codex_history_selection();
     }
+}
+
+fn clamp_table_selection(
+    table: &mut TableState,
+    selected: Option<usize>,
+    len: usize,
+) -> Option<usize> {
+    if len == 0 {
+        table.select(None);
+        *table.offset_mut() = 0;
+        return None;
+    }
+
+    let selected = selected.unwrap_or(0).min(len - 1);
+    table.select(Some(selected));
+    *table.offset_mut() = table.offset().min(len - 1).min(selected);
+    Some(selected)
 }
 
 pub(in crate::tui) fn merge_codex_history_external_focus(
@@ -336,8 +365,7 @@ pub(in crate::tui) fn adjust_table_selection(
     len: usize,
 ) -> Option<usize> {
     if len == 0 {
-        table.select(None);
-        return None;
+        return clamp_table_selection(table, None, len);
     }
     let cur = table.selected().unwrap_or(0);
     let next = if delta.is_negative() {
@@ -345,8 +373,7 @@ pub(in crate::tui) fn adjust_table_selection(
     } else {
         (cur + delta as usize).min(len - 1)
     };
-    table.select(Some(next));
-    Some(next)
+    clamp_table_selection(table, Some(next), len)
 }
 
 #[cfg(test)]
@@ -409,5 +436,38 @@ mod tests {
         assert_eq!(ui.selected_codex_history_idx, 1);
         assert_eq!(ui.selected_codex_history_id.as_deref(), Some("sid-b"));
         assert_eq!(ui.codex_history_table.selected(), Some(1));
+    }
+
+    #[test]
+    fn table_selection_clamp_resets_stale_offset() {
+        let mut table = TableState::default()
+            .with_offset(25)
+            .with_selected(Some(25));
+
+        let selected = clamp_table_selection(&mut table, Some(25), 3);
+
+        assert_eq!(selected, Some(2));
+        assert_eq!(table.selected(), Some(2));
+        assert_eq!(table.offset(), 2);
+
+        let selected = clamp_table_selection(&mut table, Some(2), 0);
+
+        assert_eq!(selected, None);
+        assert_eq!(table.selected(), None);
+        assert_eq!(table.offset(), 0);
+    }
+
+    #[test]
+    fn reset_table_viewports_keeps_selection_but_clears_offsets() {
+        let mut ui = UiState::default();
+        ui.stations_table = TableState::default().with_offset(8).with_selected(Some(9));
+        ui.sessions_table = TableState::default().with_offset(3).with_selected(Some(4));
+
+        ui.reset_table_viewports();
+
+        assert_eq!(ui.stations_table.selected(), Some(9));
+        assert_eq!(ui.stations_table.offset(), 0);
+        assert_eq!(ui.sessions_table.selected(), Some(4));
+        assert_eq!(ui.sessions_table.offset(), 0);
     }
 }

@@ -106,6 +106,7 @@ pub async fn run_dashboard(
                 // region changes (e.g., switching tabs). A full clear on page switch keeps the
                 // UI visually consistent without clearing on every tick.
                 request_full_clear(&mut render_invalidation);
+                ui.reset_table_viewports();
                 last_drawn_page = ui.page;
             }
             if matches!(render_invalidation, RenderInvalidation::FullClear) {
@@ -301,6 +302,7 @@ pub async fn run_dashboard(
                         }
                     }
                     Event::Resize(_, _) => {
+                        ui.reset_table_viewports();
                         request_full_clear(&mut render_invalidation);
                     }
                     _ => {}

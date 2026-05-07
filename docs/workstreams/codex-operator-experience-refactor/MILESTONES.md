@@ -52,6 +52,12 @@ Suggested verification:
   - resize terminal narrower/wider
   - switch pages repeatedly
 
+Current implementation slice:
+
+- Full-clear invalidation is used on page switches and terminal resize.
+- Stateful table viewport offsets are clamped with selection state and reset on page switch/resize to avoid stale rows after data or size changes.
+- Header status lines now have final display-width fitting, including CJK width, so narrow terminals clip predictably instead of overflowing.
+
 ### P0.2 Usage Metrics v2
 
 Scope:

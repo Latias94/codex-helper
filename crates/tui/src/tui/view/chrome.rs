@@ -4,6 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::model::{Palette, Snapshot, shorten_middle};
 use crate::tui::state::UiState;
@@ -22,6 +23,69 @@ fn push_header_metric(
 ) {
     spans.push(Span::styled(label.into(), label_style));
     spans.push(Span::styled(value.into(), value_style));
+}
+
+fn text_prefix_by_width(text: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(ch_width) > max_width {
+            break;
+        }
+        out.push(ch);
+        width = width.saturating_add(ch_width);
+    }
+    out
+}
+
+fn truncate_text_to_width(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    format!(
+        "{}…",
+        text_prefix_by_width(text, max_width.saturating_sub(1))
+    )
+}
+
+fn fit_spans_to_width(spans: Vec<Span<'static>>, max_width: u16) -> Line<'static> {
+    let max_width = usize::from(max_width);
+    if max_width == 0 {
+        return Line::from("");
+    }
+
+    let mut used = 0usize;
+    let mut fitted = Vec::new();
+    for span in spans {
+        let width = UnicodeWidthStr::width(span.content.as_ref());
+        if used.saturating_add(width) <= max_width {
+            used = used.saturating_add(width);
+            fitted.push(span);
+            continue;
+        }
+
+        let remaining = max_width.saturating_sub(used);
+        if remaining > 0 {
+            let style = span.style;
+            fitted.push(Span::styled(
+                truncate_text_to_width(span.content.as_ref(), remaining),
+                style,
+            ));
+        }
+        break;
+    }
+    Line::from(fitted)
+}
+
+fn fit_line_to_width(line: Line<'static>, max_width: u16) -> Line<'static> {
+    fit_spans_to_width(line.spans, max_width)
 }
 
 pub(super) fn render_header(
@@ -426,7 +490,8 @@ pub(super) fn render_header(
         }
     }
 
-    let subtitle = Line::from(subtitle_spans);
+    let title = fit_line_to_width(title, inner.width);
+    let subtitle = fit_spans_to_width(subtitle_spans, inner.width);
 
     let tabs = ratatui::widgets::Tabs::new(
         page_titles(ui.language)
@@ -584,4 +649,38 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
         Paragraph::new(Text::from(line)).wrap(Wrap { trim: true }),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_width(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    }
+
+    #[test]
+    fn fit_spans_to_width_truncates_overlong_header_line() {
+        let line = fit_spans_to_width(
+            vec![
+                Span::raw("active 12   "),
+                Span::styled("current very-long-provider-name", Style::default()),
+            ],
+            18,
+        );
+
+        assert!(line_width(&line) <= 18);
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "curre…");
+    }
+
+    #[test]
+    fn fit_spans_to_width_handles_cjk_display_width() {
+        let line = fit_spans_to_width(vec![Span::raw("状态 运行中 provider")], 8);
+
+        assert!(line_width(&line) <= 8);
+        assert_eq!(line.spans[0].content.as_ref(), "状态 运…");
+    }
 }
