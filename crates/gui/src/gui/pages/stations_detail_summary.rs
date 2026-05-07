@@ -8,6 +8,7 @@ pub(super) fn render_station_identity_summary(
     snapshot: &GuiRuntimeSnapshot,
     health: Option<&StationHealth>,
     health_status: Option<&HealthCheckStatus>,
+    balances: Option<&[ProviderBalanceSnapshot]>,
     lb: Option<&LbConfigView>,
     referencing_profiles: &[String],
     configured_active_station: Option<&str>,
@@ -60,6 +61,10 @@ pub(super) fn render_station_identity_summary(
     ui.label(format!(
         "health: {}",
         format_runtime_station_health_status(health, health_status)
+    ));
+    ui.label(format!(
+        "balance: {}",
+        super::stations_detail_health::format_station_balance_summary(balances)
     ));
     ui.label(format!("breaker: {}", format_runtime_lb_summary(lb)));
     ui.label(format!(

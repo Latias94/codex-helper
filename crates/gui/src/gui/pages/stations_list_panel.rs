@@ -1,3 +1,4 @@
+use super::stations_detail_health::format_station_balance_summary;
 use super::*;
 
 pub(super) fn render_station_list_panel(
@@ -35,6 +36,12 @@ pub(super) fn render_station_list_panel(
                 );
                 let breaker_label =
                     format_runtime_lb_summary(runtime_maps.lb_view.get(cfg.name.as_str()));
+                let balance_label = format_station_balance_summary(
+                    runtime_maps
+                        .provider_balances
+                        .get(cfg.name.as_str())
+                        .map(Vec::as_slice),
+                );
 
                 let mut label = format!("L{} {}", cfg.level.clamp(1, 10), cfg.name);
                 if let Some(alias) = cfg.alias.as_deref()
@@ -54,7 +61,7 @@ pub(super) fn render_station_list_panel(
                 let capability_hover =
                     runtime_config_capability_hover_text(ctx.lang, &cfg.capabilities);
                 let hover = format!(
-                    "health: {health_label}\nbreaker: {breaker_label}\n{}\nsource: {}",
+                    "health: {health_label}\nbalance: {balance_label}\nbreaker: {breaker_label}\n{}\nsource: {}",
                     capability_hover,
                     format_runtime_station_source(ctx.lang, cfg)
                 );
@@ -66,8 +73,9 @@ pub(super) fn render_station_list_panel(
                     *selected_name = Some(cfg.name.clone());
                 }
                 ui.small(format!(
-                    "{}  |  {}",
+                    "{}  |  {}  |  {}",
                     health_label,
+                    balance_label,
                     format_runtime_config_capability_label(ctx.lang, &cfg.capabilities)
                 ));
                 ui.add_space(4.0);

@@ -219,6 +219,7 @@ Current implementation slice:
 - Projected provider balance snapshots through the dashboard API, local GUI runtime state, attach refresh, and TUI snapshot.
 - Converted PackyCode budget and YesCode profile polling into balance snapshots while keeping quota exhaustion as an LB eligibility flag, not a health failure.
 - Added balance snapshot summaries to the shared station routing posture DTO so GUI/TUI auto-switch previews can mark `ok`, `exhausted`, `stale`, and `error` balance states in candidate order.
+- Added shared GUI station balance summaries to the Stations list, identity summary, and balance detail section so exhausted/stale/error quota state is visible before drilling into rows.
 
 ### P1.3 GUI Request Observatory
 

@@ -1,5 +1,88 @@
 use super::*;
 
+pub(super) fn format_station_balance_summary(
+    balances: Option<&[ProviderBalanceSnapshot]>,
+) -> String {
+    let Some(balances) = balances else {
+        return "unknown".to_string();
+    };
+    if balances.is_empty() {
+        return "unknown".to_string();
+    }
+
+    let mut ok = 0usize;
+    let mut exhausted = 0usize;
+    let mut stale = 0usize;
+    let mut error = 0usize;
+    let mut unknown = 0usize;
+    for balance in balances {
+        match balance.status {
+            BalanceSnapshotStatus::Ok => ok += 1,
+            BalanceSnapshotStatus::Exhausted => exhausted += 1,
+            BalanceSnapshotStatus::Stale => stale += 1,
+            BalanceSnapshotStatus::Error => error += 1,
+            BalanceSnapshotStatus::Unknown => unknown += 1,
+        }
+    }
+
+    let primary = balances
+        .iter()
+        .min_by(|left, right| balance_priority(left, right));
+    let headline = primary
+        .map(|balance| balance.status.as_str())
+        .unwrap_or("unknown");
+    let mut parts = vec![
+        format!("status={headline}"),
+        format!("rows={}", balances.len()),
+    ];
+    push_nonzero_count(&mut parts, "ok", ok);
+    push_nonzero_count(&mut parts, "exhausted", exhausted);
+    push_nonzero_count(&mut parts, "stale", stale);
+    push_nonzero_count(&mut parts, "error", error);
+    push_nonzero_count(&mut parts, "unknown", unknown);
+
+    if let Some(primary) = primary {
+        let target = match primary.upstream_index {
+            Some(idx) => format!("{}#{}", shorten_middle(&primary.provider_id, 18), idx),
+            None => shorten_middle(&primary.provider_id, 18),
+        };
+        parts.push(format!("primary={target}"));
+        let amount = primary.amount_summary();
+        if amount != "-" {
+            parts.push(amount);
+        }
+    }
+
+    parts.join(" ")
+}
+
+fn push_nonzero_count(parts: &mut Vec<String>, label: &str, count: usize) {
+    if count > 0 {
+        parts.push(format!("{label}={count}"));
+    }
+}
+
+fn balance_priority(
+    left: &ProviderBalanceSnapshot,
+    right: &ProviderBalanceSnapshot,
+) -> std::cmp::Ordering {
+    balance_status_rank(left.status)
+        .cmp(&balance_status_rank(right.status))
+        .then_with(|| left.upstream_index.cmp(&right.upstream_index))
+        .then_with(|| left.provider_id.cmp(&right.provider_id))
+        .then_with(|| left.fetched_at_ms.cmp(&right.fetched_at_ms))
+}
+
+fn balance_status_rank(status: BalanceSnapshotStatus) -> u8 {
+    match status {
+        BalanceSnapshotStatus::Error => 0,
+        BalanceSnapshotStatus::Exhausted => 1,
+        BalanceSnapshotStatus::Stale => 2,
+        BalanceSnapshotStatus::Unknown => 3,
+        BalanceSnapshotStatus::Ok => 4,
+    }
+}
+
 pub(super) fn render_station_health_section(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
@@ -142,6 +225,7 @@ pub(super) fn render_station_balance_section(
             ui.label(pick(ctx.lang, "(无余额数据)", "(no balance data)"));
             return;
         }
+        ui.small(format_station_balance_summary(Some(balances)));
 
         egui::ScrollArea::vertical()
             .id_salt(("stations_balance_scroll", cfg.name.as_str()))
@@ -237,4 +321,37 @@ pub(super) fn render_station_breaker_section(
 fn refresh_runtime_snapshot(ctx: &mut PageCtx<'_>) {
     ctx.proxy
         .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn station_balance_summary_prioritizes_problematic_primary() {
+        let balances = vec![
+            ProviderBalanceSnapshot {
+                provider_id: "ok-provider".to_string(),
+                upstream_index: Some(0),
+                status: BalanceSnapshotStatus::Ok,
+                total_balance_usd: Some("3.5".to_string()),
+                ..Default::default()
+            },
+            ProviderBalanceSnapshot {
+                provider_id: "empty-provider".to_string(),
+                upstream_index: Some(1),
+                status: BalanceSnapshotStatus::Exhausted,
+                total_balance_usd: Some("0".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let summary = format_station_balance_summary(Some(&balances));
+
+        assert!(summary.contains("status=exhausted"));
+        assert!(summary.contains("ok=1"));
+        assert!(summary.contains("exhausted=1"));
+        assert!(summary.contains("primary=empty-provider#1"));
+        assert!(summary.contains("total=$0"));
+    }
 }

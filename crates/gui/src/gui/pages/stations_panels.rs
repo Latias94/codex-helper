@@ -97,6 +97,7 @@ fn render_station_detail_panel(
         snapshot,
         health,
         health_status,
+        balances,
         lb,
         &referencing_profiles,
         configured_active_station,
