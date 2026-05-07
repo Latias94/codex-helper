@@ -28,6 +28,12 @@ pub(super) async fn get_retry_config(
     Ok(Json(build_retry_config_response(cfg.as_ref())))
 }
 
+pub(super) async fn get_pricing_catalog(
+    _proxy: ProxyService,
+) -> Result<Json<crate::pricing::ModelPriceCatalogSnapshot>, (StatusCode, String)> {
+    Ok(Json(crate::pricing::bundled_model_price_catalog_snapshot()))
+}
+
 pub(super) async fn set_retry_config(
     proxy: ProxyService,
     Json(payload): Json<crate::config::RetryConfig>,

@@ -59,6 +59,8 @@ pub struct ControlPlaneSurfaceCapabilities {
     #[serde(default)]
     pub retry_config: bool,
     #[serde(default)]
+    pub pricing_catalog: bool,
+    #[serde(default)]
     pub stations: bool,
     #[serde(default)]
     pub station_runtime: bool,

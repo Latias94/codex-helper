@@ -172,6 +172,8 @@ pub struct OperatorSummaryLinks {
     pub status_station_health: String,
     pub control_trace: String,
     pub retry_config: String,
+    #[serde(default)]
+    pub pricing_catalog: String,
     pub sessions: String,
     pub session_by_id_template: String,
     pub session_overrides: String,

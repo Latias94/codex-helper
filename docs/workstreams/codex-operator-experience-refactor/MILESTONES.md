@@ -181,6 +181,11 @@ Acceptance:
 - Unknown price is shown as unknown, not zero.
 - Costs are calculated in core, not UI.
 
+Current implementation slice:
+
+- Core owns a bundled cache-aware model price catalog and calculates request cost with confidence labels.
+- Added a read-only operator API surface at `/__codex_helper/api/v1/pricing/catalog` so GUI/TUI/attach clients can inspect the price rows, source, confidence, and cache price fields used by core cost estimates.
+
 ### P1.2 Balance Adapter Model
 
 Scope:

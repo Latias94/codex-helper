@@ -349,6 +349,49 @@ impl ModelPrice {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelPriceView {
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    pub input_per_1m_usd: String,
+    pub output_per_1m_usd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_per_1m_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_per_1m_usd: Option<String>,
+    pub source: String,
+    pub confidence: CostConfidence,
+}
+
+impl From<&ModelPrice> for ModelPriceView {
+    fn from(price: &ModelPrice) -> Self {
+        Self {
+            model_id: price.model_id.clone(),
+            display_name: price.display_name.clone(),
+            aliases: price.aliases.clone(),
+            input_per_1m_usd: price.input_per_1m.format_usd(),
+            output_per_1m_usd: price.output_per_1m.format_usd(),
+            cache_read_input_per_1m_usd: price.cache_read_input_per_1m.map(UsdAmount::format_usd),
+            cache_creation_input_per_1m_usd: price
+                .cache_creation_input_per_1m
+                .map(UsdAmount::format_usd),
+            source: price.source.clone(),
+            confidence: price.confidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ModelPriceCatalogSnapshot {
+    pub source: String,
+    pub model_count: usize,
+    #[serde(default)]
+    pub models: Vec<ModelPriceView>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ModelPriceCatalog {
     entries: BTreeMap<String, ModelPrice>,
@@ -409,11 +452,28 @@ impl ModelPriceCatalog {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    pub fn snapshot(&self, source: impl Into<String>) -> ModelPriceCatalogSnapshot {
+        let models = self
+            .entries
+            .values()
+            .map(ModelPriceView::from)
+            .collect::<Vec<_>>();
+        ModelPriceCatalogSnapshot {
+            source: source.into(),
+            model_count: models.len(),
+            models,
+        }
+    }
 }
 
 pub fn bundled_model_price_catalog() -> &'static ModelPriceCatalog {
     static CATALOG: OnceLock<ModelPriceCatalog> = OnceLock::new();
     CATALOG.get_or_init(build_bundled_model_price_catalog)
+}
+
+pub fn bundled_model_price_catalog_snapshot() -> ModelPriceCatalogSnapshot {
+    bundled_model_price_catalog().snapshot("bundled")
 }
 
 pub fn estimate_request_cost_from_bundled_catalog(
@@ -771,6 +831,23 @@ mod tests {
 
         assert!(catalog.price_for_model("gpt-5.3-codex-high").is_some());
         assert!(catalog.price_for_model("GPT-5.1-CODEX-MAX-XHIGH").is_some());
+    }
+
+    #[test]
+    fn bundled_catalog_snapshot_exposes_operator_price_rows() {
+        let snapshot = bundled_model_price_catalog_snapshot();
+
+        assert_eq!(snapshot.source, "bundled");
+        assert_eq!(snapshot.model_count, snapshot.models.len());
+        let gpt5 = snapshot
+            .models
+            .iter()
+            .find(|model| model.model_id == "gpt-5")
+            .expect("gpt-5 price row");
+        assert_eq!(gpt5.input_per_1m_usd, "1.25");
+        assert_eq!(gpt5.output_per_1m_usd, "10");
+        assert_eq!(gpt5.cache_read_input_per_1m_usd.as_deref(), Some("0.125"));
+        assert_eq!(gpt5.confidence, CostConfidence::Estimated);
     }
 
     #[test]

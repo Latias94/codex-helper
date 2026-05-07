@@ -13,7 +13,7 @@ use super::control_plane::{
 use super::control_plane_manifest::{
     API_V1_CAPABILITIES, API_V1_CONTROL_TRACE, API_V1_GLOBAL_STATION_OVERRIDE,
     API_V1_HEALTHCHECK_CANCEL, API_V1_HEALTHCHECK_START, API_V1_OPERATOR_SUMMARY,
-    API_V1_PROFILE_BY_NAME, API_V1_PROFILES, API_V1_PROFILES_DEFAULT,
+    API_V1_PRICING_CATALOG, API_V1_PROFILE_BY_NAME, API_V1_PROFILES, API_V1_PROFILES_DEFAULT,
     API_V1_PROFILES_DEFAULT_PERSISTED, API_V1_PROVIDER_SPEC_BY_NAME, API_V1_PROVIDER_SPECS,
     API_V1_PROVIDERS, API_V1_PROVIDERS_RUNTIME, API_V1_RETRY_CONFIG, API_V1_RUNTIME_RELOAD,
     API_V1_RUNTIME_STATUS, API_V1_SESSION_BY_ID, API_V1_SESSION_OVERRIDE_EFFORT,
@@ -37,8 +37,8 @@ use super::persisted_registry_api::{
 };
 use super::providers_api::{apply_provider_runtime_meta, list_providers};
 use super::runtime_admin_api::{
-    get_control_trace, get_retry_config, list_profiles, reload_runtime_config, runtime_status,
-    set_retry_config,
+    get_control_trace, get_pricing_catalog, get_retry_config, list_profiles, reload_runtime_config,
+    runtime_status, set_retry_config,
 };
 use super::session_overrides::{
     apply_session_manual_overrides, list_session_manual_overrides, list_session_model_overrides,

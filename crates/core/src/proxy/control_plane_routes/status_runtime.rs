@@ -10,6 +10,7 @@ pub(super) fn status_and_runtime_routes(proxy: ProxyService) -> Router {
     let runtime_reload_proxy = proxy.clone();
     let control_trace_proxy = proxy.clone();
     let retry_get_proxy = proxy.clone();
+    let pricing_proxy = proxy.clone();
 
     Router::new()
         .route(
@@ -48,5 +49,9 @@ pub(super) fn status_and_runtime_routes(proxy: ProxyService) -> Router {
             API_V1_RETRY_CONFIG,
             get(move || get_retry_config(retry_get_proxy.clone()))
                 .post(move |payload| set_retry_config(proxy.clone(), payload)),
+        )
+        .route(
+            API_V1_PRICING_CATALOG,
+            get(move || get_pricing_catalog(pricing_proxy.clone())),
         )
 }

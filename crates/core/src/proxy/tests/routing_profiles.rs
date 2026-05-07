@@ -324,6 +324,47 @@ async fn proxy_api_v1_snapshot_works() {
         Some("session_override")
     );
 
+    let caps = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/capabilities",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("capabilities send")
+        .error_for_status()
+        .expect("capabilities status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("capabilities json");
+    assert_eq!(
+        caps["surface_capabilities"]["pricing_catalog"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        caps["endpoints"]
+            .as_array()
+            .expect("endpoint list")
+            .iter()
+            .any(|endpoint| endpoint.as_str() == Some("/__codex_helper/api/v1/pricing/catalog"))
+    );
+
+    let pricing = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/pricing/catalog",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("pricing catalog send")
+        .error_for_status()
+        .expect("pricing catalog status")
+        .json::<crate::pricing::ModelPriceCatalogSnapshot>()
+        .await
+        .expect("pricing catalog json");
+    assert_eq!(pricing.source, "bundled");
+    assert!(pricing.models.iter().any(|model| model.model_id == "gpt-5"));
+
     proxy_handle.abort();
 }
 
