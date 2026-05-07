@@ -79,6 +79,7 @@ pub struct ControlTraceRecordState {
 
 #[derive(Debug)]
 pub struct StatsViewState {
+    pub(super) pricing_editor: StatsPricingEditorState,
     pub control_trace_limit: usize,
     pub control_trace_loaded_limit: usize,
     pub control_trace_loaded_signature: Option<String>,
@@ -94,6 +95,7 @@ pub struct StatsViewState {
 impl Default for StatsViewState {
     fn default() -> Self {
         Self {
+            pricing_editor: StatsPricingEditorState::default(),
             control_trace_limit: 80,
             control_trace_loaded_limit: 0,
             control_trace_loaded_signature: None,
@@ -104,6 +106,35 @@ impl Default for StatsViewState {
             control_trace_entries: Vec::new(),
             control_trace_last_loaded_ms: None,
             control_trace_last_error: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct StatsPricingEditorState {
+    pub(super) selected_model_id: Option<String>,
+    pub(super) draft_model_id: String,
+    pub(super) display_name: String,
+    pub(super) aliases: String,
+    pub(super) input_per_1m_usd: String,
+    pub(super) output_per_1m_usd: String,
+    pub(super) cache_read_input_per_1m_usd: String,
+    pub(super) cache_creation_input_per_1m_usd: String,
+    pub(super) confidence: crate::pricing::CostConfidence,
+}
+
+impl Default for StatsPricingEditorState {
+    fn default() -> Self {
+        Self {
+            selected_model_id: None,
+            draft_model_id: String::new(),
+            display_name: String::new(),
+            aliases: String::new(),
+            input_per_1m_usd: String::new(),
+            output_per_1m_usd: String::new(),
+            cache_read_input_per_1m_usd: String::new(),
+            cache_creation_input_per_1m_usd: String::new(),
+            confidence: crate::pricing::CostConfidence::Estimated,
         }
     }
 }

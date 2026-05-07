@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::pricing::{CostConfidence, ModelPriceView};
 
+use super::stats_pricing_editor::render_local_pricing_overrides;
 use super::*;
 
 pub(super) fn render_pricing_catalog(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
@@ -29,10 +30,21 @@ pub(super) fn render_pricing_catalog(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             "当前价格目录为空，成本会继续显示为未知。",
             "The current price catalog is empty, so costs remain unknown.",
         ));
-        return;
+    } else {
+        render_operator_pricing_catalog(ui, ctx, &snapshot);
     }
 
-    let rows = catalog.prioritized_models(recent_model_order(&snapshot), 30);
+    render_local_pricing_overrides(ui, ctx, &snapshot);
+}
+
+fn render_operator_pricing_catalog(
+    ui: &mut egui::Ui,
+    ctx: &mut PageCtx<'_>,
+    snapshot: &GuiRuntimeSnapshot,
+) {
+    let rows = snapshot
+        .pricing_catalog
+        .prioritized_models(recent_model_order(snapshot), 30);
     egui::ScrollArea::vertical()
         .id_salt("stats_pricing_catalog_scroll")
         .max_height(260.0)
