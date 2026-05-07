@@ -3,7 +3,7 @@ use std::time::Duration;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::model::{Palette, Snapshot, shorten_middle};
@@ -86,6 +86,23 @@ fn fit_spans_to_width(spans: Vec<Span<'static>>, max_width: u16) -> Line<'static
 
 fn fit_line_to_width(line: Line<'static>, max_width: u16) -> Line<'static> {
     fit_spans_to_width(line.spans, max_width)
+}
+
+fn header_tabs_line(p: Palette, ui: &UiState, max_width: u16) -> Line<'static> {
+    let selected = page_index(ui.page);
+    let mut spans = Vec::new();
+    for (idx, title) in page_titles(ui.language).iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if idx == selected {
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.muted)
+        };
+        spans.push(Span::styled((*title).to_string(), style));
+    }
+    fit_spans_to_width(spans, max_width)
 }
 
 pub(super) fn render_header(
@@ -490,16 +507,7 @@ pub(super) fn render_header(
     let title = fit_line_to_width(title, inner.width);
     let subtitle = fit_spans_to_width(subtitle_spans, inner.width);
 
-    let tabs = ratatui::widgets::Tabs::new(
-        page_titles(ui.language)
-            .iter()
-            .map(|t| Line::from(*t))
-            .collect::<Vec<_>>(),
-    )
-    .select(page_index(ui.page))
-    .style(Style::default().fg(p.muted))
-    .highlight_style(Style::default().fg(p.text).add_modifier(Modifier::BOLD))
-    .divider(Span::raw("  "));
+    let tabs = header_tabs_line(p, ui, inner.width);
 
     let block = Block::default()
         .borders(Borders::BOTTOM)
@@ -507,7 +515,7 @@ pub(super) fn render_header(
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(Text::from(title)), chunks[0]);
     f.render_widget(Paragraph::new(Text::from(subtitle)), chunks[1]);
-    f.render_widget(tabs, chunks[2]);
+    f.render_widget(Paragraph::new(Text::from(tabs)), chunks[2]);
 }
 
 pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
@@ -632,20 +640,16 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
     };
     let right = ui.toast.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
 
-    let line = Line::from(vec![
-        Span::styled(left, Style::default().fg(p.muted)),
-        Span::raw(" "),
-        Span::styled(right, Style::default().fg(p.accent)),
-    ]);
-
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(p.border));
-    f.render_widget(block, area);
-    f.render_widget(
-        Paragraph::new(Text::from(line)).wrap(Wrap { trim: true }),
-        area,
-    );
+    let mut spans = vec![Span::styled(left, Style::default().fg(p.muted))];
+    if !right.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            right.to_string(),
+            Style::default().fg(p.accent),
+        ));
+    }
+    let line = fit_spans_to_width(spans, area.width);
+    f.render_widget(Paragraph::new(Text::from(line)), area);
 }
 
 #[cfg(test)]
@@ -679,5 +683,17 @@ mod tests {
 
         assert!(line_width(&line) <= 8);
         assert_eq!(line.spans[0].content.as_ref(), "状态 运…");
+    }
+
+    #[test]
+    fn header_tabs_line_fits_available_width() {
+        let ui = UiState {
+            page: Page::Settings,
+            language: crate::tui::Language::En,
+            ..Default::default()
+        };
+        let line = header_tabs_line(Palette::default(), &ui, 24);
+
+        assert!(line_width(&line) <= 24);
     }
 }

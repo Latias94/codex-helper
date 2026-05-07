@@ -49,6 +49,57 @@ fn request_full_clear(invalidation: &mut RenderInvalidation) {
     *invalidation = RenderInvalidation::FullClear;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderSurfaceKey {
+    page: types::Page,
+    overlay: types::Overlay,
+    focus: types::Focus,
+    stats_focus: types::StatsFocus,
+    selected_station_idx: usize,
+    selected_session_idx: usize,
+    selected_request_idx: usize,
+    selected_request_page_idx: usize,
+    selected_sessions_page_idx: usize,
+    selected_codex_history_idx: usize,
+    codex_recent_selected_idx: usize,
+    selected_stats_station_idx: usize,
+    selected_stats_provider_idx: usize,
+    effort_menu_idx: usize,
+    model_menu_idx: usize,
+    service_tier_menu_idx: usize,
+    profile_menu_idx: usize,
+    provider_menu_idx: usize,
+    station_info_scroll: u16,
+    session_transcript_scroll: u16,
+}
+
+impl RenderSurfaceKey {
+    fn capture(ui: &UiState) -> Self {
+        Self {
+            page: ui.page,
+            overlay: ui.overlay,
+            focus: ui.focus,
+            stats_focus: ui.stats_focus,
+            selected_station_idx: ui.selected_station_idx,
+            selected_session_idx: ui.selected_session_idx,
+            selected_request_idx: ui.selected_request_idx,
+            selected_request_page_idx: ui.selected_request_page_idx,
+            selected_sessions_page_idx: ui.selected_sessions_page_idx,
+            selected_codex_history_idx: ui.selected_codex_history_idx,
+            codex_recent_selected_idx: ui.codex_recent_selected_idx,
+            selected_stats_station_idx: ui.selected_stats_station_idx,
+            selected_stats_provider_idx: ui.selected_stats_provider_idx,
+            effort_menu_idx: ui.effort_menu_idx,
+            model_menu_idx: ui.model_menu_idx,
+            service_tier_menu_idx: ui.service_tier_menu_idx,
+            profile_menu_idx: ui.profile_menu_idx,
+            provider_menu_idx: ui.provider_menu_idx,
+            station_info_scroll: ui.station_info_scroll,
+            session_transcript_scroll: ui.session_transcript_scroll,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_dashboard(
     state: Arc<ProxyState>,
@@ -185,6 +236,7 @@ pub async fn run_dashboard(
                 let Some(Ok(event)) = maybe_event else { continue; };
                 match event {
                     Event::Key(key) if input::should_accept_key_event(&key) => {
+                        let before_surface = RenderSurfaceKey::capture(&ui);
                         if input::handle_key_event(state.clone(), &mut providers, &mut ui, &snapshot, key).await {
                             if ui.needs_snapshot_refresh {
                                 snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
@@ -298,7 +350,12 @@ pub async fn run_dashboard(
                                 }
                                 ui.needs_codex_recent_refresh = false;
                             }
-                            request_redraw(&mut render_invalidation);
+                            let after_surface = RenderSurfaceKey::capture(&ui);
+                            if before_surface != after_surface {
+                                request_full_clear(&mut render_invalidation);
+                            } else {
+                                request_redraw(&mut render_invalidation);
+                            }
                         }
                     }
                     Event::Resize(_, _) => {
