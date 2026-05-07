@@ -1,14 +1,10 @@
-use super::*;
+use crate::dashboard_core::{
+    StationRetryBoundary, StationRoutingCandidate, StationRoutingMode, StationRoutingPosture,
+    StationRoutingPostureInput, StationRoutingSkipReason, StationRoutingSource,
+    build_station_routing_posture,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StationsRoutingPreview {
-    source: String,
-    mode: String,
-    eligible: Vec<String>,
-    skipped: Vec<String>,
-    retry_boundary: String,
-    session_pin_note: Option<String>,
-}
+use super::*;
 
 pub(super) fn render_stations_routing_preview(
     ui: &mut egui::Ui,
@@ -17,312 +13,260 @@ pub(super) fn render_stations_routing_preview(
     runtime_maps: &RuntimeStationMaps,
     configured_active_station: Option<&str>,
 ) {
-    let preview = build_stations_routing_preview(
-        ctx.lang,
-        &snapshot.stations,
-        snapshot.global_station_override.as_deref(),
-        configured_active_station,
-        snapshot.session_station_overrides.len(),
-        snapshot.resolved_retry.as_ref(),
-        runtime_maps,
-    );
+    let posture =
+        build_gui_station_routing_posture(snapshot, runtime_maps, configured_active_station);
 
     ui.group(|ui| {
-        ui.heading(pick(ctx.lang, "Routing preview", "Routing preview"));
+        ui.heading(pick(
+            ctx.lang,
+            "自动切换解释",
+            "Auto-switch explanation",
+        ));
         ui.small(pick(
             ctx.lang,
-            "按当前运行态预览新请求的 station 候选顺序；具体会话仍会先应用 session pin / profile binding。",
-            "Preview the station candidate order for new requests under the current runtime state; concrete sessions still apply session pins and profile bindings first.",
+            "按当前运行态解释新请求会如何选择 station、哪些目标被排除，以及 retry 何时允许跨站。具体会话仍会先应用 session pin / profile binding。",
+            "Explain how new requests choose stations under the current runtime, which targets are excluded, and when retry may cross station boundaries. Concrete sessions still apply session pins and profile bindings first.",
         ));
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
                 "{}: {}",
                 pick(ctx.lang, "来源", "Source"),
-                preview.source
+                format_routing_source(ctx.lang, &posture.source)
             ));
-            ui.label(format!("{}: {}", pick(ctx.lang, "模式", "Mode"), preview.mode));
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "模式", "Mode"),
+                format_routing_mode(ctx.lang, posture.mode)
+            ));
         });
-        ui.small(preview.retry_boundary);
-        if let Some(note) = preview.session_pin_note {
+        ui.small(format_retry_boundary(ctx.lang, posture.retry_boundary));
+        if let Some(summary) = format_recent_switch_observations(ctx.lang, snapshot) {
+            ui.small(summary);
+        }
+        if let Some(note) = session_pin_note(ctx.lang, posture.session_pin_count) {
             ui.colored_label(egui::Color32::from_rgb(200, 120, 40), note);
         }
 
         ui.add_space(4.0);
         ui.label(pick(ctx.lang, "候选顺序", "Candidate order"));
-        if preview.eligible.is_empty() {
+        if posture.eligible_candidates.is_empty() {
             ui.colored_label(
                 egui::Color32::from_rgb(200, 120, 40),
                 pick(ctx.lang, "<无可用候选>", "<no eligible candidates>"),
             );
         } else {
-            for (index, item) in preview.eligible.iter().enumerate() {
-                ui.small(format!("{}. {item}", index + 1));
+            for (index, candidate) in posture.eligible_candidates.iter().enumerate() {
+                ui.small(format!(
+                    "{}. {}",
+                    index + 1,
+                    format_routing_candidate(ctx.lang, candidate)
+                ));
+            }
+            if posture.mode == StationRoutingMode::PinnedStation {
+                ui.small(pick(
+                    ctx.lang,
+                    "pin 模式下 disabled/draining/half-open 仍可被固定路由使用；breaker_open 和无上游会阻断。",
+                    "In pin mode, disabled/draining/half-open stations remain usable for pinned routing; breaker_open and empty upstream pools block it.",
+                ));
             }
         }
 
-        if !preview.skipped.is_empty() {
+        if !posture.skipped.is_empty() {
             ui.add_space(4.0);
             ui.label(pick(ctx.lang, "跳过原因", "Skipped"));
-            for item in &preview.skipped {
-                ui.small(item);
+            for item in &posture.skipped {
+                ui.small(format!(
+                    "{}: {}",
+                    item.station_name,
+                    item.reasons
+                        .iter()
+                        .map(|reason| format_skip_reason(ctx.lang, reason))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
         }
     });
 }
 
-fn build_stations_routing_preview(
-    lang: Language,
-    stations: &[StationOption],
-    global_station_override: Option<&str>,
-    configured_active_station: Option<&str>,
-    session_pin_count: usize,
-    retry: Option<&crate::config::ResolvedRetryConfig>,
+fn build_gui_station_routing_posture(
+    snapshot: &GuiRuntimeSnapshot,
     runtime_maps: &RuntimeStationMaps,
-) -> StationsRoutingPreview {
-    let mut preview =
-        if let Some(global_pin) = global_station_override.and_then(non_empty_trimmed_str) {
-            build_pinned_routing_preview(lang, stations, global_pin, runtime_maps)
-        } else {
-            build_auto_routing_preview(lang, stations, configured_active_station, runtime_maps)
-        };
+    configured_active_station: Option<&str>,
+) -> StationRoutingPosture {
+    let stations = snapshot
+        .stations
+        .iter()
+        .map(|station| {
+            StationRoutingCandidate::from_station_option(
+                station,
+                configured_active_station,
+                runtime_maps.lb_view.get(station.name.as_str()),
+            )
+        })
+        .collect::<Vec<_>>();
 
-    preview.retry_boundary = retry_boundary_text(lang, retry);
-    preview.session_pin_note = session_pin_note(lang, session_pin_count);
-    preview
+    build_station_routing_posture(StationRoutingPostureInput {
+        stations: &stations,
+        session_station_override: None,
+        global_station_override: snapshot.global_station_override.as_deref(),
+        configured_active_station,
+        session_pin_count: snapshot.session_station_overrides.len(),
+        retry: snapshot.resolved_retry.as_ref(),
+    })
 }
 
-fn build_pinned_routing_preview(
-    lang: Language,
-    stations: &[StationOption],
-    global_pin: &str,
-    runtime_maps: &RuntimeStationMaps,
-) -> StationsRoutingPreview {
-    let mut eligible = Vec::new();
-    let mut skipped = Vec::new();
-
-    match stations.iter().find(|station| station.name == global_pin) {
-        Some(station) => {
-            let reasons = pinned_skip_reasons(lang, station, runtime_maps);
-            if reasons.is_empty() {
-                eligible.push(format!(
-                    "{} {}",
-                    station_label(station, None, runtime_maps),
-                    pick(
-                        lang,
-                        "(global pin；draining/half-open 仍允许被固定路由使用)",
-                        "(global pin; draining/half-open remain usable for pinned routing)",
-                    )
-                ));
-            } else {
-                skipped.push(format!("{}: {}", station.name, reasons.join(", ")));
-            }
+fn format_routing_source(lang: Language, source: &StationRoutingSource) -> String {
+    match source {
+        StationRoutingSource::SessionPin(station) => format!("session pin={station}"),
+        StationRoutingSource::GlobalPin(station) => format!("global pin={station}"),
+        StationRoutingSource::ConfiguredActiveStation(station) => {
+            format!("configured active_station={station}")
         }
-        None => skipped.push(match lang {
-            Language::Zh => format!("global pin 目标 {global_pin} 不在当前 station 列表中"),
-            Language::En => {
-                format!("global pin target {global_pin} is not in the current station list")
-            }
-        }),
-    }
-
-    StationsRoutingPreview {
-        source: match lang {
-            Language::Zh => format!("global pin={global_pin}"),
-            Language::En => format!("global pin={global_pin}"),
-        },
-        mode: pick(lang, "pinned station", "pinned station").to_string(),
-        eligible,
-        skipped,
-        retry_boundary: String::new(),
-        session_pin_note: None,
+        StationRoutingSource::Auto => pick(
+            lang,
+            "auto / no configured active",
+            "auto / no configured active",
+        )
+        .to_string(),
     }
 }
 
-fn build_auto_routing_preview(
-    lang: Language,
-    stations: &[StationOption],
-    configured_active_station: Option<&str>,
-    runtime_maps: &RuntimeStationMaps,
-) -> StationsRoutingPreview {
-    let configured_active_station = configured_active_station.and_then(non_empty_trimmed_str);
-    let mut candidates = Vec::new();
-    let mut skipped = Vec::new();
-
-    for station in stations {
-        let reasons =
-            automatic_skip_reasons(lang, station, configured_active_station, runtime_maps);
-        if reasons.is_empty() {
-            candidates.push(station.clone());
-        } else {
-            skipped.push(format!("{}: {}", station.name, reasons.join(", ")));
+fn format_routing_mode(lang: Language, mode: StationRoutingMode) -> &'static str {
+    match mode {
+        StationRoutingMode::PinnedStation => pick(lang, "pinned station", "pinned station"),
+        StationRoutingMode::AutoLevelFallback => {
+            pick(lang, "auto / level fallback", "auto / level fallback")
         }
-    }
-
-    let mut levels = candidates
-        .iter()
-        .map(|station| station.level.clamp(1, 10))
-        .collect::<Vec<_>>();
-    levels.sort_unstable();
-    levels.dedup();
-    let has_multi_level = levels.len() > 1;
-
-    if has_multi_level {
-        candidates.sort_by(|a, b| {
-            a.level
-                .clamp(1, 10)
-                .cmp(&b.level.clamp(1, 10))
-                .then_with(|| {
-                    station_is_configured_active(b, configured_active_station)
-                        .cmp(&station_is_configured_active(a, configured_active_station))
-                })
-                .then_with(|| a.name.cmp(&b.name))
-        });
-    } else {
-        candidates.sort_by(|a, b| a.name.cmp(&b.name));
-        if let Some(active) = configured_active_station
-            && let Some(pos) = candidates.iter().position(|station| station.name == active)
-        {
-            let item = candidates.remove(pos);
-            candidates.insert(0, item);
-        }
-    }
-
-    let eligible = candidates
-        .iter()
-        .map(|station| station_label(station, configured_active_station, runtime_maps))
-        .collect::<Vec<_>>();
-    let mode = if has_multi_level {
-        pick(lang, "auto / level fallback", "auto / level fallback")
-    } else {
-        pick(
+        StationRoutingMode::AutoSingleLevelFallback => pick(
             lang,
             "auto / single-level fallback",
             "auto / single-level fallback",
-        )
-    };
-    let source = configured_active_station
-        .map(|active| match lang {
-            Language::Zh => format!("configured active_station={active}"),
-            Language::En => format!("configured active_station={active}"),
-        })
-        .unwrap_or_else(|| {
-            pick(
-                lang,
-                "auto / no configured active",
-                "auto / no configured active",
-            )
-            .to_string()
-        });
-
-    StationsRoutingPreview {
-        source,
-        mode: mode.to_string(),
-        eligible,
-        skipped,
-        retry_boundary: String::new(),
-        session_pin_note: None,
+        ),
     }
 }
 
-fn automatic_skip_reasons(
-    lang: Language,
-    station: &StationOption,
-    configured_active_station: Option<&str>,
-    runtime_maps: &RuntimeStationMaps,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    if !station.enabled && !station_is_configured_active(station, configured_active_station) {
-        reasons.push(pick(lang, "disabled", "disabled").to_string());
-    }
-    if station.runtime_state != RuntimeConfigState::Normal {
-        reasons.push(match lang {
-            Language::Zh => format!(
-                "state={} 不参与自动路由",
-                runtime_config_state_label(lang, station.runtime_state)
-            ),
-            Language::En => format!(
-                "state={} is not eligible for automatic routing",
-                runtime_config_state_label(lang, station.runtime_state)
-            ),
-        });
-    }
-    if station_upstream_count(runtime_maps, station.name.as_str()) == Some(0) {
-        reasons.push(pick(lang, "no routable upstreams", "no routable upstreams").to_string());
-    }
-    reasons
-}
-
-fn pinned_skip_reasons(
-    lang: Language,
-    station: &StationOption,
-    runtime_maps: &RuntimeStationMaps,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    if station.runtime_state == RuntimeConfigState::BreakerOpen {
-        reasons.push(
-            pick(
-                lang,
-                "breaker_open blocks pinned routing",
-                "breaker_open blocks pinned routing",
-            )
-            .to_string(),
-        );
-    }
-    if station_upstream_count(runtime_maps, station.name.as_str()) == Some(0) {
-        reasons.push(pick(lang, "no routable upstreams", "no routable upstreams").to_string());
-    }
-    reasons
-}
-
-fn retry_boundary_text(
-    lang: Language,
-    retry: Option<&crate::config::ResolvedRetryConfig>,
-) -> String {
-    let Some(retry) = retry else {
-        return pick(
+fn format_retry_boundary(lang: Language, boundary: StationRetryBoundary) -> String {
+    match boundary {
+        StationRetryBoundary::Unknown => pick(
             lang,
             "retry: resolved policy 暂不可见；跨站边界未知。",
             "retry: resolved policy is not visible yet; cross-station boundaries are unknown.",
         )
-        .to_string();
-    };
-
-    let provider_failover =
-        retry.provider.strategy == RetryStrategy::Failover && retry.provider.max_attempts > 1;
-    if retry.allow_cross_station_before_first_output && provider_failover {
-        return match lang {
+        .to_string(),
+        StationRetryBoundary::CrossStationBeforeFirstOutput {
+            provider_max_attempts,
+        } => match lang {
             Language::Zh => format!(
-                "retry: provider failover x{}；首包前可按候选顺序跨 station，首包后固定在当前 station。",
-                retry.provider.max_attempts
+                "retry: provider failover x{provider_max_attempts}；首包前可按候选顺序跨 station，首包后固定在当前 station。"
             ),
             Language::En => format!(
-                "retry: provider failover x{}; may cross stations in candidate order before first output, then stays on the current station.",
-                retry.provider.max_attempts
+                "retry: provider failover x{provider_max_attempts}; may cross stations in candidate order before first output, then stays on the current station."
             ),
-        };
-    }
-
-    if retry.provider.max_attempts > 1 {
-        return match lang {
+        },
+        StationRetryBoundary::CurrentStationFirst {
+            provider_strategy,
+            provider_max_attempts,
+        } => match lang {
             Language::Zh => format!(
-                "retry: provider {} x{}；当前策略不允许首包前跨 station，失败会先留在已选 station 内。",
-                retry_strategy_label(retry.provider.strategy),
-                retry.provider.max_attempts
+                "retry: provider {} x{provider_max_attempts}；当前策略不允许首包前跨 station，失败会先留在已选 station 内。",
+                retry_strategy_label(provider_strategy)
             ),
             Language::En => format!(
-                "retry: provider {} x{}; cross-station failover before first output is disabled, so failures stay inside the selected station first.",
-                retry_strategy_label(retry.provider.strategy),
-                retry.provider.max_attempts
+                "retry: provider {} x{provider_max_attempts}; cross-station failover before first output is disabled, so failures stay inside the selected station first.",
+                retry_strategy_label(provider_strategy)
             ),
-        };
+        },
+        StationRetryBoundary::NextRequestOnly => pick(
+            lang,
+            "retry: provider 只有一次尝试；自动切换主要依赖下一次请求重新选路。",
+            "retry: provider has one attempt; automatic switching mainly happens when the next request is routed.",
+        )
+        .to_string(),
+    }
+}
+
+fn format_recent_switch_observations(
+    lang: Language,
+    snapshot: &GuiRuntimeSnapshot,
+) -> Option<String> {
+    snapshot.operator_retry_summary.as_ref().map(|summary| {
+        format!(
+            "{}: retry={}  {}={}  {}={}  fast={}",
+            pick(lang, "最近观测", "Recent observations"),
+            summary.recent_retried_requests,
+            pick(lang, "同站", "same_station"),
+            summary.recent_same_station_retries,
+            pick(lang, "跨站", "cross_station"),
+            summary.recent_cross_station_failovers,
+            summary.recent_fast_mode_requests,
+        )
+    })
+}
+
+fn format_routing_candidate(lang: Language, candidate: &StationRoutingCandidate) -> String {
+    let mut parts = vec![format!("L{}", candidate.level.clamp(1, 10))];
+    if candidate.active {
+        parts.push("active".to_string());
+    }
+    match candidate.upstreams {
+        Some(upstreams) => parts.push(format!("upstreams={upstreams}")),
+        None => parts.push("upstreams=?".to_string()),
+    }
+    if candidate.runtime_state != RuntimeConfigState::Normal {
+        parts.push(format!(
+            "state={}",
+            runtime_config_state_label(lang, candidate.runtime_state)
+        ));
+    }
+    if candidate.has_cooldown {
+        parts.push("cooldown".to_string());
+    }
+    if candidate.all_usage_exhausted {
+        parts.push("usage=exhausted(all)".to_string());
+    } else if candidate.any_usage_exhausted {
+        parts.push("usage=exhausted(partial)".to_string());
     }
 
-    pick(
-        lang,
-        "retry: provider 只有一次尝试；自动切换主要依赖下一次请求重新选路。",
-        "retry: provider has one attempt; automatic switching mainly happens when the next request is routed.",
-    )
-    .to_string()
+    match candidate
+        .alias
+        .as_deref()
+        .filter(|alias| !alias.trim().is_empty())
+    {
+        Some(alias) => format!("{} ({alias}) [{}]", candidate.name, parts.join(", ")),
+        None => format!("{} [{}]", candidate.name, parts.join(", ")),
+    }
+}
+
+fn format_skip_reason(lang: Language, reason: &StationRoutingSkipReason) -> String {
+    match reason {
+        StationRoutingSkipReason::Disabled => pick(lang, "disabled", "disabled").to_string(),
+        StationRoutingSkipReason::RuntimeState(state) => match lang {
+            Language::Zh => format!(
+                "state={} 不参与自动路由",
+                runtime_config_state_label(lang, *state)
+            ),
+            Language::En => format!(
+                "state={} is not eligible for automatic routing",
+                runtime_config_state_label(lang, *state)
+            ),
+        },
+        StationRoutingSkipReason::NoRoutableUpstreams => {
+            pick(lang, "no routable upstreams", "no routable upstreams").to_string()
+        }
+        StationRoutingSkipReason::MissingPinnedTarget => pick(
+            lang,
+            "pinned target is not in the current station list",
+            "pinned target is not in the current station list",
+        )
+        .to_string(),
+        StationRoutingSkipReason::BreakerOpenBlocksPinned => pick(
+            lang,
+            "breaker_open blocks pinned routing",
+            "breaker_open blocks pinned routing",
+        )
+        .to_string(),
+    }
 }
 
 fn session_pin_note(lang: Language, session_pin_count: usize) -> Option<String> {
@@ -336,210 +280,44 @@ fn session_pin_note(lang: Language, session_pin_count: usize) -> Option<String> 
     })
 }
 
-fn station_label(
-    station: &StationOption,
-    configured_active_station: Option<&str>,
-    runtime_maps: &RuntimeStationMaps,
-) -> String {
-    let mut parts = vec![format!("L{}", station.level.clamp(1, 10))];
-    if station_is_configured_active(station, configured_active_station) {
-        parts.push("active".to_string());
-    }
-    if let Some(upstreams) = station_upstream_count(runtime_maps, station.name.as_str()) {
-        parts.push(format!("upstreams={upstreams}"));
-    }
-    if station.runtime_state != RuntimeConfigState::Normal {
-        parts.push(format!(
-            "state={}",
-            runtime_config_state_label(Language::En, station.runtime_state)
-        ));
-    }
-
-    match station
-        .alias
-        .as_deref()
-        .filter(|alias| !alias.trim().is_empty())
-    {
-        Some(alias) => format!("{} ({alias}) [{}]", station.name, parts.join(", ")),
-        None => format!("{} [{}]", station.name, parts.join(", ")),
-    }
-}
-
-fn station_upstream_count(runtime_maps: &RuntimeStationMaps, station_name: &str) -> Option<usize> {
-    runtime_maps
-        .lb_view
-        .get(station_name)
-        .map(|view| view.upstreams.len())
-}
-
-fn station_is_configured_active(
-    station: &StationOption,
-    configured_active_station: Option<&str>,
-) -> bool {
-    configured_active_station == Some(station.name.as_str())
-}
-
-fn non_empty_trimmed_str(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then_some(trimmed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn station(
-        name: &str,
-        enabled: bool,
-        level: u8,
-        runtime_state: RuntimeConfigState,
-    ) -> StationOption {
-        StationOption {
-            name: name.to_string(),
-            alias: None,
-            enabled,
-            level,
-            configured_enabled: enabled,
-            configured_level: level,
-            runtime_enabled_override: None,
-            runtime_level_override: None,
-            runtime_state,
-            runtime_state_override: None,
-            capabilities: StationCapabilitySummary::default(),
-        }
-    }
+    #[test]
+    fn retry_boundary_text_explains_cross_station_window() {
+        let text = format_retry_boundary(
+            Language::En,
+            StationRetryBoundary::CrossStationBeforeFirstOutput {
+                provider_max_attempts: 3,
+            },
+        );
 
-    fn runtime_maps(upstream_counts: &[(&str, usize)]) -> RuntimeStationMaps {
-        RuntimeStationMaps {
-            lb_view: upstream_counts
-                .iter()
-                .map(|(name, count)| {
-                    (
-                        (*name).to_string(),
-                        LbConfigView {
-                            last_good_index: None,
-                            upstreams: vec![Default::default(); *count],
-                        },
-                    )
-                })
-                .collect(),
-            ..RuntimeStationMaps::default()
-        }
+        assert!(text.contains("before first output"));
+        assert!(text.contains("stays on the current station"));
     }
 
     #[test]
-    fn auto_routing_preview_puts_single_level_active_first_and_skips_blocked() {
-        let stations = vec![
-            station("alpha", true, 1, RuntimeConfigState::Normal),
-            station("beta", true, 1, RuntimeConfigState::Normal),
-            station("disabled", false, 1, RuntimeConfigState::Normal),
-            station("drain", true, 1, RuntimeConfigState::Draining),
-        ];
-        let maps = runtime_maps(&[("alpha", 1), ("beta", 1), ("disabled", 1), ("drain", 1)]);
-
-        let preview = build_stations_routing_preview(
+    fn candidate_label_marks_runtime_warnings() {
+        let label = format_routing_candidate(
             Language::En,
-            &stations,
-            None,
-            Some("beta"),
-            0,
-            Some(&RetryProfileName::Balanced.defaults()),
-            &maps,
+            &StationRoutingCandidate {
+                name: "alpha".to_string(),
+                alias: Some("Alpha".to_string()),
+                level: 1,
+                enabled: true,
+                active: true,
+                upstreams: Some(2),
+                runtime_state: RuntimeConfigState::HalfOpen,
+                has_cooldown: true,
+                any_usage_exhausted: true,
+                all_usage_exhausted: false,
+            },
         );
 
-        assert_eq!(preview.mode, "auto / single-level fallback");
-        assert!(preview.eligible[0].starts_with("beta"));
-        assert!(preview.eligible[1].starts_with("alpha"));
-        assert!(
-            preview
-                .skipped
-                .iter()
-                .any(|item| item.contains("disabled: disabled"))
-        );
-        assert!(
-            preview
-                .skipped
-                .iter()
-                .any(|item| item.contains("drain") && item.contains("automatic routing"))
-        );
-    }
-
-    #[test]
-    fn auto_routing_preview_sorts_multi_level_before_active_tiebreak() {
-        let stations = vec![
-            station("alpha", true, 2, RuntimeConfigState::Normal),
-            station("beta", true, 1, RuntimeConfigState::Normal),
-            station("zeta", true, 2, RuntimeConfigState::Normal),
-        ];
-        let maps = runtime_maps(&[("alpha", 1), ("beta", 1), ("zeta", 1)]);
-
-        let preview = build_stations_routing_preview(
-            Language::En,
-            &stations,
-            None,
-            Some("zeta"),
-            0,
-            None,
-            &maps,
-        );
-
-        assert_eq!(preview.mode, "auto / level fallback");
-        assert!(preview.eligible[0].starts_with("beta"));
-        assert!(preview.eligible[1].starts_with("zeta"));
-        assert!(preview.eligible[2].starts_with("alpha"));
-    }
-
-    #[test]
-    fn pinned_routing_preview_allows_draining_but_blocks_breaker_open() {
-        let maps = runtime_maps(&[("drain", 1), ("breaker", 1)]);
-        let draining = build_stations_routing_preview(
-            Language::En,
-            &[station("drain", false, 1, RuntimeConfigState::Draining)],
-            Some("drain"),
-            None,
-            0,
-            None,
-            &maps,
-        );
-        assert_eq!(draining.mode, "pinned station");
-        assert!(draining.eligible[0].contains("global pin"));
-
-        let blocked = build_stations_routing_preview(
-            Language::En,
-            &[station("breaker", true, 1, RuntimeConfigState::BreakerOpen)],
-            Some("breaker"),
-            None,
-            0,
-            None,
-            &maps,
-        );
-        assert!(blocked.eligible.is_empty());
-        assert!(blocked.skipped[0].contains("breaker_open blocks pinned routing"));
-    }
-
-    #[test]
-    fn retry_boundary_text_explains_before_and_after_first_output() {
-        let preview = build_stations_routing_preview(
-            Language::En,
-            &[station("alpha", true, 1, RuntimeConfigState::Normal)],
-            None,
-            Some("alpha"),
-            2,
-            Some(&RetryProfileName::AggressiveFailover.defaults()),
-            &runtime_maps(&[("alpha", 1)]),
-        );
-
-        assert!(preview.retry_boundary.contains("before first output"));
-        assert!(
-            preview
-                .retry_boundary
-                .contains("stays on the current station")
-        );
-        assert!(
-            preview
-                .session_pin_note
-                .as_deref()
-                .is_some_and(|note| note.contains("2 sessions"))
-        );
+        assert!(label.contains("alpha (Alpha)"));
+        assert!(label.contains("state=half_open"));
+        assert!(label.contains("cooldown"));
+        assert!(label.contains("usage=exhausted(partial)"));
     }
 }

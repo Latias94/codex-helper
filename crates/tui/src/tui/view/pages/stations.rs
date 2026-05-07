@@ -5,6 +5,11 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
+use crate::dashboard_core::{
+    StationRetryBoundary, StationRoutingCandidate, StationRoutingMode, StationRoutingPosture,
+    StationRoutingPostureInput, StationRoutingSkipReason, StationRoutingSource,
+    build_station_routing_posture, summarize_recent_retry_observations,
+};
 use crate::state::BalanceSnapshotStatus;
 use crate::tui::ProviderOption;
 use crate::tui::model::{Palette, Snapshot, format_age, now_ms, shorten, shorten_middle};
@@ -21,135 +26,63 @@ fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StationRoutingPreview {
-    mode: String,
-    order: Vec<String>,
-    skipped: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StationRoutingCandidate {
-    name: String,
-    level: u8,
-    active: bool,
-    upstreams: usize,
-}
-
-fn station_routing_preview(
+fn station_routing_posture(
     providers: &[ProviderOption],
     station_meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
+    lb_view: &HashMap<String, crate::state::LbConfigView>,
     session_override: Option<&str>,
     global_station_override: Option<&str>,
-) -> StationRoutingPreview {
-    if let Some(station) = non_empty_trimmed(session_override) {
-        return pinned_station_routing_preview("pinned(session)", station, providers);
-    }
-    if let Some(station) = non_empty_trimmed(global_station_override) {
-        return pinned_station_routing_preview("pinned(global-station)", station, providers);
-    }
-    automatic_station_routing_preview(providers, station_meta_overrides)
-}
-
-fn pinned_station_routing_preview(
-    source: &str,
-    station_name: &str,
-    providers: &[ProviderOption],
-) -> StationRoutingPreview {
-    let order = providers
+    retry: Option<&crate::config::ResolvedRetryConfig>,
+) -> StationRoutingPosture {
+    let candidates = providers
         .iter()
-        .find(|provider| provider.name == station_name)
         .map(|provider| {
-            vec![format!(
-                "{} [L{}, pinned, upstreams={}]",
-                provider.name,
-                provider.level.clamp(1, 10),
-                provider.upstreams.len()
-            )]
-        })
-        .unwrap_or_default();
-    let skipped = if order.is_empty() {
-        vec![format!("{station_name}: missing pinned station")]
-    } else {
-        Vec::new()
-    };
-
-    StationRoutingPreview {
-        mode: format!("{source}={station_name}"),
-        order,
-        skipped,
-    }
-}
-
-fn automatic_station_routing_preview(
-    providers: &[ProviderOption],
-    station_meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
-) -> StationRoutingPreview {
-    let mut candidates = Vec::new();
-    let mut skipped = Vec::new();
-
-    for provider in providers {
-        let (enabled, level) = effective_station_enabled_level(provider, station_meta_overrides);
-        let mut reasons = Vec::new();
-        if !enabled && !provider.active {
-            reasons.push("disabled");
-        }
-        if provider.upstreams.is_empty() {
-            reasons.push("no_upstreams");
-        }
-        if reasons.is_empty() {
-            candidates.push(StationRoutingCandidate {
+            let lb = lb_view.get(provider.name.as_str());
+            let (enabled, level) =
+                effective_station_enabled_level(provider, station_meta_overrides);
+            StationRoutingCandidate {
                 name: provider.name.clone(),
+                alias: provider.alias.clone(),
                 level,
+                enabled,
                 active: provider.active,
-                upstreams: provider.upstreams.len(),
-            });
-        } else {
-            skipped.push(format!("{}: {}", provider.name, reasons.join(",")));
-        }
-    }
-
-    let mut levels = candidates
-        .iter()
-        .map(|candidate| candidate.level)
+                upstreams: lb
+                    .map(|view| view.upstreams.len())
+                    .or(Some(provider.upstreams.len())),
+                runtime_state: crate::state::RuntimeConfigState::Normal,
+                has_cooldown: lb.is_some_and(|view| {
+                    view.upstreams
+                        .iter()
+                        .any(|upstream| upstream.cooldown_remaining_secs.is_some())
+                }),
+                any_usage_exhausted: lb.is_some_and(|view| {
+                    view.upstreams
+                        .iter()
+                        .any(|upstream| upstream.usage_exhausted)
+                }),
+                all_usage_exhausted: lb.is_some_and(|view| {
+                    !view.upstreams.is_empty()
+                        && view
+                            .upstreams
+                            .iter()
+                            .all(|upstream| upstream.usage_exhausted)
+                }),
+            }
+        })
         .collect::<Vec<_>>();
-    levels.sort_unstable();
-    levels.dedup();
-    let has_multi_level = levels.len() > 1;
+    let configured_active_station = providers
+        .iter()
+        .find(|provider| provider.active)
+        .map(|provider| provider.name.as_str());
 
-    if has_multi_level {
-        candidates.sort_by(|a, b| {
-            a.level
-                .cmp(&b.level)
-                .then_with(|| b.active.cmp(&a.active))
-                .then_with(|| a.name.cmp(&b.name))
-        });
-    } else {
-        candidates.sort_by(|a, b| a.name.cmp(&b.name));
-        if let Some(pos) = candidates.iter().position(|candidate| candidate.active) {
-            let item = candidates.remove(pos);
-            candidates.insert(0, item);
-        }
-    }
-
-    StationRoutingPreview {
-        mode: if has_multi_level {
-            "auto(level fallback)".to_string()
-        } else {
-            "auto(single-level fallback)".to_string()
-        },
-        order: candidates
-            .iter()
-            .map(|candidate| {
-                let active = if candidate.active { ", active" } else { "" };
-                format!(
-                    "{} [L{}{}, upstreams={}]",
-                    candidate.name, candidate.level, active, candidate.upstreams
-                )
-            })
-            .collect(),
-        skipped,
-    }
+    build_station_routing_posture(StationRoutingPostureInput {
+        stations: &candidates,
+        session_station_override: session_override,
+        global_station_override,
+        configured_active_station,
+        session_pin_count: 0,
+        retry,
+    })
 }
 
 fn effective_station_enabled_level(
@@ -166,9 +99,90 @@ fn effective_station_enabled_level(
     )
 }
 
-fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
-    let value = value?.trim();
-    (!value.is_empty()).then_some(value)
+fn format_routing_source(source: &StationRoutingSource) -> String {
+    match source {
+        StationRoutingSource::SessionPin(station) => format!("session pin={station}"),
+        StationRoutingSource::GlobalPin(station) => format!("global pin={station}"),
+        StationRoutingSource::ConfiguredActiveStation(station) => {
+            format!("configured active={station}")
+        }
+        StationRoutingSource::Auto => "auto".to_string(),
+    }
+}
+
+fn format_routing_mode(mode: StationRoutingMode) -> &'static str {
+    match mode {
+        StationRoutingMode::PinnedStation => "pinned",
+        StationRoutingMode::AutoLevelFallback => "auto(level fallback)",
+        StationRoutingMode::AutoSingleLevelFallback => "auto(single-level fallback)",
+    }
+}
+
+fn format_retry_boundary(boundary: StationRetryBoundary) -> String {
+    match boundary {
+        StationRetryBoundary::Unknown => "resolved policy unavailable".to_string(),
+        StationRetryBoundary::CrossStationBeforeFirstOutput {
+            provider_max_attempts,
+        } => {
+            format!("provider failover x{provider_max_attempts}; cross-station before first output")
+        }
+        StationRetryBoundary::CurrentStationFirst {
+            provider_strategy,
+            provider_max_attempts,
+        } => format!(
+            "provider {provider_strategy:?} x{provider_max_attempts}; selected station first"
+        )
+        .to_ascii_lowercase(),
+        StationRetryBoundary::NextRequestOnly => {
+            "provider x1; auto switch on next routed request".to_string()
+        }
+    }
+}
+
+fn format_routing_candidate(candidate: &StationRoutingCandidate) -> String {
+    let mut parts = vec![format!("L{}", candidate.level.clamp(1, 10))];
+    if candidate.active {
+        parts.push("active".to_string());
+    }
+    match candidate.upstreams {
+        Some(upstreams) => parts.push(format!("upstreams={upstreams}")),
+        None => parts.push("upstreams=?".to_string()),
+    }
+    if candidate.has_cooldown {
+        parts.push("cooldown".to_string());
+    }
+    if candidate.all_usage_exhausted {
+        parts.push("quota=all_exhausted".to_string());
+    } else if candidate.any_usage_exhausted {
+        parts.push("quota=partial_exhausted".to_string());
+    }
+
+    format!("{} [{}]", candidate.name, parts.join(", "))
+}
+
+fn format_skipped_station(skipped: &crate::dashboard_core::StationRoutingSkipped) -> String {
+    format!(
+        "{}: {}",
+        skipped.station_name,
+        skipped
+            .reasons
+            .iter()
+            .map(format_skip_reason)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn format_skip_reason(reason: &StationRoutingSkipReason) -> String {
+    match reason {
+        StationRoutingSkipReason::Disabled => "disabled".to_string(),
+        StationRoutingSkipReason::RuntimeState(state) => {
+            format!("state={state:?}").to_ascii_lowercase()
+        }
+        StationRoutingSkipReason::NoRoutableUpstreams => "no_upstreams".to_string(),
+        StationRoutingSkipReason::MissingPinnedTarget => "missing_pinned_station".to_string(),
+        StationRoutingSkipReason::BreakerOpenBlocksPinned => "breaker_open_blocks_pin".to_string(),
+    }
 }
 
 pub(super) fn render_stations_page(
@@ -373,21 +387,59 @@ pub(super) fn render_stations_page(
             ),
         ]));
 
-        let routing = station_routing_preview(
+        let routing = station_routing_posture(
             providers,
             &snapshot.station_meta_overrides,
+            &snapshot.lb_view,
             session_override,
             global_station_override,
+            ui.last_runtime_retry.as_ref(),
         );
         lines.push(Line::from(vec![
             Span::styled("routing: ", Style::default().fg(p.muted)),
-            Span::styled(routing.mode, Style::default().fg(p.muted)),
+            Span::styled(
+                format!(
+                    "{} · {}",
+                    format_routing_source(&routing.source),
+                    format_routing_mode(routing.mode)
+                ),
+                Style::default().fg(p.muted),
+            ),
         ]));
-        if !routing.order.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("retry: ", Style::default().fg(p.muted)),
+            Span::styled(
+                shorten_middle(&format_retry_boundary(routing.retry_boundary), 96),
+                Style::default().fg(p.muted),
+            ),
+        ]));
+        let observations = summarize_recent_retry_observations(&snapshot.recent);
+        lines.push(Line::from(vec![
+            Span::styled("recent: ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!(
+                    "retry={} same={} cross={} fast={}",
+                    observations.recent_retried_requests,
+                    observations.recent_same_station_retries,
+                    observations.recent_cross_station_failovers,
+                    observations.recent_fast_mode_requests
+                ),
+                Style::default().fg(p.muted),
+            ),
+        ]));
+        if !routing.eligible_candidates.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled("order: ", Style::default().fg(p.muted)),
                 Span::styled(
-                    shorten_middle(&routing.order.join(" > "), 96),
+                    shorten_middle(
+                        &routing
+                            .eligible_candidates
+                            .iter()
+                            .map(format_routing_candidate)
+                            .collect::<Vec<_>>()
+                            .join(" > "),
+                        96,
+                    ),
                     Style::default().fg(p.text),
                 ),
             ]));
@@ -396,7 +448,15 @@ pub(super) fn render_stations_page(
             lines.push(Line::from(vec![
                 Span::styled("skipped: ", Style::default().fg(p.muted)),
                 Span::styled(
-                    shorten_middle(&routing.skipped.join(" | "), 96),
+                    shorten_middle(
+                        &routing
+                            .skipped
+                            .iter()
+                            .map(format_skipped_station)
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                        96,
+                    ),
                     Style::default().fg(p.muted),
                 ),
             ]));
@@ -655,13 +715,19 @@ mod tests {
             provider("beta", true, 1, true, 1),
             provider("disabled", false, 1, false, 1),
         ];
+        let lb_view = HashMap::new();
 
-        let preview = station_routing_preview(&providers, &HashMap::new(), None, None);
+        let preview =
+            station_routing_posture(&providers, &HashMap::new(), &lb_view, None, None, None);
 
-        assert_eq!(preview.mode, "auto(single-level fallback)");
-        assert!(preview.order[0].starts_with("beta"));
-        assert!(preview.order[1].starts_with("alpha"));
-        assert_eq!(preview.skipped, vec!["disabled: disabled"]);
+        assert_eq!(preview.mode, StationRoutingMode::AutoSingleLevelFallback);
+        assert_eq!(preview.eligible_candidates[0].name, "beta");
+        assert_eq!(preview.eligible_candidates[1].name, "alpha");
+        assert_eq!(preview.skipped[0].station_name, "disabled");
+        assert_eq!(
+            preview.skipped[0].reasons,
+            vec![StationRoutingSkipReason::Disabled]
+        );
     }
 
     #[test]
@@ -671,13 +737,15 @@ mod tests {
             provider("beta", true, 1, false, 1),
             provider("zeta", true, 2, true, 1),
         ];
+        let lb_view = HashMap::new();
 
-        let preview = station_routing_preview(&providers, &HashMap::new(), None, None);
+        let preview =
+            station_routing_posture(&providers, &HashMap::new(), &lb_view, None, None, None);
 
-        assert_eq!(preview.mode, "auto(level fallback)");
-        assert!(preview.order[0].starts_with("beta"));
-        assert!(preview.order[1].starts_with("zeta"));
-        assert!(preview.order[2].starts_with("alpha"));
+        assert_eq!(preview.mode, StationRoutingMode::AutoLevelFallback);
+        assert_eq!(preview.eligible_candidates[0].name, "beta");
+        assert_eq!(preview.eligible_candidates[1].name, "zeta");
+        assert_eq!(preview.eligible_candidates[2].name, "alpha");
     }
 
     #[test]
@@ -690,21 +758,42 @@ mod tests {
             ("alpha".to_string(), (Some(false), Some(1))),
             ("beta".to_string(), (None, Some(2))),
         ]);
+        let lb_view = HashMap::new();
 
-        let preview = station_routing_preview(&providers, &overrides, None, None);
+        let preview = station_routing_posture(&providers, &overrides, &lb_view, None, None, None);
 
-        assert_eq!(preview.order, vec!["beta [L2, upstreams=1]"]);
-        assert_eq!(preview.skipped, vec!["alpha: disabled"]);
+        assert_eq!(preview.eligible_candidates[0].name, "beta");
+        assert_eq!(preview.eligible_candidates[0].level, 2);
+        assert_eq!(preview.skipped[0].station_name, "alpha");
+        assert_eq!(
+            preview.skipped[0].reasons,
+            vec![StationRoutingSkipReason::Disabled]
+        );
     }
 
     #[test]
     fn station_routing_preview_marks_pinned_targets() {
         let providers = vec![provider("alpha", false, 1, false, 0)];
+        let lb_view = HashMap::new();
 
-        let preview = station_routing_preview(&providers, &HashMap::new(), Some("alpha"), None);
+        let preview = station_routing_posture(
+            &providers,
+            &HashMap::new(),
+            &lb_view,
+            Some("alpha"),
+            None,
+            None,
+        );
 
-        assert_eq!(preview.mode, "pinned(session)=alpha");
-        assert_eq!(preview.order, vec!["alpha [L1, pinned, upstreams=0]"]);
-        assert!(preview.skipped.is_empty());
+        assert_eq!(preview.mode, StationRoutingMode::PinnedStation);
+        assert!(matches!(
+            preview.source,
+            StationRoutingSource::SessionPin(ref station) if station == "alpha"
+        ));
+        assert!(preview.eligible_candidates.is_empty());
+        assert_eq!(
+            preview.skipped[0].reasons,
+            vec![StationRoutingSkipReason::NoRoutableUpstreams]
+        );
     }
 }

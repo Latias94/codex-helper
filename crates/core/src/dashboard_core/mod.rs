@@ -1,4 +1,5 @@
 pub mod operator_summary;
+pub mod routing_posture;
 pub mod snapshot;
 pub mod station_options;
 pub mod types;
@@ -8,6 +9,11 @@ pub use operator_summary::{
     ApiV1OperatorSummary, OperatorHealthSummary, OperatorProfileSummary, OperatorRetryObservations,
     OperatorRetrySummary, OperatorRuntimeSummary, OperatorSummaryCounts, OperatorSummaryLinks,
     build_operator_health_summary, summarize_recent_retry_observations,
+};
+pub use routing_posture::{
+    StationRetryBoundary, StationRoutingCandidate, StationRoutingMode, StationRoutingPosture,
+    StationRoutingPostureInput, StationRoutingSkipReason, StationRoutingSkipped,
+    StationRoutingSource, build_station_routing_posture,
 };
 pub use snapshot::{ApiV1Snapshot, build_dashboard_snapshot};
 pub use station_options::{

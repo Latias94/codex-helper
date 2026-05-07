@@ -167,6 +167,7 @@ pub(super) async fn build_operator_summary(
                 .allow_cross_station_before_first_output,
             recent_retried_requests: retry_observations.recent_retried_requests,
             recent_cross_station_failovers: retry_observations.recent_cross_station_failovers,
+            recent_same_station_retries: retry_observations.recent_same_station_retries,
             recent_fast_mode_requests: retry_observations.recent_fast_mode_requests,
         },
         health: Some(health),

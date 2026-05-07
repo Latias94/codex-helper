@@ -88,6 +88,8 @@ pub struct OperatorRetrySummary {
     #[serde(default)]
     pub recent_cross_station_failovers: usize,
     #[serde(default)]
+    pub recent_same_station_retries: usize,
+    #[serde(default)]
     pub recent_fast_mode_requests: usize,
 }
 
@@ -95,6 +97,7 @@ pub struct OperatorRetrySummary {
 pub struct OperatorRetryObservations {
     pub recent_retried_requests: usize,
     pub recent_cross_station_failovers: usize,
+    pub recent_same_station_retries: usize,
     pub recent_fast_mode_requests: usize,
 }
 
@@ -132,6 +135,8 @@ pub fn summarize_recent_retry_observations(
         observations.recent_retried_requests += 1;
         if observability.cross_station_failover {
             observations.recent_cross_station_failovers += 1;
+        } else if observability.same_station_retry {
+            observations.recent_same_station_retries += 1;
         }
     }
 
@@ -332,6 +337,7 @@ mod tests {
 
         assert_eq!(summary.recent_retried_requests, 2);
         assert_eq!(summary.recent_cross_station_failovers, 1);
+        assert_eq!(summary.recent_same_station_retries, 1);
         assert_eq!(summary.recent_fast_mode_requests, 2);
     }
 }

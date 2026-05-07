@@ -401,6 +401,7 @@ fn local_operator_retry_summary(r: &RunningProxy) -> OperatorRetrySummary {
             .allow_cross_station_before_first_output,
         recent_retried_requests: retry_observations.recent_retried_requests,
         recent_cross_station_failovers: retry_observations.recent_cross_station_failovers,
+        recent_same_station_retries: retry_observations.recent_same_station_retries,
         recent_fast_mode_requests: retry_observations.recent_fast_mode_requests,
     }
 }

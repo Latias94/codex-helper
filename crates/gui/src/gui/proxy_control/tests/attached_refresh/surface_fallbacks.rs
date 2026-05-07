@@ -43,6 +43,7 @@ fn request_attach_with_discovered_proxy_preloads_surface_capabilities() {
             allow_cross_station_before_first_output: true,
             recent_retried_requests: 0,
             recent_cross_station_failovers: 0,
+            recent_same_station_retries: 0,
             recent_fast_mode_requests: 0,
         }),
         operator_health_summary: Some(crate::dashboard_core::OperatorHealthSummary {
