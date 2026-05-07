@@ -6,7 +6,7 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::lb::{LoadBalancer, SelectedUpstream};
-use crate::logging::{BodyPreview, HeaderEntry};
+use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog};
 use crate::state::RouteDecisionProvenance;
 
 use super::ProxyService;
@@ -14,6 +14,9 @@ use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upst
 use super::attempt_request::{AttemptRequestSetupParams, prepare_attempt_request};
 use super::http_debug::{HttpDebugBase, format_reqwest_error_for_retry_chain};
 use super::retry::{RetryLayerOptions, backoff_sleep, should_retry_class};
+use super::route_attempts::{
+    ErrorRouteAttemptParams, RouteAttemptErrorKind, record_error_route_attempt,
+};
 
 pub(super) struct AttemptTransportSuccess {
     pub(super) response: reqwest::Response,
@@ -63,6 +66,8 @@ pub(super) struct AttemptTransportParams<'a> {
     pub(super) avoided_total: &'a mut usize,
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
     pub(super) upstream_chain: &'a mut Vec<String>,
+    pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
+    pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
 }
 
@@ -79,6 +84,8 @@ pub(super) struct AttemptReadBodyParams<'a> {
     pub(super) avoided_total: &'a mut usize,
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
     pub(super) upstream_chain: &'a mut Vec<String>,
+    pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
+    pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
 }
 
@@ -114,6 +121,8 @@ pub(super) async fn handle_attempt_transport(
         avoided_total,
         last_err,
         upstream_chain,
+        route_attempts,
+        route_attempt_index,
         model_note,
     } = params;
 
@@ -121,14 +130,6 @@ pub(super) async fn handle_attempt_transport(
         Ok((url, _headers)) => url,
         Err(error) => {
             let err_str = error.to_string();
-            upstream_chain.push(format!(
-                "{}:{} (idx={}) target_build_error={} model={}",
-                selected.station_name,
-                selected.upstream.base_url,
-                selected.index,
-                err_str,
-                model_note
-            ));
             apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
                 lb: None,
@@ -137,12 +138,26 @@ pub(super) async fn handle_attempt_transport(
                 penalize_reason: None,
                 cooldown_secs: transport_cooldown_secs,
                 cooldown_backoff,
-                error_message: err_str,
+                error_message: err_str.clone(),
                 avoid_set,
                 avoided_total,
                 last_err,
             })
             .await;
+            record_error_route_attempt(
+                upstream_chain,
+                route_attempts,
+                ErrorRouteAttemptParams {
+                    selected,
+                    route_attempt_index,
+                    kind: RouteAttemptErrorKind::TargetBuild,
+                    reason: err_str.as_str(),
+                    model_note,
+                    duration_ms: None,
+                    cooldown_secs: Some(transport_cooldown_secs),
+                    cooldown_reason: Some("target_build_error"),
+                },
+            );
             return AttemptTransportOutcome::TryNextUpstream;
         }
     };
@@ -187,16 +202,22 @@ pub(super) async fn handle_attempt_transport(
         Ok(response) => response,
         Err(error) => {
             let err_str = format_reqwest_error_for_retry_chain(&error);
-            upstream_chain.push(format!(
-                "{}:{} (idx={}) transport_error={} model={}",
-                selected.station_name,
-                selected.upstream.base_url,
-                selected.index,
-                err_str,
-                model_note
-            ));
             let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
                 && should_retry_class(upstream_opt, Some("upstream_transport_error"));
+            record_error_route_attempt(
+                upstream_chain,
+                route_attempts,
+                ErrorRouteAttemptParams {
+                    selected,
+                    route_attempt_index,
+                    kind: RouteAttemptErrorKind::Transport,
+                    reason: err_str.as_str(),
+                    model_note,
+                    duration_ms: Some(upstream_start.elapsed().as_millis() as u64),
+                    cooldown_secs: (!can_retry_upstream).then_some(transport_cooldown_secs),
+                    cooldown_reason: (!can_retry_upstream).then_some("upstream_transport_error"),
+                },
+            );
             if can_retry_upstream {
                 backoff_sleep(upstream_opt, upstream_attempt).await;
                 return AttemptTransportOutcome::RetrySameUpstream;
@@ -244,6 +265,8 @@ pub(super) async fn read_attempt_response_body(
         avoided_total,
         last_err,
         upstream_chain,
+        route_attempts,
+        route_attempt_index,
         model_note,
     } = params;
 
@@ -251,16 +274,22 @@ pub(super) async fn read_attempt_response_body(
         Ok(bytes) => AttemptReadBodyOutcome::Continue(bytes),
         Err(error) => {
             let err_str = format_reqwest_error_for_retry_chain(&error);
-            upstream_chain.push(format!(
-                "{}:{} (idx={}) body_read_error={} model={}",
-                selected.station_name,
-                selected.upstream.base_url,
-                selected.index,
-                err_str,
-                model_note
-            ));
             let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
                 && should_retry_class(upstream_opt, Some("upstream_transport_error"));
+            record_error_route_attempt(
+                upstream_chain,
+                route_attempts,
+                ErrorRouteAttemptParams {
+                    selected,
+                    route_attempt_index,
+                    kind: RouteAttemptErrorKind::BodyRead,
+                    reason: err_str.as_str(),
+                    model_note,
+                    duration_ms: None,
+                    cooldown_secs: (!can_retry_upstream).then_some(transport_cooldown_secs),
+                    cooldown_reason: (!can_retry_upstream).then_some("upstream_body_read_error"),
+                },
+            );
             if can_retry_upstream {
                 backoff_sleep(upstream_opt, upstream_attempt).await;
                 return AttemptReadBodyOutcome::RetrySameUpstream;

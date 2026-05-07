@@ -165,8 +165,31 @@ fn route_attempt_brief(attempt: &crate::logging::RouteAttemptLog) -> String {
         (None, None) => "-".to_string(),
     };
     let mut parts = vec![target, attempt.decision.clone()];
+    if let Some(provider_id) = attempt.provider_id.as_deref() {
+        parts.push(format!("provider={}", shorten_middle(provider_id, 24)));
+    }
+    if let Some(provider_attempt) = attempt.provider_attempt {
+        if let Some(max) = attempt.provider_max_attempts {
+            parts.push(format!("p={provider_attempt}/{max}"));
+        } else {
+            parts.push(format!("p={provider_attempt}"));
+        }
+    }
+    if let Some(upstream_attempt) = attempt.upstream_attempt {
+        if let Some(max) = attempt.upstream_max_attempts {
+            parts.push(format!("u={upstream_attempt}/{max}"));
+        } else {
+            parts.push(format!("u={upstream_attempt}"));
+        }
+    }
     if let Some(status_code) = attempt.status_code {
         parts.push(format!("st={status_code}"));
+    }
+    if let Some(duration_ms) = attempt.duration_ms {
+        parts.push(format!("dur={duration_ms}ms"));
+    }
+    if let Some(cooldown_secs) = attempt.cooldown_secs {
+        parts.push(format!("cd={cooldown_secs}s"));
     }
     if let Some(error_class) = attempt.error_class.as_deref() {
         parts.push(format!("class={error_class}"));

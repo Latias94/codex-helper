@@ -418,6 +418,23 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
         (None, None) => "-".to_string(),
     };
     let mut parts = vec![attempt.decision.clone()];
+    if let Some(provider_id) = attempt.provider_id.as_deref() {
+        parts.push(format!("prov={}", shorten_middle(provider_id, 18)));
+    }
+    if let Some(provider_attempt) = attempt.provider_attempt {
+        if let Some(max) = attempt.provider_max_attempts {
+            parts.push(format!("p={provider_attempt}/{max}"));
+        } else {
+            parts.push(format!("p={provider_attempt}"));
+        }
+    }
+    if let Some(upstream_attempt) = attempt.upstream_attempt {
+        if let Some(max) = attempt.upstream_max_attempts {
+            parts.push(format!("u={upstream_attempt}/{max}"));
+        } else {
+            parts.push(format!("u={upstream_attempt}"));
+        }
+    }
     if attempt.skipped {
         parts.push("skipped".to_string());
     }
@@ -429,6 +446,30 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
     }
     if let Some(model) = attempt.model.as_deref() {
         parts.push(format!("model={}", shorten(model, 22)));
+    }
+    if let Some(ttfb_ms) = attempt.upstream_headers_ms {
+        parts.push(format!("ttfb={ttfb_ms}ms"));
+    }
+    if let Some(duration_ms) = attempt.duration_ms {
+        parts.push(format!("dur={duration_ms}ms"));
+    }
+    if let Some(cooldown_secs) = attempt.cooldown_secs {
+        parts.push(format!("cd={cooldown_secs}s"));
+    }
+    if !attempt.avoid_for_station.is_empty() {
+        let avoid = attempt
+            .avoid_for_station
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("avoid=[{avoid}]"));
+    } else if let Some(avoided_total) = attempt.avoided_total.filter(|value| *value > 0) {
+        if let Some(total) = attempt.total_upstreams {
+            parts.push(format!("avoided={avoided_total}/{total}"));
+        } else {
+            parts.push(format!("avoided={avoided_total}"));
+        }
     }
     if let Some(reason) = attempt.reason.as_deref() {
         parts.push(format!("reason={}", shorten_middle(reason, 42)));

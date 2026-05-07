@@ -315,6 +315,10 @@ fn route_attempts_is_empty(value: &[RouteAttemptLog]) -> bool {
     value.is_empty()
 }
 
+fn route_attempt_avoid_for_station_is_empty(value: &[usize]) -> bool {
+    value.is_empty()
+}
+
 fn bool_is_false(value: &bool) -> bool {
     !*value
 }
@@ -323,11 +327,30 @@ fn bool_is_false(value: &bool) -> bool {
 pub struct RouteAttemptLog {
     pub attempt_index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_max_attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_max_attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub station_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_index: Option<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "route_attempt_avoid_for_station_is_empty"
+    )]
+    pub avoid_for_station: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avoided_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_upstreams: Option<usize>,
     pub decision: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -337,6 +360,14 @@ pub struct RouteAttemptLog {
     pub error_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_headers_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<String>,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub skipped: bool,
     pub raw: String,

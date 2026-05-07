@@ -360,6 +360,7 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
         "codex",
         Arc::new(std::sync::Mutex::new(HashMap::new())),
     );
+    let state = proxy.state.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -381,6 +382,28 @@ async fn proxy_failover_across_requests_penalizes_502_when_no_internal_retry() {
         body1_s.contains(r#""upstream":2"#),
         "expected response from upstream2, got: {body1_s}"
     );
+    let mut finished = Vec::new();
+    for _ in 0..100 {
+        finished = state.list_recent_finished(10).await;
+        if finished.iter().any(|request| request.retry.is_some()) {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    let retry = finished
+        .iter()
+        .find_map(|request| request.retry.as_ref())
+        .expect("streaming failover should record retry info");
+    assert_eq!(retry.attempts, 2);
+    assert_eq!(retry.route_attempts.len(), 2);
+    assert_eq!(retry.route_attempts[0].decision, "failed_status");
+    assert_eq!(retry.route_attempts[0].provider_id.as_deref(), Some("u1"));
+    assert_eq!(retry.route_attempts[0].provider_attempt, Some(1));
+    assert_eq!(retry.route_attempts[1].decision, "completed");
+    assert_eq!(retry.route_attempts[1].provider_id.as_deref(), Some("u2"));
+    assert_eq!(retry.route_attempts[1].provider_attempt, Some(1));
+    assert_eq!(retry.route_attempts[1].upstream_index, Some(1));
+    assert!(retry.route_attempts[1].upstream_headers_ms.is_some());
 
     // Second request should now go directly to upstream2 thanks to the cooldown on upstream1.
     let (status2, body2) = {

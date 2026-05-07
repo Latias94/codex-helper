@@ -36,6 +36,7 @@ mod request_preparation;
 mod request_routing;
 mod response_finalization;
 mod retry;
+mod route_attempts;
 mod route_provenance;
 mod router_setup;
 mod runtime_admin_api;

@@ -5,7 +5,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 
 use crate::lb::{CooldownBackoff, LoadBalancer, SelectedUpstream};
-use crate::logging::ServiceTierLog;
+use crate::logging::{RouteAttemptLog, ServiceTierLog};
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
 
 use super::ProxyService;
@@ -17,9 +17,10 @@ use super::response_finalization::{
     FinalizeForwardResponseParams, finish_and_build_forward_response,
 };
 use super::retry::{
-    RetryLayerOptions, RetryPlan, retry_info_for_chain, retry_sleep, should_never_retry,
-    should_retry_class, should_retry_status,
+    RetryLayerOptions, RetryPlan, retry_info_for_observed_attempts, retry_sleep,
+    should_never_retry, should_retry_class, should_retry_status,
 };
+use super::route_attempts::{StatusRouteAttemptParams, record_status_route_attempt};
 use super::stream::{SseSuccessMeta, build_sse_success_response};
 
 pub(super) enum AttemptResponseOutcome {
@@ -48,6 +49,8 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) effective_effort: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
     pub(super) upstream_chain: &'a mut Vec<String>,
+    pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
+    pub(super) route_attempt_index: usize,
     pub(super) model_note: &'a str,
     pub(super) plan: &'a RetryPlan,
     pub(super) upstream_opt: &'a RetryLayerOptions,
@@ -74,7 +77,10 @@ pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) request_body_len: usize,
     pub(super) upstream_request_body_len: usize,
     pub(super) debug_base: Option<HttpDebugBase>,
-    pub(super) upstream_chain: &'a [String],
+    pub(super) upstream_chain: &'a mut Vec<String>,
+    pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
+    pub(super) route_attempt_index: usize,
+    pub(super) model_note: &'a str,
     pub(super) session_id: Option<&'a str>,
     pub(super) cwd: Option<&'a str>,
     pub(super) effective_effort: Option<&'a str>,
@@ -107,6 +113,9 @@ pub(super) async fn handle_streaming_attempt_success(
         upstream_request_body_len,
         debug_base,
         upstream_chain,
+        route_attempts,
+        route_attempt_index,
+        model_note,
         session_id,
         cwd,
         effective_effort,
@@ -126,7 +135,23 @@ pub(super) async fn handle_streaming_attempt_success(
         crate::lb::COOLDOWN_SECS,
         cooldown_backoff,
     );
-    let retry = retry_info_for_chain(upstream_chain);
+    let duration_ms = start.elapsed().as_millis() as u64;
+    record_status_route_attempt(
+        upstream_chain,
+        route_attempts,
+        StatusRouteAttemptParams {
+            selected,
+            route_attempt_index,
+            status_code: status.as_u16(),
+            error_class: None,
+            model_note,
+            upstream_headers_ms,
+            duration_ms,
+            cooldown_secs: None,
+            cooldown_reason: None,
+        },
+    );
+    let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
     build_sse_success_response(
         proxy,
         lb.clone(),
@@ -183,6 +208,8 @@ pub(super) async fn handle_attempt_response(
         effective_effort,
         base_service_tier,
         upstream_chain,
+        route_attempts,
+        route_attempt_index,
         model_note,
         plan,
         upstream_opt,
@@ -199,15 +226,30 @@ pub(super) async fn handle_attempt_response(
         classify_upstream_response(status_code, &response_headers, response_body.as_ref());
     let never_retry = should_never_retry(plan, status_code, cls.as_deref());
     let observed_service_tier = extract_service_tier_from_response_body(response_body.as_ref());
-
-    upstream_chain.push(format!(
-        "{} (idx={}) status={} class={} model={}",
-        selected.upstream.base_url,
-        selected.index,
-        status_code,
-        cls.as_deref().unwrap_or("-"),
-        model_note
-    ));
+    let upstream_retryable = should_retry_status(upstream_opt, status_code)
+        || should_retry_class(upstream_opt, cls.as_deref());
+    let can_retry_same_upstream =
+        upstream_retryable && upstream_attempt + 1 < upstream_opt.max_attempts;
+    let provider_retryable = should_retry_status(provider_opt, status_code)
+        || should_retry_class(provider_opt, cls.as_deref());
+    let provider_failover =
+        !status.is_success() && !never_retry && !can_retry_same_upstream && provider_retryable;
+    let cooldown_reason = format!("status_{status_code}");
+    record_status_route_attempt(
+        upstream_chain,
+        route_attempts,
+        StatusRouteAttemptParams {
+            selected,
+            route_attempt_index,
+            status_code,
+            error_class: cls.as_deref(),
+            model_note,
+            upstream_headers_ms,
+            duration_ms,
+            cooldown_secs: provider_failover.then_some(plan.transport_cooldown_secs),
+            cooldown_reason: provider_failover.then_some(cooldown_reason.as_str()),
+        },
+    );
 
     if status.is_success() {
         lb.record_result_with_backoff(
@@ -226,7 +268,7 @@ pub(super) async fn handle_attempt_response(
         .await;
 
         let usage = extract_usage_from_bytes(&response_body);
-        let retry = retry_info_for_chain(upstream_chain);
+        let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
         return AttemptResponseOutcome::Return(
             finish_attempt_forward_response(
                 proxy,
@@ -274,7 +316,7 @@ pub(super) async fn handle_attempt_response(
         )
         .await;
 
-        let retry = retry_info_for_chain(upstream_chain);
+        let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
         return AttemptResponseOutcome::Return(
             finish_attempt_forward_response(
                 proxy,
@@ -301,15 +343,11 @@ pub(super) async fn handle_attempt_response(
         );
     }
 
-    let upstream_retryable = should_retry_status(upstream_opt, status_code)
-        || should_retry_class(upstream_opt, cls.as_deref());
-    if upstream_retryable && upstream_attempt + 1 < upstream_opt.max_attempts {
+    if can_retry_same_upstream {
         retry_sleep(upstream_opt, upstream_attempt, &response_headers).await;
         return AttemptResponseOutcome::RetrySameUpstream;
     }
 
-    let provider_retryable = should_retry_status(provider_opt, status_code)
-        || should_retry_class(provider_opt, cls.as_deref());
     if provider_retryable {
         if !class_is_health_neutral(cls.as_deref()) {
             let penalty_reason = format!("status_{status_code}");
@@ -338,7 +376,7 @@ pub(super) async fn handle_attempt_response(
         return AttemptResponseOutcome::TryNextUpstream;
     }
 
-    let retry = retry_info_for_chain(upstream_chain);
+    let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
     record_passive_upstream_failure(
         proxy.state.as_ref(),
         proxy.service_name,

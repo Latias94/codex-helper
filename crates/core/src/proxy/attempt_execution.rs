@@ -6,7 +6,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
 
 use crate::lb::{CooldownBackoff, LoadBalancer, SelectedUpstream};
-use crate::logging::{BodyPreview, HeaderEntry, ServiceTierLog, log_retry_trace};
+use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace};
 use crate::state::SessionBinding;
 
 use super::ProxyService;
@@ -21,6 +21,7 @@ use super::attempt_transport::{
 use super::headers::filter_response_headers;
 use super::request_preparation::RequestFlavor;
 use super::retry::{RetryLayerOptions, RetryPlan};
+use super::route_attempts::{StartRouteAttemptParams, start_selected_route_attempt};
 use super::selected_upstream_request::{
     SelectedUpstreamRequestSetupParams, prepare_selected_upstream_request,
 };
@@ -89,6 +90,7 @@ pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) avoided_total: &'a mut usize,
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
     pub(super) upstream_chain: &'a mut Vec<String>,
+    pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
 }
 
 pub(super) async fn execute_selected_upstream(
@@ -137,6 +139,7 @@ pub(super) async fn execute_selected_upstream(
         avoided_total,
         last_err,
         upstream_chain,
+        route_attempts,
     } = params;
 
     let selected_setup = prepare_selected_upstream_request(SelectedUpstreamRequestSetupParams {
@@ -182,6 +185,21 @@ pub(super) async fn execute_selected_upstream(
             total_upstreams,
             model_note: model_note.as_str(),
         });
+        let route_attempt_index = start_selected_route_attempt(
+            route_attempts,
+            StartRouteAttemptParams {
+                selected,
+                provider_id: provider_id.as_deref(),
+                provider_attempt,
+                upstream_attempt,
+                provider_max_attempts: provider_opt.max_attempts,
+                upstream_max_attempts: upstream_opt.max_attempts,
+                model_note: model_note.as_str(),
+                avoid_set,
+                avoided_total: *avoided_total,
+                total_upstreams,
+            },
+        );
 
         let transport = handle_attempt_transport(AttemptTransportParams {
             proxy,
@@ -212,6 +230,8 @@ pub(super) async fn execute_selected_upstream(
             avoided_total,
             last_err,
             upstream_chain,
+            route_attempts,
+            route_attempt_index,
             model_note: model_note.as_str(),
         })
         .await;
@@ -248,6 +268,9 @@ pub(super) async fn execute_selected_upstream(
                     upstream_request_body_len,
                     debug_base,
                     upstream_chain,
+                    route_attempts,
+                    route_attempt_index,
+                    model_note: model_note.as_str(),
                     session_id,
                     cwd,
                     effective_effort,
@@ -277,6 +300,8 @@ pub(super) async fn execute_selected_upstream(
             avoided_total,
             last_err,
             upstream_chain,
+            route_attempts,
+            route_attempt_index,
             model_note: model_note.as_str(),
         })
         .await
@@ -307,6 +332,8 @@ pub(super) async fn execute_selected_upstream(
             effective_effort,
             base_service_tier,
             upstream_chain,
+            route_attempts,
+            route_attempt_index,
             model_note: model_note.as_str(),
             plan,
             upstream_opt,

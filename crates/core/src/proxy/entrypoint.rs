@@ -10,7 +10,7 @@ use super::provider_execution::{
 };
 use super::request_context::prepare_proxy_request;
 use super::request_failures::{finish_failed_proxy_request, no_upstreams_available_error};
-use super::retry::retry_info_for_chain;
+use super::retry::retry_info_for_observed_attempts;
 
 #[instrument(skip_all, fields(service = %proxy.service_name))]
 pub async fn handle_proxy(
@@ -60,14 +60,16 @@ pub async fn handle_proxy(
         cooldown_backoff: prepared.cooldown_backoff,
     })
     .await;
-    let (upstream_chain, last_err) = match provider_execution {
+    let (upstream_chain, route_attempts, last_err) = match provider_execution {
         ProviderExecutionOutcome::Return(response) => return Ok(response),
-        ProviderExecutionOutcome::Exhausted(state) => (state.upstream_chain, state.last_err),
+        ProviderExecutionOutcome::Exhausted(state) => {
+            (state.upstream_chain, state.route_attempts, state.last_err)
+        }
     };
 
     if let Some((status, msg)) = last_err {
         let dur = start.elapsed().as_millis() as u64;
-        let retry = retry_info_for_chain(&upstream_chain);
+        let retry = retry_info_for_observed_attempts(&upstream_chain, &route_attempts);
         return Err(finish_failed_proxy_request(
             super::request_failures::FailedProxyRequestParams {
                 proxy: &proxy,

@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
 use crate::lb::{LoadBalancer, SelectedUpstream};
+use crate::logging::RouteAttemptLog;
 use crate::model_routing;
+
+use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
 
 pub(super) fn station_upstreams_exhausted(
     upstream_total: usize,
@@ -16,7 +19,11 @@ pub(super) fn select_supported_upstream(
     strict_multi_config: bool,
     avoid_set: &mut HashSet<usize>,
     upstream_chain: &mut Vec<String>,
+    route_attempts: &mut Vec<RouteAttemptLog>,
     avoided_total: &mut usize,
+    provider_attempt: u32,
+    provider_max_attempts: u32,
+    total_upstreams: usize,
 ) -> Option<SelectedUpstream> {
     loop {
         let upstream_total = lb.service.upstreams.len();
@@ -41,16 +48,22 @@ pub(super) fn select_supported_upstream(
                 requested_model,
             );
             if !supported {
-                upstream_chain.push(format!(
-                    "{}:{} (idx={}) skipped_unsupported_model={}",
-                    selected.station_name,
-                    selected.upstream.base_url,
-                    selected.index,
-                    requested_model
-                ));
                 if avoid_set.insert(selected.index) {
                     *avoided_total = avoided_total.saturating_add(1);
                 }
+                record_unsupported_model_skip(
+                    upstream_chain,
+                    route_attempts,
+                    UnsupportedModelSkipParams {
+                        selected: &selected,
+                        requested_model,
+                        provider_attempt,
+                        provider_max_attempts,
+                        avoid_set,
+                        avoided_total: *avoided_total,
+                        total_upstreams,
+                    },
+                );
                 continue;
             }
         }
@@ -104,6 +117,7 @@ mod tests {
         ]);
         let mut avoid_set = HashSet::new();
         let mut upstream_chain = Vec::new();
+        let mut route_attempts = Vec::new();
         let mut avoided_total = 0;
 
         let selected = select_supported_upstream(
@@ -112,7 +126,11 @@ mod tests {
             false,
             &mut avoid_set,
             &mut upstream_chain,
+            &mut route_attempts,
             &mut avoided_total,
+            0,
+            2,
+            2,
         )
         .expect("selected");
 
@@ -121,6 +139,11 @@ mod tests {
         assert_eq!(avoided_total, 1);
         assert_eq!(upstream_chain.len(), 1);
         assert!(upstream_chain[0].contains("skipped_unsupported_model=gpt-5"));
+        assert_eq!(route_attempts.len(), 1);
+        assert_eq!(route_attempts[0].decision, "skipped_capability_mismatch");
+        assert_eq!(route_attempts[0].provider_attempt, Some(1));
+        assert_eq!(route_attempts[0].provider_max_attempts, Some(2));
+        assert_eq!(route_attempts[0].avoid_for_station, vec![0]);
     }
 
     #[test]
@@ -131,6 +154,7 @@ mod tests {
         ]);
         let mut avoid_set = HashSet::new();
         let mut upstream_chain = Vec::new();
+        let mut route_attempts = Vec::new();
         let mut avoided_total = 0;
 
         let selected = select_supported_upstream(
@@ -139,13 +163,18 @@ mod tests {
             true,
             &mut avoid_set,
             &mut upstream_chain,
+            &mut route_attempts,
             &mut avoided_total,
+            0,
+            2,
+            2,
         );
 
         assert!(selected.is_none());
         assert_eq!(avoid_set.len(), 2);
         assert_eq!(avoided_total, 2);
         assert_eq!(upstream_chain.len(), 2);
+        assert_eq!(route_attempts.len(), 2);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use tokio::time::sleep;
 use crate::config::ResolvedRetryConfig;
 use crate::config::ResolvedRetryLayerConfig;
 use crate::config::RetryStrategy;
-use crate::logging::{RetryInfo, parse_route_attempts_from_chain};
+use crate::logging::{RetryInfo, RouteAttemptLog, parse_route_attempts_from_chain};
 
 #[derive(Clone)]
 pub(super) struct RetryLayerOptions {
@@ -92,9 +92,17 @@ pub(super) fn retry_plan(cfg: &ResolvedRetryConfig) -> RetryPlan {
     }
 }
 
-pub(super) fn retry_info_for_chain(chain: &[String]) -> Option<RetryInfo> {
+pub(super) fn retry_info_for_observed_attempts(
+    chain: &[String],
+    route_attempts: &[RouteAttemptLog],
+) -> Option<RetryInfo> {
     let mut attempts = chain.len() as u32;
-    if chain
+    if !route_attempts.is_empty() {
+        attempts = route_attempts
+            .iter()
+            .filter(|attempt| attempt.decision != "all_upstreams_avoided")
+            .count() as u32;
+    } else if chain
         .last()
         .is_some_and(|s| s.starts_with("all_upstreams_avoided"))
     {
@@ -107,7 +115,11 @@ pub(super) fn retry_info_for_chain(chain: &[String]) -> Option<RetryInfo> {
     Some(RetryInfo {
         attempts,
         upstream_chain: chain.to_vec(),
-        route_attempts: parse_route_attempts_from_chain(chain),
+        route_attempts: if route_attempts.is_empty() {
+            parse_route_attempts_from_chain(chain)
+        } else {
+            route_attempts.to_vec()
+        },
     })
 }
 
@@ -242,7 +254,7 @@ mod tests {
             "https://b.example/v1 (idx=1) status=502 class=-".to_string(),
             "all_upstreams_avoided total=2".to_string(),
         ];
-        let info = retry_info_for_chain(&chain).unwrap();
+        let info = retry_info_for_observed_attempts(&chain, &[]).unwrap();
         assert_eq!(info.attempts, 2);
         assert_eq!(info.upstream_chain, chain);
         assert_eq!(info.route_attempts.len(), 3);
@@ -252,12 +264,64 @@ mod tests {
     }
 
     #[test]
+    fn retry_info_prefers_structured_route_attempts() {
+        let chain = vec![
+            "alpha:https://a.example/v1 (idx=0) status=502 class=- model=gpt".to_string(),
+            "beta:https://b.example/v1 (idx=0) status=200 class=- model=gpt".to_string(),
+        ];
+        let route_attempts = vec![
+            RouteAttemptLog {
+                attempt_index: 0,
+                provider_id: Some("provider-a".to_string()),
+                provider_attempt: Some(1),
+                provider_max_attempts: Some(2),
+                upstream_attempt: Some(1),
+                upstream_max_attempts: Some(1),
+                station_name: Some("alpha".to_string()),
+                upstream_base_url: Some("https://a.example/v1".to_string()),
+                upstream_index: Some(0),
+                decision: "failed_status".to_string(),
+                status_code: Some(502),
+                raw: chain[0].clone(),
+                ..Default::default()
+            },
+            RouteAttemptLog {
+                attempt_index: 1,
+                provider_id: Some("provider-b".to_string()),
+                provider_attempt: Some(2),
+                provider_max_attempts: Some(2),
+                upstream_attempt: Some(1),
+                upstream_max_attempts: Some(1),
+                station_name: Some("beta".to_string()),
+                upstream_base_url: Some("https://b.example/v1".to_string()),
+                upstream_index: Some(0),
+                decision: "completed".to_string(),
+                status_code: Some(200),
+                upstream_headers_ms: Some(42),
+                duration_ms: Some(100),
+                raw: chain[1].clone(),
+                ..Default::default()
+            },
+        ];
+
+        let info = retry_info_for_observed_attempts(&chain, &route_attempts).unwrap();
+
+        assert_eq!(info.attempts, 2);
+        assert_eq!(info.route_attempts, route_attempts);
+        assert_eq!(
+            info.route_attempts[1].provider_id.as_deref(),
+            Some("provider-b")
+        );
+        assert_eq!(info.route_attempts[1].upstream_headers_ms, Some(42));
+    }
+
+    #[test]
     fn retry_info_is_none_when_only_one_real_attempt_happened() {
         let chain = vec![
             "https://a.example/v1 (idx=0) status=502 class=-".to_string(),
             "all_upstreams_avoided total=1".to_string(),
         ];
-        assert!(retry_info_for_chain(&chain).is_none());
+        assert!(retry_info_for_observed_attempts(&chain, &[]).is_none());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
 
 use crate::config::RetryStrategy;
 use crate::lb::{CooldownBackoff, LoadBalancer};
-use crate::logging::{BodyPreview, HeaderEntry, ServiceTierLog, log_retry_trace};
+use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace};
 use crate::state::SessionBinding;
 
 use super::ProxyService;
@@ -65,6 +65,7 @@ pub(super) enum ProviderExecutionOutcome {
 
 pub(super) struct ProviderExecutionState {
     pub(super) upstream_chain: Vec<String>,
+    pub(super) route_attempts: Vec<RouteAttemptLog>,
     pub(super) last_err: Option<(StatusCode, String)>,
 }
 
@@ -150,6 +151,7 @@ pub(super) async fn execute_provider_chain(
         .sum::<usize>();
     let mut avoid: HashMap<String, HashSet<usize>> = HashMap::new();
     let mut upstream_chain: Vec<String> = Vec::new();
+    let mut route_attempts: Vec<RouteAttemptLog> = Vec::new();
     let mut avoided_total: usize = 0;
     let mut tried_stations: HashSet<String> = HashSet::new();
     let strict_multi_config = lbs.len() > 1;
@@ -208,6 +210,7 @@ pub(super) async fn execute_provider_chain(
             avoided_total: &mut avoided_total,
             last_err: &mut last_err,
             upstream_chain: &mut upstream_chain,
+            route_attempts: &mut route_attempts,
         })
         .await
         {
@@ -235,6 +238,7 @@ pub(super) async fn execute_provider_chain(
 
     ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
         upstream_chain,
+        route_attempts,
         last_err,
     })
 }
@@ -281,6 +285,7 @@ struct ExecuteStationUpstreamsParams<'a> {
     avoided_total: &'a mut usize,
     last_err: &'a mut Option<(StatusCode, String)>,
     upstream_chain: &'a mut Vec<String>,
+    route_attempts: &'a mut Vec<RouteAttemptLog>,
 }
 
 async fn execute_station_upstreams(
@@ -328,6 +333,7 @@ async fn execute_station_upstreams(
         avoided_total,
         last_err,
         upstream_chain,
+        route_attempts,
     } = params;
 
     'upstreams: loop {
@@ -351,7 +357,11 @@ async fn execute_station_upstreams(
             strict_multi_config,
             avoid_set,
             upstream_chain,
+            route_attempts,
             avoided_total,
+            provider_attempt,
+            plan.provider.max_attempts,
+            total_upstreams,
         );
         let Some(selected) = selected else {
             break 'upstreams;
@@ -400,6 +410,7 @@ async fn execute_station_upstreams(
             avoided_total,
             last_err,
             upstream_chain,
+            route_attempts,
         })
         .await
         {
