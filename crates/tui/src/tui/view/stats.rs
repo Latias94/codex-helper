@@ -141,7 +141,7 @@ fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, area: Rect) {
         .title("Tokens (since start)")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
-    let t2 = Text::from(vec![
+    let mut token_lines = vec![
         Line::from(vec![
             Span::styled("in   ", Style::default().fg(p.muted)),
             Span::styled(
@@ -158,7 +158,7 @@ fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, area: Rect) {
         Line::from(vec![
             Span::styled("rsn  ", Style::default().fg(p.muted)),
             Span::styled(
-                tokens_short(tokens.reasoning_tokens),
+                tokens_short(tokens.reasoning_output_tokens_total()),
                 Style::default().fg(p.text),
             ),
             Span::raw("   "),
@@ -168,7 +168,29 @@ fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, area: Rect) {
                 Style::default().fg(p.text),
             ),
         ]),
-    ]);
+    ];
+    if tokens.has_cache_tokens() {
+        token_lines.push(Line::from(vec![
+            Span::styled("cached ", Style::default().fg(p.muted)),
+            Span::styled(
+                tokens_short(tokens.cached_input_tokens),
+                Style::default().fg(p.text),
+            ),
+            Span::raw("   "),
+            Span::styled("read ", Style::default().fg(p.muted)),
+            Span::styled(
+                tokens_short(tokens.cache_read_input_tokens),
+                Style::default().fg(p.text),
+            ),
+            Span::raw("   "),
+            Span::styled("create ", Style::default().fg(p.muted)),
+            Span::styled(
+                tokens_short(tokens.cache_creation_tokens_total()),
+                Style::default().fg(p.text),
+            ),
+        ]));
+    }
+    let t2 = Text::from(token_lines);
     f.render_widget(
         Paragraph::new(t2).block(b2).wrap(Wrap { trim: true }),
         cols[1],
@@ -452,7 +474,7 @@ fn render_detail_panel(
                     "{}/{}/{}",
                     tokens_short(bucket.usage.input_tokens),
                     tokens_short(bucket.usage.output_tokens),
-                    tokens_short(bucket.usage.reasoning_tokens),
+                    tokens_short(bucket.usage.reasoning_output_tokens_total()),
                 ),
                 Style::default().fg(p.muted),
             ),

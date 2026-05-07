@@ -125,13 +125,22 @@ fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
 }
 
 fn fmt_usage_line(u: &UsageMetrics) -> String {
-    format!(
+    let mut line = format!(
         "tokens in/out/rsn/ttl: {}/{}/{}/{}",
         tokens_short(u.input_tokens),
         tokens_short(u.output_tokens),
-        tokens_short(u.reasoning_tokens),
+        tokens_short(u.reasoning_output_tokens_total()),
         tokens_short(u.total_tokens)
-    )
+    );
+    if u.has_cache_tokens() {
+        line.push_str(&format!(
+            " cache cached/read/create: {}/{}/{}",
+            tokens_short(u.cached_input_tokens),
+            tokens_short(u.cache_read_input_tokens),
+            tokens_short(u.cache_creation_tokens_total())
+        ));
+    }
+    line
 }
 
 pub(in crate::tui) fn selected_stats_target(

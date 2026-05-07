@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn i64_is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UsageMetrics {
     #[serde(default)]
@@ -9,8 +13,28 @@ pub struct UsageMetrics {
     pub output_tokens: i64,
     #[serde(default)]
     pub reasoning_tokens: i64,
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub reasoning_output_tokens: i64,
     #[serde(default)]
     pub total_tokens: i64,
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub cached_input_tokens: i64,
+    #[serde(
+        default,
+        alias = "cache_read_tokens",
+        skip_serializing_if = "i64_is_zero"
+    )]
+    pub cache_read_input_tokens: i64,
+    #[serde(
+        default,
+        alias = "cache_creation_tokens",
+        skip_serializing_if = "i64_is_zero"
+    )]
+    pub cache_creation_input_tokens: i64,
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub cache_creation_5m_input_tokens: i64,
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub cache_creation_1h_input_tokens: i64,
 }
 
 impl UsageMetrics {
@@ -18,7 +42,49 @@ impl UsageMetrics {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(other.reasoning_output_tokens_total());
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(other.cache_read_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+        self.cache_creation_5m_input_tokens = self
+            .cache_creation_5m_input_tokens
+            .saturating_add(other.cache_creation_5m_input_tokens);
+        self.cache_creation_1h_input_tokens = self
+            .cache_creation_1h_input_tokens
+            .saturating_add(other.cache_creation_1h_input_tokens);
+    }
+
+    pub fn reasoning_output_tokens_total(&self) -> i64 {
+        self.reasoning_output_tokens.max(self.reasoning_tokens)
+    }
+
+    pub fn cache_creation_tokens_total(&self) -> i64 {
+        let by_ttl = self
+            .cache_creation_5m_input_tokens
+            .saturating_add(self.cache_creation_1h_input_tokens);
+        self.cache_creation_input_tokens.max(by_ttl)
+    }
+
+    pub fn has_cache_tokens(&self) -> bool {
+        self.cached_input_tokens > 0
+            || self.cache_read_input_tokens > 0
+            || self.cache_creation_tokens_total() > 0
+    }
+
+    fn derived_total_tokens(&self) -> i64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.cache_creation_tokens_total())
     }
 }
 
@@ -45,6 +111,7 @@ fn extract_usage_obj(payload: &Value) -> Option<&Value> {
 fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
     let mut m = UsageMetrics::default();
     let mut recognized = false;
+    let mut total_provided = false;
 
     if let Some(v) = usage_obj.get("input_tokens") {
         m.input_tokens = to_i64(v);
@@ -57,6 +124,7 @@ fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
     if let Some(v) = usage_obj.get("total_tokens") {
         m.total_tokens = to_i64(v);
         recognized = true;
+        total_provided = true;
     }
 
     // OpenAI Chat Completions compatibility (`prompt_tokens` / `completion_tokens`).
@@ -71,7 +139,15 @@ fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
 
     // Some providers may expose reasoning tokens directly.
     if let Some(v) = usage_obj.get("reasoning_tokens") {
-        m.reasoning_tokens = to_i64(v);
+        let value = to_i64(v);
+        m.reasoning_tokens = value;
+        m.reasoning_output_tokens = value;
+        recognized = true;
+    }
+    if let Some(v) = usage_obj.get("reasoning_output_tokens") {
+        let value = to_i64(v);
+        m.reasoning_output_tokens = value;
+        m.reasoning_tokens = m.reasoning_tokens.max(value);
         recognized = true;
     }
 
@@ -80,7 +156,9 @@ fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
         .and_then(|v| v.as_object())
         && let Some(v) = details.get("reasoning_tokens")
     {
-        m.reasoning_tokens = to_i64(v);
+        let value = to_i64(v);
+        m.reasoning_tokens = value;
+        m.reasoning_output_tokens = value;
         recognized = true;
     }
     if let Some(details) = usage_obj
@@ -88,13 +166,66 @@ fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
         .and_then(|v| v.as_object())
         && let Some(v) = details.get("reasoning_tokens")
     {
-        m.reasoning_tokens = to_i64(v);
+        let value = to_i64(v);
+        m.reasoning_tokens = value;
+        m.reasoning_output_tokens = value;
         recognized = true;
     }
 
+    if let Some(details) = usage_obj
+        .get("input_tokens_details")
+        .or_else(|| usage_obj.get("input_token_details"))
+        .and_then(|v| v.as_object())
+        && let Some(v) = details.get("cached_tokens")
+    {
+        m.cached_input_tokens = to_i64(v);
+        recognized = true;
+    }
+    if let Some(details) = usage_obj
+        .get("prompt_tokens_details")
+        .or_else(|| usage_obj.get("prompt_token_details"))
+        .and_then(|v| v.as_object())
+        && let Some(v) = details.get("cached_tokens")
+    {
+        m.cached_input_tokens = to_i64(v);
+        recognized = true;
+    }
+
+    if let Some(v) = usage_obj.get("cached_input_tokens") {
+        m.cached_input_tokens = to_i64(v);
+        recognized = true;
+    }
+    if let Some(v) = usage_obj
+        .get("cache_read_input_tokens")
+        .or_else(|| usage_obj.get("cache_read_tokens"))
+    {
+        m.cache_read_input_tokens = to_i64(v);
+        recognized = true;
+    }
+    if let Some(v) = usage_obj
+        .get("cache_creation_input_tokens")
+        .or_else(|| usage_obj.get("cache_creation_tokens"))
+    {
+        m.cache_creation_input_tokens = to_i64(v);
+        recognized = true;
+    }
+    if let Some(v) = usage_obj.get("cache_creation_5m_input_tokens") {
+        m.cache_creation_5m_input_tokens = to_i64(v);
+        recognized = true;
+    }
+    if let Some(v) = usage_obj.get("cache_creation_1h_input_tokens") {
+        m.cache_creation_1h_input_tokens = to_i64(v);
+        recognized = true;
+    }
+    if m.cache_creation_input_tokens == 0 {
+        m.cache_creation_input_tokens = m
+            .cache_creation_5m_input_tokens
+            .saturating_add(m.cache_creation_1h_input_tokens);
+    }
+
     // If total isn't provided, derive it from input/output when possible.
-    if usage_obj.get("total_tokens").is_none() {
-        m.total_tokens = m.input_tokens.saturating_add(m.output_tokens);
+    if !total_provided {
+        m.total_tokens = m.derived_total_tokens();
     }
 
     if !recognized {
@@ -238,8 +369,8 @@ mod tests {
             Some(UsageMetrics {
                 input_tokens: 1,
                 output_tokens: 2,
-                reasoning_tokens: 0,
                 total_tokens: 3,
+                ..UsageMetrics::default()
             })
         );
     }
@@ -262,7 +393,61 @@ mod tests {
                 input_tokens: 9,
                 output_tokens: 12,
                 reasoning_tokens: 5,
+                reasoning_output_tokens: 5,
                 total_tokens: 21,
+                ..UsageMetrics::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_responses_usage_cache_and_reasoning_details() {
+        let json = r#"{
+          "response":{
+            "usage":{
+              "input_tokens":100,
+              "output_tokens":20,
+              "input_tokens_details":{"cached_tokens":40},
+              "output_tokens_details":{"reasoning_tokens":7}
+            }
+          }
+        }"#;
+        assert_eq!(
+            extract_usage_from_bytes(json.as_bytes()),
+            Some(UsageMetrics {
+                input_tokens: 100,
+                output_tokens: 20,
+                reasoning_tokens: 7,
+                reasoning_output_tokens: 7,
+                cached_input_tokens: 40,
+                total_tokens: 120,
+                ..UsageMetrics::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_anthropic_cache_usage_fields() {
+        let json = r#"{
+          "usage":{
+            "input_tokens":10,
+            "output_tokens":5,
+            "cache_read_input_tokens":30,
+            "cache_creation_5m_input_tokens":20,
+            "cache_creation_1h_input_tokens":40
+          }
+        }"#;
+        assert_eq!(
+            extract_usage_from_bytes(json.as_bytes()),
+            Some(UsageMetrics {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 105,
+                cache_read_input_tokens: 30,
+                cache_creation_input_tokens: 60,
+                cache_creation_5m_input_tokens: 20,
+                cache_creation_1h_input_tokens: 40,
+                ..UsageMetrics::default()
             })
         );
     }

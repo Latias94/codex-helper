@@ -56,10 +56,21 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 "in={}  out={}  rsn={}  ttl={}",
                 tokens_short(since.usage.input_tokens),
                 tokens_short(since.usage.output_tokens),
-                tokens_short(since.usage.reasoning_tokens),
+                tokens_short(since.usage.reasoning_output_tokens_total()),
                 tokens_short(since.usage.total_tokens)
             ));
             ui.end_row();
+
+            if since.usage.has_cache_tokens() {
+                ui.label(pick(ctx.lang, "Cache Tokens", "Cache tokens"));
+                ui.label(format!(
+                    "cached={}  read={}  create={}",
+                    tokens_short(since.usage.cached_input_tokens),
+                    tokens_short(since.usage.cache_read_input_tokens),
+                    tokens_short(since.usage.cache_creation_tokens_total())
+                ));
+                ui.end_row();
+            }
 
             ui.label(pick(ctx.lang, "成本(估算)", "Cost (estimated)"));
             let cost_hint = if pricing_per_1k_usd().is_some() {

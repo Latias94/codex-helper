@@ -377,13 +377,22 @@ pub(in crate::tui) fn tokens_short(n: i64) -> String {
 }
 
 pub(in crate::tui) fn usage_line(usage: &UsageMetrics) -> String {
-    format!(
+    let mut line = format!(
         "tok in/out/rsn/ttl: {}/{}/{}/{}",
         tokens_short(usage.input_tokens),
         tokens_short(usage.output_tokens),
-        tokens_short(usage.reasoning_tokens),
+        tokens_short(usage.reasoning_output_tokens_total()),
         tokens_short(usage.total_tokens)
-    )
+    );
+    if usage.has_cache_tokens() {
+        line.push_str(&format!(
+            " cache cached/read/create: {}/{}/{}",
+            tokens_short(usage.cached_input_tokens),
+            tokens_short(usage.cache_read_input_tokens),
+            tokens_short(usage.cache_creation_tokens_total())
+        ));
+    }
+    line
 }
 
 pub(in crate::tui) fn status_style(p: Palette, status: Option<u16>) -> Style {

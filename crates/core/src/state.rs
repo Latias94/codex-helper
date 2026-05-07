@@ -1743,6 +1743,7 @@ mod tests {
                     output_tokens: 2,
                     reasoning_tokens: 3,
                     total_tokens: 6,
+                    ..UsageMetrics::default()
                 }),
                 retry: None,
                 service: "codex".to_string(),
@@ -1801,6 +1802,7 @@ mod tests {
                     output_tokens: 20,
                     reasoning_tokens: 5,
                     total_tokens: 35,
+                    ..UsageMetrics::default()
                 },
                 turns_with_usage: 2,
                 last_status: Some(429),
