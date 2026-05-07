@@ -72,7 +72,7 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 ui.end_row();
             }
 
-            ui.label(pick(ctx.lang, "成本(估算)", "Cost (estimated)"));
+            ui.label(pick(ctx.lang, "成本", "Cost"));
             ui.label(since.cost.display_total_with_confidence());
             ui.end_row();
 

@@ -182,7 +182,7 @@ fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, area: Rect) {
     );
 
     let b3 = Block::default()
-        .title("Cost (estimated)")
+        .title("Cost")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
     let t3 = Text::from(vec![
