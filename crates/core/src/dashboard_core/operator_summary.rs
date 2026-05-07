@@ -114,31 +114,6 @@ pub struct OperatorSummaryCounts {
     pub providers: usize,
 }
 
-fn retry_chain_station_prefix(entry: &str) -> Option<&str> {
-    let pos = entry.find(":http")?;
-    let prefix = entry[..pos].trim();
-    if prefix.is_empty() {
-        None
-    } else {
-        Some(prefix)
-    }
-}
-
-fn retry_chain_touched_other_station(
-    retry: &crate::logging::RetryInfo,
-    final_station: Option<&str>,
-) -> bool {
-    let Some(final_station) = final_station.filter(|station| !station.trim().is_empty()) else {
-        return false;
-    };
-
-    retry
-        .upstream_chain
-        .iter()
-        .filter_map(|entry| retry_chain_station_prefix(entry))
-        .any(|station| station != final_station)
-}
-
 pub fn summarize_recent_retry_observations(
     recent: &[FinishedRequest],
 ) -> OperatorRetryObservations {
@@ -161,7 +136,7 @@ pub fn summarize_recent_retry_observations(
         }
 
         observations.recent_retried_requests += 1;
-        if retry_chain_touched_other_station(retry, request.station_name.as_deref()) {
+        if retry.touched_other_station(request.station_name.as_deref()) {
             observations.recent_cross_station_failovers += 1;
         }
     }
@@ -335,6 +310,7 @@ mod tests {
                 Some(crate::logging::RetryInfo {
                     attempts: 2,
                     upstream_chain: vec!["alpha:http://alpha.example/v1".to_string()],
+                    route_attempts: Vec::new(),
                 }),
             ),
             finished_request(
@@ -346,6 +322,7 @@ mod tests {
                         "beta:http://beta.example/v1".to_string(),
                         "alpha:http://alpha.example/v1".to_string(),
                     ],
+                    route_attempts: Vec::new(),
                 }),
             ),
             finished_request(Some("alpha"), Some("priority"), None),

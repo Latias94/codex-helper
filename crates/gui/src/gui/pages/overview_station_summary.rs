@@ -26,30 +26,6 @@ struct RecentRetryRollup {
     fast_mode_requests: usize,
 }
 
-fn retry_chain_station_prefix(entry: &str) -> Option<&str> {
-    let pos = entry.find(":http")?;
-    let prefix = entry[..pos].trim();
-    if prefix.is_empty() {
-        None
-    } else {
-        Some(prefix)
-    }
-}
-
-fn retry_chain_touched_other_station(
-    retry: &crate::logging::RetryInfo,
-    final_station: Option<&str>,
-) -> bool {
-    let Some(final_station) = final_station.filter(|station| !station.trim().is_empty()) else {
-        return false;
-    };
-    retry
-        .upstream_chain
-        .iter()
-        .filter_map(|entry| retry_chain_station_prefix(entry))
-        .any(|station| station != final_station)
-}
-
 fn recent_provider_hit_summaries(recent: &[FinishedRequest]) -> Vec<RecentProviderHitSummary> {
     let mut grouped = BTreeMap::<String, RecentProviderHitSummary>::new();
 
@@ -106,7 +82,7 @@ fn recent_retry_rollup(recent: &[FinishedRequest]) -> RecentRetryRollup {
             continue;
         }
         rollup.retried_requests += 1;
-        if retry_chain_touched_other_station(retry, request.station_name.as_deref()) {
+        if retry.touched_other_station(request.station_name.as_deref()) {
             rollup.cross_station_failovers += 1;
         }
     }
@@ -329,6 +305,7 @@ mod tests {
                             .to_string(),
                         "https://api.vibe.example/v1 (idx=1) status=200 class=-".to_string(),
                     ],
+                    route_attempts: Vec::new(),
                 }),
             ),
             sample_request(
@@ -343,6 +320,7 @@ mod tests {
                             .to_string(),
                         "https://api.right.example/v1 (idx=1) status=200 class=-".to_string(),
                     ],
+                    route_attempts: Vec::new(),
                 }),
             ),
         ];

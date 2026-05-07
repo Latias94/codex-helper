@@ -300,11 +300,252 @@ pub struct HttpDebugRef {
     pub file: String,
 }
 
+fn route_attempts_is_empty(value: &[RouteAttemptLog]) -> bool {
+    value.is_empty()
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct RouteAttemptLog {
+    pub attempt_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub station_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_index: Option<usize>,
+    pub decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub skipped: bool,
+    pub raw: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct RetryInfo {
     pub attempts: u32,
     pub upstream_chain: Vec<String>,
+    #[serde(default, skip_serializing_if = "route_attempts_is_empty")]
+    pub route_attempts: Vec<RouteAttemptLog>,
 }
+
+impl RetryInfo {
+    pub fn route_attempts_or_derived(&self) -> Vec<RouteAttemptLog> {
+        if self.route_attempts.is_empty() {
+            parse_route_attempts_from_chain(&self.upstream_chain)
+        } else {
+            self.route_attempts.clone()
+        }
+    }
+
+    pub fn touches_station(&self, station_name: &str) -> bool {
+        let station_name = station_name.trim();
+        if station_name.is_empty() {
+            return false;
+        }
+        self.route_attempts_or_derived()
+            .iter()
+            .any(|attempt| attempt.station_name.as_deref() == Some(station_name))
+    }
+
+    pub fn touched_other_station(&self, final_station: Option<&str>) -> bool {
+        let Some(final_station) = final_station
+            .map(str::trim)
+            .filter(|station| !station.is_empty())
+        else {
+            return false;
+        };
+
+        self.route_attempts_or_derived()
+            .iter()
+            .filter_map(|attempt| attempt.station_name.as_deref())
+            .any(|station| station != final_station)
+    }
+}
+
+pub(crate) fn parse_route_attempts_from_chain(chain: &[String]) -> Vec<RouteAttemptLog> {
+    chain
+        .iter()
+        .enumerate()
+        .map(|(idx, raw)| parse_route_attempt_from_chain_entry(raw, idx as u32))
+        .collect()
+}
+
+fn parse_route_attempt_from_chain_entry(raw: &str, attempt_index: u32) -> RouteAttemptLog {
+    let raw = raw.trim();
+    let mut attempt = RouteAttemptLog {
+        attempt_index,
+        decision: "observed".to_string(),
+        raw: raw.to_string(),
+        ..Default::default()
+    };
+
+    if raw.starts_with("all_upstreams_avoided") {
+        attempt.decision = "all_upstreams_avoided".to_string();
+        attempt.reason = route_chain_value(raw, "total").map(|total| format!("total={total}"));
+        attempt.skipped = true;
+        return attempt;
+    }
+
+    let (target, metadata, upstream_index) = split_route_chain_entry(raw);
+    attempt.upstream_index = upstream_index;
+    if let Some(target) = target {
+        let (station_name, upstream_base_url) = parse_route_chain_target(target);
+        attempt.station_name = station_name;
+        attempt.upstream_base_url = upstream_base_url;
+    }
+
+    if let Some(status_code) =
+        route_chain_value(metadata, "status").and_then(|value| value.parse::<u16>().ok())
+    {
+        attempt.status_code = Some(status_code);
+        attempt.decision = if (200..300).contains(&status_code) {
+            "completed".to_string()
+        } else {
+            "failed_status".to_string()
+        };
+    }
+
+    if let Some(error_class) =
+        route_chain_value(metadata, "class").filter(|value| !value.eq_ignore_ascii_case("-"))
+    {
+        attempt.error_class = Some(error_class);
+    }
+    if let Some(model) = route_chain_value(metadata, "model") {
+        attempt.model = Some(model);
+    }
+
+    if let Some(model) = route_chain_value(metadata, "skipped_unsupported_model") {
+        attempt.decision = "skipped_capability_mismatch".to_string();
+        attempt.reason = Some("unsupported_model".to_string());
+        attempt.model = Some(model);
+        attempt.skipped = true;
+    }
+
+    if let Some(error) = route_chain_value(metadata, "transport_error") {
+        attempt.decision = "failed_transport".to_string();
+        attempt.reason = Some(error);
+        attempt.error_class = Some("upstream_transport_error".to_string());
+    }
+
+    if let Some(error) = route_chain_value(metadata, "target_build_error") {
+        attempt.decision = "failed_target_build".to_string();
+        attempt.reason = Some(error);
+        attempt.error_class = Some("target_build_error".to_string());
+    }
+
+    if let Some(error) = route_chain_value(metadata, "body_read_error") {
+        attempt.decision = "failed_body_read".to_string();
+        attempt.reason = Some(error);
+        attempt.error_class = Some("upstream_body_read_error".to_string());
+    }
+
+    attempt
+}
+
+fn split_route_chain_entry(raw: &str) -> (Option<&str>, &str, Option<usize>) {
+    if let Some(idx_start) = raw.find(" (idx=") {
+        let target = raw[..idx_start].trim();
+        let after_idx = &raw[idx_start + " (idx=".len()..];
+        if let Some(idx_end) = after_idx.find(')') {
+            let upstream_index = after_idx[..idx_end].trim().parse::<usize>().ok();
+            let metadata = after_idx[idx_end + 1..].trim();
+            return (non_empty_str(target), metadata, upstream_index);
+        }
+        return (non_empty_str(target), after_idx.trim(), None);
+    }
+
+    if let Some(metadata_start) = first_route_chain_key_start(raw) {
+        let target = raw[..metadata_start].trim();
+        let metadata = raw[metadata_start..].trim();
+        return (non_empty_str(target), metadata, None);
+    }
+
+    (non_empty_str(raw), "", None)
+}
+
+fn parse_route_chain_target(target: &str) -> (Option<String>, Option<String>) {
+    let target = target.trim();
+    if target.is_empty() {
+        return (None, None);
+    }
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return (None, Some(target.to_string()));
+    }
+
+    if let Some(pos) = target.find(":http://").or_else(|| target.find(":https://")) {
+        let station = target[..pos].trim();
+        let base_url = target[pos + 1..].trim();
+        return (
+            non_empty_str(station).map(ToOwned::to_owned),
+            non_empty_str(base_url).map(ToOwned::to_owned),
+        );
+    }
+
+    (None, Some(target.to_string()))
+}
+
+fn first_route_chain_key_start(raw: &str) -> Option<usize> {
+    ROUTE_CHAIN_KEYS
+        .iter()
+        .filter_map(|key| find_route_chain_key(raw, format!("{key}=").as_str()))
+        .min()
+}
+
+fn route_chain_value(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    let start = find_route_chain_key(raw, needle.as_str())?;
+    let value_start = start + needle.len();
+    let value_end = ROUTE_CHAIN_KEYS
+        .iter()
+        .filter(|candidate| **candidate != key)
+        .filter_map(|candidate| {
+            raw[value_start..]
+                .find(&format!(" {candidate}="))
+                .map(|offset| value_start + offset)
+        })
+        .min()
+        .unwrap_or(raw.len());
+    non_empty_str(raw[value_start..value_end].trim()).map(ToOwned::to_owned)
+}
+
+fn find_route_chain_key(raw: &str, needle: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    while let Some(pos) = raw[offset..].find(needle) {
+        let absolute = offset + pos;
+        if absolute == 0 || raw[..absolute].ends_with(' ') {
+            return Some(absolute);
+        }
+        offset = absolute + needle.len();
+    }
+    None
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+const ROUTE_CHAIN_KEYS: &[&str] = &[
+    "status",
+    "class",
+    "model",
+    "transport_error",
+    "target_build_error",
+    "body_read_error",
+    "skipped_unsupported_model",
+    "total",
+];
 
 #[derive(Debug, Serialize)]
 struct HttpDebugLogEntry<'a> {

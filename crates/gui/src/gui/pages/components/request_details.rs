@@ -418,6 +418,21 @@ fn render_request_retry_chain_card(ui: &mut egui::Ui, lang: Language, request: &
                     ui.add_space(4.0);
                 }
                 let max = 12usize;
+                let attempts = retry.route_attempts_or_derived();
+                if !attempts.is_empty() {
+                    for (idx, attempt) in attempts.iter().take(max).enumerate() {
+                        ui.monospace(format!(
+                            "{:>2}. {}",
+                            idx + 1,
+                            request_route_attempt_line(attempt)
+                        ));
+                    }
+                    if attempts.len() > max {
+                        ui.small(format!("... +{} more", attempts.len() - max));
+                    }
+                    return;
+                }
+
                 for (idx, entry) in retry.upstream_chain.iter().take(max).enumerate() {
                     ui.monospace(format!("{:>2}. {}", idx + 1, shorten_middle(entry, 120)));
                 }
@@ -437,6 +452,35 @@ fn render_request_retry_chain_card(ui: &mut egui::Ui, lang: Language, request: &
             );
         },
     );
+}
+
+fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> String {
+    let target = match (
+        attempt.station_name.as_deref(),
+        attempt.upstream_base_url.as_deref(),
+    ) {
+        (Some(station), Some(upstream)) => format!("{station}:{}", shorten_middle(upstream, 64)),
+        (Some(station), None) => station.to_string(),
+        (None, Some(upstream)) => shorten_middle(upstream, 72),
+        (None, None) => "-".to_string(),
+    };
+    let mut parts = vec![attempt.decision.clone()];
+    if attempt.skipped {
+        parts.push("skipped".to_string());
+    }
+    if let Some(status_code) = attempt.status_code {
+        parts.push(format!("status={status_code}"));
+    }
+    if let Some(error_class) = attempt.error_class.as_deref() {
+        parts.push(format!("class={error_class}"));
+    }
+    if let Some(model) = attempt.model.as_deref() {
+        parts.push(format!("model={model}"));
+    }
+    if let Some(reason) = attempt.reason.as_deref() {
+        parts.push(format!("reason={}", shorten_middle(reason, 56)));
+    }
+    format!("{target}  {}", parts.join(" "))
 }
 
 fn request_upstream_host(request: &FinishedRequest) -> Option<String> {

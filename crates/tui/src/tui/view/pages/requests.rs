@@ -248,17 +248,36 @@ pub(super) fn render_requests_page(
                 Span::styled(retry.attempts.to_string(), Style::default().fg(p.text)),
             ]));
             let max = 12usize;
-            for (idx, entry) in retry.upstream_chain.iter().take(max).enumerate() {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{:>2}. ", idx + 1), Style::default().fg(p.muted)),
-                    Span::styled(shorten_middle(entry, 120), Style::default().fg(p.muted)),
-                ]));
-            }
-            if retry.upstream_chain.len() > max {
-                lines.push(Line::from(Span::styled(
-                    format!("… +{} more", retry.upstream_chain.len() - max),
-                    Style::default().fg(p.muted),
-                )));
+            let attempts = retry.route_attempts_or_derived();
+            if !attempts.is_empty() {
+                for (idx, attempt) in attempts.iter().take(max).enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:>2}. ", idx + 1), Style::default().fg(p.muted)),
+                        Span::styled(
+                            request_route_attempt_line(attempt),
+                            Style::default().fg(p.muted),
+                        ),
+                    ]));
+                }
+                if attempts.len() > max {
+                    lines.push(Line::from(Span::styled(
+                        format!("... +{} more", attempts.len() - max),
+                        Style::default().fg(p.muted),
+                    )));
+                }
+            } else {
+                for (idx, entry) in retry.upstream_chain.iter().take(max).enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:>2}. ", idx + 1), Style::default().fg(p.muted)),
+                        Span::styled(shorten_middle(entry, 120), Style::default().fg(p.muted)),
+                    ]));
+                }
+                if retry.upstream_chain.len() > max {
+                    lines.push(Line::from(Span::styled(
+                        format!("... +{} more", retry.upstream_chain.len() - max),
+                        Style::default().fg(p.muted),
+                    )));
+                }
             }
         } else {
             lines.push(Line::from(Span::styled(
@@ -297,4 +316,33 @@ pub(super) fn render_requests_page(
         .style(Style::default().fg(p.text))
         .wrap(Wrap { trim: false });
     f.render_widget(content, columns[1]);
+}
+
+fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> String {
+    let target = match (
+        attempt.station_name.as_deref(),
+        attempt.upstream_base_url.as_deref(),
+    ) {
+        (Some(station), Some(upstream)) => format!("{station}:{}", shorten_middle(upstream, 54)),
+        (Some(station), None) => station.to_string(),
+        (None, Some(upstream)) => shorten_middle(upstream, 62),
+        (None, None) => "-".to_string(),
+    };
+    let mut parts = vec![attempt.decision.clone()];
+    if attempt.skipped {
+        parts.push("skipped".to_string());
+    }
+    if let Some(status_code) = attempt.status_code {
+        parts.push(format!("status={status_code}"));
+    }
+    if let Some(error_class) = attempt.error_class.as_deref() {
+        parts.push(format!("class={error_class}"));
+    }
+    if let Some(model) = attempt.model.as_deref() {
+        parts.push(format!("model={}", shorten(model, 22)));
+    }
+    if let Some(reason) = attempt.reason.as_deref() {
+        parts.push(format!("reason={}", shorten_middle(reason, 42)));
+    }
+    format!("{target}  {}", parts.join(" "))
 }

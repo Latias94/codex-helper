@@ -5,7 +5,7 @@ use tokio::time::sleep;
 use crate::config::ResolvedRetryConfig;
 use crate::config::ResolvedRetryLayerConfig;
 use crate::config::RetryStrategy;
-use crate::logging::RetryInfo;
+use crate::logging::{RetryInfo, parse_route_attempts_from_chain};
 
 #[derive(Clone)]
 pub(super) struct RetryLayerOptions {
@@ -107,6 +107,7 @@ pub(super) fn retry_info_for_chain(chain: &[String]) -> Option<RetryInfo> {
     Some(RetryInfo {
         attempts,
         upstream_chain: chain.to_vec(),
+        route_attempts: parse_route_attempts_from_chain(chain),
     })
 }
 
@@ -244,6 +245,10 @@ mod tests {
         let info = retry_info_for_chain(&chain).unwrap();
         assert_eq!(info.attempts, 2);
         assert_eq!(info.upstream_chain, chain);
+        assert_eq!(info.route_attempts.len(), 3);
+        assert_eq!(info.route_attempts[0].decision, "failed_status");
+        assert_eq!(info.route_attempts[0].status_code, Some(502));
+        assert_eq!(info.route_attempts[2].decision, "all_upstreams_avoided");
     }
 
     #[test]

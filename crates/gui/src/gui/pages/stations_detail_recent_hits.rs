@@ -26,11 +26,7 @@ impl StationProviderHitSummary {
 }
 
 fn retry_chain_mentions_station(retry: &crate::logging::RetryInfo, station_name: &str) -> bool {
-    let prefix = format!("{station_name}:");
-    retry
-        .upstream_chain
-        .iter()
-        .any(|entry| entry.starts_with(prefix.as_str()))
+    retry.touches_station(station_name)
 }
 
 fn station_related_recent_requests<'a>(
@@ -134,30 +130,50 @@ fn related_request_outcome_label(
 }
 
 fn retry_chain_brief(retry: &crate::logging::RetryInfo) -> String {
-    if retry.upstream_chain.is_empty() {
+    let attempts = retry.route_attempts_or_derived();
+    if attempts.is_empty() {
         return "-".to_string();
     }
     let max = 2usize;
-    if retry.upstream_chain.len() <= max {
-        return retry
-            .upstream_chain
+    if attempts.len() <= max {
+        return attempts
             .iter()
-            .map(|entry| shorten_middle(entry, 88))
+            .map(route_attempt_brief)
             .collect::<Vec<_>>()
             .join(" -> ");
     }
     format!(
         "{} -> ... -> {}",
-        shorten_middle(&retry.upstream_chain[0], 72),
-        shorten_middle(
-            retry
-                .upstream_chain
-                .last()
-                .map(String::as_str)
-                .unwrap_or("-"),
-            72
-        )
+        route_attempt_brief(&attempts[0]),
+        attempts
+            .last()
+            .map(route_attempt_brief)
+            .unwrap_or_else(|| "-".to_string())
     )
+}
+
+fn route_attempt_brief(attempt: &crate::logging::RouteAttemptLog) -> String {
+    let target = match (
+        attempt.station_name.as_deref(),
+        attempt.upstream_base_url.as_deref(),
+    ) {
+        (Some(station), Some(upstream)) => {
+            format!("{station}:{}", summarize_upstream_target(upstream, 44))
+        }
+        (Some(station), None) => station.to_string(),
+        (None, Some(upstream)) => summarize_upstream_target(upstream, 48),
+        (None, None) => "-".to_string(),
+    };
+    let mut parts = vec![target, attempt.decision.clone()];
+    if let Some(status_code) = attempt.status_code {
+        parts.push(format!("st={status_code}"));
+    }
+    if let Some(error_class) = attempt.error_class.as_deref() {
+        parts.push(format!("class={error_class}"));
+    } else if let Some(reason) = attempt.reason.as_deref() {
+        parts.push(shorten_middle(reason, 48));
+    }
+    parts.join(" ")
 }
 
 pub(super) fn render_station_recent_hits_section(
@@ -315,6 +331,7 @@ mod tests {
                 "right:https://api.right.example/v1 (idx=0) transport_error=timeout".to_string(),
                 "https://api.vibe.example/v1 (idx=1) status=200 class=-".to_string(),
             ],
+            route_attempts: Vec::new(),
         };
 
         assert!(retry_chain_mentions_station(&retry, "right"));
@@ -329,6 +346,7 @@ mod tests {
                 "right:https://api.right.example/v1 (idx=0) transport_error=timeout".to_string(),
                 "https://api.vibe.example/v1 (idx=1) status=200 class=-".to_string(),
             ],
+            route_attempts: Vec::new(),
         };
         let recent = vec![
             sample_request("right", "right", None),
@@ -350,6 +368,7 @@ mod tests {
                 "right:https://api.right.example/v1 (idx=0) transport_error=timeout".to_string(),
                 "https://api.vibe.example/v1 (idx=1) status=200 class=-".to_string(),
             ],
+            route_attempts: Vec::new(),
         };
         let right = sample_request("right", "right", None);
         let vibe = sample_request("vibe", "vibe", Some(retry));

@@ -188,6 +188,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
             retry: Some(crate::logging::RetryInfo {
                 attempts: 2,
                 upstream_chain: vec!["test:http://127.0.0.1:9/v1".to_string()],
+                route_attempts: Vec::new(),
             }),
             ttfb_ms: Some(180),
         })
@@ -233,6 +234,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
                     "backup:http://127.0.0.2:9/v1".to_string(),
                     "test:http://127.0.0.1:9/v1".to_string(),
                 ],
+                route_attempts: Vec::new(),
             }),
             ttfb_ms: Some(200),
         })
