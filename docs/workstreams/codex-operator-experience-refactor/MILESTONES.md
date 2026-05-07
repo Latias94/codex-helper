@@ -244,6 +244,11 @@ Acceptance:
   - cost when known
   - station balance/eligibility
 
+Current implementation slice:
+
+- TUI request details now show compact fast/tier, cache-aware usage, cost parts, generation timing, output token speed, and structured route attempts.
+- TUI station details now show an explicit station routing preview with automatic candidate order, pinned target order, skipped stations, and runtime enabled/level overrides.
+
 ### P1.5 Policy Preview UX
 
 Scope:

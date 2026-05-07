@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
@@ -51,6 +53,156 @@ fn balance_amounts(snapshot: &ProviderBalanceSnapshot) -> String {
     } else {
         parts.join(" ")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StationRoutingPreview {
+    mode: String,
+    order: Vec<String>,
+    skipped: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StationRoutingCandidate {
+    name: String,
+    level: u8,
+    active: bool,
+    upstreams: usize,
+}
+
+fn station_routing_preview(
+    providers: &[ProviderOption],
+    station_meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
+    session_override: Option<&str>,
+    global_station_override: Option<&str>,
+) -> StationRoutingPreview {
+    if let Some(station) = non_empty_trimmed(session_override) {
+        return pinned_station_routing_preview("pinned(session)", station, providers);
+    }
+    if let Some(station) = non_empty_trimmed(global_station_override) {
+        return pinned_station_routing_preview("pinned(global-station)", station, providers);
+    }
+    automatic_station_routing_preview(providers, station_meta_overrides)
+}
+
+fn pinned_station_routing_preview(
+    source: &str,
+    station_name: &str,
+    providers: &[ProviderOption],
+) -> StationRoutingPreview {
+    let order = providers
+        .iter()
+        .find(|provider| provider.name == station_name)
+        .map(|provider| {
+            vec![format!(
+                "{} [L{}, pinned, upstreams={}]",
+                provider.name,
+                provider.level.clamp(1, 10),
+                provider.upstreams.len()
+            )]
+        })
+        .unwrap_or_default();
+    let skipped = if order.is_empty() {
+        vec![format!("{station_name}: missing pinned station")]
+    } else {
+        Vec::new()
+    };
+
+    StationRoutingPreview {
+        mode: format!("{source}={station_name}"),
+        order,
+        skipped,
+    }
+}
+
+fn automatic_station_routing_preview(
+    providers: &[ProviderOption],
+    station_meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
+) -> StationRoutingPreview {
+    let mut candidates = Vec::new();
+    let mut skipped = Vec::new();
+
+    for provider in providers {
+        let (enabled, level) = effective_station_enabled_level(provider, station_meta_overrides);
+        let mut reasons = Vec::new();
+        if !enabled && !provider.active {
+            reasons.push("disabled");
+        }
+        if provider.upstreams.is_empty() {
+            reasons.push("no_upstreams");
+        }
+        if reasons.is_empty() {
+            candidates.push(StationRoutingCandidate {
+                name: provider.name.clone(),
+                level,
+                active: provider.active,
+                upstreams: provider.upstreams.len(),
+            });
+        } else {
+            skipped.push(format!("{}: {}", provider.name, reasons.join(",")));
+        }
+    }
+
+    let mut levels = candidates
+        .iter()
+        .map(|candidate| candidate.level)
+        .collect::<Vec<_>>();
+    levels.sort_unstable();
+    levels.dedup();
+    let has_multi_level = levels.len() > 1;
+
+    if has_multi_level {
+        candidates.sort_by(|a, b| {
+            a.level
+                .cmp(&b.level)
+                .then_with(|| b.active.cmp(&a.active))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+    } else {
+        candidates.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Some(pos) = candidates.iter().position(|candidate| candidate.active) {
+            let item = candidates.remove(pos);
+            candidates.insert(0, item);
+        }
+    }
+
+    StationRoutingPreview {
+        mode: if has_multi_level {
+            "auto(level fallback)".to_string()
+        } else {
+            "auto(single-level fallback)".to_string()
+        },
+        order: candidates
+            .iter()
+            .map(|candidate| {
+                let active = if candidate.active { ", active" } else { "" };
+                format!(
+                    "{} [L{}{}, upstreams={}]",
+                    candidate.name, candidate.level, active, candidate.upstreams
+                )
+            })
+            .collect(),
+        skipped,
+    }
+}
+
+fn effective_station_enabled_level(
+    provider: &ProviderOption,
+    station_meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
+) -> (bool, u8) {
+    let (enabled_override, level_override) = station_meta_overrides
+        .get(provider.name.as_str())
+        .copied()
+        .unwrap_or((None, None));
+    (
+        enabled_override.unwrap_or(provider.enabled),
+        level_override.unwrap_or(provider.level).clamp(1, 10),
+    )
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    let value = value?.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 pub(super) fn render_stations_page(
@@ -255,28 +407,34 @@ pub(super) fn render_stations_page(
             ),
         ]));
 
-        let routing = if let Some(s) = session_override {
-            format!("pinned(session)={s}")
-        } else if let Some(g) = global_station_override {
-            format!("pinned(global-station)={g}")
-        } else {
-            let mut levels = providers
-                .iter()
-                .filter(|c| c.enabled || c.active)
-                .map(|c| c.level.clamp(1, 10))
-                .collect::<Vec<_>>();
-            levels.sort_unstable();
-            levels.dedup();
-            if levels.len() > 1 {
-                "auto(level-based)".to_string()
-            } else {
-                "auto(active-only)".to_string()
-            }
-        };
+        let routing = station_routing_preview(
+            providers,
+            &snapshot.station_meta_overrides,
+            session_override,
+            global_station_override,
+        );
         lines.push(Line::from(vec![
             Span::styled("routing: ", Style::default().fg(p.muted)),
-            Span::styled(routing, Style::default().fg(p.muted)),
+            Span::styled(routing.mode, Style::default().fg(p.muted)),
         ]));
+        if !routing.order.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("order: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    shorten_middle(&routing.order.join(" > "), 96),
+                    Style::default().fg(p.text),
+                ),
+            ]));
+        }
+        if !routing.skipped.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("skipped: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    shorten_middle(&routing.skipped.join(" | "), 96),
+                    Style::default().fg(p.muted),
+                ),
+            ]));
+        }
 
         if let Some(st) = snapshot.health_checks.get(cfg.name.as_str()) {
             let status = if !st.done {
@@ -493,4 +651,92 @@ pub(super) fn render_stations_page(
         .style(Style::default().fg(p.muted))
         .wrap(Wrap { trim: false });
     f.render_widget(content, columns[1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::UpstreamSummary;
+
+    fn provider(
+        name: &str,
+        enabled: bool,
+        level: u8,
+        active: bool,
+        upstreams: usize,
+    ) -> ProviderOption {
+        ProviderOption {
+            name: name.to_string(),
+            alias: None,
+            enabled,
+            level,
+            active,
+            upstreams: (0..upstreams)
+                .map(|idx| UpstreamSummary {
+                    base_url: format!("https://{name}-{idx}.example/v1"),
+                    ..UpstreamSummary::default()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn station_routing_preview_uses_single_level_fallback_order() {
+        let providers = vec![
+            provider("alpha", true, 1, false, 1),
+            provider("beta", true, 1, true, 1),
+            provider("disabled", false, 1, false, 1),
+        ];
+
+        let preview = station_routing_preview(&providers, &HashMap::new(), None, None);
+
+        assert_eq!(preview.mode, "auto(single-level fallback)");
+        assert!(preview.order[0].starts_with("beta"));
+        assert!(preview.order[1].starts_with("alpha"));
+        assert_eq!(preview.skipped, vec!["disabled: disabled"]);
+    }
+
+    #[test]
+    fn station_routing_preview_sorts_multi_level_and_active_tiebreak() {
+        let providers = vec![
+            provider("alpha", true, 2, false, 1),
+            provider("beta", true, 1, false, 1),
+            provider("zeta", true, 2, true, 1),
+        ];
+
+        let preview = station_routing_preview(&providers, &HashMap::new(), None, None);
+
+        assert_eq!(preview.mode, "auto(level fallback)");
+        assert!(preview.order[0].starts_with("beta"));
+        assert!(preview.order[1].starts_with("zeta"));
+        assert!(preview.order[2].starts_with("alpha"));
+    }
+
+    #[test]
+    fn station_routing_preview_applies_runtime_meta_overrides() {
+        let providers = vec![
+            provider("alpha", true, 3, false, 1),
+            provider("beta", true, 3, false, 1),
+        ];
+        let overrides = HashMap::from([
+            ("alpha".to_string(), (Some(false), Some(1))),
+            ("beta".to_string(), (None, Some(2))),
+        ]);
+
+        let preview = station_routing_preview(&providers, &overrides, None, None);
+
+        assert_eq!(preview.order, vec!["beta [L2, upstreams=1]"]);
+        assert_eq!(preview.skipped, vec!["alpha: disabled"]);
+    }
+
+    #[test]
+    fn station_routing_preview_marks_pinned_targets() {
+        let providers = vec![provider("alpha", false, 1, false, 0)];
+
+        let preview = station_routing_preview(&providers, &HashMap::new(), Some("alpha"), None);
+
+        assert_eq!(preview.mode, "pinned(session)=alpha");
+        assert_eq!(preview.order, vec!["alpha [L1, pinned, upstreams=0]"]);
+        assert!(preview.skipped.is_empty());
+    }
 }
