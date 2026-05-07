@@ -3,9 +3,73 @@ use ratatui::layout::Rect;
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::config::RetryStrategy;
+use crate::config::{ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryStrategy};
 use crate::tui::model::{Palette, Snapshot, now_ms, shorten_middle};
 use crate::tui::state::UiState;
+
+fn retry_strategy_name(strategy: RetryStrategy) -> &'static str {
+    match strategy {
+        RetryStrategy::Failover => "failover",
+        RetryStrategy::SameUpstream => "same_upstream",
+    }
+}
+
+fn retry_trigger_summary(layer: &ResolvedRetryLayerConfig) -> String {
+    let statuses = if layer.on_status.trim().is_empty() {
+        "-".to_string()
+    } else {
+        layer.on_status.clone()
+    };
+    let classes = if layer.on_class.is_empty() {
+        "-".to_string()
+    } else {
+        layer.on_class.join(",")
+    };
+    format!("status=[{statuses}] class=[{classes}]")
+}
+
+fn retry_layer_preview(label: &str, layer: &ResolvedRetryLayerConfig) -> String {
+    format!(
+        "{label}: strategy={} attempts={} backoff={}..{}ms jitter={}ms retry_on={}",
+        retry_strategy_name(layer.strategy),
+        layer.max_attempts,
+        layer.backoff_ms,
+        layer.backoff_max_ms,
+        layer.jitter_ms,
+        retry_trigger_summary(layer)
+    )
+}
+
+fn retry_policy_preview_lines(retry: &ResolvedRetryConfig) -> Vec<String> {
+    let mut lines = vec![
+        retry_layer_preview("upstream", &retry.upstream),
+        retry_layer_preview("provider", &retry.provider),
+    ];
+    let boundary = if retry.allow_cross_station_before_first_output {
+        "boundary: cross-station failover allowed before first output; after output stays on committed route"
+    } else {
+        "boundary: cross-station failover blocked before first output; same-station/upstream policy only"
+    };
+    lines.push(boundary.to_string());
+    let never_class = if retry.never_on_class.is_empty() {
+        "-".to_string()
+    } else {
+        retry.never_on_class.join(",")
+    };
+    lines.push(format!(
+        "guardrails: never_status=[{}] never_class=[{}]",
+        retry.never_on_status, never_class
+    ));
+    lines.push(format!(
+        "cooldown: transport={}s cf_challenge={}s cf_timeout={}s backoff_factor={} max={}s",
+        retry.transport_cooldown_secs,
+        retry.cloudflare_challenge_cooldown_secs,
+        retry.cloudflare_timeout_cooldown_secs,
+        retry.cooldown_backoff_factor,
+        retry.cooldown_backoff_max_secs
+    ));
+    lines
+}
 
 pub(super) fn render_settings_page(
     f: &mut Frame<'_>,
@@ -300,50 +364,16 @@ pub(super) fn render_settings_page(
         ),
     ]));
     if let Some(retry) = ui.last_runtime_retry.as_ref() {
-        let upstream_strategy = match retry.upstream.strategy {
-            RetryStrategy::Failover => "failover",
-            RetryStrategy::SameUpstream => "same_upstream",
-        };
-        let provider_strategy = match retry.provider.strategy {
-            RetryStrategy::Failover => "failover",
-            RetryStrategy::SameUpstream => "same_upstream",
-        };
-        lines.push(Line::from(vec![
-            Span::styled("retry: ", Style::default().fg(p.muted)),
-            Span::styled(
-                format!(
-                    "upstream(strategy={} attempts={} backoff={}..{} jitter={}) provider(strategy={} attempts={}) guardrails(never_on_status='{}') cooldown(cf_chal={}s cf_to={}s transport={}s) cooldown_backoff(factor={} max={}s)",
-                    upstream_strategy,
-                    retry.upstream.max_attempts,
-                    retry.upstream.backoff_ms,
-                    retry.upstream.backoff_max_ms,
-                    retry.upstream.jitter_ms,
-                    provider_strategy,
-                    retry.provider.max_attempts,
-                    retry.never_on_status,
-                    retry.cloudflare_challenge_cooldown_secs,
-                    retry.cloudflare_timeout_cooldown_secs,
-                    retry.transport_cooldown_secs,
-                    retry.cooldown_backoff_factor,
-                    retry.cooldown_backoff_max_secs
-                ),
-                Style::default().fg(p.muted),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  upstream.on_status: ", Style::default().fg(p.muted)),
-            Span::styled(
-                retry.upstream.on_status.clone(),
-                Style::default().fg(p.muted),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  provider.on_status: ", Style::default().fg(p.muted)),
-            Span::styled(
-                retry.provider.on_status.clone(),
-                Style::default().fg(p.muted),
-            ),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "retry policy:",
+            Style::default().fg(p.text),
+        )]));
+        for line in retry_policy_preview_lines(retry) {
+            lines.push(Line::from(vec![
+                Span::styled("  - ", Style::default().fg(p.muted)),
+                Span::styled(line, Style::default().fg(p.muted)),
+            ]));
+        }
     }
 
     lines.push(Line::from(""));
@@ -380,4 +410,45 @@ pub(super) fn render_settings_page(
         .style(Style::default().fg(p.muted))
         .wrap(Wrap { trim: false });
     f.render_widget(content, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn retry_layer(strategy: RetryStrategy, attempts: u32) -> ResolvedRetryLayerConfig {
+        ResolvedRetryLayerConfig {
+            max_attempts: attempts,
+            backoff_ms: 100,
+            backoff_max_ms: 1_000,
+            jitter_ms: 25,
+            on_status: "429,500-599".to_string(),
+            on_class: vec!["upstream_transport_error".to_string()],
+            strategy,
+        }
+    }
+
+    #[test]
+    fn retry_policy_preview_lines_explain_layers_and_boundary() {
+        let retry = ResolvedRetryConfig {
+            upstream: retry_layer(RetryStrategy::SameUpstream, 2),
+            provider: retry_layer(RetryStrategy::Failover, 3),
+            allow_cross_station_before_first_output: true,
+            never_on_status: "400,401,403".to_string(),
+            never_on_class: vec!["client_error_non_retryable".to_string()],
+            cloudflare_challenge_cooldown_secs: 60,
+            cloudflare_timeout_cooldown_secs: 30,
+            transport_cooldown_secs: 45,
+            cooldown_backoff_factor: 2,
+            cooldown_backoff_max_secs: 900,
+        };
+
+        let lines = retry_policy_preview_lines(&retry);
+
+        assert!(lines[0].contains("upstream: strategy=same_upstream attempts=2"));
+        assert!(lines[1].contains("provider: strategy=failover attempts=3"));
+        assert!(lines[2].contains("cross-station failover allowed before first output"));
+        assert!(lines[3].contains("never_status=[400,401,403]"));
+        assert!(lines[4].contains("transport=45s"));
+    }
 }
