@@ -156,6 +156,7 @@ mod tests {
                 kind: "request_completed".to_string(),
                 service: Some("codex".to_string()),
                 request_id: Some(1),
+                trace_id: Some("codex-1".to_string()),
                 event: Some("request_completed".to_string()),
                 detail: Some(ControlTraceDetail::RequestCompleted {
                     method: Some("POST".to_string()),
@@ -188,6 +189,7 @@ mod tests {
             kind: "retry_trace".to_string(),
             service: Some("codex".to_string()),
             request_id: Some(7),
+            trace_id: Some("codex-7".to_string()),
             event: Some("attempt_select".to_string()),
             detail: Some(ControlTraceDetail::AttemptSelect {
                 station_name: Some("right".to_string()),
@@ -213,6 +215,7 @@ mod tests {
             kind: "retry_trace".to_string(),
             service: Some("codex".to_string()),
             request_id: None,
+            trace_id: None,
             event: Some("provider_runtime_override".to_string()),
             detail: Some(ControlTraceDetail::ProviderRuntimeOverride {
                 provider_name: Some("alpha".to_string()),

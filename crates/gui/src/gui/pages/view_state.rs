@@ -72,6 +72,7 @@ pub struct ControlTraceRecordState {
     pub kind: String,
     pub service: Option<String>,
     pub request_id: Option<u64>,
+    pub trace_id: Option<String>,
     pub event: Option<String>,
     pub summary: String,
 }

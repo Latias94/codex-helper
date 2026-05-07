@@ -60,6 +60,8 @@ pub struct ControlTraceLogEntry {
     pub service: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +71,15 @@ pub struct ControlTraceLogEntry {
 }
 
 impl ControlTraceLogEntry {
+    pub fn resolved_trace_id(&self) -> Option<String> {
+        derive_control_trace_id(
+            self.trace_id.as_deref(),
+            self.service.as_deref(),
+            self.request_id,
+            &self.payload,
+        )
+    }
+
     pub fn resolved_detail(&self) -> Option<ControlTraceDetail> {
         self.detail.clone().or_else(|| {
             infer_control_trace_detail(self.kind.as_str(), self.event.as_deref(), &self.payload)
@@ -135,20 +146,24 @@ pub fn read_recent_control_trace_entries(
 
     let mut out = Vec::new();
     for line in ring {
-        let Ok(mut entry) = serde_json::from_str::<ControlTraceLogEntry>(&line) else {
+        let Ok(entry) = serde_json::from_str::<ControlTraceLogEntry>(&line) else {
             continue;
         };
-        if entry.detail.is_none() {
-            entry.detail = infer_control_trace_detail(
-                entry.kind.as_str(),
-                entry.event.as_deref(),
-                &entry.payload,
-            );
-        }
-        out.push(entry);
+        out.push(hydrate_control_trace_entry(entry));
     }
     out.sort_by_key(|entry| std::cmp::Reverse(entry.ts_ms));
     Ok(out)
+}
+
+fn hydrate_control_trace_entry(mut entry: ControlTraceLogEntry) -> ControlTraceLogEntry {
+    if entry.trace_id.is_none() {
+        entry.trace_id = entry.resolved_trace_id();
+    }
+    if entry.detail.is_none() {
+        entry.detail =
+            infer_control_trace_detail(entry.kind.as_str(), entry.event.as_deref(), &entry.payload);
+    }
+    entry
 }
 
 fn json_u64_field(value: &JsonValue, key: &str) -> Option<u64> {
@@ -202,6 +217,27 @@ fn json_string_vec_field(value: &JsonValue, key: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn derive_control_trace_id(
+    trace_id: Option<&str>,
+    service: Option<&str>,
+    request_id: Option<u64>,
+    payload: &JsonValue,
+) -> Option<String> {
+    trace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| json_string_field(payload, "trace_id"))
+        .or_else(|| {
+            let request_id = request_id.or_else(|| json_u64_field(payload, "request_id"))?;
+            let service = service
+                .map(str::to_string)
+                .or_else(|| json_string_field(payload, "service"))
+                .unwrap_or_default();
+            Some(request_trace_id(service.as_str(), request_id))
+        })
 }
 
 fn json_service_tier_field(value: &JsonValue) -> ServiceTierLog {
@@ -318,11 +354,13 @@ fn make_control_trace_entry(
     payload: JsonValue,
 ) -> ControlTraceLogEntry {
     let detail = infer_control_trace_detail(kind, event, &payload);
+    let trace_id = derive_control_trace_id(None, service, request_id, &payload);
     ControlTraceLogEntry {
         ts_ms,
         kind: kind.to_string(),
         service: service.map(str::to_string),
         request_id,
+        trace_id,
         event: event.map(str::to_string),
         detail,
         payload,
@@ -409,9 +447,58 @@ mod tests {
         assert_eq!(value["kind"].as_str(), Some("retry_trace"));
         assert_eq!(value["event"].as_str(), Some("attempt_select"));
         assert_eq!(value["request_id"].as_u64(), Some(7));
+        assert_eq!(value["trace_id"].as_str(), Some("codex-7"));
         assert_eq!(value["service"].as_str(), Some("codex"));
         assert_eq!(value["payload"]["event"].as_str(), Some("attempt_select"));
         assert_eq!(value["detail"]["type"].as_str(), Some("attempt_select"));
+    }
+
+    #[test]
+    fn hydrate_control_trace_entry_adds_trace_id_to_legacy_event() {
+        let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
+            "ts_ms": 1,
+            "kind": "retry_trace",
+            "service": "codex",
+            "request_id": 7,
+            "event": "attempt_select",
+            "payload": {
+                "event": "attempt_select",
+                "station_name": "right"
+            }
+        }))
+        .expect("deserialize legacy control trace");
+
+        let entry = hydrate_control_trace_entry(entry);
+
+        assert_eq!(entry.trace_id.as_deref(), Some("codex-7"));
+        assert_eq!(
+            entry.detail,
+            Some(ControlTraceDetail::AttemptSelect {
+                station_name: Some("right".to_string()),
+                upstream_index: None,
+                upstream_base_url: None,
+                provider_id: None,
+                model: None,
+            })
+        );
+    }
+
+    #[test]
+    fn resolved_trace_id_prefers_payload_trace_id() {
+        let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
+            "ts_ms": 1,
+            "kind": "retry_trace",
+            "service": "codex",
+            "request_id": 7,
+            "payload": {
+                "trace_id": "external-123",
+                "service": "codex",
+                "request_id": 8
+            }
+        }))
+        .expect("deserialize control trace");
+
+        assert_eq!(entry.resolved_trace_id().as_deref(), Some("external-123"));
     }
 
     #[test]

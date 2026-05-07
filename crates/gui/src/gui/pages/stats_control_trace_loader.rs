@@ -113,6 +113,7 @@ fn control_trace_record_from_entry(
         kind: entry.kind.clone(),
         service: entry.service.clone(),
         request_id: entry.request_id,
+        trace_id: entry.resolved_trace_id(),
         event: resolved_control_trace_event(entry),
         summary: control_trace_summary(entry, lang),
     }
@@ -131,4 +132,34 @@ fn resolved_control_trace_event(entry: &ControlTraceLogEntry) -> Option<String> 
             ControlTraceDetail::RetryEvent { event_name, .. } => event_name,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_trace_record_uses_resolved_trace_id() {
+        let entry = ControlTraceLogEntry {
+            ts_ms: 1,
+            kind: "retry_trace".to_string(),
+            service: Some("codex".to_string()),
+            request_id: Some(7),
+            trace_id: None,
+            event: Some("attempt_select".to_string()),
+            detail: Some(ControlTraceDetail::AttemptSelect {
+                station_name: Some("right".to_string()),
+                upstream_index: Some(0),
+                upstream_base_url: None,
+                provider_id: Some("right".to_string()),
+                model: Some("gpt-5".to_string()),
+            }),
+            payload: serde_json::json!({}),
+        };
+
+        let record = control_trace_record_from_entry(&entry, Language::En);
+
+        assert_eq!(record.trace_id.as_deref(), Some("codex-7"));
+        assert_eq!(record.request_id, Some(7));
+    }
 }

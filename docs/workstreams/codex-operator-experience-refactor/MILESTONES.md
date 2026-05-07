@@ -110,6 +110,12 @@ Acceptance:
 - Failover/retry traces are visible without reading raw logs.
 - Streaming and non-streaming completion tests cover service tier, usage, timing, and route attempts.
 
+Current implementation slice:
+
+- Added structured route attempt records to request retry info so GUI/TUI do not need to infer route decisions from raw chain strings.
+- Added top-level `trace_id` to control-trace entries and backfilled it from legacy `service` + `request_id` records on read.
+- Updated the GUI control-trace panel to display/search by `trace_id` as the primary join key while retaining numeric request IDs as fallback.
+
 ### P0.4 Operator API DTO Alignment
 
 Scope:

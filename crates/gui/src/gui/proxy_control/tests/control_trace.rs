@@ -12,6 +12,7 @@ fn read_control_trace_entries_prefers_attached_api_when_supported() {
                 kind: "request_completed".to_string(),
                 service: Some("codex".to_string()),
                 request_id: Some(9),
+                trace_id: Some("codex-9".to_string()),
                 event: Some("request_completed".to_string()),
                 detail: None,
                 payload: serde_json::json!({
@@ -57,6 +58,7 @@ fn read_control_trace_entries_uses_operator_summary_control_trace_link_when_pres
                 kind: "request_completed".to_string(),
                 service: Some("codex".to_string()),
                 request_id: Some(10),
+                trace_id: Some("codex-10".to_string()),
                 event: Some("request_completed".to_string()),
                 detail: None,
                 payload: serde_json::json!({

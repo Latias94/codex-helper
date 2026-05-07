@@ -73,8 +73,8 @@ pub(super) fn render_control_trace_panel(ui: &mut egui::Ui, ctx: &mut PageCtx<'_
                         .desired_width(220.0)
                         .hint_text(pick(
                             ctx.lang,
-                            "event / station / provider / request_id",
-                            "event / station / provider / request_id",
+                            "trace_id / event / station / provider",
+                            "trace_id / event / station / provider",
                         )),
                 );
 
@@ -138,7 +138,7 @@ pub(super) fn render_control_trace_panel(ui: &mut egui::Ui, ctx: &mut PageCtx<'_
                         .show(ui, |ui| {
                             ui.strong(pick(ctx.lang, "时间", "Time"));
                             ui.strong(pick(ctx.lang, "类型", "Kind"));
-                            ui.strong("req");
+                            ui.strong("trace");
                             ui.strong(pick(ctx.lang, "事件", "Event"));
                             ui.strong(pick(ctx.lang, "摘要", "Summary"));
                             ui.end_row();
@@ -148,8 +148,11 @@ pub(super) fn render_control_trace_panel(ui: &mut egui::Ui, ctx: &mut PageCtx<'_
                                 ui.monospace(record.kind.as_str());
                                 ui.monospace(
                                     record
-                                        .request_id
-                                        .map(|value| value.to_string())
+                                        .trace_id
+                                        .clone()
+                                        .or_else(|| {
+                                            record.request_id.map(|value| value.to_string())
+                                        })
                                         .unwrap_or_else(|| "-".to_string()),
                                 );
                                 ui.small(record.event.clone().unwrap_or_else(|| "-".to_string()));
@@ -189,6 +192,7 @@ fn control_trace_record_matches_query(record: &ControlTraceRecordState, query: &
     for candidate in [
         Some(record.kind.as_str()),
         record.service.as_deref(),
+        record.trace_id.as_deref(),
         record.event.as_deref(),
         Some(record.summary.as_str()),
     ] {
@@ -201,6 +205,6 @@ fn control_trace_record_matches_query(record: &ControlTraceRecordState, query: &
     }
     record
         .request_id
-        .map(|value| value.to_string().contains(q.as_str()))
-        .unwrap_or(false)
+        .map(|value| value.to_string())
+        .is_some_and(|value| value.contains(q.as_str()))
 }
