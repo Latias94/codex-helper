@@ -644,6 +644,16 @@ input_per_1m_usd = "0.50"
 output_per_1m_usd = "1.50"
 ```
 
+也可以用 CLI 管理该文件，避免手动拼 TOML：
+
+```bash
+codex-helper pricing path
+codex-helper pricing list
+codex-helper pricing list --local --model gpt-5
+codex-helper pricing set custom-codex --input-per-1m-usd 0.50 --output-per-1m-usd 1.50 --confidence estimated
+codex-helper pricing remove custom-codex
+```
+
 ### 用量提供商（Usage Providers）
 
 路径：`~/.codex-helper/usage_providers.json`，示例：

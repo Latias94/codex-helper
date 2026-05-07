@@ -4,11 +4,17 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::file_replace::write_text_file;
 use crate::usage::UsageMetrics;
 
 const FEMTO_USD_PER_USD: i128 = 1_000_000_000_000_000;
 const TOKENS_PER_MILLION: i128 = 1_000_000;
 const MULTIPLIER_SCALE: i128 = 1_000_000;
+const MODEL_PRICE_OVERRIDES_DOC_HEADER: &str = r#"# codex-helper pricing_overrides.toml
+#
+# Managed by `codex-helper pricing`.
+# Use this file for provider-specific model aliases, custom relay prices, or local corrections.
+"#;
 
 fn u64_is_zero(value: &u64) -> bool {
     *value == 0
@@ -350,42 +356,122 @@ impl ModelPrice {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-struct ModelPriceOverridesFile {
-    #[serde(default)]
-    models: BTreeMap<String, ModelPriceOverride>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LocalModelPriceOverridesDocument {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, LocalModelPriceOverride>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-struct ModelPriceOverride {
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    aliases: Vec<String>,
-    input_per_1m_usd: String,
-    output_per_1m_usd: String,
-    #[serde(default)]
-    cache_read_input_per_1m_usd: Option<String>,
-    #[serde(default)]
-    cache_creation_input_per_1m_usd: Option<String>,
-    #[serde(default)]
-    confidence: Option<CostConfidence>,
+impl LocalModelPriceOverridesDocument {
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+
+    pub fn normalized(&self) -> Result<Self, String> {
+        let mut models = BTreeMap::new();
+        for (raw_model_id, row) in &self.models {
+            let model_id = raw_model_id.trim();
+            if model_id.is_empty() {
+                return Err("pricing override model id cannot be empty".to_string());
+            }
+            let model_id = model_id.to_string();
+            let sanitized = row.clone().sanitized(&model_id)?;
+            if models.insert(model_id.clone(), sanitized).is_some() {
+                return Err(format!(
+                    "pricing override model id '{model_id}' appears more than once after normalization"
+                ));
+            }
+        }
+        Ok(Self { models })
+    }
+
+    fn into_prices(self, source: &str) -> Result<Vec<ModelPrice>, String> {
+        validate_model_price_overrides_document(&self)?;
+
+        let mut prices = Vec::new();
+        for (model_id, override_row) in self.models {
+            let model_id = model_id.trim().to_string();
+            let price = override_row
+                .into_model_price(model_id.clone(), source)
+                .map_err(|err| format!("invalid pricing override for model '{model_id}': {err}"))?;
+            prices.push(price);
+        }
+        Ok(prices)
+    }
 }
 
-impl ModelPriceOverride {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalModelPriceOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    pub input_per_1m_usd: String,
+    pub output_per_1m_usd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_per_1m_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_per_1m_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<CostConfidence>,
+}
+
+impl LocalModelPriceOverride {
+    pub fn sanitized(mut self, model_id: &str) -> Result<Self, String> {
+        self.validate_prices()?;
+
+        self.display_name = self
+            .display_name
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let model_key = normalize_model_key(model_id);
+        let mut seen_aliases = BTreeSet::new();
+        let mut aliases = Vec::new();
+        for alias in self.aliases {
+            let alias = alias.trim().to_string();
+            if alias.is_empty() {
+                return Err(format!("model '{model_id}' contains an empty alias"));
+            }
+            let alias_key = normalize_model_key(&alias);
+            if alias_key == model_key {
+                continue;
+            }
+            if seen_aliases.insert(alias_key) {
+                aliases.push(alias);
+            }
+        }
+        self.aliases = aliases;
+
+        Ok(self)
+    }
+
+    fn validate_prices(&self) -> Result<(), String> {
+        validate_usd_decimal("input_per_1m_usd", &self.input_per_1m_usd)?;
+        validate_usd_decimal("output_per_1m_usd", &self.output_per_1m_usd)?;
+        if let Some(value) = self.cache_read_input_per_1m_usd.as_deref() {
+            validate_usd_decimal("cache_read_input_per_1m_usd", value)?;
+        }
+        if let Some(value) = self.cache_creation_input_per_1m_usd.as_deref() {
+            validate_usd_decimal("cache_creation_input_per_1m_usd", value)?;
+        }
+        Ok(())
+    }
+
     fn into_model_price(self, model_id: String, source: &str) -> Result<ModelPrice, String> {
+        let row = self.sanitized(&model_id)?;
         let mut price = ModelPrice::from_per_million_usd(
             model_id,
-            self.display_name,
-            &self.input_per_1m_usd,
-            &self.output_per_1m_usd,
-            self.cache_read_input_per_1m_usd.as_deref(),
-            self.cache_creation_input_per_1m_usd.as_deref(),
+            row.display_name,
+            &row.input_per_1m_usd,
+            &row.output_per_1m_usd,
+            row.cache_read_input_per_1m_usd.as_deref(),
+            row.cache_creation_input_per_1m_usd.as_deref(),
             source.to_string(),
         )
         .ok_or_else(|| "invalid USD decimal price".to_string())?
-        .with_aliases(self.aliases);
-        if let Some(confidence) = self.confidence {
+        .with_aliases(row.aliases);
+        if let Some(confidence) = row.confidence {
             price.confidence = confidence;
         }
         Ok(price)
@@ -582,21 +668,50 @@ pub fn model_price_overrides_path() -> PathBuf {
     crate::config::proxy_home_dir().join("pricing_overrides.toml")
 }
 
-fn parse_model_price_overrides_toml(text: &str, source: &str) -> Result<Vec<ModelPrice>, String> {
-    let parsed: ModelPriceOverridesFile =
+fn parse_model_price_overrides_document(
+    text: &str,
+) -> Result<LocalModelPriceOverridesDocument, String> {
+    let parsed: LocalModelPriceOverridesDocument =
         toml::from_str(text).map_err(|err| format!("invalid pricing override TOML: {err}"))?;
-    let mut prices = Vec::new();
-    for (model_id, override_row) in parsed.models {
-        let model_id = model_id.trim().to_string();
-        if model_id.is_empty() {
-            return Err("pricing override model id cannot be empty".to_string());
-        }
-        let price = override_row
-            .into_model_price(model_id.clone(), source)
-            .map_err(|err| format!("invalid pricing override for model '{model_id}': {err}"))?;
-        prices.push(price);
+    validate_model_price_overrides_document(&parsed)?;
+    Ok(parsed)
+}
+
+pub fn load_model_price_overrides_document() -> Result<LocalModelPriceOverridesDocument, String> {
+    let path = model_price_overrides_path();
+    if !path.exists() {
+        return Ok(LocalModelPriceOverridesDocument::default());
     }
-    Ok(prices)
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    parse_model_price_overrides_document(&text)
+}
+
+pub fn save_model_price_overrides_document(
+    document: &LocalModelPriceOverridesDocument,
+) -> Result<PathBuf, String> {
+    validate_model_price_overrides_document(document)?;
+    let normalized = document.normalized()?;
+    validate_model_price_overrides_document(&normalized)?;
+    let path = model_price_overrides_path();
+    let body = toml::to_string_pretty(&normalized)
+        .map_err(|err| format!("failed to serialize pricing overrides: {err}"))?;
+    let text = if body.trim().is_empty() {
+        MODEL_PRICE_OVERRIDES_DOC_HEADER.to_string()
+    } else {
+        format!("{MODEL_PRICE_OVERRIDES_DOC_HEADER}\n{body}")
+    };
+    write_text_file(&path, &text)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+pub fn local_model_price_catalog_snapshot() -> Result<ModelPriceCatalogSnapshot, String> {
+    let path = model_price_overrides_path();
+    let document = load_model_price_overrides_document()?;
+    let source = format!("local:{}", path.display());
+    let prices = document.into_prices(&source)?;
+    Ok(ModelPriceCatalog::with_prices(prices).snapshot(source))
 }
 
 fn load_model_price_overrides_from_disk() -> Result<Vec<ModelPrice>, String> {
@@ -604,31 +719,107 @@ fn load_model_price_overrides_from_disk() -> Result<Vec<ModelPrice>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    parse_model_price_overrides_toml(&text, &format!("local:{}", path.display()))
+    let document = load_model_price_overrides_document()?;
+    document.into_prices(&format!("local:{}", path.display()))
+}
+
+fn build_operator_model_price_catalog_with_overrides(
+    overrides: Vec<ModelPrice>,
+) -> (ModelPriceCatalog, String) {
+    let mut catalog = bundled_model_price_catalog().clone();
+    if overrides.is_empty() {
+        return (catalog, "bundled".to_string());
+    }
+
+    let override_count = overrides.len();
+    for price in overrides {
+        catalog.insert(price);
+    }
+    (
+        catalog,
+        format!("bundled+local-overrides({override_count})"),
+    )
+}
+
+pub fn validate_model_price_overrides_document(
+    document: &LocalModelPriceOverridesDocument,
+) -> Result<(), String> {
+    let mut seen_model_ids = BTreeMap::<String, String>::new();
+    let mut seen_aliases = BTreeMap::<String, String>::new();
+
+    for (raw_model_id, row) in &document.models {
+        let model_id = raw_model_id.trim();
+        if model_id.is_empty() {
+            return Err("pricing override model id cannot be empty".to_string());
+        }
+        let model_key = normalize_model_key(model_id);
+        if model_key.is_empty() {
+            return Err("pricing override model id cannot be empty".to_string());
+        }
+
+        if let Some(existing) = seen_aliases.get(&model_key)
+            && existing != model_id
+        {
+            return Err(format!(
+                "pricing override model id '{model_id}' conflicts with alias from '{existing}'"
+            ));
+        }
+
+        if let Some(existing) = seen_model_ids.insert(model_key.clone(), model_id.to_string())
+            && existing != model_id
+        {
+            return Err(format!(
+                "pricing override model id '{model_id}' conflicts with '{existing}' after case-insensitive normalization"
+            ));
+        }
+
+        row.validate_prices()?;
+
+        let mut row_aliases = BTreeSet::new();
+        for alias in &row.aliases {
+            let alias = alias.trim();
+            if alias.is_empty() {
+                return Err(format!(
+                    "pricing override model '{model_id}' contains an empty alias"
+                ));
+            }
+
+            let alias_key = normalize_model_key(alias);
+            if alias_key == model_key {
+                continue;
+            }
+            if !row_aliases.insert(alias_key.clone()) {
+                continue;
+            }
+
+            if let Some(existing) = seen_model_ids.get(&alias_key) {
+                return Err(format!(
+                    "pricing override alias '{alias}' for model '{model_id}' conflicts with model id '{existing}'"
+                ));
+            }
+
+            if let Some(existing) = seen_aliases.insert(alias_key.clone(), model_id.to_string())
+                && existing != model_id
+            {
+                return Err(format!(
+                    "pricing override alias '{alias}' is used by both '{existing}' and '{model_id}'"
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn build_operator_model_price_catalog() -> (ModelPriceCatalog, String) {
-    let mut catalog = bundled_model_price_catalog().clone();
     match load_model_price_overrides_from_disk() {
-        Ok(overrides) if overrides.is_empty() => (catalog, "bundled".to_string()),
-        Ok(overrides) => {
-            let override_count = overrides.len();
-            for price in overrides {
-                catalog.insert(price);
-            }
-            (
-                catalog,
-                format!("bundled+local-overrides({override_count})"),
-            )
-        }
+        Ok(overrides) => build_operator_model_price_catalog_with_overrides(overrides),
         Err(err) => {
             static WARNED: OnceLock<()> = OnceLock::new();
             WARNED.get_or_init(|| {
                 tracing::warn!("failed to load model price overrides: {err}");
             });
-            (catalog, "bundled".to_string())
+            (bundled_model_price_catalog().clone(), "bundled".to_string())
         }
     }
 }
@@ -750,6 +941,13 @@ fn unknown_with_source(source: &str) -> CostBreakdown {
         pricing_source: Some(source.to_string()),
         ..CostBreakdown::unknown()
     }
+}
+
+fn validate_usd_decimal(field: &str, value: &str) -> Result<(), String> {
+    if UsdAmount::from_decimal_str(value).is_some() {
+        return Ok(());
+    }
+    Err(format!("{field} must be a non-negative USD decimal string"))
 }
 
 fn normalize_model_key(model: &str) -> String {
@@ -1062,7 +1260,8 @@ confidence = "exact"
 input_per_1m_usd = "0.5"
 output_per_1m_usd = "1.5"
 "#;
-        let overrides = parse_model_price_overrides_toml(text, "local-test").expect("overrides");
+        let document = parse_model_price_overrides_document(text).expect("overrides");
+        let overrides = document.into_prices("local-test").expect("overrides");
         let mut catalog = bundled_model_price_catalog().clone();
         for price in overrides {
             catalog.insert(price);
@@ -1081,6 +1280,23 @@ output_per_1m_usd = "1.5"
             .expect("new override model");
         assert_eq!(custom.input_per_1m.format_usd(), "0.5");
         assert_eq!(custom.source, "local-test");
+    }
+
+    #[test]
+    fn local_price_override_document_rejects_conflicting_aliases() {
+        let text = r#"
+[models.gpt-5]
+input_per_1m_usd = "1"
+output_per_1m_usd = "2"
+aliases = ["custom"]
+
+[models.gpt-4]
+input_per_1m_usd = "3"
+output_per_1m_usd = "4"
+aliases = ["CUSTOM"]
+"#;
+        let err = parse_model_price_overrides_document(text).expect_err("should fail");
+        assert!(err.contains("used by both"));
     }
 
     #[test]

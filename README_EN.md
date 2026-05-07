@@ -672,6 +672,16 @@ input_per_1m_usd = "0.50"
 output_per_1m_usd = "1.50"
 ```
 
+You can also manage this file through the CLI instead of hand-writing TOML:
+
+```bash
+codex-helper pricing path
+codex-helper pricing list
+codex-helper pricing list --local --model gpt-5
+codex-helper pricing set custom-codex --input-per-1m-usd 0.50 --output-per-1m-usd 1.50 --confidence estimated
+codex-helper pricing remove custom-codex
+```
+
 ### `usage_providers.json`
 
 Path: `~/.codex-helper/usage_providers.json`. If it does not exist, codex-helper will write a default file similar to:

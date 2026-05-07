@@ -72,6 +72,10 @@ pub async fn run_cli() -> CliResult<()> {
             commands::usage::handle_usage_cmd(cmd).await?;
             return Ok(());
         }
+        Command::Pricing { cmd } => {
+            commands::pricing::handle_pricing_cmd(cmd).await?;
+            return Ok(());
+        }
         Command::Notify { cmd } => {
             match cmd {
                 NotifyCommand::Codex {

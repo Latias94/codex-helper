@@ -19,6 +19,8 @@ pub enum CliError {
     CodexConfig(String),
     /// Errors while working with usage logs / usage_providers.json
     Usage(String),
+    /// Errors while reading or writing local pricing overrides
+    Pricing(String),
     /// Generic fallback for other failures
     Other(String),
 }
@@ -29,6 +31,7 @@ impl std::fmt::Display for CliError {
             CliError::ProxyConfig(msg) => write!(f, "Proxy config error: {}", msg),
             CliError::CodexConfig(msg) => write!(f, "Codex config error: {}", msg),
             CliError::Usage(msg) => write!(f, "Usage error: {}", msg),
+            CliError::Pricing(msg) => write!(f, "Pricing error: {}", msg),
             CliError::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -94,6 +97,11 @@ pub(crate) enum Command {
     Usage {
         #[command(subcommand)]
         cmd: UsageCommand,
+    },
+    /// Manage local model pricing overrides
+    Pricing {
+        #[command(subcommand)]
+        cmd: PricingCommand,
     },
     /// Handle Codex notifications (for Codex `notify` hook)
     Notify {
@@ -475,6 +483,64 @@ pub enum UsageCommand {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PricingCommand {
+    /// Print the local pricing override path
+    Path,
+    /// List the merged price catalog or only local overrides
+    List {
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+        /// Show only local override rows instead of the merged operator catalog
+        #[arg(long)]
+        local: bool,
+        /// Filter rows by model id or alias match
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Add or replace a local model price override
+    Set {
+        model_id: String,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long = "alias")]
+        aliases: Vec<String>,
+        #[arg(long)]
+        input_per_1m_usd: String,
+        #[arg(long)]
+        output_per_1m_usd: String,
+        #[arg(long)]
+        cache_read_input_per_1m_usd: Option<String>,
+        #[arg(long)]
+        cache_creation_input_per_1m_usd: Option<String>,
+        #[arg(long, value_enum, default_value_t = PricingConfidence::Estimated)]
+        confidence: PricingConfidence,
+    },
+    /// Remove a local model price override
+    Remove { model_id: String },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub enum PricingConfidence {
+    Unknown,
+    Partial,
+    Estimated,
+    Exact,
+}
+
+impl From<PricingConfidence> for codex_helper_core::pricing::CostConfidence {
+    fn from(value: PricingConfidence) -> Self {
+        match value {
+            PricingConfidence::Unknown => Self::Unknown,
+            PricingConfidence::Partial => Self::Partial,
+            PricingConfidence::Estimated => Self::Estimated,
+            PricingConfidence::Exact => Self::Exact,
+        }
+    }
 }
 
 pub type ConfigCommand = StationCommand;
