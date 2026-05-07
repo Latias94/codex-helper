@@ -434,12 +434,14 @@ mod tests {
             }),
             cost: crate::pricing::CostBreakdown::default(),
             retry: None,
+            observability: crate::state::RequestObservability::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
             status_code: 200,
             duration_ms: 1_500,
             ttfb_ms: Some(500),
+            streaming: false,
             ended_at_ms: 1_000,
         };
 
@@ -467,12 +469,14 @@ mod tests {
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
             retry: None,
+            observability: crate::state::RequestObservability::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
             status_code: 200,
             duration_ms: 900,
             ttfb_ms: Some(120),
+            streaming: false,
             ended_at_ms: 9_000,
         };
         let decision = RouteDecisionProvenance {
@@ -523,12 +527,14 @@ mod tests {
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
             retry: None,
+            observability: crate::state::RequestObservability::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
             status_code: 200,
             duration_ms: 500,
             ttfb_ms: Some(120),
+            streaming: false,
             ended_at_ms: 9_000,
         };
 

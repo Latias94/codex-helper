@@ -30,7 +30,7 @@ pub use self::runtime_types::{
     RuntimeConfigState, StationHealth, UpstreamHealth, UsageBucket, UsageRollupView,
 };
 pub use self::session_identity::{
-    ActiveRequest, FinishRequestParams, FinishedRequest, ResolvedRouteValue,
+    ActiveRequest, FinishRequestParams, FinishedRequest, RequestObservability, ResolvedRouteValue,
     RouteDecisionProvenance, RouteValueSource, SessionBinding, SessionContinuityMode,
     SessionIdentityCard, SessionIdentityCardBuildInputs, SessionManualOverrides,
     SessionObservationScope, SessionStats, build_session_identity_cards_from_parts,
@@ -1416,7 +1416,7 @@ impl ProxyState {
             CostAdjustments::default(),
         );
 
-        let finished = FinishedRequest {
+        let mut finished = FinishedRequest {
             id: params.id,
             trace_id: req.trace_id,
             session_id: req.session_id,
@@ -1433,14 +1433,17 @@ impl ProxyState {
             usage: params.usage.clone(),
             cost,
             retry: params.retry,
+            observability: RequestObservability::default(),
             service: req.service,
             method: req.method,
             path: req.path,
             status_code: params.status_code,
             duration_ms: params.duration_ms,
             ttfb_ms: params.ttfb_ms,
+            streaming: params.streaming,
             ended_at_ms: params.ended_at_ms,
         };
+        finished.refresh_observability();
 
         {
             let day = (finished.ended_at_ms / 86_400_000) as i32;
@@ -1824,11 +1827,15 @@ mod tests {
                     usage: None,
                     retry: None,
                     ttfb_ms: Some(4),
+                    streaming: false,
                 })
                 .await;
 
             let recent = state.list_recent_finished(1).await;
             assert_eq!(recent[0].trace_id.as_deref(), Some("codex-1"));
+            assert_eq!(recent[0].observability.trace_id.as_deref(), Some("codex-1"));
+            assert!(recent[0].observability.fast_mode);
+            assert_eq!(recent[0].observability.generation_ms, Some(6));
         });
     }
 
@@ -1869,6 +1876,7 @@ mod tests {
                     }),
                     retry: None,
                     ttfb_ms: Some(4),
+                    streaming: false,
                 })
                 .await;
 
@@ -1930,12 +1938,14 @@ mod tests {
                 }),
                 cost: CostBreakdown::default(),
                 retry: None,
+                observability: RequestObservability::default(),
                 service: "codex".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
                 status_code: 200,
                 duration_ms: 1200,
                 ttfb_ms: Some(100),
+                streaming: false,
                 ended_at_ms: 2_000,
             },
             FinishedRequest {
@@ -1955,12 +1965,14 @@ mod tests {
                 usage: None,
                 cost: CostBreakdown::default(),
                 retry: None,
+                observability: RequestObservability::default(),
                 service: "codex".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
                 status_code: 429,
                 duration_ms: 900,
                 ttfb_ms: None,
+                streaming: false,
                 ended_at_ms: 1_000,
             },
         ];

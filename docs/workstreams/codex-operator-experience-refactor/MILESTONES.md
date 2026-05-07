@@ -143,6 +143,12 @@ Acceptance:
 - Attach-mode clients receive the same semantic fields as local mode.
 - Compatibility tests cover old and new payload shapes.
 
+Current implementation slice:
+
+- Added a core `RequestObservability` DTO on finished requests with canonical timing, output speed, attempt count, route-attempt count, retry/failover flags, fast-mode state, streaming state, and `trace_id`.
+- Materialized this DTO when requests finish, while legacy payloads without `observability` still deserialize and derive the same view from old fields.
+- Moved GUI/TUI request lists, summaries, and details to read generation time, output token speed, attempt counts, fast mode, and retry/failover flags through core request methods instead of local duplicate calculations.
+
 ## P1 - Cost, Balance, and Operator UI
 
 Goal:

@@ -44,11 +44,7 @@ fn recent_provider_hit_summaries(recent: &[FinishedRequest]) -> Vec<RecentProvid
         if request.status_code >= 400 {
             entry.errors += 1;
         }
-        let attempts = request
-            .retry
-            .as_ref()
-            .map(|retry| retry.attempts)
-            .unwrap_or(1);
+        let attempts = request.attempt_count();
         if attempts > 1 {
             entry.retry_requests += 1;
         }
@@ -67,22 +63,16 @@ fn recent_provider_hit_summaries(recent: &[FinishedRequest]) -> Vec<RecentProvid
 fn recent_retry_rollup(recent: &[FinishedRequest]) -> RecentRetryRollup {
     let mut rollup = RecentRetryRollup::default();
     for request in recent {
-        if request
-            .service_tier
-            .as_deref()
-            .is_some_and(|tier| tier.eq_ignore_ascii_case("priority"))
-        {
+        let observability = request.observability_view();
+        if observability.fast_mode {
             rollup.fast_mode_requests += 1;
         }
 
-        let Some(retry) = request.retry.as_ref() else {
-            continue;
-        };
-        if retry.attempts <= 1 {
+        if !observability.retried {
             continue;
         }
         rollup.retried_requests += 1;
-        if retry.touched_other_station(request.station_name.as_deref()) {
+        if observability.cross_station_failover {
             rollup.cross_station_failovers += 1;
         }
     }
@@ -265,12 +255,14 @@ mod tests {
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
             retry,
+            observability: crate::state::RequestObservability::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
             status_code,
             duration_ms: 500,
             ttfb_ms: None,
+            streaming: false,
             ended_at_ms: 1_000,
         }
     }

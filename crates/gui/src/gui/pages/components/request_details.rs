@@ -470,11 +470,8 @@ fn render_request_control_trace_card(ui: &mut egui::Ui, lang: Language, request:
 }
 
 fn render_request_retry_chain_card(ui: &mut egui::Ui, lang: Language, request: &FinishedRequest) {
-    let tone = if request
-        .retry
-        .as_ref()
-        .is_some_and(|retry| retry.attempts > 1)
-    {
+    let observability = request.observability_view();
+    let tone = if observability.retried {
         ConsoleTone::Warning
     } else {
         ConsoleTone::Neutral
@@ -485,8 +482,8 @@ fn render_request_retry_chain_card(ui: &mut egui::Ui, lang: Language, request: &
         tone,
         |ui| {
             if let Some(retry) = request.retry.as_ref() {
-                ui.small(format!("attempts: {}", retry.attempts));
-                if retry.attempts > 1 {
+                ui.small(format!("attempts: {}", observability.attempt_count));
+                if observability.retried {
                     console_note(
                         ui,
                         pick(
@@ -627,27 +624,35 @@ fn request_upstream_host(request: &FinishedRequest) -> Option<String> {
 }
 
 fn request_speed_rows(request: &FinishedRequest) -> Vec<(String, String)> {
+    let observability = request.observability_view();
     let mut rows = vec![
         (
             "duration".to_string(),
-            format!("{} ms", request.duration_ms),
+            observability
+                .duration_ms
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "-".to_string()),
         ),
         (
             "ttfb".to_string(),
-            request
+            observability
                 .ttfb_ms
-                .filter(|value| *value > 0)
                 .map(|value| format!("{value} ms"))
                 .unwrap_or_else(|| "-".to_string()),
         ),
         (
             "generation".to_string(),
-            request_generation_ms(request)
+            observability
+                .generation_ms
                 .map(|value| format!("{value} ms"))
                 .unwrap_or_else(|| "-".to_string()),
         ),
+        (
+            "streaming".to_string(),
+            if observability.streaming { "yes" } else { "no" }.to_string(),
+        ),
     ];
-    if let Some(rate) = request_output_tok_per_sec(request) {
+    if let Some(rate) = observability.output_tokens_per_second {
         rows.push(("out_tok/s".to_string(), format!("{rate:.1}")));
     }
     rows
@@ -730,29 +735,8 @@ fn format_usd_option(value: Option<&str>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn request_generation_ms(request: &FinishedRequest) -> Option<u64> {
-    if request.duration_ms == 0 {
-        return None;
-    }
-    let ttfb_ms = request.ttfb_ms.unwrap_or(0);
-    if ttfb_ms > 0 && ttfb_ms < request.duration_ms {
-        Some(request.duration_ms.saturating_sub(ttfb_ms))
-    } else {
-        Some(request.duration_ms)
-    }
-}
-
 pub(in super::super) fn request_output_tok_per_sec(request: &FinishedRequest) -> Option<f64> {
-    let usage = request.usage.as_ref()?;
-    if usage.output_tokens == 0 {
-        return None;
-    }
-    let gen_ms = request_generation_ms(request)?;
-    if gen_ms == 0 {
-        return None;
-    }
-    let rate = (usage.output_tokens as f64) / (gen_ms as f64 / 1000.0);
-    rate.is_finite().then_some(rate).filter(|rate| *rate > 0.0)
+    request.output_tokens_per_second()
 }
 
 fn request_observed_route_value(

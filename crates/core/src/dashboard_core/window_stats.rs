@@ -56,7 +56,7 @@ where
         }
         out.total += 1;
 
-        let attempts = r.retry.as_ref().map(|x| x.attempts).unwrap_or(1);
+        let attempts = r.attempt_count();
         attempts_sum = attempts_sum.saturating_add(attempts as u64);
         if attempts > 1 {
             retry_cnt = retry_cnt.saturating_add(1);

@@ -191,6 +191,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
                 route_attempts: Vec::new(),
             }),
             ttfb_ms: Some(180),
+            streaming: false,
         })
         .await;
     let recent_cross_station = proxy
@@ -237,6 +238,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
                 route_attempts: Vec::new(),
             }),
             ttfb_ms: Some(200),
+            streaming: false,
         })
         .await;
     let recent_fast_mode_only = proxy
@@ -276,6 +278,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
             usage: None,
             retry: None,
             ttfb_ms: Some(120),
+            streaming: false,
         })
         .await;
 

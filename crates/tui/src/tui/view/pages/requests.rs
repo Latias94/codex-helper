@@ -89,7 +89,7 @@ pub(super) fn render_requests_page(
                 status_style(p, Some(r.status_code)),
             );
             let dur = format!("{}ms", r.duration_ms);
-            let attempts_n = r.retry.as_ref().map(|x| x.attempts).unwrap_or(1);
+            let attempts_n = r.attempt_count();
             let attempts = attempts_n.to_string();
             let model = r.model.as_deref().unwrap_or("-").to_string();
             let cfg = r.station_name.as_deref().unwrap_or("-").to_string();
@@ -136,6 +136,7 @@ pub(super) fn render_requests_page(
     let selected = filtered.get(ui.selected_request_page_idx);
     let mut lines = Vec::new();
     if let Some(r) = selected {
+        let observability = r.observability_view();
         let focus_mode = if ui.focused_request_session_id.is_some() {
             "explicit session focus"
         } else {
@@ -204,11 +205,7 @@ pub(super) fn render_requests_page(
             Span::styled("tier: ", Style::default().fg(p.muted)),
             Span::styled(
                 request_service_tier_label(r.service_tier.as_deref()),
-                Style::default().fg(if request_is_fast_mode(r) {
-                    p.good
-                } else {
-                    p.text
-                }),
+                Style::default().fg(if r.is_fast_mode() { p.good } else { p.text }),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -232,20 +229,31 @@ pub(super) fn render_requests_page(
             ]));
         }
 
-        if let Some(ttfb_ms) = r.ttfb_ms.filter(|v| *v > 0) {
-            lines.push(Line::from(vec![
-                Span::styled("ttfb: ", Style::default().fg(p.muted)),
-                Span::styled(format!("{ttfb_ms}ms"), Style::default().fg(p.text)),
-                Span::raw("  "),
-                Span::styled("generation: ", Style::default().fg(p.muted)),
-                Span::styled(
-                    request_generation_ms(r)
-                        .map(|value| format!("{value}ms"))
-                        .unwrap_or_else(|| "-".to_string()),
-                    Style::default().fg(p.text),
-                ),
-            ]));
-        }
+        lines.push(Line::from(vec![
+            Span::styled("ttfb: ", Style::default().fg(p.muted)),
+            Span::styled(
+                observability
+                    .ttfb_ms
+                    .map(|value| format!("{value}ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                Style::default().fg(p.text),
+            ),
+            Span::raw("  "),
+            Span::styled("generation: ", Style::default().fg(p.muted)),
+            Span::styled(
+                observability
+                    .generation_ms
+                    .map(|value| format!("{value}ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                Style::default().fg(p.text),
+            ),
+            Span::raw("  "),
+            Span::styled("stream: ", Style::default().fg(p.muted)),
+            Span::styled(
+                if observability.streaming { "yes" } else { "no" },
+                Style::default().fg(p.text),
+            ),
+        ]));
 
         if let Some(u) = r.usage.as_ref().filter(|u| u.total_tokens > 0) {
             lines.push(Line::from(vec![
@@ -266,13 +274,7 @@ pub(super) fn render_requests_page(
                 ]));
             }
 
-            let gen_ms = request_generation_ms(r).unwrap_or(0);
-            let out_tok_s = if gen_ms > 0 && u.output_tokens > 0 {
-                Some((u.output_tokens as f64) / (gen_ms as f64 / 1000.0))
-            } else {
-                None
-            };
-            if let Some(rate) = out_tok_s.filter(|v| v.is_finite() && *v > 0.0) {
+            if let Some(rate) = observability.output_tokens_per_second {
                 lines.push(Line::from(vec![
                     Span::styled("out_tok/s: ", Style::default().fg(p.muted)),
                     Span::styled(format!("{rate:.1}"), Style::default().fg(p.text)),
@@ -288,7 +290,7 @@ pub(super) fn render_requests_page(
         if let Some(retry) = r.retry.as_ref() {
             lines.push(Line::from(vec![
                 Span::styled("attempts: ", Style::default().fg(p.muted)),
-                Span::styled(retry.attempts.to_string(), Style::default().fg(p.text)),
+                Span::styled(r.attempt_count().to_string(), Style::default().fg(p.text)),
             ]));
             let max = 12usize;
             let attempts = retry.route_attempts_or_derived();
@@ -359,25 +361,6 @@ pub(super) fn render_requests_page(
         .style(Style::default().fg(p.text))
         .wrap(Wrap { trim: false });
     f.render_widget(content, columns[1]);
-}
-
-fn request_generation_ms(request: &crate::state::FinishedRequest) -> Option<u64> {
-    if request.duration_ms == 0 {
-        return None;
-    }
-    let ttfb_ms = request.ttfb_ms.unwrap_or(0);
-    if ttfb_ms > 0 && ttfb_ms < request.duration_ms {
-        Some(request.duration_ms.saturating_sub(ttfb_ms))
-    } else {
-        Some(request.duration_ms)
-    }
-}
-
-fn request_is_fast_mode(request: &crate::state::FinishedRequest) -> bool {
-    request
-        .service_tier
-        .as_deref()
-        .is_some_and(|tier| tier.trim().eq_ignore_ascii_case("priority"))
 }
 
 fn request_service_tier_label(value: Option<&str>) -> String {

@@ -62,6 +62,7 @@ pub(super) async fn finish_and_build_forward_response(
             usage: usage.clone(),
             retry: retry.clone(),
             ttfb_ms: Some(upstream_headers_ms),
+            streaming: false,
         })
         .await;
 

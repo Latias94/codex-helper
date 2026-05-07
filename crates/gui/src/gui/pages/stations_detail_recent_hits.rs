@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct StationRelatedRequestView<'a> {
     request: &'a FinishedRequest,
     touched_only: bool,
@@ -79,11 +79,7 @@ fn station_provider_hit_summaries(
         if request.status_code >= 400 {
             entry.errors += 1;
         }
-        let attempts = request
-            .retry
-            .as_ref()
-            .map(|retry| retry.attempts)
-            .unwrap_or(1);
+        let attempts = request.attempt_count();
         if attempts > 1 {
             entry.retry_requests += 1;
         }
@@ -115,9 +111,12 @@ fn related_request_outcome_label(
             ),
             request.station_name.as_deref().unwrap_or("-"),
         )
-    } else if request.retry.as_ref().is_some_and(|retry| {
-        retry_chain_mentions_station(retry, station_name) && retry.attempts > 1
-    }) {
+    } else if request
+        .retry
+        .as_ref()
+        .is_some_and(|retry| retry_chain_mentions_station(retry, station_name))
+        && request.attempt_count() > 1
+    {
         pick(
             lang,
             "最终命中该站点（经历重试/切换）",
@@ -253,11 +252,7 @@ pub(super) fn render_station_recent_hits_section(
             let now = now_ms();
             for related in related_requests.iter().take(8) {
                 let request = related.request;
-                let attempts = request
-                    .retry
-                    .as_ref()
-                    .map(|retry| retry.attempts)
-                    .unwrap_or(1);
+                let attempts = request.attempt_count();
                 let upstream = request
                     .upstream_base_url
                     .as_deref()
@@ -299,7 +294,7 @@ pub(super) fn render_station_recent_hits_section(
                         tier
                     ));
                     if let Some(retry) = request.retry.as_ref()
-                        && retry.attempts > 1
+                        && request.attempt_count() > 1
                     {
                         ui.small(format!(
                             "{}: {}",
@@ -338,12 +333,14 @@ mod tests {
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
             retry,
+            observability: crate::state::RequestObservability::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
             status_code: 200,
             duration_ms: 500,
             ttfb_ms: None,
+            streaming: false,
             ended_at_ms: 1_000,
         }
     }

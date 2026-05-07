@@ -7,6 +7,79 @@ use crate::pricing::CostBreakdown;
 use crate::sessions;
 use crate::usage::UsageMetrics;
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn service_tier_is_fast(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|tier| tier.eq_ignore_ascii_case("priority"))
+}
+
+fn generation_ms_from_duration(duration_ms: u64, ttfb_ms: Option<u64>) -> Option<u64> {
+    if duration_ms == 0 {
+        return None;
+    }
+    let ttfb_ms = ttfb_ms.unwrap_or(0);
+    if ttfb_ms > 0 && ttfb_ms < duration_ms {
+        Some(duration_ms.saturating_sub(ttfb_ms))
+    } else {
+        Some(duration_ms)
+    }
+}
+
+fn default_attempt_count() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RequestObservability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_per_second: Option<f64>,
+    #[serde(default = "default_attempt_count")]
+    pub attempt_count: u32,
+    #[serde(default)]
+    pub route_attempt_count: usize,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub retried: bool,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub cross_station_failover: bool,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub same_station_retry: bool,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub fast_mode: bool,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub streaming: bool,
+}
+
+impl Default for RequestObservability {
+    fn default() -> Self {
+        Self {
+            trace_id: None,
+            duration_ms: None,
+            ttfb_ms: None,
+            generation_ms: None,
+            output_tokens_per_second: None,
+            attempt_count: 1,
+            route_attempt_count: 0,
+            retried: false,
+            cross_station_failover: false,
+            same_station_retry: false,
+            fast_mode: false,
+            streaming: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveRequest {
     pub id: u64,
@@ -40,7 +113,7 @@ pub struct ActiveRequest {
     pub started_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FinishedRequest {
     pub id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +146,8 @@ pub struct FinishedRequest {
     pub cost: CostBreakdown,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<crate::logging::RetryInfo>,
+    #[serde(default)]
+    pub observability: RequestObservability,
     pub service: String,
     pub method: String,
     pub path: String,
@@ -80,7 +155,102 @@ pub struct FinishedRequest {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttfb_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub streaming: bool,
     pub ended_at_ms: u64,
+}
+
+impl FinishedRequest {
+    pub fn observability_view(&self) -> RequestObservability {
+        RequestObservability::from_finished_request(self)
+    }
+
+    pub fn refresh_observability(&mut self) {
+        self.observability = self.observability_view();
+    }
+
+    pub fn generation_ms(&self) -> Option<u64> {
+        self.observability_view().generation_ms
+    }
+
+    pub fn output_tokens_per_second(&self) -> Option<f64> {
+        self.observability_view().output_tokens_per_second
+    }
+
+    pub fn attempt_count(&self) -> u32 {
+        self.observability_view().attempt_count
+    }
+
+    pub fn is_fast_mode(&self) -> bool {
+        self.observability_view().fast_mode
+    }
+
+    pub fn crossed_station_boundary(&self) -> bool {
+        self.observability_view().cross_station_failover
+    }
+}
+
+impl RequestObservability {
+    pub fn from_finished_request(request: &FinishedRequest) -> Self {
+        let retry = request.retry.as_ref();
+        let attempt_count = retry.map(|retry| retry.attempts.max(1)).unwrap_or(1);
+        let route_attempts = retry
+            .map(|retry| retry.route_attempts_or_derived())
+            .unwrap_or_default();
+        let route_attempt_count = route_attempts.len();
+        let final_station = request
+            .station_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|station| !station.is_empty());
+        let has_station_context = final_station.is_some()
+            && route_attempts
+                .iter()
+                .any(|attempt| attempt.station_name.as_deref().is_some());
+        let cross_station_failover = final_station.is_some_and(|final_station| {
+            route_attempts
+                .iter()
+                .filter_map(|attempt| attempt.station_name.as_deref())
+                .any(|station| station != final_station)
+        });
+        let retried = attempt_count > 1;
+        let same_station_retry = retried && has_station_context && !cross_station_failover;
+        let generation_ms = generation_ms_from_duration(request.duration_ms, request.ttfb_ms);
+        let output_tokens_per_second = request.usage.as_ref().and_then(|usage| {
+            if usage.output_tokens == 0 {
+                return None;
+            }
+            let generation_ms = generation_ms?;
+            if generation_ms == 0 {
+                return None;
+            }
+            let rate = (usage.output_tokens as f64) / (generation_ms as f64 / 1000.0);
+            rate.is_finite().then_some(rate).filter(|rate| *rate > 0.0)
+        });
+        let decided_fast = request
+            .route_decision
+            .as_ref()
+            .and_then(|decision| decision.effective_service_tier.as_ref())
+            .is_some_and(|value| service_tier_is_fast(Some(value.value.as_str())));
+
+        Self {
+            trace_id: request
+                .trace_id
+                .clone()
+                .or_else(|| request.observability.trace_id.clone()),
+            duration_ms: Some(request.duration_ms),
+            ttfb_ms: request.ttfb_ms.filter(|value| *value > 0),
+            generation_ms,
+            output_tokens_per_second,
+            attempt_count,
+            route_attempt_count,
+            retried,
+            cross_station_failover,
+            same_station_retry,
+            fast_mode: decided_fast || service_tier_is_fast(request.service_tier.as_deref()),
+            streaming: request.streaming || request.observability.streaming,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +263,7 @@ pub struct FinishRequestParams {
     pub usage: Option<UsageMetrics>,
     pub retry: Option<crate::logging::RetryInfo>,
     pub ttfb_ms: Option<u64>,
+    pub streaming: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -808,5 +979,130 @@ pub async fn enrich_session_identity_cards_with_host_transcripts(
             .as_deref()
             .and_then(|sid| found.get(sid))
             .map(|path| path.to_string_lossy().to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::logging::RetryInfo;
+    use crate::pricing::CostBreakdown;
+    use crate::usage::UsageMetrics;
+
+    fn sample_finished_request() -> FinishedRequest {
+        FinishedRequest {
+            id: 7,
+            trace_id: Some("codex-7".to_string()),
+            session_id: Some("sid".to_string()),
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: Some("gpt-5".to_string()),
+            reasoning_effort: None,
+            service_tier: Some("default".to_string()),
+            station_name: Some("primary".to_string()),
+            provider_id: Some("primary-provider".to_string()),
+            upstream_base_url: Some("https://primary.example/v1".to_string()),
+            route_decision: Some(RouteDecisionProvenance {
+                effective_service_tier: Some(ResolvedRouteValue {
+                    value: "priority".to_string(),
+                    source: RouteValueSource::ProfileDefault,
+                }),
+                ..Default::default()
+            }),
+            usage: Some(UsageMetrics {
+                output_tokens: 200,
+                total_tokens: 200,
+                ..UsageMetrics::default()
+            }),
+            cost: CostBreakdown::default(),
+            retry: Some(RetryInfo {
+                attempts: 2,
+                upstream_chain: vec![
+                    "backup:https://backup.example/v1 (idx=0) transport_error=timeout".to_string(),
+                    "primary:https://primary.example/v1 (idx=0) status=200 class=-".to_string(),
+                ],
+                route_attempts: Vec::new(),
+            }),
+            observability: RequestObservability::default(),
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 1_500,
+            ttfb_ms: Some(500),
+            streaming: true,
+            ended_at_ms: 2_000,
+        }
+    }
+
+    #[test]
+    fn finished_request_observability_derives_canonical_request_facts() {
+        let request = sample_finished_request();
+
+        let observability = request.observability_view();
+
+        assert_eq!(observability.trace_id.as_deref(), Some("codex-7"));
+        assert_eq!(observability.duration_ms, Some(1_500));
+        assert_eq!(observability.ttfb_ms, Some(500));
+        assert_eq!(observability.generation_ms, Some(1_000));
+        assert_eq!(observability.attempt_count, 2);
+        assert_eq!(observability.route_attempt_count, 2);
+        assert!(observability.retried);
+        assert!(observability.cross_station_failover);
+        assert!(observability.fast_mode);
+        assert!(observability.streaming);
+        assert_eq!(observability.output_tokens_per_second, Some(200.0));
+    }
+
+    #[test]
+    fn finished_request_serializes_materialized_observability_for_operator_api() {
+        let mut request = sample_finished_request();
+        request.refresh_observability();
+
+        let value = serde_json::to_value(&request).expect("finished request json");
+
+        assert_eq!(value["observability"]["trace_id"].as_str(), Some("codex-7"));
+        assert_eq!(
+            value["observability"]["generation_ms"].as_u64(),
+            Some(1_000)
+        );
+        assert_eq!(
+            value["observability"]["output_tokens_per_second"].as_f64(),
+            Some(200.0)
+        );
+        assert_eq!(value["observability"]["attempt_count"].as_u64(), Some(2));
+        assert_eq!(value["observability"]["streaming"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn finished_request_legacy_payload_still_derives_observability() {
+        let request: FinishedRequest = serde_json::from_value(serde_json::json!({
+            "id": 8,
+            "trace_id": "codex-8",
+            "usage": {
+                "output_tokens": 120,
+                "total_tokens": 120
+            },
+            "cost": {},
+            "service": "codex",
+            "method": "POST",
+            "path": "/v1/responses",
+            "status_code": 200,
+            "duration_ms": 1_500,
+            "ttfb_ms": 300,
+            "ended_at_ms": 2_500
+        }))
+        .expect("legacy finished request");
+
+        assert_eq!(request.observability.attempt_count, 1);
+        assert!(!request.streaming);
+
+        let observability = request.observability_view();
+        assert_eq!(observability.generation_ms, Some(1_200));
+        assert_eq!(observability.output_tokens_per_second, Some(100.0));
+        assert_eq!(observability.attempt_count, 1);
+        assert!(!observability.fast_mode);
     }
 }

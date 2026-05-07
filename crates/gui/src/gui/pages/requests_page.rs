@@ -59,11 +59,7 @@ fn render_requests_list(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, filtered: &[&F
             for (pos, request) in filtered.iter().enumerate() {
                 let selected = pos == ctx.view.requests.selected_idx;
                 let age = format_age(now, Some(request.ended_at_ms));
-                let attempts = request
-                    .retry
-                    .as_ref()
-                    .map(|retry| retry.attempts)
-                    .unwrap_or(1);
+                let attempts = request.attempt_count();
                 let model = request.model.as_deref().unwrap_or("-");
                 let station = request.station_name.as_deref().unwrap_or("-");
                 let provider = request.provider_id.as_deref().unwrap_or("-");

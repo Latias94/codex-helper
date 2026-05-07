@@ -294,6 +294,7 @@ impl Drop for StreamFinalize {
                     usage: usage_for_state,
                     retry: retry_for_state,
                     ttfb_ms: ttfb_ms_for_state,
+                    streaming: true,
                 })
                 .await;
         });

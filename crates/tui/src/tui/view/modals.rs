@@ -431,7 +431,7 @@ pub(super) fn render_station_info_modal(
                 }
                 let e = map.entry(url.to_string()).or_default();
                 e.total += 1;
-                let attempts = r.retry.as_ref().map(|x| x.attempts).unwrap_or(1);
+                let attempts = r.attempt_count();
                 e.attempts_sum = e.attempts_sum.saturating_add(attempts as u64);
                 if attempts > 1 {
                     e.retry_cnt = e.retry_cnt.saturating_add(1);

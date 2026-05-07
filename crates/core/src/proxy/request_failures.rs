@@ -163,6 +163,7 @@ pub(super) async fn finish_failed_proxy_request(
             usage: None,
             retry: retry.clone(),
             ttfb_ms: None,
+            streaming: false,
         })
         .await;
 

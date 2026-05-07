@@ -120,23 +120,17 @@ pub fn summarize_recent_retry_observations(
     let mut observations = OperatorRetryObservations::default();
 
     for request in recent {
-        if request
-            .service_tier
-            .as_deref()
-            .is_some_and(|tier| tier.eq_ignore_ascii_case("priority"))
-        {
+        let observability = request.observability_view();
+        if observability.fast_mode {
             observations.recent_fast_mode_requests += 1;
         }
 
-        let Some(retry) = request.retry.as_ref() else {
-            continue;
-        };
-        if retry.attempts <= 1 {
+        if !observability.retried {
             continue;
         }
 
         observations.recent_retried_requests += 1;
-        if retry.touched_other_station(request.station_name.as_deref()) {
+        if observability.cross_station_failover {
             observations.recent_cross_station_failovers += 1;
         }
     }
@@ -293,12 +287,14 @@ mod tests {
             usage: None,
             cost: crate::pricing::CostBreakdown::default(),
             retry,
+            observability: crate::state::RequestObservability::default(),
             service: "codex".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
             status_code: 200,
             duration_ms: 100,
             ttfb_ms: None,
+            streaming: false,
             ended_at_ms: 1,
         }
     }

@@ -206,10 +206,7 @@ pub(super) fn render_header(
         .and_then(|r| r.station_name.as_deref())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
-    let last_attempts = last_req
-        .and_then(|r| r.retry.as_ref())
-        .map(|x| x.attempts)
-        .unwrap_or(1);
+    let last_attempts = last_req.map(|r| r.attempt_count()).unwrap_or(1);
 
     let fmt_ok_pct = |ok: usize, total: usize| -> String {
         if total == 0 {
