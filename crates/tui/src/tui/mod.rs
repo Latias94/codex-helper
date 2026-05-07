@@ -32,6 +32,23 @@ use self::model::{Palette, now_ms, refresh_snapshot};
 use self::state::{UiState, merge_codex_history_external_focus};
 use self::terminal::TerminalGuard;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderInvalidation {
+    None,
+    Redraw,
+    FullClear,
+}
+
+fn request_redraw(invalidation: &mut RenderInvalidation) {
+    if matches!(invalidation, RenderInvalidation::None) {
+        *invalidation = RenderInvalidation::Redraw;
+    }
+}
+
+fn request_full_clear(invalidation: &mut RenderInvalidation) {
+    *invalidation = RenderInvalidation::FullClear;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_dashboard(
     state: Arc<ProxyState>,
@@ -80,16 +97,19 @@ pub async fn run_dashboard(
     let mut providers = providers;
     ui.clamp_selection(&snapshot, providers.len());
 
-    let mut should_redraw = true;
+    let mut render_invalidation = RenderInvalidation::FullClear;
     let mut last_drawn_page = ui.page;
     loop {
-        if should_redraw {
+        if render_invalidation != RenderInvalidation::None {
             if ui.page != last_drawn_page {
                 // Defensive: some terminals occasionally leave stale cells when only a small
                 // region changes (e.g., switching tabs). A full clear on page switch keeps the
                 // UI visually consistent without clearing on every tick.
-                terminal.clear()?;
+                request_full_clear(&mut render_invalidation);
                 last_drawn_page = ui.page;
+            }
+            if matches!(render_invalidation, RenderInvalidation::FullClear) {
+                terminal.clear()?;
             }
             terminal.draw(|f| {
                 view::render_app(
@@ -102,7 +122,7 @@ pub async fn run_dashboard(
                     &providers,
                 )
             })?;
-            should_redraw = false;
+            render_invalidation = RenderInvalidation::None;
         }
 
         if ui.should_exit || *shutdown_rx.borrow() {
@@ -147,7 +167,7 @@ pub async fn run_dashboard(
                     }
                     ui.last_runtime_config_refresh_at = Some(Instant::now());
                 }
-                should_redraw = true;
+                request_redraw(&mut render_invalidation);
             }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
@@ -277,11 +297,11 @@ pub async fn run_dashboard(
                                 }
                                 ui.needs_codex_recent_refresh = false;
                             }
-                            should_redraw = true;
+                            request_redraw(&mut render_invalidation);
                         }
                     }
                     Event::Resize(_, _) => {
-                        should_redraw = true;
+                        request_full_clear(&mut render_invalidation);
                     }
                     _ => {}
                 }

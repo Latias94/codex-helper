@@ -5,9 +5,24 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::tui::model::{Palette, Snapshot};
+use crate::tui::model::{Palette, Snapshot, shorten_middle};
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay, Page, page_index, page_titles};
+
+fn push_header_sep(spans: &mut Vec<Span<'static>>, compact: bool) {
+    spans.push(Span::raw(if compact { "  " } else { "   " }));
+}
+
+fn push_header_metric(
+    spans: &mut Vec<Span<'static>>,
+    label: impl Into<String>,
+    value: impl Into<String>,
+    label_style: Style,
+    value_style: Style,
+) {
+    spans.push(Span::styled(label.into(), label_style));
+    spans.push(Span::styled(value.into(), value_style));
+}
 
 pub(super) fn render_header(
     f: &mut Frame<'_>,
@@ -73,32 +88,57 @@ pub(super) fn render_header(
         Focus::Requests => crate::tui::i18n::pick(ui.language, "请求", "Requests"),
         Focus::Stations => crate::tui::i18n::pick(ui.language, "站点", "Stations"),
     };
-    let title = Line::from(vec![
-        Span::styled(
-            "codex-helper",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("{service_name}:{port}"),
-            Style::default().fg(p.muted),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!(
-                "{}{focus}",
-                crate::tui::i18n::pick(ui.language, "焦点：", "focus: ")
+    let title = if inner.width >= 72 {
+        Line::from(vec![
+            Span::styled(
+                "codex-helper",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             ),
-            Style::default().fg(p.muted),
-        ),
-    ]);
+            Span::raw("  "),
+            Span::styled(
+                format!("{service_name}:{port}"),
+                Style::default().fg(p.muted),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "{}{focus}",
+                    crate::tui::i18n::pick(ui.language, "焦点：", "focus: ")
+                ),
+                Style::default().fg(p.muted),
+            ),
+        ])
+    } else if inner.width >= 46 {
+        Line::from(vec![
+            Span::styled(
+                "codex-helper",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{service_name}:{port}"),
+                Style::default().fg(p.muted),
+            ),
+            Span::raw("  "),
+            Span::styled(focus.to_string(), Style::default().fg(p.muted)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "codex-helper",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(port.to_string(), Style::default().fg(p.muted)),
+        ])
+    };
 
     let last_req = snapshot.recent.first();
     let last_provider = last_req
         .and_then(|r| r.provider_id.as_deref())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
-    let last_config = last_req
+    let last_station = last_req
         .and_then(|r| r.station_name.as_deref())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
@@ -126,112 +166,267 @@ pub(super) fn render_header(
     let s5 = &snapshot.stats_5m;
     let s1 = &snapshot.stats_1h;
 
-    let subtitle = Line::from(vec![
-        Span::styled(
+    let hc_text = if hc_running > 0 {
+        if ui.language == crate::tui::Language::Zh {
+            format!("运行:{hc_running} 取消:{hc_canceling}")
+        } else {
+            format!("run:{hc_running} cancel:{hc_canceling}")
+        }
+    } else {
+        "-".to_string()
+    };
+    let route_full = format!("{last_provider}/{last_station}×{last_attempts}");
+    let route_medium = format!(
+        "{}/{}×{last_attempts}",
+        shorten_middle(last_provider, 18),
+        shorten_middle(last_station, 18)
+    );
+    let route_compact = format!("{}×{last_attempts}", shorten_middle(last_station, 18));
+    let overrides_total = overrides_model
+        .saturating_add(overrides_effort)
+        .saturating_add(overrides_station)
+        .saturating_add(overrides_tier);
+
+    let mut subtitle_spans = Vec::new();
+    if inner.width >= 150 {
+        push_header_metric(
+            &mut subtitle_spans,
             crate::tui::i18n::pick(ui.language, "活跃 ", "active "),
+            active_total.to_string(),
             Style::default().fg(p.muted),
-        ),
-        Span::styled(active_total.to_string(), Style::default().fg(p.good)),
-        Span::raw("   "),
-        Span::styled(
+            Style::default().fg(p.good),
+        );
+        push_header_sep(&mut subtitle_spans, false);
+        push_header_metric(
+            &mut subtitle_spans,
             crate::tui::i18n::pick(ui.language, "错误(80) ", "errors(80) "),
-            Style::default().fg(p.muted),
-        ),
-        Span::styled(
             recent_err.to_string(),
+            Style::default().fg(p.muted),
             Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
-        ),
-        Span::raw("   "),
-        Span::styled("5m ", Style::default().fg(p.muted)),
-        Span::styled(
+        );
+        push_header_sep(&mut subtitle_spans, false);
+        push_header_metric(
+            &mut subtitle_spans,
+            "5m ",
             fmt_ok_pct(s5.ok_2xx, s5.total),
+            Style::default().fg(p.muted),
             Style::default().fg(if s5.total > 0 && s5.ok_2xx == s5.total {
                 p.good
             } else {
                 p.muted
             }),
-        ),
-        Span::raw(" "),
-        Span::styled("p95 ", Style::default().fg(p.muted)),
-        Span::styled(fmt_ms(s5.p95_ms), Style::default().fg(p.muted)),
-        Span::raw(" "),
-        Span::styled("att ", Style::default().fg(p.muted)),
-        Span::styled(fmt_attempts(s5.avg_attempts), Style::default().fg(p.muted)),
-        Span::raw(" "),
-        Span::styled("429 ", Style::default().fg(p.muted)),
-        Span::styled(
+        );
+        subtitle_spans.push(Span::raw(" "));
+        push_header_metric(
+            &mut subtitle_spans,
+            "p95 ",
+            fmt_ms(s5.p95_ms),
+            Style::default().fg(p.muted),
+            Style::default().fg(p.muted),
+        );
+        subtitle_spans.push(Span::raw(" "));
+        push_header_metric(
+            &mut subtitle_spans,
+            "att ",
+            fmt_attempts(s5.avg_attempts),
+            Style::default().fg(p.muted),
+            Style::default().fg(p.muted),
+        );
+        subtitle_spans.push(Span::raw(" "));
+        push_header_metric(
+            &mut subtitle_spans,
+            "429 ",
             s5.err_429.to_string(),
+            Style::default().fg(p.muted),
             Style::default().fg(if s5.err_429 > 0 { p.warn } else { p.muted }),
-        ),
-        Span::raw(" "),
-        Span::styled("5xx ", Style::default().fg(p.muted)),
-        Span::styled(
+        );
+        subtitle_spans.push(Span::raw(" "));
+        push_header_metric(
+            &mut subtitle_spans,
+            "5xx ",
             s5.err_5xx.to_string(),
+            Style::default().fg(p.muted),
             Style::default().fg(if s5.err_5xx > 0 { p.warn } else { p.muted }),
-        ),
-        Span::raw("   "),
-        Span::styled("1h ", Style::default().fg(p.muted)),
-        Span::styled(
+        );
+        push_header_sep(&mut subtitle_spans, false);
+        push_header_metric(
+            &mut subtitle_spans,
+            "1h ",
             fmt_ok_pct(s1.ok_2xx, s1.total),
             Style::default().fg(p.muted),
-        ),
-        Span::raw(" "),
-        Span::styled("p95 ", Style::default().fg(p.muted)),
-        Span::styled(fmt_ms(s1.p95_ms), Style::default().fg(p.muted)),
-        Span::raw(" "),
-        Span::styled("429 ", Style::default().fg(p.muted)),
-        Span::styled(
+            Style::default().fg(p.muted),
+        );
+        subtitle_spans.push(Span::raw(" "));
+        push_header_metric(
+            &mut subtitle_spans,
+            "p95 ",
+            fmt_ms(s1.p95_ms),
+            Style::default().fg(p.muted),
+            Style::default().fg(p.muted),
+        );
+        subtitle_spans.push(Span::raw(" "));
+        push_header_metric(
+            &mut subtitle_spans,
+            "429 ",
             s1.err_429.to_string(),
+            Style::default().fg(p.muted),
             Style::default().fg(if s1.err_429 > 0 { p.warn } else { p.muted }),
-        ),
-        Span::raw("   "),
-        Span::styled(
+        );
+        push_header_sep(&mut subtitle_spans, false);
+        push_header_metric(
+            &mut subtitle_spans,
             crate::tui::i18n::pick(ui.language, "当前 ", "cur "),
+            route_full,
             Style::default().fg(p.muted),
-        ),
-        Span::styled(
-            format!("{last_provider}/{last_config}×{last_attempts}"),
             Style::default().fg(p.accent),
-        ),
-        Span::raw("   "),
-        Span::styled(
+        );
+        push_header_sep(&mut subtitle_spans, false);
+        push_header_metric(
+            &mut subtitle_spans,
             crate::tui::i18n::pick(ui.language, "健康检查 ", "hc "),
+            hc_text,
             Style::default().fg(p.muted),
-        ),
-        Span::styled(
-            if hc_running > 0 {
-                if ui.language == crate::tui::Language::Zh {
-                    format!("运行:{hc_running} 取消:{hc_canceling}")
-                } else {
-                    format!("run:{hc_running} cancel:{hc_canceling}")
-                }
-            } else {
-                "-".to_string()
-            },
             Style::default().fg(if hc_running > 0 { p.accent } else { p.muted }),
-        ),
-        Span::raw("   "),
-        Span::styled(
+        );
+        push_header_sep(&mut subtitle_spans, false);
+        push_header_metric(
+            &mut subtitle_spans,
             crate::tui::i18n::pick(ui.language, "覆盖(M/E/C/T) ", "overrides(M/E/C/T) "),
-            Style::default().fg(p.muted),
-        ),
-        Span::styled(
             format!("{overrides_model}/{overrides_effort}/{overrides_station}/{overrides_tier}"),
             Style::default().fg(p.muted),
-        ),
-        Span::raw("   "),
-        Span::styled(
+            Style::default().fg(p.muted),
+        );
+        push_header_sep(&mut subtitle_spans, false);
+        push_header_metric(
+            &mut subtitle_spans,
             crate::tui::i18n::pick(ui.language, "覆盖(全局站点) ", "override(global station) "),
+            global_station.to_string(),
             Style::default().fg(p.muted),
-        ),
-        Span::styled(global_station.to_string(), Style::default().fg(p.accent)),
-        Span::raw("   "),
-        Span::styled(
+            Style::default().fg(p.accent),
+        );
+        push_header_sep(&mut subtitle_spans, false);
+        push_header_metric(
+            &mut subtitle_spans,
             crate::tui::i18n::pick(ui.language, "刷新 ", "updated "),
+            format!("{updated}ms"),
             Style::default().fg(p.muted),
-        ),
-        Span::styled(format!("{updated}ms"), Style::default().fg(p.muted)),
-    ]);
+            Style::default().fg(p.muted),
+        );
+    } else if inner.width >= 96 {
+        push_header_metric(
+            &mut subtitle_spans,
+            crate::tui::i18n::pick(ui.language, "活 ", "act "),
+            active_total.to_string(),
+            Style::default().fg(p.muted),
+            Style::default().fg(p.good),
+        );
+        push_header_sep(&mut subtitle_spans, true);
+        push_header_metric(
+            &mut subtitle_spans,
+            crate::tui::i18n::pick(ui.language, "错 ", "err "),
+            recent_err.to_string(),
+            Style::default().fg(p.muted),
+            Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
+        );
+        push_header_sep(&mut subtitle_spans, true);
+        push_header_metric(
+            &mut subtitle_spans,
+            "5m ",
+            format!("{} {}", fmt_ok_pct(s5.ok_2xx, s5.total), fmt_ms(s5.p95_ms)),
+            Style::default().fg(p.muted),
+            Style::default().fg(p.muted),
+        );
+        push_header_sep(&mut subtitle_spans, true);
+        push_header_metric(
+            &mut subtitle_spans,
+            crate::tui::i18n::pick(ui.language, "当前 ", "cur "),
+            route_medium,
+            Style::default().fg(p.muted),
+            Style::default().fg(p.accent),
+        );
+        if hc_running > 0 {
+            push_header_sep(&mut subtitle_spans, true);
+            push_header_metric(
+                &mut subtitle_spans,
+                "hc ",
+                hc_text,
+                Style::default().fg(p.muted),
+                Style::default().fg(p.accent),
+            );
+        }
+        if overrides_total > 0 {
+            push_header_sep(&mut subtitle_spans, true);
+            push_header_metric(
+                &mut subtitle_spans,
+                "ovr ",
+                overrides_total.to_string(),
+                Style::default().fg(p.muted),
+                Style::default().fg(p.muted),
+            );
+        }
+        if global_station != "-" {
+            push_header_sep(&mut subtitle_spans, true);
+            push_header_metric(
+                &mut subtitle_spans,
+                "global ",
+                shorten_middle(global_station, 18),
+                Style::default().fg(p.muted),
+                Style::default().fg(p.accent),
+            );
+        }
+        push_header_sep(&mut subtitle_spans, true);
+        push_header_metric(
+            &mut subtitle_spans,
+            crate::tui::i18n::pick(ui.language, "刷 ", "upd "),
+            format!("{updated}ms"),
+            Style::default().fg(p.muted),
+            Style::default().fg(p.muted),
+        );
+    } else {
+        push_header_metric(
+            &mut subtitle_spans,
+            crate::tui::i18n::pick(ui.language, "活 ", "act "),
+            active_total.to_string(),
+            Style::default().fg(p.muted),
+            Style::default().fg(p.good),
+        );
+        push_header_sep(&mut subtitle_spans, true);
+        push_header_metric(
+            &mut subtitle_spans,
+            crate::tui::i18n::pick(ui.language, "错 ", "err "),
+            recent_err.to_string(),
+            Style::default().fg(p.muted),
+            Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
+        );
+        push_header_sep(&mut subtitle_spans, true);
+        push_header_metric(
+            &mut subtitle_spans,
+            "5m ",
+            fmt_ok_pct(s5.ok_2xx, s5.total),
+            Style::default().fg(p.muted),
+            Style::default().fg(p.muted),
+        );
+        push_header_sep(&mut subtitle_spans, true);
+        push_header_metric(
+            &mut subtitle_spans,
+            crate::tui::i18n::pick(ui.language, "当前 ", "cur "),
+            route_compact,
+            Style::default().fg(p.muted),
+            Style::default().fg(p.accent),
+        );
+        if inner.width >= 70 {
+            push_header_sep(&mut subtitle_spans, true);
+            push_header_metric(
+                &mut subtitle_spans,
+                crate::tui::i18n::pick(ui.language, "刷 ", "upd "),
+                format!("{updated}ms"),
+                Style::default().fg(p.muted),
+                Style::default().fg(p.muted),
+            );
+        }
+    }
+
+    let subtitle = Line::from(subtitle_spans);
 
     let tabs = ratatui::widgets::Tabs::new(
         page_titles(ui.language)

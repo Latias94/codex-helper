@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
 use crate::tui::ProviderOption;
 use crate::tui::model::{Palette, Snapshot, format_age, now_ms, shorten, shorten_middle};
@@ -152,7 +152,8 @@ pub(super) fn render_stations_page(
     .header(header)
     .block(left_block)
     .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
-    .highlight_symbol("  ");
+    .highlight_symbol("  ")
+    .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, columns[0], &mut ui.stations_table);
 
     let selected = providers.get(ui.selected_station_idx);
