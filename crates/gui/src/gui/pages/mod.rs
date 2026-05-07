@@ -411,6 +411,43 @@ mod tests {
     }
 
     #[test]
+    fn request_output_rate_uses_generation_time_after_ttfb() {
+        let request = FinishedRequest {
+            id: 43,
+            trace_id: Some("codex-43".to_string()),
+            session_id: None,
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            station_name: None,
+            provider_id: None,
+            upstream_base_url: None,
+            route_decision: None,
+            usage: Some(UsageMetrics {
+                output_tokens: 180,
+                total_tokens: 180,
+                ..UsageMetrics::default()
+            }),
+            cost: crate::pricing::CostBreakdown::default(),
+            retry: None,
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 1_500,
+            ttfb_ms: Some(500),
+            ended_at_ms: 1_000,
+        };
+
+        let rate = requests::request_output_tok_per_sec(&request).expect("rate");
+
+        assert!((rate - 180.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn request_route_decision_reason_explains_model_mapping() {
         let request = FinishedRequest {
             id: 42,

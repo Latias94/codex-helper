@@ -17,6 +17,8 @@ pub(in super::super) fn render_request_detail_cards(
 ) {
     render_request_summary_card(ui, lang, request);
     ui.add_space(8.0);
+    render_request_usage_speed_cost_card(ui, lang, request);
+    ui.add_space(8.0);
     render_request_control_trace_card(ui, lang, request);
     ui.add_space(8.0);
     render_request_retry_chain_card(ui, lang, request);
@@ -290,6 +292,72 @@ fn render_request_summary_card(ui: &mut egui::Ui, lang: Language, request: &Fini
     );
 }
 
+fn render_request_usage_speed_cost_card(
+    ui: &mut egui::Ui,
+    lang: Language,
+    request: &FinishedRequest,
+) {
+    let has_usage = request.usage.is_some();
+    let has_cost = !request.cost.is_unknown();
+    let tone = if has_usage || has_cost {
+        ConsoleTone::Positive
+    } else {
+        ConsoleTone::Neutral
+    };
+
+    console_section(
+        ui,
+        pick(lang, "用量 / 速度 / 成本", "Usage / speed / cost"),
+        tone,
+        |ui| {
+            if !has_usage && !has_cost {
+                console_note(
+                    ui,
+                    pick(
+                        lang,
+                        "这个请求没有可用的 usage 或成本数据；可能是上游没有返回 usage，或旧日志没有这些字段。",
+                        "This request has no usage or cost data; the upstream may not have returned usage, or the record may come from an older log.",
+                    ),
+                );
+                return;
+            }
+
+            ui.columns(3, |cols| {
+                cols[0].label(pick(lang, "速度", "Speed"));
+                console_kv_grid(
+                    &mut cols[0],
+                    ("requests_usage_speed", request.id),
+                    &request_speed_rows(request),
+                );
+
+                cols[1].label(pick(lang, "Tokens", "Tokens"));
+                let token_rows = request
+                    .usage
+                    .as_ref()
+                    .map(request_token_rows)
+                    .unwrap_or_else(|| {
+                        vec![(
+                            "usage".to_string(),
+                            pick(lang, "unknown", "unknown").to_string(),
+                        )]
+                    });
+                console_kv_grid(
+                    &mut cols[1],
+                    ("requests_usage_tokens", request.id),
+                    &token_rows,
+                );
+
+                cols[2].label(pick(lang, "成本", "Cost"));
+                console_kv_grid(
+                    &mut cols[2],
+                    ("requests_usage_cost", request.id),
+                    &request_cost_rows(request),
+                );
+            });
+        },
+    );
+}
+
 fn render_request_control_trace_card(ui: &mut egui::Ui, lang: Language, request: &FinishedRequest) {
     let tone = if request.route_decision.is_some() {
         ConsoleTone::Accent
@@ -513,17 +581,128 @@ fn request_upstream_host(request: &FinishedRequest) -> Option<String> {
     }
 }
 
-fn request_output_tok_per_sec(request: &FinishedRequest) -> Option<f64> {
+fn request_speed_rows(request: &FinishedRequest) -> Vec<(String, String)> {
+    let mut rows = vec![
+        (
+            "duration".to_string(),
+            format!("{} ms", request.duration_ms),
+        ),
+        (
+            "ttfb".to_string(),
+            request
+                .ttfb_ms
+                .filter(|value| *value > 0)
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "generation".to_string(),
+            request_generation_ms(request)
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+    ];
+    if let Some(rate) = request_output_tok_per_sec(request) {
+        rows.push(("out_tok/s".to_string(), format!("{rate:.1}")));
+    }
+    rows
+}
+
+fn request_token_rows(usage: &crate::usage::UsageMetrics) -> Vec<(String, String)> {
+    let mut rows = vec![
+        ("input".to_string(), usage.input_tokens.to_string()),
+        ("output".to_string(), usage.output_tokens.to_string()),
+        (
+            "reasoning".to_string(),
+            usage.reasoning_output_tokens_total().to_string(),
+        ),
+        ("total".to_string(), usage.total_tokens.to_string()),
+    ];
+    if usage.has_cache_tokens() {
+        rows.push((
+            "cached_input".to_string(),
+            usage.cached_input_tokens.to_string(),
+        ));
+        rows.push((
+            "cache_read".to_string(),
+            usage.cache_read_input_tokens.to_string(),
+        ));
+        rows.push((
+            "cache_create".to_string(),
+            usage.cache_creation_tokens_total().to_string(),
+        ));
+        if usage.cache_creation_5m_input_tokens > 0 || usage.cache_creation_1h_input_tokens > 0 {
+            rows.push((
+                "cache_create_5m".to_string(),
+                usage.cache_creation_5m_input_tokens.to_string(),
+            ));
+            rows.push((
+                "cache_create_1h".to_string(),
+                usage.cache_creation_1h_input_tokens.to_string(),
+            ));
+        }
+    }
+    rows
+}
+
+fn request_cost_rows(request: &FinishedRequest) -> Vec<(String, String)> {
+    let cost = &request.cost;
+    let mut rows = vec![("total".to_string(), cost.display_total_with_confidence())];
+    rows.push((
+        "input".to_string(),
+        format_usd_option(cost.input_cost_usd.as_deref()),
+    ));
+    rows.push((
+        "output".to_string(),
+        format_usd_option(cost.output_cost_usd.as_deref()),
+    ));
+    rows.push((
+        "cache_read".to_string(),
+        format_usd_option(cost.cache_read_cost_usd.as_deref()),
+    ));
+    rows.push((
+        "cache_create".to_string(),
+        format_usd_option(cost.cache_creation_cost_usd.as_deref()),
+    ));
+    if let Some(multiplier) = cost.service_tier_multiplier.as_deref() {
+        rows.push(("tier_mult".to_string(), multiplier.to_string()));
+    }
+    if let Some(multiplier) = cost.provider_cost_multiplier.as_deref() {
+        rows.push(("provider_mult".to_string(), multiplier.to_string()));
+    }
+    rows.push((
+        "source".to_string(),
+        cost.pricing_source
+            .clone()
+            .unwrap_or_else(|| "-".to_string()),
+    ));
+    rows
+}
+
+fn format_usd_option(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("${value}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn request_generation_ms(request: &FinishedRequest) -> Option<u64> {
+    if request.duration_ms == 0 {
+        return None;
+    }
+    let ttfb_ms = request.ttfb_ms.unwrap_or(0);
+    if ttfb_ms > 0 && ttfb_ms < request.duration_ms {
+        Some(request.duration_ms.saturating_sub(ttfb_ms))
+    } else {
+        Some(request.duration_ms)
+    }
+}
+
+pub(in super::super) fn request_output_tok_per_sec(request: &FinishedRequest) -> Option<f64> {
     let usage = request.usage.as_ref()?;
     if usage.output_tokens == 0 {
         return None;
     }
-    let ttfb_ms = request.ttfb_ms.unwrap_or(0);
-    let gen_ms = if ttfb_ms > 0 && ttfb_ms < request.duration_ms {
-        request.duration_ms.saturating_sub(ttfb_ms)
-    } else {
-        request.duration_ms
-    };
+    let gen_ms = request_generation_ms(request)?;
     if gen_ms == 0 {
         return None;
     }
