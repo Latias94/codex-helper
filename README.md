@@ -215,7 +215,7 @@ ch
 - 分组：`codex-helper config set-level <name> <level>` + `codex-helper config set-active <name>`
 - 策略：`codex-helper config set-retry-profile <balanced|same-upstream|aggressive-failover|cost-primary>`
 
-> 注意：`set-retry-profile` 会覆盖整个 `[retry]` 段；如果你要高级微调（例如 `retry.upstream.max_attempts`、`retry.provider.on_status`、`transport_cooldown_secs`，以及用于兜底的 `never_on_status` / `never_on_class`），可以在执行 profile 后再手改配置文件（旧版扁平字段仍兼容，但建议迁移到两层配置）。
+> 注意：`set-retry-profile` 会覆盖整个 `[retry]` 段；如果你要高级微调（例如 `retry.upstream.max_attempts`、`retry.provider.on_status`、`transport_cooldown_secs`，以及用于兜底的 `never_on_status` / `never_on_class`），可以在执行 profile 后再手改配置文件。retry 微调必须写在 `retry.upstream` / `retry.provider` 两层配置里。
 
 | 场景目标 | 你只需要怎么“分组”（导入后） | 建议策略（profile） | 备注 |
 | --- | --- | --- | --- |
@@ -721,8 +721,6 @@ cloudflare_timeout_cooldown_secs = 60
 transport_cooldown_secs = 30
 cooldown_backoff_factor = 1
 cooldown_backoff_max_secs = 600
-
-# 兼容说明：旧版扁平字段（max_attempts/on_status/strategy/...）仍可解析，默认映射到 retry.upstream.*。
 ```
 
 注意：重试可能导致 **POST 请求重放**（例如重复计费/重复写入）。建议仅在你明确接受这一风险、且错误大多是瞬态的场景下开启，并将尝试次数控制在较小范围内。

@@ -3,6 +3,57 @@ use super::*;
 mod config_failover;
 mod response_semantics;
 
+fn retry_layer_config(
+    max_attempts: u32,
+    on_status: &str,
+    on_class: Vec<String>,
+    strategy: RetryStrategy,
+) -> crate::config::RetryLayerConfig {
+    crate::config::RetryLayerConfig {
+        max_attempts: Some(max_attempts),
+        backoff_ms: Some(0),
+        backoff_max_ms: Some(0),
+        jitter_ms: Some(0),
+        on_status: Some(on_status.to_string()),
+        on_class: Some(on_class),
+        strategy: Some(strategy),
+    }
+}
+
+fn retry_config(
+    max_attempts: u32,
+    on_status: &str,
+    on_class: Vec<String>,
+    strategy: RetryStrategy,
+) -> RetryConfig {
+    retry_config_with_cooldowns(max_attempts, on_status, on_class, strategy, 0, 0, 0)
+}
+
+fn retry_config_with_cooldowns(
+    max_attempts: u32,
+    on_status: &str,
+    on_class: Vec<String>,
+    strategy: RetryStrategy,
+    cloudflare_challenge_cooldown_secs: u64,
+    cloudflare_timeout_cooldown_secs: u64,
+    transport_cooldown_secs: u64,
+) -> RetryConfig {
+    RetryConfig {
+        upstream: Some(retry_layer_config(
+            max_attempts,
+            on_status,
+            on_class,
+            strategy,
+        )),
+        cloudflare_challenge_cooldown_secs: Some(cloudflare_challenge_cooldown_secs),
+        cloudflare_timeout_cooldown_secs: Some(cloudflare_timeout_cooldown_secs),
+        transport_cooldown_secs: Some(transport_cooldown_secs),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn proxy_failover_retries_502_then_uses_second_upstream() {
     let upstream1_hits = Arc::new(AtomicUsize::new(0));
@@ -35,21 +86,7 @@ async fn proxy_failover_retries_502_then_uses_second_upstream() {
     let (u2_addr, u2_handle) = spawn_axum_server(upstream2);
 
     let proxy_client = Client::new();
-    let retry = RetryConfig {
-        max_attempts: Some(2),
-        backoff_ms: Some(0),
-        backoff_max_ms: Some(0),
-        jitter_ms: Some(0),
-        on_status: Some("502".to_string()),
-        on_class: Some(Vec::new()),
-        strategy: Some(RetryStrategy::Failover),
-        cloudflare_challenge_cooldown_secs: Some(0),
-        cloudflare_timeout_cooldown_secs: Some(0),
-        transport_cooldown_secs: Some(0),
-        cooldown_backoff_factor: Some(1),
-        cooldown_backoff_max_secs: Some(0),
-        ..Default::default()
-    };
+    let retry = retry_config(2, "502", Vec::new(), RetryStrategy::Failover);
     let cfg = make_proxy_config(
         vec![
             UpstreamConfig {
@@ -160,21 +197,7 @@ async fn proxy_same_upstream_retries_502_then_succeeds_without_failover() {
     let (u2_addr, u2_handle) = spawn_axum_server(upstream2);
 
     let proxy_client = Client::new();
-    let retry = RetryConfig {
-        max_attempts: Some(2),
-        backoff_ms: Some(0),
-        backoff_max_ms: Some(0),
-        jitter_ms: Some(0),
-        on_status: Some("502".to_string()),
-        on_class: Some(Vec::new()),
-        strategy: Some(RetryStrategy::SameUpstream),
-        cloudflare_challenge_cooldown_secs: Some(0),
-        cloudflare_timeout_cooldown_secs: Some(0),
-        transport_cooldown_secs: Some(0),
-        cooldown_backoff_factor: Some(1),
-        cooldown_backoff_max_secs: Some(0),
-        ..Default::default()
-    };
+    let retry = retry_config(2, "502", Vec::new(), RetryStrategy::SameUpstream);
     let cfg = make_proxy_config(
         vec![
             UpstreamConfig {
@@ -476,21 +499,15 @@ async fn proxy_failover_across_requests_penalizes_transport_error_when_no_intern
     let unused = reserve_unused_local_addr();
 
     let proxy_client = Client::new();
-    let retry = RetryConfig {
-        max_attempts: Some(1),
-        backoff_ms: Some(0),
-        backoff_max_ms: Some(0),
-        jitter_ms: Some(0),
-        on_status: Some("502".to_string()),
-        on_class: Some(vec!["upstream_transport_error".to_string()]),
-        strategy: Some(RetryStrategy::Failover),
-        cloudflare_challenge_cooldown_secs: Some(0),
-        cloudflare_timeout_cooldown_secs: Some(0),
-        transport_cooldown_secs: Some(60),
-        cooldown_backoff_factor: Some(1),
-        cooldown_backoff_max_secs: Some(0),
-        ..Default::default()
-    };
+    let retry = retry_config_with_cooldowns(
+        1,
+        "502",
+        vec!["upstream_transport_error".to_string()],
+        RetryStrategy::Failover,
+        0,
+        0,
+        60,
+    );
     let cfg = make_proxy_config(
         vec![
             UpstreamConfig {
@@ -630,21 +647,15 @@ async fn proxy_failover_across_requests_penalizes_cloudflare_challenge_when_no_i
     let (u2_addr, u2_handle) = spawn_axum_server(upstream2);
 
     let proxy_client = Client::new();
-    let retry = RetryConfig {
-        max_attempts: Some(1),
-        backoff_ms: Some(0),
-        backoff_max_ms: Some(0),
-        jitter_ms: Some(0),
-        on_status: Some("502".to_string()),
-        on_class: Some(vec!["cloudflare_challenge".to_string()]),
-        strategy: Some(RetryStrategy::Failover),
-        cloudflare_challenge_cooldown_secs: Some(60),
-        cloudflare_timeout_cooldown_secs: Some(0),
-        transport_cooldown_secs: Some(0),
-        cooldown_backoff_factor: Some(1),
-        cooldown_backoff_max_secs: Some(0),
-        ..Default::default()
-    };
+    let retry = retry_config_with_cooldowns(
+        1,
+        "502",
+        vec!["cloudflare_challenge".to_string()],
+        RetryStrategy::Failover,
+        60,
+        0,
+        0,
+    );
     let cfg = make_proxy_config(
         vec![
             UpstreamConfig {

@@ -247,8 +247,6 @@ profile = "balanced"
 # 默认包含 "client_error_non_retryable"（常见请求格式/参数错误）。
 # never_on_class = ["client_error_non_retryable"]
 
-# 兼容说明：旧版扁平字段（max_attempts/on_status/strategy/...）仍可解析，默认映射到 retry.upstream.*。
-
 # 对某些失败类型施加冷却（秒）。
 # cloudflare_challenge_cooldown_secs = 300
 # cloudflare_timeout_cooldown_secs = 60

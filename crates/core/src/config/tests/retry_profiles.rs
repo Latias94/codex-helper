@@ -94,9 +94,11 @@ fn retry_profile_aggressive_failover_enables_broader_failover_with_guardrails() 
 fn retry_profile_allows_explicit_overrides() {
     let cfg = RetryConfig {
         profile: Some(RetryProfileName::SameUpstream),
-        // Override profile defaults:
-        max_attempts: Some(5),
-        strategy: Some(RetryStrategy::Failover),
+        upstream: Some(RetryLayerConfig {
+            max_attempts: Some(5),
+            strategy: Some(RetryStrategy::Failover),
+            ..RetryLayerConfig::default()
+        }),
         ..RetryConfig::default()
     };
     let resolved = cfg.resolve();
@@ -126,4 +128,17 @@ profile = "cost-primary"
 "#;
     let cfg = toml::from_str::<ProxyConfig>(text).expect("toml parse");
     assert_eq!(cfg.retry.profile, Some(RetryProfileName::CostPrimary));
+}
+
+#[test]
+fn retry_config_rejects_retired_flat_fields() {
+    let text = r#"
+version = 1
+
+[retry]
+max_attempts = 5
+"#;
+    let err = toml::from_str::<ProxyConfig>(text).expect_err("retired flat retry field");
+
+    assert!(err.to_string().contains("unknown field `max_attempts`"));
 }

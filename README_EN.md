@@ -257,7 +257,7 @@ If you already imported accounts via `codex-helper config overwrite-from-codex -
 - Grouping: `codex-helper config set-level <name> <level>` + `codex-helper config set-active <name>`
 - Strategy: `codex-helper config set-retry-profile <balanced|same-upstream|aggressive-failover|cost-primary>`
 
-> Note: `set-retry-profile` overwrites the whole `[retry]` block. If you want advanced tweaks (e.g. `retry.upstream.max_attempts`, `retry.provider.on_status`, `transport_cooldown_secs`, and guardrails like `never_on_status` / `never_on_class`), apply a profile first, then edit the config file (legacy flat fields are still accepted, but the layered config is recommended).
+> Note: `set-retry-profile` overwrites the whole `[retry]` block. If you want advanced tweaks (e.g. `retry.upstream.max_attempts`, `retry.provider.on_status`, `transport_cooldown_secs`, and guardrails like `never_on_status` / `never_on_class`), apply a profile first, then edit the config file. Retry tweaks must live under the layered `retry.upstream` / `retry.provider` blocks.
 
 | Goal | What to change after import | Suggested retry profile | Notes |
 | --- | --- | --- | --- |
@@ -770,9 +770,6 @@ cloudflare_timeout_cooldown_secs = 60
 transport_cooldown_secs = 30
 cooldown_backoff_factor = 1
 cooldown_backoff_max_secs = 600
-
-# Compatibility: legacy flat fields (max_attempts/on_status/strategy/...) are still accepted,
-# and are mapped to retry.upstream.* by default.
 ```
 
 Note: retries may replay **non-idempotent POST requests** (potential double-billing or duplicate writes). Only enable retries if you accept this risk, and keep the attempt count low.

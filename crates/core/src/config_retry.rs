@@ -36,6 +36,7 @@ pub struct ResolvedRetryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RetryLayerConfig {
     #[serde(default)]
     pub max_attempts: Option<u32>,
@@ -54,27 +55,12 @@ pub struct RetryLayerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     /// Curated retry policy preset. When set, codex-helper starts from the profile defaults,
     /// then applies any explicitly configured fields below as overrides.
     #[serde(default)]
     pub profile: Option<RetryProfileName>,
-    // Legacy (pre-v0.10.0) flat retry fields (kept for backward compatibility).
-    // Prefer the nested `upstream` / `provider` blocks for new configs.
-    #[serde(default)]
-    pub max_attempts: Option<u32>,
-    #[serde(default)]
-    pub backoff_ms: Option<u64>,
-    #[serde(default)]
-    pub backoff_max_ms: Option<u64>,
-    #[serde(default)]
-    pub jitter_ms: Option<u64>,
-    #[serde(default)]
-    pub on_status: Option<String>,
-    #[serde(default)]
-    pub on_class: Option<Vec<String>>,
-    #[serde(default)]
-    pub strategy: Option<RetryStrategy>,
     #[serde(default)]
     pub upstream: Option<RetryLayerConfig>,
     #[serde(default)]
@@ -115,13 +101,6 @@ impl Default for RetryConfig {
     fn default() -> Self {
         Self {
             profile: Some(RetryProfileName::Balanced),
-            max_attempts: None,
-            backoff_ms: None,
-            backoff_max_ms: None,
-            jitter_ms: None,
-            on_status: None,
-            on_class: None,
-            strategy: None,
             upstream: None,
             provider: None,
             allow_cross_station_before_first_output: None,
@@ -235,33 +214,6 @@ impl RetryConfig {
             .profile
             .unwrap_or(RetryProfileName::Balanced)
             .defaults();
-
-        // Legacy flat fields map to the upstream layer by default, so existing configs that only
-        // tuned `max_attempts` / `on_status` keep a similar "retry the current upstream" behavior.
-        // If `upstream` is explicitly configured, it always takes precedence.
-        if self.upstream.is_none() {
-            if let Some(v) = self.max_attempts {
-                out.upstream.max_attempts = v;
-            }
-            if let Some(v) = self.backoff_ms {
-                out.upstream.backoff_ms = v;
-            }
-            if let Some(v) = self.backoff_max_ms {
-                out.upstream.backoff_max_ms = v;
-            }
-            if let Some(v) = self.jitter_ms {
-                out.upstream.jitter_ms = v;
-            }
-            if let Some(v) = self.on_status.as_deref() {
-                out.upstream.on_status = v.to_string();
-            }
-            if let Some(v) = self.on_class.as_ref() {
-                out.upstream.on_class = v.clone();
-            }
-            if let Some(v) = self.strategy {
-                out.upstream.strategy = v;
-            }
-        }
 
         if let Some(layer) = self.upstream.as_ref() {
             if let Some(v) = layer.max_attempts {
