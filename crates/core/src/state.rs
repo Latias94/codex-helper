@@ -1291,8 +1291,10 @@ impl ProxyState {
         started_at_ms: u64,
     ) -> u64 {
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let trace_id = Some(crate::logging::request_trace_id(service, id));
         let req = ActiveRequest {
             id,
+            trace_id,
             session_id,
             client_name,
             client_addr,
@@ -1340,6 +1342,7 @@ impl ProxyState {
 
         let finished = FinishedRequest {
             id: params.id,
+            trace_id: req.trace_id,
             session_id: req.session_id,
             client_name: req.client_name,
             client_addr: req.client_addr,
@@ -1705,9 +1708,52 @@ mod tests {
     use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamAuth, UpstreamConfig};
 
     #[test]
+    fn begin_and_finish_requests_keep_trace_id() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request(
+                    "codex",
+                    "POST",
+                    "/v1/responses",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("gpt-5".to_string()),
+                    None,
+                    Some("priority".to_string()),
+                    100,
+                )
+                .await;
+
+            let active = state.list_active_requests().await;
+            assert_eq!(active[0].trace_id.as_deref(), Some("codex-1"));
+
+            state
+                .finish_request(FinishRequestParams {
+                    id: request_id,
+                    status_code: 200,
+                    duration_ms: 10,
+                    ended_at_ms: 110,
+                    observed_service_tier: Some("priority".to_string()),
+                    usage: None,
+                    retry: None,
+                    ttfb_ms: Some(4),
+                })
+                .await;
+
+            let recent = state.list_recent_finished(1).await;
+            assert_eq!(recent[0].trace_id.as_deref(), Some("codex-1"));
+        });
+    }
+
+    #[test]
     fn build_session_identity_cards_merges_sources_and_sorts_newest_first() {
         let active = vec![ActiveRequest {
             id: 1,
+            trace_id: Some("codex-1".to_string()),
             session_id: Some("sid-active".to_string()),
             client_name: Some("Frank-Laptop".to_string()),
             client_addr: Some("100.64.0.8".to_string()),
@@ -1727,6 +1773,7 @@ mod tests {
         let recent = vec![
             FinishedRequest {
                 id: 2,
+                trace_id: Some("codex-2".to_string()),
                 session_id: Some("sid-recent".to_string()),
                 client_name: Some("Studio-Mini".to_string()),
                 client_addr: Some("100.64.0.9".to_string()),
@@ -1756,6 +1803,7 @@ mod tests {
             },
             FinishedRequest {
                 id: 3,
+                trace_id: Some("codex-3".to_string()),
                 session_id: Some("sid-active".to_string()),
                 client_name: Some("Frank-Laptop".to_string()),
                 client_addr: Some("100.64.0.8".to_string()),
@@ -1894,6 +1942,7 @@ mod tests {
     fn build_session_identity_cards_prefers_binding_defaults_for_effective_route() {
         let active = vec![ActiveRequest {
             id: 1,
+            trace_id: Some("codex-1".to_string()),
             session_id: Some("sid-bound".to_string()),
             client_name: Some("Workstation".to_string()),
             client_addr: Some("100.64.0.10".to_string()),
@@ -1981,6 +2030,7 @@ mod tests {
     fn build_session_identity_cards_keeps_binding_values_but_allows_global_config_override() {
         let active = vec![ActiveRequest {
             id: 1,
+            trace_id: Some("codex-1".to_string()),
             session_id: Some("sid-bound".to_string()),
             client_name: Some("Workstation".to_string()),
             client_addr: Some("100.64.0.10".to_string()),

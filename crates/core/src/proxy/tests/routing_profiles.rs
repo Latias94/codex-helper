@@ -304,6 +304,10 @@ async fn proxy_api_v1_snapshot_works() {
         "snapshot should not expose legacy configs alias"
     );
     assert_eq!(
+        snap["snapshot"]["active"][0]["trace_id"].as_str(),
+        Some("codex-1")
+    );
+    assert_eq!(
         snap["snapshot"]["session_cards"][0]["effective_station"]["source"].as_str(),
         Some("session_override")
     );

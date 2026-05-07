@@ -246,6 +246,7 @@ fn observed_history_summaries_fall_back_to_recent_requests() {
     let mut snapshot = empty_snapshot();
     snapshot.recent = vec![FinishedRequest {
         id: 1,
+        trace_id: Some("codex-1".to_string()),
         session_id: Some("sid-recent".to_string()),
         client_name: Some("Tablet".to_string()),
         client_addr: Some("100.64.0.13".to_string()),

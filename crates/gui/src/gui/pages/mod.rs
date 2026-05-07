@@ -413,6 +413,7 @@ mod tests {
     fn request_route_decision_reason_explains_model_mapping() {
         let request = FinishedRequest {
             id: 42,
+            trace_id: Some("codex-42".to_string()),
             session_id: Some("sid-req".to_string()),
             client_name: None,
             client_addr: None,
@@ -467,6 +468,7 @@ mod tests {
     fn request_history_summary_from_request_builds_observed_bridge() {
         let request = FinishedRequest {
             id: 7,
+            trace_id: Some("codex-7".to_string()),
             session_id: Some("sid-req".to_string()),
             client_name: Some("Tablet".to_string()),
             client_addr: Some("100.64.0.13".to_string()),

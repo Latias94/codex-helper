@@ -170,6 +170,16 @@ pub(super) fn render_requests_page(
             Span::styled(format!("{}ms", r.duration_ms), Style::default().fg(p.muted)),
         ]));
         lines.push(Line::from(vec![
+            Span::styled("trace: ", Style::default().fg(p.muted)),
+            Span::styled(
+                r.trace_id
+                    .as_deref()
+                    .map(|value| shorten_middle(value, 52))
+                    .unwrap_or_else(|| format!("request-{}", r.id)),
+                Style::default().fg(p.text),
+            ),
+        ]));
+        lines.push(Line::from(vec![
             Span::styled("method: ", Style::default().fg(p.muted)),
             Span::styled(r.method.clone(), Style::default().fg(p.text)),
         ]));

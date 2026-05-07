@@ -48,6 +48,15 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+pub fn request_trace_id(service: &str, request_id: u64) -> String {
+    let service = service.trim();
+    if service.is_empty() {
+        format!("request-{request_id}")
+    } else {
+        format!("{service}-{request_id}")
+    }
+}
+
 fn env_bool(key: &str) -> bool {
     let Ok(v) = std::env::var(key) else {
         return false;
@@ -262,6 +271,8 @@ pub struct RequestLog<'a> {
     pub timestamp_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     pub service: &'a str,
     pub method: &'a str,
     pub path: &'a str,
@@ -553,6 +564,8 @@ struct HttpDebugLogEntry<'a> {
     pub timestamp_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     pub service: &'a str,
     pub method: &'a str,
     pub path: &'a str,
@@ -716,6 +729,7 @@ pub fn log_request_with_debug(
     }
 
     let ts = now_ms();
+    let trace_id = request_id.map(|id| request_trace_id(service, id));
 
     static DEBUG_SEQ: AtomicU64 = AtomicU64::new(0);
     let mut http_debug_for_main = http_debug;
@@ -739,6 +753,7 @@ pub fn log_request_with_debug(
             id: &id,
             timestamp_ms: ts,
             request_id,
+            trace_id: trace_id.clone(),
             service,
             method,
             path,
@@ -779,6 +794,7 @@ pub fn log_request_with_debug(
     let entry = RequestLog {
         timestamp_ms: ts,
         request_id,
+        trace_id,
         service,
         method,
         path,

@@ -836,6 +836,7 @@ mod tests {
             recent: vec![
                 FinishedRequest {
                     id: 1,
+                    trace_id: Some("codex-1".to_string()),
                     session_id: Some("sid-selected".to_string()),
                     client_name: None,
                     client_addr: None,
@@ -859,6 +860,7 @@ mod tests {
                 },
                 FinishedRequest {
                     id: 2,
+                    trace_id: Some("codex-2".to_string()),
                     session_id: Some("sid-explicit".to_string()),
                     client_name: None,
                     client_addr: None,

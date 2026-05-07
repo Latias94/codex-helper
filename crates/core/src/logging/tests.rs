@@ -5,6 +5,7 @@ fn request_log_serializes_request_id_when_present() {
     let value = serde_json::to_value(RequestLog {
         timestamp_ms: 1,
         request_id: Some(42),
+        trace_id: Some(request_trace_id("codex", 42)),
         service: "codex",
         method: "POST",
         path: "/v1/responses",
@@ -30,6 +31,7 @@ fn request_log_serializes_request_id_when_present() {
     .expect("serialize request log");
 
     assert_eq!(value["request_id"].as_u64(), Some(42));
+    assert_eq!(value["trace_id"].as_str(), Some("codex-42"));
 }
 
 #[test]

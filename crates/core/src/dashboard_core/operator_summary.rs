@@ -278,6 +278,7 @@ mod tests {
     ) -> FinishedRequest {
         FinishedRequest {
             id: 1,
+            trace_id: Some("codex-1".to_string()),
             session_id: None,
             client_name: None,
             client_addr: None,

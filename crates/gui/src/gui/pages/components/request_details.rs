@@ -187,6 +187,14 @@ fn render_request_summary_card(ui: &mut egui::Ui, lang: Language, request: &Fini
                 .clone()
                 .unwrap_or_else(|| "-".to_string()),
         ),
+        (
+            "trace_id".to_string(),
+            request
+                .trace_id
+                .as_deref()
+                .map(|value| shorten_middle(value, 48))
+                .unwrap_or_else(|| format!("request-{}", request.id)),
+        ),
     ];
     let mut route_rows = vec![
         (
