@@ -12,6 +12,18 @@ pub(super) fn render_station_quick_switch_section(
         "Quick switch（运行时）",
         "Quick switch (runtime)",
     ));
+    ui.small(format!(
+        "{}: {}  |  {}: {}  |  {}: {}",
+        pick(ctx.lang, "当前 effective", "Current effective"),
+        snapshot
+            .effective_active_station
+            .as_deref()
+            .unwrap_or_else(|| pick(ctx.lang, "-", "-")),
+        pick(ctx.lang, "站点状态", "Station state"),
+        runtime_state_label(cfg.runtime_state),
+        pick(ctx.lang, "目标", "Target"),
+        cfg.name
+    ));
     ui.separator();
     ui.horizontal(|ui| {
         if ui
@@ -61,4 +73,13 @@ pub(super) fn render_station_quick_switch_section(
         "这里的 pin 只影响当前代理运行态，不修改持久化站点设置。",
         "Pins here only affect the current proxy runtime and do not rewrite persisted station settings.",
     ));
+}
+
+fn runtime_state_label(state: crate::state::RuntimeConfigState) -> &'static str {
+    match state {
+        crate::state::RuntimeConfigState::Normal => "normal",
+        crate::state::RuntimeConfigState::Draining => "draining",
+        crate::state::RuntimeConfigState::BreakerOpen => "breaker_open",
+        crate::state::RuntimeConfigState::HalfOpen => "half_open",
+    }
 }
