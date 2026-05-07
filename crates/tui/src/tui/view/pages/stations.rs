@@ -30,6 +30,7 @@ fn station_routing_posture(
     providers: &[ProviderOption],
     station_meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
     lb_view: &HashMap<String, crate::state::LbConfigView>,
+    provider_balances: &HashMap<String, Vec<crate::state::ProviderBalanceSnapshot>>,
     session_override: Option<&str>,
     global_station_override: Option<&str>,
     retry: Option<&crate::config::ResolvedRetryConfig>,
@@ -67,6 +68,11 @@ fn station_routing_posture(
                             .iter()
                             .all(|upstream| upstream.usage_exhausted)
                 }),
+                balance: crate::dashboard_core::StationRoutingBalanceSummary::from_snapshots(
+                    provider_balances
+                        .get(provider.name.as_str())
+                        .map(Vec::as_slice),
+                ),
             }
         })
         .collect::<Vec<_>>();
@@ -156,8 +162,38 @@ fn format_routing_candidate(candidate: &StationRoutingCandidate) -> String {
     } else if candidate.any_usage_exhausted {
         parts.push("quota=partial_exhausted".to_string());
     }
+    if !candidate.balance.is_empty() {
+        parts.push(format_routing_balance(candidate));
+    }
 
     format!("{} [{}]", candidate.name, parts.join(", "))
+}
+
+fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
+    let balance = &candidate.balance;
+    let mut parts = Vec::new();
+    if balance.exhausted == balance.snapshots && balance.snapshots > 0 {
+        parts.push("exhausted_all".to_string());
+    } else if balance.exhausted > 0 {
+        parts.push(format!(
+            "exhausted={}/{}",
+            balance.exhausted, balance.snapshots
+        ));
+    }
+    if balance.error > 0 {
+        parts.push(format!("error={}", balance.error));
+    }
+    if balance.stale > 0 {
+        parts.push(format!("stale={}", balance.stale));
+    }
+    if balance.unknown > 0 {
+        parts.push(format!("unknown={}", balance.unknown));
+    }
+    if parts.is_empty() {
+        format!("balance=ok({})", balance.snapshots)
+    } else {
+        format!("balance={}", parts.join("/"))
+    }
 }
 
 fn format_skipped_station(skipped: &crate::dashboard_core::StationRoutingSkipped) -> String {
@@ -391,6 +427,7 @@ pub(super) fn render_stations_page(
             providers,
             &snapshot.station_meta_overrides,
             &snapshot.lb_view,
+            &snapshot.provider_balances,
             session_override,
             global_station_override,
             ui.last_runtime_retry.as_ref(),
@@ -717,8 +754,17 @@ mod tests {
         ];
         let lb_view = HashMap::new();
 
-        let preview =
-            station_routing_posture(&providers, &HashMap::new(), &lb_view, None, None, None);
+        let provider_balances = HashMap::new();
+
+        let preview = station_routing_posture(
+            &providers,
+            &HashMap::new(),
+            &lb_view,
+            &provider_balances,
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(preview.mode, StationRoutingMode::AutoSingleLevelFallback);
         assert_eq!(preview.eligible_candidates[0].name, "beta");
@@ -739,8 +785,17 @@ mod tests {
         ];
         let lb_view = HashMap::new();
 
-        let preview =
-            station_routing_posture(&providers, &HashMap::new(), &lb_view, None, None, None);
+        let provider_balances = HashMap::new();
+
+        let preview = station_routing_posture(
+            &providers,
+            &HashMap::new(),
+            &lb_view,
+            &provider_balances,
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(preview.mode, StationRoutingMode::AutoLevelFallback);
         assert_eq!(preview.eligible_candidates[0].name, "beta");
@@ -760,7 +815,17 @@ mod tests {
         ]);
         let lb_view = HashMap::new();
 
-        let preview = station_routing_posture(&providers, &overrides, &lb_view, None, None, None);
+        let provider_balances = HashMap::new();
+
+        let preview = station_routing_posture(
+            &providers,
+            &overrides,
+            &lb_view,
+            &provider_balances,
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(preview.eligible_candidates[0].name, "beta");
         assert_eq!(preview.eligible_candidates[0].level, 2);
@@ -775,11 +840,13 @@ mod tests {
     fn station_routing_preview_marks_pinned_targets() {
         let providers = vec![provider("alpha", false, 1, false, 0)];
         let lb_view = HashMap::new();
+        let provider_balances = HashMap::new();
 
         let preview = station_routing_posture(
             &providers,
             &HashMap::new(),
             &lb_view,
+            &provider_balances,
             Some("alpha"),
             None,
             None,
@@ -795,5 +862,58 @@ mod tests {
             preview.skipped[0].reasons,
             vec![StationRoutingSkipReason::NoRoutableUpstreams]
         );
+    }
+
+    #[test]
+    fn station_routing_preview_marks_balance_warnings() {
+        let providers = vec![provider("alpha", true, 1, true, 1)];
+        let lb_view = HashMap::new();
+        let provider_balances = HashMap::from([(
+            "alpha".to_string(),
+            vec![crate::state::ProviderBalanceSnapshot {
+                status: BalanceSnapshotStatus::Exhausted,
+                ..crate::state::ProviderBalanceSnapshot::default()
+            }],
+        )]);
+
+        let preview = station_routing_posture(
+            &providers,
+            &HashMap::new(),
+            &lb_view,
+            &provider_balances,
+            None,
+            None,
+            None,
+        );
+        let label = format_routing_candidate(&preview.eligible_candidates[0]);
+
+        assert!(label.contains("balance=exhausted_all"));
+    }
+
+    #[test]
+    fn station_routing_preview_does_not_treat_unknown_balance_as_ok() {
+        let providers = vec![provider("alpha", true, 1, true, 1)];
+        let lb_view = HashMap::new();
+        let provider_balances = HashMap::from([(
+            "alpha".to_string(),
+            vec![crate::state::ProviderBalanceSnapshot {
+                status: BalanceSnapshotStatus::Unknown,
+                ..crate::state::ProviderBalanceSnapshot::default()
+            }],
+        )]);
+
+        let preview = station_routing_posture(
+            &providers,
+            &HashMap::new(),
+            &lb_view,
+            &provider_balances,
+            None,
+            None,
+            None,
+        );
+        let label = format_routing_candidate(&preview.eligible_candidates[0]);
+
+        assert!(label.contains("balance=unknown=1"));
+        assert!(!label.contains("balance=ok"));
     }
 }

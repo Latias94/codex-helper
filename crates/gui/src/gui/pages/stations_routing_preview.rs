@@ -102,6 +102,10 @@ fn build_gui_station_routing_posture(
                 station,
                 configured_active_station,
                 runtime_maps.lb_view.get(station.name.as_str()),
+                runtime_maps
+                    .provider_balances
+                    .get(station.name.as_str())
+                    .map(Vec::as_slice),
             )
         })
         .collect::<Vec<_>>();
@@ -227,6 +231,9 @@ fn format_routing_candidate(lang: Language, candidate: &StationRoutingCandidate)
     } else if candidate.any_usage_exhausted {
         parts.push("usage=exhausted(partial)".to_string());
     }
+    if !candidate.balance.is_empty() {
+        parts.push(format_routing_balance(candidate));
+    }
 
     match candidate
         .alias
@@ -235,6 +242,33 @@ fn format_routing_candidate(lang: Language, candidate: &StationRoutingCandidate)
     {
         Some(alias) => format!("{} ({alias}) [{}]", candidate.name, parts.join(", ")),
         None => format!("{} [{}]", candidate.name, parts.join(", ")),
+    }
+}
+
+fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
+    let balance = &candidate.balance;
+    let mut parts = Vec::new();
+    if balance.exhausted == balance.snapshots && balance.snapshots > 0 {
+        parts.push("exhausted(all)".to_string());
+    } else if balance.exhausted > 0 {
+        parts.push(format!(
+            "exhausted={}/{}",
+            balance.exhausted, balance.snapshots
+        ));
+    }
+    if balance.error > 0 {
+        parts.push(format!("error={}", balance.error));
+    }
+    if balance.stale > 0 {
+        parts.push(format!("stale={}", balance.stale));
+    }
+    if balance.unknown > 0 {
+        parts.push(format!("unknown={}", balance.unknown));
+    }
+    if parts.is_empty() {
+        format!("balance=ok({})", balance.snapshots)
+    } else {
+        format!("balance={}", parts.join("/"))
     }
 }
 
@@ -312,6 +346,7 @@ mod tests {
                 has_cooldown: true,
                 any_usage_exhausted: true,
                 all_usage_exhausted: false,
+                balance: crate::dashboard_core::StationRoutingBalanceSummary::default(),
             },
         );
 
@@ -319,5 +354,64 @@ mod tests {
         assert!(label.contains("state=half_open"));
         assert!(label.contains("cooldown"));
         assert!(label.contains("usage=exhausted(partial)"));
+    }
+
+    #[test]
+    fn candidate_label_marks_balance_warnings() {
+        let label = format_routing_candidate(
+            Language::En,
+            &StationRoutingCandidate {
+                name: "alpha".to_string(),
+                alias: None,
+                level: 1,
+                enabled: true,
+                active: false,
+                upstreams: Some(2),
+                runtime_state: RuntimeConfigState::Normal,
+                has_cooldown: false,
+                any_usage_exhausted: false,
+                all_usage_exhausted: false,
+                balance: crate::dashboard_core::StationRoutingBalanceSummary {
+                    snapshots: 2,
+                    ok: 0,
+                    exhausted: 1,
+                    stale: 1,
+                    error: 0,
+                    unknown: 0,
+                },
+            },
+        );
+
+        assert!(label.contains("balance=exhausted=1/2/stale=1"));
+    }
+
+    #[test]
+    fn candidate_label_does_not_treat_unknown_balance_as_ok() {
+        let label = format_routing_candidate(
+            Language::En,
+            &StationRoutingCandidate {
+                name: "alpha".to_string(),
+                alias: None,
+                level: 1,
+                enabled: true,
+                active: false,
+                upstreams: Some(1),
+                runtime_state: RuntimeConfigState::Normal,
+                has_cooldown: false,
+                any_usage_exhausted: false,
+                all_usage_exhausted: false,
+                balance: crate::dashboard_core::StationRoutingBalanceSummary {
+                    snapshots: 1,
+                    ok: 0,
+                    exhausted: 0,
+                    stale: 0,
+                    error: 0,
+                    unknown: 1,
+                },
+            },
+        );
+
+        assert!(label.contains("balance=unknown=1"));
+        assert!(!label.contains("balance=ok"));
     }
 }

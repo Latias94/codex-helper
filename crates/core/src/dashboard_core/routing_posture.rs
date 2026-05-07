@@ -1,9 +1,51 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ResolvedRetryConfig, RetryStrategy};
-use crate::state::{LbConfigView, RuntimeConfigState};
+use crate::state::{
+    BalanceSnapshotStatus, LbConfigView, ProviderBalanceSnapshot, RuntimeConfigState,
+};
 
 use super::types::StationOption;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StationRoutingBalanceSummary {
+    pub snapshots: usize,
+    #[serde(default)]
+    pub ok: usize,
+    #[serde(default)]
+    pub exhausted: usize,
+    #[serde(default)]
+    pub stale: usize,
+    #[serde(default)]
+    pub error: usize,
+    #[serde(default)]
+    pub unknown: usize,
+}
+
+impl StationRoutingBalanceSummary {
+    pub fn from_snapshots(snapshots: Option<&[ProviderBalanceSnapshot]>) -> Self {
+        let mut out = Self::default();
+        let Some(snapshots) = snapshots else {
+            return out;
+        };
+
+        out.snapshots = snapshots.len();
+        for snapshot in snapshots {
+            match snapshot.status {
+                BalanceSnapshotStatus::Ok => out.ok += 1,
+                BalanceSnapshotStatus::Exhausted => out.exhausted += 1,
+                BalanceSnapshotStatus::Stale => out.stale += 1,
+                BalanceSnapshotStatus::Error => out.error += 1,
+                BalanceSnapshotStatus::Unknown => out.unknown += 1,
+            }
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.snapshots == 0
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StationRoutingCandidate {
@@ -23,6 +65,11 @@ pub struct StationRoutingCandidate {
     pub any_usage_exhausted: bool,
     #[serde(default)]
     pub all_usage_exhausted: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "StationRoutingBalanceSummary::is_empty"
+    )]
+    pub balance: StationRoutingBalanceSummary,
 }
 
 impl StationRoutingCandidate {
@@ -30,6 +77,7 @@ impl StationRoutingCandidate {
         station: &StationOption,
         configured_active_station: Option<&str>,
         lb: Option<&LbConfigView>,
+        balances: Option<&[ProviderBalanceSnapshot]>,
     ) -> Self {
         let upstreams = lb.map(|view| view.upstreams.len());
         let has_cooldown = lb.is_some_and(|view| {
@@ -61,6 +109,7 @@ impl StationRoutingCandidate {
             has_cooldown,
             any_usage_exhausted,
             all_usage_exhausted,
+            balance: StationRoutingBalanceSummary::from_snapshots(balances),
         }
     }
 }
@@ -345,6 +394,7 @@ mod tests {
             has_cooldown: false,
             any_usage_exhausted: false,
             all_usage_exhausted: false,
+            balance: StationRoutingBalanceSummary::default(),
         }
     }
 
@@ -491,7 +541,7 @@ mod tests {
         };
 
         let candidate =
-            StationRoutingCandidate::from_station_option(&station, Some("alpha"), Some(&lb));
+            StationRoutingCandidate::from_station_option(&station, Some("alpha"), Some(&lb), None);
 
         assert_eq!(candidate.level, 10);
         assert!(candidate.active);
@@ -499,5 +549,53 @@ mod tests {
         assert!(candidate.has_cooldown);
         assert!(candidate.any_usage_exhausted);
         assert!(candidate.all_usage_exhausted);
+    }
+
+    #[test]
+    fn station_option_adapter_preserves_balance_warning_facts() {
+        let station = StationOption {
+            name: "alpha".to_string(),
+            alias: None,
+            enabled: true,
+            level: 1,
+            configured_enabled: true,
+            configured_level: 1,
+            runtime_enabled_override: None,
+            runtime_level_override: None,
+            runtime_state: RuntimeConfigState::Normal,
+            runtime_state_override: None,
+            capabilities: Default::default(),
+        };
+        let balances = vec![
+            ProviderBalanceSnapshot {
+                status: BalanceSnapshotStatus::Ok,
+                ..ProviderBalanceSnapshot::default()
+            },
+            ProviderBalanceSnapshot {
+                status: BalanceSnapshotStatus::Exhausted,
+                ..ProviderBalanceSnapshot::default()
+            },
+            ProviderBalanceSnapshot {
+                status: BalanceSnapshotStatus::Stale,
+                ..ProviderBalanceSnapshot::default()
+            },
+            ProviderBalanceSnapshot {
+                status: BalanceSnapshotStatus::Error,
+                ..ProviderBalanceSnapshot::default()
+            },
+        ];
+
+        let candidate = StationRoutingCandidate::from_station_option(
+            &station,
+            Some("alpha"),
+            None,
+            Some(&balances),
+        );
+
+        assert_eq!(candidate.balance.snapshots, 4);
+        assert_eq!(candidate.balance.ok, 1);
+        assert_eq!(candidate.balance.exhausted, 1);
+        assert_eq!(candidate.balance.stale, 1);
+        assert_eq!(candidate.balance.error, 1);
     }
 }

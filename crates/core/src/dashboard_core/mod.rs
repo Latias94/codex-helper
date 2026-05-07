@@ -11,9 +11,10 @@ pub use operator_summary::{
     build_operator_health_summary, summarize_recent_retry_observations,
 };
 pub use routing_posture::{
-    StationRetryBoundary, StationRoutingCandidate, StationRoutingMode, StationRoutingPosture,
-    StationRoutingPostureInput, StationRoutingSkipReason, StationRoutingSkipped,
-    StationRoutingSource, build_station_routing_posture,
+    StationRetryBoundary, StationRoutingBalanceSummary, StationRoutingCandidate,
+    StationRoutingMode, StationRoutingPosture, StationRoutingPostureInput,
+    StationRoutingSkipReason, StationRoutingSkipped, StationRoutingSource,
+    build_station_routing_posture,
 };
 pub use snapshot::{ApiV1Snapshot, build_dashboard_snapshot};
 pub use station_options::{
