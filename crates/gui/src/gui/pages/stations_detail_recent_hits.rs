@@ -313,6 +313,7 @@ mod tests {
             upstream_base_url: Some("https://api.example.com/v1".to_string()),
             route_decision: None,
             usage: None,
+            cost: crate::pricing::CostBreakdown::default(),
             retry,
             service: "codex".to_string(),
             method: "POST".to_string(),

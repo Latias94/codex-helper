@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pricing::{CostBreakdown, CostSummary};
 use crate::usage::UsageMetrics;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -15,6 +16,8 @@ pub struct UsageBucket {
     pub ttfb_ms_total: u64,
     pub ttfb_samples: u64,
     pub usage: UsageMetrics,
+    #[serde(default, skip_serializing_if = "CostSummary::is_empty")]
+    pub cost: CostSummary,
 }
 
 impl UsageBucket {
@@ -23,6 +26,7 @@ impl UsageBucket {
         status_code: u16,
         duration_ms: u64,
         usage: Option<&UsageMetrics>,
+        cost: Option<&CostBreakdown>,
         ttfb_ms: Option<u64>,
     ) {
         self.requests_total = self.requests_total.saturating_add(1);
@@ -32,6 +36,11 @@ impl UsageBucket {
         self.duration_ms_total = self.duration_ms_total.saturating_add(duration_ms);
         if let Some(u) = usage {
             self.usage.add_assign(u);
+            if let Some(cost) = cost {
+                self.cost.record_usage_cost(cost);
+            } else {
+                self.cost.record_usage_cost(&CostBreakdown::unknown());
+            }
             self.requests_with_usage = self.requests_with_usage.saturating_add(1);
             self.duration_ms_with_usage_total = self
                 .duration_ms_with_usage_total

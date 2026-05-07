@@ -259,6 +259,7 @@ fn observed_history_summaries_fall_back_to_recent_requests() {
         upstream_base_url: None,
         route_decision: None,
         usage: None,
+        cost: crate::pricing::CostBreakdown::default(),
         retry: None,
         service: "codex".to_string(),
         method: "POST".to_string(),

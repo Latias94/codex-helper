@@ -245,6 +245,10 @@ fn render_request_summary_card(ui: &mut egui::Ui, lang: Language, request: &Fini
         .filter(|usage| usage.total_tokens > 0)
     {
         route_rows.push(("usage".to_string(), usage_line(usage)));
+        route_rows.push((
+            "cost".to_string(),
+            request.cost.display_total_with_confidence(),
+        ));
     }
     if let Some(rate) = request_output_tok_per_sec(request) {
         route_rows.push(("out_tok/s".to_string(), format!("{rate:.1}")));

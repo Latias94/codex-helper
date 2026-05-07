@@ -12,6 +12,9 @@ use tokio::time::{Duration, interval};
 
 use crate::config::ServiceConfigManager;
 use crate::lb::LbState;
+#[cfg(test)]
+use crate::pricing::CostBreakdown;
+use crate::pricing::{CostAdjustments, estimate_request_cost_from_bundled_catalog};
 use crate::sessions;
 use crate::usage::UsageMetrics;
 
@@ -1194,17 +1197,19 @@ impl ProxyState {
             let day = (*ended_at_ms / 86_400_000) as i32;
             rollup
                 .since_start
-                .record(*status_code, *duration_ms, usage.as_ref(), *ttfb_ms);
+                .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
             rollup.by_day.entry(day).or_default().record(
                 *status_code,
                 *duration_ms,
                 usage.as_ref(),
+                None,
                 *ttfb_ms,
             );
             rollup.by_config.entry(cfg_key.clone()).or_default().record(
                 *status_code,
                 *duration_ms,
                 usage.as_ref(),
+                None,
                 *ttfb_ms,
             );
             rollup
@@ -1213,19 +1218,19 @@ impl ProxyState {
                 .or_default()
                 .entry(day)
                 .or_default()
-                .record(*status_code, *duration_ms, usage.as_ref(), *ttfb_ms);
+                .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
             rollup
                 .by_provider
                 .entry(provider_key.clone())
                 .or_default()
-                .record(*status_code, *duration_ms, usage.as_ref(), *ttfb_ms);
+                .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
             rollup
                 .by_provider_day
                 .entry(provider_key.clone())
                 .or_default()
                 .entry(day)
                 .or_default()
-                .record(*status_code, *duration_ms, usage.as_ref(), *ttfb_ms);
+                .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
         }
 
         events.len()
@@ -1340,6 +1345,18 @@ impl ProxyState {
             return;
         };
 
+        let pricing_model = req
+            .route_decision
+            .as_ref()
+            .and_then(|decision| decision.effective_model.as_ref())
+            .map(|value| value.value.as_str())
+            .or(req.model.as_deref());
+        let cost = estimate_request_cost_from_bundled_catalog(
+            pricing_model,
+            params.usage.as_ref(),
+            CostAdjustments::default(),
+        );
+
         let finished = FinishedRequest {
             id: params.id,
             trace_id: req.trace_id,
@@ -1355,6 +1372,7 @@ impl ProxyState {
             upstream_base_url: req.upstream_base_url,
             route_decision: req.route_decision,
             usage: params.usage.clone(),
+            cost,
             retry: params.retry,
             service: req.service,
             method: req.method,
@@ -1382,18 +1400,21 @@ impl ProxyState {
                 finished.status_code,
                 finished.duration_ms,
                 finished.usage.as_ref(),
+                Some(&finished.cost),
                 finished.ttfb_ms,
             );
             rollup.by_day.entry(day).or_default().record(
                 finished.status_code,
                 finished.duration_ms,
                 finished.usage.as_ref(),
+                Some(&finished.cost),
                 finished.ttfb_ms,
             );
             rollup.by_config.entry(cfg_key.clone()).or_default().record(
                 finished.status_code,
                 finished.duration_ms,
                 finished.usage.as_ref(),
+                Some(&finished.cost),
                 finished.ttfb_ms,
             );
             rollup
@@ -1406,6 +1427,7 @@ impl ProxyState {
                     finished.status_code,
                     finished.duration_ms,
                     finished.usage.as_ref(),
+                    Some(&finished.cost),
                     finished.ttfb_ms,
                 );
 
@@ -1417,6 +1439,7 @@ impl ProxyState {
                     finished.status_code,
                     finished.duration_ms,
                     finished.usage.as_ref(),
+                    Some(&finished.cost),
                     finished.ttfb_ms,
                 );
             rollup
@@ -1429,6 +1452,7 @@ impl ProxyState {
                     finished.status_code,
                     finished.duration_ms,
                     finished.usage.as_ref(),
+                    Some(&finished.cost),
                     finished.ttfb_ms,
                 );
         }
@@ -1750,6 +1774,59 @@ mod tests {
     }
 
     #[test]
+    fn finish_request_estimates_cost_and_rolls_up_cost() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let request_id = state
+                .begin_request(
+                    "codex",
+                    "POST",
+                    "/v1/responses",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("gpt-5".to_string()),
+                    None,
+                    None,
+                    100,
+                )
+                .await;
+
+            state
+                .finish_request(FinishRequestParams {
+                    id: request_id,
+                    status_code: 200,
+                    duration_ms: 10,
+                    ended_at_ms: 110,
+                    observed_service_tier: None,
+                    usage: Some(UsageMetrics {
+                        input_tokens: 1_000,
+                        output_tokens: 500,
+                        cached_input_tokens: 100,
+                        total_tokens: 1_500,
+                        ..UsageMetrics::default()
+                    }),
+                    retry: None,
+                    ttfb_ms: Some(4),
+                })
+                .await;
+
+            let recent = state.list_recent_finished(1).await;
+            assert_eq!(recent[0].cost.total_cost_usd.as_deref(), Some("0.0061375"));
+
+            let rollup = state.get_usage_rollup_view("codex", 12, 1).await;
+            assert_eq!(
+                rollup.since_start.cost.total_cost_usd.as_deref(),
+                Some("0.0061375")
+            );
+            assert_eq!(rollup.since_start.cost.priced_requests, 1);
+            assert_eq!(rollup.since_start.cost.unpriced_requests, 0);
+        });
+    }
+
+    #[test]
     fn build_session_identity_cards_merges_sources_and_sorts_newest_first() {
         let active = vec![ActiveRequest {
             id: 1,
@@ -1792,6 +1869,7 @@ mod tests {
                     total_tokens: 6,
                     ..UsageMetrics::default()
                 }),
+                cost: CostBreakdown::default(),
                 retry: None,
                 service: "codex".to_string(),
                 method: "POST".to_string(),
@@ -1816,6 +1894,7 @@ mod tests {
                 upstream_base_url: Some("https://right.example/v1".to_string()),
                 route_decision: None,
                 usage: None,
+                cost: CostBreakdown::default(),
                 retry: None,
                 service: "codex".to_string(),
                 method: "POST".to_string(),

@@ -227,6 +227,13 @@ pub(super) fn render_requests_page(
                 Span::styled("usage: ", Style::default().fg(p.muted)),
                 Span::styled(usage_line(u), Style::default().fg(p.accent)),
             ]));
+            lines.push(Line::from(vec![
+                Span::styled("cost: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    r.cost.display_total_with_confidence(),
+                    Style::default().fg(p.text),
+                ),
+            ]));
 
             let ttfb_ms = r.ttfb_ms.unwrap_or(0);
             let gen_ms = if ttfb_ms > 0 && ttfb_ms < r.duration_ms {

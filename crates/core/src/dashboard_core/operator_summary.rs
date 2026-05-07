@@ -291,6 +291,7 @@ mod tests {
             upstream_base_url: None,
             route_decision: None,
             usage: None,
+            cost: crate::pricing::CostBreakdown::default(),
             retry,
             service: "codex".to_string(),
             method: "POST".to_string(),

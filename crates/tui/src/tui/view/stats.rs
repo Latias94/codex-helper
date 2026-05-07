@@ -3,38 +3,27 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, Wrap};
 
+use crate::pricing::CostConfidence;
 use crate::state::UsageBucket;
 use crate::tui::ProviderOption;
 use crate::tui::model::{Palette, Snapshot, shorten, shorten_middle, tokens_short};
 use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
 
-fn pricing_per_1k_usd() -> Option<(f64, f64)> {
-    let input = std::env::var("CODEX_HELPER_PRICE_INPUT_PER_1K_USD")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())?;
-    let output = std::env::var("CODEX_HELPER_PRICE_OUTPUT_PER_1K_USD")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())?;
-    if input.is_finite() && output.is_finite() && input >= 0.0 && output >= 0.0 {
-        Some((input, output))
-    } else {
-        None
-    }
-}
-
-fn estimate_cost_usd(bucket: &UsageBucket) -> Option<f64> {
-    let (input_price, output_price) = pricing_per_1k_usd()?;
-    let input = (bucket.usage.input_tokens.max(0) as f64) / 1000.0;
-    let output = (bucket.usage.output_tokens.max(0) as f64) / 1000.0;
-    Some(input * input_price + output * output_price)
-}
-
 fn fmt_pct(num: u64, den: u64) -> String {
     if den == 0 {
         return "-".to_string();
     }
     format!("{:.1}%", (num as f64) * 100.0 / (den as f64))
+}
+
+fn cost_confidence_label(confidence: CostConfidence) -> &'static str {
+    match confidence {
+        CostConfidence::Unknown => "unknown",
+        CostConfidence::Partial => "partial",
+        CostConfidence::Estimated => "estimated",
+        CostConfidence::Exact => "exact",
+    }
 }
 
 fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
@@ -105,12 +94,8 @@ fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, area: Rect) {
     let err_pct = fmt_pct(s.requests_error, s.requests_total);
     let avg_ms = fmt_avg_ms(s.duration_ms_total, s.requests_total);
     let tokens = &s.usage;
-    let cost = estimate_cost_usd(s).map(|v| format!("${v:.2}"));
-    let cost_hint = if pricing_per_1k_usd().is_some() {
-        cost.unwrap_or_else(|| "-".to_string())
-    } else {
-        "(set CODEX_HELPER_PRICE_* env)".to_string()
-    };
+    let cost_hint = s.cost.display_total();
+    let cost_confidence = cost_confidence_label(s.cost.confidence);
 
     let b1 = Block::default()
         .title("Requests (since start)")
@@ -207,11 +192,11 @@ fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(
-                "pricing  ",
+                "confidence  ",
                 Style::default().fg(p.muted).add_modifier(Modifier::DIM),
             ),
             Span::styled(
-                "global per-1k (env)",
+                cost_confidence,
                 Style::default().fg(p.muted).add_modifier(Modifier::DIM),
             ),
         ]),
@@ -297,8 +282,10 @@ fn render_bucket_table_stateful(
     let rows = items
         .iter()
         .map(|(name, b)| {
-            let cost = estimate_cost_usd(b)
-                .map(|v| format!("{v:.2}"))
+            let cost = b
+                .cost
+                .total_cost_usd
+                .clone()
                 .unwrap_or_else(|| "-".to_string());
             let rate = fmt_tok_s_0(calc_output_rate_tok_s(b));
             Row::new(vec![
@@ -416,9 +403,7 @@ fn render_detail_panel(
     let out_rate = calc_output_rate_tok_s(bucket);
     let out_rate_s = fmt_tok_s_0(out_rate);
     let avg_ttfb = fmt_avg_ttfb_ms(bucket);
-    let cost = estimate_cost_usd(bucket)
-        .map(|v| format!("${v:.2}"))
-        .unwrap_or_else(|| "-".to_string());
+    let cost = bucket.cost.display_total();
 
     let lines = vec![
         Line::from(vec![
@@ -480,7 +465,10 @@ fn render_detail_panel(
             ),
         ]),
         Line::from(vec![Span::styled(
-            "pricing: set CODEX_HELPER_PRICE_* env for usd",
+            format!(
+                "cost confidence: {}",
+                cost_confidence_label(bucket.cost.confidence)
+            ),
             Style::default().fg(p.muted).add_modifier(Modifier::DIM),
         )]),
     ];

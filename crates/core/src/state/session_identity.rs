@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ServiceConfigManager;
+use crate::pricing::CostBreakdown;
 use crate::sessions;
 use crate::usage::UsageMetrics;
 
@@ -68,6 +69,8 @@ pub struct FinishedRequest {
     pub route_decision: Option<RouteDecisionProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
+    #[serde(default, skip_serializing_if = "CostBreakdown::is_unknown")]
+    pub cost: CostBreakdown,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<crate::logging::RetryInfo>,
     pub service: String,

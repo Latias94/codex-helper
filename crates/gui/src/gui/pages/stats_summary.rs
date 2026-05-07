@@ -73,19 +73,7 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
 
             ui.label(pick(ctx.lang, "成本(估算)", "Cost (estimated)"));
-            let cost_hint = if pricing_per_1k_usd().is_some() {
-                estimate_cost_usd(since.usage.input_tokens, since.usage.output_tokens)
-                    .map(|v| format!("${v:.2}"))
-                    .unwrap_or_else(|| "-".to_string())
-            } else {
-                pick(
-                    ctx.lang,
-                    "（设置 CODEX_HELPER_PRICE_* env）",
-                    "(set CODEX_HELPER_PRICE_* env)",
-                )
-                .to_string()
-            };
-            ui.label(cost_hint);
+            ui.label(since.cost.display_total_with_confidence());
             ui.end_row();
 
             ui.label(pick(ctx.lang, "窗口(5m)", "Window (5m)"));
@@ -236,25 +224,4 @@ fn fmt_pct(ok: usize, total: usize) -> String {
         return "-".to_string();
     }
     format!("{:.0}%", (ok as f64) * 100.0 / (total as f64))
-}
-
-fn pricing_per_1k_usd() -> Option<(f64, f64)> {
-    let input = std::env::var("CODEX_HELPER_PRICE_INPUT_PER_1K_USD")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())?;
-    let output = std::env::var("CODEX_HELPER_PRICE_OUTPUT_PER_1K_USD")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())?;
-    if input.is_finite() && output.is_finite() && input >= 0.0 && output >= 0.0 {
-        Some((input, output))
-    } else {
-        None
-    }
-}
-
-fn estimate_cost_usd(input_tokens: i64, output_tokens: i64) -> Option<f64> {
-    let (in_price, out_price) = pricing_per_1k_usd()?;
-    let input = (input_tokens.max(0) as f64) / 1000.0;
-    let output = (output_tokens.max(0) as f64) / 1000.0;
-    Some(input * in_price + output * out_price)
 }

@@ -10,6 +10,7 @@ pub mod lb;
 pub mod logging;
 pub mod model_routing;
 pub mod notify;
+pub mod pricing;
 pub mod proxy;
 pub mod sessions;
 pub mod state;
