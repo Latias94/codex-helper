@@ -40,18 +40,24 @@ Fearless refactor is not permission to:
 
 ### Replace Env-only UI Pricing
 
-Current direction:
+Previous direction:
 
 - `crates/tui/src/tui/view/stats.rs`
 - `crates/gui/src/gui/pages/stats_summary.rs`
 
-These estimate cost from simple input/output prices supplied through environment variables.
+These used to be the risk zone for simple UI-side input/output price estimates.
 
 Target:
 
 - A core pricing engine owns model price lookup and cost calculation.
 - UI code only renders already computed cost summaries and confidence labels.
 - Env prices may remain as a local override source, not as the primary architecture.
+
+Current status:
+
+- Core owns cache-aware request cost calculation and rollup cost summaries.
+- GUI/TUI render core cost totals, parts, and confidence labels.
+- The remaining work is price catalog sync / local overrides, not UI-side math removal.
 
 Removal condition:
 

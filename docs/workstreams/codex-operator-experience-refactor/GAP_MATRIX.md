@@ -96,7 +96,7 @@ Use it for:
 | Route chain | Retry info exists, not detailed enough | Failover queue/status | Provider chain detail | Attempt-level decisions needed | P0 |
 | Service tier / fast | Requested/effective/actual exists | Provider/model dependent | Request detail badges | Need consistent UI and pricing linkage | P0/P1 |
 | Token usage | Basic input/output/reasoning/total | Cache read/create | Cache read/create/5m/1h | Usage v2 needed | P0 |
-| Cost calculation | Env-based UI estimate | Model pricing table | High precision cost engine | Move cost to core engine | P1 |
+| Cost calculation | Core cache-aware pricing engine + confidence labels | Model pricing table | High precision cost engine | Add source-backed sync / overrides | P1 |
 | Model price sync | Not first-class | Seeded pricing table | External sync + cache | Add optional source-backed catalog | P1 |
 | Balance/quota | `usage_providers.rs` marks exhausted | Balance scripts/adapters | Provider limit/cost windows | Promote to first-class balance state | P1 |
 | Health vs quota | Partially separated by `usage_exhausted` | Provider/circuit UI | Circuit + limits | Need clear semantics and UI | P1 |
@@ -134,23 +134,24 @@ Recommended fix:
 Observed from local files:
 
 - `crates/core/src/usage.rs`
-  - current `UsageMetrics` includes `input_tokens`, `output_tokens`, `reasoning_tokens`, `total_tokens`
-- `crates/tui/src/tui/view/stats.rs`
-  - UI estimates cost from simple per-1k token env prices
-- `crates/gui/src/gui/pages/stats_summary.rs`
-  - GUI has similar UI-side cost estimation
+  - `UsageMetrics` now normalizes input/output/reasoning, cached input, cache read, cache creation, and TTL-specific cache creation fields.
+- `crates/core/src/pricing.rs`
+  - core owns cache-aware request cost calculation, model price lookup, and confidence labels.
+- `crates/core/src/state/runtime_types.rs`
+  - request and rollup cost fields are carried through `UsageBucket` / `CostSummary`.
+- `crates/gui/src/gui/pages/stats_summary.rs` and `crates/tui/src/tui/view/stats.rs`
+  - UI renders core-computed cost and confidence instead of doing local price math.
 
 Gap:
 
-- no normalized cache-read/cache-create/cached-input fields
-- no core-owned pricing engine
-- no request cost confidence
+- model price sync / local override source is still basic
+- long-horizon cost audit still depends on runtime rollups and JSONL replay
 
 Recommended fix:
 
-- `UsageMetrics` compatibility plus `TokenUsageV2`
-- core pricing module
-- request/rollup cost fields
+- add optional source-backed price catalog sync
+- add explicit local price override file/API
+- evaluate SQLite only after request/usage/cost schema stops moving
 
 ### Balance and Quota
 
