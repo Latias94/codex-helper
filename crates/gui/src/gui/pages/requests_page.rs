@@ -58,27 +58,111 @@ fn render_requests_list(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, filtered: &[&F
             let now = now_ms();
             for (pos, request) in filtered.iter().enumerate() {
                 let selected = pos == ctx.view.requests.selected_idx;
-                let age = format_age(now, Some(request.ended_at_ms));
-                let attempts = request.attempt_count();
-                let model = request.model.as_deref().unwrap_or("-");
-                let station = request.station_name.as_deref().unwrap_or("-");
-                let provider = request.provider_id.as_deref().unwrap_or("-");
-                let path = shorten_middle(&request.path, 60);
-                let label = format!(
-                    "{age}  st={}  {}ms  att={}  {}  {}  {}  {}",
-                    request.status_code,
-                    request.duration_ms,
-                    attempts,
-                    shorten(model, 18),
-                    shorten(station, 14),
-                    shorten(provider, 10),
-                    path
-                );
+                let label = request_list_label(request, now);
                 if ui.selectable_label(selected, label).clicked() {
                     ctx.view.requests.selected_idx = pos;
                 }
             }
         });
+}
+
+fn request_list_label(request: &FinishedRequest, now_ms: u64) -> String {
+    let age = format_age(now_ms, Some(request.ended_at_ms));
+    let model = request.model.as_deref().unwrap_or("-");
+    let station = request.station_name.as_deref().unwrap_or("-");
+    let provider = request.provider_id.as_deref().unwrap_or("-");
+    let path = shorten_middle(&request.path, 44);
+    let metrics = request_list_metrics(request);
+    format!(
+        "{age}  http={}  dur={}ms  ttfb={}  att={}  {}  stn={}  prv={}  {}  {}",
+        request.status_code,
+        request.duration_ms,
+        request_list_ttfb(request),
+        request.attempt_count(),
+        shorten(model, 18),
+        shorten(station, 14),
+        shorten(provider, 12),
+        shorten(&metrics, 96),
+        path
+    )
+}
+
+fn request_list_metrics(request: &FinishedRequest) -> String {
+    let mut parts = Vec::new();
+    if request.is_fast_mode() {
+        parts.push("fast".to_string());
+    } else if let Some(tier) = request
+        .service_tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("tier={tier}"));
+    }
+
+    if let Some(usage) = request.usage.as_ref() {
+        parts.push(format!(
+            "tok={}/{}/{}",
+            compact_count(usage.input_tokens),
+            compact_count(usage.output_tokens),
+            compact_count(usage.total_tokens)
+        ));
+        let cache_total = usage
+            .cached_input_tokens
+            .max(0)
+            .saturating_add(usage.cache_read_input_tokens.max(0))
+            .saturating_add(usage.cache_creation_tokens_total().max(0));
+        if cache_total > 0 {
+            parts.push(format!("cache={}", compact_count(cache_total)));
+        }
+    }
+
+    if let Some(rate) = request.output_tokens_per_second() {
+        parts.push(format!("out/s={rate:.1}"));
+    }
+    if !request.cost.is_unknown() {
+        parts.push(format!(
+            "cost={}",
+            request.cost.display_total_with_confidence()
+        ));
+    }
+
+    let observability = request.observability_view();
+    if observability.cross_station_failover {
+        parts.push("failover=x-station".to_string());
+    } else if observability.same_station_retry {
+        parts.push("retry=same-station".to_string());
+    } else if observability.retried {
+        parts.push("retry=yes".to_string());
+    }
+    if observability.route_attempt_count > 0 {
+        parts.push(format!("route={}", observability.route_attempt_count));
+    }
+
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn request_list_ttfb(request: &FinishedRequest) -> String {
+    request
+        .ttfb_ms
+        .filter(|value| *value > 0)
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn compact_count(value: i64) -> String {
+    let value = value.max(0) as f64;
+    if value >= 1_000_000.0 {
+        format!("{:.1}m", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}k", value / 1_000.0)
+    } else {
+        format!("{value:.0}")
+    }
 }
 
 fn render_requests_detail(
@@ -143,4 +227,107 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         render_requests_list(&mut cols[0], ctx, &filtered);
         render_requests_detail(&mut cols[1], ctx, &filtered, selected_sid_ref);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_fixture() -> FinishedRequest {
+        FinishedRequest {
+            id: 7,
+            trace_id: Some("codex-7".to_string()),
+            session_id: Some("sid".to_string()),
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: Some("priority".to_string()),
+            station_name: Some("primary".to_string()),
+            provider_id: Some("provider-a".to_string()),
+            upstream_base_url: Some("https://api.example.com/v1".to_string()),
+            route_decision: None,
+            usage: None,
+            cost: crate::pricing::CostBreakdown::default(),
+            retry: None,
+            observability: crate::state::RequestObservability::default(),
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 1_000,
+            ttfb_ms: Some(500),
+            streaming: false,
+            ended_at_ms: 9_000,
+        }
+    }
+
+    #[test]
+    fn request_list_label_surfaces_fast_cache_cost_and_speed() {
+        let usage = UsageMetrics {
+            input_tokens: 1_500,
+            output_tokens: 100,
+            cached_input_tokens: 50,
+            cache_read_input_tokens: 250,
+            total_tokens: 1_600,
+            ..UsageMetrics::default()
+        };
+        let price = crate::pricing::ModelPrice::from_per_million_usd(
+            "gpt-5.4",
+            None,
+            "1",
+            "2",
+            Some("0.1"),
+            Some("0"),
+            "test",
+        )
+        .expect("price");
+        let mut request = request_fixture();
+        request.usage = Some(usage.clone());
+        request.cost = crate::pricing::estimate_usage_cost(
+            &usage,
+            &price,
+            crate::pricing::CostAdjustments::default(),
+        );
+
+        let label = request_list_label(&request, 10_000);
+
+        assert!(label.contains("fast"));
+        assert!(label.contains("tok=1.5k/100/1.6k"));
+        assert!(label.contains("cache=300"));
+        assert!(label.contains("out/s=200.0"));
+        assert!(label.contains("cost=$"));
+    }
+
+    #[test]
+    fn request_list_label_marks_cross_station_failover_route_count() {
+        let mut request = request_fixture();
+        request.retry = Some(crate::logging::RetryInfo {
+            attempts: 2,
+            upstream_chain: Vec::new(),
+            route_attempts: vec![
+                crate::logging::RouteAttemptLog {
+                    attempt_index: 0,
+                    station_name: Some("backup".to_string()),
+                    decision: "select".to_string(),
+                    raw: "backup".to_string(),
+                    ..Default::default()
+                },
+                crate::logging::RouteAttemptLog {
+                    attempt_index: 1,
+                    station_name: Some("primary".to_string()),
+                    decision: "select".to_string(),
+                    raw: "primary".to_string(),
+                    ..Default::default()
+                },
+            ],
+        });
+
+        let label = request_list_label(&request, 10_000);
+
+        assert!(label.contains("failover=x-station"));
+        assert!(label.contains("route=2"));
+        assert!(label.contains("att=2"));
+    }
 }

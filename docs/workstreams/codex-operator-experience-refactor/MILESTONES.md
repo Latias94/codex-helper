@@ -251,6 +251,7 @@ Current implementation slice:
 
 - CLI `usage tail` now shows station/provider/model, service tier/fast, duration, TTFB, output speed, cache-aware token parts, and cost estimates when model/usage are available.
 - CLI `usage summary` now includes cache read/create and reasoning token totals by station instead of only input/output/total tokens.
+- GUI Requests list rows now surface fast mode, token/cache totals, output speed, cost confidence, retry/failover state, and route-attempt counts before opening the detail pane.
 
 ### P1.4 TUI Parity Pass
 

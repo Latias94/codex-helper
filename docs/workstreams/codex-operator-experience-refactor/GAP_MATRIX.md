@@ -145,13 +145,13 @@ Observed from local files:
 Gap:
 
 - model price sync is still not source-backed
-- local price overrides now have a typed CLI, but GUI editing is not first-class yet
+- local price overrides now have a typed CLI and a local-running GUI editor under Stats
 - long-horizon cost audit still depends on runtime rollups and JSONL replay
 
 Recommended fix:
 
 - add optional source-backed price catalog sync
-- add GUI editing for local price overrides when the pricing workspace matures
+- add source-backed catalog sync and provider-specific price/multiplier presets when the pricing workspace matures
 - evaluate SQLite only after request/usage/cost schema stops moving
 
 ### Balance and Quota
