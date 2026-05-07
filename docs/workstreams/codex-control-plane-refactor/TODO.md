@@ -121,7 +121,7 @@ See `VOCABULARY.md` for the canonical term mapping and compatibility-only wordin
       - [x] routing explanation output and retry-trace observability now emit station-first field names (`active_station`, `selected_station`, `eligible_stations`)
       - [x] TUI page/focus/stats state now uses station-first names (`Page::Stations`, `Focus::Stations`, `StatsFocus::Stations`)
       - [x] `ServiceConfigManager` public serialization now emits `stations`, accepts legacy `configs`, and treats `active_station()` as the canonical accessor
-      - [x] `dashboard_core` internal module naming is now station-first (`station_options`), and `active_config()` is reduced to a compatibility-only shim
+      - [x] `dashboard_core` internal module naming is now station-first (`station_options`), and the unused `active_config()` compatibility shim has been removed
       - [x] persisted active-station mutation now uses canonical `/api/v1/stations/active`, while legacy `/stations/config-active` remains a compatibility alias only
       - [x] control-plane capability payload now emits canonical `station_persisted_settings`, while legacy `station_persisted_config` remains a deserialize-only compatibility alias
       - [x] GUI station detail module naming is now settings-first (`stations_detail_persisted_settings.rs`)

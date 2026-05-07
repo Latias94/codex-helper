@@ -196,7 +196,7 @@ Scope:
 - finish the vocabulary cleanup from legacy `config` language to station-first language
 - keep `config` only where it literally means persisted config/document concepts or historical design material
 - reduce the remaining compatibility-only tail explicitly:
-  - narrow shims such as `active_config()`
+  - remove dead shims such as `active_config()` once no internal call sites remain
   - compatibility tests/assertions for legacy fields/routes
   - migration/docs examples that intentionally show legacy `configs` input
 - treat runtime/operator-facing code paths as effectively closed, with the remaining work focused on docs/examples/export wording and explicit compatibility boundaries

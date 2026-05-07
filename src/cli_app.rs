@@ -52,27 +52,6 @@ pub async fn run_cli() -> CliResult<()> {
             }
             return Ok(());
         }
-        Command::SwitchOn {
-            port,
-            codex,
-            claude,
-        } => {
-            eprintln!(
-                "{}",
-                "Warning: `switch-on` is a legacy alias; please use `switch on` instead.".yellow()
-            );
-            do_switch_on(port, codex, claude)?;
-            return Ok(());
-        }
-        Command::SwitchOff { codex, claude } => {
-            eprintln!(
-                "{}",
-                "Warning: `switch-off` is a legacy alias; please use `switch off` instead."
-                    .yellow()
-            );
-            do_switch_off(codex, claude)?;
-            return Ok(());
-        }
         Command::Station { cmd } => {
             commands::station::handle_station_cmd(cmd).await?;
             return Ok(());
@@ -281,7 +260,7 @@ async fn run_server(
         // Guard before switching: if Codex is already pointing to the local proxy and a backup exists,
         // ask whether to restore first (interactive only).
         if let Err(err) = codex_integration::guard_codex_config_before_switch_on_interactive() {
-            tracing::warn!("Failed to guard Codex config before switch-on: {}", err);
+            tracing::warn!("Failed to guard Codex config before switch on: {}", err);
         }
         match codex_integration::switch_on(port) {
             Ok(()) => {
@@ -293,7 +272,7 @@ async fn run_server(
         }
     } else if service_name == "claude" {
         if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
-            tracing::warn!("Failed to guard Claude settings before switch-on: {}", err);
+            tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
         }
         match codex_integration::claude_switch_on(port) {
             Ok(()) => {
@@ -832,7 +811,7 @@ fn do_switch_on(port: u16, codex: bool, claude: bool) -> CliResult<()> {
     }
     if claude {
         if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
-            tracing::warn!("Failed to guard Claude settings before switch-on: {}", err);
+            tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
         }
         codex_integration::claude_switch_on(port)
             .map_err(|e| CliError::CodexConfig(e.to_string()))?;
@@ -971,7 +950,7 @@ fn print_codex_switch_status() {
 
     if backup_path.exists() {
         println!(
-            "  已检测到备份文件：{:?}（switch-off 将尝试从此处恢复）",
+            "  已检测到备份文件：{:?}（switch off 将尝试从此处恢复）",
             backup_path
         );
     } else {

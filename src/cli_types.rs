@@ -62,35 +62,13 @@ pub(crate) enum Command {
         #[arg(long)]
         no_tui: bool,
     },
-    /// Manage Codex/Claude switch-on/off state
+    /// Manage Codex/Claude switch on/off state
     Switch {
         #[command(subcommand)]
         cmd: SwitchCommand,
     },
-    /// Legacy: patch ~/.codex/config.toml to use local proxy (use `switch on` instead)
-    #[command(hide = true)]
-    SwitchOn {
-        #[arg(long, default_value_t = 3211)]
-        port: u16,
-        /// Target Codex config (default)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude settings (experimental)
-        #[arg(long)]
-        claude: bool,
-    },
-    /// Legacy: restore ~/.codex/config.toml from backup (use `switch off` instead)
-    #[command(hide = true)]
-    SwitchOff {
-        /// Target Codex config (default)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude settings (experimental)
-        #[arg(long)]
-        claude: bool,
-    },
     /// Manage proxy stations for Codex / Claude
-    #[command(name = "station", visible_alias = "config")]
+    #[command(name = "station")]
     Station {
         #[command(subcommand)]
         cmd: StationCommand,

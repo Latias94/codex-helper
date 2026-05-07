@@ -60,7 +60,7 @@ ch
 This will:
 
 - Start a Codex proxy on `127.0.0.1:3211`;
-- Guard and, if needed, rewrite `~/.codex/config.toml` to point Codex at the local proxy (snapshotting the original config before switch-on and cleaning the backup after restore so the next cycle captures the latest original state);
+- Guard and, if needed, rewrite `~/.codex/config.toml` to point Codex at the local proxy (snapshotting the original config before `switch on` and cleaning the backup after restore so the next cycle captures the latest original state);
 - When writing `model_providers.codex_proxy`, set `request_max_retries = 0` by default to avoid double-retry (Codex retries + codex-helper retries); you can override it in `~/.codex/config.toml`;
 - Automatically retry/fail over a small number of times for transient failures (429/5xx/network hiccups) and common provider auth/routing failures (e.g. 401/403/404/408) **before any response bytes are streamed to the client** (configurable);
 - If `~/.codex-helper/config.toml` / `config.json` is still empty, bootstrap a default upstream from `~/.codex/config.toml` + `auth.json`;

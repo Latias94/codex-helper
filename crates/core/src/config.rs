@@ -322,12 +322,6 @@ impl ServiceConfigManager {
             })
     }
 
-    /// 兼容层：保留给历史调用方，新的主路径应使用 `active_station()`。
-    #[doc(hidden)]
-    pub fn active_config(&self) -> Option<&ServiceConfig> {
-        self.active_station()
-    }
-
     pub fn profile(&self, name: &str) -> Option<&ServiceControlProfile> {
         self.profiles.get(name)
     }

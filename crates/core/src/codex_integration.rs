@@ -347,7 +347,7 @@ pub fn guard_codex_config_before_switch_on_interactive() -> Result<()> {
     let is_tty = atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
     if !is_tty {
         eprintln!(
-            "Notice: Codex currently points to local codex-helper ({base_url}) and backup {:?} exists; run `codex-helper switch-off` if you want to restore the original config.",
+            "Notice: Codex currently points to local codex-helper ({base_url}) and backup {:?} exists; run `codex-helper switch off` if you want to restore the original config.",
             backup_path
         );
         return Ok(());
@@ -703,7 +703,7 @@ pub fn guard_claude_settings_before_switch_on_interactive() -> Result<()> {
     let is_tty = atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
     if !is_tty {
         eprintln!(
-            "Notice: Claude settings {:?} already points to the local proxy ({base_url}), and backup {:?} exists; run `codex-helper switch-off --claude` if you want to restore the original config.",
+            "Notice: Claude settings {:?} already points to the local proxy ({base_url}), and backup {:?} exists; run `codex-helper switch off --claude` if you want to restore the original config.",
             settings_path, backup_path
         );
         return Ok(());
