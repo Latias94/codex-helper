@@ -195,6 +195,23 @@ pub(super) fn render_requests_page(
             ),
         ]));
         lines.push(Line::from(vec![
+            Span::styled("effort: ", Style::default().fg(p.muted)),
+            Span::styled(
+                r.reasoning_effort.as_deref().unwrap_or("-").to_string(),
+                Style::default().fg(p.text),
+            ),
+            Span::raw("  "),
+            Span::styled("tier: ", Style::default().fg(p.muted)),
+            Span::styled(
+                request_service_tier_label(r.service_tier.as_deref()),
+                Style::default().fg(if request_is_fast_mode(r) {
+                    p.good
+                } else {
+                    p.text
+                }),
+            ),
+        ]));
+        lines.push(Line::from(vec![
             Span::styled("station: ", Style::default().fg(p.muted)),
             Span::styled(
                 r.station_name.as_deref().unwrap_or("-").to_string(),
@@ -219,6 +236,14 @@ pub(super) fn render_requests_page(
             lines.push(Line::from(vec![
                 Span::styled("ttfb: ", Style::default().fg(p.muted)),
                 Span::styled(format!("{ttfb_ms}ms"), Style::default().fg(p.text)),
+                Span::raw("  "),
+                Span::styled("generation: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    request_generation_ms(r)
+                        .map(|value| format!("{value}ms"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    Style::default().fg(p.text),
+                ),
             ]));
         }
 
@@ -234,13 +259,14 @@ pub(super) fn render_requests_page(
                     Style::default().fg(p.text),
                 ),
             ]));
+            if let Some(cost_parts) = request_cost_parts_line(r) {
+                lines.push(Line::from(vec![
+                    Span::styled("cost_parts: ", Style::default().fg(p.muted)),
+                    Span::styled(cost_parts, Style::default().fg(p.muted)),
+                ]));
+            }
 
-            let ttfb_ms = r.ttfb_ms.unwrap_or(0);
-            let gen_ms = if ttfb_ms > 0 && ttfb_ms < r.duration_ms {
-                r.duration_ms.saturating_sub(ttfb_ms)
-            } else {
-                r.duration_ms
-            };
+            let gen_ms = request_generation_ms(r).unwrap_or(0);
             let out_tok_s = if gen_ms > 0 && u.output_tokens > 0 {
                 Some((u.output_tokens as f64) / (gen_ms as f64 / 1000.0))
             } else {
@@ -333,6 +359,52 @@ pub(super) fn render_requests_page(
         .style(Style::default().fg(p.text))
         .wrap(Wrap { trim: false });
     f.render_widget(content, columns[1]);
+}
+
+fn request_generation_ms(request: &crate::state::FinishedRequest) -> Option<u64> {
+    if request.duration_ms == 0 {
+        return None;
+    }
+    let ttfb_ms = request.ttfb_ms.unwrap_or(0);
+    if ttfb_ms > 0 && ttfb_ms < request.duration_ms {
+        Some(request.duration_ms.saturating_sub(ttfb_ms))
+    } else {
+        Some(request.duration_ms)
+    }
+}
+
+fn request_is_fast_mode(request: &crate::state::FinishedRequest) -> bool {
+    request
+        .service_tier
+        .as_deref()
+        .is_some_and(|tier| tier.trim().eq_ignore_ascii_case("priority"))
+}
+
+fn request_service_tier_label(value: Option<&str>) -> String {
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
+    match value {
+        Some(tier) if tier.eq_ignore_ascii_case("priority") => format!("{tier} (fast)"),
+        Some(tier) => tier.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn request_cost_parts_line(request: &crate::state::FinishedRequest) -> Option<String> {
+    let cost = &request.cost;
+    let mut parts = Vec::new();
+    if let Some(value) = cost.input_cost_usd.as_deref() {
+        parts.push(format!("in=${value}"));
+    }
+    if let Some(value) = cost.output_cost_usd.as_deref() {
+        parts.push(format!("out=${value}"));
+    }
+    if let Some(value) = cost.cache_read_cost_usd.as_deref() {
+        parts.push(format!("read=${value}"));
+    }
+    if let Some(value) = cost.cache_creation_cost_usd.as_deref() {
+        parts.push(format!("create=${value}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> String {
