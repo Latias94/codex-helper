@@ -267,6 +267,11 @@ Acceptance:
 - Cross-station failover boundaries are explicit.
 - Cost-primary and fast-first policies are understandable without reading docs.
 
+Current implementation slice:
+
+- Added a GUI retry policy preview that shows the resolved retry profile, upstream/provider strategy and attempt count, plus the cross-station-before-first-output boundary.
+- Added a GUI station routing preview that explains the current source (`global pin` or automatic active/level routing), candidate station order, skipped station reasons, session pin caveats, and after-first-output failover behavior.
+
 ## P2 - Productization and Long-horizon Control
 
 Goal:

@@ -4,6 +4,7 @@ use super::stations_empty_state::{
 use super::stations_panels::render_stations_panels;
 pub(super) use super::stations_profile_management::render_profile_management_entrypoint;
 use super::stations_retry_panel::render_retry_panel;
+use super::stations_routing_preview::render_stations_routing_preview;
 use super::stations_runtime_summary::render_stations_runtime_summary;
 use super::*;
 
@@ -115,6 +116,15 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         configured_active_station.as_deref(),
         effective_active_station.as_deref(),
         supports_persisted_station_settings,
+    );
+
+    ui.add_space(8.0);
+    render_stations_routing_preview(
+        ui,
+        ctx,
+        &snapshot,
+        &runtime_maps,
+        configured_active_station.as_deref(),
     );
 
     ui.add_space(8.0);

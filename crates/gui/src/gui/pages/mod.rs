@@ -155,6 +155,7 @@ mod stations_list_panel;
 mod stations_panels;
 mod stations_profile_management;
 mod stations_retry_panel;
+mod stations_routing_preview;
 mod stations_runtime_summary;
 mod stats;
 mod stats_control_trace;
