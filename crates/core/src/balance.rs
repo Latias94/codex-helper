@@ -11,6 +11,18 @@ pub enum BalanceSnapshotStatus {
     Error,
 }
 
+impl BalanceSnapshotStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BalanceSnapshotStatus::Unknown => "unknown",
+            BalanceSnapshotStatus::Ok => "ok",
+            BalanceSnapshotStatus::Exhausted => "exhausted",
+            BalanceSnapshotStatus::Stale => "stale",
+            BalanceSnapshotStatus::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderBalanceSnapshot {
     pub provider_id: String,
@@ -120,5 +132,60 @@ impl ProviderBalanceSnapshot {
             || self.paygo_balance_usd.is_some()
             || self.monthly_budget_usd.is_some()
             || self.monthly_spent_usd.is_some()
+    }
+
+    pub fn amount_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(total) = self.total_balance_usd.as_deref() {
+            parts.push(format!("total=${total}"));
+        }
+        if let Some(budget) = self.monthly_budget_usd.as_deref() {
+            parts.push(format!("budget=${budget}"));
+        }
+        if let Some(spent) = self.monthly_spent_usd.as_deref() {
+            parts.push(format!("spent=${spent}"));
+        }
+        if let Some(sub) = self.subscription_balance_usd.as_deref() {
+            parts.push(format!("sub=${sub}"));
+        }
+        if let Some(paygo) = self.paygo_balance_usd.as_deref() {
+            parts.push(format!("paygo=${paygo}"));
+        }
+        if parts.is_empty() {
+            "-".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn balance_snapshot_status_labels_are_stable() {
+        assert_eq!(BalanceSnapshotStatus::Unknown.as_str(), "unknown");
+        assert_eq!(BalanceSnapshotStatus::Ok.as_str(), "ok");
+        assert_eq!(BalanceSnapshotStatus::Exhausted.as_str(), "exhausted");
+        assert_eq!(BalanceSnapshotStatus::Stale.as_str(), "stale");
+        assert_eq!(BalanceSnapshotStatus::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn provider_balance_amount_summary_formats_known_amounts() {
+        let snapshot = ProviderBalanceSnapshot {
+            total_balance_usd: Some("3.5".to_string()),
+            monthly_budget_usd: Some("5".to_string()),
+            monthly_spent_usd: Some("1.25".to_string()),
+            subscription_balance_usd: Some("2".to_string()),
+            paygo_balance_usd: Some("1.5".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            snapshot.amount_summary(),
+            "total=$3.5 budget=$5 spent=$1.25 sub=$2 paygo=$1.5"
+        );
     }
 }

@@ -158,6 +158,7 @@ mod stations_retry_panel;
 mod stations_routing_preview;
 mod stations_runtime_summary;
 mod stats;
+mod stats_balance;
 mod stats_control_trace;
 mod stats_control_trace_loader;
 mod stats_control_trace_summary;

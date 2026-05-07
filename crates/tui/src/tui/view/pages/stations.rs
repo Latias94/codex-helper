@@ -5,20 +5,10 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
-use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
+use crate::state::BalanceSnapshotStatus;
 use crate::tui::ProviderOption;
 use crate::tui::model::{Palette, Snapshot, format_age, now_ms, shorten, shorten_middle};
 use crate::tui::state::UiState;
-
-fn balance_status_label(status: BalanceSnapshotStatus) -> &'static str {
-    match status {
-        BalanceSnapshotStatus::Unknown => "unknown",
-        BalanceSnapshotStatus::Ok => "ok",
-        BalanceSnapshotStatus::Exhausted => "exhausted",
-        BalanceSnapshotStatus::Stale => "stale",
-        BalanceSnapshotStatus::Error => "error",
-    }
-}
 
 fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {
     match status {
@@ -28,30 +18,6 @@ fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {
         }
         BalanceSnapshotStatus::Stale => Style::default().fg(p.warn),
         BalanceSnapshotStatus::Unknown => Style::default().fg(p.muted),
-    }
-}
-
-fn balance_amounts(snapshot: &ProviderBalanceSnapshot) -> String {
-    let mut parts = Vec::new();
-    if let Some(total) = snapshot.total_balance_usd.as_deref() {
-        parts.push(format!("total=${total}"));
-    }
-    if let Some(budget) = snapshot.monthly_budget_usd.as_deref() {
-        parts.push(format!("budget=${budget}"));
-    }
-    if let Some(spent) = snapshot.monthly_spent_usd.as_deref() {
-        parts.push(format!("spent=${spent}"));
-    }
-    if let Some(sub) = snapshot.subscription_balance_usd.as_deref() {
-        parts.push(format!("sub=${sub}"));
-    }
-    if let Some(paygo) = snapshot.paygo_balance_usd.as_deref() {
-        parts.push(format!("paygo=${paygo}"));
-    }
-    if parts.is_empty() {
-        "-".to_string()
-    } else {
-        parts.join(" ")
     }
 }
 
@@ -539,7 +505,6 @@ pub(super) fn render_stations_page(
                         .upstream_index
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "-".to_string());
-                    let status = balance_status_label(balance.status);
                     lines.push(Line::from(vec![
                         Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
                         Span::styled(
@@ -547,10 +512,13 @@ pub(super) fn render_stations_page(
                             Style::default().fg(p.text),
                         ),
                         Span::raw("  "),
-                        Span::styled(status, balance_status_style(p, balance.status)),
+                        Span::styled(
+                            balance.status.as_str(),
+                            balance_status_style(p, balance.status),
+                        ),
                         Span::raw("  "),
                         Span::styled(
-                            shorten(&balance_amounts(balance), 72),
+                            shorten(&balance.amount_summary(), 72),
                             Style::default().fg(p.muted),
                         ),
                     ]));

@@ -9,7 +9,7 @@ use crate::config::{ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryStrategy
 use crate::healthcheck::{
     HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
 };
-use crate::tui::model::{Palette, Snapshot, now_ms, shorten_middle};
+use crate::tui::model::{Palette, Snapshot, now_ms, shorten, shorten_middle};
 use crate::tui::state::UiState;
 
 fn retry_strategy_name(strategy: RetryStrategy) -> &'static str {
@@ -103,6 +103,63 @@ fn pricing_catalog_preview_lines(snapshot: &Snapshot, limit: usize) -> Vec<Strin
     lines
 }
 
+fn balance_overview_lines(snapshot: &Snapshot, limit: usize) -> Vec<String> {
+    let mut stations = summarize_station_balances(&snapshot.provider_balances);
+    if stations.is_empty() {
+        return vec!["no balance data".to_string()];
+    }
+
+    stations.sort_by(|left, right| {
+        station_priority(left)
+            .cmp(&station_priority(right))
+            .then_with(|| left.station_name.cmp(&right.station_name))
+    });
+
+    let total_rows = stations
+        .iter()
+        .map(|station| station.total_rows)
+        .sum::<usize>();
+    let exhausted_rows = stations
+        .iter()
+        .map(|station| station.exhausted_rows)
+        .sum::<usize>();
+    let stale_rows = stations
+        .iter()
+        .map(|station| station.stale_rows)
+        .sum::<usize>();
+    let error_rows = stations
+        .iter()
+        .map(|station| station.error_rows)
+        .sum::<usize>();
+
+    let mut lines = vec![format!(
+        "stations={}  rows={}  exhausted={}  stale={}  error={}",
+        stations.len(),
+        total_rows,
+        exhausted_rows,
+        stale_rows,
+        error_rows
+    )];
+    for station in stations.into_iter().take(limit) {
+        lines.push(format!(
+            "{}  rows={} ok={} stale={} exhausted={} err={} unknown={}  {}",
+            shorten_middle(&station.station_name, 20),
+            station.total_rows,
+            station.ok_rows,
+            station.stale_rows,
+            station.exhausted_rows,
+            station.error_rows,
+            station.unknown_rows,
+            station
+                .primary
+                .as_ref()
+                .map(format_primary_balance)
+                .unwrap_or_else(|| "-".to_string())
+        ));
+    }
+    lines
+}
+
 fn prioritized_price_rows(
     snapshot: &Snapshot,
     limit: usize,
@@ -169,6 +226,99 @@ fn confidence_label(confidence: crate::pricing::CostConfidence) -> &'static str 
         crate::pricing::CostConfidence::Estimated => "estimated",
         crate::pricing::CostConfidence::Exact => "exact",
     }
+}
+
+#[derive(Debug, Clone)]
+struct StationBalanceSummary {
+    station_name: String,
+    total_rows: usize,
+    ok_rows: usize,
+    stale_rows: usize,
+    exhausted_rows: usize,
+    error_rows: usize,
+    unknown_rows: usize,
+    primary: Option<crate::state::ProviderBalanceSnapshot>,
+}
+
+fn summarize_station_balances(
+    provider_balances: &HashMap<String, Vec<crate::state::ProviderBalanceSnapshot>>,
+) -> Vec<StationBalanceSummary> {
+    provider_balances
+        .iter()
+        .map(|(station_name, balances)| StationBalanceSummary {
+            station_name: station_name.clone(),
+            total_rows: balances.len(),
+            ok_rows: balances
+                .iter()
+                .filter(|balance| balance.status == crate::state::BalanceSnapshotStatus::Ok)
+                .count(),
+            stale_rows: balances
+                .iter()
+                .filter(|balance| balance.status == crate::state::BalanceSnapshotStatus::Stale)
+                .count(),
+            exhausted_rows: balances
+                .iter()
+                .filter(|balance| balance.status == crate::state::BalanceSnapshotStatus::Exhausted)
+                .count(),
+            error_rows: balances
+                .iter()
+                .filter(|balance| balance.status == crate::state::BalanceSnapshotStatus::Error)
+                .count(),
+            unknown_rows: balances
+                .iter()
+                .filter(|balance| balance.status == crate::state::BalanceSnapshotStatus::Unknown)
+                .count(),
+            primary: balances.iter().cloned().min_by(balance_priority),
+        })
+        .collect()
+}
+
+fn balance_priority(
+    left: &crate::state::ProviderBalanceSnapshot,
+    right: &crate::state::ProviderBalanceSnapshot,
+) -> std::cmp::Ordering {
+    balance_status_rank(left.status)
+        .cmp(&balance_status_rank(right.status))
+        .then_with(|| left.upstream_index.cmp(&right.upstream_index))
+        .then_with(|| left.provider_id.cmp(&right.provider_id))
+        .then_with(|| left.fetched_at_ms.cmp(&right.fetched_at_ms))
+}
+
+fn balance_status_rank(status: crate::state::BalanceSnapshotStatus) -> u8 {
+    match status {
+        crate::state::BalanceSnapshotStatus::Error => 0,
+        crate::state::BalanceSnapshotStatus::Exhausted => 1,
+        crate::state::BalanceSnapshotStatus::Stale => 2,
+        crate::state::BalanceSnapshotStatus::Unknown => 3,
+        crate::state::BalanceSnapshotStatus::Ok => 4,
+    }
+}
+
+fn station_priority(summary: &StationBalanceSummary) -> u8 {
+    summary
+        .primary
+        .as_ref()
+        .map(|snapshot| balance_status_rank(snapshot.status))
+        .unwrap_or(5)
+}
+
+fn format_primary_balance(snapshot: &crate::state::ProviderBalanceSnapshot) -> String {
+    let mut line = format!(
+        "{}  #{}  {}  {}",
+        shorten_middle(&snapshot.provider_id, 20),
+        snapshot
+            .upstream_index
+            .map(|idx| idx.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        snapshot.status.as_str(),
+        snapshot.amount_summary()
+    );
+    if let Some(err) = snapshot.error.as_deref()
+        && !err.trim().is_empty()
+    {
+        line.push_str(&format!("  err={}", shorten(err, 48)));
+    }
+    line
 }
 
 pub(super) fn render_settings_page(
@@ -271,6 +421,18 @@ pub(super) fn render_settings_page(
             Span::styled("5m top station: ", Style::default().fg(p.muted)),
             Span::styled(cfg.to_string(), Style::default().fg(p.text)),
             Span::styled(format!("  n={n}"), Style::default().fg(p.muted)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        crate::tui::i18n::pick(ui.language, "余额概览", "Balance overview"),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    for line in balance_overview_lines(snapshot, 6) {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default().fg(p.muted)),
+            Span::styled(shorten_middle(&line, 110), Style::default().fg(p.muted)),
         ]));
     }
 
