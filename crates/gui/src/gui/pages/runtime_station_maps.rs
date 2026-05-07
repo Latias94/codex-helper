@@ -6,6 +6,7 @@ use crate::gui::proxy_control::ProxyController;
 pub(super) struct RuntimeStationMaps {
     pub(super) station_health: HashMap<String, StationHealth>,
     pub(super) health_checks: HashMap<String, HealthCheckStatus>,
+    pub(super) provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub(super) lb_view: HashMap<String, LbConfigView>,
 }
 
@@ -16,6 +17,7 @@ pub(super) fn runtime_station_maps(proxy: &ProxyController) -> RuntimeStationMap
             .map(|running| RuntimeStationMaps {
                 station_health: running.station_health.clone(),
                 health_checks: running.health_checks.clone(),
+                provider_balances: running.provider_balances.clone(),
                 lb_view: running.lb_view.clone(),
             })
             .unwrap_or_default(),
@@ -24,6 +26,7 @@ pub(super) fn runtime_station_maps(proxy: &ProxyController) -> RuntimeStationMap
             .map(|attached| RuntimeStationMaps {
                 station_health: attached.station_health.clone(),
                 health_checks: attached.health_checks.clone(),
+                provider_balances: attached.provider_balances.clone(),
                 lb_view: attached.lb_view.clone(),
             })
             .unwrap_or_default(),

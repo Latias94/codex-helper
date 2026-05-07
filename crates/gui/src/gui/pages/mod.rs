@@ -19,9 +19,10 @@ use crate::dashboard_core::{
 use crate::doctor::{DoctorLang, DoctorStatus};
 use crate::sessions::{SessionSummary, SessionSummarySource};
 use crate::state::{
-    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ResolvedRouteValue,
-    RouteDecisionProvenance, RouteValueSource, RuntimeConfigState, SessionContinuityMode,
-    SessionIdentityCard, SessionObservationScope, SessionStats, StationHealth,
+    ActiveRequest, BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
+    ProviderBalanceSnapshot, ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource,
+    RuntimeConfigState, SessionContinuityMode, SessionIdentityCard, SessionObservationScope,
+    SessionStats, StationHealth,
 };
 use crate::usage::UsageMetrics;
 

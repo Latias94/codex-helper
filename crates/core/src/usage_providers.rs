@@ -7,8 +7,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::balance::ProviderBalanceSnapshot;
 use crate::config::{ProxyConfig, proxy_home_dir};
 use crate::lb::LbState;
+use crate::pricing::UsdAmount;
+use crate::state::ProxyState;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -17,6 +20,15 @@ enum ProviderKind {
     BudgetHttpJson,
     /// YesCode 账户用量，基于 /api/v1/auth/profile 返回的余额信息
     YescodeProfile,
+}
+
+impl ProviderKind {
+    fn source_name(&self) -> &'static str {
+        match self {
+            ProviderKind::BudgetHttpJson => "usage_provider:budget_http_json",
+            ProviderKind::YescodeProfile => "usage_provider:yescode_profile",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -48,6 +60,17 @@ static LAST_USAGE_POLL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::ne
 
 // Minimal poll interval per provider to avoid hammering usage APIs.
 const MIN_POLL_INTERVAL_SECS: u64 = 20;
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn stale_after_ms(fetched_at_ms: u64, interval_secs: u64) -> Option<u64> {
+    fetched_at_ms.checked_add(interval_secs.saturating_mul(3).saturating_mul(1_000))
+}
 
 fn usage_providers_path() -> std::path::PathBuf {
     proxy_home_dir().join("usage_providers.json")
@@ -85,7 +108,7 @@ fn load_providers() -> UsageProvidersFile {
         return file;
     }
 
-    // 写入默认配置（当前仅包含 packycode），方便用户查看/修改
+    // 写入默认配置，方便用户查看/修改。
     let default = default_providers();
     if let Ok(text) = serde_json::to_string_pretty(&default) {
         if let Some(parent) = path.parent() {
@@ -146,7 +169,7 @@ async fn poll_budget_http_json(
     client: &Client,
     endpoint: &str,
     token: &str,
-) -> Result<(bool, f64, f64)> {
+) -> Result<serde_json::Value> {
     let resp = client
         .get(endpoint)
         .header("Authorization", format!("Bearer {}", token))
@@ -157,26 +180,14 @@ async fn poll_budget_http_json(
     if !resp.status().is_success() {
         anyhow::bail!("usage provider HTTP {}", resp.status());
     }
-    let value: serde_json::Value = resp.json().await?;
-
-    let monthly_budget = value
-        .get("monthly_budget_usd")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let monthly_spent = value
-        .get("monthly_spent_usd")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-
-    let exhausted = monthly_budget > 0.0 && monthly_spent >= monthly_budget;
-    Ok((exhausted, monthly_budget, monthly_spent))
+    Ok(resp.json().await?)
 }
 
 async fn poll_yescode_profile(
     client: &Client,
     endpoint: &str,
     token: &str,
-) -> Result<(bool, f64, f64, f64)> {
+) -> Result<serde_json::Value> {
     let resp = client
         .get(endpoint)
         .header("X-API-Key", token)
@@ -187,26 +198,88 @@ async fn poll_yescode_profile(
     if !resp.status().is_success() {
         anyhow::bail!("yescode profile HTTP {}", resp.status());
     }
-    let value: serde_json::Value = resp.json().await?;
+    Ok(resp.json().await?)
+}
 
-    let subscription_balance = value
-        .get("subscription_balance")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let paygo_balance = value
-        .get("pay_as_you_go_balance")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let total_balance = subscription_balance + paygo_balance;
+fn amount_from_json(value: &serde_json::Value) -> Option<UsdAmount> {
+    let raw = match value {
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => text.trim().to_string(),
+        _ => return None,
+    };
+    UsdAmount::from_decimal_str(raw.as_str())
+}
 
-    // 简单策略：总余额 <= 0 视为额度用尽。
-    let exhausted = total_balance <= 0.0;
-    Ok((
-        exhausted,
-        total_balance,
-        subscription_balance,
-        paygo_balance,
-    ))
+fn amount_from_key(value: &serde_json::Value, key: &str) -> Option<UsdAmount> {
+    value.get(key).and_then(amount_from_json)
+}
+
+fn amount_to_string(amount: UsdAmount) -> String {
+    amount.format_usd()
+}
+
+fn base_snapshot(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    ProviderBalanceSnapshot::new(
+        provider.id.clone(),
+        upstream.station_name.clone(),
+        upstream.index,
+        provider.kind.source_name(),
+        fetched_at_ms,
+        stale_after_ms,
+    )
+}
+
+fn budget_snapshot_from_json(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    value: &serde_json::Value,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    let monthly_budget = amount_from_key(value, "monthly_budget_usd");
+    let monthly_spent = amount_from_key(value, "monthly_spent_usd");
+    let exhausted = match (monthly_budget, monthly_spent) {
+        (Some(budget), Some(spent)) if !budget.is_zero() => Some(spent >= budget),
+        (Some(_), Some(_)) => Some(false),
+        _ => None,
+    };
+
+    let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
+    snapshot.monthly_budget_usd = monthly_budget.map(amount_to_string);
+    snapshot.monthly_spent_usd = monthly_spent.map(amount_to_string);
+    snapshot.exhausted = exhausted;
+    snapshot.refresh_status(fetched_at_ms);
+    snapshot
+}
+
+fn yescode_snapshot_from_json(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    value: &serde_json::Value,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    let subscription_balance = amount_from_key(value, "subscription_balance");
+    let paygo_balance = amount_from_key(value, "pay_as_you_go_balance");
+    let total_balance = match (subscription_balance, paygo_balance) {
+        (Some(subscription), Some(paygo)) => Some(subscription.saturating_add(paygo)),
+        (Some(subscription), None) => Some(subscription),
+        (None, Some(paygo)) => Some(paygo),
+        (None, None) => None,
+    };
+
+    let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
+    snapshot.total_balance_usd = total_balance.map(amount_to_string);
+    snapshot.subscription_balance_usd = subscription_balance.map(amount_to_string);
+    snapshot.paygo_balance_usd = paygo_balance.map(amount_to_string);
+    snapshot.exhausted = total_balance.map(UsdAmount::is_zero);
+    snapshot.refresh_status(fetched_at_ms);
+    snapshot
 }
 
 fn update_usage_exhausted(
@@ -246,6 +319,8 @@ fn update_usage_exhausted(
 pub async fn poll_for_codex_upstream(
     cfg: Arc<ProxyConfig>,
     lb_states: Arc<Mutex<HashMap<String, LbState>>>,
+    state: Arc<ProxyState>,
+    service_name: &str,
     station_name: &str,
     upstream_index: usize,
 ) {
@@ -334,44 +409,189 @@ pub async fn poll_for_codex_upstream(
         let upstreams = vec![current_ref];
 
         let c = client.get_or_insert_with(Client::new);
+        let fetched_at_ms = unix_now_ms();
+        let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
 
         if let Some(token) = resolve_token(&provider, &upstreams, &cfg) {
             match provider.kind {
                 ProviderKind::BudgetHttpJson => {
                     match poll_budget_http_json(c, &provider.endpoint, &token).await {
-                        Ok((exhausted, monthly_budget, monthly_spent)) => {
-                            update_usage_exhausted(&lb_states, &cfg, &upstreams, exhausted);
+                        Ok(value) => {
+                            let snapshot = budget_snapshot_from_json(
+                                &provider,
+                                &upstreams[0],
+                                &value,
+                                fetched_at_ms,
+                                stale_after_ms,
+                            );
+                            let exhausted_for_lb = snapshot.exhausted.unwrap_or(false);
+                            update_usage_exhausted(&lb_states, &cfg, &upstreams, exhausted_for_lb);
+                            state
+                                .record_provider_balance_snapshot(service_name, snapshot.clone())
+                                .await;
                             info!(
-                                "usage provider '{}' exhausted = {} (monthly: {:.2}/{:.2} USD)",
-                                provider.id, exhausted, monthly_spent, monthly_budget
+                                "usage provider '{}' exhausted = {} (monthly: {}/{})",
+                                provider.id,
+                                exhausted_for_lb,
+                                snapshot.monthly_spent_usd.as_deref().unwrap_or("unknown"),
+                                snapshot.monthly_budget_usd.as_deref().unwrap_or("unknown")
                             );
                         }
                         Err(err) => {
+                            state
+                                .record_provider_balance_snapshot(
+                                    service_name,
+                                    base_snapshot(
+                                        &provider,
+                                        &upstreams[0],
+                                        fetched_at_ms,
+                                        stale_after_ms,
+                                    )
+                                    .with_error(err.to_string()),
+                                )
+                                .await;
                             warn!("usage provider '{}' poll failed: {}", provider.id, err);
                         }
                     }
                 }
                 ProviderKind::YescodeProfile => {
                     match poll_yescode_profile(c, &provider.endpoint, &token).await {
-                        Ok((exhausted, total_balance, sub_balance, paygo_balance)) => {
-                            update_usage_exhausted(&lb_states, &cfg, &upstreams, exhausted);
+                        Ok(value) => {
+                            let snapshot = yescode_snapshot_from_json(
+                                &provider,
+                                &upstreams[0],
+                                &value,
+                                fetched_at_ms,
+                                stale_after_ms,
+                            );
+                            let exhausted_for_lb = snapshot.exhausted.unwrap_or(false);
+                            update_usage_exhausted(&lb_states, &cfg, &upstreams, exhausted_for_lb);
+                            state
+                                .record_provider_balance_snapshot(service_name, snapshot.clone())
+                                .await;
                             info!(
-                                "usage provider '{}' exhausted = {} (yescode balance: total={:.2}, subscription={:.2}, paygo={:.2})",
-                                provider.id, exhausted, total_balance, sub_balance, paygo_balance
+                                "usage provider '{}' exhausted = {} (yescode balance: total={}, subscription={}, paygo={})",
+                                provider.id,
+                                exhausted_for_lb,
+                                snapshot.total_balance_usd.as_deref().unwrap_or("unknown"),
+                                snapshot
+                                    .subscription_balance_usd
+                                    .as_deref()
+                                    .unwrap_or("unknown"),
+                                snapshot.paygo_balance_usd.as_deref().unwrap_or("unknown")
                             );
                         }
                         Err(err) => {
+                            state
+                                .record_provider_balance_snapshot(
+                                    service_name,
+                                    base_snapshot(
+                                        &provider,
+                                        &upstreams[0],
+                                        fetched_at_ms,
+                                        stale_after_ms,
+                                    )
+                                    .with_error(err.to_string()),
+                                )
+                                .await;
                             warn!("usage provider '{}' poll failed: {}", provider.id, err);
                         }
                     }
                 }
             }
         } else {
+            state
+                .record_provider_balance_snapshot(
+                    service_name,
+                    base_snapshot(&provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+                        .with_error(
+                            "no usable token; checked provider token_env and upstream auth",
+                        ),
+                )
+                .await;
             warn!(
                 "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
 跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.json",
                 provider.id
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::balance::BalanceSnapshotStatus;
+
+    fn provider(id: &str, kind: ProviderKind) -> UsageProviderConfig {
+        UsageProviderConfig {
+            id: id.to_string(),
+            kind,
+            domains: vec!["example.com".to_string()],
+            endpoint: "https://example.com/usage".to_string(),
+            token_env: None,
+            poll_interval_secs: Some(60),
+        }
+    }
+
+    fn upstream() -> UpstreamRef {
+        UpstreamRef {
+            station_name: "right".to_string(),
+            index: 1,
+        }
+    }
+
+    #[test]
+    fn budget_snapshot_reports_monthly_budget_and_exhaustion() {
+        let snapshot = budget_snapshot_from_json(
+            &provider("packycode", ProviderKind::BudgetHttpJson),
+            &upstream(),
+            &serde_json::json!({
+                "monthly_budget_usd": "10.50",
+                "monthly_spent_usd": 10.5
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert_eq!(snapshot.exhausted, Some(true));
+        assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("10.5"));
+        assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("10.5"));
+    }
+
+    #[test]
+    fn budget_snapshot_keeps_missing_amounts_unknown() {
+        let snapshot = budget_snapshot_from_json(
+            &provider("packycode", ProviderKind::BudgetHttpJson),
+            &upstream(),
+            &serde_json::json!({}),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Unknown);
+        assert_eq!(snapshot.exhausted, None);
+    }
+
+    #[test]
+    fn yescode_snapshot_sums_subscription_and_paygo_balances() {
+        let snapshot = yescode_snapshot_from_json(
+            &provider("yescode", ProviderKind::YescodeProfile),
+            &upstream(),
+            &serde_json::json!({
+                "subscription_balance": "1.25",
+                "pay_as_you_go_balance": 2.5
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("3.75"));
+        assert_eq!(snapshot.subscription_balance_usd.as_deref(), Some("1.25"));
+        assert_eq!(snapshot.paygo_balance_usd.as_deref(), Some("2.5"));
     }
 }

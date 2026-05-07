@@ -9,8 +9,9 @@ use crate::config::ProxyConfig;
 use crate::dashboard_core::WindowStats;
 pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
-    FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState, ResolvedRouteValue,
-    SessionIdentityCard, SessionObservationScope, StationHealth, UsageRollupView,
+    FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot, ProxyState,
+    ResolvedRouteValue, SessionIdentityCard, SessionObservationScope, StationHealth,
+    UsageRollupView,
 };
 use crate::usage::UsageMetrics;
 
@@ -83,6 +84,7 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) global_station_override: Option<String>,
     pub(in crate::tui) station_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
     pub(in crate::tui) usage_rollup: UsageRollupView,
+    pub(in crate::tui) provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub(in crate::tui) station_health: HashMap<String, StationHealth>,
     pub(in crate::tui) health_checks: HashMap<String, HealthCheckStatus>,
     pub(in crate::tui) lb_view: HashMap<String, LbConfigView>,
@@ -614,6 +616,7 @@ pub(in crate::tui) async fn refresh_snapshot(
         global_station_override,
         station_meta_overrides: config_meta,
         usage_rollup: snap.usage_rollup,
+        provider_balances: snap.provider_balances,
         station_health,
         health_checks: snap.health_checks,
         lb_view: snap.lb_view,
@@ -781,6 +784,7 @@ mod tests {
             global_station_override: None,
             station_meta_overrides: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
+            provider_balances: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
@@ -892,6 +896,7 @@ mod tests {
             global_station_override: None,
             station_meta_overrides: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
+            provider_balances: HashMap::new(),
             station_health: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),

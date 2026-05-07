@@ -84,6 +84,7 @@ pub(super) fn sample_snapshot(stations: Vec<StationOption>) -> ApiV1Snapshot {
             session_service_tier_overrides: HashMap::new(),
             session_stats: HashMap::new(),
             station_health: HashMap::new(),
+            provider_balances: HashMap::new(),
             health_checks: HashMap::new(),
             lb_view: HashMap::new(),
             usage_rollup: UsageRollupView::default(),

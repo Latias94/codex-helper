@@ -16,8 +16,8 @@ use crate::dashboard_core::{
     RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationOption, WindowStats,
 };
 use crate::state::{
-    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, SessionIdentityCard,
-    SessionManualOverrides, SessionStats, StationHealth, UsageRollupView,
+    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
+    SessionIdentityCard, SessionManualOverrides, SessionStats, StationHealth, UsageRollupView,
 };
 
 use super::attached_discovery::{attached_management_candidates, resolve_api_v1_surface};

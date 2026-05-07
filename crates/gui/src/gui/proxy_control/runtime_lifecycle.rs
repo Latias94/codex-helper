@@ -298,6 +298,7 @@ impl ProxyController {
             session_stats: HashMap::new(),
             stations,
             station_health: HashMap::new(),
+            provider_balances: HashMap::new(),
             health_checks: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),

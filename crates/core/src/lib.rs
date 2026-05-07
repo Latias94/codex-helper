@@ -1,3 +1,4 @@
+pub mod balance;
 mod client_config;
 pub mod codex_integration;
 pub mod config;

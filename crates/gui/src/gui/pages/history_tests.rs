@@ -63,6 +63,7 @@ fn empty_snapshot() -> GuiRuntimeSnapshot {
         session_stats: HashMap::new(),
         stations: Vec::<StationOption>::new(),
         usage_rollup: UsageRollupView::default(),
+        provider_balances: HashMap::new(),
         stats_5m: WindowStats::default(),
         stats_1h: WindowStats::default(),
         operator_runtime_summary: None,

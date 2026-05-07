@@ -10,6 +10,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
+pub use crate::balance::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
 use crate::config::ServiceConfigManager;
 use crate::lb::LbState;
 #[cfg(test)]
@@ -43,6 +44,7 @@ use self::session_identity::{
 
 type PassiveStationHealthMap =
     HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>;
+type ProviderBalanceMap = HashMap<String, HashMap<String, HashMap<usize, ProviderBalanceSnapshot>>>;
 
 pub struct PassiveUpstreamFailureRecord {
     pub service_name: String,
@@ -64,6 +66,13 @@ fn recent_finished_max() -> usize {
             .unwrap_or(2_000)
             .clamp(200, 20_000)
     })
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Runtime-only state for the proxy process.
@@ -94,6 +103,7 @@ pub struct ProxyState {
     usage_rollups: RwLock<HashMap<String, UsageRollup>>,
     station_health: RwLock<HashMap<String, HashMap<String, StationHealth>>>,
     passive_station_health: RwLock<PassiveStationHealthMap>,
+    provider_balances: RwLock<ProviderBalanceMap>,
     station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
     lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
 }
@@ -169,6 +179,7 @@ impl ProxyState {
             usage_rollups: RwLock::new(HashMap::new()),
             station_health: RwLock::new(HashMap::new()),
             passive_station_health: RwLock::new(HashMap::new()),
+            provider_balances: RwLock::new(HashMap::new()),
             station_health_checks: RwLock::new(HashMap::new()),
             lb_states,
         })
@@ -751,6 +762,54 @@ impl ProxyState {
             guard.get(service_name).cloned().unwrap_or_default()
         };
         merge_station_health(active, passive)
+    }
+
+    pub async fn record_provider_balance_snapshot(
+        &self,
+        service_name: &str,
+        mut snapshot: ProviderBalanceSnapshot,
+    ) {
+        let (Some(station_name), Some(upstream_index)) =
+            (snapshot.station_name.clone(), snapshot.upstream_index)
+        else {
+            return;
+        };
+        snapshot.refresh_status(unix_now_ms());
+
+        let mut guard = self.provider_balances.write().await;
+        guard
+            .entry(service_name.to_string())
+            .or_default()
+            .entry(station_name)
+            .or_default()
+            .insert(upstream_index, snapshot);
+    }
+
+    pub async fn get_provider_balance_view(
+        &self,
+        service_name: &str,
+    ) -> HashMap<String, Vec<ProviderBalanceSnapshot>> {
+        let now_ms = unix_now_ms();
+        let guard = self.provider_balances.read().await;
+        let Some(per_service) = guard.get(service_name) else {
+            return HashMap::new();
+        };
+
+        per_service
+            .iter()
+            .map(|(station_name, upstreams)| {
+                let mut snapshots = upstreams.values().cloned().collect::<Vec<_>>();
+                for snapshot in &mut snapshots {
+                    snapshot.refresh_status(now_ms);
+                }
+                snapshots.sort_by(|a, b| {
+                    a.upstream_index
+                        .cmp(&b.upstream_index)
+                        .then_with(|| a.provider_id.cmp(&b.provider_id))
+                });
+                (station_name.clone(), snapshots)
+            })
+            .collect()
     }
 
     pub async fn record_passive_upstream_success(
@@ -2395,6 +2454,43 @@ mod tests {
                     .get("sid-2")
                     .is_some_and(|overrides| overrides.reasoning_effort.is_none())
             );
+        });
+    }
+
+    #[test]
+    fn provider_balance_snapshots_are_recorded_and_refreshed() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            state
+                .record_provider_balance_snapshot(
+                    "codex",
+                    ProviderBalanceSnapshot {
+                        provider_id: "packycode".to_string(),
+                        station_name: Some("right".to_string()),
+                        upstream_index: Some(2),
+                        source: "usage_provider:budget_http_json".to_string(),
+                        fetched_at_ms: 10,
+                        stale_after_ms: Some(0),
+                        stale: false,
+                        status: BalanceSnapshotStatus::Unknown,
+                        exhausted: Some(false),
+                        total_balance_usd: Some("3.5".to_string()),
+                        subscription_balance_usd: None,
+                        paygo_balance_usd: None,
+                        monthly_budget_usd: Some("5".to_string()),
+                        monthly_spent_usd: Some("1.5".to_string()),
+                        error: None,
+                    },
+                )
+                .await;
+
+            let view = state.get_provider_balance_view("codex").await;
+            let balances = view.get("right").expect("station balance");
+            assert_eq!(balances.len(), 1);
+            assert_eq!(balances[0].provider_id, "packycode");
+            assert_eq!(balances[0].status, BalanceSnapshotStatus::Stale);
+            assert_eq!(balances[0].exhausted, Some(false));
         });
     }
 

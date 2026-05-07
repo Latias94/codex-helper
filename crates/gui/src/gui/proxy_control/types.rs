@@ -20,8 +20,8 @@ use crate::dashboard_core::{
 use crate::logging::ControlTraceLogEntry;
 use crate::proxy::{local_admin_base_url_for_proxy_port, local_proxy_base_url};
 use crate::state::{
-    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
-    SessionIdentityCard, SessionStats, StationHealth, UsageRollupView,
+    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
+    ProxyState, SessionIdentityCard, SessionStats, StationHealth, UsageRollupView,
 };
 
 use super::attached_discovery::DiscoveredProxy;
@@ -87,6 +87,7 @@ pub struct AttachedStatus {
     pub session_stats: HashMap<String, SessionStats>,
     pub stations: Vec<StationOption>,
     pub station_health: HashMap<String, StationHealth>,
+    pub provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,
@@ -146,6 +147,7 @@ impl AttachedStatus {
             session_stats: HashMap::new(),
             stations: Vec::new(),
             station_health: HashMap::new(),
+            provider_balances: HashMap::new(),
             health_checks: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
             stats_5m: WindowStats::default(),
@@ -204,6 +206,7 @@ pub struct GuiRuntimeSnapshot {
     pub session_stats: HashMap<String, SessionStats>,
     pub stations: Vec<StationOption>,
     pub usage_rollup: UsageRollupView,
+    pub provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
     pub operator_runtime_summary: Option<OperatorRuntimeSummary>,
@@ -249,6 +252,7 @@ pub struct RunningProxy {
     pub session_stats: HashMap<String, SessionStats>,
     pub stations: Vec<StationOption>,
     pub station_health: HashMap<String, StationHealth>,
+    pub provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
     pub usage_rollup: UsageRollupView,
     pub stats_5m: WindowStats,

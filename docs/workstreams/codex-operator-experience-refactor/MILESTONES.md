@@ -187,6 +187,12 @@ Acceptance:
 - Route eligibility can skip exhausted upstreams without poisoning health.
 - Provider balance fetch failures are visible but not treated as transport failures.
 
+Current implementation slice:
+
+- Added a core balance snapshot DTO with `ok`, `exhausted`, `stale`, `error`, and `unknown` states.
+- Projected provider balance snapshots through the dashboard API, local GUI runtime state, attach refresh, and TUI snapshot.
+- Converted PackyCode budget and YesCode profile polling into balance snapshots while keeping quota exhaustion as an LB eligibility flag, not a health failure.
+
 ### P1.3 GUI Request Observatory
 
 Scope:

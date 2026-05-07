@@ -397,12 +397,16 @@ pub(super) async fn build_sse_success_response(
         tokio::spawn({
             let cfg = cfg_snapshot;
             let lb_states = proxy.lb_states.clone();
+            let state = proxy.state.clone();
+            let service_name = proxy.service_name.to_string();
             let station_name = selected.station_name.clone();
             let upstream_index = selected.index;
             async move {
                 usage_providers::poll_for_codex_upstream(
                     cfg,
                     lb_states,
+                    state,
+                    service_name.as_str(),
                     &station_name,
                     upstream_index,
                 )

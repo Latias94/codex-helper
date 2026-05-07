@@ -3,7 +3,7 @@ use super::stations_detail_controls::{
     render_station_runtime_control_section,
 };
 use super::stations_detail_health::{
-    render_station_breaker_section, render_station_health_section,
+    render_station_balance_section, render_station_breaker_section, render_station_health_section,
 };
 use super::stations_detail_provider_routes::render_station_provider_routes_section;
 use super::stations_detail_recent_hits::render_station_recent_hits_section;
@@ -78,6 +78,10 @@ fn render_station_detail_panel(
 
     let health = runtime_maps.station_health.get(cfg.name.as_str());
     let health_status = runtime_maps.health_checks.get(cfg.name.as_str());
+    let balances = runtime_maps
+        .provider_balances
+        .get(cfg.name.as_str())
+        .map(Vec::as_slice);
     let lb = runtime_maps.lb_view.get(cfg.name.as_str());
     let referencing_profiles = snapshot
         .profiles
@@ -125,6 +129,10 @@ fn render_station_detail_panel(
     ui.add_space(8.0);
     ui.separator();
     render_station_health_section(ui, ctx, &cfg, health, health_status);
+
+    ui.add_space(8.0);
+    ui.separator();
+    render_station_balance_section(ui, ctx, &cfg, balances);
 
     ui.add_space(8.0);
     ui.separator();

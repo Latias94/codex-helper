@@ -62,8 +62,26 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             }
             let alias = cfg.alias.as_deref().unwrap_or("");
             let capability = format_runtime_config_capability_label(ctx.lang, &cfg.capabilities);
+            let balance = snapshot
+                .provider_balances
+                .get(cfg.name.as_str())
+                .map(|balances| {
+                    balances
+                        .iter()
+                        .map(|balance| {
+                            format!(
+                                "{} {:?} {}",
+                                balance.provider_id,
+                                balance.status,
+                                balance.error.as_deref().unwrap_or("")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
             let haystack = format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
                 cfg.name.to_ascii_lowercase(),
                 alias.to_ascii_lowercase(),
                 format_runtime_station_health_status(
@@ -72,6 +90,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                 )
                 .to_ascii_lowercase(),
                 capability.to_ascii_lowercase(),
+                balance.to_ascii_lowercase(),
             );
             haystack.contains(search_query.as_str())
         })

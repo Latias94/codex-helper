@@ -6,8 +6,8 @@ use crate::dashboard_core::WindowStats;
 use crate::dashboard_core::types::{ControlProfileOption, StationOption};
 use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::state::{
-    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProxyState,
-    SessionIdentityCard, SessionIdentityCardBuildInputs, SessionStats, StationHealth,
+    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
+    ProxyState, SessionIdentityCard, SessionIdentityCardBuildInputs, SessionStats, StationHealth,
     UsageRollupView, build_session_identity_cards_from_parts,
     enrich_session_identity_cards_with_host_transcripts,
 };
@@ -32,6 +32,8 @@ pub struct DashboardSnapshot {
     pub session_stats: HashMap<String, SessionStats>,
     #[serde(default)]
     pub station_health: HashMap<String, StationHealth>,
+    #[serde(default)]
+    pub provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
     pub health_checks: HashMap<String, HealthCheckStatus>,
     pub lb_view: HashMap<String, LbConfigView>,
     pub usage_rollup: UsageRollupView,
@@ -96,6 +98,7 @@ pub async fn build_dashboard_snapshot(
         session_stats,
         usage_rollup,
         station_health,
+        provider_balances,
         health_checks,
         lb_view,
     ) = tokio::join!(
@@ -110,6 +113,7 @@ pub async fn build_dashboard_snapshot(
         state.list_session_stats(),
         state.get_usage_rollup_view(service_name, 12, stats_days),
         state.get_station_health(service_name),
+        state.get_provider_balance_view(service_name),
         state.list_health_checks(service_name),
         state.get_lb_view(),
     );
@@ -146,6 +150,7 @@ pub async fn build_dashboard_snapshot(
         session_service_tier_overrides: session_service_tier,
         session_stats,
         station_health,
+        provider_balances,
         health_checks,
         lb_view,
         usage_rollup,

@@ -23,6 +23,7 @@ pub(super) fn apply_refresh_result(att: &mut AttachedStatus, result: RefreshResu
     att.session_stats = result.session_stats;
     att.stations = result.stations;
     att.station_health = result.station_health;
+    att.provider_balances = result.provider_balances;
     att.health_checks = result.health_checks;
     att.usage_rollup = result.usage_rollup;
     att.stats_5m = result.stats_5m;

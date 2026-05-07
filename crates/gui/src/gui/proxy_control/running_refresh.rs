@@ -157,6 +157,7 @@ impl ProxyController {
                 r.session_service_tier_overrides = snap.session_service_tier_overrides;
                 r.session_stats = snap.session_stats;
                 r.station_health = station_health;
+                r.provider_balances = snap.provider_balances;
                 r.health_checks = snap.health_checks;
                 r.usage_rollup = snap.usage_rollup;
                 r.stats_5m = snap.stats_5m;

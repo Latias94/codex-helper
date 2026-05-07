@@ -130,6 +130,75 @@ pub(super) fn render_station_health_section(
     }
 }
 
+pub(super) fn render_station_balance_section(
+    ui: &mut egui::Ui,
+    ctx: &mut PageCtx<'_>,
+    cfg: &StationOption,
+    balances: Option<&[ProviderBalanceSnapshot]>,
+) {
+    ui.label(pick(ctx.lang, "余额 / 额度", "Balance / quota"));
+    if let Some(balances) = balances {
+        if balances.is_empty() {
+            ui.label(pick(ctx.lang, "(无余额数据)", "(no balance data)"));
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt(("stations_balance_scroll", cfg.name.as_str()))
+            .max_height(150.0)
+            .show(ui, |ui| {
+                for snapshot in balances.iter().rev().take(12) {
+                    let status = match snapshot.status {
+                        BalanceSnapshotStatus::Unknown => "unknown",
+                        BalanceSnapshotStatus::Ok => "ok",
+                        BalanceSnapshotStatus::Exhausted => "exhausted",
+                        BalanceSnapshotStatus::Stale => "stale",
+                        BalanceSnapshotStatus::Error => "error",
+                    };
+                    let mut parts = vec![status.to_string()];
+                    if let Some(total) = snapshot.total_balance_usd.as_deref() {
+                        parts.push(format!("total=${total}"));
+                    }
+                    if let Some(budget) = snapshot.monthly_budget_usd.as_deref() {
+                        parts.push(format!("budget=${budget}"));
+                    }
+                    if let Some(spent) = snapshot.monthly_spent_usd.as_deref() {
+                        parts.push(format!("spent=${spent}"));
+                    }
+                    if let Some(sub) = snapshot.subscription_balance_usd.as_deref() {
+                        parts.push(format!("sub=${sub}"));
+                    }
+                    if let Some(paygo) = snapshot.paygo_balance_usd.as_deref() {
+                        parts.push(format!("paygo=${paygo}"));
+                    }
+                    if snapshot.stale {
+                        parts.push("stale".to_string());
+                    }
+                    if let Some(err) = snapshot.error.as_deref()
+                        && !err.trim().is_empty()
+                    {
+                        parts.push(shorten(err, 50));
+                    }
+
+                    ui.label(format!(
+                        "{}  {}  {}",
+                        shorten_middle(&snapshot.provider_id, 18),
+                        snapshot
+                            .upstream_index
+                            .map(|idx| format!("#{}", idx))
+                            .unwrap_or_else(|| "-".to_string()),
+                        parts.join(" | ")
+                    ));
+                }
+                if balances.len() > 12 {
+                    ui.label(format!("… +{} more", balances.len() - 12));
+                }
+            });
+    } else {
+        ui.label(pick(ctx.lang, "(无余额数据)", "(no balance data)"));
+    }
+}
+
 pub(super) fn render_station_breaker_section(
     ui: &mut egui::Ui,
     ctx: &mut PageCtx<'_>,
