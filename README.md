@@ -472,8 +472,11 @@ codex-helper config set-level openai 2
 
   ```bash
   codex-helper usage summary
+  codex-helper usage tail --limit 20
   codex-helper usage tail --limit 20 --raw
   ```
+
+  普通文本输出会展示 station/provider/model、service_tier/fast、input/output/cache/reasoning token、耗时、TTFB、输出速度和可估算成本；`--raw` 仍输出原始 JSONL。
 
 - 状态与诊断：
 

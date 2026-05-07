@@ -232,6 +232,7 @@ Scope:
   - service tier / fast
   - route chain
   - raw sanitized trace
+- Keep `codex-helper usage tail` as a compact CLI request observer over JSONL.
 
 Primary files:
 
@@ -244,6 +245,11 @@ Acceptance:
 - A user can inspect one request and understand what happened without reading logs.
 - Route chain shows skipped/failed/final providers.
 - Cost and cache fields are visible when known and gracefully absent when unknown.
+
+Current implementation slice:
+
+- CLI `usage tail` now shows station/provider/model, service tier/fast, duration, TTFB, output speed, cache-aware token parts, and cost estimates when model/usage are available.
+- CLI `usage summary` now includes cache read/create and reasoning token totals by station instead of only input/output/total tokens.
 
 ### P1.4 TUI Parity Pass
 

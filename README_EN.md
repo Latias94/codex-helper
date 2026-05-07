@@ -500,8 +500,11 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
 
   ```bash
   codex-helper usage summary
+  codex-helper usage tail --limit 20
   codex-helper usage tail --limit 20 --raw
   ```
+
+  Text output shows station/provider/model, service_tier/fast, input/output/cache/reasoning tokens, duration, TTFB, output speed, and estimated cost when possible; `--raw` still prints the original JSONL.
 
 - Status & doctor:
 
