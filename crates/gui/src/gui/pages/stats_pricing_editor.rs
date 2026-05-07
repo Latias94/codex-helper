@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use crate::pricing::{CostConfidence, LocalModelPriceOverride, LocalModelPriceOverridesDocument};
+use crate::pricing::{
+    CostConfidence, LocalModelPriceOverride, LocalModelPriceOverridesDocument,
+    ModelPriceCatalogSnapshot,
+};
 
 use super::view_state::StatsPricingEditorState;
 use super::*;
@@ -46,12 +49,81 @@ pub(super) fn render_local_pricing_overrides(
         }
     };
 
+    render_observed_unpriced_models(ui, ctx, snapshot);
     render_local_pricing_override_rows(ui, ctx, &document);
     render_local_pricing_override_form(ui, ctx, &document);
 }
 
 fn load_local_pricing_overrides_document() -> Result<LocalModelPriceOverridesDocument, String> {
     crate::pricing::load_model_price_overrides_document().and_then(|document| document.normalized())
+}
+
+fn render_observed_unpriced_models(
+    ui: &mut egui::Ui,
+    ctx: &mut PageCtx<'_>,
+    snapshot: &GuiRuntimeSnapshot,
+) {
+    let models = observed_unpriced_models(snapshot, 12);
+    if models.is_empty() {
+        return;
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.small(pick(ctx.lang, "最近观测到但未定价：", "Observed unpriced:"));
+        for model in models {
+            if ui.button(shorten(&model, 28)).clicked() {
+                start_pricing_editor_for_model(&mut ctx.view.stats.pricing_editor, &model);
+            }
+        }
+    });
+}
+
+fn observed_unpriced_models(snapshot: &GuiRuntimeSnapshot, limit: usize) -> Vec<String> {
+    observed_unpriced_models_from_candidates(
+        snapshot
+            .recent
+            .iter()
+            .filter_map(|request| request.model.as_deref())
+            .chain(snapshot.session_cards.iter().filter_map(|card| {
+                card.effective_model
+                    .as_ref()
+                    .map(|value| value.value.as_str())
+                    .or(card.last_model.as_deref())
+            })),
+        &snapshot.pricing_catalog,
+        limit,
+    )
+}
+
+fn observed_unpriced_models_from_candidates<I, S>(
+    observed_models: I,
+    catalog: &ModelPriceCatalogSnapshot,
+    limit: usize,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for model in observed_models {
+        let model = model.as_ref().trim();
+        if model.is_empty() {
+            continue;
+        }
+        let key = model.to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        if catalog.models.iter().any(|row| row.matches_model(model)) {
+            continue;
+        }
+        out.push(model.to_string());
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
 }
 
 fn render_local_pricing_override_rows(
@@ -472,6 +544,11 @@ fn clear_pricing_editor(editor: &mut StatsPricingEditorState) {
     *editor = StatsPricingEditorState::default();
 }
 
+fn start_pricing_editor_for_model(editor: &mut StatsPricingEditorState, model_id: &str) {
+    clear_pricing_editor(editor);
+    editor.draft_model_id = model_id.trim().to_string();
+}
+
 fn build_pricing_override_from_editor(
     editor: &StatsPricingEditorState,
 ) -> Result<(String, LocalModelPriceOverride), String> {
@@ -581,5 +658,24 @@ mod tests {
         assert_eq!(editor.cache_read_input_per_1m_usd, "0.1");
         assert_eq!(editor.cache_creation_input_per_1m_usd, "");
         assert_eq!(editor.confidence, CostConfidence::Estimated);
+    }
+
+    #[test]
+    fn observed_unpriced_models_filters_catalog_matches_and_duplicates() {
+        let catalog = crate::pricing::bundled_model_price_catalog_snapshot();
+
+        let models = observed_unpriced_models_from_candidates(
+            [
+                "gpt-5.4-high",
+                "relay-gpt-5",
+                "RELAY-GPT-5",
+                "",
+                "relay-codex",
+            ],
+            &catalog,
+            8,
+        );
+
+        assert_eq!(models, vec!["relay-gpt-5", "relay-codex"]);
     }
 }
