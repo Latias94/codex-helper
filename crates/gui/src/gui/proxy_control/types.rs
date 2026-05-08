@@ -118,6 +118,7 @@ pub struct AttachedStatus {
     pub supports_session_override_reset: bool,
     pub supports_control_trace_api: bool,
     pub supports_request_ledger_api: bool,
+    pub supports_request_ledger_summary_api: bool,
     pub supports_station_api: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
@@ -181,6 +182,7 @@ impl AttachedStatus {
             supports_session_override_reset: false,
             supports_control_trace_api: false,
             supports_request_ledger_api: false,
+            supports_request_ledger_summary_api: false,
             supports_station_api: false,
             shared_capabilities: SharedControlPlaneCapabilities::default(),
             host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
@@ -359,6 +361,12 @@ impl RequestLedgerDataSource {
 pub struct RequestLedgerReadResult {
     pub source: RequestLedgerDataSource,
     pub records: Vec<FinishedRequest>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestLedgerSummaryReadResult {
+    pub source: RequestLedgerDataSource,
+    pub rows: Vec<crate::request_ledger::RequestUsageSummaryRow>,
 }
 
 pub(super) struct PortInUseModal {

@@ -9,6 +9,7 @@ pub(super) fn status_and_runtime_routes(proxy: ProxyService) -> Router {
     let runtime_status_proxy = proxy.clone();
     let runtime_reload_proxy = proxy.clone();
     let request_ledger_proxy = proxy.clone();
+    let request_ledger_summary_proxy = proxy.clone();
     let control_trace_proxy = proxy.clone();
     let retry_get_proxy = proxy.clone();
     let pricing_proxy = proxy.clone();
@@ -45,6 +46,12 @@ pub(super) fn status_and_runtime_routes(proxy: ProxyService) -> Router {
         .route(
             API_V1_REQUEST_LEDGER_RECENT,
             get(move |query| get_request_ledger_recent(request_ledger_proxy.clone(), query)),
+        )
+        .route(
+            API_V1_REQUEST_LEDGER_SUMMARY,
+            get(move |query| {
+                get_request_ledger_summary(request_ledger_summary_proxy.clone(), query)
+            }),
         )
         .route(
             API_V1_CONTROL_TRACE,

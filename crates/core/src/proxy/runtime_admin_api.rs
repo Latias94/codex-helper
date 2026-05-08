@@ -43,6 +43,35 @@ impl RequestLedgerRecentQuery {
     }
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct RequestLedgerSummaryQuery {
+    limit: Option<usize>,
+    by: Option<String>,
+    session: Option<String>,
+    model: Option<String>,
+    station: Option<String>,
+    provider: Option<String>,
+    status_min: Option<u64>,
+    status_max: Option<u64>,
+    fast: Option<bool>,
+    retried: Option<bool>,
+}
+
+impl RequestLedgerSummaryQuery {
+    fn filters(&self) -> crate::request_ledger::RequestLogFilters {
+        crate::request_ledger::RequestLogFilters {
+            session: clean_filter(self.session.clone()),
+            model: clean_filter(self.model.clone()),
+            station: clean_filter(self.station.clone()),
+            provider: clean_filter(self.provider.clone()),
+            status_min: self.status_min,
+            status_max: self.status_max,
+            fast: self.fast.unwrap_or(false),
+            retried: self.retried.unwrap_or(false),
+        }
+    }
+}
+
 fn clean_filter(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -81,6 +110,31 @@ pub(super) async fn get_request_ledger_recent(
         crate::request_ledger::find_finished_requests_from_log(&path, &filters, limit)
     };
     records
+        .map(Json)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+pub(super) async fn get_request_ledger_summary(
+    _proxy: ProxyService,
+    Query(q): Query<RequestLedgerSummaryQuery>,
+) -> Result<Json<Vec<crate::request_ledger::RequestUsageSummaryRow>>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(30).clamp(1, 100);
+    let group = match q
+        .by
+        .as_deref()
+        .unwrap_or("station")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "provider" => crate::request_ledger::RequestUsageSummaryGroup::Provider,
+        "model" => crate::request_ledger::RequestUsageSummaryGroup::Model,
+        "session" => crate::request_ledger::RequestUsageSummaryGroup::Session,
+        _ => crate::request_ledger::RequestUsageSummaryGroup::Station,
+    };
+    let filters = q.filters();
+    let path = crate::request_ledger::request_log_path();
+    crate::request_ledger::summarize_request_log(&path, group, &filters, limit)
         .map(Json)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }

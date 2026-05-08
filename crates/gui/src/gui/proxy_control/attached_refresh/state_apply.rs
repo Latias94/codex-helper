@@ -53,6 +53,7 @@ pub(super) fn apply_refresh_result(att: &mut AttachedStatus, result: RefreshResu
     att.supports_session_override_reset = result.supports_session_override_reset;
     att.supports_control_trace_api = result.supports_control_trace_api;
     att.supports_request_ledger_api = result.supports_request_ledger_api;
+    att.supports_request_ledger_summary_api = result.supports_request_ledger_summary_api;
     att.supports_station_api = result.supports_station_api;
     att.shared_capabilities = result.shared_capabilities;
     att.host_local_capabilities = result.host_local_capabilities;

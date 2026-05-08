@@ -108,7 +108,7 @@ impl RequestLogFilters {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RequestUsageAggregate {
     pub requests: u64,
     pub duration_ms_total: u64,
@@ -168,12 +168,19 @@ impl RequestUsageAggregate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RequestUsageSummaryGroup {
     Station,
     Provider,
     Model,
     Session,
+}
+
+impl Default for RequestUsageSummaryGroup {
+    fn default() -> Self {
+        Self::Station
+    }
 }
 
 impl RequestUsageSummaryGroup {
@@ -196,7 +203,7 @@ impl RequestUsageSummaryGroup {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RequestUsageSummaryRow {
     pub group_value: String,
     pub aggregate: RequestUsageAggregate,

@@ -185,6 +185,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/request-ledger/recent"))
     }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/request-ledger/summary"))
+    }));
     assert_eq!(
         caps["surface_capabilities"]["snapshot"].as_bool(),
         Some(true)
@@ -220,6 +225,10 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     );
     assert_eq!(
         caps["surface_capabilities"]["request_ledger_recent"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["request_ledger_summary"].as_bool(),
         Some(true)
     );
     let host_local_history = crate::config::codex_sessions_dir().is_dir();
@@ -434,6 +443,30 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         Some(1)
     );
     assert_eq!(filtered_request_ledger[0]["id"].as_u64(), Some(42));
+
+    let request_summary = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/request-ledger/summary?limit=10&by=provider&station=backup&provider=fallback&model=5.4&fast=true&retried=true&status_min=400&status_max=499",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("request summary send")
+        .error_for_status()
+        .expect("request summary status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("request summary json");
+    assert_eq!(request_summary.as_array().map(|items| items.len()), Some(1));
+    assert_eq!(request_summary[0]["group_value"].as_str(), Some("fallback"));
+    assert_eq!(
+        request_summary[0]["aggregate"]["requests"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        request_summary[0]["aggregate"]["total_tokens"].as_u64(),
+        Some(150)
+    );
 
     let set_global = client
         .post(format!(

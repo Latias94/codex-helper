@@ -43,6 +43,52 @@ pub(super) struct StationsRetryEditorState {
     pub(super) cooldown_backoff_max_secs: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestLedgerSummaryFilterState {
+    pub session: String,
+    pub model: String,
+    pub station: String,
+    pub provider: String,
+    pub status_min: String,
+    pub status_max: String,
+    pub fast_only: bool,
+    pub retried_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestLedgerSummaryFilterParseError {
+    StatusMin,
+    StatusMax,
+}
+
+impl RequestLedgerSummaryFilterState {
+    pub fn to_request_log_filters(
+        &self,
+    ) -> Result<crate::request_ledger::RequestLogFilters, RequestLedgerSummaryFilterParseError>
+    {
+        Ok(crate::request_ledger::RequestLogFilters {
+            session: normalize_text_filter(&self.session),
+            model: normalize_text_filter(&self.model),
+            station: normalize_text_filter(&self.station),
+            provider: normalize_text_filter(&self.provider),
+            status_min: parse_status_bound(
+                &self.status_min,
+                RequestLedgerSummaryFilterParseError::StatusMin,
+            )?,
+            status_max: parse_status_bound(
+                &self.status_max,
+                RequestLedgerSummaryFilterParseError::StatusMax,
+            )?,
+            fast: self.fast_only,
+            retried: self.retried_only,
+        })
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct DoctorViewState {
     pub report: Option<crate::doctor::DoctorReport>,
@@ -90,6 +136,17 @@ pub struct StatsViewState {
     pub control_trace_entries: Vec<ControlTraceRecordState>,
     pub control_trace_last_loaded_ms: Option<u64>,
     pub control_trace_last_error: Option<String>,
+    pub request_ledger_summary_filters: RequestLedgerSummaryFilterState,
+    pub request_ledger_summary_group: crate::request_ledger::RequestUsageSummaryGroup,
+    pub request_ledger_summary_limit: usize,
+    pub request_ledger_summary_loaded_signature: Option<String>,
+    pub request_ledger_summary_loaded_group: crate::request_ledger::RequestUsageSummaryGroup,
+    pub request_ledger_summary_loaded_limit: usize,
+    pub request_ledger_summary_loaded_filters: crate::request_ledger::RequestLogFilters,
+    pub request_ledger_summary_source_detail: Option<String>,
+    pub request_ledger_summary_rows: Vec<crate::request_ledger::RequestUsageSummaryRow>,
+    pub request_ledger_summary_loaded_at_ms: Option<u64>,
+    pub request_ledger_summary_last_error: Option<String>,
 }
 
 impl Default for StatsViewState {
@@ -106,8 +163,41 @@ impl Default for StatsViewState {
             control_trace_entries: Vec::new(),
             control_trace_last_loaded_ms: None,
             control_trace_last_error: None,
+            request_ledger_summary_filters: RequestLedgerSummaryFilterState::default(),
+            request_ledger_summary_group: crate::request_ledger::RequestUsageSummaryGroup::Station,
+            request_ledger_summary_limit: 30,
+            request_ledger_summary_loaded_signature: None,
+            request_ledger_summary_loaded_group:
+                crate::request_ledger::RequestUsageSummaryGroup::Station,
+            request_ledger_summary_loaded_limit: 0,
+            request_ledger_summary_loaded_filters:
+                crate::request_ledger::RequestLogFilters::default(),
+            request_ledger_summary_source_detail: None,
+            request_ledger_summary_rows: Vec::new(),
+            request_ledger_summary_loaded_at_ms: None,
+            request_ledger_summary_last_error: None,
         }
     }
+}
+
+fn normalize_text_filter(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_status_bound(
+    value: &str,
+    error: RequestLedgerSummaryFilterParseError,
+) -> Result<Option<u64>, RequestLedgerSummaryFilterParseError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value.parse::<u64>().map(Some).map_err(|_| error)
 }
 
 #[derive(Debug)]

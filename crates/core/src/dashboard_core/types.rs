@@ -57,6 +57,8 @@ pub struct ControlPlaneSurfaceCapabilities {
     #[serde(default)]
     pub request_ledger_recent: bool,
     #[serde(default)]
+    pub request_ledger_summary: bool,
+    #[serde(default)]
     pub control_trace: bool,
     #[serde(default)]
     pub retry_config: bool,

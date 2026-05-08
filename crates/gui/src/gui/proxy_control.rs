@@ -8,7 +8,10 @@ use crate::dashboard_core::{
 };
 use crate::logging::{ControlTraceLogEntry, control_trace_path, read_recent_control_trace_entries};
 use crate::proxy::local_proxy_base_url;
-use crate::request_ledger::{request_log_path, tail_finished_requests_from_log};
+use crate::request_ledger::{
+    RequestLogFilters, RequestUsageSummaryGroup, request_log_path, summarize_request_log,
+    tail_finished_requests_from_log,
+};
 use anyhow::bail;
 use reqwest::Client;
 
@@ -29,7 +32,7 @@ use self::types::PortInUseModal;
 pub use self::types::{
     AttachedStatus, ControlTraceDataSource, ControlTraceReadResult, GuiRuntimeSnapshot,
     PortInUseAction, ProxyController, ProxyMode, ProxyModeKind, RequestLedgerDataSource,
-    RequestLedgerReadResult, RunningProxy,
+    RequestLedgerReadResult, RequestLedgerSummaryReadResult, RunningProxy,
 };
 
 fn admin_auth_token() -> Option<String> {
@@ -174,8 +177,27 @@ impl ProxyController {
         }
     }
 
+    pub fn request_ledger_summary_source(&self) -> Option<RequestLedgerDataSource> {
+        match &self.mode {
+            ProxyMode::Running(_) => Some(RequestLedgerDataSource::LocalFile {
+                path: request_log_path(),
+            }),
+            ProxyMode::Attached(att) if att.supports_request_ledger_summary_api => {
+                Some(RequestLedgerDataSource::AttachedApi {
+                    admin_base_url: att.admin_base_url.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub fn request_ledger_source_signature(&self) -> Option<String> {
         self.request_ledger_source()
+            .map(|source| source.signature())
+    }
+
+    pub fn request_ledger_summary_source_signature(&self) -> Option<String> {
+        self.request_ledger_summary_source()
             .map(|source| source.signature())
     }
 
@@ -221,6 +243,62 @@ impl ProxyController {
         };
 
         Ok(RequestLedgerReadResult { source, records })
+    }
+
+    pub fn read_request_ledger_summary(
+        &self,
+        rt: &tokio::runtime::Runtime,
+        group: RequestUsageSummaryGroup,
+        limit: usize,
+        filters: &RequestLogFilters,
+    ) -> anyhow::Result<RequestLedgerSummaryReadResult> {
+        let limit = limit.clamp(1, 100);
+        let source = self.request_ledger_summary_source().ok_or_else(|| {
+            anyhow::anyhow!("request ledger summary is unavailable for this proxy")
+        })?;
+
+        let rows = match &source {
+            RequestLedgerDataSource::LocalFile { path } => {
+                summarize_request_log(path, group, filters, limit)?
+            }
+            RequestLedgerDataSource::AttachedApi { admin_base_url } => {
+                let request_ledger_path = self
+                    .attached()
+                    .and_then(|att| att.operator_summary_links.as_ref())
+                    .map(|links| links.request_ledger_summary.as_str())
+                    .filter(|path| !path.trim().is_empty())
+                    .unwrap_or("/__codex_helper/api/v1/request-ledger/summary")
+                    .to_string();
+                let by = match group {
+                    RequestUsageSummaryGroup::Station => "station",
+                    RequestUsageSummaryGroup::Provider => "provider",
+                    RequestUsageSummaryGroup::Model => "model",
+                    RequestUsageSummaryGroup::Session => "session",
+                };
+                let client = self.http_client.clone();
+                let admin_base_url = admin_base_url.clone();
+                rt.block_on(async move {
+                    let query = request_ledger_summary_query_pairs(limit, by, filters);
+                    let mut url =
+                        reqwest::Url::parse(&format!("{admin_base_url}{request_ledger_path}"))?;
+                    {
+                        let mut pairs = url.query_pairs_mut();
+                        for (key, value) in query {
+                            pairs.append_pair(&key, &value);
+                        }
+                    }
+                    let response =
+                        send_admin_request(client.get(url).timeout(Duration::from_millis(1200)))
+                            .await?;
+                    let rows = response
+                        .json::<Vec<crate::request_ledger::RequestUsageSummaryRow>>()
+                        .await?;
+                    Ok::<Vec<crate::request_ledger::RequestUsageSummaryRow>, anyhow::Error>(rows)
+                })?
+            }
+        };
+
+        Ok(RequestLedgerSummaryReadResult { source, rows })
     }
 
     pub fn read_control_trace_entries(
@@ -418,6 +496,44 @@ impl ProxyController {
         self.last_start_error = None;
         self.port_in_use_modal = None;
     }
+}
+
+fn request_ledger_summary_query_pairs(
+    limit: usize,
+    by: &str,
+    filters: &RequestLogFilters,
+) -> Vec<(String, String)> {
+    let mut query = vec![
+        ("limit".to_string(), limit.to_string()),
+        ("by".to_string(), by.to_string()),
+    ];
+
+    if let Some(session) = filters.session.as_deref() {
+        query.push(("session".to_string(), session.to_string()));
+    }
+    if let Some(model) = filters.model.as_deref() {
+        query.push(("model".to_string(), model.to_string()));
+    }
+    if let Some(station) = filters.station.as_deref() {
+        query.push(("station".to_string(), station.to_string()));
+    }
+    if let Some(provider) = filters.provider.as_deref() {
+        query.push(("provider".to_string(), provider.to_string()));
+    }
+    if let Some(status_min) = filters.status_min {
+        query.push(("status_min".to_string(), status_min.to_string()));
+    }
+    if let Some(status_max) = filters.status_max {
+        query.push(("status_max".to_string(), status_max.to_string()));
+    }
+    if filters.fast {
+        query.push(("fast".to_string(), "true".to_string()));
+    }
+    if filters.retried {
+        query.push(("retried".to_string(), "true".to_string()));
+    }
+
+    query
 }
 
 fn local_operator_runtime_summary(r: &RunningProxy) -> OperatorRuntimeSummary {

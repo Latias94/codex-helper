@@ -177,6 +177,8 @@ pub struct OperatorSummaryLinks {
     pub status_station_health: String,
     #[serde(default)]
     pub request_ledger_recent: String,
+    #[serde(default)]
+    pub request_ledger_summary: String,
     pub control_trace: String,
     pub retry_config: String,
     #[serde(default)]

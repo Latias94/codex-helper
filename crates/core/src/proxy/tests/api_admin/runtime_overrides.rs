@@ -444,6 +444,10 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         Some(true)
     );
     assert_eq!(
+        summary["surface_capabilities"]["request_ledger_summary"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
         summary["surface_capabilities"]["station_persisted_settings"].as_bool(),
         Some(true)
     );
@@ -536,6 +540,10 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
     assert_eq!(
         summary["links"]["request_ledger_recent"].as_str(),
         Some("/__codex_helper/api/v1/request-ledger/recent")
+    );
+    assert_eq!(
+        summary["links"]["request_ledger_summary"].as_str(),
+        Some("/__codex_helper/api/v1/request-ledger/summary")
     );
     assert_eq!(
         summary["links"]["station_probe"].as_str(),

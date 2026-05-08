@@ -553,7 +553,9 @@ Current bridge:
 - `codex-helper usage tail/summary/find` now uses that core query API instead of carrying private CLI parsing logic.
 - `codex-helper usage summary --by station|provider|model|session` gives immediate long-horizon grouped usage views while the durable ledger remains undecided.
 - The v1 management plane exposes `request-ledger/recent` behind the same admin boundary as the rest of the control API, returning projected `FinishedRequest` records instead of host-local file paths and accepting the same session/model/station/provider/status/fast/retry filters as the core ledger query API.
+- The v1 management plane also exposes `request-ledger/summary` behind the same admin boundary, so attached GUI clients can read grouped station/provider/model/session usage with the same filter semantics as local JSONL replay.
 - GUI Requests can opt into the JSONL ledger while the proxy is running locally or attached to a proxy that advertises the request-ledger API, projecting log rows back into the shared `FinishedRequest` detail/list components and filtering by model, station, provider, fast mode, retry, selected session, and error status.
+- GUI Stats now has a dedicated request-ledger summary panel that mirrors the same filter surface for long-horizon grouped usage.
 - This validates the operator query surface before choosing a durable index. Future SQLite should be a rebuildable query/cache layer over canonical request records, while JSONL remains the export/debug source.
 
 ## Migration Strategy
