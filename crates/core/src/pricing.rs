@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::file_replace::write_text_file;
 use crate::usage::UsageMetrics;
 
+const BASELLM_ALL_JSON_URL: &str = "https://basellm.github.io/llm-metadata/api/all.json";
 const FEMTO_USD_PER_USD: i128 = 1_000_000_000_000_000;
 const TOKENS_PER_MILLION: i128 = 1_000_000;
 const MULTIPLIER_SCALE: i128 = 1_000_000;
@@ -54,6 +55,10 @@ impl UsdAmount {
 
     pub fn is_zero(self) -> bool {
         self.femto_usd == 0
+    }
+
+    pub fn checked_div_u64(self, divisor: u64) -> Option<Self> {
+        (divisor > 0).then(|| Self::from_femto_usd(self.femto_usd / divisor as i128))
     }
 
     pub fn saturating_add(self, other: Self) -> Self {
@@ -662,6 +667,121 @@ pub fn bundled_model_price_catalog() -> &'static ModelPriceCatalog {
 
 pub fn bundled_model_price_catalog_snapshot() -> ModelPriceCatalogSnapshot {
     bundled_model_price_catalog().snapshot("bundled")
+}
+
+pub fn basellm_all_json_url() -> &'static str {
+    BASELLM_ALL_JSON_URL
+}
+
+pub fn basellm_model_price_catalog_snapshot_from_json(
+    source: impl Into<String>,
+    text: &str,
+) -> Result<ModelPriceCatalogSnapshot, String> {
+    let root: serde_json::Value =
+        serde_json::from_str(text).map_err(|err| format!("invalid basellm JSON: {err}"))?;
+    let provider_map = root
+        .as_object()
+        .ok_or_else(|| "basellm all.json root must be an object".to_string())?;
+
+    let mut models = Vec::new();
+    for (provider_name, provider_value) in provider_map {
+        let Some(models_map) = provider_value
+            .get("models")
+            .and_then(|value| value.as_object())
+        else {
+            continue;
+        };
+
+        for (model_id, model_value) in models_map {
+            let Some(cost) = model_value.get("cost").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            let Some(input) = basellm_cost_field(cost, "input") else {
+                continue;
+            };
+            let Some(output) = basellm_cost_field(cost, "output") else {
+                continue;
+            };
+
+            let cache_read = basellm_cost_field(cost, "cache_read");
+            let cache_creation = basellm_cost_field(cost, "cache_write");
+            let display_name = model_value
+                .get("name")
+                .and_then(json_scalar_to_string)
+                .or_else(|| {
+                    model_value
+                        .get("display_name")
+                        .and_then(json_scalar_to_string)
+                })
+                .filter(|value| value != model_id);
+
+            models.push(ModelPriceView {
+                model_id: model_id.to_string(),
+                display_name,
+                aliases: basellm_aliases(model_value),
+                input_per_1m_usd: input,
+                output_per_1m_usd: output,
+                cache_read_input_per_1m_usd: cache_read,
+                cache_creation_input_per_1m_usd: cache_creation,
+                source: format!("basellm:{provider_name}"),
+                confidence: CostConfidence::Estimated,
+            });
+        }
+    }
+
+    models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    models.dedup_by(|left, right| {
+        normalize_model_key(&left.model_id) == normalize_model_key(&right.model_id)
+    });
+    Ok(ModelPriceCatalogSnapshot {
+        source: source.into(),
+        model_count: models.len(),
+        models,
+    })
+}
+
+fn basellm_cost_field(
+    cost: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    cost.get(key).and_then(json_scalar_to_string)
+}
+
+fn basellm_aliases(model_value: &serde_json::Value) -> Vec<String> {
+    let mut aliases = Vec::new();
+    if let Some(value) = model_value.get("aliases") {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let Some(alias) = json_scalar_to_string(item) {
+                        let alias = alias.trim();
+                        if !alias.is_empty() {
+                            aliases.push(alias.to_string());
+                        }
+                    }
+                }
+            }
+            serde_json::Value::String(alias) => {
+                let alias = alias.trim();
+                if !alias.is_empty() {
+                    aliases.push(alias.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    aliases
+}
+
+fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        _ => None,
+    }
 }
 
 pub fn model_price_overrides_path() -> PathBuf {
@@ -1316,5 +1436,52 @@ aliases = ["CUSTOM"]
         assert_eq!(summary.confidence, CostConfidence::Partial);
         assert_eq!(summary.priced_requests, 1);
         assert_eq!(summary.unpriced_requests, 1);
+    }
+
+    #[test]
+    fn basellm_snapshot_imports_per_million_cost_rows() {
+        let text = r#"
+{
+  "openai": {
+    "models": {
+      "gpt-test": {
+        "name": "GPT Test",
+        "aliases": ["relay-gpt-test"],
+        "cost": {
+          "input": "1.5",
+          "output": 6,
+          "cache_read": "0.15",
+          "cache_write": "0"
+        }
+      }
+    }
+  },
+  "unknown-provider": {
+    "models": {
+      "ignored": {
+        "cost": { "input": 1, "output": 2 }
+      }
+    }
+  }
+}
+"#;
+
+        let snapshot =
+            basellm_model_price_catalog_snapshot_from_json("basellm-test", text).expect("snapshot");
+
+        assert_eq!(snapshot.source, "basellm-test");
+        assert_eq!(snapshot.model_count, 2);
+        let row = snapshot
+            .models
+            .iter()
+            .find(|row| row.model_id == "gpt-test")
+            .expect("gpt-test row");
+        assert_eq!(row.display_name.as_deref(), Some("GPT Test"));
+        assert_eq!(row.aliases, vec!["relay-gpt-test"]);
+        assert_eq!(row.input_per_1m_usd, "1.5");
+        assert_eq!(row.output_per_1m_usd, "6");
+        assert_eq!(row.cache_read_input_per_1m_usd.as_deref(), Some("0.15"));
+        assert_eq!(row.cache_creation_input_per_1m_usd.as_deref(), Some("0"));
+        assert_eq!(row.source, "basellm:openai");
     }
 }

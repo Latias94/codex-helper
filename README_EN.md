@@ -688,10 +688,14 @@ codex-helper pricing list --local --model gpt-5
 codex-helper pricing set custom-codex --input-per-1m-usd 0.50 --output-per-1m-usd 1.50 --confidence estimated
 codex-helper pricing sync http://127.0.0.1:4322/__codex_helper/api/v1/pricing/catalog --model relay-gpt5 --dry-run
 codex-helper pricing sync http://127.0.0.1:4322/__codex_helper/api/v1/pricing/catalog --model relay-gpt5
+codex-helper pricing sync-basellm --model gpt-5 --dry-run
+codex-helper pricing sync-basellm --model gpt-5
 codex-helper pricing remove custom-codex
 ```
 
 `pricing sync` pulls `ModelPriceCatalogSnapshot` JSON, the same shape exposed by this project's admin API. It merges matching rows into local overrides by default; add `--replace` to rewrite the local override file from the matched remote rows.
+
+`pricing sync-basellm` pulls `https://basellm.github.io/llm-metadata/api/all.json` and converts its per-million model prices into this project's local override format. Use it to refresh bundled seed prices with an external catalog source while keeping local overrides on top.
 
 ### `usage_providers.json`
 
@@ -707,6 +711,27 @@ Path: `~/.codex-helper/usage_providers.json`. If it does not exist, codex-helper
       "endpoint": "https://www.packycode.com/api/backend/users/info",
       "token_env": null,
       "poll_interval_secs": 60
+    },
+    {
+      "id": "my-sub2api",
+      "kind": "openai_balance_http_json",
+      "domains": ["relay.example.com"],
+      "endpoint": "{{base_url}}/user/balance",
+      "poll_interval_secs": 60
+    },
+    {
+      "id": "my-new-api",
+      "kind": "new_api_user_self",
+      "domains": ["newapi.example.com"],
+      "endpoint": "{{base_url}}/api/user/self",
+      "token_env": "NEW_API_ACCESS_TOKEN",
+      "headers": {
+        "New-Api-User": "{{userId}}"
+      },
+      "variables": {
+        "userId": "{{env:NEW_API_USER_ID}}"
+      },
+      "poll_interval_secs": 60
     }
   ]
 }
@@ -718,6 +743,15 @@ For `budget_http_json`:
 - if the upstream uses `auth_token_env`, the token is read from that environment variable at runtime;
 - the response is inspected for fields like `monthly_budget_usd` / `monthly_spent_usd` to decide if the quota is exhausted;
 - associated upstreams are then marked `usage_exhausted = true` in LB state; when possible, LB avoids these upstreams.
+
+For the new generic adapters:
+
+- `endpoint` supports `{{base_url}}`, `{{upstream_base_url}}`, `{{token}}` / `{{apiKey}}` / `{{accessToken}}`, `{{env:NAME}}`, and `variables` templates; `{{base_url}}` is normalized to drop a trailing `/v1` when present;
+- `openai_balance_http_json` covers the cc-switch style generic template / common sub2api relays: it defaults to `{{base_url}}/user/balance` and reads fields such as `balance`, `remaining`, `credit`, `subscription_balance`, and `pay_as_you_go_balance`;
+- `new_api_user_self` covers New API style relays: it defaults to `{{base_url}}/api/user/self` and parses `data.quota` / `data.used_quota`, converting the quota units to USD with the cc-switch-style `500000` divisor by default;
+- custom/self-hosted providers can extend the parser with `extract.remaining_balance_paths`, `extract.monthly_spent_paths`, `extract.monthly_budget_paths`, `extract.exhausted_paths`, and divisor fields without touching Rust code;
+- after a request finishes, codex-helper polls `endpoint` on demand and stores `ok` / `exhausted` / `stale` / `error` / `unknown` balance snapshots;
+- matching upstreams are then marked `usage_exhausted = true` in LB state; when possible, LB avoids these upstreams.
 
 ### Filtering & logging
 

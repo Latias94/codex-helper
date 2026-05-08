@@ -88,39 +88,18 @@ pub async fn handle_pricing_cmd(cmd: PricingCommand) -> CliResult<()> {
             dry_run,
         } => {
             let snapshot = fetch_remote_pricing_catalog(&url).await?;
-            let base_document = if replace {
-                LocalModelPriceOverridesDocument::default()
-            } else {
-                pricing::load_model_price_overrides_document()
-                    .and_then(|document| document.normalized())
-                    .map_err(CliError::Pricing)?
-            };
-            let (document, imported) =
-                merge_snapshot_into_overrides(base_document, &snapshot, &models)?;
-
-            if imported == 0 {
-                println!(
-                    "No pricing rows matched the requested filters from {}.",
-                    snapshot.source
-                );
-                return Ok(());
-            }
-
-            if dry_run {
-                println!(
-                    "Would import {} pricing row(s) from {} into {:?}.",
-                    imported,
-                    snapshot.source,
-                    pricing::model_price_overrides_path()
-                );
-            } else {
-                let path = pricing::save_model_price_overrides_document(&document)
-                    .map_err(CliError::Pricing)?;
-                println!(
-                    "Imported {} pricing row(s) from {} into {:?}.",
-                    imported, snapshot.source, path
-                );
-            }
+            import_snapshot(snapshot, models, replace, dry_run)?;
+        }
+        PricingCommand::SyncBasellm {
+            url,
+            models,
+            replace,
+            dry_run,
+        } => {
+            let text = fetch_remote_pricing_text(&url).await?;
+            let snapshot = pricing::basellm_model_price_catalog_snapshot_from_json(&url, &text)
+                .map_err(CliError::Pricing)?;
+            import_snapshot(snapshot, models, replace, dry_run)?;
         }
     }
 
@@ -128,6 +107,12 @@ pub async fn handle_pricing_cmd(cmd: PricingCommand) -> CliResult<()> {
 }
 
 async fn fetch_remote_pricing_catalog(url: &str) -> Result<ModelPriceCatalogSnapshot, CliError> {
+    let text = fetch_remote_pricing_text(url).await?;
+    serde_json::from_str(&text)
+        .map_err(|err| CliError::Pricing(format!("invalid pricing catalog JSON: {err}")))
+}
+
+async fn fetch_remote_pricing_text(url: &str) -> Result<String, CliError> {
     let url = reqwest::Url::parse(url)
         .map_err(|err| CliError::Pricing(format!("invalid pricing sync URL: {err}")))?;
     match url.scheme() {
@@ -154,9 +139,48 @@ async fn fetch_remote_pricing_catalog(url: &str) -> Result<ModelPriceCatalogSnap
         .text()
         .await
         .map_err(|err| CliError::Pricing(format!("failed to read pricing sync response: {err}")))?;
+    Ok(text)
+}
 
-    serde_json::from_str(&text)
-        .map_err(|err| CliError::Pricing(format!("invalid pricing catalog JSON: {err}")))
+fn import_snapshot(
+    snapshot: ModelPriceCatalogSnapshot,
+    models: Vec<String>,
+    replace: bool,
+    dry_run: bool,
+) -> CliResult<()> {
+    let base_document = if replace {
+        LocalModelPriceOverridesDocument::default()
+    } else {
+        pricing::load_model_price_overrides_document()
+            .and_then(|document| document.normalized())
+            .map_err(CliError::Pricing)?
+    };
+    let (document, imported) = merge_snapshot_into_overrides(base_document, &snapshot, &models)?;
+
+    if imported == 0 {
+        println!(
+            "No pricing rows matched the requested filters from {}.",
+            snapshot.source
+        );
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            "Would import {} pricing row(s) from {} into {:?}.",
+            imported,
+            snapshot.source,
+            pricing::model_price_overrides_path()
+        );
+    } else {
+        let path =
+            pricing::save_model_price_overrides_document(&document).map_err(CliError::Pricing)?;
+        println!(
+            "Imported {} pricing row(s) from {} into {:?}.",
+            imported, snapshot.source, path
+        );
+    }
+    Ok(())
 }
 
 fn merge_snapshot_into_overrides(

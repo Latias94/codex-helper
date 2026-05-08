@@ -583,6 +583,24 @@ pub enum PricingCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Pull basellm llm-metadata pricing JSON into local overrides
+    SyncBasellm {
+        /// URL returning basellm all.json data
+        #[arg(
+            long,
+            default_value = "https://basellm.github.io/llm-metadata/api/all.json"
+        )]
+        url: String,
+        /// Import only rows matching these model ids or aliases
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Replace local overrides instead of merging into them
+        #[arg(long)]
+        replace: bool,
+        /// Show what would be imported without writing pricing_overrides.toml
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

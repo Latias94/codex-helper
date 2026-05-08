@@ -188,6 +188,7 @@ Current implementation slice:
 - Added a read-only operator API surface at `/__codex_helper/api/v1/pricing/catalog` so GUI/TUI/attach clients can inspect the price rows, source, confidence, and cache price fields used by core cost estimates.
 - Added `~/.codex-helper/pricing_overrides.toml` local model price overrides; request cost calculation and GUI/TUI pricing catalog views now use the merged operator catalog.
 - Added `codex-helper pricing path/list/set/remove/sync` so local overrides can be managed through a typed CLI, including pulling `ModelPriceCatalogSnapshot` JSON from a remote operator catalog.
+- Added `codex-helper pricing sync-basellm` so the operator catalog can be refreshed from the external basellm `llm-metadata/api/all.json` price source instead of relying only on the bundled seed table.
 - Added a GUI local pricing override editor under Stats for local-running mode; attached mode remains read-only against the remote pricing catalog.
 - GUI pricing catalog rows can be saved directly as local overrides while the proxy is running locally, reusing the same override validation and refresh path as the editor.
 - Added an observed-unpriced model strip in the GUI pricing editor so relay aliases seen in recent requests can be turned into local override rows without retyping the model id.
@@ -221,6 +222,7 @@ Current implementation slice:
 - Added a core balance snapshot DTO with `ok`, `exhausted`, `stale`, `error`, and `unknown` states.
 - Projected provider balance snapshots through the dashboard API, local GUI runtime state, attach refresh, and TUI snapshot.
 - Converted PackyCode budget and YesCode profile polling into balance snapshots while keeping quota exhaustion as an LB eligibility flag, not a health failure.
+- Added generic OpenAI/sub2api balance polling plus New API quota polling, with configurable JSON paths, divisors, headers, and endpoint/variable templating for self-hosted relays.
 - Added balance snapshot summaries to the shared station routing posture DTO so GUI/TUI auto-switch previews can mark `ok`, `exhausted`, `stale`, and `error` balance states in candidate order.
 - Added shared GUI station balance summaries to the Stations list, identity summary, and balance detail section so exhausted/stale/error quota state is visible before drilling into rows.
 

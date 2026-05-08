@@ -49,6 +49,7 @@ pub(super) fn render_stations_routing_preview(
 
         ui.add_space(4.0);
         ui.label(pick(ctx.lang, "候选顺序", "Candidate order"));
+        ui.small(format_routing_order_hint(ctx.lang, posture.mode));
         if posture.eligible_candidates.is_empty() {
             ui.colored_label(
                 egui::Color32::from_rgb(200, 120, 40),
@@ -208,6 +209,26 @@ fn format_recent_switch_observations(
     })
 }
 
+fn format_routing_order_hint(lang: Language, mode: StationRoutingMode) -> &'static str {
+    match mode {
+        StationRoutingMode::PinnedStation => pick(
+            lang,
+            "排序规则：pin 模式只看固定目标；level / active 不会重新排序，breaker_open 和无上游会阻断。",
+            "Order rule: pinned mode only uses the pinned target; level / active do not reorder it, while breaker_open and empty upstream pools block it.",
+        ),
+        StationRoutingMode::AutoLevelFallback => pick(
+            lang,
+            "排序规则：先按 level，小 level 优先；同级再优先 active。月包主用、按量兜底通常放成 L1 active + L2 backup。",
+            "Order rule: lower level wins, then active wins within the same level. Monthly primary plus pay-as-you-go backup usually maps to L1 active + L2 backup.",
+        ),
+        StationRoutingMode::AutoSingleLevelFallback => pick(
+            lang,
+            "排序规则：所有候选同级时优先 active，其余同级候选继续作为 failover 池；余额状态只解释风险，不改写 station 顺序。",
+            "Order rule: with one level, active is preferred and the remaining same-level candidates stay in the failover pool; balance status explains risk but does not rewrite station order.",
+        ),
+    }
+}
+
 fn format_routing_candidate(lang: Language, candidate: &StationRoutingCandidate) -> String {
     let mut parts = vec![format!("L{}", candidate.level.clamp(1, 10))];
     if candidate.active {
@@ -329,6 +350,23 @@ mod tests {
 
         assert!(text.contains("before first output"));
         assert!(text.contains("stays on the current station"));
+    }
+
+    #[test]
+    fn routing_order_hint_explains_level_priority() {
+        let text = format_routing_order_hint(Language::En, StationRoutingMode::AutoLevelFallback);
+
+        assert!(text.contains("lower level wins"));
+        assert!(text.contains("L1 active + L2 backup"));
+    }
+
+    #[test]
+    fn routing_order_hint_explains_same_level_active_priority() {
+        let text =
+            format_routing_order_hint(Language::En, StationRoutingMode::AutoSingleLevelFallback);
+
+        assert!(text.contains("active is preferred"));
+        assert!(text.contains("balance status explains risk"));
     }
 
     #[test]

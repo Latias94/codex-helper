@@ -660,10 +660,14 @@ codex-helper pricing list --local --model gpt-5
 codex-helper pricing set custom-codex --input-per-1m-usd 0.50 --output-per-1m-usd 1.50 --confidence estimated
 codex-helper pricing sync http://127.0.0.1:4322/__codex_helper/api/v1/pricing/catalog --model relay-gpt5 --dry-run
 codex-helper pricing sync http://127.0.0.1:4322/__codex_helper/api/v1/pricing/catalog --model relay-gpt5
+codex-helper pricing sync-basellm --model gpt-5 --dry-run
+codex-helper pricing sync-basellm --model gpt-5
 codex-helper pricing remove custom-codex
 ```
 
 `pricing sync` 拉取的是 `ModelPriceCatalogSnapshot` JSON（也就是本项目 admin API 暴露的价格目录格式），默认合并到本地覆盖；加 `--replace` 会用远端匹配结果替换本地覆盖文件。
+
+`pricing sync-basellm` 拉取 `https://basellm.github.io/llm-metadata/api/all.json`，把其中的 per-million 模型价格转换为本项目的本地覆盖格式。这个命令适合定期刷新模型价格，避免长期依赖内置种子价格；本地覆盖仍然优先于内置表。
 
 ### 用量提供商（Usage Providers）
 
@@ -679,6 +683,27 @@ codex-helper pricing remove custom-codex
       "endpoint": "https://www.packycode.com/api/backend/users/info",
       "token_env": null,
       "poll_interval_secs": 60
+    },
+    {
+      "id": "my-sub2api",
+      "kind": "openai_balance_http_json",
+      "domains": ["relay.example.com"],
+      "endpoint": "{{base_url}}/user/balance",
+      "poll_interval_secs": 60
+    },
+    {
+      "id": "my-new-api",
+      "kind": "new_api_user_self",
+      "domains": ["newapi.example.com"],
+      "endpoint": "{{base_url}}/api/user/self",
+      "token_env": "NEW_API_ACCESS_TOKEN",
+      "headers": {
+        "New-Api-User": "{{userId}}"
+      },
+      "variables": {
+        "userId": "{{env:NEW_API_USER_ID}}"
+      },
+      "poll_interval_secs": 60
     }
   ]
 }
@@ -688,7 +713,11 @@ codex-helper pricing remove custom-codex
 
 - upstream 的 `base_url` host 匹配 `domains` 中任一项，即视为该 provider 的管理对象；
 - 调用 `endpoint` 的认证 token 优先来自 `token_env`，否则尝试使用绑定 upstream 的 `auth.auth_token` / `auth.auth_token_env`（运行时从环境变量解析）；
-- 请求结束后，codex-helper 按需调用 `endpoint` 查询额度，解析 `monthly_budget_usd` / `monthly_spent_usd`；
+- `endpoint` 支持 `{{base_url}}`、`{{upstream_base_url}}`、`{{token}}` / `{{apiKey}}` / `{{accessToken}}`、`{{env:NAME}}` 和 `variables` 模板；`{{base_url}}` 会自动去掉常见的尾部 `/v1`；
+- `openai_balance_http_json` 适配 cc-switch 通用模板 / 常见 sub2api：默认请求 `{{base_url}}/user/balance`，解析 `balance`、`remaining`、`credit`、`subscription_balance`、`pay_as_you_go_balance` 等常见字段；
+- `new_api_user_self` 适配 New API：默认请求 `{{base_url}}/api/user/self`，按 cc-switch 模板解析 `data.quota` / `data.used_quota`，默认除以 `500000` 转成 USD；
+- 自研接口可以通过 `extract.remaining_balance_paths`、`extract.monthly_spent_paths`、`extract.monthly_budget_paths`、`extract.exhausted_paths` 和 divisor 字段扩展，不需要改 Rust 代码；
+- 请求结束后，codex-helper 按需调用 `endpoint` 查询额度，记录 `ok` / `exhausted` / `stale` / `error` / `unknown` 余额快照；
 - 当额度用尽时，对应 upstream 在 LB 中被标记为 `usage_exhausted = true`，优先避开该线路。
 
 ### 请求过滤与日志
