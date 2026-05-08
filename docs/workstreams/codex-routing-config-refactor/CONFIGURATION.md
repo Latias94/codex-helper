@@ -214,7 +214,7 @@ Best when you would rather fail than spill into a non-monthly provider.
 The old `station` CLI surface remains as a compatibility command group, but on a `version = 3` file it edits providers and routing directly:
 
 ```bash
-codex-helper station add input --base-url https://ai.input.im/v1 --auth-token-env INPUT_API_KEY
+codex-helper station add input --base-url https://ai.input.im/v1 --auth-token-env INPUT_API_KEY --tag billing=monthly --tag region=hk
 codex-helper station set-active input
 codex-helper station enable input
 codex-helper station disable input
@@ -223,6 +223,7 @@ codex-helper station disable input
 - `station list` shows v3 providers plus policy, target, order, and exhaustion behavior.
 - `station explain` shows the v3 routing recipe; `--station <name>` is treated as a provider detail selector on v3 files.
 - `station add` creates `[codex.providers.input]` and appends `input` to `codex.routing.order`.
+- repeated `--tag key=value` flags are written to provider tags and can drive `tag-preferred` policies.
 - `station set-active input` pins `codex.routing.policy = "manual-sticky"` and `target = "input"`.
 - `station enable/disable` toggles the provider, keeping `routing.order` stable.
 - `station disable` clears a manual target if it disables that target.

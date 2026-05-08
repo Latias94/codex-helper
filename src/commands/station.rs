@@ -230,6 +230,27 @@ fn ensure_v3_routing_order_contains(view: &mut ServiceViewV3, provider_name: &st
     }
 }
 
+fn parse_cli_tags(raw_tags: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut tags = BTreeMap::new();
+    for raw in raw_tags {
+        let Some((key, value)) = raw.split_once('=') else {
+            anyhow::bail!("tag '{}' must use KEY=VALUE form", raw);
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            anyhow::bail!("tag '{}' has an empty key", raw);
+        }
+        if value.is_empty() {
+            anyhow::bail!("tag '{}' has an empty value", raw);
+        }
+        if tags.insert(key.to_string(), value.to_string()).is_some() {
+            anyhow::bail!("duplicate tag key '{}'", key);
+        }
+    }
+    Ok(tags)
+}
+
 fn routing_policy_label(policy: RoutingPolicyV3) -> &'static str {
     match policy {
         RoutingPolicyV3::ManualSticky => "manual-sticky",
@@ -741,6 +762,7 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             api_key,
             api_key_env,
             alias,
+            tags,
             level,
             disabled,
             codex,
@@ -749,6 +771,8 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let service = resolve_service(codex, claude)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let parsed_tags =
+                parse_cli_tags(&tags).map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let document = load_config_document()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -766,6 +790,7 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
                             api_key,
                             api_key_env,
                         },
+                        tags: parsed_tags,
                         ..ProviderConfigV3::default()
                     },
                 );
@@ -794,7 +819,7 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
                     api_key,
                     api_key_env,
                 },
-                tags: Default::default(),
+                tags: parsed_tags.into_iter().collect(),
                 supported_models: Default::default(),
                 model_mapping: Default::default(),
             };

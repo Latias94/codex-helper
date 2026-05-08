@@ -227,6 +227,9 @@ pub enum StationCommand {
         /// Optional alias for this station
         #[arg(long)]
         alias: Option<String>,
+        /// Provider/upstream tag in KEY=VALUE form; can be passed multiple times
+        #[arg(long = "tag", value_name = "KEY=VALUE")]
+        tags: Vec<String>,
         /// Priority group for level-based station routing (1..=10, lower is higher priority)
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=10))]
         level: u8,
