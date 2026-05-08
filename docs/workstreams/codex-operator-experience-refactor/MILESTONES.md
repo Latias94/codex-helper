@@ -228,6 +228,7 @@ Current implementation slice:
 - Added TUI balance summaries to the Stations list/detail and Settings overview so operators can inspect balance state and amounts without drilling into logs.
 - Kept balance refresh in the core adapter layer: `usage_providers.json` owns provider-level `refresh_on_request` and `poll_interval_secs`, and request-driven polling reuses the cached snapshot path instead of pushing refresh timing into the UI.
 - Added a manual provider balance refresh admin API so TUI/GUI can trigger the same core adapter/LB/snapshot path without learning provider-specific balance endpoints.
+- Balance-aware station ordering now demotes known fully exhausted stations during automatic routing, and the runtime preview uses the same order so UI and proxy stay in sync.
 
 ### P1.2.1 Thin Provider Config
 
@@ -347,7 +348,7 @@ Current implementation slice:
 - GUI retry editing now shows a draft resolved policy before writeback and highlights whether the draft enables cross-station failover before first output.
 - Added a GUI station routing preview that explains the current source (`global pin` or automatic active/level routing), candidate station order, skipped station reasons, session pin caveats, and after-first-output failover behavior.
 - Added a compact TUI Settings retry policy preview that splits upstream policy, provider policy, cross-station boundary, guardrails, and cooldown behavior into readable lines.
-- Core proxy routing now builds an explicit station routing plan before request dispatch, which keeps pinned selection, active fallback, and single-level/multi-level ordering out of the orchestration layer.
+- Core proxy routing now builds an explicit station routing plan before request dispatch, which keeps pinned selection, active fallback, and balance-aware single-level/multi-level ordering out of the orchestration layer.
 - Next cleanup target is route-policy vocabulary: the current `retry.provider` naming still reads like provider-local retry, but the actual boundary is route/station selection policy.
 
 ## P2 - Productization and Long-horizon Control

@@ -17,6 +17,15 @@ fn station_candidate_json(candidate: &StationRoutingCandidate) -> serde_json::Va
         "enabled": candidate.enabled,
         "runtime_state": candidate.runtime_state,
         "upstreams": candidate.upstream_count,
+        "balance_state": station_balance_state(candidate),
+        "balance": {
+            "snapshots": candidate.balance.snapshots,
+            "ok": candidate.balance.ok,
+            "exhausted": candidate.balance.exhausted,
+            "stale": candidate.balance.stale,
+            "error": candidate.balance.error,
+            "unknown": candidate.balance.unknown,
+        },
     })
 }
 
@@ -25,6 +34,19 @@ fn station_candidate_names(candidates: &[StationRoutingCandidate]) -> Vec<String
         .iter()
         .map(|candidate| candidate.name.clone())
         .collect()
+}
+
+fn station_balance_state(candidate: &StationRoutingCandidate) -> &'static str {
+    let balance = &candidate.balance;
+    if balance.snapshots == 0 {
+        "unknown"
+    } else if balance.exhausted == balance.snapshots {
+        "all_exhausted"
+    } else if balance.exhausted > 0 {
+        "partial_exhausted"
+    } else {
+        "available"
+    }
 }
 
 impl ProxyService {
@@ -72,6 +94,10 @@ impl ProxyService {
         let upstream_overrides = self
             .state
             .get_upstream_meta_overrides(self.service_name)
+            .await;
+        let provider_balances = self
+            .state
+            .get_provider_balance_view(self.service_name)
             .await;
         if let Some((name, source)) = self.pinned_config(mgr, session_id).await {
             let pinned_runtime_state = state_overrides
@@ -142,6 +168,7 @@ impl ProxyService {
             &meta_overrides,
             &state_overrides,
             &upstream_overrides,
+            &provider_balances,
         );
         let selected_station_names = station_candidate_names(&plan.selected_stations);
         let eligible_station_names = station_candidate_names(&plan.eligible_stations);
@@ -200,6 +227,7 @@ impl ProxyService {
                         "level": candidate.level,
                         "upstreams": candidate.upstream_count,
                     })).collect::<Vec<_>>(),
+                    "selected_details": plan.selected_stations.iter().map(station_candidate_json).collect::<Vec<_>>(),
                     "eligible_count": plan.selected_stations.len(),
                 }));
             }
@@ -214,6 +242,7 @@ impl ProxyService {
                     "selected_station": selected.map(|candidate| candidate.name.clone()),
                     "selected_level": selected.map(|candidate| candidate.level),
                     "selected_upstreams": selected.map(|candidate| candidate.upstream_count),
+                    "selected_details": selected.map(station_candidate_json),
                 }));
             }
             StationRoutingMode::MultiLevelEmpty => {

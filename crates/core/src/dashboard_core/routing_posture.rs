@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ResolvedRetryConfig, RetryStrategy};
@@ -45,6 +47,32 @@ impl StationRoutingBalanceSummary {
     pub fn is_empty(&self) -> bool {
         self.snapshots == 0
     }
+}
+
+fn balance_exhaustion_rank(balance: &StationRoutingBalanceSummary) -> u8 {
+    if balance.snapshots > 0 && balance.exhausted == balance.snapshots {
+        1
+    } else {
+        0
+    }
+}
+
+fn compare_station_candidates(
+    left: &StationRoutingCandidate,
+    right: &StationRoutingCandidate,
+    use_level: bool,
+) -> Ordering {
+    balance_exhaustion_rank(&left.balance)
+        .cmp(&balance_exhaustion_rank(&right.balance))
+        .then_with(|| {
+            if use_level {
+                left.level.cmp(&right.level)
+            } else {
+                Ordering::Equal
+            }
+        })
+        .then_with(|| right.active.cmp(&left.active))
+        .then_with(|| left.name.cmp(&right.name))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -288,19 +316,9 @@ fn build_auto_station_posture(
     let has_multi_level = levels.len() > 1;
 
     if has_multi_level {
-        candidates.sort_by(|a, b| {
-            a.level
-                .clamp(1, 10)
-                .cmp(&b.level.clamp(1, 10))
-                .then_with(|| b.active.cmp(&a.active))
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        candidates.sort_by(|a, b| compare_station_candidates(a, b, true));
     } else {
-        candidates.sort_by(|a, b| a.name.cmp(&b.name));
-        if let Some(pos) = candidates.iter().position(|station| station.active) {
-            let station = candidates.remove(pos);
-            candidates.insert(0, station);
-        }
+        candidates.sort_by(|a, b| compare_station_candidates(a, b, false));
     }
 
     StationRoutingPosture {
@@ -597,5 +615,65 @@ mod tests {
         assert_eq!(candidate.balance.exhausted, 1);
         assert_eq!(candidate.balance.stale, 1);
         assert_eq!(candidate.balance.error, 1);
+    }
+
+    #[test]
+    fn auto_posture_demotes_known_exhausted_station_after_clear_peer() {
+        let mut monthly = station("monthly", true, 1, true, 1);
+        monthly.balance = StationRoutingBalanceSummary {
+            snapshots: 1,
+            exhausted: 1,
+            ..StationRoutingBalanceSummary::default()
+        };
+        let mut paygo = station("paygo", true, 2, false, 1);
+        paygo.balance = StationRoutingBalanceSummary {
+            snapshots: 1,
+            ok: 1,
+            ..StationRoutingBalanceSummary::default()
+        };
+        let stations = vec![monthly, paygo];
+
+        let posture = build_station_routing_posture(StationRoutingPostureInput {
+            stations: &stations,
+            session_station_override: None,
+            global_station_override: None,
+            configured_active_station: Some("monthly"),
+            session_pin_count: 0,
+            retry: None,
+        });
+
+        assert_eq!(posture.mode, StationRoutingMode::AutoLevelFallback);
+        assert_eq!(posture.eligible_candidates[0].name, "paygo");
+        assert_eq!(posture.eligible_candidates[1].name, "monthly");
+    }
+
+    #[test]
+    fn auto_posture_keeps_partially_exhausted_station_in_priority_group() {
+        let mut monthly = station("monthly", true, 1, true, 1);
+        monthly.balance = StationRoutingBalanceSummary {
+            snapshots: 2,
+            exhausted: 1,
+            ..StationRoutingBalanceSummary::default()
+        };
+        let mut paygo = station("paygo", true, 2, false, 1);
+        paygo.balance = StationRoutingBalanceSummary {
+            snapshots: 1,
+            ok: 1,
+            ..StationRoutingBalanceSummary::default()
+        };
+        let stations = vec![monthly, paygo];
+
+        let posture = build_station_routing_posture(StationRoutingPostureInput {
+            stations: &stations,
+            session_station_override: None,
+            global_station_override: None,
+            configured_active_station: Some("monthly"),
+            session_pin_count: 0,
+            retry: None,
+        });
+
+        assert_eq!(posture.mode, StationRoutingMode::AutoLevelFallback);
+        assert_eq!(posture.eligible_candidates[0].name, "monthly");
+        assert_eq!(posture.eligible_candidates[1].name, "paygo");
     }
 }

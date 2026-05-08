@@ -1,6 +1,9 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamConfig};
+use crate::dashboard_core::StationRoutingBalanceSummary;
+use crate::state::ProviderBalanceSnapshot;
 use crate::state::RuntimeConfigState;
 
 #[derive(Debug, Clone)]
@@ -11,6 +14,7 @@ pub(super) struct StationRoutingCandidate {
     pub(super) enabled: bool,
     pub(super) runtime_state: RuntimeConfigState,
     pub(super) upstream_count: usize,
+    pub(super) balance: StationRoutingBalanceSummary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +135,7 @@ fn station_candidate(
     runtime_state: RuntimeConfigState,
     level: u8,
     enabled: bool,
+    balance: StationRoutingBalanceSummary,
 ) -> StationRoutingCandidate {
     StationRoutingCandidate {
         name: name.to_string(),
@@ -139,7 +144,48 @@ fn station_candidate(
         enabled,
         runtime_state,
         upstream_count: svc.upstreams.len(),
+        balance,
     }
+}
+
+fn station_balance_summary(
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    station_name: &str,
+) -> StationRoutingBalanceSummary {
+    StationRoutingBalanceSummary::from_snapshots(
+        provider_balances
+            .get(station_name)
+            .map(|balances| balances.as_slice()),
+    )
+}
+
+fn balance_exhaustion_rank(balance: &StationRoutingBalanceSummary) -> u8 {
+    if balance.snapshots > 0 && balance.exhausted == balance.snapshots {
+        1
+    } else {
+        0
+    }
+}
+
+fn compare_station_candidates(
+    left: &StationRoutingCandidate,
+    right: &StationRoutingCandidate,
+    active_name: Option<&str>,
+    use_level: bool,
+) -> Ordering {
+    let left_active = active_name.is_some_and(|n| n == left.name.as_str());
+    let right_active = active_name.is_some_and(|n| n == right.name.as_str());
+    balance_exhaustion_rank(&left.balance)
+        .cmp(&balance_exhaustion_rank(&right.balance))
+        .then_with(|| {
+            if use_level {
+                left.level.cmp(&right.level)
+            } else {
+                Ordering::Equal
+            }
+        })
+        .then_with(|| right_active.cmp(&left_active))
+        .then_with(|| left.name.cmp(&right.name))
 }
 
 pub(super) fn build_station_routing_plan(
@@ -148,6 +194,7 @@ pub(super) fn build_station_routing_plan(
     meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
     state_overrides: &HashMap<String, RuntimeConfigState>,
     upstream_overrides: &HashMap<String, (Option<bool>, Option<RuntimeConfigState>)>,
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
 ) -> StationRoutingPlan {
     let mut eligible_stations = mgr
         .stations()
@@ -167,7 +214,14 @@ pub(super) fn build_station_routing_plan(
 
             filtered_service_for_routing(svc, upstream_overrides, false).map(|svc| {
                 let level = level_ovr.unwrap_or(svc.level).clamp(1, 10);
-                station_candidate(name, &svc, runtime_state, level, enabled)
+                station_candidate(
+                    name,
+                    &svc,
+                    runtime_state,
+                    level,
+                    enabled,
+                    station_balance_summary(provider_balances, name.as_str()),
+                )
             })
         })
         .collect::<Vec<_>>();
@@ -199,6 +253,7 @@ pub(super) fn build_station_routing_plan(
                 effective_runtime_config_state(state_overrides, svc.name.as_str()),
                 svc.level.clamp(1, 10),
                 svc.enabled,
+                station_balance_summary(provider_balances, svc.name.as_str()),
             );
             return StationRoutingPlan {
                 mode: if has_multi_level {
@@ -226,15 +281,7 @@ pub(super) fn build_station_routing_plan(
 
     if !has_multi_level {
         let mut selected_stations = eligible_stations.clone();
-        selected_stations.sort_by(|a, b| a.name.cmp(&b.name));
-        if let Some(active) = active_name
-            && let Some(pos) = selected_stations
-                .iter()
-                .position(|candidate| candidate.name == active)
-        {
-            let item = selected_stations.remove(pos);
-            selected_stations.insert(0, item);
-        }
+        selected_stations.sort_by(|a, b| compare_station_candidates(a, b, active_name, false));
         return StationRoutingPlan {
             mode: StationRoutingMode::SingleLevelMulti,
             active_station: active_name.map(ToOwned::to_owned),
@@ -243,14 +290,7 @@ pub(super) fn build_station_routing_plan(
         };
     }
 
-    eligible_stations.sort_by(|a, b| {
-        let a_active = active_name.is_some_and(|n| n == a.name.as_str());
-        let b_active = active_name.is_some_and(|n| n == b.name.as_str());
-        a.level
-            .cmp(&b.level)
-            .then_with(|| b_active.cmp(&a_active))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    eligible_stations.sort_by(|a, b| compare_station_candidates(a, b, active_name, true));
 
     StationRoutingPlan {
         mode: StationRoutingMode::MultiLevel,
@@ -284,6 +324,7 @@ pub(super) fn resolve_pinned_station_selection(
             effective_runtime_config_state(state_overrides, svc.name.as_str()),
             svc.level.clamp(1, 10),
             svc.enabled,
+            StationRoutingBalanceSummary::default(),
         ));
     };
     let Some(svc) = filtered_service_for_routing(base_svc, upstream_overrides, true) else {
@@ -296,13 +337,16 @@ pub(super) fn resolve_pinned_station_selection(
         runtime_state,
         svc.level.clamp(1, 10),
         svc.enabled,
+        StationRoutingBalanceSummary::default(),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::balance::BalanceSnapshotStatus;
     use crate::config::{ServiceConfigManager, UpstreamAuth};
+    use crate::state::ProviderBalanceSnapshot;
     use std::collections::BTreeMap;
 
     fn upstream(base_url: &str) -> UpstreamConfig {
@@ -350,6 +394,34 @@ mod tests {
             .collect()
     }
 
+    fn balance(statuses: &[BalanceSnapshotStatus]) -> Vec<ProviderBalanceSnapshot> {
+        statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| ProviderBalanceSnapshot {
+                provider_id: format!("provider-{index}"),
+                station_name: Some("ignored".to_string()),
+                upstream_index: Some(index),
+                source: "test".to_string(),
+                fetched_at_ms: 1,
+                stale_after_ms: None,
+                stale: false,
+                status: *status,
+                exhausted: match status {
+                    BalanceSnapshotStatus::Exhausted => Some(true),
+                    BalanceSnapshotStatus::Ok => Some(false),
+                    _ => None,
+                },
+                total_balance_usd: None,
+                subscription_balance_usd: None,
+                paygo_balance_usd: None,
+                monthly_budget_usd: None,
+                monthly_spent_usd: None,
+                error: None,
+            })
+            .collect()
+    }
+
     #[test]
     fn auto_single_level_prefers_active_then_alphabetical() {
         let mgr = manager(
@@ -364,6 +436,7 @@ mod tests {
         let plan = build_station_routing_plan(
             &mgr,
             mgr.active.as_deref(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -391,6 +464,7 @@ mod tests {
         let plan = build_station_routing_plan(
             &mgr,
             mgr.active.as_deref(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -425,6 +499,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(plan.mode, StationRoutingMode::SingleLevelMulti);
@@ -449,6 +524,7 @@ mod tests {
         let plan = build_station_routing_plan(
             &mgr,
             mgr.active.as_deref(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -529,5 +605,82 @@ mod tests {
             resolve_pinned_station_selection(&mgr, "alpha", &HashMap::new(), &upstream_overrides),
             PinnedRoutingSelection::Missing
         ));
+    }
+
+    #[test]
+    fn auto_routes_known_exhausted_station_after_clear_peer() {
+        let mgr = manager(
+            Some("monthly"),
+            vec![
+                service(
+                    "monthly",
+                    true,
+                    1,
+                    vec![upstream("https://monthly.example/v1")],
+                ),
+                service("paygo", true, 2, vec![upstream("https://paygo.example/v1")]),
+            ],
+        );
+        let provider_balances = HashMap::from([
+            (
+                "monthly".to_string(),
+                balance(&[BalanceSnapshotStatus::Exhausted]),
+            ),
+            ("paygo".to_string(), balance(&[BalanceSnapshotStatus::Ok])),
+        ]);
+
+        let plan = build_station_routing_plan(
+            &mgr,
+            mgr.active.as_deref(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &provider_balances,
+        );
+
+        assert_eq!(plan.mode, StationRoutingMode::MultiLevel);
+        assert_eq!(names(&plan.selected_stations), vec!["paygo", "monthly"]);
+        assert_eq!(plan.selected_stations[0].balance.exhausted, 0);
+        assert_eq!(plan.selected_stations[1].balance.exhausted, 1);
+    }
+
+    #[test]
+    fn auto_keeps_partially_exhausted_station_in_its_priority_group() {
+        let mgr = manager(
+            Some("monthly"),
+            vec![
+                service(
+                    "monthly",
+                    true,
+                    1,
+                    vec![
+                        upstream("https://monthly-a.example/v1"),
+                        upstream("https://monthly-b.example/v1"),
+                    ],
+                ),
+                service("paygo", true, 2, vec![upstream("https://paygo.example/v1")]),
+            ],
+        );
+        let provider_balances = HashMap::from([
+            (
+                "monthly".to_string(),
+                balance(&[BalanceSnapshotStatus::Exhausted, BalanceSnapshotStatus::Ok]),
+            ),
+            ("paygo".to_string(), balance(&[BalanceSnapshotStatus::Ok])),
+        ]);
+
+        let plan = build_station_routing_plan(
+            &mgr,
+            mgr.active.as_deref(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &provider_balances,
+        );
+
+        assert_eq!(plan.mode, StationRoutingMode::MultiLevel);
+        assert_eq!(names(&plan.selected_stations), vec!["monthly", "paygo"]);
+        assert_eq!(plan.selected_stations[0].balance.exhausted, 1);
+        assert_eq!(plan.selected_stations[0].balance.snapshots, 2);
     }
 }
