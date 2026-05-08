@@ -477,3 +477,65 @@ fn save_config_v3_writes_routing_first_schema() {
         assert!(!saved.contains("[codex.stations."));
     });
 }
+
+#[test]
+fn save_config_preserves_v3_routing_when_only_runtime_metadata_changes() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let cfg = ProxyConfigV3 {
+            version: 3,
+            codex: ServiceViewV3 {
+                providers: BTreeMap::from([
+                    (
+                        "monthly".to_string(),
+                        ProviderConfigV3 {
+                            base_url: Some("https://monthly.example.com/v1".to_string()),
+                            tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                            ..ProviderConfigV3::default()
+                        },
+                    ),
+                    (
+                        "paygo".to_string(),
+                        ProviderConfigV3 {
+                            base_url: Some("https://paygo.example.com/v1".to_string()),
+                            tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
+                            ..ProviderConfigV3::default()
+                        },
+                    ),
+                ]),
+                routing: Some(RoutingConfigV3 {
+                    policy: RoutingPolicyV3::TagPreferred,
+                    prefer_tags: vec![BTreeMap::from([(
+                        "billing".to_string(),
+                        "monthly".to_string(),
+                    )])],
+                    order: vec!["monthly".to_string(), "paygo".to_string()],
+                    on_exhausted: RoutingExhaustedActionV3::Stop,
+                    ..RoutingConfigV3::default()
+                }),
+                ..ServiceViewV3::default()
+            },
+            ..ProxyConfigV3::default()
+        };
+
+        let path = super::save_config_v3(&cfg).await.expect("save v3");
+        let mut runtime = super::load_config().await.expect("load runtime");
+        runtime.ui.language = Some("zh".to_string());
+        super::save_config(&runtime)
+            .await
+            .expect("save runtime metadata");
+
+        let saved = std::fs::read_to_string(path).expect("read saved config");
+        let reparsed = toml::from_str::<ProxyConfigV3>(&saved).expect("parse v3");
+        let routing = reparsed.codex.routing.expect("routing should remain");
+        assert_eq!(routing.policy, RoutingPolicyV3::TagPreferred);
+        assert_eq!(routing.on_exhausted, RoutingExhaustedActionV3::Stop);
+        assert_eq!(routing.order, vec!["monthly", "paygo"]);
+        assert_eq!(reparsed.ui.language.as_deref(), Some("zh"));
+    });
+}

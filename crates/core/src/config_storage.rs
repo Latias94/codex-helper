@@ -361,6 +361,46 @@ pub async fn load_config() -> Result<ProxyConfig> {
     Ok(cfg)
 }
 
+fn runtime_service_manager_value(mgr: &ServiceConfigManager) -> Result<JsonValue> {
+    serde_json::to_value(mgr).context("serialize runtime service manager")
+}
+
+async fn save_existing_v3_if_only_runtime_metadata_changed(
+    cfg: &ProxyConfig,
+) -> Result<Option<PathBuf>> {
+    let path = config_toml_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let text = fs::read_to_string(&path).await?;
+    if toml_schema_version_or_shape(&text) != Some(3) {
+        return Ok(None);
+    }
+
+    let mut requested = cfg.clone();
+    normalize_proxy_config(&mut requested);
+    validate_proxy_config(&requested)?;
+
+    let mut existing = toml::from_str::<ProxyConfigV3>(&text)?;
+    let mut existing_runtime = compile_v3_to_runtime(&existing)?;
+    normalize_proxy_config(&mut existing_runtime);
+
+    if runtime_service_manager_value(&existing_runtime.codex)?
+        != runtime_service_manager_value(&requested.codex)?
+        || runtime_service_manager_value(&existing_runtime.claude)?
+            != runtime_service_manager_value(&requested.claude)?
+    {
+        return Ok(None);
+    }
+
+    existing.retry = requested.retry;
+    existing.notify = requested.notify;
+    existing.default_service = requested.default_service;
+    existing.ui = requested.ui;
+    save_config_v3(&existing).await.map(Some)
+}
+
 pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
     if cfg.version == Some(2) {
         let migrated = compact_v2_config(&migrate_legacy_to_v2(cfg))?;
@@ -368,6 +408,12 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
         return Ok(());
     }
     if cfg.version == Some(3) {
+        if save_existing_v3_if_only_runtime_metadata_changed(cfg)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
         let migrated = migrate_legacy_to_v3(cfg)?;
         save_config_v3(&migrated).await?;
         return Ok(());
