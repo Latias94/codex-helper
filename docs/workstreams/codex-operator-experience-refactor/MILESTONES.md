@@ -342,6 +342,7 @@ Current implementation slice:
 - Added `codex-helper usage find` as a JSONL-backed search bridge for session/model/station/provider/status/fast/retry filters. This does not replace the future ledger, but validates the query surface before adding durable indexed storage.
 - Moved JSONL request log reading, filtering, usage aggregation, and compact formatting into core `request_ledger`, so CLI, future GUI/TUI history views, and any SQLite index can share the same query semantics.
 - Extended `codex-helper usage summary --by station|provider|model|session` so long-horizon JSONL replay can answer provider/model/session consumption questions before SQLite is introduced.
+- Added a local-running GUI Requests mode that loads recent `requests.jsonl` entries through core `request_ledger` and reuses the existing request list/detail components for longer local history.
 - Kept JSONL as the canonical append-only export/debug source for this phase; a future SQLite ledger should be a rebuildable index/cache over the same canonical request records.
 
 ### P2.2 Advanced Route Policy Engine

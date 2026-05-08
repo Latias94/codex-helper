@@ -299,6 +299,12 @@ pub struct RequestsViewState {
     pub scope_session: bool,
     pub focused_session_id: Option<String>,
     pub selected_idx: usize,
+    pub include_local_ledger: bool,
+    pub local_ledger_limit: usize,
+    pub local_ledger_loaded_limit: usize,
+    pub local_ledger_loaded_at_ms: Option<u64>,
+    pub local_ledger_last_error: Option<String>,
+    pub local_ledger_records: Vec<FinishedRequest>,
 }
 
 impl Default for RequestsViewState {
@@ -308,6 +314,12 @@ impl Default for RequestsViewState {
             scope_session: true,
             focused_session_id: None,
             selected_idx: 0,
+            include_local_ledger: false,
+            local_ledger_limit: 1000,
+            local_ledger_loaded_limit: 0,
+            local_ledger_loaded_at_ms: None,
+            local_ledger_last_error: None,
+            local_ledger_records: Vec::new(),
         }
     }
 }

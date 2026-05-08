@@ -7,6 +7,7 @@ use serde_json::Value as JsonValue;
 
 pub use crate::logging::request_log_path;
 use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog};
+use crate::state::{FinishedRequest, RequestObservability, RouteDecisionProvenance};
 use crate::usage::UsageMetrics;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,6 +208,22 @@ pub fn tail_request_log(path: &Path, limit: usize) -> std::io::Result<Vec<Reques
     Ok(lines[start..].to_vec())
 }
 
+pub fn tail_finished_requests_from_log(
+    path: &Path,
+    limit: usize,
+) -> std::io::Result<Vec<FinishedRequest>> {
+    let lines = tail_request_log(path, limit)?;
+    let mut requests = lines
+        .iter()
+        .filter_map(|line| {
+            line.value()
+                .and_then(finished_request_from_request_log_record)
+        })
+        .collect::<Vec<_>>();
+    requests.reverse();
+    Ok(requests)
+}
+
 pub fn summarize_request_log(
     path: &Path,
     group: RequestUsageSummaryGroup,
@@ -338,6 +355,61 @@ pub fn request_log_record_was_retried(record: &JsonValue) -> bool {
     request_was_retried(record)
 }
 
+pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<FinishedRequest> {
+    let timestamp_ms = u64_field(record, "timestamp_ms").unwrap_or(0);
+    let request_id = u64_field(record, "request_id").unwrap_or(timestamp_ms);
+    let status_code = u64_field(record, "status_code")
+        .and_then(|status| u16::try_from(status).ok())
+        .unwrap_or(0);
+    let duration_ms = u64_field(record, "duration_ms").unwrap_or(0);
+    let usage = usage_metrics(record);
+    let model = request_model(record);
+    let cost = estimate_request_cost_from_operator_catalog(
+        model.as_deref(),
+        usage.as_ref(),
+        CostAdjustments::default(),
+    );
+    let retry = record
+        .get("retry")
+        .and_then(|retry| serde_json::from_value(retry.clone()).ok());
+    let route_decision = record.get("route_decision").and_then(|route_decision| {
+        serde_json::from_value::<RouteDecisionProvenance>(route_decision.clone()).ok()
+    });
+
+    let mut request = FinishedRequest {
+        id: request_id,
+        trace_id: str_field(record, "trace_id").map(ToOwned::to_owned),
+        session_id: str_field(record, "session_id").map(ToOwned::to_owned),
+        client_name: str_field(record, "client_name").map(ToOwned::to_owned),
+        client_addr: str_field(record, "client_addr").map(ToOwned::to_owned),
+        cwd: str_field(record, "cwd").map(ToOwned::to_owned),
+        model,
+        reasoning_effort: str_field(record, "reasoning_effort").map(ToOwned::to_owned),
+        service_tier: service_tier_value(record),
+        station_name: non_dash(station_name(record)).map(ToOwned::to_owned),
+        provider_id: str_field(record, "provider_id").map(ToOwned::to_owned),
+        upstream_base_url: str_field(record, "upstream_base_url").map(ToOwned::to_owned),
+        route_decision,
+        usage,
+        cost,
+        retry,
+        observability: RequestObservability::default(),
+        service: str_field(record, "service").unwrap_or("-").to_string(),
+        method: str_field(record, "method").unwrap_or("-").to_string(),
+        path: str_field(record, "path").unwrap_or("-").to_string(),
+        status_code,
+        duration_ms,
+        ttfb_ms: u64_field(record, "ttfb_ms"),
+        streaming: record
+            .get("streaming")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        ended_at_ms: timestamp_ms,
+    };
+    request.refresh_observability();
+    Some(request)
+}
+
 fn field_contains(value: Option<&str>, expected: &str) -> bool {
     let expected = expected.trim().to_ascii_lowercase();
     if expected.is_empty() {
@@ -466,19 +538,20 @@ fn raw_kv_field(raw: &str, key: &str) -> Option<String> {
 }
 
 fn service_tier_display(record: &JsonValue) -> String {
-    let tier = record
-        .get("service_tier")
-        .and_then(|tier| {
-            tier.as_str()
-                .map(ToOwned::to_owned)
-                .or_else(|| service_tier_log_value(tier))
-        })
-        .unwrap_or_else(|| "-".to_string());
+    let tier = service_tier_value(record).unwrap_or_else(|| "-".to_string());
     if tier.eq_ignore_ascii_case("priority") {
         "priority(fast)".to_string()
     } else {
         tier
     }
+}
+
+fn service_tier_value(record: &JsonValue) -> Option<String> {
+    record.get("service_tier").and_then(|tier| {
+        tier.as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| service_tier_log_value(tier))
+    })
 }
 
 fn service_tier_log_value(tier: &JsonValue) -> Option<String> {
@@ -491,6 +564,10 @@ fn station_name(record: &JsonValue) -> &str {
     str_field(record, "station_name")
         .or_else(|| str_field(record, "config_name"))
         .unwrap_or("-")
+}
+
+fn non_dash(value: &str) -> Option<&str> {
+    (value != "-").then_some(value)
 }
 
 fn str_field<'a>(record: &'a JsonValue, key: &str) -> Option<&'a str> {
@@ -755,5 +832,51 @@ mod tests {
         );
         assert_eq!(session_rows[0].group_value, "sid-b");
         assert_eq!(session_rows[0].aggregate.requests, 2);
+    }
+
+    #[test]
+    fn request_log_record_projects_to_finished_request_for_ui_reuse() {
+        let record = json!({
+            "timestamp_ms": 1234,
+            "request_id": 42,
+            "trace_id": "codex-42",
+            "service": "codex",
+            "method": "POST",
+            "path": "/v1/responses",
+            "status_code": 200,
+            "duration_ms": 1500,
+            "ttfb_ms": 500,
+            "station_name": "primary",
+            "provider_id": "relay",
+            "upstream_base_url": "https://relay.example/v1",
+            "session_id": "sid-a",
+            "reasoning_effort": "medium",
+            "service_tier": { "actual": "priority" },
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150
+            },
+            "retry": {
+                "attempts": 2,
+                "upstream_chain": [
+                    "primary:https://relay.example/v1 (idx=0) status=429 class=rate_limit model=gpt-5.4",
+                    "primary:https://relay.example/v1 (idx=1) status=200 class=- model=gpt-5.4"
+                ]
+            }
+        });
+
+        let request =
+            finished_request_from_request_log_record(&record).expect("finished request projection");
+
+        assert_eq!(request.id, 42);
+        assert_eq!(request.trace_id.as_deref(), Some("codex-42"));
+        assert_eq!(request.session_id.as_deref(), Some("sid-a"));
+        assert_eq!(request.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(request.service_tier.as_deref(), Some("priority"));
+        assert!(request.is_fast_mode());
+        assert_eq!(request.attempt_count(), 2);
+        assert_eq!(request.output_tokens_per_second(), Some(50.0));
+        assert_eq!(request.ended_at_ms, 1234);
     }
 }

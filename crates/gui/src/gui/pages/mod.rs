@@ -396,6 +396,7 @@ mod tests {
             scope_session: false,
             focused_session_id: None,
             selected_idx: 7,
+            ..RequestsViewState::default()
         };
 
         prepare_select_requests_for_session(&mut state, "sid-req".to_string());
