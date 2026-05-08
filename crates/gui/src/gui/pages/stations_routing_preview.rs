@@ -218,13 +218,13 @@ fn format_routing_order_hint(lang: Language, mode: StationRoutingMode) -> &'stat
         ),
         StationRoutingMode::AutoLevelFallback => pick(
             lang,
-            "排序规则：已知全耗尽的 station 会降级；其余先按 level，小 level 优先；同级再优先 active。部分耗尽/未知余额只作为风险提示。",
-            "Order rule: known fully exhausted stations are demoted; the rest prefer lower level, then active within the same level. Partial/unknown balances stay as risk signals.",
+            "排序规则：默认会把已知全耗尽的 station 降级；可配置的 provider 例外会只显示余额不参与路由。其余先按 level，小 level 优先；同级再优先 active。",
+            "Order rule: known fully exhausted stations are demoted by default, while provider-level exceptions only show balance but do not affect routing. The rest prefer lower level, then active within the same level.",
         ),
         StationRoutingMode::AutoSingleLevelFallback => pick(
             lang,
-            "排序规则：所有候选同级时，已知全耗尽的 station 会降级；其余优先 active，再按名称稳定排序。部分耗尽/未知余额只作为风险提示。",
-            "Order rule: with one level, known fully exhausted stations are demoted; the rest prefer active, then stable name order. Partial/unknown balances stay as risk signals.",
+            "排序规则：所有候选同级时，默认会把已知全耗尽的 station 降级；provider 可关闭这条信任。其余优先 active，再按名称稳定排序。",
+            "Order rule: with one level, known fully exhausted stations are demoted by default unless a provider opts out of routing trust. The rest prefer active, then stable name order.",
         ),
     }
 }
@@ -269,12 +269,22 @@ fn format_routing_candidate(lang: Language, candidate: &StationRoutingCandidate)
 fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
     let balance = &candidate.balance;
     let mut parts = Vec::new();
-    if balance.exhausted == balance.snapshots && balance.snapshots > 0 {
+    if balance.routing_snapshots == 0 {
+        if balance.exhausted > 0 {
+            parts.push("exhausted(untrusted)".to_string());
+        }
+    } else if balance.routing_exhausted == balance.routing_snapshots {
         parts.push("exhausted(all)".to_string());
-    } else if balance.exhausted > 0 {
+    } else if balance.routing_exhausted > 0 {
         parts.push(format!(
             "exhausted={}/{}",
-            balance.exhausted, balance.snapshots
+            balance.routing_exhausted, balance.routing_snapshots
+        ));
+    }
+    if balance.routing_ignored_exhausted > 0 {
+        parts.push(format!(
+            "ignored_for_routing={}",
+            balance.routing_ignored_exhausted
         ));
     }
     if balance.error > 0 {
@@ -356,9 +366,9 @@ mod tests {
     fn routing_order_hint_explains_level_priority() {
         let text = format_routing_order_hint(Language::En, StationRoutingMode::AutoLevelFallback);
 
-        assert!(text.contains("known fully exhausted stations are demoted"));
+        assert!(text.contains("demoted by default"));
+        assert!(text.contains("provider-level exceptions"));
         assert!(text.contains("prefer lower level"));
-        assert!(text.contains("Partial/unknown balances stay as risk signals"));
     }
 
     #[test]
@@ -366,9 +376,9 @@ mod tests {
         let text =
             format_routing_order_hint(Language::En, StationRoutingMode::AutoSingleLevelFallback);
 
-        assert!(text.contains("known fully exhausted stations are demoted"));
+        assert!(text.contains("demoted by default"));
+        assert!(text.contains("provider opts out of routing trust"));
         assert!(text.contains("prefer active"));
-        assert!(text.contains("Partial/unknown balances stay as risk signals"));
     }
 
     #[test]
@@ -426,6 +436,9 @@ mod tests {
                     stale: 1,
                     error: 0,
                     unknown: 0,
+                    routing_snapshots: 2,
+                    routing_exhausted: 1,
+                    routing_ignored_exhausted: 0,
                 },
             },
         );
@@ -455,11 +468,47 @@ mod tests {
                     stale: 0,
                     error: 0,
                     unknown: 1,
+                    routing_snapshots: 1,
+                    routing_exhausted: 0,
+                    routing_ignored_exhausted: 0,
                 },
             },
         );
 
         assert!(label.contains("balance=unknown=1"));
         assert!(!label.contains("balance=ok"));
+    }
+
+    #[test]
+    fn candidate_label_marks_ignored_routing_exhaustion() {
+        let label = format_routing_candidate(
+            Language::En,
+            &StationRoutingCandidate {
+                name: "alpha".to_string(),
+                alias: None,
+                level: 1,
+                enabled: true,
+                active: false,
+                upstreams: Some(1),
+                runtime_state: RuntimeConfigState::Normal,
+                has_cooldown: false,
+                any_usage_exhausted: false,
+                all_usage_exhausted: false,
+                balance: crate::dashboard_core::StationRoutingBalanceSummary {
+                    snapshots: 1,
+                    ok: 0,
+                    exhausted: 1,
+                    stale: 0,
+                    error: 0,
+                    unknown: 0,
+                    routing_snapshots: 0,
+                    routing_exhausted: 0,
+                    routing_ignored_exhausted: 1,
+                },
+            },
+        );
+
+        assert!(label.contains("exhausted(untrusted)"));
+        assert!(label.contains("ignored_for_routing=1"));
     }
 }

@@ -107,6 +107,11 @@ struct UsageProviderConfig {
         skip_serializing_if = "bool_is_true"
     )]
     refresh_on_request: bool,
+    #[serde(
+        default = "default_trust_exhaustion_for_routing",
+        skip_serializing_if = "bool_is_true"
+    )]
+    trust_exhaustion_for_routing: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -170,6 +175,10 @@ fn default_refresh_on_request() -> bool {
     true
 }
 
+fn default_trust_exhaustion_for_routing() -> bool {
+    true
+}
+
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -228,6 +237,7 @@ fn default_providers() -> UsageProvidersFile {
                 token_env: None,
                 poll_interval_secs: Some(60),
                 refresh_on_request: true,
+                trust_exhaustion_for_routing: true,
                 headers: BTreeMap::new(),
                 variables: BTreeMap::new(),
                 extract: UsageProviderExtractConfig::default(),
@@ -241,6 +251,7 @@ fn default_providers() -> UsageProvidersFile {
                 token_env: None,
                 poll_interval_secs: Some(60),
                 refresh_on_request: true,
+                trust_exhaustion_for_routing: true,
                 headers: BTreeMap::new(),
                 variables: BTreeMap::new(),
                 extract: UsageProviderExtractConfig::default(),
@@ -577,14 +588,16 @@ fn base_snapshot(
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
 ) -> ProviderBalanceSnapshot {
-    ProviderBalanceSnapshot::new(
+    let mut snapshot = ProviderBalanceSnapshot::new(
         provider.id.clone(),
         upstream.station_name.clone(),
         upstream.index,
         provider.kind.source_name(),
         fetched_at_ms,
         stale_after_ms,
-    )
+    );
+    snapshot.exhaustion_affects_routing = provider.trust_exhaustion_for_routing;
+    snapshot
 }
 
 fn budget_snapshot_from_json(
@@ -986,14 +999,18 @@ async fn refresh_provider_target(
                 fetched_at_ms,
                 stale_after_ms,
             );
-            let exhausted_for_lb = snapshot.exhausted.unwrap_or(false);
+            let exhausted_for_lb = snapshot.routing_exhausted();
             update_usage_exhausted(lb_states, cfg, service_name, &upstreams, exhausted_for_lb);
             state
                 .record_provider_balance_snapshot(service_name, snapshot)
                 .await;
             info!(
-                "usage provider '{}' refreshed {}[{}], exhausted = {}",
-                provider.id, target.upstream.station_name, target.upstream.index, exhausted_for_lb
+                "usage provider '{}' refreshed {}[{}], exhausted = {}, routing_trusted = {}",
+                provider.id,
+                target.upstream.station_name,
+                target.upstream.index,
+                exhausted_for_lb,
+                provider.trust_exhaustion_for_routing
             );
             UsageProviderRefreshOutcome::Refreshed
         }
@@ -1187,6 +1204,7 @@ mod tests {
             token_env: None,
             poll_interval_secs: Some(60),
             refresh_on_request: true,
+            trust_exhaustion_for_routing: true,
             headers: BTreeMap::new(),
             variables: BTreeMap::new(),
             extract: UsageProviderExtractConfig::default(),
@@ -1316,6 +1334,39 @@ mod tests {
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
         assert_eq!(snapshot.exhausted, Some(false));
         assert_eq!(snapshot.total_balance_usd.as_deref(), Some("1.25"));
+    }
+
+    #[test]
+    fn provider_can_disable_routing_trust_for_exhausted_balance() {
+        let mut provider = provider("sub2api", ProviderKind::OpenAiBalanceHttpJson);
+        provider.trust_exhaustion_for_routing = false;
+
+        let snapshot = balance_http_snapshot_from_json(
+            &provider,
+            &upstream(),
+            &serde_json::json!({
+                "balance": "0"
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert_eq!(snapshot.exhausted, Some(true));
+        assert!(!snapshot.exhaustion_affects_routing);
+        assert!(!snapshot.routing_exhausted());
+    }
+
+    #[test]
+    fn provider_exhaustion_trust_defaults_to_enabled_when_omitted() {
+        let provider: UsageProviderConfig = serde_json::from_value(serde_json::json!({
+            "id": "sub2api",
+            "kind": "openai_balance_http_json",
+            "domains": ["example.com"]
+        }))
+        .expect("provider config");
+
+        assert!(provider.trust_exhaustion_for_routing);
     }
 
     #[test]

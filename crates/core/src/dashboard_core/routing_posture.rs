@@ -22,6 +22,12 @@ pub struct StationRoutingBalanceSummary {
     pub error: usize,
     #[serde(default)]
     pub unknown: usize,
+    #[serde(default)]
+    pub routing_snapshots: usize,
+    #[serde(default)]
+    pub routing_exhausted: usize,
+    #[serde(default)]
+    pub routing_ignored_exhausted: usize,
 }
 
 impl StationRoutingBalanceSummary {
@@ -40,6 +46,14 @@ impl StationRoutingBalanceSummary {
                 BalanceSnapshotStatus::Error => out.error += 1,
                 BalanceSnapshotStatus::Unknown => out.unknown += 1,
             }
+            if snapshot.exhaustion_affects_routing {
+                out.routing_snapshots += 1;
+                if snapshot.status == BalanceSnapshotStatus::Exhausted {
+                    out.routing_exhausted += 1;
+                }
+            } else if snapshot.status == BalanceSnapshotStatus::Exhausted {
+                out.routing_ignored_exhausted += 1;
+            }
         }
         out
     }
@@ -50,7 +64,7 @@ impl StationRoutingBalanceSummary {
 }
 
 fn balance_exhaustion_rank(balance: &StationRoutingBalanceSummary) -> u8 {
-    if balance.snapshots > 0 && balance.exhausted == balance.snapshots {
+    if balance.routing_snapshots > 0 && balance.routing_exhausted == balance.routing_snapshots {
         1
     } else {
         0
@@ -623,12 +637,15 @@ mod tests {
         monthly.balance = StationRoutingBalanceSummary {
             snapshots: 1,
             exhausted: 1,
+            routing_snapshots: 1,
+            routing_exhausted: 1,
             ..StationRoutingBalanceSummary::default()
         };
         let mut paygo = station("paygo", true, 2, false, 1);
         paygo.balance = StationRoutingBalanceSummary {
             snapshots: 1,
             ok: 1,
+            routing_snapshots: 1,
             ..StationRoutingBalanceSummary::default()
         };
         let stations = vec![monthly, paygo];
@@ -648,17 +665,53 @@ mod tests {
     }
 
     #[test]
-    fn auto_posture_keeps_partially_exhausted_station_in_priority_group() {
+    fn auto_posture_does_not_demote_ignored_exhausted_station() {
         let mut monthly = station("monthly", true, 1, true, 1);
         monthly.balance = StationRoutingBalanceSummary {
-            snapshots: 2,
+            snapshots: 1,
             exhausted: 1,
+            routing_ignored_exhausted: 1,
             ..StationRoutingBalanceSummary::default()
         };
         let mut paygo = station("paygo", true, 2, false, 1);
         paygo.balance = StationRoutingBalanceSummary {
             snapshots: 1,
             ok: 1,
+            routing_snapshots: 1,
+            routing_exhausted: 0,
+            ..StationRoutingBalanceSummary::default()
+        };
+        let stations = vec![monthly, paygo];
+
+        let posture = build_station_routing_posture(StationRoutingPostureInput {
+            stations: &stations,
+            session_station_override: None,
+            global_station_override: None,
+            configured_active_station: Some("monthly"),
+            session_pin_count: 0,
+            retry: None,
+        });
+
+        assert_eq!(posture.mode, StationRoutingMode::AutoLevelFallback);
+        assert_eq!(posture.eligible_candidates[0].name, "monthly");
+        assert_eq!(posture.eligible_candidates[1].name, "paygo");
+    }
+
+    #[test]
+    fn auto_posture_keeps_partially_exhausted_station_in_priority_group() {
+        let mut monthly = station("monthly", true, 1, true, 1);
+        monthly.balance = StationRoutingBalanceSummary {
+            snapshots: 2,
+            exhausted: 1,
+            routing_snapshots: 2,
+            routing_exhausted: 1,
+            ..StationRoutingBalanceSummary::default()
+        };
+        let mut paygo = station("paygo", true, 2, false, 1);
+        paygo.balance = StationRoutingBalanceSummary {
+            snapshots: 1,
+            ok: 1,
+            routing_snapshots: 1,
             ..StationRoutingBalanceSummary::default()
         };
         let stations = vec![monthly, paygo];

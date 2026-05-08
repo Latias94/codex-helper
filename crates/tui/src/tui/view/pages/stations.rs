@@ -130,10 +130,10 @@ fn format_routing_order_hint(mode: StationRoutingMode) -> &'static str {
             "pinned target only; breaker_open / empty upstreams block."
         }
         StationRoutingMode::AutoLevelFallback => {
-            "known fully exhausted stations are demoted first, then lower level, then active."
+            "known fully exhausted stations are demoted by default; provider-level exceptions only show balance."
         }
         StationRoutingMode::AutoSingleLevelFallback => {
-            "known fully exhausted stations are demoted first, then active, then stable name order."
+            "known fully exhausted stations are demoted by default unless a provider opts out of routing trust."
         }
     }
 }
@@ -186,12 +186,22 @@ fn format_routing_candidate(candidate: &StationRoutingCandidate) -> String {
 fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
     let balance = &candidate.balance;
     let mut parts = Vec::new();
-    if balance.exhausted == balance.snapshots && balance.snapshots > 0 {
+    if balance.routing_snapshots == 0 {
+        if balance.exhausted > 0 {
+            parts.push("exhausted_untrusted".to_string());
+        }
+    } else if balance.routing_exhausted == balance.routing_snapshots {
         parts.push("exhausted_all".to_string());
-    } else if balance.exhausted > 0 {
+    } else if balance.routing_exhausted > 0 {
         parts.push(format!(
             "exhausted={}/{}",
-            balance.exhausted, balance.snapshots
+            balance.routing_exhausted, balance.routing_snapshots
+        ));
+    }
+    if balance.routing_ignored_exhausted > 0 {
+        parts.push(format!(
+            "ignored_for_routing={}",
+            balance.routing_ignored_exhausted
         ));
     }
     if balance.error > 0 {
@@ -1020,6 +1030,34 @@ mod tests {
     }
 
     #[test]
+    fn station_routing_preview_marks_ignored_routing_exhaustion() {
+        let providers = vec![provider("alpha", true, 1, true, 1)];
+        let lb_view = HashMap::new();
+        let provider_balances = HashMap::from([(
+            "alpha".to_string(),
+            vec![crate::state::ProviderBalanceSnapshot {
+                status: BalanceSnapshotStatus::Exhausted,
+                exhaustion_affects_routing: false,
+                ..crate::state::ProviderBalanceSnapshot::default()
+            }],
+        )]);
+
+        let preview = station_routing_posture(
+            &providers,
+            &HashMap::new(),
+            &lb_view,
+            &provider_balances,
+            None,
+            None,
+            None,
+        );
+        let label = format_routing_candidate(&preview.eligible_candidates[0]);
+
+        assert!(label.contains("balance=exhausted_untrusted"));
+        assert!(label.contains("ignored_for_routing=1"));
+    }
+
+    #[test]
     fn station_routing_preview_does_not_treat_unknown_balance_as_ok() {
         let providers = vec![provider("alpha", true, 1, true, 1)];
         let lb_view = HashMap::new();
@@ -1050,8 +1088,8 @@ mod tests {
     fn routing_order_hint_explains_balance_demotion() {
         let text = format_routing_order_hint(StationRoutingMode::AutoLevelFallback);
 
-        assert!(text.contains("fully exhausted stations are demoted first"));
-        assert!(text.contains("lower level"));
+        assert!(text.contains("demoted by default"));
+        assert!(text.contains("provider-level exceptions"));
     }
 
     #[test]

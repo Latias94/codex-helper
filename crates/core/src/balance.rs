@@ -40,6 +40,11 @@ pub struct ProviderBalanceSnapshot {
     pub status: BalanceSnapshotStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exhausted: Option<bool>,
+    #[serde(
+        default = "default_exhaustion_affects_routing",
+        skip_serializing_if = "bool_is_true"
+    )]
+    pub exhaustion_affects_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_balance_usd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +71,7 @@ impl Default for ProviderBalanceSnapshot {
             stale: false,
             status: BalanceSnapshotStatus::Unknown,
             exhausted: None,
+            exhaustion_affects_routing: true,
             total_balance_usd: None,
             subscription_balance_usd: None,
             paygo_balance_usd: None,
@@ -126,6 +132,10 @@ impl ProviderBalanceSnapshot {
         };
     }
 
+    pub fn routing_exhausted(&self) -> bool {
+        self.exhaustion_affects_routing && self.status == BalanceSnapshotStatus::Exhausted
+    }
+
     fn has_amount_data(&self) -> bool {
         self.total_balance_usd.is_some()
             || self.subscription_balance_usd.is_some()
@@ -159,6 +169,14 @@ impl ProviderBalanceSnapshot {
     }
 }
 
+fn default_exhaustion_affects_routing() -> bool {
+    true
+}
+
+fn bool_is_true(value: &bool) -> bool {
+    *value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +205,18 @@ mod tests {
             snapshot.amount_summary(),
             "total=$3.5 budget=$5 spent=$1.25 sub=$2 paygo=$1.5"
         );
+    }
+
+    #[test]
+    fn routing_exhausted_respects_snapshot_routing_flag() {
+        let mut snapshot = ProviderBalanceSnapshot {
+            exhausted: Some(true),
+            exhaustion_affects_routing: false,
+            ..Default::default()
+        };
+        snapshot.refresh_status(100);
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert!(!snapshot.routing_exhausted());
     }
 }

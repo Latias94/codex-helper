@@ -160,7 +160,7 @@ fn station_balance_summary(
 }
 
 fn balance_exhaustion_rank(balance: &StationRoutingBalanceSummary) -> u8 {
-    if balance.snapshots > 0 && balance.exhausted == balance.snapshots {
+    if balance.routing_snapshots > 0 && balance.routing_exhausted == balance.routing_snapshots {
         1
     } else {
         0
@@ -412,6 +412,7 @@ mod tests {
                     BalanceSnapshotStatus::Ok => Some(false),
                     _ => None,
                 },
+                exhaustion_affects_routing: true,
                 total_balance_usd: None,
                 subscription_balance_usd: None,
                 paygo_balance_usd: None,
@@ -420,6 +421,20 @@ mod tests {
                 error: None,
             })
             .collect()
+    }
+
+    fn ignored_exhausted_balance() -> Vec<ProviderBalanceSnapshot> {
+        vec![ProviderBalanceSnapshot {
+            provider_id: "provider-0".to_string(),
+            station_name: Some("ignored".to_string()),
+            upstream_index: Some(0),
+            source: "test".to_string(),
+            fetched_at_ms: 1,
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            exhaustion_affects_routing: false,
+            ..ProviderBalanceSnapshot::default()
+        }]
     }
 
     #[test]
@@ -642,6 +657,44 @@ mod tests {
         assert_eq!(names(&plan.selected_stations), vec!["paygo", "monthly"]);
         assert_eq!(plan.selected_stations[0].balance.exhausted, 0);
         assert_eq!(plan.selected_stations[1].balance.exhausted, 1);
+    }
+
+    #[test]
+    fn auto_keeps_ignored_exhausted_station_in_its_priority_group() {
+        let mgr = manager(
+            Some("monthly"),
+            vec![
+                service(
+                    "monthly",
+                    true,
+                    1,
+                    vec![upstream("https://monthly.example/v1")],
+                ),
+                service("paygo", true, 2, vec![upstream("https://paygo.example/v1")]),
+            ],
+        );
+        let provider_balances = HashMap::from([
+            ("monthly".to_string(), ignored_exhausted_balance()),
+            ("paygo".to_string(), balance(&[BalanceSnapshotStatus::Ok])),
+        ]);
+
+        let plan = build_station_routing_plan(
+            &mgr,
+            mgr.active.as_deref(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &provider_balances,
+        );
+
+        assert_eq!(plan.mode, StationRoutingMode::MultiLevel);
+        assert_eq!(names(&plan.selected_stations), vec!["monthly", "paygo"]);
+        assert_eq!(plan.selected_stations[0].balance.exhausted, 1);
+        assert_eq!(plan.selected_stations[0].balance.routing_snapshots, 0);
+        assert_eq!(
+            plan.selected_stations[0].balance.routing_ignored_exhausted,
+            1
+        );
     }
 
     #[test]

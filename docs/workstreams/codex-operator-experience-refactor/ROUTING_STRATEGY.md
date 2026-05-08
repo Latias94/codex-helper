@@ -12,6 +12,7 @@
 - A pinned station is blocked only by breaker-open runtime state.
 - General routing builds a station plan from runtime state, enabled state, and upstream eligibility.
 - Known fully exhausted balance snapshots are now a route-priority signal.
+- Provider adapters may opt out of routing trust for exhausted snapshots when a source returns misleading zeros.
 - Only stations with every known balance snapshot exhausted are demoted.
 - Partial exhaustion, stale, error, and unknown balance states remain risk signals, not hard ordering inputs.
 - Same-level stations are ordered by exhaustion rank, then active station, then name.

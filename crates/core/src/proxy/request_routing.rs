@@ -25,6 +25,9 @@ fn station_candidate_json(candidate: &StationRoutingCandidate) -> serde_json::Va
             "stale": candidate.balance.stale,
             "error": candidate.balance.error,
             "unknown": candidate.balance.unknown,
+            "routing_snapshots": candidate.balance.routing_snapshots,
+            "routing_exhausted": candidate.balance.routing_exhausted,
+            "routing_ignored_exhausted": candidate.balance.routing_ignored_exhausted,
         },
     })
 }
@@ -38,14 +41,77 @@ fn station_candidate_names(candidates: &[StationRoutingCandidate]) -> Vec<String
 
 fn station_balance_state(candidate: &StationRoutingCandidate) -> &'static str {
     let balance = &candidate.balance;
-    if balance.snapshots == 0 {
-        "unknown"
-    } else if balance.exhausted == balance.snapshots {
+    if balance.routing_snapshots == 0 {
+        if balance.exhausted > 0 {
+            "ignored_exhausted"
+        } else {
+            "unknown"
+        }
+    } else if balance.routing_exhausted == balance.routing_snapshots {
         "all_exhausted"
-    } else if balance.exhausted > 0 {
+    } else if balance.routing_exhausted > 0 {
         "partial_exhausted"
+    } else if balance.exhausted > 0 {
+        "ignored_exhausted"
     } else {
         "available"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::config::ServiceConfig;
+    use crate::dashboard_core::StationRoutingBalanceSummary;
+    use crate::state::RuntimeConfigState;
+
+    fn candidate(balance: StationRoutingBalanceSummary) -> StationRoutingCandidate {
+        StationRoutingCandidate {
+            name: "alpha".to_string(),
+            service: ServiceConfig {
+                name: "alpha".to_string(),
+                alias: None,
+                enabled: true,
+                level: 1,
+                upstreams: vec![],
+            },
+            level: 1,
+            enabled: true,
+            runtime_state: RuntimeConfigState::Normal,
+            upstream_count: 0,
+            balance,
+        }
+    }
+
+    #[test]
+    fn balance_state_marks_ignored_exhaustion_separately() {
+        let candidate = candidate(StationRoutingBalanceSummary {
+            snapshots: 1,
+            exhausted: 1,
+            routing_ignored_exhausted: 1,
+            ..StationRoutingBalanceSummary::default()
+        });
+
+        assert_eq!(station_balance_state(&candidate), "ignored_exhausted");
+        let json = station_candidate_json(&candidate);
+        assert_eq!(
+            json["balance"]["routing_ignored_exhausted"].as_u64(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn balance_state_marks_trusted_all_exhausted() {
+        let candidate = candidate(StationRoutingBalanceSummary {
+            snapshots: 1,
+            exhausted: 1,
+            routing_snapshots: 1,
+            routing_exhausted: 1,
+            ..StationRoutingBalanceSummary::default()
+        });
+
+        assert_eq!(station_balance_state(&candidate), "all_exhausted");
     }
 }
 

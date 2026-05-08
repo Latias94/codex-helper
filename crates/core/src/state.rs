@@ -2487,6 +2487,7 @@ mod tests {
                         stale: false,
                         status: BalanceSnapshotStatus::Unknown,
                         exhausted: Some(false),
+                        exhaustion_affects_routing: true,
                         total_balance_usd: Some("3.5".to_string()),
                         subscription_balance_usd: None,
                         paygo_balance_usd: None,

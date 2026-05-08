@@ -395,6 +395,7 @@ Rules:
 - balance stale means unknown, not exhausted
 - balance API failure should be visible but should not automatically trip health
 - hard auth failures may still be provider faults when proven
+- provider-level balance adapters may opt out of routing trust for exhausted snapshots when the API is known to return misleading zeros; display should still show the raw exhausted state
 
 Refresh policy:
 
