@@ -196,6 +196,120 @@ fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
     }
 }
 
+fn balance_amount_brief(snapshot: &crate::state::ProviderBalanceSnapshot) -> Option<String> {
+    if let Some(total) = snapshot
+        .total_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(format!("${total}"));
+    }
+
+    match (
+        snapshot
+            .monthly_spent_usd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        snapshot
+            .monthly_budget_usd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(spent), Some(budget)) => Some(format!("${spent}/${budget}")),
+        _ => snapshot
+            .subscription_balance_usd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("sub ${value}"))
+            .or_else(|| {
+                snapshot
+                    .paygo_balance_usd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("paygo ${value}"))
+            }),
+    }
+}
+
+fn station_balance_cell(
+    provider_balances: &HashMap<String, Vec<crate::state::ProviderBalanceSnapshot>>,
+    station_name: &str,
+) -> String {
+    let Some(balances) = provider_balances.get(station_name) else {
+        return "-".to_string();
+    };
+    if balances.is_empty() {
+        return "-".to_string();
+    }
+
+    if balances.len() == 1 {
+        let snapshot = &balances[0];
+        let amount = balance_amount_brief(snapshot);
+        return match snapshot.status {
+            BalanceSnapshotStatus::Ok => amount.unwrap_or_else(|| "ok".to_string()),
+            BalanceSnapshotStatus::Exhausted => amount
+                .map(|value| format!("exh {value}"))
+                .unwrap_or_else(|| "exh".to_string()),
+            BalanceSnapshotStatus::Stale => amount
+                .map(|value| format!("stale {value}"))
+                .unwrap_or_else(|| "stale".to_string()),
+            BalanceSnapshotStatus::Error => "err".to_string(),
+            BalanceSnapshotStatus::Unknown => amount
+                .map(|value| format!("unk {value}"))
+                .unwrap_or_else(|| "unk".to_string()),
+        };
+    }
+
+    let mut ok = 0usize;
+    let mut stale = 0usize;
+    let mut exhausted = 0usize;
+    let mut error = 0usize;
+    let mut unknown = 0usize;
+    for snapshot in balances {
+        match snapshot.status {
+            BalanceSnapshotStatus::Ok => ok += 1,
+            BalanceSnapshotStatus::Stale => stale += 1,
+            BalanceSnapshotStatus::Exhausted => exhausted += 1,
+            BalanceSnapshotStatus::Error => error += 1,
+            BalanceSnapshotStatus::Unknown => unknown += 1,
+        }
+    }
+
+    let total = balances.len();
+    if error > 0 {
+        return format!("err {error}/{total}");
+    }
+    if exhausted > 0 {
+        return format!("exh {exhausted}/{total}");
+    }
+    if stale > 0 && ok == 0 {
+        return format!("stale {stale}/{total}");
+    }
+    if ok > 0 {
+        if let Some(amount) = balances
+            .iter()
+            .find(|snapshot| snapshot.status == BalanceSnapshotStatus::Ok)
+            .and_then(balance_amount_brief)
+        {
+            return amount;
+        }
+        return format!("ok {ok}/{total}");
+    }
+    if stale > 0 {
+        return format!("stale {stale}/{total}");
+    }
+    if unknown > 0 {
+        return format!("unk {unknown}/{total}");
+    }
+
+    "-".to_string()
+}
+
 fn format_skipped_station(skipped: &crate::dashboard_core::StationRoutingSkipped) -> String {
     format!(
         "{}: {}",
@@ -233,6 +347,7 @@ pub(super) fn render_stations_page(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
+    let now = now_ms();
 
     let selected_session = snapshot
         .rows
@@ -254,7 +369,7 @@ pub(super) fn render_stations_page(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["Lvl", "Name", "Alias", "On", "Up", "Health"])
+    let header = Row::new(["Lvl", "Name", "On", "Up", "Balance", "Health"])
         .style(Style::default().fg(p.muted))
         .height(1);
 
@@ -274,13 +389,9 @@ pub(super) fn render_stations_page(
                 name = format!("* {name}");
             }
 
-            let alias = cfg
-                .alias
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("-");
             let on = if enabled { "on" } else { "off" };
             let up = cfg.upstreams.len().to_string();
+            let balance = station_balance_cell(&snapshot.provider_balances, cfg.name.as_str());
             let health = if let Some(st) = snapshot.health_checks.get(cfg.name.as_str())
                 && !st.done
             {
@@ -336,9 +447,9 @@ pub(super) fn render_stations_page(
             Row::new([
                 format!("L{level}"),
                 name,
-                alias.to_string(),
                 on.to_string(),
                 up,
+                balance,
                 health,
             ])
             .style(style)
@@ -353,11 +464,11 @@ pub(super) fn render_stations_page(
         rows,
         [
             Constraint::Length(4),
-            Constraint::Length(16),
             Constraint::Min(10),
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(10),
         ],
     )
     .header(header)
@@ -530,7 +641,7 @@ pub(super) fn render_stations_page(
         }
 
         if let Some(health) = snapshot.station_health.get(cfg.name.as_str()) {
-            let age = format_age(now_ms(), Some(health.checked_at_ms));
+            let age = format_age(now, Some(health.checked_at_ms));
             lines.push(Line::from(vec![
                 Span::styled("health: ", Style::default().fg(p.muted)),
                 Span::styled(
@@ -612,7 +723,7 @@ pub(super) fn render_stations_page(
                         ),
                         Span::raw("  "),
                         Span::styled(
-                            shorten(&balance.amount_summary(), 72),
+                            shorten_middle(&balance.amount_summary(), 56),
                             Style::default().fg(p.muted),
                         ),
                     ]));
@@ -912,5 +1023,39 @@ mod tests {
 
         assert!(label.contains("balance=unknown=1"));
         assert!(!label.contains("balance=ok"));
+    }
+
+    #[test]
+    fn station_balance_cell_shows_single_amount() {
+        let provider_balances = HashMap::from([(
+            "alpha".to_string(),
+            vec![crate::state::ProviderBalanceSnapshot {
+                status: BalanceSnapshotStatus::Ok,
+                total_balance_usd: Some("3.50".to_string()),
+                ..crate::state::ProviderBalanceSnapshot::default()
+            }],
+        )]);
+
+        assert_eq!(station_balance_cell(&provider_balances, "alpha"), "$3.50");
+    }
+
+    #[test]
+    fn station_balance_cell_summarizes_multi_snapshot_states() {
+        let provider_balances = HashMap::from([(
+            "alpha".to_string(),
+            vec![
+                crate::state::ProviderBalanceSnapshot {
+                    status: BalanceSnapshotStatus::Exhausted,
+                    ..crate::state::ProviderBalanceSnapshot::default()
+                },
+                crate::state::ProviderBalanceSnapshot {
+                    status: BalanceSnapshotStatus::Ok,
+                    total_balance_usd: Some("1.00".to_string()),
+                    ..crate::state::ProviderBalanceSnapshot::default()
+                },
+            ],
+        )]);
+
+        assert_eq!(station_balance_cell(&provider_balances, "alpha"), "exh 1/2");
     }
 }

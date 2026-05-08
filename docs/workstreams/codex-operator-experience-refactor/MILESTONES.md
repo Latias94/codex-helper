@@ -225,6 +225,32 @@ Current implementation slice:
 - Added generic OpenAI/sub2api balance polling plus New API quota polling, with configurable JSON paths, divisors, headers, and endpoint/variable templating for self-hosted relays.
 - Added balance snapshot summaries to the shared station routing posture DTO so GUI/TUI auto-switch previews can mark `ok`, `exhausted`, `stale`, and `error` balance states in candidate order.
 - Added shared GUI station balance summaries to the Stations list, identity summary, and balance detail section so exhausted/stale/error quota state is visible before drilling into rows.
+- Added TUI balance summaries to the Stations list/detail and Settings overview so operators can inspect balance state and amounts without drilling into logs.
+- Kept balance refresh in the core adapter layer: `usage_providers.json` owns provider-level `poll_interval_secs`, and request-driven polling reuses the cached snapshot path instead of pushing refresh timing into the UI.
+
+### P1.2.1 Thin Provider Config
+
+Scope:
+
+- Keep provider creation focused on alias, enabled state, auth, and endpoints.
+- Treat `supported_models` and `model_mapping` as optional advanced routing metadata.
+- Keep pricing and balance adapter configuration outside the provider object unless the provider needs only a small reference.
+- Avoid a "one provider equals one full Codex config" shape.
+
+Primary files/modules:
+
+- `crates/core/src/config_v2.rs`
+- `crates/core/src/config_bootstrap.rs`
+- `crates/core/src/config_auth_sync.rs`
+- `crates/core/src/proxy/persisted_registry_api.rs`
+- `crates/gui/src/gui/pages/proxy_settings_workspace/editors/providers/*`
+
+Acceptance:
+
+- Adding a provider does not require filling model mapping tables.
+- GUI/CLI provider creation defaults to passthrough model policy.
+- Advanced model policy remains available without being part of the default add-provider path.
+- Existing configs with model metadata still load, but new persisted specs stay minimal unless advanced fields are intentionally set.
 
 ### P1.3 GUI Request Observatory
 

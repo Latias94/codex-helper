@@ -168,15 +168,16 @@ Observed from local files:
 
 Gap:
 
-- useful behavior exists but is not productized as balance status
-- balance/quota is not yet visible enough in station detail
-- stale/error/exhausted states need stronger modeling
+- useful behavior now exists and is surfaced in TUI/GUI, but balance adapter coverage is still incomplete
+- balance/quota still needs clearer policy weighting and operator-facing refresh controls
+- stale/error/exhausted states need to keep feeding routing preview and station eligibility
 
 Recommended fix:
 
 - first-class balance snapshot DTO
 - UI station balance display
 - route eligibility reason: quota exhausted
+- provider-level refresh policy and adapter extension points
 
 ### Request Chain
 

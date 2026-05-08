@@ -36,6 +36,17 @@ An operator still needs better answers to these questions:
 - Treating every provider-specific API as a first-class built-in before an adapter contract exists.
 - Enabling aggressive cross-station failover by default.
 
+## Provider Configuration Philosophy
+
+A provider should stay cheap to add.
+
+- The common path should ask for identity, auth, and endpoint data only.
+- Model allowlists and model mappings are advanced routing metadata, not a prerequisite for onboarding a provider.
+- Balance adapters and price catalogs belong in their own domains; provider config should not grow into a per-provider Codex clone.
+- If the operator does not declare model policy, the default should remain thin and permissive rather than forcing a large preset.
+
+The test for the schema is simple: can an operator add a relay without filling model tables, and only touch model policy when the relay really differs?
+
 ## Product Model
 
 ### Operator Console
@@ -384,6 +395,14 @@ Rules:
 - balance stale means unknown, not exhausted
 - balance API failure should be visible but should not automatically trip health
 - hard auth failures may still be provider faults when proven
+
+Refresh policy:
+
+- Balance fetching belongs to the core adapter layer, with GUI/TUI reading cached snapshots.
+- The default trigger is request-driven: after a routed request finishes, the matching balance adapter may poll its endpoint.
+- `poll_interval_secs` is the provider-level throttle/cache window so high-frequency Codex traffic does not hammer balance APIs.
+- UI surfaces should show balance amount, status, and routing eligibility; refresh timing is implementation detail unless exposed through an explicit diagnostics view.
+- A manual refresh action can be added later, but it should still call the same core adapter path.
 
 Adapter types:
 
