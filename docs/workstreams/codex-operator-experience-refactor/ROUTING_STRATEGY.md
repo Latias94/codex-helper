@@ -12,8 +12,10 @@
 - A pinned station is blocked only by breaker-open runtime state.
 - General routing builds a station plan from runtime state, enabled state, and upstream eligibility.
 - Known fully exhausted balance snapshots are now a route-priority signal.
-- Same-level stations are ordered by balance exhaustion, then active station, then name.
-- Multi-level stations are ordered by balance exhaustion, then level, then active tiebreak, then name.
+- Only stations with every known balance snapshot exhausted are demoted.
+- Partial exhaustion, stale, error, and unknown balance states remain risk signals, not hard ordering inputs.
+- Same-level stations are ordered by exhaustion rank, then active station, then name.
+- Multi-level stations are ordered by exhaustion rank, then level, then active tiebreak, then name.
 - Station-local load balancing still owns upstream choice inside the selected station.
 - Cross-station failover before first output is still gated by the retry policy guardrail.
 

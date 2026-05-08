@@ -229,6 +229,7 @@ Current implementation slice:
 - Kept balance refresh in the core adapter layer: `usage_providers.json` owns provider-level `refresh_on_request` and `poll_interval_secs`, and request-driven polling reuses the cached snapshot path instead of pushing refresh timing into the UI.
 - Added a manual provider balance refresh admin API so TUI/GUI can trigger the same core adapter/LB/snapshot path without learning provider-specific balance endpoints.
 - Balance-aware station ordering now demotes known fully exhausted stations during automatic routing, and the runtime preview uses the same order so UI and proxy stay in sync.
+- Routing previews now state the actual rule explicitly: only stations with every known balance snapshot exhausted are demoted, while partial/stale/error/unknown balances stay as warning signals.
 
 ### P1.2.1 Thin Provider Config
 

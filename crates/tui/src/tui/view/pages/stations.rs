@@ -124,6 +124,20 @@ fn format_routing_mode(mode: StationRoutingMode) -> &'static str {
     }
 }
 
+fn format_routing_order_hint(mode: StationRoutingMode) -> &'static str {
+    match mode {
+        StationRoutingMode::PinnedStation => {
+            "pinned target only; breaker_open / empty upstreams block."
+        }
+        StationRoutingMode::AutoLevelFallback => {
+            "known fully exhausted stations are demoted first, then lower level, then active."
+        }
+        StationRoutingMode::AutoSingleLevelFallback => {
+            "known fully exhausted stations are demoted first, then active, then stable name order."
+        }
+    }
+}
+
 fn format_retry_boundary(boundary: StationRetryBoundary) -> String {
     match boundary {
         StationRetryBoundary::Unknown => "resolved policy unavailable".to_string(),
@@ -555,6 +569,13 @@ pub(super) fn render_stations_page(
             Span::styled("retry: ", Style::default().fg(p.muted)),
             Span::styled(
                 shorten_middle(&format_retry_boundary(routing.retry_boundary), 96),
+                Style::default().fg(p.muted),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("order_rule: ", Style::default().fg(p.muted)),
+            Span::styled(
+                shorten_middle(format_routing_order_hint(routing.mode), 96),
                 Style::default().fg(p.muted),
             ),
         ]));
@@ -1023,6 +1044,14 @@ mod tests {
 
         assert!(label.contains("balance=unknown=1"));
         assert!(!label.contains("balance=ok"));
+    }
+
+    #[test]
+    fn routing_order_hint_explains_balance_demotion() {
+        let text = format_routing_order_hint(StationRoutingMode::AutoLevelFallback);
+
+        assert!(text.contains("fully exhausted stations are demoted first"));
+        assert!(text.contains("lower level"));
     }
 
     #[test]

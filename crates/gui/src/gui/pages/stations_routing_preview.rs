@@ -213,18 +213,18 @@ fn format_routing_order_hint(lang: Language, mode: StationRoutingMode) -> &'stat
     match mode {
         StationRoutingMode::PinnedStation => pick(
             lang,
-            "排序规则：pin 模式只看固定目标；level / active 不会重新排序，breaker_open 和无上游会阻断。",
-            "Order rule: pinned mode only uses the pinned target; level / active do not reorder it, while breaker_open and empty upstream pools block it.",
+            "排序规则：pin 模式只看固定目标；level / active / 余额不会重新排序，breaker_open 和无上游会阻断。",
+            "Order rule: pinned mode only uses the pinned target; level / active / balance do not reorder it, while breaker_open and empty upstream pools block it.",
         ),
         StationRoutingMode::AutoLevelFallback => pick(
             lang,
-            "排序规则：先按 level，小 level 优先；同级再优先 active。月包主用、按量兜底通常放成 L1 active + L2 backup。",
-            "Order rule: lower level wins, then active wins within the same level. Monthly primary plus pay-as-you-go backup usually maps to L1 active + L2 backup.",
+            "排序规则：已知全耗尽的 station 会降级；其余先按 level，小 level 优先；同级再优先 active。部分耗尽/未知余额只作为风险提示。",
+            "Order rule: known fully exhausted stations are demoted; the rest prefer lower level, then active within the same level. Partial/unknown balances stay as risk signals.",
         ),
         StationRoutingMode::AutoSingleLevelFallback => pick(
             lang,
-            "排序规则：所有候选同级时优先 active，其余同级候选继续作为 failover 池；余额状态只解释风险，不改写 station 顺序。",
-            "Order rule: with one level, active is preferred and the remaining same-level candidates stay in the failover pool; balance status explains risk but does not rewrite station order.",
+            "排序规则：所有候选同级时，已知全耗尽的 station 会降级；其余优先 active，再按名称稳定排序。部分耗尽/未知余额只作为风险提示。",
+            "Order rule: with one level, known fully exhausted stations are demoted; the rest prefer active, then stable name order. Partial/unknown balances stay as risk signals.",
         ),
     }
 }
@@ -356,17 +356,27 @@ mod tests {
     fn routing_order_hint_explains_level_priority() {
         let text = format_routing_order_hint(Language::En, StationRoutingMode::AutoLevelFallback);
 
-        assert!(text.contains("lower level wins"));
-        assert!(text.contains("L1 active + L2 backup"));
+        assert!(text.contains("known fully exhausted stations are demoted"));
+        assert!(text.contains("prefer lower level"));
+        assert!(text.contains("Partial/unknown balances stay as risk signals"));
     }
 
     #[test]
-    fn routing_order_hint_explains_same_level_active_priority() {
+    fn routing_order_hint_explains_same_level_balance_and_active_priority() {
         let text =
             format_routing_order_hint(Language::En, StationRoutingMode::AutoSingleLevelFallback);
 
-        assert!(text.contains("active is preferred"));
-        assert!(text.contains("balance status explains risk"));
+        assert!(text.contains("known fully exhausted stations are demoted"));
+        assert!(text.contains("prefer active"));
+        assert!(text.contains("Partial/unknown balances stay as risk signals"));
+    }
+
+    #[test]
+    fn routing_order_hint_explains_pinned_balance_boundary() {
+        let text = format_routing_order_hint(Language::En, StationRoutingMode::PinnedStation);
+
+        assert!(text.contains("pinned target"));
+        assert!(text.contains("balance do not reorder"));
     }
 
     #[test]
