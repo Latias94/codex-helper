@@ -161,6 +161,12 @@ Target:
 - Table highlight spacing is consistent across all stateful tables.
 - Header/status/footer text has width-aware compaction.
 
+Current status:
+
+- The render loop uses explicit redraw vs full-clear invalidation, with full clear on page switch and terminal resize.
+- Stations aligns with stateful table highlight spacing and synchronizes viewport offset from the visible row count before rendering.
+- Header/status lines are display-width fitted, and page tabs degrade to compact numeric labels while keeping the selected page visible.
+
 Removal condition:
 
 - TUI smoke tests or snapshot-style tests cover resize/page switch layout invariants where practical.

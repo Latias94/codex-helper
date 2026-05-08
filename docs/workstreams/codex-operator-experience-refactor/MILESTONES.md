@@ -55,8 +55,9 @@ Suggested verification:
 Current implementation slice:
 
 - Full-clear invalidation is used on page switches and terminal resize.
+- Stations now synchronizes table selection and viewport offset before rendering, using the actual visible row count so up/down navigation cannot leave the selected row outside the stateful table window.
 - Stateful table viewport offsets are clamped with selection state and reset on page switch/resize to avoid stale rows after data or size changes.
-- Header status lines now have final display-width fitting, including CJK width, so narrow terminals clip predictably instead of overflowing.
+- Header status lines now have final display-width fitting, including CJK width, and page tabs compact to numeric tabs while preserving the selected page label on narrow terminals.
 
 ### P0.2 Usage Metrics v2
 

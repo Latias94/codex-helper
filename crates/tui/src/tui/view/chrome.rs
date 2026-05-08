@@ -88,21 +88,62 @@ fn fit_line_to_width(line: Line<'static>, max_width: u16) -> Line<'static> {
     fit_spans_to_width(line.spans, max_width)
 }
 
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
+fn tab_style(p: Palette, selected: bool) -> Style {
+    if selected {
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.muted)
+    }
+}
+
 fn header_tabs_line(p: Palette, ui: &UiState, max_width: u16) -> Line<'static> {
     let selected = page_index(ui.page);
-    let mut spans = Vec::new();
-    for (idx, title) in page_titles(ui.language).iter().enumerate() {
+    let titles = page_titles(ui.language);
+
+    let mut full = Vec::new();
+    for (idx, title) in titles.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::raw("  "));
+            full.push(Span::raw("  "));
         }
-        let style = if idx == selected {
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(p.muted)
-        };
-        spans.push(Span::styled((*title).to_string(), style));
+        full.push(Span::styled(
+            (*title).to_string(),
+            tab_style(p, idx == selected),
+        ));
     }
-    fit_spans_to_width(spans, max_width)
+    if spans_width(&full) <= usize::from(max_width) {
+        return Line::from(full);
+    }
+
+    let mut compact = Vec::new();
+    for (idx, title) in titles.iter().enumerate() {
+        if idx > 0 {
+            compact.push(Span::raw(" "));
+        }
+        let label = if idx == selected {
+            (*title).to_string()
+        } else {
+            (idx + 1).to_string()
+        };
+        compact.push(Span::styled(label, tab_style(p, idx == selected)));
+    }
+    if spans_width(&compact) <= usize::from(max_width) {
+        return Line::from(compact);
+    }
+
+    fit_spans_to_width(
+        vec![Span::styled(
+            titles[selected].to_string(),
+            tab_style(p, true),
+        )],
+        max_width,
+    )
 }
 
 pub(super) fn render_header(
@@ -663,6 +704,13 @@ mod tests {
             .sum()
     }
 
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
     #[test]
     fn fit_spans_to_width_truncates_overlong_header_line() {
         let line = fit_spans_to_width(
@@ -695,5 +743,33 @@ mod tests {
         let line = header_tabs_line(Palette::default(), &ui, 24);
 
         assert!(line_width(&line) <= 24);
+    }
+
+    #[test]
+    fn header_tabs_line_keeps_selected_page_visible_when_compact() {
+        let ui = UiState {
+            page: Page::Settings,
+            language: crate::tui::Language::En,
+            ..Default::default()
+        };
+
+        let line = header_tabs_line(Palette::default(), &ui, 24);
+
+        assert!(line_width(&line) <= 24);
+        assert!(line_text(&line).contains("6 Settings"));
+    }
+
+    #[test]
+    fn header_tabs_line_falls_back_to_selected_page_for_tiny_width() {
+        let ui = UiState {
+            page: Page::Recent,
+            language: crate::tui::Language::En,
+            ..Default::default()
+        };
+
+        let line = header_tabs_line(Palette::default(), &ui, 8);
+
+        assert!(line_width(&line) <= 8);
+        assert!(line_text(&line).starts_with("8"));
     }
 }

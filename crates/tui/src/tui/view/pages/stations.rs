@@ -346,11 +346,8 @@ pub(super) fn render_stations_page(
         })
         .collect::<Vec<_>>();
 
-    ui.stations_table.select(if providers.is_empty() {
-        None
-    } else {
-        Some(ui.selected_station_idx)
-    });
+    let table_visible_rows = usize::from(left_block.inner(columns[0]).height.saturating_sub(1));
+    ui.sync_stations_table_viewport(providers.len(), table_visible_rows);
 
     let table = Table::new(
         rows,

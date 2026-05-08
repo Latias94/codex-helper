@@ -54,10 +54,7 @@ Current strengths:
 
 Current weak points:
 
-- TUI rendering has known polish/stability issues:
-  - resize redraws do not force a full terminal clear
-  - the Stations table highlight spacing differs from other tables
-  - the header/status bar has long single-line text that can break narrow layouts
+- TUI rendering has been hardened with full-clear invalidation on resize/page switch, Stations viewport synchronization, consistent table highlight spacing, and compact selected-page-aware header tabs; remaining risk is terminal-emulator-specific smoke coverage.
 - Usage metrics and cost calculation now have a core cache-aware path, but price catalog sync / override UX still needs product polish.
 - Balance/usage polling is now projected as first-class balance snapshots, but more provider adapters and policy weighting are still needed.
 - Request logs and API DTOs expose route/cost/cache facts, but long-horizon audit/search still needs a durable ledger decision.

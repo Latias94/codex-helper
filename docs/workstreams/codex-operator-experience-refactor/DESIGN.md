@@ -438,7 +438,7 @@ Suggested model:
 
 ```rust
 enum RenderInvalidation {
-    Normal,
+    Redraw,
     FullClear,
 }
 ```
@@ -450,6 +450,8 @@ Events requiring full clear:
 - entering/leaving large overlay if stale cells are observed
 - theme/layout mode changes
 
+Current implementation uses explicit redraw vs full-clear invalidation, with page switches and terminal resize forcing a clear before the next draw.
+
 ### Table Stability
 
 All stateful tables should use consistent highlight spacing.
@@ -459,6 +461,8 @@ Known immediate target:
 - `crates/tui/src/tui/view/pages/stations.rs`
 
 Other table pages already use `HighlightSpacing::Always` in several places. Stations should align with that behavior.
+
+Stations now also synchronizes table offset from the selected row and visible row count before rendering. This keeps navigation deterministic instead of relying on ratatui's render-time offset mutation as the only source of truth.
 
 ### Header and Footer Compaction
 
@@ -472,6 +476,8 @@ Other table pages already use `HighlightSpacing::Always` in several places. Stat
   - key route and health only
 
 Avoid long single-line paragraphs that rely on terminal wrapping.
+
+Current header implementation fits lines by display width, including CJK characters, and compacts page tabs to numeric labels while preserving the selected page label on narrow terminals.
 
 ## GUI Design Direction
 

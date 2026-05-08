@@ -283,6 +283,20 @@ impl UiState {
         }
     }
 
+    pub(in crate::tui) fn sync_stations_table_viewport(
+        &mut self,
+        providers_len: usize,
+        visible_rows: usize,
+    ) {
+        self.selected_station_idx = clamp_table_viewport(
+            &mut self.stations_table,
+            Some(self.selected_station_idx),
+            providers_len,
+            visible_rows,
+        )
+        .unwrap_or(0);
+    }
+
     pub(in crate::tui) fn sync_codex_history_selection(&mut self) {
         let len = self.codex_history_sessions.len();
         let selected_idx = self
@@ -338,6 +352,35 @@ fn clamp_table_selection(
     let selected = selected.unwrap_or(0).min(len - 1);
     table.select(Some(selected));
     *table.offset_mut() = table.offset().min(len - 1).min(selected);
+    Some(selected)
+}
+
+fn clamp_table_viewport(
+    table: &mut TableState,
+    selected: Option<usize>,
+    len: usize,
+    visible_rows: usize,
+) -> Option<usize> {
+    let selected = clamp_table_selection(table, selected, len)?;
+    if visible_rows == 0 {
+        *table.offset_mut() = selected;
+        return Some(selected);
+    }
+
+    let visible_rows = visible_rows.min(len);
+    let max_offset = len.saturating_sub(visible_rows);
+    let mut offset = table.offset().min(max_offset);
+
+    if selected < offset {
+        offset = selected;
+    } else {
+        let end_exclusive = offset.saturating_add(visible_rows);
+        if selected >= end_exclusive {
+            offset = selected.saturating_add(1).saturating_sub(visible_rows);
+        }
+    }
+
+    *table.offset_mut() = offset.min(max_offset);
     Some(selected)
 }
 
@@ -455,6 +498,43 @@ mod tests {
         assert_eq!(selected, None);
         assert_eq!(table.selected(), None);
         assert_eq!(table.offset(), 0);
+    }
+
+    #[test]
+    fn table_viewport_scrolls_down_to_keep_selection_visible() {
+        let mut table = TableState::default().with_offset(0).with_selected(Some(0));
+
+        let selected = clamp_table_viewport(&mut table, Some(8), 20, 5);
+
+        assert_eq!(selected, Some(8));
+        assert_eq!(table.selected(), Some(8));
+        assert_eq!(table.offset(), 4);
+    }
+
+    #[test]
+    fn table_viewport_scrolls_up_to_keep_selection_visible() {
+        let mut table = TableState::default()
+            .with_offset(10)
+            .with_selected(Some(10));
+
+        let selected = clamp_table_viewport(&mut table, Some(7), 20, 5);
+
+        assert_eq!(selected, Some(7));
+        assert_eq!(table.selected(), Some(7));
+        assert_eq!(table.offset(), 7);
+    }
+
+    #[test]
+    fn table_viewport_clamps_offset_when_list_shrinks() {
+        let mut table = TableState::default()
+            .with_offset(12)
+            .with_selected(Some(12));
+
+        let selected = clamp_table_viewport(&mut table, Some(12), 8, 5);
+
+        assert_eq!(selected, Some(7));
+        assert_eq!(table.selected(), Some(7));
+        assert_eq!(table.offset(), 3);
     }
 
     #[test]

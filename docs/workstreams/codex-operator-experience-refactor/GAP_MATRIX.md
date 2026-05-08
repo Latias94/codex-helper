@@ -89,7 +89,7 @@ Use it for:
 | --- | --- | --- | --- | --- | --- |
 | Codex-first relay | Strong | Supports Codex among many CLIs | Supports Codex among many CLIs | Keep our specialization | Keep |
 | Station/profile/session binding | Strong | Provider-oriented | Provider/CLI-oriented | Our advantage; preserve | Keep |
-| TUI stability | Known issues in Stations/header/resize | GUI-first | GUI-first | TUI needs render hygiene | P0 |
+| TUI stability | Render invalidation, Stations viewport sync, and compact header tabs are implemented; manual smoke still needed | GUI-first | GUI-first | Keep hardening snapshot-style coverage where practical | P0 |
 | GUI operator console | Exists, still maturing | Strong desktop UI | Strong dashboard UI | Needs request/cost/balance polish | P1 |
 | Request JSONL | Exists | SQLite request logs | SQLite request logs | Needs v2 schema and trace chain | P0 |
 | Trace ID | Partial/local request ID | Request ID | Trace ID first-class | Add stable trace key across events | P0 |
@@ -112,22 +112,23 @@ Use it for:
 Observed from local files:
 
 - `crates/tui/src/tui/mod.rs`
-  - page switches call `terminal.clear()`
-  - `Event::Resize` only sets `should_redraw = true`
+  - page switches and resize events request full terminal clear
+  - the render loop separates normal redraw from full-clear invalidation
 - `crates/tui/src/tui/view/pages/stations.rs`
-  - Stations table does not use the same `HighlightSpacing::Always` pattern used by other table pages
+  - Stations table uses `HighlightSpacing::Always`
+  - Stations table synchronizes selection and viewport offset against the visible row count before render
 - `crates/tui/src/tui/view/chrome.rs`
-  - header/footer strings are dense and single-line oriented
+  - header/footer strings are display-width fitted, including CJK width
+  - page tabs compact to numeric tabs while preserving the selected page label
 
-Likely effect:
+Remaining risk:
 
-- stale cells or repeated-row artifacts after selection movement, resize, or narrow layout pressure.
+- manual smoke testing is still needed across terminals because stale-cell behavior can depend on terminal emulator quirks
 
 Recommended fix:
 
-- full clear on resize
-- consistent highlight spacing
-- width-aware chrome compaction
+- add snapshot-style layout tests where practical
+- keep reducing render-time state mutation for filtered tables
 
 ### Usage and Cost
 
