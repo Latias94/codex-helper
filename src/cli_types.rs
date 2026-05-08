@@ -625,7 +625,7 @@ pub enum UsageCommand {
         /// Maximum number of summary rows to show (sorted by total_tokens desc)
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Group summary rows by station, provider, model, or session
+        /// Group summary rows by routing target, provider, model, or session
         #[arg(long, value_enum, default_value_t = UsageSummaryBy::Station)]
         by: UsageSummaryBy,
     },
@@ -640,7 +640,7 @@ pub enum UsageCommand {
         /// Match model id substring
         #[arg(long)]
         model: Option<String>,
-        /// Match station/config name substring
+        /// Match routing target/config name substring
         #[arg(long)]
         station: Option<String>,
         /// Match provider id substring

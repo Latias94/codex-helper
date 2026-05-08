@@ -408,7 +408,7 @@ codex-helper config migrate --write --yes
   codex-helper usage find --session <SESSION_ID> --raw
   ```
 
-  Text output shows station/provider/model, service_tier/fast, input/output/cache/reasoning tokens, duration, TTFB, output speed, and estimated cost when possible. `usage find` filters by session/model/station/provider/status/fast/retry; `--raw` still prints the original JSONL.
+  Text output shows routing target/provider/model, service_tier/fast, input/output/cache/reasoning tokens, duration, TTFB, output speed, and estimated cost when possible. `usage find` filters by session/model/routing target/provider/status/fast/retry; `--raw` still prints the original JSONL.
 
 - Status & doctor:
 

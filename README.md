@@ -360,7 +360,7 @@ codex-helper config migrate --write --yes
   codex-helper usage find --session <SESSION_ID> --raw
   ```
 
-  普通文本输出会展示 station/provider/model、service_tier/fast、input/output/cache/reasoning token、耗时、TTFB、输出速度和可估算成本；`usage find` 可按 session/model/station/provider/status/fast/retry 过滤，`--raw` 仍输出原始 JSONL。
+  普通文本输出会展示 routing target/provider/model、service_tier/fast、input/output/cache/reasoning token、耗时、TTFB、输出速度和可估算成本；`usage find` 可按 session/model/routing target/provider/status/fast/retry 过滤，`--raw` 仍输出原始 JSONL。
 
 - 状态与诊断：
 
