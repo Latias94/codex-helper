@@ -56,6 +56,17 @@ pub struct RequestLogFilters {
 }
 
 impl RequestLogFilters {
+    pub fn is_empty(&self) -> bool {
+        self.session.is_none()
+            && self.model.is_none()
+            && self.station.is_none()
+            && self.provider.is_none()
+            && self.status_min.is_none()
+            && self.status_max.is_none()
+            && !self.fast
+            && !self.retried
+    }
+
     pub fn matches(&self, record: &JsonValue) -> bool {
         if let Some(expected) = self.session.as_deref()
             && !field_contains(str_field(record, "session_id"), expected)
@@ -222,6 +233,21 @@ pub fn tail_finished_requests_from_log(
         .collect::<Vec<_>>();
     requests.reverse();
     Ok(requests)
+}
+
+pub fn find_finished_requests_from_log(
+    path: &Path,
+    filters: &RequestLogFilters,
+    limit: usize,
+) -> std::io::Result<Vec<FinishedRequest>> {
+    let lines = find_request_log(path, filters, limit)?;
+    Ok(lines
+        .iter()
+        .filter_map(|line| {
+            line.value()
+                .and_then(finished_request_from_request_log_record)
+        })
+        .collect())
 }
 
 pub fn summarize_request_log(
@@ -446,9 +472,25 @@ fn request_was_retried(record: &JsonValue) -> bool {
     {
         return true;
     }
-    record
+    if record
         .get("retry")
         .and_then(|retry| retry.get("route_attempts"))
+        .and_then(|attempts| attempts.as_array())
+        .is_some_and(|attempts| attempts.len() > 1)
+    {
+        return true;
+    }
+    if record
+        .get("retry")
+        .and_then(|retry| retry.get("attempts"))
+        .and_then(|attempts| attempts.as_u64())
+        .is_some_and(|attempts| attempts > 1)
+    {
+        return true;
+    }
+    record
+        .get("retry")
+        .and_then(|retry| retry.get("upstream_chain"))
         .and_then(|attempts| attempts.as_array())
         .is_some_and(|attempts| attempts.len() > 1)
 }

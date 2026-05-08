@@ -416,6 +416,25 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert_eq!(request_ledger[0]["model"].as_str(), Some("gpt-5.4"));
     assert_eq!(request_ledger[0]["service_tier"].as_str(), Some("priority"));
 
+    let filtered_request_ledger = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/request-ledger/recent?limit=40&station=backup&provider=fallback&model=5.4&fast=true&retried=true&status_min=400&status_max=499",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("filtered request ledger send")
+        .error_for_status()
+        .expect("filtered request ledger status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("filtered request ledger json");
+    assert_eq!(
+        filtered_request_ledger.as_array().map(|items| items.len()),
+        Some(1)
+    );
+    assert_eq!(filtered_request_ledger[0]["id"].as_u64(), Some(42));
+
     let set_global = client
         .post(format!(
             "http://{}/__codex_helper/api/v1/overrides/global-station",

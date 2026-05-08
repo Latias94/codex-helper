@@ -344,6 +344,7 @@ Current implementation slice:
 - Extended `codex-helper usage summary --by station|provider|model|session` so long-horizon JSONL replay can answer provider/model/session consumption questions before SQLite is introduced.
 - Added a local-running GUI Requests mode that loads recent `requests.jsonl` entries through core `request_ledger` and reuses the existing request list/detail components for longer local history.
 - Added the admin-protected v1 `request-ledger/recent` management API and GUI attached-mode loading, so a GUI attached to another codex-helper proxy can inspect that proxy's JSONL-backed request history without reading the GUI host's local files.
+- Aligned request-ledger filtering across CLI/API/GUI for session, model, station, provider, status ranges, fast mode, and retry/failover inspection.
 - Kept JSONL as the canonical append-only export/debug source for this phase; a future SQLite ledger should be a rebuildable index/cache over the same canonical request records.
 
 ### P2.2 Advanced Route Policy Engine

@@ -552,8 +552,8 @@ Current bridge:
 - `crates/core/src/request_ledger.rs` owns JSONL-backed request log reading, filtering, usage aggregation, and compact request formatting.
 - `codex-helper usage tail/summary/find` now uses that core query API instead of carrying private CLI parsing logic.
 - `codex-helper usage summary --by station|provider|model|session` gives immediate long-horizon grouped usage views while the durable ledger remains undecided.
-- The v1 management plane exposes `request-ledger/recent` behind the same admin boundary as the rest of the control API, returning projected `FinishedRequest` records instead of host-local file paths.
-- GUI Requests can opt into the JSONL ledger while the proxy is running locally or attached to a proxy that advertises the request-ledger API, projecting log rows back into the shared `FinishedRequest` detail/list components.
+- The v1 management plane exposes `request-ledger/recent` behind the same admin boundary as the rest of the control API, returning projected `FinishedRequest` records instead of host-local file paths and accepting the same session/model/station/provider/status/fast/retry filters as the core ledger query API.
+- GUI Requests can opt into the JSONL ledger while the proxy is running locally or attached to a proxy that advertises the request-ledger API, projecting log rows back into the shared `FinishedRequest` detail/list components and filtering by model, station, provider, fast mode, retry, selected session, and error status.
 - This validates the operator query surface before choosing a durable index. Future SQLite should be a rebuildable query/cache layer over canonical request records, while JSONL remains the export/debug source.
 
 ## Migration Strategy

@@ -62,6 +62,46 @@ pub(super) fn render_requests_filters(
         }
     });
 
+    ui.horizontal_wrapped(|ui| {
+        ui.label(pick(ctx.lang, "模型", "Model"));
+        ui.add(
+            egui::TextEdit::singleline(&mut ctx.view.requests.model_filter).desired_width(110.0),
+        );
+        ui.label(pick(ctx.lang, "站点", "Station"));
+        ui.add(
+            egui::TextEdit::singleline(&mut ctx.view.requests.station_filter).desired_width(100.0),
+        );
+        ui.label(pick(ctx.lang, "提供商", "Provider"));
+        ui.add(
+            egui::TextEdit::singleline(&mut ctx.view.requests.provider_filter).desired_width(100.0),
+        );
+        ui.checkbox(
+            &mut ctx.view.requests.fast_only,
+            pick(ctx.lang, "fast", "fast"),
+        );
+        ui.checkbox(
+            &mut ctx.view.requests.retried_only,
+            pick(ctx.lang, "重试", "retried"),
+        );
+
+        let has_filters = !ctx.view.requests.model_filter.trim().is_empty()
+            || !ctx.view.requests.station_filter.trim().is_empty()
+            || !ctx.view.requests.provider_filter.trim().is_empty()
+            || ctx.view.requests.fast_only
+            || ctx.view.requests.retried_only;
+        if has_filters
+            && ui
+                .button(pick(ctx.lang, "清除筛选", "Clear filters"))
+                .clicked()
+        {
+            ctx.view.requests.model_filter.clear();
+            ctx.view.requests.station_filter.clear();
+            ctx.view.requests.provider_filter.clear();
+            ctx.view.requests.fast_only = false;
+            ctx.view.requests.retried_only = false;
+        }
+    });
+
     if ctx.view.requests.include_request_ledger {
         render_request_ledger_status(ui, ctx);
     }
@@ -170,20 +210,122 @@ pub(super) fn filtered_recent_requests<'a>(
 ) -> Vec<&'a FinishedRequest> {
     recent
         .iter()
-        .filter(|request| {
-            if ctx.view.requests.errors_only && request.status_code < 400 {
-                return false;
-            }
-            if ctx.view.requests.scope_session {
-                match (selected_sid_ref, request.session_id.as_deref()) {
-                    (Some(sid), Some(request_sid)) => sid == request_sid,
-                    (Some(_), None) => false,
-                    (None, _) => true,
-                }
-            } else {
-                true
-            }
-        })
+        .filter(|request| request_matches_filters(request, &ctx.view.requests, selected_sid_ref))
         .take(600)
         .collect()
+}
+
+fn request_matches_filters(
+    request: &FinishedRequest,
+    filters: &RequestsViewState,
+    selected_sid_ref: Option<&str>,
+) -> bool {
+    if filters.errors_only && request.status_code < 400 {
+        return false;
+    }
+    if filters.scope_session {
+        match (selected_sid_ref, request.session_id.as_deref()) {
+            (Some(sid), Some(request_sid)) if sid == request_sid => {}
+            (Some(_), _) => return false,
+            (None, _) => {}
+        }
+    }
+    if !field_matches_filter(request.model.as_deref(), &filters.model_filter) {
+        return false;
+    }
+    if !field_matches_filter(request.station_name.as_deref(), &filters.station_filter) {
+        return false;
+    }
+    if !field_matches_filter(request.provider_id.as_deref(), &filters.provider_filter) {
+        return false;
+    }
+    if filters.fast_only && !request.is_fast_mode() {
+        return false;
+    }
+    if filters.retried_only && !request.observability_view().retried {
+        return false;
+    }
+    true
+}
+
+fn field_matches_filter(value: Option<&str>, filter: &str) -> bool {
+    let filter = filter.trim().to_ascii_lowercase();
+    if filter.is_empty() {
+        return true;
+    }
+    value
+        .map(|value| value.to_ascii_lowercase().contains(&filter))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_fixture() -> FinishedRequest {
+        let mut request = FinishedRequest {
+            id: 7,
+            trace_id: Some("codex-7".to_string()),
+            session_id: Some("sid".to_string()),
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            service_tier: Some("priority".to_string()),
+            station_name: Some("primary".to_string()),
+            provider_id: Some("relay".to_string()),
+            upstream_base_url: Some("https://relay.example/v1".to_string()),
+            route_decision: None,
+            usage: None,
+            cost: crate::pricing::CostBreakdown::default(),
+            retry: Some(crate::logging::RetryInfo {
+                attempts: 2,
+                upstream_chain: vec![
+                    "primary:https://relay.example/v1".to_string(),
+                    "backup:https://relay.example/v1".to_string(),
+                ],
+                route_attempts: Vec::new(),
+            }),
+            observability: crate::state::RequestObservability::default(),
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 1_000,
+            ttfb_ms: Some(200),
+            streaming: false,
+            ended_at_ms: 9_000,
+        };
+        request.refresh_observability();
+        request
+    }
+
+    #[test]
+    fn request_filters_match_route_fast_and_retry_fields() {
+        let request = request_fixture();
+        let filters = RequestsViewState {
+            scope_session: true,
+            model_filter: "5.4".to_string(),
+            station_filter: "prim".to_string(),
+            provider_filter: "relay".to_string(),
+            fast_only: true,
+            retried_only: true,
+            ..RequestsViewState::default()
+        };
+
+        assert!(request_matches_filters(&request, &filters, Some("sid")));
+    }
+
+    #[test]
+    fn request_filters_reject_nonmatching_provider() {
+        let request = request_fixture();
+        let filters = RequestsViewState {
+            scope_session: false,
+            provider_filter: "other".to_string(),
+            ..RequestsViewState::default()
+        };
+
+        assert!(!request_matches_filters(&request, &filters, None));
+    }
 }

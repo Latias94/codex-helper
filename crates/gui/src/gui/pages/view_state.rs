@@ -297,6 +297,11 @@ pub struct SessionsViewState {
 pub struct RequestsViewState {
     pub errors_only: bool,
     pub scope_session: bool,
+    pub model_filter: String,
+    pub station_filter: String,
+    pub provider_filter: String,
+    pub fast_only: bool,
+    pub retried_only: bool,
     pub focused_session_id: Option<String>,
     pub selected_idx: usize,
     pub include_request_ledger: bool,
@@ -314,6 +319,11 @@ impl Default for RequestsViewState {
         Self {
             errors_only: false,
             scope_session: true,
+            model_filter: String::new(),
+            station_filter: String::new(),
+            provider_filter: String::new(),
+            fast_only: false,
+            retried_only: false,
             focused_session_id: None,
             selected_idx: 0,
             include_request_ledger: false,

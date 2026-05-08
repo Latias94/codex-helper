@@ -18,6 +18,35 @@ pub(super) struct ControlTraceQuery {
 #[derive(serde::Deserialize)]
 pub(super) struct RequestLedgerRecentQuery {
     limit: Option<usize>,
+    session: Option<String>,
+    model: Option<String>,
+    station: Option<String>,
+    provider: Option<String>,
+    status_min: Option<u64>,
+    status_max: Option<u64>,
+    fast: Option<bool>,
+    retried: Option<bool>,
+}
+
+impl RequestLedgerRecentQuery {
+    fn filters(&self) -> crate::request_ledger::RequestLogFilters {
+        crate::request_ledger::RequestLogFilters {
+            session: clean_filter(self.session.clone()),
+            model: clean_filter(self.model.clone()),
+            station: clean_filter(self.station.clone()),
+            provider: clean_filter(self.provider.clone()),
+            status_min: self.status_min,
+            status_max: self.status_max,
+            fast: self.fast.unwrap_or(false),
+            retried: self.retried.unwrap_or(false),
+        }
+    }
+}
+
+fn clean_filter(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub(super) async fn runtime_status(
@@ -44,12 +73,16 @@ pub(super) async fn get_request_ledger_recent(
     Query(q): Query<RequestLedgerRecentQuery>,
 ) -> Result<Json<Vec<crate::state::FinishedRequest>>, (StatusCode, String)> {
     let limit = q.limit.unwrap_or(1000).clamp(20, 5000);
-    crate::request_ledger::tail_finished_requests_from_log(
-        &crate::request_ledger::request_log_path(),
-        limit,
-    )
-    .map(Json)
-    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+    let filters = q.filters();
+    let path = crate::request_ledger::request_log_path();
+    let records = if filters.is_empty() {
+        crate::request_ledger::tail_finished_requests_from_log(&path, limit)
+    } else {
+        crate::request_ledger::find_finished_requests_from_log(&path, &filters, limit)
+    };
+    records
+        .map(Json)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
 pub(super) async fn set_retry_config(
