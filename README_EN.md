@@ -137,7 +137,7 @@ If you want the shortest path to the current feature set, these are the main ent
 - TUI / GUI
   - `Stations`: station capability, health, breaker, quick switch
   - `Sessions`: session identity, effective route, session overrides
-  - `Profiles` / Config: profile and provider/routing structure management
+  - `Proxy Settings` / Config: v3 routing-first summary and raw TOML; persistent provider/routing edits should use CLI commands or raw TOML
 - Read APIs
   - `GET /__codex_helper/api/v1/capabilities`
   - `GET /__codex_helper/api/v1/snapshot`
@@ -154,7 +154,8 @@ For design/runtime boundaries, read:
 
 - `docs/workstreams/codex-control-plane-refactor/README.md`
 - `docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md`
-- `docs/workstreams/codex-routing-config-refactor/CONFIGURATION.md` (routing-first config guide)
+- `docs/CONFIGURATION.md` (routing-first user configuration guide)
+- `docs/workstreams/codex-routing-config-refactor/CONFIGURATION.md` (routing-first refactor design record)
 
 ---
 
@@ -254,7 +255,7 @@ Common routing policies:
 | --- | --- | --- |
 | Always use one provider | `codex-helper routing pin <provider>` | Manual sticky mode; switch manually if it fails |
 | Ordered fallback | `codex-helper routing order a b c` | Most intuitive: try the next provider when the current one cannot be used |
-| Monthly first, pay-as-you-go fallback | `codex-helper routing prefer-tag --tag billing=monthly --order paygo --on-exhausted continue` | Use tags for business intent; continue after all preferred providers are exhausted |
+| Monthly first, pay-as-you-go fallback | `codex-helper routing prefer-tag --tag billing=monthly --order input,openai --on-exhausted continue` | Use tags for business intent; continue after all preferred providers are exhausted |
 | Stop when monthly providers are exhausted | Same command with `--on-exhausted stop` | Prevent accidental pay-as-you-go spend |
 
 The equivalent TOML stays small:
@@ -288,7 +289,7 @@ codex-helper config migrate --dry-run
 codex-helper config migrate --write --yes
 ```
 
-`routing list` / `routing explain` are read-only runtime views. Add providers and edit routing with the `provider` and `routing` commands.
+`routing show` reads the persisted route recipe. `routing list` / `routing explain` are read-only runtime views. Add providers and edit routing with the `provider` and `routing` commands.
 
 ---
 
@@ -358,7 +359,7 @@ codex-helper config migrate --write --yes
   ```bash
   codex-helper routing order openai-main packy-main
   codex-helper routing pin openai-main
-  codex-helper routing prefer-tag --tag billing=monthly --order openai-main --on-exhausted continue
+  codex-helper routing prefer-tag --tag billing=monthly --order packy-main,openai-main --on-exhausted continue
   codex-helper routing show
   ```
 
@@ -564,6 +565,8 @@ Key ideas:
 - `routing.policy`: `manual-sticky`, `ordered-failover`, or `tag-preferred`;
 - `station` remains a runtime view, not the public write surface.
 
+For full examples, policy evaluation, and migration notes, read [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
 ### `pricing_overrides.toml`
 
 The bundled price catalog covers common Codex/OpenAI models. If your relay provider uses custom model aliases, prices, or multipliers, add `~/.codex-helper/pricing_overrides.toml`. Overrides replace bundled rows with the same model id and can also add new models; request cost calculation and GUI/TUI pricing views use the merged catalog.
@@ -658,9 +661,10 @@ For the new generic adapters:
 - custom/self-hosted providers can extend the parser with `extract.remaining_balance_paths`, `extract.monthly_spent_paths`, `extract.monthly_budget_paths`, `extract.exhausted_paths`, and divisor fields without touching Rust code;
 - `refresh_on_request` controls whether a request finish automatically triggers a balance poll for that provider; it defaults to `true`, and `false` disables the request-driven refresh path;
 - `poll_interval_secs` controls the minimum interval between balance polls for that provider; when omitted it defaults to `60`, the current trigger is on-demand polling after a routed request finishes rather than the TUI/GUI repaint loop, values below 20 seconds are clamped up to 20, and `0` disables request-driven refresh entirely;
+- `trust_exhaustion_for_routing` controls whether `exhausted` snapshots are allowed to demote routes automatically; it defaults to `true`, and `false` keeps the balance visible without using it as a routing signal;
 - `POST /__codex_helper/api/v1/providers/balances/refresh` manually triggers the same core adapter path; optional `station_name` / `provider_id` query parameters narrow the refresh target, and manual refresh bypasses `refresh_on_request` plus the request-driven throttle;
 - after a request finishes, codex-helper polls `endpoint` on demand and stores `ok` / `exhausted` / `stale` / `error` / `unknown` balance snapshots;
-- matching upstreams are then marked `usage_exhausted = true` in LB state; when possible, LB avoids these upstreams.
+- when trusted balance snapshots show exhaustion, matching upstreams are marked `usage_exhausted = true` in LB state; when possible, LB avoids these upstreams.
 
 ### Filtering & logging
 

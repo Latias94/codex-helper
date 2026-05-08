@@ -135,7 +135,7 @@ ch
 - TUI / GUI
   - `Stations`：看 station、能力、健康、breaker、快速切换
   - `Sessions`：看 session identity、effective route、session override
-  - `Profiles` / Config：管理 profile、provider/routing 结构
+  - `Proxy Settings` / Config：查看 v3 routing-first 配置摘要；持久化 provider/routing 编辑优先用 CLI 或 raw TOML
 - 只读 API
   - `GET /__codex_helper/api/v1/capabilities`
   - `GET /__codex_helper/api/v1/snapshot`
@@ -152,7 +152,8 @@ ch
 
 - `docs/workstreams/codex-control-plane-refactor/README.md`
 - `docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md`
-- `docs/workstreams/codex-routing-config-refactor/CONFIGURATION.md`（routing-first 配置指南）
+- `docs/CONFIGURATION.md`（routing-first 用户配置指南）
+- `docs/workstreams/codex-routing-config-refactor/CONFIGURATION.md`（routing-first 重构设计记录）
 
 ---
 
@@ -207,7 +208,7 @@ codex-helper config set-retry-profile balanced
 | --- | --- | --- |
 | 固定只用一个供应商 | `codex-helper routing pin <provider>` | 手动粘住；如果该 provider 不可用，请手动切换 |
 | 按顺序兜底 | `codex-helper routing order a b c` | 最直观，适合“这个中转不能用就换下一个” |
-| 包月优先、按量兜底 | `codex-helper routing prefer-tag --tag billing=monthly --order paygo --on-exhausted continue` | provider 用标签表达业务含义；包月全耗尽后继续兜底 |
+| 包月优先、按量兜底 | `codex-helper routing prefer-tag --tag billing=monthly --order input,openai --on-exhausted continue` | provider 用标签表达业务含义；包月全耗尽后继续兜底 |
 | 包月全耗尽即停止 | 同上但 `--on-exhausted stop` | 防止误走按量线路 |
 
 对应的 TOML 很薄：
@@ -241,7 +242,7 @@ codex-helper config migrate --dry-run
 codex-helper config migrate --write --yes
 ```
 
-`routing list` / `routing explain` 用于查看编译后的运行时视图；新增 provider、调整顺序、启用禁用都使用 `provider` 和 `routing` 命令。
+`routing show` 用于查看持久化策略；`routing list` / `routing explain` 用于查看编译后的运行时视图。新增 provider、调整顺序、启用禁用都使用 `provider` 和 `routing` 命令。
 
 ---
 
@@ -310,7 +311,7 @@ codex-helper config migrate --write --yes
   ```bash
   codex-helper routing order openai-main packy-main
   codex-helper routing pin openai-main
-  codex-helper routing prefer-tag --tag billing=monthly --order openai-main --on-exhausted continue
+  codex-helper routing prefer-tag --tag billing=monthly --order packy-main,openai-main --on-exhausted continue
   codex-helper routing show
   ```
 
@@ -516,6 +517,8 @@ on_exhausted = "continue"
 - `routing.policy`：`manual-sticky`、`ordered-failover` 或 `tag-preferred`；
 - `station` 只保留为运行时视图，不再作为新增/切换 provider 的写入入口。
 
+完整配置示例、策略对比和迁移说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
+
 ### 价格覆盖（Pricing Overrides）
 
 内置价格目录覆盖常见 Codex/OpenAI 模型；如果你使用的中转商模型别名、价格或倍率不同，可以添加 `~/.codex-helper/pricing_overrides.toml`。该文件会覆盖内置同名模型，也可以新增模型，成本计算和 GUI/TUI 价格目录都会使用合并后的结果。
@@ -605,9 +608,10 @@ codex-helper pricing remove custom-codex
 - 自研接口可以通过 `extract.remaining_balance_paths`、`extract.monthly_spent_paths`、`extract.monthly_budget_paths`、`extract.exhausted_paths` 和 divisor 字段扩展，不需要改 Rust 代码；
 - `refresh_on_request` 控制请求结束后是否自动查询额度，默认 `true`；设为 `false` 可关闭该 provider 的请求后自动刷新；
 - `poll_interval_secs` 控制该 provider 两次额度查询之间的最小间隔，省略时默认 `60`；当前触发点是请求结束后的按需轮询，不跟随 TUI/GUI 的界面刷新频率，低于 20 会按 20 秒处理，设为 `0` 可禁用请求后自动刷新；
+- `trust_exhaustion_for_routing` 控制是否把 `exhausted` 快照作为自动降级信号，默认 `true`；如果某个站点的余额接口经常误报 0，可设为 `false`，余额仍展示但不参与路由降级；
 - `POST /__codex_helper/api/v1/providers/balances/refresh` 可手动触发同一套 core adapter 余额刷新；可用 query 参数 `station_name` / `provider_id` 定向刷新，手动刷新不受 `refresh_on_request` 和请求后节流限制；
 - 请求结束后，codex-helper 按需调用 `endpoint` 查询额度，记录 `ok` / `exhausted` / `stale` / `error` / `unknown` 余额快照；
-- 当额度用尽时，对应 upstream 在 LB 中被标记为 `usage_exhausted = true`，优先避开该线路。
+- 当可信余额快照显示额度用尽时，对应 upstream 在 LB 中被标记为 `usage_exhausted = true`，优先避开该线路。
 
 ### 请求过滤与日志
 
