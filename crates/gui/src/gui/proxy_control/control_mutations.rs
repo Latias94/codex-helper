@@ -102,34 +102,6 @@ where
     }
 }
 
-pub(super) fn mode_child_control_url<F>(
-    mode: &ProxyMode,
-    supported: F,
-    unsupported_message: &'static str,
-    select_parent: impl FnOnce(&OperatorSummaryLinks) -> Option<&str>,
-    fallback_parent: &str,
-    child: &str,
-) -> anyhow::Result<String>
-where
-    F: FnOnce(&AttachedStatus) -> bool,
-{
-    match mode {
-        ProxyMode::Running(r) => Ok(control_url(
-            &local_proxy_base_url(r.admin_port),
-            &linked_child_path(fallback_parent, child),
-        )),
-        ProxyMode::Attached(att) => attached_child_control_url(
-            att,
-            supported(att),
-            unsupported_message,
-            select_parent,
-            fallback_parent,
-            child,
-        ),
-        _ => bail!("proxy is not running/attached"),
-    }
-}
-
 pub(super) fn mode_template_control_url<F>(
     mode: &ProxyMode,
     supported: F,

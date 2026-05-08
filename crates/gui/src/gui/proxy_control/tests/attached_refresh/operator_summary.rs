@@ -263,6 +263,7 @@ fn refresh_attached_prefers_operator_summary_for_runtime_card_fields() {
     controller.refresh_attached_if_due(&rt, Duration::ZERO);
 
     let snapshot = controller.snapshot().expect("attached snapshot");
+    let attached = controller.attached().expect("attached status");
     assert_eq!(
         snapshot.configured_active_station.as_deref(),
         Some("summary-station")
@@ -272,9 +273,9 @@ fn refresh_attached_prefers_operator_summary_for_runtime_card_fields() {
         Some("summary-station")
     );
     assert_eq!(snapshot.default_profile.as_deref(), Some("fast"));
-    assert!(snapshot.supports_operator_summary_api);
+    assert!(attached.supports_operator_summary_api);
     assert_eq!(
-        snapshot
+        attached
             .operator_runtime_summary
             .as_ref()
             .and_then(|summary| summary.default_profile_summary.as_ref())
@@ -310,21 +311,21 @@ fn refresh_attached_prefers_operator_summary_for_runtime_card_fields() {
         Some(2)
     );
     assert_eq!(
-        snapshot
+        attached
             .operator_counts
             .as_ref()
             .map(|counts| counts.sessions),
         Some(1)
     );
     assert_eq!(
-        snapshot
+        attached
             .operator_counts
             .as_ref()
             .map(|counts| counts.providers),
         Some(1)
     );
     assert_eq!(
-        snapshot
+        attached
             .operator_health_summary
             .as_ref()
             .map(|summary| summary.stations_with_failing_passive_health),
@@ -347,11 +348,11 @@ fn refresh_attached_prefers_operator_summary_for_runtime_card_fields() {
     assert_eq!(snapshot.profiles.len(), 2);
     assert_eq!(snapshot.profiles[0].name, "fast");
     assert!(snapshot.profiles[0].fast_mode);
-    assert_eq!(snapshot.providers.len(), 1);
-    assert_eq!(snapshot.providers[0].name, "right");
-    assert_eq!(snapshot.providers[0].endpoints.len(), 1);
+    assert_eq!(attached.providers.len(), 1);
+    assert_eq!(attached.providers[0].name, "right");
+    assert_eq!(attached.providers[0].endpoints.len(), 1);
     assert_eq!(
-        snapshot.providers[0].endpoints[0].base_url,
+        attached.providers[0].endpoints[0].base_url,
         "https://right.example.com/v1"
     );
 

@@ -33,7 +33,6 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         .effective_active_station
         .clone()
         .or(active_station.clone());
-    let supports_persisted_station_settings = snapshot.supports_persisted_station_settings;
     let mut stations = snapshot.stations.clone();
     stations.sort_by(|a, b| {
         a.level
@@ -115,7 +114,6 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         &snapshot,
         configured_active_station.as_deref(),
         effective_active_station.as_deref(),
-        supports_persisted_station_settings,
     );
 
     ui.add_space(8.0);
@@ -167,7 +165,6 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         active_station.as_deref(),
         configured_active_station.as_deref(),
         effective_active_station.as_deref(),
-        supports_persisted_station_settings,
     );
     ctx.view.stations.selected_name = selected_name;
 }

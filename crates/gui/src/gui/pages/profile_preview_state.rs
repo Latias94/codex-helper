@@ -169,26 +169,9 @@ pub(super) fn local_profile_preview_catalogs_from_text(
     BTreeMap<String, PersistedStationSpec>,
     BTreeMap<String, PersistedStationProviderRef>,
 )> {
-    let ProxySettingsWorkingDocument::V2(cfg) = parse_proxy_settings_document(text).ok()? else {
-        return None;
-    };
-    let view = match service_name {
-        "claude" => &cfg.claude,
-        _ => &cfg.codex,
-    };
-    let catalog = crate::config::build_persisted_station_catalog(view);
-    Some((
-        catalog
-            .stations
-            .into_iter()
-            .map(|station| (station.name.clone(), station))
-            .collect(),
-        catalog
-            .providers
-            .into_iter()
-            .map(|provider| (provider.name.clone(), provider))
-            .collect(),
-    ))
+    let _ = service_name;
+    parse_proxy_settings_document(text).ok()?;
+    None
 }
 
 pub(super) fn capability_support_truthy(support: CapabilitySupport) -> Option<bool> {

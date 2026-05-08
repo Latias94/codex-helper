@@ -80,7 +80,6 @@ pub(super) struct RefreshResult {
     pub persisted_stations: BTreeMap<String, PersistedStationSpec>,
     pub persisted_station_providers: BTreeMap<String, PersistedStationProviderRef>,
     pub supports_station_spec_api: bool,
-    pub supports_persisted_station_settings: bool,
     pub supports_default_profile_override: bool,
     pub supports_station_runtime_override: bool,
     pub supports_session_override_reset: bool,
@@ -214,7 +213,6 @@ pub(super) async fn refresh_from_base(
     let supports_global_station_override = resolved_surface.global_station_override;
     let supports_session_station = resolved_surface.session_station;
     let supports_session_effort = resolved_surface.session_reasoning_effort;
-    let supports_persisted_station_settings = resolved_surface.persisted_station_settings;
     let supports_station_api = resolved_surface.station_api;
     let supports_station_runtime_override = resolved_surface.station_runtime;
     let supports_request_ledger_api = resolved_surface.request_ledger_recent;
@@ -511,7 +509,6 @@ pub(super) async fn refresh_from_base(
                 })
                 .unwrap_or_default(),
             supports_station_spec_api,
-            supports_persisted_station_settings,
             supports_default_profile_override,
             supports_station_runtime_override,
             supports_session_override_reset,
@@ -828,7 +825,6 @@ pub(super) async fn refresh_from_base(
             })
             .unwrap_or_default(),
         supports_station_spec_api,
-        supports_persisted_station_settings,
         supports_default_profile_override,
         supports_station_runtime_override,
         supports_session_override_reset,

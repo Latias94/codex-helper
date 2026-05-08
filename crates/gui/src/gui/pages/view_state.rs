@@ -249,26 +249,10 @@ pub(super) enum ProxySettingsMode {
     Raw,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum ProxySettingsSection {
-    Stations,
-    Providers,
-    #[default]
-    Profiles,
-}
-
 #[derive(Debug)]
 pub struct ProxySettingsViewState {
     pub(super) mode: ProxySettingsMode,
-    pub(super) section: ProxySettingsSection,
     pub(super) service: crate::config::ServiceKind,
-    pub(super) selected_name: Option<String>,
-    pub(super) station_editor: StationEditorState,
-    pub(super) selected_provider_name: Option<String>,
-    pub(super) provider_editor: ProviderEditorState,
-    pub(super) selected_profile_name: Option<String>,
-    pub(super) new_profile_name: String,
-    pub(super) profile_editor: ProfileEditorState,
     pub(super) working: Option<ProxySettingsWorkingDocument>,
     pub(super) load_error: Option<String>,
     pub(super) import_codex: ImportCodexModalState,
@@ -278,15 +262,7 @@ impl Default for ProxySettingsViewState {
     fn default() -> Self {
         Self {
             mode: ProxySettingsMode::Form,
-            section: ProxySettingsSection::default(),
             service: crate::config::ServiceKind::Codex,
-            selected_name: None,
-            station_editor: StationEditorState::default(),
-            selected_provider_name: None,
-            provider_editor: ProviderEditorState::default(),
-            selected_profile_name: None,
-            new_profile_name: String::new(),
-            profile_editor: ProfileEditorState::default(),
             working: None,
             load_error: None,
             import_codex: ImportCodexModalState::default(),
@@ -294,55 +270,8 @@ impl Default for ProxySettingsViewState {
     }
 }
 
-#[derive(Debug, Default)]
-pub(super) struct StationEditorState {
-    pub(super) station_name: Option<String>,
-    pub(super) alias: String,
-    pub(super) enabled: bool,
-    pub(super) level: u8,
-    pub(super) members: Vec<StationMemberEditorState>,
-    pub(super) new_station_name: String,
-}
-
-#[derive(Debug, Default, Clone)]
-pub(super) struct StationMemberEditorState {
-    pub(super) provider: String,
-    pub(super) endpoint_names: String,
-    pub(super) preferred: bool,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct ProviderEditorState {
-    pub(super) provider_name: Option<String>,
-    pub(super) alias: String,
-    pub(super) enabled: bool,
-    pub(super) auth_token_env: String,
-    pub(super) api_key_env: String,
-    pub(super) endpoints: Vec<ProviderEndpointEditorState>,
-    pub(super) new_provider_name: String,
-}
-
-#[derive(Debug, Default, Clone)]
-pub(super) struct ProviderEndpointEditorState {
-    pub(super) name: String,
-    pub(super) base_url: String,
-    pub(super) enabled: bool,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct ProfileEditorState {
-    pub(super) profile_name: Option<String>,
-    pub(super) extends: Option<String>,
-    pub(super) station: Option<String>,
-    pub(super) model: String,
-    pub(super) reasoning_effort: String,
-    pub(super) service_tier: String,
-}
-
 #[derive(Debug, Clone)]
 pub(super) enum ProxySettingsWorkingDocument {
-    Legacy(crate::config::ProxyConfig),
-    V2(crate::config::ProxyConfigV2),
     V3(crate::config::ProxyConfigV3),
 }
 

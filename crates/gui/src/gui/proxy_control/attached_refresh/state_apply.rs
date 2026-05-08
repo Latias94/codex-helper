@@ -47,7 +47,6 @@ pub(super) fn apply_refresh_result(att: &mut AttachedStatus, result: RefreshResu
     att.persisted_stations = result.persisted_stations;
     att.persisted_station_providers = result.persisted_station_providers;
     att.supports_station_spec_api = result.supports_station_spec_api;
-    att.supports_persisted_station_settings = result.supports_persisted_station_settings;
     att.supports_default_profile_override = result.supports_default_profile_override;
     att.supports_station_runtime_override = result.supports_station_runtime_override;
     att.supports_session_override_reset = result.supports_session_override_reset;

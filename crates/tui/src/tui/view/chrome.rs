@@ -571,13 +571,13 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
         Overlay::None => match ui.page {
             Page::Dashboard => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话站点  P 全局站点  O/H(会话) o/h(请求) 跳转  ? 帮助",
-                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session station  P global station  O/H(session) o/h(request) jump  ? help",
+                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话站点  P 全局 pin  O/H(会话) o/h(请求) 跳转  ? 帮助",
+                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session station  P global pin  O/H(session) o/h(request) jump  ? help",
             ),
             Page::Stations => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  t 切换 enabled  +/- level  h 检查  H 全部检查  c 取消  C 全部取消  Enter 设为 active  Backspace 自动  o 会话站点 override  O 清除  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  i details  t toggle enabled  +/- level  h check  H check all  c cancel  C cancel all  Enter set active station  Backspace auto  o session station override  O clear  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  Enter 设为全局 pin  Backspace 清除  o 会话站点 override  O 清除  h 检查  H 全部检查  c 取消  C 全部取消  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  i details  Enter set global pin  Backspace clear  o session station override  O clear  h check  H check all  c cancel  C cancel all  ? help",
             ),
             Page::Requests => crate::tui::i18n::pick(
                 ui.language,

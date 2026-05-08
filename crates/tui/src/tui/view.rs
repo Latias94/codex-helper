@@ -55,11 +55,9 @@ pub(in crate::tui) fn render_app(
                     "会话 Provider 覆盖",
                     "Session provider override",
                 ),
-                Overlay::ProviderMenuGlobal => crate::tui::i18n::pick(
-                    ui.language,
-                    "全局 active Provider",
-                    "Global active provider",
-                ),
+                Overlay::ProviderMenuGlobal => {
+                    crate::tui::i18n::pick(ui.language, "全局站点 pin", "Global station pin")
+                }
                 _ => unreachable!(),
             };
             modals::render_provider_modal(f, p, ui, providers, title);

@@ -1,5 +1,4 @@
 use super::*;
-use crate::gui::proxy_control::attached_discovery::resolve_api_v1_surface;
 
 #[test]
 fn request_attach_with_discovered_proxy_preloads_surface_capabilities() {
@@ -14,7 +13,6 @@ fn request_attach_with_discovered_proxy_preloads_surface_capabilities() {
         surface_capabilities: crate::dashboard_core::ControlPlaneSurfaceCapabilities {
             operator_summary: true,
             retry_config: true,
-            station_persisted_settings: true,
             station_specs: true,
             provider_specs: true,
             default_profile_override: true,
@@ -106,7 +104,6 @@ fn request_attach_with_discovered_proxy_preloads_surface_capabilities() {
     assert!(attached.supports_retry_config_api);
     assert!(attached.supports_provider_spec_api);
     assert!(attached.supports_station_spec_api);
-    assert!(attached.supports_persisted_station_settings);
     assert!(attached.supports_default_profile_override);
     assert!(attached.supports_session_override_reset);
     assert!(attached.supports_control_trace_api);
@@ -667,31 +664,4 @@ fn refresh_attached_rejects_pre_v1_runtime_surface() {
     assert!(!attached.supports_station_runtime_override);
 
     handle.abort();
-}
-
-#[test]
-fn resolve_api_v1_surface_requires_complete_station_settings_surface_for_endpoint_fallback() {
-    let endpoints = vec!["/__codex_helper/api/v1/stations/active".to_string()];
-
-    let resolved = resolve_api_v1_surface(
-        &crate::dashboard_core::ControlPlaneSurfaceCapabilities::default(),
-        &endpoints,
-    );
-
-    assert!(!resolved.persisted_station_settings);
-}
-
-#[test]
-fn resolve_api_v1_surface_accepts_station_settings_only_with_update_endpoint() {
-    let endpoints = vec![
-        "/__codex_helper/api/v1/stations/active".to_string(),
-        "/__codex_helper/api/v1/stations/{name}".to_string(),
-    ];
-
-    let resolved = resolve_api_v1_surface(
-        &crate::dashboard_core::ControlPlaneSurfaceCapabilities::default(),
-        &endpoints,
-    );
-
-    assert!(resolved.persisted_station_settings);
 }

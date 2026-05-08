@@ -10,8 +10,8 @@ use super::history_external::{
 use super::history_observed::*;
 use super::*;
 use crate::dashboard_core::{
-    ControlProfileOption, HostLocalControlPlaneCapabilities, ProviderOption,
-    RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationOption, WindowStats,
+    ControlProfileOption, HostLocalControlPlaneCapabilities, RemoteAdminAccessCapabilities,
+    SharedControlPlaneCapabilities, StationOption, WindowStats,
 };
 use crate::gui::proxy_control::GuiRuntimeSnapshot;
 use crate::sessions::SessionSummarySource;
@@ -55,7 +55,6 @@ fn empty_snapshot() -> GuiRuntimeSnapshot {
         configured_default_profile: None,
         default_profile: None,
         profiles: Vec::<ControlProfileOption>::new(),
-        providers: Vec::<ProviderOption>::new(),
         session_model_overrides: HashMap::new(),
         session_station_overrides: HashMap::new(),
         session_effort_overrides: HashMap::new(),
@@ -67,17 +66,12 @@ fn empty_snapshot() -> GuiRuntimeSnapshot {
         stats_5m: WindowStats::default(),
         stats_1h: WindowStats::default(),
         pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
-        operator_runtime_summary: None,
         operator_retry_summary: None,
-        operator_health_summary: None,
-        operator_counts: None,
-        supports_operator_summary_api: false,
         supports_pricing_catalog_api: false,
         configured_retry: None,
         resolved_retry: None,
         supports_v1: true,
         supports_retry_config_api: true,
-        supports_persisted_station_settings: true,
         supports_default_profile_override: true,
         supports_station_runtime_override: true,
         supports_session_override_reset: true,

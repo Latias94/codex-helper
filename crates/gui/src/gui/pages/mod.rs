@@ -8,9 +8,7 @@ use super::i18n::{Language, pick};
 use super::proxy_control::{DiscoveredProxy, GuiRuntimeSnapshot, PortInUseAction, ProxyModeKind};
 use super::util::open_in_file_manager;
 use crate::config::{
-    GroupConfigV2, GroupMemberRefV2, PersistedProviderSpec, PersistedStationProviderRef,
-    PersistedStationSpec, ProviderConfigV2, ProviderEndpointV2, RetryConfig, RetryProfileName,
-    RetryStrategy,
+    PersistedStationProviderRef, PersistedStationSpec, RetryConfig, RetryProfileName, RetryStrategy,
 };
 use crate::dashboard_core::{
     CapabilitySupport, ControlProfileOption, HostLocalControlPlaneCapabilities, ModelCatalogKind,
@@ -27,7 +25,6 @@ use crate::state::{
 use crate::usage::UsageMetrics;
 
 mod components;
-mod control_deck;
 mod doctor;
 mod formatting;
 mod history;
@@ -79,7 +76,6 @@ mod proxy_settings_document;
 mod proxy_settings_form;
 mod proxy_settings_raw;
 mod proxy_settings_shell;
-mod proxy_settings_workspace;
 mod remote_attach;
 mod remote_attach_admin;
 mod remote_attach_host_local;
@@ -144,8 +140,6 @@ mod setup_proxy_step;
 mod stations;
 mod stations_detail_controls;
 mod stations_detail_health;
-mod stations_detail_persisted_settings;
-mod stations_detail_provider_routes;
 mod stations_detail_quick_switch;
 mod stations_detail_recent_hits;
 mod stations_detail_runtime_control;
@@ -192,8 +186,7 @@ use profile_preview::{
 #[allow(unused_imports)]
 use proxy_settings_document::{
     parse_proxy_settings_document, save_proxy_settings_document,
-    sync_codex_auth_into_settings_document, working_legacy_proxy_settings,
-    working_legacy_proxy_settings_mut,
+    sync_codex_auth_into_settings_document,
 };
 #[allow(unused_imports)]
 use remote_attach::*;
@@ -210,9 +203,8 @@ use session_views::*;
 use view_state::SessionOverrideEditor;
 pub use view_state::ViewState;
 use view_state::{
-    ProfileEditorState, ProviderEditorState, ProviderEndpointEditorState, ProxySettingsMode,
-    ProxySettingsViewState, ProxySettingsWorkingDocument, RequestsViewState, SessionsViewState,
-    StationEditorState, StationMemberEditorState, StationsRetryEditorState,
+    ProxySettingsMode, ProxySettingsWorkingDocument, RequestsViewState, SessionsViewState,
+    StationsRetryEditorState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

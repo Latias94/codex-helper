@@ -813,10 +813,8 @@ pub(super) fn render_stations_page(
             "  i            Provider 详情（可滚动）",
             "  i            provider details (scrollable)",
         )));
-        lines.push(Line::from(
-            "  Enter        set active station (same-level failover enabled)",
-        ));
-        lines.push(Line::from("  Backspace    clear active (auto)"));
+        lines.push(Line::from("  Enter        set global pin"));
+        lines.push(Line::from("  Backspace    clear global pin (auto)"));
         lines.push(Line::from(
             "  o            set session override to selected station",
         ));
@@ -825,15 +823,6 @@ pub(super) fn render_stations_page(
         lines.push(Line::from("  H            health check all stations"));
         lines.push(Line::from("  c            cancel health check (selected)"));
         lines.push(Line::from("  C            cancel health check (all)"));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            "Edit (hot reload + persisted)",
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        )]));
-        lines.push(Line::from(
-            "  t            toggle enabled (immediate, saved)",
-        ));
-        lines.push(Line::from("  +/-          adjust level (immediate, saved)"));
     } else {
         lines.push(Line::from(Span::styled(
             "No stations available.",

@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn local_profile_preview_catalogs_from_text_extracts_v2_station_provider_structure() {
+fn local_profile_preview_catalogs_from_text_rejects_legacy_v2_schema() {
     let text = r#"
 version = 2
 
@@ -24,19 +24,7 @@ provider = "right"
 preferred = true
 "#;
 
-    let (stations, providers) =
-        local_profile_preview_catalogs_from_text(text, "codex").expect("catalog");
-
-    let station = stations.get("primary").expect("primary station");
-    assert_eq!(station.alias.as_deref(), Some("Primary"));
-    assert_eq!(station.level, 3);
-    assert_eq!(station.members.len(), 1);
-    assert_eq!(station.members[0].provider, "right");
-
-    let provider = providers.get("right").expect("right provider");
-    assert_eq!(provider.alias.as_deref(), Some("Right"));
-    assert_eq!(provider.endpoints.len(), 1);
-    assert_eq!(provider.endpoints[0].name, "main");
+    assert!(local_profile_preview_catalogs_from_text(text, "codex").is_none());
 }
 
 #[test]
@@ -93,7 +81,7 @@ fn build_profile_route_preview_collects_member_routes_and_capability_checks() {
             alias: Some("Primary".to_string()),
             enabled: true,
             level: 2,
-            members: vec![GroupMemberRefV2 {
+            members: vec![crate::config::GroupMemberRefV2 {
                 provider: "right".to_string(),
                 endpoint_names: Vec::new(),
                 preferred: true,

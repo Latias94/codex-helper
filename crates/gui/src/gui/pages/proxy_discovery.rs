@@ -296,11 +296,7 @@ fn discovery_has_operator_home(proxy: &DiscoveredProxy) -> bool {
 
 fn discovery_has_station_control(proxy: &DiscoveredProxy) -> bool {
     let surface = &proxy.surface_capabilities;
-    surface.stations
-        || surface.station_runtime
-        || surface.station_persisted_settings
-        || surface.station_specs
-        || surface.station_probe
+    surface.stations || surface.station_runtime || surface.station_specs || surface.station_probe
 }
 
 fn discovery_has_profile_control(proxy: &DiscoveredProxy) -> bool {
@@ -599,7 +595,6 @@ mod tests {
                 operator_summary: true,
                 stations: true,
                 station_runtime: true,
-                station_persisted_settings: true,
                 station_specs: true,
                 profiles: true,
                 default_profile_override: true,
@@ -753,9 +748,6 @@ mod tests {
         let mut no_management_surface = proxy.clone();
         no_management_surface.surface_capabilities.stations = false;
         no_management_surface.surface_capabilities.station_runtime = false;
-        no_management_surface
-            .surface_capabilities
-            .station_persisted_settings = false;
         no_management_surface.surface_capabilities.station_specs = false;
         no_management_surface.surface_capabilities.profiles = false;
         no_management_surface

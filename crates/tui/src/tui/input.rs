@@ -9,7 +9,6 @@ use tokio::sync::{OnceCell, Semaphore};
 
 use crate::config::{
     UpstreamConfig,
-    auth_sync::{SyncCodexAuthFromCodexOptions, sync_codex_auth_from_codex_cli},
     bootstrap::overwrite_codex_config_from_codex_cli_in_place,
     proxy_home_dir,
     storage::{load_config, save_config},
@@ -734,77 +733,21 @@ async fn clear_session_manual_overrides(state: &ProxyState, sid: String) {
     state.clear_session_manual_overrides(&sid).await;
 }
 
-async fn apply_global_active_station(
+async fn apply_global_station_pin(
     state: &ProxyState,
-    providers: &mut Vec<ProviderOption>,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
+    providers: &[ProviderOption],
     station_name: Option<String>,
 ) -> anyhow::Result<()> {
-    // Do not pin routing via runtime override; only persist the preferred station (active),
-    // so failover across stations remains possible.
-    state.clear_global_station_override().await;
-
-    let mut cfg = load_config().await?;
-    if ui.service_name == "codex" {
-        let _ = sync_codex_auth_from_codex_cli(
-            &mut cfg,
-            SyncCodexAuthFromCodexOptions {
-                add_missing: false,
-                set_active: false,
-                force: false,
-            },
-        );
-    }
-
-    let mgr = if ui.service_name == "claude" {
-        &mut cfg.claude
+    if let Some(name) = station_name.as_deref() {
+        if !providers.iter().any(|provider| provider.name == name) {
+            anyhow::bail!("unknown station: {name}");
+        }
+        state
+            .set_global_station_override(name.to_string(), now_ms())
+            .await;
     } else {
-        &mut cfg.codex
-    };
-    if let Some(name) = station_name.as_deref()
-        && !mgr.contains_station(name)
-    {
-        anyhow::bail!("unknown station: {name}");
+        state.clear_global_station_override().await;
     }
-    mgr.active = station_name;
-
-    save_config(&cfg).await?;
-
-    // Best-effort: ask the running server to reload immediately.
-    let url = format!(
-        "http://127.0.0.1:{}/__codex_helper/api/v1/runtime/reload",
-        ui.admin_port
-    );
-    let _ = reqwest::Client::new().post(&url).send().await;
-
-    *providers = crate::tui::build_provider_options(&cfg, ui.service_name);
-    ui.clamp_selection(snapshot, providers.len());
-    Ok(())
-}
-
-async fn persist_station_meta(
-    ui: &UiState,
-    station_name: &str,
-    enabled: Option<bool>,
-    level: Option<u8>,
-) -> anyhow::Result<()> {
-    let mut cfg = load_config().await?;
-    let mgr = if ui.service_name == "claude" {
-        &mut cfg.claude
-    } else {
-        &mut cfg.codex
-    };
-    let Some(svc) = mgr.station_mut(station_name) else {
-        anyhow::bail!("station '{station_name}' not found");
-    };
-    if let Some(enabled) = enabled {
-        svc.enabled = enabled;
-    }
-    if let Some(level) = level {
-        svc.level = level.clamp(1, 10);
-    }
-    save_config(&cfg).await?;
     Ok(())
 }
 
@@ -1457,25 +1400,23 @@ async fn handle_key_normal(
             else {
                 return true;
             };
-            match apply_global_active_station(state, providers, ui, snapshot, Some(name.clone()))
-                .await
-            {
+            match apply_global_station_pin(state, providers, Some(name.clone())).await {
                 Ok(()) => {
-                    ui.toast = Some((format!("active station: {name}"), Instant::now()));
+                    ui.toast = Some((format!("global station pin: {name}"), Instant::now()));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("set active failed: {err}"), Instant::now()));
+                    ui.toast = Some((format!("set global pin failed: {err}"), Instant::now()));
                 }
             }
             true
         }
         KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
-            match apply_global_active_station(state, providers, ui, snapshot, None).await {
+            match apply_global_station_pin(state, providers, None).await {
                 Ok(()) => {
-                    ui.toast = Some(("active station: <auto>".to_string(), Instant::now()));
+                    ui.toast = Some(("global station pin: <auto>".to_string(), Instant::now()));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("set active failed: {err}"), Instant::now()));
+                    ui.toast = Some((format!("set global pin failed: {err}"), Instant::now()));
                 }
             }
             true
@@ -1519,80 +1460,6 @@ async fn handle_key_normal(
                 "session station override: <clear>".to_string(),
                 Instant::now(),
             ));
-            true
-        }
-        KeyCode::Char('t') if ui.page == Page::Stations => {
-            let Some(pvd) = providers.get(ui.selected_station_idx) else {
-                return true;
-            };
-            let (enabled_ovr, _) = snapshot
-                .station_meta_overrides
-                .get(pvd.name.as_str())
-                .copied()
-                .unwrap_or((None, None));
-            let current = enabled_ovr.unwrap_or(pvd.enabled);
-            let next = !current;
-            let now = now_ms();
-            state
-                .set_station_enabled_override(ui.service_name, pvd.name.clone(), next, now)
-                .await;
-
-            if let Err(err) = persist_station_meta(ui, &pvd.name, Some(next), None).await {
-                ui.toast = Some((format!("save failed: {err}"), Instant::now()));
-            } else {
-                ui.toast = Some((
-                    format!(
-                        "station {} enabled={}",
-                        pvd.name,
-                        if next { "true" } else { "false" }
-                    ),
-                    Instant::now(),
-                ));
-            }
-            true
-        }
-        KeyCode::Char('+') | KeyCode::Char('=') if ui.page == Page::Stations => {
-            let Some(pvd) = providers.get(ui.selected_station_idx) else {
-                return true;
-            };
-            let (_, level_ovr) = snapshot
-                .station_meta_overrides
-                .get(pvd.name.as_str())
-                .copied()
-                .unwrap_or((None, None));
-            let current = level_ovr.unwrap_or(pvd.level).clamp(1, 10);
-            let next = (current + 1).min(10);
-            let now = now_ms();
-            state
-                .set_station_level_override(ui.service_name, pvd.name.clone(), next, now)
-                .await;
-            if let Err(err) = persist_station_meta(ui, &pvd.name, None, Some(next)).await {
-                ui.toast = Some((format!("save failed: {err}"), Instant::now()));
-            } else {
-                ui.toast = Some((format!("station {} level={next}", pvd.name), Instant::now()));
-            }
-            true
-        }
-        KeyCode::Char('-') if ui.page == Page::Stations => {
-            let Some(pvd) = providers.get(ui.selected_station_idx) else {
-                return true;
-            };
-            let (_, level_ovr) = snapshot
-                .station_meta_overrides
-                .get(pvd.name.as_str())
-                .copied()
-                .unwrap_or((None, None));
-            let current = level_ovr.unwrap_or(pvd.level).clamp(1, 10);
-            let next = current.saturating_sub(1).max(1);
-            let now = now_ms();
-            state
-                .set_station_level_override(ui.service_name, pvd.name.clone(), next, now)
-                .await;
-            if let Err(err) = persist_station_meta(ui, &pvd.name, None, Some(next)).await {
-                ui.toast = Some((format!("save failed: {err}"), Instant::now()));
-            } else {
-                ui.toast = Some((format!("station {} level={next}", pvd.name), Instant::now()));
-            }
             true
         }
         KeyCode::Char('h') if ui.page == Page::Stations => {
@@ -2964,7 +2831,6 @@ async fn handle_key_normal(
                 .global_station_override
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
-                .or_else(|| providers.iter().find(|p| p.active).map(|p| p.name.as_str()))
                 .unwrap_or("");
             ui.provider_menu_idx = providers
                 .iter()
@@ -3445,25 +3311,19 @@ async fn handle_key_provider_menu(
 
             match ui.overlay {
                 Overlay::ProviderMenuGlobal => {
-                    match apply_global_active_station(
-                        state,
-                        providers,
-                        ui,
-                        snapshot,
-                        chosen.clone(),
-                    )
-                    .await
-                    {
+                    match apply_global_station_pin(state, providers, chosen.clone()).await {
                         Ok(()) => {
-                            let active = providers
-                                .iter()
-                                .find(|p| p.active)
-                                .map(|p| p.name.as_str())
-                                .unwrap_or("<auto>");
-                            ui.toast = Some((format!("active station: {active}"), Instant::now()));
+                            ui.toast = Some((
+                                format!(
+                                    "global station pin: {}",
+                                    chosen.as_deref().unwrap_or("<auto>")
+                                ),
+                                Instant::now(),
+                            ));
                         }
                         Err(err) => {
-                            ui.toast = Some((format!("set active failed: {err}"), Instant::now()));
+                            ui.toast =
+                                Some((format!("set global pin failed: {err}"), Instant::now()));
                         }
                     }
                 }

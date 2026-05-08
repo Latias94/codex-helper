@@ -79,7 +79,6 @@ pub(super) struct ResolvedApiV1Surface {
     pub(super) pricing_catalog: bool,
     pub(super) provider_specs: bool,
     pub(super) station_specs: bool,
-    pub(super) persisted_station_settings: bool,
     pub(super) default_profile_override: bool,
     pub(super) session_override_reset: bool,
     pub(super) control_trace: bool,
@@ -104,7 +103,6 @@ const API_V1_RETRY_CONFIG_ENDPOINT: &str = "/__codex_helper/api/v1/retry/config"
 const API_V1_PROVIDER_SPECS_ENDPOINT: &str = "/__codex_helper/api/v1/providers/specs";
 const API_V1_STATIONS_ENDPOINT: &str = "/__codex_helper/api/v1/stations";
 const API_V1_STATIONS_RUNTIME_ENDPOINT: &str = "/__codex_helper/api/v1/stations/runtime";
-const API_V1_STATION_ACTIVE_ENDPOINT: &str = "/__codex_helper/api/v1/stations/active";
 const API_V1_STATION_SPECS_ENDPOINT: &str = "/__codex_helper/api/v1/stations/specs";
 const API_V1_DEFAULT_PROFILE_ENDPOINT: &str = "/__codex_helper/api/v1/profiles/default";
 const API_V1_SESSION_OVERRIDE_RESET_ENDPOINT: &str =
@@ -113,8 +111,6 @@ const API_V1_CONTROL_TRACE_ENDPOINT: &str = "/__codex_helper/api/v1/control-trac
 const API_V1_REQUEST_LEDGER_RECENT_ENDPOINT: &str = "/__codex_helper/api/v1/request-ledger/recent";
 const API_V1_REQUEST_LEDGER_SUMMARY_ENDPOINT: &str =
     "/__codex_helper/api/v1/request-ledger/summary";
-const API_V1_STATION_PERSISTED_SETTINGS_UPDATE_ENDPOINT: &str =
-    "/__codex_helper/api/v1/stations/{name}";
 const API_V1_PRICING_CATALOG_ENDPOINT: &str = "/__codex_helper/api/v1/pricing/catalog";
 const API_V1_STATION_PROBE_ENDPOINT: &str = "/__codex_helper/api/v1/stations/probe";
 const API_V1_SESSION_OVERRIDES_ENDPOINT: &str = "/__codex_helper/api/v1/overrides/session";
@@ -149,25 +145,6 @@ fn supports_any_capability_flag(
     flag || endpoint_candidates
         .iter()
         .any(|endpoint| supports_capability_flag(false, endpoints, endpoint))
-}
-
-fn supports_persisted_station_settings_surface(
-    surface: &ControlPlaneSurfaceCapabilities,
-    endpoints: &[String],
-) -> bool {
-    if surface.station_persisted_settings {
-        return true;
-    }
-
-    let has_station_update = supports_capability_flag(
-        false,
-        endpoints,
-        API_V1_STATION_PERSISTED_SETTINGS_UPDATE_ENDPOINT,
-    );
-    let has_active_switch =
-        supports_capability_flag(false, endpoints, API_V1_STATION_ACTIVE_ENDPOINT);
-
-    has_station_update && has_active_switch
 }
 
 pub(super) fn resolve_api_v1_surface(
@@ -207,7 +184,6 @@ pub(super) fn resolve_api_v1_surface(
             endpoints,
             API_V1_STATION_SPECS_ENDPOINT,
         ),
-        persisted_station_settings: supports_persisted_station_settings_surface(surface, endpoints),
         default_profile_override: supports_capability_flag(
             surface.default_profile_override,
             endpoints,
@@ -282,7 +258,6 @@ fn apply_resolved_surface(attached: &mut AttachedStatus, resolved_surface: Resol
     attached.supports_pricing_catalog_api = resolved_surface.pricing_catalog;
     attached.supports_provider_spec_api = resolved_surface.provider_specs;
     attached.supports_station_spec_api = resolved_surface.station_specs;
-    attached.supports_persisted_station_settings = resolved_surface.persisted_station_settings;
     attached.supports_default_profile_override = resolved_surface.default_profile_override;
     attached.supports_station_runtime_override = resolved_surface.station_runtime;
     attached.supports_session_override_reset = resolved_surface.session_override_reset;
@@ -324,7 +299,6 @@ fn discovery_surface_score(surface: &ControlPlaneSurfaceCapabilities) -> u32 {
         surface.retry_config,
         surface.stations,
         surface.station_runtime,
-        surface.station_persisted_settings,
         surface.station_specs,
         surface.station_probe,
         surface.providers,

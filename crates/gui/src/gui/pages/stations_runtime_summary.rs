@@ -6,7 +6,6 @@ pub(super) fn render_stations_runtime_summary(
     snapshot: &GuiRuntimeSnapshot,
     configured_active_station: Option<&str>,
     effective_active_station: Option<&str>,
-    supports_persisted_station_settings: bool,
 ) {
     ui.group(|ui| {
         ui.horizontal(|ui| {
@@ -77,28 +76,6 @@ pub(super) fn render_stations_runtime_summary(
             }
         });
         ui.horizontal(|ui| {
-            ui.label(format!(
-                "{}: {}",
-                pick(ctx.lang, "持久化站点设置", "Persisted station settings"),
-                if supports_persisted_station_settings {
-                    pick(ctx.lang, "可用", "available")
-                } else {
-                    pick(ctx.lang, "不可用", "unavailable")
-                }
-            ));
-            if matches!(snapshot.kind, ProxyModeKind::Attached) {
-                ui.label(format!(
-                    "{}: {}",
-                    pick(ctx.lang, "远端写回", "Remote write-back"),
-                    if supports_persisted_station_settings {
-                        pick(ctx.lang, "已启用", "enabled")
-                    } else {
-                        pick(ctx.lang, "未提供", "not exposed")
-                    }
-                ));
-            }
-        });
-        ui.horizontal(|ui| {
             if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
                 ctx.proxy
                     .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
@@ -129,24 +106,16 @@ pub(super) fn render_stations_runtime_summary(
         ui.colored_label(
             egui::Color32::from_rgb(120, 120, 120),
             if matches!(snapshot.kind, ProxyModeKind::Attached) {
-                if supports_persisted_station_settings {
-                    pick(
-                        ctx.lang,
-                        "附着模式下，global pin / runtime 覆盖会直接作用到远端代理；下面的“持久化站点设置”也会直接写回远端代理的持久化状态，不会改动本机文件。",
-                        "In attached mode, global pin and runtime overrides act on the remote proxy directly; the persisted station settings below also write back to the remote proxy's persisted state rather than this device's local file.",
-                    )
-                } else {
-                    pick(
-                        ctx.lang,
-                        "附着模式下，global pin / runtime 覆盖会直接作用到远端代理；当前附着目标还没有暴露持久化站点设置 API，因此只能做运行时控制。",
-                        "In attached mode, global pin and runtime overrides act on the remote proxy directly; this attached target does not expose persisted station settings APIs yet, so only runtime controls are available.",
-                    )
-                }
+                pick(
+                    ctx.lang,
+                    "附着模式下，global pin / runtime 覆盖会直接作用到远端代理；这里不再提供旧的持久化站点写回入口。",
+                    "In attached mode, global pin and runtime overrides act on the remote proxy directly; the old persisted station write-back entrypoint is no longer shown here.",
+                )
             } else {
                 pick(
                     ctx.lang,
-                    "这里的 global pin 是运行时覆盖；“持久化站点设置”会通过本地 control-plane 写回配置文件并刷新运行态。",
-                    "Global pin here is runtime-only; the persisted station settings write through the local control plane and refresh the runtime.",
+                    "这里的 global pin 是运行时覆盖；配置文件编辑请走代理设置页的原始视图。",
+                    "Global pin here is runtime-only; edit the config file through the Proxy Settings raw view.",
                 )
             },
         );

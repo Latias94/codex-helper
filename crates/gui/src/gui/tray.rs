@@ -16,11 +16,6 @@ pub enum TrayAction {
     ReloadSettings,
     SwitchOn,
     SwitchOff,
-    /// Prefer persisted station control-plane; fall back to local config save when no live proxy is manageable.
-    SetActiveStation {
-        service: crate::config::ServiceKind,
-        name: String,
-    },
     /// Apply API v1 global override (pinned). `None` means <auto>.
     ApplyPinnedStation {
         name: Option<String>,
@@ -319,50 +314,6 @@ fn build_menu_base(
         menu.append(&PredefinedMenuItem::separator())?;
 
         let quick = Submenu::new(pick(lang, "快速切换", "Quick switch"), true);
-
-        // Active station quick switch (persistent).
-        let can_set_active = matches!(
-            model.proxy_kind,
-            super::proxy_control::ProxyModeKind::Running
-        ) && model
-            .service_name
-            .as_deref()
-            .is_some_and(|s| s == "codex" || s == "claude")
-            && !model.stations.is_empty();
-        let active_menu = Submenu::new(
-            pick(lang, "默认站点(active)", "Default station (active)"),
-            can_set_active,
-        );
-        if can_set_active {
-            let svc = if model.service_name.as_deref() == Some("claude") {
-                crate::config::ServiceKind::Claude
-            } else {
-                crate::config::ServiceKind::Codex
-            };
-            let active = model.active_display.as_deref().unwrap_or("");
-            for station in model.stations.iter() {
-                let label = format_station_label(station);
-                let id = menu_id(
-                    if svc == crate::config::ServiceKind::Claude {
-                        "codex-helper-gui.tray.active.claude"
-                    } else {
-                        "codex-helper-gui.tray.active.codex"
-                    },
-                    station.name.as_str(),
-                );
-                let checked = station.name == active;
-                let item = CheckMenuItem::with_id(id.clone(), label, true, checked, None);
-                dynamic_actions.insert(
-                    id,
-                    TrayAction::SetActiveStation {
-                        service: svc,
-                        name: station.name.clone(),
-                    },
-                );
-                active_menu.append(&item)?;
-            }
-        }
-        quick.append(&active_menu)?;
 
         // Pinned station (runtime-only).
         let can_pinned = (matches!(
