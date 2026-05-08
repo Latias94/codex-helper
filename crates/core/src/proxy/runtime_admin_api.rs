@@ -15,6 +15,11 @@ pub(super) struct ControlTraceQuery {
     limit: Option<usize>,
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct RequestLedgerRecentQuery {
+    limit: Option<usize>,
+}
+
 pub(super) async fn runtime_status(
     proxy: ProxyService,
 ) -> Result<Json<RuntimeStatusResponse>, (StatusCode, String)> {
@@ -32,6 +37,19 @@ pub(super) async fn get_pricing_catalog(
     _proxy: ProxyService,
 ) -> Result<Json<crate::pricing::ModelPriceCatalogSnapshot>, (StatusCode, String)> {
     Ok(Json(crate::pricing::operator_model_price_catalog_snapshot()))
+}
+
+pub(super) async fn get_request_ledger_recent(
+    _proxy: ProxyService,
+    Query(q): Query<RequestLedgerRecentQuery>,
+) -> Result<Json<Vec<crate::state::FinishedRequest>>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(1000).clamp(20, 5000);
+    crate::request_ledger::tail_finished_requests_from_log(
+        &crate::request_ledger::request_log_path(),
+        limit,
+    )
+    .map(Json)
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
 pub(super) async fn set_retry_config(

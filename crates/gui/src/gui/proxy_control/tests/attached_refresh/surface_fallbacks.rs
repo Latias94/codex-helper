@@ -20,6 +20,7 @@ fn request_attach_with_discovered_proxy_preloads_surface_capabilities() {
             default_profile_override: true,
             session_override_reset: true,
             control_trace: true,
+            request_ledger_recent: true,
             stations: true,
             station_runtime: true,
             ..Default::default()
@@ -109,6 +110,7 @@ fn request_attach_with_discovered_proxy_preloads_surface_capabilities() {
     assert!(attached.supports_default_profile_override);
     assert!(attached.supports_session_override_reset);
     assert!(attached.supports_control_trace_api);
+    assert!(attached.supports_request_ledger_api);
     assert!(attached.supports_station_api);
     assert!(attached.supports_station_runtime_override);
     assert_eq!(

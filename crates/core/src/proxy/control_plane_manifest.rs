@@ -13,6 +13,8 @@ pub(super) const API_V1_STATUS_STATION_HEALTH: &str =
     "/__codex_helper/api/v1/status/station-health";
 pub(super) const API_V1_RUNTIME_STATUS: &str = "/__codex_helper/api/v1/runtime/status";
 pub(super) const API_V1_RUNTIME_RELOAD: &str = "/__codex_helper/api/v1/runtime/reload";
+pub(super) const API_V1_REQUEST_LEDGER_RECENT: &str =
+    "/__codex_helper/api/v1/request-ledger/recent";
 pub(super) const API_V1_CONTROL_TRACE: &str = "/__codex_helper/api/v1/control-trace";
 pub(super) const API_V1_RETRY_CONFIG: &str = "/__codex_helper/api/v1/retry/config";
 pub(super) const API_V1_PRICING_CATALOG: &str = "/__codex_helper/api/v1/pricing/catalog";
@@ -69,6 +71,7 @@ const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_STATUS_STATION_HEALTH,
     API_V1_RUNTIME_STATUS,
     API_V1_RUNTIME_RELOAD,
+    API_V1_REQUEST_LEDGER_RECENT,
     API_V1_CONTROL_TRACE,
     API_V1_RETRY_CONFIG,
     API_V1_PRICING_CATALOG,
@@ -118,6 +121,7 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
         status_station_health: true,
         runtime_status: true,
         runtime_reload: true,
+        request_ledger_recent: true,
         control_trace: true,
         retry_config: true,
         pricing_catalog: true,
@@ -156,6 +160,7 @@ pub(super) fn api_v1_operator_summary_links() -> OperatorSummaryLinks {
         status_session_stats: API_V1_STATUS_SESSION_STATS.to_string(),
         status_health_checks: API_V1_STATUS_HEALTH_CHECKS.to_string(),
         status_station_health: API_V1_STATUS_STATION_HEALTH.to_string(),
+        request_ledger_recent: API_V1_REQUEST_LEDGER_RECENT.to_string(),
         control_trace: API_V1_CONTROL_TRACE.to_string(),
         retry_config: API_V1_RETRY_CONFIG.to_string(),
         pricing_catalog: API_V1_PRICING_CATALOG.to_string(),

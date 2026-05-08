@@ -8,6 +8,7 @@ use crate::dashboard_core::{
 };
 use crate::logging::{ControlTraceLogEntry, control_trace_path, read_recent_control_trace_entries};
 use crate::proxy::local_proxy_base_url;
+use crate::request_ledger::{request_log_path, tail_finished_requests_from_log};
 use anyhow::bail;
 use reqwest::Client;
 
@@ -27,7 +28,8 @@ use self::attached_discovery::{
 use self::types::PortInUseModal;
 pub use self::types::{
     AttachedStatus, ControlTraceDataSource, ControlTraceReadResult, GuiRuntimeSnapshot,
-    PortInUseAction, ProxyController, ProxyMode, ProxyModeKind, RunningProxy,
+    PortInUseAction, ProxyController, ProxyMode, ProxyModeKind, RequestLedgerDataSource,
+    RequestLedgerReadResult, RunningProxy,
 };
 
 fn admin_auth_token() -> Option<String> {
@@ -156,6 +158,69 @@ impl ProxyController {
 
     pub fn control_trace_source_signature(&self) -> Option<String> {
         self.control_trace_source().map(|source| source.signature())
+    }
+
+    pub fn request_ledger_source(&self) -> Option<RequestLedgerDataSource> {
+        match &self.mode {
+            ProxyMode::Running(_) => Some(RequestLedgerDataSource::LocalFile {
+                path: request_log_path(),
+            }),
+            ProxyMode::Attached(att) if att.supports_request_ledger_api => {
+                Some(RequestLedgerDataSource::AttachedApi {
+                    admin_base_url: att.admin_base_url.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn request_ledger_source_signature(&self) -> Option<String> {
+        self.request_ledger_source()
+            .map(|source| source.signature())
+    }
+
+    pub fn read_request_ledger_records(
+        &self,
+        rt: &tokio::runtime::Runtime,
+        limit: usize,
+    ) -> anyhow::Result<RequestLedgerReadResult> {
+        let limit = limit.clamp(20, 5000);
+        let source = self
+            .request_ledger_source()
+            .ok_or_else(|| anyhow::anyhow!("request ledger is unavailable for this proxy"))?;
+
+        let records = match &source {
+            RequestLedgerDataSource::LocalFile { path } => {
+                tail_finished_requests_from_log(path, limit)?
+            }
+            RequestLedgerDataSource::AttachedApi { admin_base_url } => {
+                let request_ledger_path = self
+                    .attached()
+                    .and_then(|att| att.operator_summary_links.as_ref())
+                    .map(|links| links.request_ledger_recent.as_str())
+                    .filter(|path| !path.trim().is_empty())
+                    .unwrap_or("/__codex_helper/api/v1/request-ledger/recent")
+                    .to_string();
+                let client = self.http_client.clone();
+                let admin_base_url = admin_base_url.clone();
+                rt.block_on(async move {
+                    let response = send_admin_request(
+                        client
+                            .get(format!(
+                                "{admin_base_url}{request_ledger_path}?limit={limit}"
+                            ))
+                            .timeout(Duration::from_millis(1200)),
+                    )
+                    .await?;
+                    let records = response
+                        .json::<Vec<crate::state::FinishedRequest>>()
+                        .await?;
+                    Ok::<Vec<crate::state::FinishedRequest>, anyhow::Error>(records)
+                })?
+            }
+        };
+
+        Ok(RequestLedgerReadResult { source, records })
     }
 
     pub fn read_control_trace_entries(

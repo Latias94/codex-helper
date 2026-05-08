@@ -1,6 +1,6 @@
 use super::components::request_details;
 use super::requests_filters::{
-    ensure_local_request_ledger_loaded, filtered_recent_requests, render_requests_filters,
+    ensure_request_ledger_loaded, filtered_recent_requests, render_requests_filters,
     selected_requests_session_id,
 };
 use super::requests_header_actions::render_request_header;
@@ -210,9 +210,9 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     render_requests_filters(ui, ctx, selected_sid_ref);
     ui.add_space(6.0);
 
-    ensure_local_request_ledger_loaded(ctx);
-    let recent = if ctx.view.requests.include_local_ledger {
-        ctx.view.requests.local_ledger_records.clone()
+    ensure_request_ledger_loaded(ctx);
+    let recent = if ctx.view.requests.include_request_ledger {
+        ctx.view.requests.request_ledger_records.clone()
     } else {
         snapshot.recent.clone()
     };

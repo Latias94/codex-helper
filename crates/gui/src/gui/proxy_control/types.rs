@@ -117,6 +117,7 @@ pub struct AttachedStatus {
     pub supports_station_runtime_override: bool,
     pub supports_session_override_reset: bool,
     pub supports_control_trace_api: bool,
+    pub supports_request_ledger_api: bool,
     pub supports_station_api: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
@@ -179,6 +180,7 @@ impl AttachedStatus {
             supports_station_runtime_override: false,
             supports_session_override_reset: false,
             supports_control_trace_api: false,
+            supports_request_ledger_api: false,
             supports_station_api: false,
             shared_capabilities: SharedControlPlaneCapabilities::default(),
             host_local_capabilities: HostLocalControlPlaneCapabilities::default(),
@@ -323,6 +325,40 @@ impl ControlTraceDataSource {
 pub struct ControlTraceReadResult {
     pub source: ControlTraceDataSource,
     pub entries: Vec<ControlTraceLogEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestLedgerDataSource {
+    LocalFile { path: PathBuf },
+    AttachedApi { admin_base_url: String },
+}
+
+impl RequestLedgerDataSource {
+    pub fn signature(&self) -> String {
+        match self {
+            RequestLedgerDataSource::LocalFile { path } => {
+                format!("local:{}", path.display())
+            }
+            RequestLedgerDataSource::AttachedApi { admin_base_url } => {
+                format!("attached-api:{admin_base_url}")
+            }
+        }
+    }
+
+    pub fn display_detail(&self) -> String {
+        match self {
+            RequestLedgerDataSource::LocalFile { path } => format!("path: {}", path.display()),
+            RequestLedgerDataSource::AttachedApi { admin_base_url } => {
+                format!("admin API: {admin_base_url}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestLedgerReadResult {
+    pub source: RequestLedgerDataSource,
+    pub records: Vec<FinishedRequest>,
 }
 
 pub(super) struct PortInUseModal {

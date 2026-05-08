@@ -3,6 +3,12 @@ use super::*;
 #[tokio::test]
 async fn proxy_api_v1_capabilities_and_overrides_work() {
     let _env_lock = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
     let mut cfg = make_proxy_config(
         vec![UpstreamConfig {
             base_url: "http://127.0.0.1:9/v1".to_string(),
@@ -174,6 +180,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/control-trace"))
     }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/request-ledger/recent"))
+    }));
     assert_eq!(
         caps["surface_capabilities"]["snapshot"].as_bool(),
         Some(true)
@@ -205,6 +216,10 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     );
     assert_eq!(
         caps["surface_capabilities"]["control_trace"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["request_ledger_recent"].as_bool(),
         Some(true)
     );
     let host_local_history = crate::config::codex_sessions_dir().is_dir();
@@ -251,10 +266,69 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
 
     let trace_dir = make_temp_test_dir();
     let trace_path = trace_dir.join("control_trace.jsonl");
-    let mut scoped = ScopedEnv::default();
     unsafe {
         scoped.set_path("CODEX_HELPER_CONTROL_TRACE_PATH", &trace_path);
     }
+    write_text_file(
+        &crate::request_ledger::request_log_path(),
+        &[
+            serde_json::json!({
+                "timestamp_ms": 100,
+                "request_id": 41,
+                "trace_id": "codex-41",
+                "service": "codex",
+                "method": "POST",
+                "path": "/v1/responses",
+                "status_code": 200,
+                "duration_ms": 900,
+                "station_name": "primary",
+                "provider_id": "relay",
+                "session_id": "sid-a",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 4,
+                    "total_tokens": 14
+                },
+                "retry": {
+                    "attempts": 1,
+                    "upstream_chain": [
+                        "primary:https://relay.example/v1 (idx=0) status=200 class=- model=gpt-5.4-mini"
+                    ]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp_ms": 200,
+                "request_id": 42,
+                "trace_id": "codex-42",
+                "service": "codex",
+                "method": "POST",
+                "path": "/v1/responses",
+                "status_code": 429,
+                "duration_ms": 1500,
+                "ttfb_ms": 300,
+                "station_name": "backup",
+                "provider_id": "fallback",
+                "session_id": "sid-b",
+                "service_tier": { "actual": "priority" },
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "total_tokens": 150
+                },
+                "retry": {
+                    "attempts": 2,
+                    "upstream_chain": [
+                        "primary:https://relay.example/v1 (idx=0) status=429 class=rate_limit model=gpt-5.4",
+                        "backup:https://fallback.example/v1 (idx=1) status=200 class=- model=gpt-5.4"
+                    ]
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n"),
+    );
+
     std::fs::write(
         &trace_path,
         [
@@ -316,6 +390,31 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .and_then(|value| value.as_str()),
         Some("request_completed")
     );
+
+    let request_ledger = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/request-ledger/recent?limit=40",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("request ledger send")
+        .error_for_status()
+        .expect("request ledger status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("request ledger json");
+    assert_eq!(request_ledger.as_array().map(|items| items.len()), Some(2));
+    assert_eq!(
+        request_ledger
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_u64()),
+        Some(42)
+    );
+    assert_eq!(request_ledger[0]["model"].as_str(), Some("gpt-5.4"));
+    assert_eq!(request_ledger[0]["service_tier"].as_str(), Some("priority"));
 
     let set_global = client
         .post(format!(

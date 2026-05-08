@@ -83,6 +83,7 @@ pub(super) struct ResolvedApiV1Surface {
     pub(super) default_profile_override: bool,
     pub(super) session_override_reset: bool,
     pub(super) control_trace: bool,
+    pub(super) request_ledger_recent: bool,
     pub(super) station_api: bool,
     pub(super) station_runtime: bool,
     pub(super) session_override_aggregate: bool,
@@ -109,6 +110,7 @@ const API_V1_DEFAULT_PROFILE_ENDPOINT: &str = "/__codex_helper/api/v1/profiles/d
 const API_V1_SESSION_OVERRIDE_RESET_ENDPOINT: &str =
     "/__codex_helper/api/v1/overrides/session/reset";
 const API_V1_CONTROL_TRACE_ENDPOINT: &str = "/__codex_helper/api/v1/control-trace";
+const API_V1_REQUEST_LEDGER_RECENT_ENDPOINT: &str = "/__codex_helper/api/v1/request-ledger/recent";
 const API_V1_STATION_PERSISTED_SETTINGS_UPDATE_ENDPOINT: &str =
     "/__codex_helper/api/v1/stations/{name}";
 const API_V1_PRICING_CATALOG_ENDPOINT: &str = "/__codex_helper/api/v1/pricing/catalog";
@@ -223,6 +225,11 @@ pub(super) fn resolve_api_v1_surface(
             endpoints,
             API_V1_CONTROL_TRACE_ENDPOINT,
         ),
+        request_ledger_recent: supports_capability_flag(
+            surface.request_ledger_recent,
+            endpoints,
+            API_V1_REQUEST_LEDGER_RECENT_ENDPOINT,
+        ),
         station_api: supports_any_capability_flag(
             surface.stations || surface.station_runtime || surface.station_probe,
             endpoints,
@@ -277,6 +284,7 @@ fn apply_resolved_surface(attached: &mut AttachedStatus, resolved_surface: Resol
     attached.supports_station_runtime_override = resolved_surface.station_runtime;
     attached.supports_session_override_reset = resolved_surface.session_override_reset;
     attached.supports_control_trace_api = resolved_surface.control_trace;
+    attached.supports_request_ledger_api = resolved_surface.request_ledger_recent;
     attached.supports_station_api = resolved_surface.station_api;
 }
 
@@ -331,6 +339,7 @@ fn discovery_surface_score(surface: &ControlPlaneSurfaceCapabilities) -> u32 {
         surface.session_override_reset,
         surface.global_station_override,
         surface.control_trace,
+        surface.request_ledger_recent,
         surface.pricing_catalog,
         surface.runtime_reload,
         surface.healthcheck_start,

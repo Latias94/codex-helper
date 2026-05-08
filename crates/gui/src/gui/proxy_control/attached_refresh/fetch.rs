@@ -85,6 +85,7 @@ pub(super) struct RefreshResult {
     pub supports_station_runtime_override: bool,
     pub supports_session_override_reset: bool,
     pub supports_control_trace_api: bool,
+    pub supports_request_ledger_api: bool,
     pub supports_station_api: bool,
     pub shared_capabilities: SharedControlPlaneCapabilities,
     pub host_local_capabilities: HostLocalControlPlaneCapabilities,
@@ -215,6 +216,7 @@ pub(super) async fn refresh_from_base(
     let supports_persisted_station_settings = resolved_surface.persisted_station_settings;
     let supports_station_api = resolved_surface.station_api;
     let supports_station_runtime_override = resolved_surface.station_runtime;
+    let supports_request_ledger_api = resolved_surface.request_ledger_recent;
 
     let operator_summary = if supports_operator_summary_api {
         get_json::<ApiV1OperatorSummary>(
@@ -512,6 +514,7 @@ pub(super) async fn refresh_from_base(
             supports_station_runtime_override,
             supports_session_override_reset,
             supports_control_trace_api,
+            supports_request_ledger_api,
             supports_station_api,
             shared_capabilities,
             host_local_capabilities,
@@ -827,6 +830,7 @@ pub(super) async fn refresh_from_base(
         supports_station_runtime_override,
         supports_session_override_reset,
         supports_control_trace_api,
+        supports_request_ledger_api,
         supports_station_api,
         shared_capabilities,
         host_local_capabilities,
