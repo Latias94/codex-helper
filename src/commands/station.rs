@@ -16,6 +16,7 @@ use crate::config::{
 };
 use crate::{CliError, CliResult, RetryProfile, StationCommand};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use tokio::fs;
 
 async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result<&'static str> {
@@ -99,6 +100,42 @@ struct ConfigExplainPayload {
     active_station: Option<String>,
     routing: ServiceRoutingExplanation,
     station: Option<ConfigExplainStation>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ConfigExplainV3ProviderEndpoint {
+    name: String,
+    base_url: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ConfigExplainV3Provider {
+    name: String,
+    alias: Option<String>,
+    enabled: bool,
+    routing_index: Option<usize>,
+    target: bool,
+    tags: BTreeMap<String, String>,
+    endpoints: Vec<ConfigExplainV3ProviderEndpoint>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigExplainV3Routing {
+    policy: &'static str,
+    target: Option<String>,
+    order: Vec<String>,
+    prefer_tags: Vec<BTreeMap<String, String>>,
+    on_exhausted: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigExplainV3Payload {
+    schema_version: u32,
+    service: String,
+    routing: ConfigExplainV3Routing,
+    providers: Vec<ConfigExplainV3Provider>,
+    provider: Option<ConfigExplainV3Provider>,
 }
 
 async fn load_config_document() -> anyhow::Result<ConfigDocument> {
@@ -310,6 +347,147 @@ fn print_v3_provider_list(label: &str, view: &ServiceViewV3) {
     }
 }
 
+fn explain_v3_routing(view: &ServiceViewV3) -> ConfigExplainV3Routing {
+    let routing = view.routing.clone().unwrap_or_default();
+    ConfigExplainV3Routing {
+        policy: routing_policy_label(routing.policy),
+        target: routing.target,
+        order: routing.order,
+        prefer_tags: routing.prefer_tags,
+        on_exhausted: routing_exhausted_label(routing.on_exhausted),
+    }
+}
+
+fn explain_v3_provider(
+    view: &ServiceViewV3,
+    provider_name: &str,
+) -> Option<ConfigExplainV3Provider> {
+    let provider = view.providers.get(provider_name)?;
+    let routing = view.routing.as_ref();
+    let routing_index = routing
+        .and_then(|routing| {
+            routing
+                .order
+                .iter()
+                .position(|candidate| candidate == provider_name)
+        })
+        .map(|idx| idx + 1);
+    let target = routing
+        .and_then(|routing| routing.target.as_deref())
+        .is_some_and(|target| target == provider_name);
+
+    let mut endpoints = Vec::new();
+    if let Some(base_url) = provider
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        endpoints.push(ConfigExplainV3ProviderEndpoint {
+            name: "default".to_string(),
+            base_url: base_url.to_string(),
+            enabled: provider.enabled,
+        });
+    }
+    endpoints.extend(provider.endpoints.iter().map(|(endpoint_name, endpoint)| {
+        ConfigExplainV3ProviderEndpoint {
+            name: endpoint_name.clone(),
+            base_url: endpoint.base_url.clone(),
+            enabled: endpoint.enabled,
+        }
+    }));
+
+    Some(ConfigExplainV3Provider {
+        name: provider_name.to_string(),
+        alias: provider.alias.clone(),
+        enabled: provider.enabled,
+        routing_index,
+        target,
+        tags: provider.tags.clone(),
+        endpoints,
+    })
+}
+
+fn explain_v3_providers(view: &ServiceViewV3) -> Vec<ConfigExplainV3Provider> {
+    ordered_v3_provider_names(view)
+        .into_iter()
+        .filter_map(|provider_name| explain_v3_provider(view, provider_name.as_str()))
+        .collect()
+}
+
+fn print_v3_explain_text(
+    label: &str,
+    view: &ServiceViewV3,
+    provider_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let routing = explain_v3_routing(view);
+    println!("Schema version: v3");
+    println!("Service: {label}");
+    println!("Routing policy: {}", routing.policy);
+    println!(
+        "Routing target: {}",
+        routing.target.as_deref().unwrap_or("<none>")
+    );
+    let order = if routing.order.is_empty() {
+        "<provider key order>".to_string()
+    } else {
+        routing.order.join(", ")
+    };
+    println!("Routing order: [{order}]");
+    println!("On exhausted: {}", routing.on_exhausted);
+
+    let providers = explain_v3_providers(view);
+    if providers.is_empty() {
+        println!("Providers: <empty>");
+    } else {
+        println!("Providers:");
+        for provider in &providers {
+            let marker = if provider.target { "*" } else { " " };
+            let enabled = if provider.enabled { "on" } else { "off" };
+            let index = provider
+                .routing_index
+                .map(|idx| idx.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {} {} {} (order={}, endpoints={}, tags={})",
+                marker,
+                enabled,
+                provider.name,
+                index,
+                provider.endpoints.len(),
+                if provider.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    provider
+                        .tags
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            );
+        }
+    }
+
+    if let Some(provider_name) = provider_name {
+        let provider = explain_v3_provider(view, provider_name)
+            .ok_or_else(|| anyhow::anyhow!("provider '{}' not found", provider_name))?;
+        println!("Provider '{}': enabled={}", provider.name, provider.enabled);
+        if provider.endpoints.is_empty() {
+            println!("  <no endpoints>");
+        } else {
+            for endpoint in provider.endpoints {
+                println!(
+                    "  [{}] {} enabled={}",
+                    endpoint.name, endpoint.base_url, endpoint.enabled
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn build_group_explain(
     mgr: &ServiceConfigManager,
     station_name: Option<&str>,
@@ -499,6 +677,34 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let document = load_config_document()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+
+            if let ConfigDocument::V3(cfg) = &document {
+                let (view, label) = select_v3_service_view(cfg, service);
+                if json {
+                    let provider = if let Some(provider_name) = station.as_deref() {
+                        Some(explain_v3_provider(view, provider_name).ok_or_else(|| {
+                            CliError::ProxyConfig(format!("provider '{}' not found", provider_name))
+                        })?)
+                    } else {
+                        None
+                    };
+                    let payload = ConfigExplainV3Payload {
+                        schema_version: document.schema_version(),
+                        service: service.to_string(),
+                        routing: explain_v3_routing(view),
+                        providers: explain_v3_providers(view),
+                        provider,
+                    };
+                    let text = serde_json::to_string_pretty(&payload)
+                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                    println!("{text}");
+                } else {
+                    print_v3_explain_text(label, view, station.as_deref())
+                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                }
+                return Ok(());
+            }
+
             let runtime = document
                 .runtime()
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
