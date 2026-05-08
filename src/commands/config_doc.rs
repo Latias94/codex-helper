@@ -117,6 +117,27 @@ pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
     }
 }
 
+pub(super) async fn load_v3_config(
+    codex: bool,
+    claude: bool,
+    command_group: &str,
+) -> anyhow::Result<(ProxyConfigV3, &'static str, &'static str)> {
+    let service = resolve_service(codex, claude).await?;
+    let document = load_config_document().await?;
+    let ConfigDocument::V3(cfg) = document else {
+        anyhow::bail!(
+            "{} commands require a version = 3 config; run `codex-helper station migrate --to v3 --write --yes` first",
+            command_group
+        );
+    };
+    let label = if service == "claude" {
+        "Claude"
+    } else {
+        "Codex"
+    };
+    Ok((cfg, service, label))
+}
+
 pub(super) fn select_service_manager<'a>(
     cfg: &'a ProxyConfig,
     service: &str,

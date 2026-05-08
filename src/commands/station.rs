@@ -1,13 +1,12 @@
 use super::config_doc::{
-    ConfigDocument, ensure_v3_routing, ensure_v3_routing_order_contains, load_config_document,
-    ordered_v3_provider_names, parse_cli_tags, print_v3_provider_list, resolve_service,
-    routing_exhausted_label, routing_policy_label, select_service_manager, select_v3_service_view,
-    select_v3_service_view_mut,
+    ConfigDocument, load_config_document, ordered_v3_provider_names, parse_cli_tags,
+    print_v3_provider_list, resolve_service, routing_exhausted_label, routing_policy_label,
+    select_service_manager, select_v3_service_view,
 };
 use crate::cli_types::ConfigSchemaTarget;
 use crate::config::{
-    ProviderConfigV3, RetryConfig, RetryProfileName, RoutingPolicyV3, ServiceConfig,
-    ServiceConfigManager, ServiceRoutingExplanation, ServiceViewV3, UpstreamAuth, UpstreamConfig,
+    RetryConfig, RetryProfileName, ServiceConfig, ServiceConfigManager, ServiceRoutingExplanation,
+    ServiceViewV3, UpstreamAuth, UpstreamConfig,
     bootstrap::{
         import_codex_config_from_codex_cli, overwrite_codex_config_from_codex_cli_in_place,
     },
@@ -478,41 +477,16 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let service = resolve_service(codex, claude)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let parsed_tags =
-                parse_cli_tags(&tags).map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let document = load_config_document()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            if let ConfigDocument::V3(mut cfg) = document {
-                let (view, label) = select_v3_service_view_mut(&mut cfg, service);
-                view.providers.insert(
-                    name.clone(),
-                    ProviderConfigV3 {
-                        alias,
-                        enabled: !disabled,
-                        base_url: Some(base_url),
-                        inline_auth: UpstreamAuth {
-                            auth_token,
-                            auth_token_env,
-                            api_key,
-                            api_key_env,
-                        },
-                        tags: parsed_tags,
-                        ..ProviderConfigV3::default()
-                    },
-                );
-                ensure_v3_routing_order_contains(view, name.as_str());
-                save_config_v3(&cfg)
-                    .await
-                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                if level != 1 {
-                    eprintln!(
-                        "warning: --level is ignored for v3 routing configs; edit routing.order to control priority."
-                    );
-                }
-                println!("Added {label} provider '{}' to v3 routing config", name);
-                return Ok(());
+            if matches!(document, ConfigDocument::V3(_)) {
+                return Err(CliError::ProxyConfig(
+                    "v3 configs do not support `station add`; use `codex-helper provider add` for providers and `codex-helper routing order` for fallback order.".to_string(),
+                ));
             }
+            let parsed_tags =
+                parse_cli_tags(&tags).map_err(|e| CliError::ProxyConfig(e.to_string()))?;
 
             let mut cfg = load_config()
                 .await
@@ -569,22 +543,10 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let document = load_config_document()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            if let ConfigDocument::V3(mut cfg) = document {
-                let (view, label) = select_v3_service_view_mut(&mut cfg, service);
-                let Some(provider) = view.providers.get_mut(name.as_str()) else {
-                    println!("{label} provider '{}' not found", name);
-                    return Ok(());
-                };
-                provider.enabled = true;
-                ensure_v3_routing_order_contains(view, name.as_str());
-                let routing = ensure_v3_routing(view);
-                routing.policy = RoutingPolicyV3::ManualSticky;
-                routing.target = Some(name.clone());
-                save_config_v3(&cfg)
-                    .await
-                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                println!("{label} routing target pinned to provider '{}'", name);
-                return Ok(());
+            if matches!(document, ConfigDocument::V3(_)) {
+                return Err(CliError::ProxyConfig(
+                    "v3 configs do not support `station set-active`; use `codex-helper routing pin <provider>`.".to_string(),
+                ));
             }
 
             let mut cfg = load_config()
@@ -630,7 +592,7 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             if matches!(document, ConfigDocument::V3(_)) {
                 return Err(CliError::ProxyConfig(
-                    "v3 routing configs do not have station levels; edit routing.order or use station set-active to pin a provider.".to_string(),
+                    "v3 routing configs do not have station levels; use `codex-helper routing order ...` to set fallback order or `codex-helper routing pin <provider>` to pin.".to_string(),
                 ));
             }
 
@@ -681,19 +643,10 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let document = load_config_document()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            if let ConfigDocument::V3(mut cfg) = document {
-                let (view, label) = select_v3_service_view_mut(&mut cfg, service);
-                let Some(provider) = view.providers.get_mut(name.as_str()) else {
-                    println!("{label} provider '{}' not found", name);
-                    return Ok(());
-                };
-                provider.enabled = true;
-                ensure_v3_routing_order_contains(view, name.as_str());
-                save_config_v3(&cfg)
-                    .await
-                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                println!("Enabled {label} provider '{}'", name);
-                return Ok(());
+            if matches!(document, ConfigDocument::V3(_)) {
+                return Err(CliError::ProxyConfig(
+                    "v3 configs do not support `station enable`; use `codex-helper provider enable <provider>`.".to_string(),
+                ));
             }
 
             let mut cfg = load_config()
@@ -742,33 +695,10 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let document = load_config_document()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            if let ConfigDocument::V3(mut cfg) = document {
-                let (view, label) = select_v3_service_view_mut(&mut cfg, service);
-                let Some(provider) = view.providers.get_mut(name.as_str()) else {
-                    println!("{label} provider '{}' not found", name);
-                    return Ok(());
-                };
-                provider.enabled = false;
-
-                let routing = ensure_v3_routing(view);
-                let was_target = routing.target.as_deref() == Some(name.as_str());
-                if was_target {
-                    routing.policy = RoutingPolicyV3::OrderedFailover;
-                    routing.target = None;
-                }
-                save_config_v3(&cfg)
-                    .await
-                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-
-                if was_target {
-                    println!(
-                        "Disabled {label} provider '{}' and cleared manual routing target",
-                        name
-                    );
-                } else {
-                    println!("Disabled {label} provider '{}'", name);
-                }
-                return Ok(());
+            if matches!(document, ConfigDocument::V3(_)) {
+                return Err(CliError::ProxyConfig(
+                    "v3 configs do not support `station disable`; use `codex-helper provider disable <provider>`.".to_string(),
+                ));
             }
 
             let mut cfg = load_config()

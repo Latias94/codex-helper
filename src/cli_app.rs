@@ -60,6 +60,10 @@ pub async fn run_cli() -> CliResult<()> {
             commands::routing::handle_routing_cmd(cmd).await?;
             return Ok(());
         }
+        Command::Provider { cmd } => {
+            commands::provider::handle_provider_cmd(cmd).await?;
+            return Ok(());
+        }
         Command::Session { cmd } => {
             commands::session::handle_session_cmd(cmd).await?;
             return Ok(());

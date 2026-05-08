@@ -81,6 +81,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: RoutingCommand,
     },
+    /// Manage routing-first provider catalog for v3 configs
+    Provider {
+        #[command(subcommand)]
+        cmd: ProviderCommand,
+    },
     /// Session-related helper commands (Codex sessions)
     Session {
         #[command(subcommand)]
@@ -433,6 +438,90 @@ pub enum RoutingCommand {
         #[arg(long)]
         codex: bool,
         /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProviderCommand {
+    /// Show providers in the v3 catalog
+    List {
+        /// Target Codex provider catalog (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude provider catalog
+        #[arg(long)]
+        claude: bool,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one provider in detail
+    Show {
+        name: String,
+        /// Target Codex provider catalog (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude provider catalog
+        #[arg(long)]
+        claude: bool,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add or replace a provider
+    Add {
+        name: String,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long)]
+        auth_token: Option<String>,
+        /// Read bearer token from an environment variable instead of storing it on disk
+        #[arg(long, conflicts_with = "auth_token")]
+        auth_token_env: Option<String>,
+        /// Use X-API-Key header value (some providers)
+        #[arg(long, conflicts_with = "api_key_env")]
+        api_key: Option<String>,
+        /// Read X-API-Key header value from an environment variable
+        #[arg(long, conflicts_with = "api_key")]
+        api_key_env: Option<String>,
+        /// Optional alias for this provider
+        #[arg(long)]
+        alias: Option<String>,
+        /// Provider tag in KEY=VALUE form; can be passed multiple times
+        #[arg(long = "tag", value_name = "KEY=VALUE")]
+        tags: Vec<String>,
+        /// Exclude this provider from automatic routing
+        #[arg(long)]
+        disabled: bool,
+        /// Replace an existing provider with the same name
+        #[arg(long)]
+        replace: bool,
+        /// Target Codex provider catalog (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude provider catalog
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Enable a provider for automatic routing
+    Enable {
+        name: String,
+        /// Target Codex provider catalog (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude provider catalog
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Disable a provider for automatic routing
+    Disable {
+        name: String,
+        /// Target Codex provider catalog (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude provider catalog
         #[arg(long)]
         claude: bool,
     },

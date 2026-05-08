@@ -1,7 +1,6 @@
 use super::config_doc::{
-    ConfigDocument, load_config_document, ordered_v3_provider_names, parse_cli_tags,
-    resolve_service, routing_exhausted_label, routing_policy_label, select_v3_service_view,
-    select_v3_service_view_mut,
+    load_v3_config, ordered_v3_provider_names, parse_cli_tags, routing_exhausted_label,
+    routing_policy_label, select_v3_service_view, select_v3_service_view_mut,
 };
 use crate::cli_types::{RoutingCommand, RoutingPolicy};
 use crate::config::{
@@ -26,7 +25,9 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             claude,
             json,
         } => {
-            let (cfg, service, label) = load_v3_config(codex, claude).await?;
+            let (cfg, service, label) = load_v3_config(codex, claude, "routing")
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let (view, _) = select_v3_service_view(&cfg, service);
             let routing = persisted_routing_spec_from_view(view);
             if json {
@@ -53,7 +54,9 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude).await?;
+            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
                 let (view, _) = select_v3_service_view_mut(&mut cfg, service);
                 if let Some(policy) = policy {
@@ -197,7 +200,9 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude).await?;
+            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
                 let (view, _) = select_v3_service_view_mut(&mut cfg, service);
                 ensure_provider_exists(view, provider.as_str())?;
@@ -224,7 +229,9 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude).await?;
+            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
                 let (view, _) = select_v3_service_view_mut(&mut cfg, service);
                 let order = normalize_complete_order(view, providers, None)
@@ -250,7 +257,9 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude).await?;
+            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
                 let (view, _) = select_v3_service_view_mut(&mut cfg, service);
                 let prefer_tag =
@@ -280,7 +289,9 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             println!("{label} tag-preferred routing updated");
         }
         RoutingCommand::ClearTarget { codex, claude } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude).await?;
+            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
                 let (view, _) = select_v3_service_view_mut(&mut cfg, service);
                 let Some(current_order) =
@@ -311,29 +322,6 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
     }
 
     Ok(())
-}
-
-async fn load_v3_config(
-    codex: bool,
-    claude: bool,
-) -> CliResult<(crate::config::ProxyConfigV3, &'static str, &'static str)> {
-    let service = resolve_service(codex, claude)
-        .await
-        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-    let document = load_config_document()
-        .await
-        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-    let ConfigDocument::V3(cfg) = document else {
-        return Err(CliError::ProxyConfig(
-            "routing commands require a version = 3 config; run `codex-helper station migrate --to v3 --write --yes` first".to_string(),
-        ));
-    };
-    let label = if service == "claude" {
-        "Claude"
-    } else {
-        "Codex"
-    };
-    Ok((cfg, service, label))
 }
 
 fn persisted_routing_spec_from_view(view: &ServiceViewV3) -> PersistedRoutingSpec {
