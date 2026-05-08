@@ -209,6 +209,23 @@ on_exhausted = "stop"
 
 Best when you would rather fail than spill into a non-monthly provider.
 
+## CLI Editing Notes
+
+The old `station` CLI surface remains as a compatibility command group, but on a `version = 3` file it edits providers and routing directly:
+
+```bash
+codex-helper station add input --base-url https://ai.input.im/v1 --auth-token-env INPUT_API_KEY
+codex-helper station set-active input
+codex-helper station enable input
+codex-helper station disable input
+```
+
+- `station add` creates `[codex.providers.input]` and appends `input` to `codex.routing.order`.
+- `station set-active input` pins `codex.routing.policy = "manual-sticky"` and `target = "input"`.
+- `station enable/disable` toggles the provider, keeping `routing.order` stable.
+- `station disable` clears a manual target if it disables that target.
+- `station set-level` is rejected for v3; provider priority is `routing.order`.
+
 ## Migration From Legacy Config
 
 The migration should be deterministic and boring.

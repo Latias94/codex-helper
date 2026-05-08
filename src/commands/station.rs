@@ -1,8 +1,9 @@
 use crate::cli_types::ConfigSchemaTarget;
 use crate::config::{
-    ConfigV3MigrationReport, ProxyConfig, ProxyConfigV2, ProxyConfigV3, RetryConfig,
-    RetryProfileName, ServiceConfig, ServiceConfigManager, ServiceKind, ServiceRoutingExplanation,
-    UpstreamAuth, UpstreamConfig,
+    ConfigV3MigrationReport, ProviderConfigV3, ProxyConfig, ProxyConfigV2, ProxyConfigV3,
+    RetryConfig, RetryProfileName, RoutingConfigV3, RoutingPolicyV3, ServiceConfig,
+    ServiceConfigManager, ServiceKind, ServiceRoutingExplanation, ServiceViewV3, UpstreamAuth,
+    UpstreamConfig,
     bootstrap::{
         import_codex_config_from_codex_cli, overwrite_codex_config_from_codex_cli_in_place,
     },
@@ -152,6 +153,32 @@ fn select_service_manager<'a>(
         (&cfg.claude, "Claude")
     } else {
         (&cfg.codex, "Codex")
+    }
+}
+
+fn select_v3_service_view_mut<'a>(
+    cfg: &'a mut ProxyConfigV3,
+    service: &str,
+) -> (&'a mut ServiceViewV3, &'static str) {
+    if service == "claude" {
+        (&mut cfg.claude, "Claude")
+    } else {
+        (&mut cfg.codex, "Codex")
+    }
+}
+
+fn ensure_v3_routing(view: &mut ServiceViewV3) -> &mut RoutingConfigV3 {
+    view.routing.get_or_insert_with(RoutingConfigV3::default)
+}
+
+fn ensure_v3_routing_order_contains(view: &mut ServiceViewV3, provider_name: &str) {
+    let routing = ensure_v3_routing(view);
+    if !routing
+        .order
+        .iter()
+        .any(|candidate| candidate == provider_name)
+    {
+        routing.order.push(provider_name.to_string());
     }
 }
 
@@ -378,6 +405,39 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let service = resolve_service(codex, claude)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let document = load_config_document()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            if let ConfigDocument::V3(mut cfg) = document {
+                let (view, label) = select_v3_service_view_mut(&mut cfg, service);
+                view.providers.insert(
+                    name.clone(),
+                    ProviderConfigV3 {
+                        alias,
+                        enabled: !disabled,
+                        base_url: Some(base_url),
+                        inline_auth: UpstreamAuth {
+                            auth_token,
+                            auth_token_env,
+                            api_key,
+                            api_key_env,
+                        },
+                        ..ProviderConfigV3::default()
+                    },
+                );
+                ensure_v3_routing_order_contains(view, name.as_str());
+                save_config_v3(&cfg)
+                    .await
+                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                if level != 1 {
+                    eprintln!(
+                        "warning: --level is ignored for v3 routing configs; edit routing.order to control priority."
+                    );
+                }
+                println!("Added {label} provider '{}' to v3 routing config", name);
+                return Ok(());
+            }
+
             let mut cfg = load_config()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -430,6 +490,27 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let service = resolve_service(codex, claude)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let document = load_config_document()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            if let ConfigDocument::V3(mut cfg) = document {
+                let (view, label) = select_v3_service_view_mut(&mut cfg, service);
+                let Some(provider) = view.providers.get_mut(name.as_str()) else {
+                    println!("{label} provider '{}' not found", name);
+                    return Ok(());
+                };
+                provider.enabled = true;
+                ensure_v3_routing_order_contains(view, name.as_str());
+                let routing = ensure_v3_routing(view);
+                routing.policy = RoutingPolicyV3::ManualSticky;
+                routing.target = Some(name.clone());
+                save_config_v3(&cfg)
+                    .await
+                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                println!("{label} routing target pinned to provider '{}'", name);
+                return Ok(());
+            }
+
             let mut cfg = load_config()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -466,6 +547,14 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             if !(1..=10).contains(&level) {
                 return Err(CliError::ProxyConfig(
                     "level must be in range 1..=10".to_string(),
+                ));
+            }
+            let document = load_config_document()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            if matches!(document, ConfigDocument::V3(_)) {
+                return Err(CliError::ProxyConfig(
+                    "v3 routing configs do not have station levels; edit routing.order or use station set-active to pin a provider.".to_string(),
                 ));
             }
 
@@ -513,6 +602,24 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let service = resolve_service(codex, claude)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let document = load_config_document()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            if let ConfigDocument::V3(mut cfg) = document {
+                let (view, label) = select_v3_service_view_mut(&mut cfg, service);
+                let Some(provider) = view.providers.get_mut(name.as_str()) else {
+                    println!("{label} provider '{}' not found", name);
+                    return Ok(());
+                };
+                provider.enabled = true;
+                ensure_v3_routing_order_contains(view, name.as_str());
+                save_config_v3(&cfg)
+                    .await
+                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                println!("Enabled {label} provider '{}'", name);
+                return Ok(());
+            }
+
             let mut cfg = load_config()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -556,6 +663,38 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let service = resolve_service(codex, claude)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let document = load_config_document()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            if let ConfigDocument::V3(mut cfg) = document {
+                let (view, label) = select_v3_service_view_mut(&mut cfg, service);
+                let Some(provider) = view.providers.get_mut(name.as_str()) else {
+                    println!("{label} provider '{}' not found", name);
+                    return Ok(());
+                };
+                provider.enabled = false;
+
+                let routing = ensure_v3_routing(view);
+                let was_target = routing.target.as_deref() == Some(name.as_str());
+                if was_target {
+                    routing.policy = RoutingPolicyV3::OrderedFailover;
+                    routing.target = None;
+                }
+                save_config_v3(&cfg)
+                    .await
+                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+
+                if was_target {
+                    println!(
+                        "Disabled {label} provider '{}' and cleared manual routing target",
+                        name
+                    );
+                } else {
+                    println!("Disabled {label} provider '{}'", name);
+                }
+                return Ok(());
+            }
+
             let mut cfg = load_config()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
