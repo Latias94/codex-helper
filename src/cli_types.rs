@@ -521,6 +521,20 @@ pub enum PricingCommand {
     },
     /// Remove a local model price override
     Remove { model_id: String },
+    /// Pull a remote pricing catalog JSON into local overrides
+    Sync {
+        /// URL returning a ModelPriceCatalogSnapshot JSON payload
+        url: String,
+        /// Import only rows matching these model ids or aliases
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Replace local overrides instead of merging into them
+        #[arg(long)]
+        replace: bool,
+        /// Show what would be imported without writing pricing_overrides.toml
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

@@ -656,8 +656,12 @@ codex-helper pricing path
 codex-helper pricing list
 codex-helper pricing list --local --model gpt-5
 codex-helper pricing set custom-codex --input-per-1m-usd 0.50 --output-per-1m-usd 1.50 --confidence estimated
+codex-helper pricing sync http://127.0.0.1:4322/__codex_helper/api/v1/pricing/catalog --model relay-gpt5 --dry-run
+codex-helper pricing sync http://127.0.0.1:4322/__codex_helper/api/v1/pricing/catalog --model relay-gpt5
 codex-helper pricing remove custom-codex
 ```
+
+`pricing sync` 拉取的是 `ModelPriceCatalogSnapshot` JSON（也就是本项目 admin API 暴露的价格目录格式），默认合并到本地覆盖；加 `--replace` 会用远端匹配结果替换本地覆盖文件。
 
 ### 用量提供商（Usage Providers）
 

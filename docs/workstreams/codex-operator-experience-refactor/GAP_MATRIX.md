@@ -97,7 +97,7 @@ Use it for:
 | Service tier / fast | Requested/effective/actual exists | Provider/model dependent | Request detail badges | Need consistent UI and pricing linkage | P0/P1 |
 | Token usage | Basic input/output/reasoning/total | Cache read/create | Cache read/create/5m/1h | Usage v2 needed | P0 |
 | Cost calculation | Core cache-aware pricing engine + confidence labels | Model pricing table | High precision cost engine | Add source-backed sync / overrides | P1 |
-| Model price sync | Not first-class | Seeded pricing table | External sync + cache | Add optional source-backed catalog | P1 |
+| Model price sync | CLI can sync remote `ModelPriceCatalogSnapshot` JSON into local overrides; no scheduled source cache yet | Seeded pricing table | External sync + cache | Add scheduled source-backed catalog cache later | P1 |
 | Balance/quota | `usage_providers.rs` marks exhausted | Balance scripts/adapters | Provider limit/cost windows | Promote to first-class balance state | P1 |
 | Health vs quota | Partially separated by `usage_exhausted` | Provider/circuit UI | Circuit + limits | Need clear semantics and UI | P1 |
 | Automatic switching | HA/failover base exists; GUI/TUI previews explain retry boundaries and GUI draft edits warn on cross-station pre-output failover | Failover queue | Intelligent failover/sticky | Need deeper policy simulation and weighted strategy controls | P1/P2 |
