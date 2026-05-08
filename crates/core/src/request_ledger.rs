@@ -156,9 +156,37 @@ impl RequestUsageAggregate {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestUsageSummaryGroup {
+    Station,
+    Provider,
+    Model,
+    Session,
+}
+
+impl RequestUsageSummaryGroup {
+    pub fn column_name(self) -> &'static str {
+        match self {
+            Self::Station => "station_name",
+            Self::Provider => "provider_id",
+            Self::Model => "model",
+            Self::Session => "session_id",
+        }
+    }
+
+    fn key(self, record: &JsonValue) -> String {
+        match self {
+            Self::Station => station_name(record).to_string(),
+            Self::Provider => str_field(record, "provider_id").unwrap_or("-").to_string(),
+            Self::Model => request_model(record).unwrap_or_else(|| "-".to_string()),
+            Self::Session => str_field(record, "session_id").unwrap_or("-").to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestUsageSummaryRow {
-    pub station_name: String,
+    pub group_value: String,
     pub aggregate: RequestUsageAggregate,
 }
 
@@ -181,10 +209,17 @@ pub fn tail_request_log(path: &Path, limit: usize) -> std::io::Result<Vec<Reques
 
 pub fn summarize_request_log(
     path: &Path,
+    group: RequestUsageSummaryGroup,
+    filters: &RequestLogFilters,
     limit: usize,
 ) -> std::io::Result<Vec<RequestUsageSummaryRow>> {
     let lines = read_request_log_lines(path)?;
-    Ok(summarize_request_log_lines(lines.iter(), limit))
+    Ok(summarize_request_log_lines(
+        lines.iter(),
+        group,
+        filters,
+        limit,
+    ))
 }
 
 pub fn find_request_log(
@@ -204,6 +239,8 @@ pub fn find_request_log(
 
 fn summarize_request_log_lines<'a>(
     lines: impl IntoIterator<Item = &'a RequestLogLine>,
+    group: RequestUsageSummaryGroup,
+    filters: &RequestLogFilters,
     limit: usize,
 ) -> Vec<RequestUsageSummaryRow> {
     let mut aggregate: HashMap<String, RequestUsageAggregate> = HashMap::new();
@@ -211,20 +248,28 @@ fn summarize_request_log_lines<'a>(
         let Some(record) = line.value() else {
             continue;
         };
-        let station_name = station_name(record).to_string();
+        if !filters.matches(record) {
+            continue;
+        }
+        let group_value = group.key(record);
         let duration_ms = u64_field(record, "duration_ms").unwrap_or(0);
-        let entry = aggregate.entry(station_name).or_default();
+        let entry = aggregate.entry(group_value).or_default();
         entry.record(duration_ms, usage_metrics(record).as_ref());
     }
 
     let mut items: Vec<RequestUsageSummaryRow> = aggregate
         .into_iter()
-        .map(|(station_name, aggregate)| RequestUsageSummaryRow {
-            station_name,
+        .map(|(group_value, aggregate)| RequestUsageSummaryRow {
+            group_value,
             aggregate,
         })
         .collect();
-    items.sort_by(|a, b| b.aggregate.total_tokens.cmp(&a.aggregate.total_tokens));
+    items.sort_by(|a, b| {
+        b.aggregate
+            .total_tokens
+            .cmp(&a.aggregate.total_tokens)
+            .then_with(|| a.group_value.cmp(&b.group_value))
+    });
     items.into_iter().take(limit).collect()
 }
 
@@ -651,12 +696,64 @@ mod tests {
         ];
 
         assert!(!lines[1].is_valid_json());
-        let rows = summarize_request_log_lines(lines.iter(), 10);
+        let rows = summarize_request_log_lines(
+            lines.iter(),
+            RequestUsageSummaryGroup::Station,
+            &RequestLogFilters::default(),
+            10,
+        );
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].station_name, "a");
+        assert_eq!(rows[0].group_value, "a");
         assert_eq!(rows[0].aggregate.total_tokens, 7);
-        assert_eq!(rows[1].station_name, "b");
+        assert_eq!(rows[1].group_value, "b");
         assert_eq!(rows[1].aggregate.total_tokens, 3);
+    }
+
+    #[test]
+    fn summary_can_group_by_provider_model_or_session_with_filters() {
+        let lines = [
+            RequestLogLine::from_raw(
+                r#"{"session_id":"sid-a","station_name":"s1","provider_id":"p1","model":"gpt-5","status_code":200,"usage":{"total_tokens":7}}"#,
+            ),
+            RequestLogLine::from_raw(
+                r#"{"session_id":"sid-b","station_name":"s1","provider_id":"p1","model":"gpt-5.4","status_code":429,"usage":{"total_tokens":11}}"#,
+            ),
+            RequestLogLine::from_raw(
+                r#"{"session_id":"sid-b","station_name":"s2","provider_id":"p2","model":"gpt-5.4","status_code":200,"usage":{"total_tokens":3}}"#,
+            ),
+        ];
+
+        let provider_rows = summarize_request_log_lines(
+            lines.iter(),
+            RequestUsageSummaryGroup::Provider,
+            &RequestLogFilters::default(),
+            10,
+        );
+        assert_eq!(provider_rows[0].group_value, "p1");
+        assert_eq!(provider_rows[0].aggregate.total_tokens, 18);
+        assert_eq!(provider_rows[1].group_value, "p2");
+
+        let model_rows = summarize_request_log_lines(
+            lines.iter(),
+            RequestUsageSummaryGroup::Model,
+            &RequestLogFilters {
+                status_min: Some(400),
+                ..RequestLogFilters::default()
+            },
+            10,
+        );
+        assert_eq!(model_rows.len(), 1);
+        assert_eq!(model_rows[0].group_value, "gpt-5.4");
+        assert_eq!(model_rows[0].aggregate.total_tokens, 11);
+
+        let session_rows = summarize_request_log_lines(
+            lines.iter(),
+            RequestUsageSummaryGroup::Session,
+            &RequestLogFilters::default(),
+            10,
+        );
+        assert_eq!(session_rows[0].group_value, "sid-b");
+        assert_eq!(session_rows[0].aggregate.requests, 2);
     }
 }

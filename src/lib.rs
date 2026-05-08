@@ -5,7 +5,7 @@ pub mod commands;
 pub use cli_app::run_cli;
 pub use cli_types::{
     CliError, CliResult, ConfigCommand, PricingCommand, PricingConfidence, RecentFormat,
-    RecentTerminal, RetryProfile, SessionCommand, StationCommand, UsageCommand,
+    RecentTerminal, RetryProfile, SessionCommand, StationCommand, UsageCommand, UsageSummaryBy,
 };
 pub use codex_helper_core::{
     codex_integration, config, dashboard_core, filter, healthcheck, lb, logging, model_routing,

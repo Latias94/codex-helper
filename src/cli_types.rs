@@ -477,11 +477,14 @@ pub enum UsageCommand {
         #[arg(long)]
         raw: bool,
     },
-    /// Summarize total token usage per station from ~/.codex-helper/logs/requests.jsonl
+    /// Summarize total token usage from ~/.codex-helper/logs/requests.jsonl
     Summary {
-        /// Maximum number of stations to show (sorted by total_tokens desc)
+        /// Maximum number of summary rows to show (sorted by total_tokens desc)
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Group summary rows by station, provider, model, or session
+        #[arg(long, value_enum, default_value_t = UsageSummaryBy::Station)]
+        by: UsageSummaryBy,
     },
     /// Find matching request records in ~/.codex-helper/logs/requests.jsonl
     Find {
@@ -519,6 +522,15 @@ pub enum UsageCommand {
         #[arg(long)]
         raw: bool,
     },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub enum UsageSummaryBy {
+    Station,
+    Provider,
+    Model,
+    Session,
 }
 
 #[derive(Subcommand, Debug)]

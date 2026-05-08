@@ -1,7 +1,8 @@
 use crate::request_ledger::{
-    RequestLogFilters, find_request_log, request_log_path, summarize_request_log, tail_request_log,
+    RequestLogFilters, RequestUsageSummaryGroup, find_request_log, request_log_path,
+    summarize_request_log, tail_request_log,
 };
-use crate::{CliError, CliResult, UsageCommand};
+use crate::{CliError, CliResult, UsageCommand, UsageSummaryBy};
 use owo_colors::OwoColorize;
 
 pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
@@ -26,22 +27,33 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
                 }
             }
         }
-        UsageCommand::Summary { limit } => {
-            let rows = summarize_request_log(&log_path, limit).map_err(|err| {
-                CliError::Usage(format!("无法打开请求日志 {:?}: {}", log_path, err))
-            })?;
+        UsageCommand::Summary { limit, by } => {
+            let group = RequestUsageSummaryGroup::from(by);
+            let rows =
+                summarize_request_log(&log_path, group, &RequestLogFilters::default(), limit)
+                    .map_err(|err| {
+                        CliError::Usage(format!("无法打开请求日志 {:?}: {}", log_path, err))
+                    })?;
 
             println!(
                 "{}",
-                format!("Usage summary by station (from {:?})", log_path).bold()
+                format!(
+                    "Usage summary by {} (from {:?})",
+                    group.column_name(),
+                    log_path
+                )
+                .bold()
             );
             println!(
                 "{}",
-                "station_name | requests | input | output | cache_read | cache_create | reasoning | total | avg_duration_ms"
-                    .bold()
+                format!(
+                    "{} | requests | input | output | cache_read | cache_create | reasoning | total | avg_duration_ms",
+                    group.column_name()
+                )
+                .bold()
             );
             for row in rows {
-                println!("{}", row.aggregate.summary_line(&row.station_name));
+                println!("{}", row.aggregate.summary_line(&row.group_value));
             }
         }
         UsageCommand::Find {
@@ -87,4 +99,15 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
     }
 
     Ok(())
+}
+
+impl From<UsageSummaryBy> for RequestUsageSummaryGroup {
+    fn from(value: UsageSummaryBy) -> Self {
+        match value {
+            UsageSummaryBy::Station => Self::Station,
+            UsageSummaryBy::Provider => Self::Provider,
+            UsageSummaryBy::Model => Self::Model,
+            UsageSummaryBy::Session => Self::Session,
+        }
+    }
 }
