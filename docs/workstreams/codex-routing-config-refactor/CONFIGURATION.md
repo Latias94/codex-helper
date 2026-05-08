@@ -246,11 +246,11 @@ codex-helper routing clear-target
 - `routing clear-target` removes the manual target and returns to ordered failover.
 - `routing set` is the low-level patch command for advanced edits: `--policy`, `--target`, `--order`, `--prefer-tag`, `--clear-prefer-tags`, and `--on-exhausted`.
 
-The old `station` CLI surface remains for migration and for listing/explaining older configs:
+Use `routing list` / `routing explain` to inspect the compiled runtime view:
 
-- `station list` shows v3 providers plus policy, target, order, and exhaustion behavior.
-- `station explain` shows the v3 routing recipe; `--station <name>` is treated as a provider detail selector on v3 files.
-- `station` is now read-only (`list` / `explain`) in the public CLI; use `provider` and `routing` for authoring.
+- `routing list` shows v3 providers plus policy, target, order, and exhaustion behavior.
+- `routing explain` shows the v3 routing recipe; `--provider <name>` is treated as a provider detail selector on v3 files.
+- The old `station` CLI surface has been removed from the public command tree.
 - `level` is a legacy migration source; provider priority is `routing.order`.
 
 ## Control Plane Editing Notes

@@ -77,14 +77,14 @@ ch
 
 - 用 `provider` / `routing` 管理上游与兜底，而不是只靠零散 `base_url` 记忆配置；
 - 用 `profile` 表达常用意图，例如 `daily` / `fast` / `deep`；
-- 用 **session identity card** 回答“这个 Codex 会话现在到底走哪个 station / upstream / model / fast mode / reasoning”；
-- 支持 **session 级覆盖**：`model`、`reasoning_effort`、`service_tier`、`station`；
-- 内置 runtime health、breaker、same-station failover，可在失败时先耗尽当前 station 内其他 eligible upstream，再考虑下一站点；
+- 用 **session identity card** 回答“这个 Codex 会话现在到底走哪个 provider / upstream / model / fast mode / reasoning”；
+- 支持 **session 级覆盖**：`model`、`reasoning_effort`、`service_tier`、路由目标；
+- 内置 runtime health、breaker、同路由候选内 failover，可在失败时先耗尽当前候选内其他 eligible upstream，再考虑下一候选；
 - 支持局域网 / Tailscale 下的 **central relay** 形态，但不会假装远程设备天然拥有宿主机的 transcript/session 文件访问能力。
 
 如果你之前把它理解成“一个帮我切换 config.toml 的本地代理”，现在可以把它理解成：
 
-> `Codex CLI -> codex-helper data plane -> station/profile/session control plane`
+> `Codex CLI -> codex-helper data plane -> provider/routing/profile/session control plane`
 
 ---
 
@@ -103,7 +103,7 @@ ch
 
 `profile` 是可复用的控制模板，用来表达“我想怎么跑这类会话”，例如：
 
-- 目标 station
+- 目标 provider / routing
 - 目标 model
 - `service_tier` / fast mode
 - `reasoning_effort`
@@ -116,12 +116,12 @@ ch
 
 - 看单会话 identity card；
 - 对单会话应用 profile；
-- 对单会话覆盖 `model / reasoning_effort / service_tier / station`；
+- 对单会话覆盖 `model / reasoning_effort / service_tier / routing target`；
 - 区分值到底来自：
   - session override
   - profile default
   - request payload
-  - station mapping
+  - provider mapping
   - runtime fallback
 
 这也是为什么“先知道当前 Codex 会话对应哪个对象”现在已经变成一等能力，而不是靠猜。
@@ -242,7 +242,7 @@ codex-helper config migrate --to v3 --dry-run
 codex-helper config migrate --to v3 --write --yes
 ```
 
-`station list` / `station explain` 只用于查看编译后的运行时视图；新增 provider、调整顺序、启用禁用都使用 `provider` 和 `routing` 命令。
+`routing list` / `routing explain` 用于查看编译后的运行时视图；新增 provider、调整顺序、启用禁用都使用 `provider` 和 `routing` 命令。
 
 ---
 
@@ -332,8 +332,8 @@ codex-helper config migrate --to v3 --write --yes
 - 查看编译后的运行时视图：
 
   ```bash
-  codex-helper station list
-  codex-helper station explain
+  codex-helper routing list
+  codex-helper routing explain
   ```
 
 ### TUI 设置页（运行态）

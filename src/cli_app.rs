@@ -52,10 +52,6 @@ pub async fn run_cli() -> CliResult<()> {
             }
             return Ok(());
         }
-        Command::Station { cmd } => {
-            commands::station::handle_station_cmd(cmd).await?;
-            return Ok(());
-        }
         Command::Config { cmd } => {
             commands::config::handle_config_cmd(cmd).await?;
             return Ok(());

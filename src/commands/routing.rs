@@ -2,6 +2,7 @@ use super::config_doc::{
     load_v3_config, ordered_v3_provider_names, parse_cli_tags, routing_exhausted_label,
     routing_policy_label, select_v3_service_view, select_v3_service_view_mut,
 };
+use super::route_view;
 use crate::cli_types::{RoutingCommand, RoutingPolicy};
 use crate::config::{
     PersistedRoutingProviderRef, PersistedRoutingSpec, RoutingExhaustedActionV3, RoutingPolicyV3,
@@ -42,6 +43,9 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             } else {
                 print_routing_text(label, view);
             }
+        }
+        view_cmd @ (RoutingCommand::List { .. } | RoutingCommand::Explain { .. }) => {
+            route_view::handle_route_view_cmd(view_cmd).await?;
         }
         RoutingCommand::Set {
             policy,

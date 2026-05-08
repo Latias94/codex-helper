@@ -7,12 +7,12 @@ use crate::config::{
     ServiceConfigManager, ServiceRoutingExplanation, ServiceViewV3, explain_service_routing,
     storage::config_file_path,
 };
-use crate::{CliError, CliResult, StationCommand};
+use crate::{CliError, CliResult, RoutingCommand};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize)]
-struct ConfigExplainStation {
+struct ConfigExplainProvider {
     name: String,
     alias: Option<String>,
     enabled: bool,
@@ -24,9 +24,9 @@ struct ConfigExplainStation {
 struct ConfigExplainPayload {
     schema_version: u32,
     service: String,
-    active_station: Option<String>,
+    active_provider: Option<String>,
     routing: ServiceRoutingExplanation,
-    station: Option<ConfigExplainStation>,
+    provider: Option<ConfigExplainProvider>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -208,18 +208,18 @@ fn print_v3_explain_text(
 
 fn build_group_explain(
     mgr: &ServiceConfigManager,
-    station_name: Option<&str>,
-) -> anyhow::Result<Option<ConfigExplainStation>> {
-    let Some(station_name) = station_name else {
+    provider_name: Option<&str>,
+) -> anyhow::Result<Option<ConfigExplainProvider>> {
+    let Some(provider_name) = provider_name else {
         return Ok(None);
     };
 
     let svc = mgr
         .configs
-        .get(station_name)
-        .ok_or_else(|| anyhow::anyhow!("station '{}' not found", station_name))?;
-    Ok(Some(ConfigExplainStation {
-        name: station_name.to_string(),
+        .get(provider_name)
+        .ok_or_else(|| anyhow::anyhow!("provider '{}' not found", provider_name))?;
+    Ok(Some(ConfigExplainProvider {
+        name: provider_name.to_string(),
         alias: svc.alias.clone(),
         enabled: svc.enabled,
         level: svc.level.clamp(1, 10),
@@ -231,12 +231,12 @@ fn print_explain_text(
     label: &str,
     schema_version: u32,
     routing: &ServiceRoutingExplanation,
-    station: Option<&ConfigExplainStation>,
+    provider: Option<&ConfigExplainProvider>,
 ) {
     println!("Schema version: v{}", schema_version);
     println!("Service: {}", label);
     println!(
-        "Active station: {}",
+        "Active provider: {}",
         routing.active_station.as_deref().unwrap_or("<none>")
     );
     println!("Routing mode: {}", routing.mode);
@@ -246,10 +246,10 @@ fn print_explain_text(
     } else {
         println!("Candidate order:");
         for (idx, candidate) in routing.eligible_stations.iter().enumerate() {
-            let active = if candidate.active { " active" } else { "" };
+            let active = if candidate.active { " preferred" } else { "" };
             if let Some(alias) = candidate.alias.as_deref() {
                 println!(
-                    "  {}. {}{} (alias={}, level={}, enabled={}, upstreams={})",
+                    "  {}. {}{} (alias={}, priority={}, enabled={}, upstreams={})",
                     idx + 1,
                     candidate.name,
                     active,
@@ -260,7 +260,7 @@ fn print_explain_text(
                 );
             } else {
                 println!(
-                    "  {}. {}{} (level={}, enabled={}, upstreams={})",
+                    "  {}. {}{} (priority={}, enabled={}, upstreams={})",
                     idx + 1,
                     candidate.name,
                     active,
@@ -274,32 +274,32 @@ fn print_explain_text(
 
     if let Some(fallback) = &routing.fallback_station {
         println!(
-            "Fallback: {} (level={}, enabled={}, upstreams={})",
+            "Fallback: {} (priority={}, enabled={}, upstreams={})",
             fallback.name, fallback.level, fallback.enabled, fallback.upstreams
         );
     }
 
-    if let Some(station) = station {
+    if let Some(provider) = provider {
         println!(
-            "Station '{}': level={} enabled={} upstreams={}",
-            station.name,
-            station.level,
-            station.enabled,
-            station.upstreams.len()
+            "Provider '{}': priority={} enabled={} upstreams={}",
+            provider.name,
+            provider.level,
+            provider.enabled,
+            provider.upstreams.len()
         );
-        if station.upstreams.is_empty() {
+        if provider.upstreams.is_empty() {
             println!("  <no upstreams>");
         } else {
-            for (idx, upstream) in station.upstreams.iter().enumerate() {
+            for (idx, upstream) in provider.upstreams.iter().enumerate() {
                 println!("  [{}] {}", idx, upstream);
             }
         }
     }
 }
 
-pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
+pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
     match cmd {
-        StationCommand::List { codex, claude } => {
+        RoutingCommand::List { codex, claude } => {
             let service = resolve_service(codex, claude)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -324,10 +324,10 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let cfg_path = config_file_path();
 
             if mgr.configs.is_empty() {
-                println!("No {} stations in {:?}", label, cfg_path);
+                println!("No {} providers in {:?}", label, cfg_path);
             } else {
                 let active = mgr.active.clone();
-                println!("{} stations (from {:?}):", label, cfg_path);
+                println!("{} providers (from {:?}):", label, cfg_path);
                 let mut items = mgr
                     .configs
                     .iter()
@@ -371,11 +371,11 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             }
         }
 
-        StationCommand::Explain {
+        RoutingCommand::Explain {
             codex,
             claude,
             json,
-            station,
+            provider,
         } => {
             let service = resolve_service(codex, claude)
                 .await
@@ -387,7 +387,7 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             if let ConfigDocument::V3(cfg) = &document {
                 let (view, label) = select_v3_service_view(cfg, service);
                 if json {
-                    let provider = if let Some(provider_name) = station.as_deref() {
+                    let provider = if let Some(provider_name) = provider.as_deref() {
                         Some(explain_v3_provider(view, provider_name).ok_or_else(|| {
                             CliError::ProxyConfig(format!("provider '{}' not found", provider_name))
                         })?)
@@ -405,7 +405,7 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                     println!("{text}");
                 } else {
-                    print_v3_explain_text(label, view, station.as_deref())
+                    print_v3_explain_text(label, view, provider.as_deref())
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 }
                 return Ok(());
@@ -416,16 +416,16 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let (mgr, label) = select_service_manager(&runtime, service);
             let routing = explain_service_routing(mgr);
-            let group_detail = build_group_explain(mgr, station.as_deref())
+            let group_detail = build_group_explain(mgr, provider.as_deref())
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
 
             if json {
                 let payload = ConfigExplainPayload {
                     schema_version: document.schema_version(),
                     service: service.to_string(),
-                    active_station: mgr.active.clone(),
+                    active_provider: mgr.active.clone(),
                     routing,
-                    station: group_detail,
+                    provider: group_detail,
                 };
                 let text = serde_json::to_string_pretty(&payload)
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -439,6 +439,7 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
                 );
             }
         }
+        _ => unreachable!("route view handles only routing list/explain"),
     }
 
     Ok(())

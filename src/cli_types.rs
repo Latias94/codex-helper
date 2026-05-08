@@ -70,18 +70,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: SwitchCommand,
     },
-    /// Inspect compiled routing stations for Codex / Claude
-    #[command(name = "station")]
-    Station {
-        #[command(subcommand)]
-        cmd: StationCommand,
-    },
     /// Manage codex-helper config files and schema migration
     Config {
         #[command(subcommand)]
         cmd: ConfigCommand,
     },
-    /// Manage routing-first provider selection and fallback policy
+    /// Manage provider routing policy and runtime routing views
     Routing {
         #[command(subcommand)]
         cmd: RoutingCommand,
@@ -188,35 +182,6 @@ pub(crate) enum SwitchCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum StationCommand {
-    /// List legacy stations or v3 providers from the current config
-    List {
-        /// Target Codex routing (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude routing
-        #[arg(long)]
-        claude: bool,
-    },
-
-    /// Explain effective routing order for a service
-    Explain {
-        /// Target Codex routing (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude routing
-        #[arg(long)]
-        claude: bool,
-        /// Output JSON instead of text
-        #[arg(long)]
-        json: bool,
-        /// Show details for a single legacy station or v3 provider
-        #[arg(long, alias = "group")]
-        station: Option<String>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
     /// Initialize a commented routing-first TOML config template
     Init {
@@ -285,6 +250,30 @@ pub enum RoutingCommand {
         /// Output JSON instead of text
         #[arg(long)]
         json: bool,
+    },
+    /// List the current runtime routing candidates
+    List {
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Explain the current runtime routing order
+    Explain {
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+        /// Show details for a single provider
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Patch routing fields directly
     Set {

@@ -37,7 +37,8 @@ Acceptance:
 - [x] Normalize CLI-written order so listed providers are promoted and remaining providers are retained.
 - [x] Add a first-class provider command group for v3 catalog edits.
 - [x] Remove compatibility `station add/set-active/set-level/enable/disable` writes from the public CLI now that provider/routing commands exist.
-- [x] Move schema/file operations to `config init` / `config migrate`, and make `station` read-only in the public CLI.
+- [x] Move schema/file operations to `config init` / `config migrate`, and move read-only route views to `routing list` / `routing explain`.
+- [x] Remove the top-level `station` CLI surface from the public command tree.
 
 Acceptance:
 

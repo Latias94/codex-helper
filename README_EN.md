@@ -77,16 +77,16 @@ As of the current release, `codex-helper` is no longer just “a local proxy wit
 
 It is now a **Codex-first local control plane**:
 
-- `station` / `provider` management for relays and upstream inventory;
+- `provider` / `routing` management for relays and upstream inventory;
 - `profile`-driven intent such as `daily`, `fast`, or `deep`;
-- session identity cards that answer which station / upstream / model / fast mode / reasoning setting a Codex session is actually using;
-- session-scoped overrides for `model`, `reasoning_effort`, `service_tier`, and station selection;
-- runtime health, breaker, and same-station failover semantics;
+- session identity cards that answer which provider / upstream / model / fast mode / reasoning setting a Codex session is actually using;
+- session-scoped overrides for `model`, `reasoning_effort`, `service_tier`, and routing target selection;
+- runtime health, breaker, and same-route failover semantics;
 - an honest LAN / Tailscale “central relay” shape, without pretending remote devices automatically gain access to host-local transcript/session files.
 
 The practical mental model is now:
 
-> `Codex CLI -> codex-helper data plane -> station/profile/session control plane`
+> `Codex CLI -> codex-helper data plane -> provider/routing/profile/session control plane`
 
 ---
 
@@ -105,7 +105,7 @@ Compatibility note:
 
 A `profile` is a reusable control template:
 
-- target station
+- target provider / routing
 - target model
 - `service_tier` / fast mode
 - `reasoning_effort`
@@ -118,12 +118,12 @@ The session is now the main control object. You can:
 
 - inspect a single-session identity card;
 - apply a profile to one session;
-- override `model / reasoning_effort / service_tier / station` per session;
+- override `model / reasoning_effort / service_tier / routing target` per session;
 - inspect where each effective value came from:
   - session override
   - profile default
   - request payload
-  - station mapping
+  - provider mapping
   - runtime fallback
 
 This is the reason session control is now meaningful instead of “guess which Codex process this maps to”.
@@ -289,7 +289,7 @@ codex-helper config migrate --to v3 --dry-run
 codex-helper config migrate --to v3 --write --yes
 ```
 
-`station list` / `station explain` are read-only runtime views. Add providers and edit routing with the `provider` and `routing` commands.
+`routing list` / `routing explain` are read-only runtime views. Add providers and edit routing with the `provider` and `routing` commands.
 
 ---
 
@@ -380,8 +380,8 @@ codex-helper config migrate --to v3 --write --yes
 - Inspect the compiled runtime view:
 
   ```bash
-  codex-helper station list
-  codex-helper station explain
+  codex-helper routing list
+  codex-helper routing explain
   ```
 
 ### TUI Settings (runtime)
