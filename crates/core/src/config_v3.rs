@@ -495,7 +495,7 @@ fn collect_service_v2_to_v3_warnings(
         }
     }
 
-    let rebound_profiles = view
+    let cleared_profiles = view
         .profiles
         .iter()
         .filter(|(_, profile)| {
@@ -503,7 +503,7 @@ fn collect_service_v2_to_v3_warnings(
                 .station
                 .as_deref()
                 .map(str::trim)
-                .is_some_and(|station| !station.is_empty() && station != ROUTING_STATION_NAME)
+                .is_some_and(|station| !station.is_empty())
         })
         .map(|(profile_name, profile)| {
             format!(
@@ -513,10 +513,10 @@ fn collect_service_v2_to_v3_warnings(
             )
         })
         .collect::<Vec<_>>();
-    if !rebound_profiles.is_empty() {
+    if !cleared_profiles.is_empty() {
         warnings.push(format!(
-            "[{service_name}] profile station bindings are rebound to '{ROUTING_STATION_NAME}' because v3 has one active routing surface: {}.",
-            rebound_profiles.join(", ")
+            "[{service_name}] profile station bindings are cleared because v3 routing owns active provider selection: {}.",
+            cleared_profiles.join(", ")
         ));
     }
 }
@@ -530,7 +530,7 @@ fn migrate_service_v2_to_v3(view: &ServiceViewV2) -> ServiceViewV3 {
             .map(str::trim)
             .is_some_and(|station| !station.is_empty())
         {
-            profile.station = Some(ROUTING_STATION_NAME.to_string());
+            profile.station = None;
         }
     }
 

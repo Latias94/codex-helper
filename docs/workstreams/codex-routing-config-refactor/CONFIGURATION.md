@@ -287,7 +287,7 @@ codex-helper config migrate --write --yes
 - `preferred` becomes the first item in the route order or the first item in a provider group.
 - explicit tags are preserved.
 - inferred business tags such as `billing=monthly` are never guessed.
-- existing profile station references are mapped to the generated `routing` target during migration.
+- existing profile station references are cleared in generated v3 profiles; `[service.routing]` owns provider selection.
 - warnings are printed to stderr when v2 station boundaries cannot be represented exactly:
   disabled inactive stations are omitted, disabled active stations stay routeable to preserve runtime fallback, repeated provider references are de-duplicated, and endpoint-scoped station members are called out because v3 routing order is provider-level.
 

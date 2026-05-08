@@ -224,7 +224,7 @@ fn migrate_v2_to_v3_emits_routing_order_and_inline_simple_providers() {
             .profiles
             .get("daily")
             .and_then(|profile| profile.station.as_deref()),
-        Some("routing")
+        None
     );
 }
 
