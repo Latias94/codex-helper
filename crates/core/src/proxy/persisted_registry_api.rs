@@ -174,6 +174,13 @@ fn sanitize_profile_request(
     }
 }
 
+fn profile_request_has_station_binding(payload: &PersistedProfileUpsertRequest) -> bool {
+    payload
+        .station
+        .as_deref()
+        .is_some_and(|station| !station.trim().is_empty())
+}
+
 fn normalize_optional_config_string(value: Option<String>) -> Option<String> {
     value
         .as_deref()
@@ -688,11 +695,18 @@ pub(super) async fn upsert_persisted_profile(
     Json(payload): Json<PersistedProfileUpsertRequest>,
 ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
     let profile_name = sanitize_profile_name(profile_name.as_str())?;
-    let profile = sanitize_profile_request(payload);
+    let has_station_binding = profile_request_has_station_binding(&payload);
 
     if let PersistedProxySettingsDocument::V3(mut document) =
         load_persisted_proxy_settings_document().await?
     {
+        if has_station_binding {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "v3 profiles do not support station bindings; edit routing instead".to_string(),
+            ));
+        }
+        let profile = sanitize_profile_request(payload);
         let view = service_view_v3_mut(&mut document, proxy.service_name);
         view.profiles.insert(profile_name.clone(), profile);
         let runtime = crate::config::compile_v3_to_runtime(&document)
@@ -715,6 +729,7 @@ pub(super) async fn upsert_persisted_profile(
         return Ok(Json(make_profiles_response(&proxy).await));
     }
 
+    let profile = sanitize_profile_request(payload);
     let cfg_snapshot = proxy.config.snapshot().await;
     let mut cfg = cfg_snapshot.as_ref().clone();
     let mgr = runtime_service_manager_mut(&mut cfg, proxy.service_name);

@@ -638,13 +638,34 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         .expect("upsert new v3 provider spec send");
     assert_eq!(upsert_new_provider.status(), StatusCode::NO_CONTENT);
 
+    let station_bound_profile = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/profiles/station-bound",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "station": "routing",
+            "model": "gpt-5.4"
+        }))
+        .send()
+        .await
+        .expect("upsert v3 station-bound profile send");
+    assert_eq!(station_bound_profile.status(), StatusCode::BAD_REQUEST);
+    let station_bound_profile_body = station_bound_profile
+        .text()
+        .await
+        .expect("station-bound profile error body");
+    assert!(
+        station_bound_profile_body.contains("v3 profiles do not support station bindings"),
+        "{station_bound_profile_body}"
+    );
+
     let upsert_profile = client
         .put(format!(
             "http://{}/__codex_helper/api/v1/profiles/daily",
             proxy_addr
         ))
         .json(&serde_json::json!({
-            "station": "routing",
             "model": "gpt-5.4",
             "reasoning_effort": "medium"
         }))
