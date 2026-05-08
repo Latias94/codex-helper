@@ -48,14 +48,14 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
     // Codex section
     if cfg.codex.configs.is_empty() {
         println!(
-            "{} none in ~/.codex-helper/config.json",
-            "Codex stations:".bold()
+            "{} none in ~/.codex-helper/config.toml/json",
+            "Codex routing candidates:".bold()
         );
     } else {
         let active = cfg.codex.active.as_deref();
         println!(
             "{}",
-            "Codex stations in ~/.codex-helper/config.json:".bold()
+            "Codex routing candidates in ~/.codex-helper/config.toml/json:".bold()
         );
         for (name, svc) in &cfg.codex.configs {
             let marker = if Some(name.as_str()) == active {
@@ -87,14 +87,14 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
     // Claude section
     if cfg.claude.configs.is_empty() {
         println!(
-            "{} none in ~/.codex-helper/config.json",
-            "Claude stations:".bold()
+            "{} none in ~/.codex-helper/config.toml/json",
+            "Claude routing candidates:".bold()
         );
     } else {
         let active = cfg.claude.active.as_deref();
         println!(
             "{}",
-            "Claude stations in ~/.codex-helper/config.json:".bold()
+            "Claude routing candidates in ~/.codex-helper/config.toml/json:".bold()
         );
         for (name, svc) in &cfg.claude.configs {
             let marker = if Some(name.as_str()) == active {
@@ -149,7 +149,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                 });
             } else {
                 let msg = format!(
-                    "已从 ~/.codex-helper/config.toml/json 读取到 {} 个 Codex 路由候选（runtime active_station = {:?}）",
+                    "已从 ~/.codex-helper/config.toml/json 读取到 {} 个 Codex 路由候选（runtime active target = {:?}）",
                     codex_count, cfg.codex.active
                 );
                 if !json {
@@ -182,7 +182,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                         && !env_is_set(env_name)
                     {
                         let msg = format!(
-                            "{} active station '{}' upstream[{}] 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
+                            "{} active route '{}' upstream[{}] 缺少环境变量 {}（Bearer token）；请在运行 codex-helper 前设置该变量",
                             svc_label, active_name, idx, env_name
                         );
                         if !json {
@@ -198,7 +198,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                         && !env_is_set(env_name)
                     {
                         let msg = format!(
-                            "{} active station '{}' upstream[{}] 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
+                            "{} active route '{}' upstream[{}] 缺少环境变量 {}（X-API-Key）；请在运行 codex-helper 前设置该变量",
                             svc_label, active_name, idx, env_name
                         );
                         if !json {
@@ -224,7 +224,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                             .unwrap_or(false)
                     {
                         let msg = format!(
-                            "{} active station '{}' upstream[{}] 在 ~/.codex-helper/config.json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
+                            "{} active route '{}' upstream[{}] 在 ~/.codex-helper/config.toml/json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
                             svc_label, active_name, idx
                         );
                         if !json {
@@ -241,7 +241,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         }
         Err(err) => {
             let msg = format!(
-                "无法读取 ~/.codex-helper/config.json：{}；请检查该文件是否为有效 JSON，或尝试备份后删除以重新初始化。",
+                "无法读取 ~/.codex-helper/config.toml/json：{}；请检查配置文件是否有效，或尝试备份后删除以重新初始化。",
                 err
             );
             if !json {

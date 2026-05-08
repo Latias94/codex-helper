@@ -212,7 +212,7 @@ pub enum ConfigCommand {
         /// Preview changes without writing ~/.codex-helper/config (toml/json)
         #[arg(long)]
         dry_run: bool,
-        /// Confirm overwriting stations (required unless --dry-run)
+        /// Confirm overwriting providers (required unless --dry-run)
         #[arg(long)]
         yes: bool,
     },
