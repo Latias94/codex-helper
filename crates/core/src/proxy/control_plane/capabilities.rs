@@ -16,15 +16,28 @@ use super::super::profile_defaults::{
 };
 use super::{SnapshotQuery, host_local_session_history_available};
 
+async fn api_v1_surface_capabilities_for_proxy(
+    proxy: &ProxyService,
+) -> crate::dashboard_core::ControlPlaneSurfaceCapabilities {
+    let mut surface = api_v1_surface_capabilities();
+    let cfg = proxy.config.snapshot().await;
+    if cfg.version == Some(3) {
+        surface.station_persisted_settings = false;
+        surface.station_specs = false;
+    }
+    surface
+}
+
 pub(in crate::proxy) async fn api_capabilities(
     proxy: ProxyService,
 ) -> Result<Json<ApiV1Capabilities>, (StatusCode, String)> {
     let host_local_history = host_local_session_history_available();
+    let surface_capabilities = api_v1_surface_capabilities_for_proxy(&proxy).await;
     Ok(Json(ApiV1Capabilities {
         api_version: 1,
         service_name: proxy.service_name.to_string(),
         endpoints: api_v1_endpoint_paths(),
-        surface_capabilities: api_v1_surface_capabilities(),
+        surface_capabilities,
         shared_capabilities: SharedControlPlaneCapabilities {
             session_observability: true,
             request_history: true,
@@ -91,7 +104,7 @@ pub(in crate::proxy) async fn api_v1_snapshot(
 pub(in crate::proxy) async fn api_operator_summary(
     proxy: ProxyService,
 ) -> Result<Json<ApiV1OperatorSummary>, (StatusCode, String)> {
-    let surface_capabilities = api_v1_surface_capabilities();
+    let surface_capabilities = api_v1_surface_capabilities_for_proxy(&proxy).await;
     let host_local_history = host_local_session_history_available();
     let shared_capabilities = SharedControlPlaneCapabilities {
         session_observability: true,

@@ -105,7 +105,6 @@ const API_V1_PROVIDER_SPECS_ENDPOINT: &str = "/__codex_helper/api/v1/providers/s
 const API_V1_STATIONS_ENDPOINT: &str = "/__codex_helper/api/v1/stations";
 const API_V1_STATIONS_RUNTIME_ENDPOINT: &str = "/__codex_helper/api/v1/stations/runtime";
 const API_V1_STATION_ACTIVE_ENDPOINT: &str = "/__codex_helper/api/v1/stations/active";
-const API_V1_STATION_ACTIVE_ENDPOINT_LEGACY: &str = "/__codex_helper/api/v1/stations/config-active";
 const API_V1_STATION_SPECS_ENDPOINT: &str = "/__codex_helper/api/v1/stations/specs";
 const API_V1_DEFAULT_PROFILE_ENDPOINT: &str = "/__codex_helper/api/v1/profiles/default";
 const API_V1_SESSION_OVERRIDE_RESET_ENDPOINT: &str =
@@ -166,12 +165,8 @@ fn supports_persisted_station_settings_surface(
         API_V1_STATION_PERSISTED_SETTINGS_UPDATE_ENDPOINT,
     );
     let has_active_switch =
-        supports_capability_flag(false, endpoints, API_V1_STATION_ACTIVE_ENDPOINT)
-            || supports_capability_flag(false, endpoints, API_V1_STATION_ACTIVE_ENDPOINT_LEGACY);
+        supports_capability_flag(false, endpoints, API_V1_STATION_ACTIVE_ENDPOINT);
 
-    // Treat the legacy `config-active` alias as a compatibility fallback only when the full
-    // persisted-station-settings surface is otherwise present. This avoids advertising a writable
-    // station-settings surface from a partial older control plane that only exposes one alias.
     has_station_update && has_active_switch
 }
 

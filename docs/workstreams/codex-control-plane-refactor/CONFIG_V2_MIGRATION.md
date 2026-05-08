@@ -210,7 +210,7 @@ reasoning_effort = "high"
 Current compatibility rules:
 
 - `profile.station` is the public name to use.
-- legacy `profile.config` is still accepted as a deserialize-only alias when reading older files.
+- legacy `profile.config` is no longer accepted; use `profile.station`.
 - profile/station capability compatibility is validated when the persisted config file is loaded.
 
 ## Compatibility Rules

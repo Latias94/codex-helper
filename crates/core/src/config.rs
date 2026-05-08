@@ -627,6 +627,33 @@ fn default_routing_on_exhausted_v3() -> RoutingExhaustedActionV3 {
     RoutingExhaustedActionV3::Continue
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedRoutingProviderRef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedRoutingSpec {
+    #[serde(default = "default_routing_policy_v3")]
+    pub policy: RoutingPolicyV3,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefer_tags: Vec<BTreeMap<String, String>>,
+    #[serde(default = "default_routing_on_exhausted_v3")]
+    pub on_exhausted: RoutingExhaustedActionV3,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<PersistedRoutingProviderRef>,
+}
+
 fn is_default_upstream_auth(auth: &UpstreamAuth) -> bool {
     auth.auth_token.is_none()
         && auth.auth_token_env.is_none()

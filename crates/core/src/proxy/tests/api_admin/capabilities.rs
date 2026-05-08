@@ -115,10 +115,10 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
             .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations/active"))
     }));
-    assert!(!caps["endpoints"].as_array().is_some_and(|items| {
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
-            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations/config-active"))
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/routing"))
     }));
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
@@ -220,10 +220,13 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         Some(true)
     );
     assert_eq!(
+        caps["surface_capabilities"]["routing"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
         caps["surface_capabilities"]["station_persisted_settings"].as_bool(),
         Some(true)
     );
-    assert!(caps["surface_capabilities"]["station_persisted_config"].is_null());
     assert_eq!(
         caps["surface_capabilities"]["session_override_reset"].as_bool(),
         Some(true)

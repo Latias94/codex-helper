@@ -164,9 +164,7 @@ This avoids making every client rebuild the same runtime explanation logic indep
   - `configured_active_station`
   - `effective_active_station`
   - `station_persisted_settings`
-- Legacy aliases remain compatibility-only and must not be treated as part of the home payload contract.
-- Hidden compatibility routes such as `/__codex_helper/api/v1/stations/config-active` are not part of this contract.
-- Deserialize-only aliases such as `station_persisted_config` are not canonical emitted fields for new clients.
+- Legacy aliases are removed from the home payload contract instead of being kept as hidden routes or deserialize-only fields.
 - Clients should ignore unknown additive fields so the payload can grow without reintroducing schema churn.
 
 The payload should not emit legacy runtime terminology such as:

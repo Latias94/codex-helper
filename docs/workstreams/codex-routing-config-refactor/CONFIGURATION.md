@@ -235,10 +235,11 @@ Local GUI, remote attach clients, and TUI-backed admin flows should edit the sam
 
 - provider spec writes update `[codex.providers.<name>]` directly;
 - new providers are appended to an existing explicit `codex.routing.order`;
-- station quick-switch is a compatibility bridge that sets `codex.routing.policy = "manual-sticky"` and `target = "<provider>"`;
-- station enable/disable is a compatibility bridge that toggles the provider's `enabled` field;
+- `GET /__codex_helper/api/v1/routing` reads the v3 routing block plus provider references;
+- `PUT /__codex_helper/api/v1/routing` is the canonical structured write path for `policy`, `order`, `target`, `prefer_tags`, and `on_exhausted`;
+- station quick-switch and station settings APIs are v2-only for persisted station schema and are rejected on v3 files;
 - profile CRUD writes `[codex.profiles]` and `default_profile` directly;
-- v2 station-structure editing is rejected on v3 files until a first-class routing editor replaces it.
+- station spec reads/writes are rejected on v3 files; use routing and provider specs instead.
 
 ## Migration From Legacy Config
 

@@ -451,7 +451,6 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         summary["surface_capabilities"]["station_persisted_settings"].as_bool(),
         Some(true)
     );
-    assert!(summary["surface_capabilities"]["station_persisted_config"].is_null());
     assert_eq!(
         summary["remote_admin_access"]["remote_requires_token"].as_bool(),
         Some(true)

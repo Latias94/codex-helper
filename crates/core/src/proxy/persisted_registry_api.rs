@@ -20,6 +20,14 @@ fn default_persisted_station_level() -> u8 {
     1
 }
 
+fn default_persisted_routing_policy() -> crate::config::RoutingPolicyV3 {
+    crate::config::RoutingPolicyV3::OrderedFailover
+}
+
+fn default_persisted_routing_on_exhausted() -> crate::config::RoutingExhaustedActionV3 {
+    crate::config::RoutingExhaustedActionV3::Continue
+}
+
 #[derive(serde::Deserialize)]
 pub(super) struct PersistedStationUpdateRequest {
     #[serde(default)]
@@ -68,7 +76,7 @@ pub(super) struct PersistedProviderSpecUpsertRequest {
 pub(super) struct PersistedProfileUpsertRequest {
     #[serde(default)]
     extends: Option<String>,
-    #[serde(default, alias = "config")]
+    #[serde(default)]
     station: Option<String>,
     #[serde(default)]
     model: Option<String>,
@@ -97,6 +105,20 @@ impl PersistedStationActiveRequest {
 #[derive(serde::Deserialize)]
 pub(super) struct PersistedDefaultProfileRequest {
     profile_name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct PersistedRoutingUpsertRequest {
+    #[serde(default = "default_persisted_routing_policy")]
+    policy: crate::config::RoutingPolicyV3,
+    #[serde(default)]
+    order: Vec<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    prefer_tags: Vec<std::collections::BTreeMap<String, String>>,
+    #[serde(default = "default_persisted_routing_on_exhausted")]
+    on_exhausted: crate::config::RoutingExhaustedActionV3,
 }
 
 fn sanitize_profile_name(profile_name: &str) -> Result<String, (StatusCode, String)> {
@@ -293,94 +315,6 @@ fn merge_persisted_provider_spec(
     }
 }
 
-fn v3_routing_order_from_provider_view(
-    view: &crate::config::ServiceViewV3,
-) -> Vec<crate::config::GroupMemberRefV2> {
-    let mut members = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut append = |provider_name: &str| {
-        if view.providers.contains_key(provider_name) && seen.insert(provider_name.to_string()) {
-            members.push(crate::config::GroupMemberRefV2 {
-                provider: provider_name.to_string(),
-                endpoint_names: Vec::new(),
-                preferred: false,
-            });
-        }
-    };
-
-    if let Some(routing) = view.routing.as_ref() {
-        if let Some(target) = routing.target.as_deref() {
-            append(target);
-        }
-        for provider_name in &routing.order {
-            append(provider_name);
-        }
-    }
-
-    for provider_name in view.providers.keys() {
-        append(provider_name);
-    }
-
-    members
-}
-
-fn v3_persisted_station_provider_endpoints(
-    provider: &crate::config::ProviderConfigV3,
-) -> Vec<crate::config::PersistedStationProviderEndpointRef> {
-    let inline = provider
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|base_url| !base_url.is_empty())
-        .map(
-            |base_url| crate::config::PersistedStationProviderEndpointRef {
-                name: "default".to_string(),
-                base_url: base_url.to_string(),
-                enabled: provider.enabled,
-            },
-        )
-        .into_iter();
-    inline
-        .chain(provider.endpoints.iter().map(|(endpoint_name, endpoint)| {
-            crate::config::PersistedStationProviderEndpointRef {
-                name: endpoint_name.clone(),
-                base_url: endpoint.base_url.clone(),
-                enabled: endpoint.enabled,
-            }
-        }))
-        .collect()
-}
-
-fn persisted_station_specs_from_v3(
-    view: &crate::config::ServiceViewV3,
-) -> crate::config::PersistedStationsCatalog {
-    crate::config::PersistedStationsCatalog {
-        stations: if view.providers.is_empty() {
-            Vec::new()
-        } else {
-            vec![crate::config::PersistedStationSpec {
-                name: "routing".to_string(),
-                alias: Some("active routing".to_string()),
-                enabled: true,
-                level: 1,
-                members: v3_routing_order_from_provider_view(view),
-            }]
-        },
-        providers: view
-            .providers
-            .iter()
-            .map(
-                |(name, provider)| crate::config::PersistedStationProviderRef {
-                    name: name.clone(),
-                    alias: provider.alias.clone(),
-                    enabled: provider.enabled,
-                    endpoints: v3_persisted_station_provider_endpoints(provider),
-                },
-            )
-            .collect(),
-    }
-}
-
 fn persisted_provider_spec_from_v3(
     name: &str,
     provider: &crate::config::ProviderConfigV3,
@@ -416,6 +350,122 @@ fn persisted_provider_spec_from_v3(
         api_key_env: provider.inline_auth.api_key_env.clone(),
         endpoints,
     }
+}
+
+fn persisted_routing_spec_from_v3(
+    view: &crate::config::ServiceViewV3,
+) -> crate::config::PersistedRoutingSpec {
+    let routing = view.routing.clone().unwrap_or_default();
+    crate::config::PersistedRoutingSpec {
+        policy: routing.policy,
+        order: routing.order,
+        target: routing.target,
+        prefer_tags: routing.prefer_tags,
+        on_exhausted: routing.on_exhausted,
+        providers: view
+            .providers
+            .iter()
+            .map(
+                |(name, provider)| crate::config::PersistedRoutingProviderRef {
+                    name: name.clone(),
+                    alias: provider.alias.clone(),
+                    enabled: provider.enabled,
+                    tags: provider.tags.clone(),
+                },
+            )
+            .collect(),
+    }
+}
+
+fn sanitize_routing_spec_request(
+    payload: PersistedRoutingUpsertRequest,
+) -> Result<crate::config::RoutingConfigV3, (StatusCode, String)> {
+    let mut order = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for provider_name in payload.order {
+        let provider_name = provider_name.trim();
+        if provider_name.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "routing order provider name is required".to_string(),
+            ));
+        }
+        if !seen.insert(provider_name.to_string()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("duplicate routing provider '{}'", provider_name),
+            ));
+        }
+        order.push(provider_name.to_string());
+    }
+
+    let target = payload
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    let mut prefer_tags = Vec::new();
+    for filter in payload.prefer_tags {
+        let normalized = filter
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let key = key.trim();
+                let value = value.trim();
+                (!key.is_empty() && !value.is_empty()).then(|| (key.to_string(), value.to_string()))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if normalized.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "routing prefer_tags entries must contain at least one key/value pair".to_string(),
+            ));
+        }
+        prefer_tags.push(normalized);
+    }
+
+    Ok(crate::config::RoutingConfigV3 {
+        policy: payload.policy,
+        order,
+        target,
+        prefer_tags,
+        on_exhausted: payload.on_exhausted,
+    })
+}
+
+fn validate_v3_routing_spec_for_view(
+    service_name: &str,
+    view: &crate::config::ServiceViewV3,
+    routing: &crate::config::RoutingConfigV3,
+) -> Result<(), (StatusCode, String)> {
+    for provider_name in &routing.order {
+        if !view.providers.contains_key(provider_name) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("[{service_name}] routing references missing provider '{provider_name}'"),
+            ));
+        }
+    }
+
+    if let Some(target) = routing.target.as_deref() {
+        let Some(provider) = view.providers.get(target) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("[{service_name}] routing target references missing provider '{target}'"),
+            ));
+        };
+        if !provider.enabled {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "[{service_name}] routing target provider '{target}' is disabled; enable the provider before pinning it"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn merge_persisted_provider_spec_v3(
@@ -507,16 +557,6 @@ fn append_new_provider_to_explicit_v3_order(
     routing.order.push(provider_name.to_string());
 }
 
-fn ensure_provider_in_v3_routing_order(
-    view: &mut crate::config::ServiceViewV3,
-    provider_name: &str,
-) {
-    let routing = view.routing.get_or_insert_with(Default::default);
-    if !routing.order.iter().any(|name| name == provider_name) {
-        routing.order.push(provider_name.to_string());
-    }
-}
-
 fn validate_station_members_for_view(
     service_name: &str,
     station_name: &str,
@@ -561,9 +601,11 @@ pub(super) async fn list_persisted_station_specs(
                 service_view_v2(&cfg, proxy.service_name),
             )))
         }
-        PersistedProxySettingsDocument::V3(cfg) => Ok(Json(persisted_station_specs_from_v3(
-            service_view_v3(&cfg, proxy.service_name),
-        ))),
+        PersistedProxySettingsDocument::V3(_) => Err((
+            StatusCode::BAD_REQUEST,
+            "v3 routing configs do not expose station specs; use the routing and provider specs APIs"
+                .to_string(),
+        )),
     }
 }
 
@@ -586,6 +628,58 @@ pub(super) async fn list_persisted_provider_specs(
             }))
         }
     }
+}
+
+pub(super) async fn list_persisted_routing_spec(
+    proxy: ProxyService,
+) -> Result<Json<crate::config::PersistedRoutingSpec>, (StatusCode, String)> {
+    match load_persisted_proxy_settings_document().await? {
+        PersistedProxySettingsDocument::V3(cfg) => Ok(Json(persisted_routing_spec_from_v3(
+            service_view_v3(&cfg, proxy.service_name),
+        ))),
+        PersistedProxySettingsDocument::V2(_) => Err((
+            StatusCode::BAD_REQUEST,
+            "routing API requires a version = 3 config".to_string(),
+        )),
+    }
+}
+
+pub(super) async fn upsert_persisted_routing_spec(
+    proxy: ProxyService,
+    Json(payload): Json<PersistedRoutingUpsertRequest>,
+) -> Result<Json<crate::config::PersistedRoutingSpec>, (StatusCode, String)> {
+    let mut document = match load_persisted_proxy_settings_document().await? {
+        PersistedProxySettingsDocument::V3(document) => document,
+        PersistedProxySettingsDocument::V2(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "routing API requires a version = 3 config".to_string(),
+            ));
+        }
+    };
+
+    let routing = sanitize_routing_spec_request(payload)?;
+    let view = service_view_v3_mut(&mut document, proxy.service_name);
+    validate_v3_routing_spec_for_view(proxy.service_name, view, &routing)?;
+    view.routing = Some(routing);
+    crate::config::compile_v3_to_runtime(&document)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    save_persisted_proxy_settings_document_and_reload(
+        &proxy,
+        PersistedProxySettingsDocument::V3(document),
+    )
+    .await?;
+
+    if let PersistedProxySettingsDocument::V3(cfg) =
+        load_persisted_proxy_settings_document().await?
+    {
+        return Ok(Json(persisted_routing_spec_from_v3(service_view_v3(
+            &cfg,
+            proxy.service_name,
+        ))));
+    }
+
+    unreachable!("saved routing document should reload as v3");
 }
 
 pub(super) async fn upsert_persisted_profile(
@@ -759,42 +853,15 @@ pub(super) async fn update_persisted_station(
         ));
     }
 
-    if let PersistedProxySettingsDocument::V3(mut document) =
-        load_persisted_proxy_settings_document().await?
-    {
-        if payload.level.is_some() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "v3 provider routing does not support station levels; edit routing.order instead"
-                    .to_string(),
-            ));
-        }
-        let view = service_view_v3_mut(&mut document, proxy.service_name);
-        let Some(provider) = view.providers.get_mut(station_name.as_str()) else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("provider '{}' not found", station_name),
-            ));
-        };
-        if let Some(enabled) = payload.enabled {
-            provider.enabled = enabled;
-            if enabled {
-                ensure_provider_in_v3_routing_order(view, station_name.as_str());
-            } else if let Some(routing) = view.routing.as_mut()
-                && routing.target.as_deref() == Some(station_name.as_str())
-            {
-                routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
-                routing.target = None;
-            }
-        }
-        crate::config::compile_v3_to_runtime(&document)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        save_persisted_proxy_settings_document_and_reload(
-            &proxy,
-            PersistedProxySettingsDocument::V3(document),
-        )
-        .await?;
-        return Ok(StatusCode::NO_CONTENT);
+    if matches!(
+        load_persisted_proxy_settings_document().await?,
+        PersistedProxySettingsDocument::V3(_)
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "v3 routing configs do not support station settings writes; edit providers and routing instead"
+                .to_string(),
+        ));
     }
 
     let cfg_snapshot = proxy.config.snapshot().await;
@@ -823,54 +890,15 @@ pub(super) async fn set_persisted_active_station(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let station_name = payload.station_name();
 
-    if let PersistedProxySettingsDocument::V3(mut document) =
-        load_persisted_proxy_settings_document().await?
-    {
-        let view = service_view_v3_mut(&mut document, proxy.service_name);
-        if let Some(station_name) = station_name.as_deref()
-            && !station_name.eq_ignore_ascii_case("routing")
-            && !view.providers.contains_key(station_name)
-        {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("provider '{}' not found", station_name),
-            ));
-        }
-
-        match station_name.as_deref() {
-            Some(name) if name.eq_ignore_ascii_case("routing") => {
-                if let Some(routing) = view.routing.as_mut() {
-                    routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
-                    routing.target = None;
-                }
-            }
-            Some(name) => {
-                let provider = view
-                    .providers
-                    .get_mut(name)
-                    .expect("provider existence was validated above");
-                provider.enabled = true;
-                ensure_provider_in_v3_routing_order(view, name);
-                let routing = view.routing.get_or_insert_with(Default::default);
-                routing.policy = crate::config::RoutingPolicyV3::ManualSticky;
-                routing.target = Some(name.to_string());
-            }
-            None => {
-                if let Some(routing) = view.routing.as_mut() {
-                    routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
-                    routing.target = None;
-                }
-            }
-        }
-
-        crate::config::compile_v3_to_runtime(&document)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        save_persisted_proxy_settings_document_and_reload(
-            &proxy,
-            PersistedProxySettingsDocument::V3(document),
-        )
-        .await?;
-        return Ok(StatusCode::NO_CONTENT);
+    if matches!(
+        load_persisted_proxy_settings_document().await?,
+        PersistedProxySettingsDocument::V3(_)
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "v3 routing configs do not support station active writes; edit routing instead"
+                .to_string(),
+        ));
     }
 
     let cfg_snapshot = proxy.config.snapshot().await;
@@ -1008,6 +1036,13 @@ pub(super) async fn upsert_persisted_provider_spec(
         );
         if is_new_provider {
             append_new_provider_to_explicit_v3_order(view, provider_name.as_str());
+        }
+        if !provider.enabled
+            && let Some(routing) = view.routing.as_mut()
+            && routing.target.as_deref() == Some(provider_name.as_str())
+        {
+            routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
+            routing.target = None;
         }
         crate::config::compile_v3_to_runtime(&document)
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;

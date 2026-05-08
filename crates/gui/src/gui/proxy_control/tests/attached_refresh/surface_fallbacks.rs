@@ -671,7 +671,7 @@ fn refresh_attached_rejects_pre_v1_runtime_surface() {
 
 #[test]
 fn resolve_api_v1_surface_requires_complete_station_settings_surface_for_endpoint_fallback() {
-    let endpoints = vec!["/__codex_helper/api/v1/stations/config-active".to_string()];
+    let endpoints = vec!["/__codex_helper/api/v1/stations/active".to_string()];
 
     let resolved = resolve_api_v1_surface(
         &crate::dashboard_core::ControlPlaneSurfaceCapabilities::default(),
@@ -682,9 +682,9 @@ fn resolve_api_v1_surface_requires_complete_station_settings_surface_for_endpoin
 }
 
 #[test]
-fn resolve_api_v1_surface_accepts_legacy_active_alias_only_with_station_update_endpoint() {
+fn resolve_api_v1_surface_accepts_station_settings_only_with_update_endpoint() {
     let endpoints = vec![
-        "/__codex_helper/api/v1/stations/config-active".to_string(),
+        "/__codex_helper/api/v1/stations/active".to_string(),
         "/__codex_helper/api/v1/stations/{name}".to_string(),
     ];
 

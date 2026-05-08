@@ -382,7 +382,7 @@ impl ProxyController {
                 resolved_retry: r.resolved_retry.clone(),
                 supports_v1: true,
                 supports_retry_config_api: true,
-                supports_persisted_station_settings: true,
+                supports_persisted_station_settings: r.cfg.version != Some(3),
                 supports_default_profile_override: true,
                 supports_station_runtime_override: true,
                 supports_session_override_reset: true,

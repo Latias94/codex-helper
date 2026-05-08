@@ -17,14 +17,14 @@ use super::control_plane_manifest::{
     API_V1_PROFILES_DEFAULT_PERSISTED, API_V1_PROVIDER_SPEC_BY_NAME, API_V1_PROVIDER_SPECS,
     API_V1_PROVIDERS, API_V1_PROVIDERS_BALANCES_REFRESH, API_V1_PROVIDERS_RUNTIME,
     API_V1_REQUEST_LEDGER_RECENT, API_V1_REQUEST_LEDGER_SUMMARY, API_V1_RETRY_CONFIG,
-    API_V1_RUNTIME_RELOAD, API_V1_RUNTIME_STATUS, API_V1_SESSION_BY_ID,
+    API_V1_ROUTING, API_V1_RUNTIME_RELOAD, API_V1_RUNTIME_STATUS, API_V1_SESSION_BY_ID,
     API_V1_SESSION_OVERRIDE_EFFORT, API_V1_SESSION_OVERRIDE_MODEL, API_V1_SESSION_OVERRIDE_PROFILE,
     API_V1_SESSION_OVERRIDE_RESET, API_V1_SESSION_OVERRIDE_SERVICE_TIER,
     API_V1_SESSION_OVERRIDE_STATION, API_V1_SESSION_OVERRIDES, API_V1_SESSIONS, API_V1_SNAPSHOT,
     API_V1_STATION_BY_NAME, API_V1_STATION_SPEC_BY_NAME, API_V1_STATION_SPECS, API_V1_STATIONS,
-    API_V1_STATIONS_ACTIVE, API_V1_STATIONS_CONFIG_ACTIVE_LEGACY, API_V1_STATIONS_PROBE,
-    API_V1_STATIONS_RUNTIME, API_V1_STATUS_ACTIVE, API_V1_STATUS_HEALTH_CHECKS,
-    API_V1_STATUS_RECENT, API_V1_STATUS_SESSION_STATS, API_V1_STATUS_STATION_HEALTH,
+    API_V1_STATIONS_ACTIVE, API_V1_STATIONS_PROBE, API_V1_STATIONS_RUNTIME, API_V1_STATUS_ACTIVE,
+    API_V1_STATUS_HEALTH_CHECKS, API_V1_STATUS_RECENT, API_V1_STATUS_SESSION_STATS,
+    API_V1_STATUS_STATION_HEALTH,
 };
 use super::healthcheck_api::{
     cancel_health_checks, list_health_checks, list_station_health, probe_station,
@@ -32,9 +32,10 @@ use super::healthcheck_api::{
 };
 use super::persisted_registry_api::{
     delete_persisted_profile, delete_persisted_provider_spec, delete_persisted_station_spec,
-    list_persisted_provider_specs, list_persisted_station_specs, set_persisted_active_station,
-    set_persisted_default_profile, update_persisted_station, upsert_persisted_profile,
-    upsert_persisted_provider_spec, upsert_persisted_station_spec,
+    list_persisted_provider_specs, list_persisted_routing_spec, list_persisted_station_specs,
+    set_persisted_active_station, set_persisted_default_profile, update_persisted_station,
+    upsert_persisted_profile, upsert_persisted_provider_spec, upsert_persisted_routing_spec,
+    upsert_persisted_station_spec,
 };
 use super::providers_api::{
     apply_provider_runtime_meta, list_providers, refresh_provider_balances,
@@ -57,6 +58,7 @@ mod healthchecks;
 mod overrides;
 mod profiles;
 mod providers;
+mod routing;
 mod stations;
 mod status_runtime;
 
@@ -70,6 +72,7 @@ pub(super) fn control_plane_routes(proxy: ProxyService) -> Router {
         .merge(status_runtime::status_and_runtime_routes(proxy.clone()))
         .merge(stations::station_routes(proxy.clone()))
         .merge(providers::provider_routes(proxy.clone()))
+        .merge(routing::routing_routes(proxy.clone()))
         .merge(profiles::profile_routes(proxy.clone()))
         .merge(overrides::override_routes(proxy.clone()))
         .merge(healthchecks::healthcheck_routes(proxy))

@@ -156,8 +156,8 @@ These are the items that should land before declaring the control-plane refactor
 - CP-401 final closeout of the remaining compatibility-only `config` terminology/export tail
 - explicit closeout of the remaining compatibility-only tail:
   - remove the last helper aliases such as `active_config()` after station-first call sites are settled
-  - keep legacy routes such as `/stations/config-active` as hidden compatibility aliases rather than canonical advertised control-plane paths
-  - keep legacy capability keys such as `station_persisted_config` as deserialize-only aliases while emitting station-first canonical names
+  - remove legacy routes such as `/stations/config-active` instead of keeping hidden compatibility aliases
+  - remove legacy capability keys such as `station_persisted_config` instead of keeping deserialize-only aliases
   - historical docs/examples that intentionally still mention legacy `configs`
   - tests/assertions that verify old field names are absent or compatibility-only
   - attach-side endpoint fallback should treat legacy aliases as compatibility-only and avoid over-advertising partial writable surfaces

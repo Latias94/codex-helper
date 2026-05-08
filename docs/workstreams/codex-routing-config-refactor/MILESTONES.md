@@ -45,18 +45,18 @@ Acceptance:
 
 - [x] Load the persisted document as v3 when the file is v3, instead of editing a compacted v2 projection.
 - [x] Preserve `providers`, `routing`, tags, profiles, and top-level metadata during local/remote control-plane edits.
-- [x] Map compatibility station quick-switch to `routing.policy = "manual-sticky"` plus `routing.target`.
-- [x] Map compatibility station enable/disable to provider enable/disable on v3 files.
+- [x] Add a first-class v3 routing API for `policy`, `order`, `target`, `prefer_tags`, and `on_exhausted`.
+- [x] Remove v3 writes from compatibility station quick-switch and station settings APIs.
 - [x] Keep provider spec CRUD v3-native and append newly created providers to an existing explicit `routing.order`.
 - [x] Keep profile CRUD/default-profile write-back v3-native.
-- [x] Reject v2 station-structure editing on v3 files instead of silently reintroducing station/group schema.
-- [ ] Add a first-class routing editor API once the GUI/TUI need structured routing writes beyond quick-switch and provider CRUD.
+- [x] Reject station spec reads/writes on v3 files instead of silently reintroducing station/group schema.
+- [x] Remove compatibility-only control-plane aliases such as `/stations/config-active` and `station_persisted_config`.
 
 Acceptance:
 
 - GUI/TUI/remote admin writes never turn a `version = 3` file back into `[codex.stations.*]`;
 - hand-written v3 routing intent survives metadata, provider, profile, and active-target edits;
-- compatibility station APIs are treated as bridges, not as the canonical v3 authoring model.
+- compatibility station APIs are v2-only and are not the canonical v3 authoring model.
 
 ## P2 - Optional Preset Expansion
 

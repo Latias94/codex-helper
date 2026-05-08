@@ -309,7 +309,7 @@ async fn proxy_api_v1_station_settings_crud_persists_active_and_meta() {
 
     let clear_active = client
         .post(format!(
-            "http://{}/__codex_helper/api/v1/stations/config-active",
+            "http://{}/__codex_helper/api/v1/stations/active",
             proxy_addr
         ))
         .json(&serde_json::json!({
@@ -438,33 +438,141 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
     let client = reqwest::Client::new();
 
-    let station_specs = client
+    let station_specs_rejected = client
         .get(format!(
             "http://{}/__codex_helper/api/v1/stations/specs",
             proxy_addr
         ))
         .send()
         .await
-        .expect("get v3 station specs send")
+        .expect("get v3 station specs send");
+    assert_eq!(station_specs_rejected.status(), StatusCode::BAD_REQUEST);
+
+    let provider_specs = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v3 provider specs send")
         .error_for_status()
-        .expect("get v3 station specs status")
+        .expect("get v3 provider specs status")
         .json::<serde_json::Value>()
         .await
-        .expect("get v3 station specs json");
+        .expect("get v3 provider specs json");
     assert_eq!(
-        station_specs["stations"][0]
-            .get("name")
-            .and_then(|value| value.as_str()),
-        Some("routing")
-    );
-    assert_eq!(
-        station_specs["providers"]
+        provider_specs["providers"]
             .as_array()
             .map(|providers| providers.len()),
         Some(2)
     );
 
-    let set_active = client
+    let capabilities = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/capabilities",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v3 capabilities send")
+        .error_for_status()
+        .expect("get v3 capabilities status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v3 capabilities json");
+    assert_eq!(
+        capabilities["surface_capabilities"]["routing"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        capabilities["surface_capabilities"]["station_specs"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        capabilities["surface_capabilities"]["station_persisted_settings"].as_bool(),
+        Some(false)
+    );
+
+    let routing_spec = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/routing",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v3 routing spec send")
+        .error_for_status()
+        .expect("get v3 routing spec status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v3 routing spec json");
+    assert_eq!(
+        routing_spec["order"].as_array().map(|order| order.len()),
+        Some(2)
+    );
+
+    let rejected_disabled_target = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/routing",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "policy": "manual-sticky",
+            "target": "input",
+            "order": ["input", "backup"],
+            "on_exhausted": "continue"
+        }))
+        .send()
+        .await
+        .expect("set disabled v3 routing target send");
+    assert_eq!(rejected_disabled_target.status(), StatusCode::BAD_REQUEST);
+
+    let enable_provider = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/input",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "alias": "Input Relay",
+            "enabled": true,
+            "auth_token_env": "INPUT_NEXT_KEY",
+            "endpoints": [
+                {
+                    "name": "default",
+                    "base_url": "https://input-next.example.com/v1",
+                    "enabled": true
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("enable v3 provider spec send");
+    assert_eq!(enable_provider.status(), StatusCode::NO_CONTENT);
+
+    let set_routing_target = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/routing",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "policy": "manual-sticky",
+            "target": "input",
+            "order": ["input", "backup"],
+            "on_exhausted": "continue"
+        }))
+        .send()
+        .await
+        .expect("set v3 routing target send")
+        .error_for_status()
+        .expect("set v3 routing target status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("set v3 routing target json");
+    assert_eq!(set_routing_target["policy"].as_str(), Some("manual-sticky"));
+    assert_eq!(set_routing_target["target"].as_str(), Some("input"));
+
+    let station_active_rejected = client
         .post(format!(
             "http://{}/__codex_helper/api/v1/stations/active",
             proxy_addr
@@ -472,33 +580,10 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         .json(&serde_json::json!({ "station_name": "input" }))
         .send()
         .await
-        .expect("set v3 active provider send");
-    assert_eq!(set_active.status(), StatusCode::NO_CONTENT);
+        .expect("set v3 active station send");
+    assert_eq!(station_active_rejected.status(), StatusCode::BAD_REQUEST);
 
-    let station_specs_after_active = client
-        .get(format!(
-            "http://{}/__codex_helper/api/v1/stations/specs",
-            proxy_addr
-        ))
-        .send()
-        .await
-        .expect("get v3 station specs after active send")
-        .error_for_status()
-        .expect("get v3 station specs after active status")
-        .json::<serde_json::Value>()
-        .await
-        .expect("get v3 station specs after active json");
-    let input_after_active = station_specs_after_active["providers"]
-        .as_array()
-        .and_then(|providers| {
-            providers
-                .iter()
-                .find(|provider| provider["name"].as_str() == Some("input"))
-        })
-        .expect("input provider after active");
-    assert_eq!(input_after_active["enabled"].as_bool(), Some(true));
-
-    let update_provider_meta = client
+    let station_update_rejected = client
         .put(format!(
             "http://{}/__codex_helper/api/v1/stations/input",
             proxy_addr
@@ -506,8 +591,8 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         .json(&serde_json::json!({ "enabled": false }))
         .send()
         .await
-        .expect("update v3 provider meta send");
-    assert_eq!(update_provider_meta.status(), StatusCode::NO_CONTENT);
+        .expect("update v3 station send");
+    assert_eq!(station_update_rejected.status(), StatusCode::BAD_REQUEST);
 
     let upsert_provider = client
         .put(format!(

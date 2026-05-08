@@ -4,7 +4,6 @@ pub(super) fn station_routes(proxy: ProxyService) -> Router {
     let stations_proxy = proxy.clone();
     let runtime_proxy = proxy.clone();
     let active_proxy = proxy.clone();
-    let active_legacy_proxy = proxy.clone();
     let probe_proxy = proxy.clone();
     let update_proxy = proxy.clone();
     let specs_proxy = proxy.clone();
@@ -22,10 +21,6 @@ pub(super) fn station_routes(proxy: ProxyService) -> Router {
         .route(
             API_V1_STATIONS_ACTIVE,
             post(move |payload| set_persisted_active_station(active_proxy.clone(), payload)),
-        )
-        .route(
-            API_V1_STATIONS_CONFIG_ACTIVE_LEGACY,
-            post(move |payload| set_persisted_active_station(active_legacy_proxy.clone(), payload)),
         )
         .route(
             API_V1_STATIONS_PROBE,

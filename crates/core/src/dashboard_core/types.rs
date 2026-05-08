@@ -65,14 +65,12 @@ pub struct ControlPlaneSurfaceCapabilities {
     #[serde(default)]
     pub pricing_catalog: bool,
     #[serde(default)]
+    pub routing: bool,
+    #[serde(default)]
     pub stations: bool,
     #[serde(default)]
     pub station_runtime: bool,
-    #[serde(
-        default,
-        rename = "station_persisted_settings",
-        alias = "station_persisted_config"
-    )]
+    #[serde(default)]
     pub station_persisted_settings: bool,
     #[serde(default)]
     pub station_specs: bool,
@@ -248,7 +246,7 @@ mod tests {
     use super::ControlPlaneSurfaceCapabilities;
 
     #[test]
-    fn control_plane_surface_capabilities_serializes_station_persisted_settings_canonically() {
+    fn control_plane_surface_capabilities_serializes_station_persisted_settings() {
         let caps = ControlPlaneSurfaceCapabilities {
             station_persisted_settings: true,
             ..Default::default()
@@ -256,16 +254,5 @@ mod tests {
 
         let value = serde_json::to_value(caps).expect("serialize capabilities");
         assert_eq!(value["station_persisted_settings"].as_bool(), Some(true));
-        assert!(value.get("station_persisted_config").is_none());
-    }
-
-    #[test]
-    fn control_plane_surface_capabilities_reads_legacy_station_persisted_config_alias() {
-        let caps: ControlPlaneSurfaceCapabilities = serde_json::from_value(serde_json::json!({
-            "station_persisted_config": true
-        }))
-        .expect("deserialize legacy capability alias");
-
-        assert!(caps.station_persisted_settings);
     }
 }

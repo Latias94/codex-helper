@@ -122,8 +122,8 @@ See `VOCABULARY.md` for the canonical term mapping and compatibility-only wordin
       - [x] TUI page/focus/stats state now uses station-first names (`Page::Stations`, `Focus::Stations`, `StatsFocus::Stations`)
       - [x] `ServiceConfigManager` public serialization now emits `stations`, accepts legacy `configs`, and treats `active_station()` as the canonical accessor
       - [x] `dashboard_core` internal module naming is now station-first (`station_options`), and the unused `active_config()` compatibility shim has been removed
-      - [x] persisted active-station mutation now uses canonical `/api/v1/stations/active`, while legacy `/stations/config-active` remains a compatibility alias only
-      - [x] control-plane capability payload now emits canonical `station_persisted_settings`, while legacy `station_persisted_config` remains a deserialize-only compatibility alias
+      - [x] persisted active-station mutation now uses canonical `/api/v1/stations/active`; legacy `/stations/config-active` has been removed
+      - [x] control-plane capability payload now emits canonical `station_persisted_settings`; legacy `station_persisted_config` has been removed
       - [x] GUI station detail module naming is now settings-first (`stations_detail_persisted_settings.rs`)
       - [x] core bootstrap/auth-sync/storage/usage/proxy flows now consume station-first manager accessors (`stations()`, `station()`, `contains_station()`)
       - [x] TUI station page module naming now matches semantics (`view/pages/stations.rs`, `apply_global_active_station`, station-first snapshot fields)

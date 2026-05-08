@@ -40,11 +40,8 @@ Allowed uses:
 
 - the literal persisted files `config.toml` / `config.json`
 - the Config page/editor/workspace when it literally edits persisted configuration documents
-- compatibility inputs/aliases such as:
+- legacy migration inputs such as:
   - `codex.configs.*`
-  - `profile.config`
-  - `/stations/config-active`
-  - `station_persisted_config`
 - historical docs/examples/tests that intentionally explain migration from the old layout
 
 Do not use bare `config` for:
@@ -120,8 +117,8 @@ When ambiguity matters, qualify it:
 | `active` | `active_station` or a more specific field such as `configured_active_station` / `effective_active_station` | legacy TOML input such as `active = "true"` |
 | `pinned config` | `session binding`, `global pinned station`, or `session station override` depending on scope | historical docs and some continuity explanations |
 | `session config override` | `session station override` | compatibility comments/tests only |
-| `profile.config` | `profile.station` | deserialize-only compatibility for older files |
-| `config-active` | persisted active-station compatibility alias | hidden compatibility routes only |
+| `profile.config` | `profile.station` | removed; migration docs only |
+| `config-active` | `/stations/active` for v2 station schema, `/routing` for v3 routing schema | removed; migration docs only |
 
 ## Writing Rules for New Work
 

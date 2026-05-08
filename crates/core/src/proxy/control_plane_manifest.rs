@@ -20,14 +20,10 @@ pub(super) const API_V1_REQUEST_LEDGER_SUMMARY: &str =
 pub(super) const API_V1_CONTROL_TRACE: &str = "/__codex_helper/api/v1/control-trace";
 pub(super) const API_V1_RETRY_CONFIG: &str = "/__codex_helper/api/v1/retry/config";
 pub(super) const API_V1_PRICING_CATALOG: &str = "/__codex_helper/api/v1/pricing/catalog";
+pub(super) const API_V1_ROUTING: &str = "/__codex_helper/api/v1/routing";
 pub(super) const API_V1_STATIONS: &str = "/__codex_helper/api/v1/stations";
 pub(super) const API_V1_STATIONS_RUNTIME: &str = "/__codex_helper/api/v1/stations/runtime";
 pub(super) const API_V1_STATIONS_ACTIVE: &str = "/__codex_helper/api/v1/stations/active";
-/// Compatibility-only alias for older clients.
-///
-/// Keep serving this route, but do not advertise it in the canonical v1 endpoint manifest.
-pub(super) const API_V1_STATIONS_CONFIG_ACTIVE_LEGACY: &str =
-    "/__codex_helper/api/v1/stations/config-active";
 pub(super) const API_V1_STATIONS_PROBE: &str = "/__codex_helper/api/v1/stations/probe";
 pub(super) const API_V1_STATION_BY_NAME: &str = "/__codex_helper/api/v1/stations/{name}";
 pub(super) const API_V1_STATION_SPECS: &str = "/__codex_helper/api/v1/stations/specs";
@@ -80,6 +76,7 @@ const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_CONTROL_TRACE,
     API_V1_RETRY_CONFIG,
     API_V1_PRICING_CATALOG,
+    API_V1_ROUTING,
     API_V1_STATIONS,
     API_V1_STATIONS_RUNTIME,
     API_V1_STATIONS_ACTIVE,
@@ -132,6 +129,7 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
         control_trace: true,
         retry_config: true,
         pricing_catalog: true,
+        routing: true,
         stations: true,
         station_runtime: true,
         station_persisted_settings: true,
@@ -173,6 +171,7 @@ pub(super) fn api_v1_operator_summary_links() -> OperatorSummaryLinks {
         control_trace: API_V1_CONTROL_TRACE.to_string(),
         retry_config: API_V1_RETRY_CONFIG.to_string(),
         pricing_catalog: API_V1_PRICING_CATALOG.to_string(),
+        routing: API_V1_ROUTING.to_string(),
         sessions: API_V1_SESSIONS.to_string(),
         session_by_id_template: API_V1_SESSION_BY_ID.to_string(),
         session_overrides: API_V1_SESSION_OVERRIDES.to_string(),
@@ -210,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn api_v1_endpoint_paths_hide_compatibility_only_aliases() {
-        assert!(!API_V1_ENDPOINT_PATHS.contains(&super::API_V1_STATIONS_CONFIG_ACTIVE_LEGACY));
+    fn api_v1_endpoint_paths_include_routing_surface() {
+        assert!(API_V1_ENDPOINT_PATHS.contains(&super::API_V1_ROUTING));
     }
 }
