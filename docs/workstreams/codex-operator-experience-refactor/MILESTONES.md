@@ -312,6 +312,7 @@ Acceptance:
 Current implementation slice:
 
 - Added a GUI retry policy preview that shows the resolved retry profile, upstream/provider strategy and attempt count, plus the cross-station-before-first-output boundary.
+- GUI retry editing now shows a draft resolved policy before writeback and highlights whether the draft enables cross-station failover before first output.
 - Added a GUI station routing preview that explains the current source (`global pin` or automatic active/level routing), candidate station order, skipped station reasons, session pin caveats, and after-first-output failover behavior.
 - Added a compact TUI Settings retry policy preview that splits upstream policy, provider policy, cross-station boundary, guardrails, and cooldown behavior into readable lines.
 

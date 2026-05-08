@@ -428,6 +428,12 @@ The UI must preview:
 - fallback order
 - behavior after first token
 
+Current GUI direction:
+
+- Retry edits show a draft resolved policy before writeback.
+- Drafts that allow cross-station failover before first output are called out as a session-continuity risk.
+- Runtime resolved policy remains visible separately so users can compare current behavior with the pending form.
+
 ## TUI Stabilization Design
 
 ### Render Invalidation

@@ -80,14 +80,19 @@ pub(super) fn render_retry_panel(
                 });
             }
 
+            let base_retry = snapshot.configured_retry.as_ref().cloned().unwrap_or_default();
+            let draft_retry = build_retry_config_from_editor(
+                &ctx.view.stations.retry_editor,
+                &base_retry,
+            );
+            render_retry_draft_preview(ui, ctx.lang, draft_retry.as_ref());
+
             ui.horizontal(|ui| {
                 if ui
                     .button(pick(ctx.lang, "写回 retry 配置", "Apply persisted retry config"))
                     .clicked()
                 {
-                    let base_retry = snapshot.configured_retry.as_ref().cloned().unwrap_or_default();
-                    match build_retry_config_from_editor(&ctx.view.stations.retry_editor, &base_retry)
-                    {
+                    match draft_retry.clone() {
                         Ok(retry) => match ctx.proxy.set_persisted_retry_config(ctx.rt, retry) {
                             Ok(()) => {
                                 ctx.proxy.refresh_current_if_due(
@@ -226,6 +231,31 @@ pub(super) fn render_retry_panel(
     });
 }
 
+fn render_retry_draft_preview(
+    ui: &mut egui::Ui,
+    lang: Language,
+    draft_retry: Result<&RetryConfig, &String>,
+) {
+    ui.add_space(4.0);
+    ui.label(pick(lang, "草稿预览", "Draft preview"));
+    match draft_retry {
+        Ok(retry) => {
+            let resolved = retry.resolve();
+            ui.small(retry_policy_preview_text(lang, retry.profile, &resolved));
+            ui.colored_label(
+                retry_policy_risk_color(&resolved),
+                retry_policy_risk_text(lang, &resolved),
+            );
+        }
+        Err(err) => {
+            ui.colored_label(
+                egui::Color32::from_rgb(190, 80, 80),
+                format!("invalid draft: {err}"),
+            );
+        }
+    }
+}
+
 fn retry_policy_preview_text(
     lang: Language,
     configured_profile: Option<RetryProfileName>,
@@ -250,6 +280,33 @@ fn retry_policy_preview_text(
         pick(lang, "首包前跨站", "cross-station before first output"),
         cross_station
     )
+}
+
+fn retry_policy_risk_text(
+    lang: Language,
+    retry: &crate::config::ResolvedRetryConfig,
+) -> &'static str {
+    if retry.allow_cross_station_before_first_output {
+        pick(
+            lang,
+            "风险提示：首包前可跨 station failover；首包后仍会锁定已提交路线。",
+            "Risk: cross-station failover is allowed before first output; after first output the committed route remains sticky.",
+        )
+    } else {
+        pick(
+            lang,
+            "安全边界：自动 retry 保持在同 station / upstream 策略内，不会主动跨 station。",
+            "Boundary: automatic retry stays within the same-station/upstream policy and will not proactively cross stations.",
+        )
+    }
+}
+
+fn retry_policy_risk_color(retry: &crate::config::ResolvedRetryConfig) -> egui::Color32 {
+    if retry.allow_cross_station_before_first_output {
+        egui::Color32::from_rgb(200, 120, 40)
+    } else {
+        egui::Color32::from_rgb(100, 150, 110)
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +336,25 @@ mod tests {
 
         assert!(text.contains("profile=auto/balanced"));
         assert!(text.contains("cross-station before first output=disabled"));
+    }
+
+    #[test]
+    fn retry_policy_risk_text_warns_for_cross_station_failover() {
+        let retry = RetryProfileName::CostPrimary.defaults();
+
+        let text = retry_policy_risk_text(Language::En, &retry);
+
+        assert!(text.contains("Risk: cross-station failover is allowed"));
+        assert!(text.contains("after first output"));
+    }
+
+    #[test]
+    fn retry_policy_risk_text_marks_same_station_boundary() {
+        let retry = RetryProfileName::Balanced.defaults();
+
+        let text = retry_policy_risk_text(Language::En, &retry);
+
+        assert!(text.contains("Boundary: automatic retry stays"));
+        assert!(text.contains("will not proactively cross stations"));
     }
 }
