@@ -1,12 +1,17 @@
 use crate::cli_types::ConfigSchemaTarget;
 use crate::config::{
-    ProxyConfig, ProxyConfigV2, RetryConfig, RetryProfileName, ServiceConfig, ServiceConfigManager,
-    ServiceKind, ServiceRoutingExplanation, UpstreamAuth, UpstreamConfig,
+    ConfigV3MigrationReport, ProxyConfig, ProxyConfigV2, ProxyConfigV3, RetryConfig,
+    RetryProfileName, ServiceConfig, ServiceConfigManager, ServiceKind, ServiceRoutingExplanation,
+    UpstreamAuth, UpstreamConfig,
     bootstrap::{
         import_codex_config_from_codex_cli, overwrite_codex_config_from_codex_cli_in_place,
     },
-    compact_v2_config, compile_v2_to_runtime, explain_service_routing, migrate_legacy_to_v2,
-    storage::{config_file_path, init_config_toml, load_config, save_config, save_config_v2},
+    compact_v2_config, compile_v2_to_runtime, compile_v3_to_runtime, explain_service_routing,
+    migrate_legacy_to_v2, migrate_legacy_to_v3_with_report, migrate_v2_to_v3_with_report,
+    storage::{
+        config_file_path, init_config_toml, load_config, save_config, save_config_v2,
+        save_config_v3,
+    },
 };
 use crate::{CliError, CliResult, RetryProfile, StationCommand};
 use serde::Serialize;
@@ -37,6 +42,7 @@ async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result<&'static s
 enum ConfigDocument {
     Legacy(ProxyConfig),
     V2(ProxyConfigV2),
+    V3(ProxyConfigV3),
 }
 
 impl ConfigDocument {
@@ -44,6 +50,7 @@ impl ConfigDocument {
         match self {
             Self::Legacy(cfg) => cfg.version.unwrap_or(1),
             Self::V2(cfg) => cfg.version,
+            Self::V3(cfg) => cfg.version,
         }
     }
 
@@ -51,13 +58,26 @@ impl ConfigDocument {
         match self {
             Self::Legacy(cfg) => Ok(cfg.clone()),
             Self::V2(cfg) => compile_v2_to_runtime(cfg),
+            Self::V3(cfg) => compile_v3_to_runtime(cfg),
         }
     }
 
-    fn v2_view(&self) -> ProxyConfigV2 {
+    fn v2_view(&self) -> anyhow::Result<ProxyConfigV2> {
         match self {
-            Self::Legacy(cfg) => migrate_legacy_to_v2(cfg),
-            Self::V2(cfg) => cfg.clone(),
+            Self::Legacy(cfg) => Ok(migrate_legacy_to_v2(cfg)),
+            Self::V2(cfg) => Ok(cfg.clone()),
+            Self::V3(cfg) => crate::config::compile_v3_to_v2(cfg),
+        }
+    }
+
+    fn v3_migration_report(&self) -> anyhow::Result<ConfigV3MigrationReport> {
+        match self {
+            Self::Legacy(cfg) => migrate_legacy_to_v3_with_report(cfg),
+            Self::V2(cfg) => migrate_v2_to_v3_with_report(cfg),
+            Self::V3(cfg) => Ok(ConfigV3MigrationReport {
+                config: cfg.clone(),
+                warnings: Vec::new(),
+            }),
         }
     }
 }
@@ -95,12 +115,27 @@ async fn load_config_document() -> anyhow::Result<ConfigDocument> {
     }
 
     let text = fs::read_to_string(&path).await?;
-    let version = toml::from_str::<toml::Value>(&text)
-        .ok()
+    let value = toml::from_str::<toml::Value>(&text).ok();
+    let version = value
+        .as_ref()
         .and_then(|value| value.get("version").and_then(|v| v.as_integer()))
-        .map(|value| value as u32);
+        .map(|value| value as u32)
+        .or_else(|| {
+            let has_routing = ["codex", "claude"].iter().any(|service| {
+                value
+                    .as_ref()
+                    .and_then(|value| value.get(*service))
+                    .and_then(|service| service.get("routing"))
+                    .is_some()
+            });
+            if has_routing { Some(3) } else { None }
+        });
 
-    if version == Some(2) {
+    if version == Some(3) {
+        let cfg = toml::from_str::<ProxyConfigV3>(&text)?;
+        compile_v3_to_runtime(&cfg)?;
+        Ok(ConfigDocument::V3(cfg))
+    } else if version == Some(2) {
         let cfg = toml::from_str::<ProxyConfigV2>(&text)?;
         compile_v2_to_runtime(&cfg)?;
         Ok(ConfigDocument::V2(cfg))
@@ -208,6 +243,12 @@ fn print_explain_text(
                 println!("  [{}] {}", idx, upstream);
             }
         }
+    }
+}
+
+fn print_migration_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
     }
 }
 
@@ -591,14 +632,14 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             println!("Set retry profile to '{:?}'", profile);
             let resolved = cfg.retry.resolve();
             println!(
-                "retry: upstream(strategy={:?} max_attempts={} backoff={}..{} jitter={}) provider(strategy={:?} max_attempts={}) guardrails(never_on_status='{}' never_on_class={:?}) cooldown(cf_chal={}s cf_to={}s transport={}s) cooldown_backoff(factor={} max={}s)",
+                "retry: upstream(strategy={:?} max_attempts={} backoff={}..{} jitter={}) route(strategy={:?} max_attempts={}) guardrails(never_on_status='{}' never_on_class={:?}) cooldown(cf_chal={}s cf_to={}s transport={}s) cooldown_backoff(factor={} max={}s)",
                 resolved.upstream.strategy,
                 resolved.upstream.max_attempts,
                 resolved.upstream.backoff_ms,
                 resolved.upstream.backoff_max_ms,
                 resolved.upstream.jitter_ms,
-                resolved.provider.strategy,
-                resolved.provider.max_attempts,
+                resolved.route.strategy,
+                resolved.route.max_attempts,
                 resolved.never_on_status,
                 resolved.never_on_class,
                 resolved.cloudflare_challenge_cooldown_secs,
@@ -672,11 +713,14 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
                     let document = load_config_document()
                         .await
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                    let v2_view = document
+                        .v2_view()
+                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                     let migrated = if compact {
-                        compact_v2_config(&document.v2_view())
+                        compact_v2_config(&v2_view)
                             .map_err(|e| CliError::ProxyConfig(e.to_string()))?
                     } else {
-                        document.v2_view()
+                        v2_view
                     };
 
                     if preview {
@@ -685,6 +729,26 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
                         println!("{text}");
                     } else {
                         let path = save_config_v2(&migrated)
+                            .await
+                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                        println!("Migrated config written to {:?}", path);
+                    }
+                }
+                ConfigSchemaTarget::V3 => {
+                    let document = load_config_document()
+                        .await
+                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                    let report = document
+                        .v3_migration_report()
+                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                    print_migration_warnings(&report.warnings);
+
+                    if preview {
+                        let text = toml::to_string_pretty(&report.config)
+                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                        println!("{text}");
+                    } else {
+                        let path = save_config_v3(&report.config)
                             .await
                             .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                         println!("Migrated config written to {:?}", path);

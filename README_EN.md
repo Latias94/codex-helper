@@ -155,6 +155,7 @@ For design/runtime boundaries, read:
 - `docs/workstreams/codex-control-plane-refactor/README.md`
 - `docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md`
 - `docs/workstreams/codex-control-plane-refactor/CONFIG_V2_MIGRATION.md`
+- `docs/workstreams/codex-routing-config-refactor/CONFIGURATION.md` (routing-first config guide)
 
 ---
 

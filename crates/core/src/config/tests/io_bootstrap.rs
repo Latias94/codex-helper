@@ -148,23 +148,18 @@ env_key = "RIGHTCODE_API_KEY"
             .await
             .expect("init_config_toml");
         let text = std::fs::read_to_string(&path).expect("read config.toml");
-        assert!(text.contains("version = 2"), "expected v2 template");
-        assert!(
-            text.contains("\n[codex]\n"),
-            "expected init to insert a real [codex] block (path={:?})",
-            path
-        );
-        assert!(
-            text.contains("active_station = \"right\""),
-            "expected imported active station to be present"
-        );
+        assert!(text.contains("version = 3"), "expected v3 template");
         assert!(
             text.contains("[codex.providers.right]"),
             "expected imported provider block to be present"
         );
         assert!(
-            text.contains("[codex.stations.right]"),
-            "expected imported station block to be present"
+            text.contains("[codex.routing]"),
+            "expected imported routing block to be present"
+        );
+        assert!(
+            text.contains("order = [\"right\"]"),
+            "expected imported routing order to be present"
         );
         assert!(
             text.contains("\n[retry]\n") && text.contains("profile = \"balanced\""),
@@ -204,10 +199,18 @@ env_key = "RIGHTCODE_API_KEY"
             .await
             .expect("init_config_toml");
         let text = std::fs::read_to_string(&path).expect("read config.toml");
-        assert!(text.contains("version = 2"), "expected v2 template");
+        assert!(text.contains("version = 3"), "expected v3 template");
         assert!(
             !text.contains("\n[codex]\n"),
             "expected no_import to skip inserting a real [codex] block"
+        );
+        assert!(
+            !text.contains("\n[codex.providers.right]\n"),
+            "expected no_import to skip inserting imported provider blocks"
+        );
+        assert!(
+            !text.contains("\n[codex.routing]\n"),
+            "expected no_import to skip inserting an active routing block"
         );
         // But the template still contains the commented example.
         assert!(text.contains("# [codex]"));

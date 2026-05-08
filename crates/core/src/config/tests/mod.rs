@@ -5,6 +5,7 @@ mod basic;
 mod io_bootstrap;
 mod retry_profiles;
 mod v2_schema;
+mod v3_schema;
 
 struct ScopedEnv {
     saved: Vec<(String, Option<String>)>,

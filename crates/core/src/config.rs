@@ -39,6 +39,9 @@ mod routing_impl;
 #[path = "config_v2.rs"]
 mod v2_impl;
 
+#[path = "config_v3.rs"]
+mod v3_impl;
+
 pub use auth_sync_impl::{
     SyncCodexAuthFromCodexOptions, SyncCodexAuthFromCodexReport, sync_codex_auth_from_codex_cli,
 };
@@ -59,11 +62,15 @@ pub use retry_impl::{
 };
 pub use routing_impl::{RoutingCandidate, ServiceRoutingExplanation, explain_service_routing};
 pub use storage_impl::{
-    config_file_path, init_config_toml, load_config, save_config, save_config_v2,
+    config_file_path, init_config_toml, load_config, save_config, save_config_v2, save_config_v3,
 };
 pub use v2_impl::{
     build_persisted_provider_catalog, build_persisted_station_catalog, compact_v2_config,
     compile_v2_to_runtime, migrate_legacy_to_v2,
+};
+pub use v3_impl::{
+    ConfigV3MigrationReport, compile_v3_to_runtime, compile_v3_to_v2, migrate_legacy_to_v3,
+    migrate_legacy_to_v3_with_report, migrate_v2_to_v3, migrate_v2_to_v3_with_report,
 };
 
 #[cfg(test)]
@@ -72,6 +79,7 @@ use bootstrap_impl::bootstrap_from_codex;
 pub mod storage {
     pub use super::storage_impl::{
         config_file_path, init_config_toml, load_config, save_config, save_config_v2,
+        save_config_v3,
     };
 }
 
@@ -418,6 +426,10 @@ fn default_proxy_config_v2_version() -> u32 {
     2
 }
 
+fn default_proxy_config_v3_version() -> u32 {
+    3
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfigV2 {
     #[serde(default = "default_proxy_config_v2_version")]
@@ -448,6 +460,178 @@ impl Default for ProxyConfigV2 {
             ui: UiConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfigV3 {
+    #[serde(default = "default_proxy_config_v3_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub codex: ServiceViewV3,
+    #[serde(default)]
+    pub claude: ServiceViewV3,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub notify: NotifyConfig,
+    #[serde(default)]
+    pub default_service: Option<ServiceKind>,
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+impl Default for ProxyConfigV3 {
+    fn default() -> Self {
+        Self {
+            version: default_proxy_config_v3_version(),
+            codex: ServiceViewV3::default(),
+            claude: ServiceViewV3::default(),
+            retry: RetryConfig::default(),
+            notify: NotifyConfig::default(),
+            default_service: None,
+            ui: UiConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceViewV3 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ServiceControlProfile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderConfigV3>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingConfigV3>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfigV3 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_upstream_auth")]
+    pub auth: UpstreamAuth,
+    #[serde(default, flatten)]
+    pub inline_auth: UpstreamAuth,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "supportedModels"
+    )]
+    pub supported_models: BTreeMap<String, bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "modelMapping"
+    )]
+    pub model_mapping: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, ProviderEndpointV3>,
+}
+
+impl Default for ProviderConfigV3 {
+    fn default() -> Self {
+        Self {
+            alias: None,
+            enabled: default_service_config_enabled(),
+            base_url: None,
+            auth: UpstreamAuth::default(),
+            inline_auth: UpstreamAuth::default(),
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEndpointV3 {
+    pub base_url: String,
+    #[serde(default = "default_service_config_enabled")]
+    pub enabled: bool,
+    #[serde(
+        default = "default_provider_endpoint_priority",
+        skip_serializing_if = "is_default_provider_endpoint_priority"
+    )]
+    pub priority: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "supportedModels"
+    )]
+    pub supported_models: BTreeMap<String, bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "modelMapping"
+    )]
+    pub model_mapping: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfigV3 {
+    #[serde(default = "default_routing_policy_v3")]
+    pub policy: RoutingPolicyV3,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefer_tags: Vec<BTreeMap<String, String>>,
+    #[serde(default = "default_routing_on_exhausted_v3")]
+    pub on_exhausted: RoutingExhaustedActionV3,
+}
+
+impl Default for RoutingConfigV3 {
+    fn default() -> Self {
+        Self {
+            policy: default_routing_policy_v3(),
+            order: Vec::new(),
+            target: None,
+            prefer_tags: Vec::new(),
+            on_exhausted: default_routing_on_exhausted_v3(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoutingPolicyV3 {
+    ManualSticky,
+    OrderedFailover,
+    TagPreferred,
+}
+
+fn default_routing_policy_v3() -> RoutingPolicyV3 {
+    RoutingPolicyV3::OrderedFailover
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoutingExhaustedActionV3 {
+    Continue,
+    Stop,
+}
+
+fn default_routing_on_exhausted_v3() -> RoutingExhaustedActionV3 {
+    RoutingExhaustedActionV3::Continue
+}
+
+fn is_default_upstream_auth(auth: &UpstreamAuth) -> bool {
+    auth.auth_token.is_none()
+        && auth.auth_token_env.is_none()
+        && auth.api_key.is_none()
+        && auth.api_key_env.is_none()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

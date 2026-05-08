@@ -71,7 +71,7 @@ const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 # - 生成/覆盖本模板：`codex-helper config init [--force]`
 # - 新安装时：首次写入配置默认会写 TOML。
 
-version = 2
+version = 3
 
 # 省略 --codex/--claude 时默认使用哪个服务。
 # default_service = "codex"
@@ -80,78 +80,54 @@ version = 2
 # --- 自动导入（可选） ---
 #
 # 如果你的机器上已配置 Codex CLI（存在 `~/.codex/config.toml`），`codex-helper config init`
-# 会尝试自动把 Codex providers 导入到本文件中，避免你手动抄写 base_url/env_key。
+# 会尝试自动把 Codex providers / routing 导入到本文件中，避免你手动抄写 base_url/env_key。
 #
 # 如果你只想生成纯模板（不导入），请使用：
 #   codex-helper config init --no-import
 
-# --- 推荐：provider / station 分层配置（v2） ---
+# --- 推荐：provider / routing 配置（v3） ---
 #
 # 大部分用户只需要改这一段。
 #
 # 说明：
 # - 优先使用环境变量方式保存密钥（`*_env`），避免写入磁盘。
-# - `providers` 负责账号、认证、模型能力、endpoint 列表。
-# - `stations` 负责调度入口、优先级(level)、启停，以及引用哪些 provider/endpoint。
-# - 同一个 provider 可以被多个 station 复用；同一个 station 也可以组合多个 provider/endpoint。
-# - 旧的 `[codex.configs.*]` 仍作为兼容输入被接受，但新写法更适合做中转站管理和未来 GUI。
-#
-# [codex]
-# active_station = "main"
+# - `providers` 负责账号、认证、endpoint 和标签。
+# - `routing` 负责顺序、策略和兜底行为。
+# - 单 endpoint provider 尽量直接写 `base_url`，不要再包一层 `endpoints.default`。
 #
 # [codex.providers.openai]
-# # enabled = true
-# [codex.providers.openai.auth]
-# auth_token_env = "OPENAI_API_KEY"
-# [codex.providers.openai.tags]
-# provider_id = "openai"
-#
-# [codex.providers.openai.endpoints.default]
 # base_url = "https://api.openai.com/v1"
+# auth_token_env = "OPENAI_API_KEY"
+# tags = { vendor = "openai", region = "us" }
 #
 # [codex.providers.backup]
-# [codex.providers.backup.auth]
-# auth_token_env = "BACKUP_API_KEY"
-# [codex.providers.backup.tags]
-# provider_id = "backup"
-# [codex.providers.backup.endpoints.hk]
 # base_url = "https://your-backup-provider.example/v1"
-# [codex.providers.backup.endpoints.hk.tags]
-# region = "hk"
+# auth_token_env = "BACKUP_API_KEY"
+# tags = { vendor = "backup", region = "hk" }
 #
-# [codex.stations.main]
-# alias = "primary+backup"
-# # enabled = true
-# # level = 1
-#
-# [[codex.stations.main.members]]
-# provider = "openai"
-# endpoint_names = ["default"]
-# preferred = true
-#
-# [[codex.stations.main.members]]
-# provider = "backup"
-# endpoint_names = ["hk"]
+# [codex.routing]
+# policy = "ordered-failover"
+# order = ["openai", "backup"]
+# on_exhausted = "continue"
 #
 # --- 会话控制模板（profiles，可选） ---
 #
 # Phase 1 先支持“定义 / 列出 / 应用到会话”，暂不自动把 default_profile 绑定到新会话。
 #
 # [codex]
-# active_station = "main"
 # default_profile = "daily"
 #
 # [codex.profiles.daily]
-# station = "main"
+# station = "routing"
 # reasoning_effort = "medium"
 #
 # [codex.profiles.fast]
-# station = "main"
+# station = "routing"
 # service_tier = "priority"
 # reasoning_effort = "low"
 #
 # [codex.profiles.deep]
-# station = "main"
+# station = "routing"
 # model = "gpt-5.4"
 # reasoning_effort = "high"
 #
@@ -263,7 +239,7 @@ profile = "balanced"
 "#;
 
 fn insert_after_version_block(template: &str, insert: &str) -> String {
-    let needle = "version = 2\n\n";
+    let needle = "version = 3\n\n";
     if let Some(idx) = template.find(needle) {
         let insert_pos = idx + needle.len();
         let mut out = String::with_capacity(template.len() + insert.len() + 2);
@@ -276,10 +252,29 @@ fn insert_after_version_block(template: &str, insert: &str) -> String {
     format!("{template}\n\n{insert}\n")
 }
 
+fn toml_schema_version_or_shape(text: &str) -> Option<u32> {
+    let value = toml::from_str::<TomlValue>(text).ok()?;
+    if let Some(version) = value
+        .get("version")
+        .and_then(|v| v.as_integer())
+        .map(|value| value as u32)
+    {
+        return Some(version);
+    }
+
+    let has_routing = ["codex", "claude"].iter().any(|service| {
+        value
+            .get(*service)
+            .and_then(|service| service.get("routing"))
+            .is_some()
+    });
+    if has_routing { Some(3) } else { None }
+}
+
 fn codex_bootstrap_snippet() -> Result<Option<String>> {
     #[derive(Serialize)]
     struct CodexOnly<'a> {
-        codex: &'a ServiceViewV2,
+        codex: &'a ServiceViewV3,
     }
 
     let mut cfg = ProxyConfig::default();
@@ -291,7 +286,7 @@ fn codex_bootstrap_snippet() -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let migrated = compact_v2_config(&migrate_legacy_to_v2(&cfg))?;
+    let migrated = migrate_legacy_to_v3(&cfg)?;
     let body = toml::to_string_pretty(&CodexOnly {
         codex: &migrated.codex,
     })?;
@@ -331,12 +326,12 @@ pub async fn load_config() -> Result<ProxyConfig> {
     let toml_path = config_toml_path();
     if toml_path.exists() {
         let text = fs::read_to_string(&toml_path).await?;
-        let version = toml::from_str::<TomlValue>(&text)
-            .ok()
-            .and_then(|value| value.get("version").and_then(|v| v.as_integer()))
-            .map(|value| value as u32);
+        let version = toml_schema_version_or_shape(&text);
 
-        let mut cfg = if version == Some(2) {
+        let mut cfg = if version == Some(3) {
+            let cfg_v3 = toml::from_str::<ProxyConfigV3>(&text)?;
+            compile_v3_to_runtime(&cfg_v3)?
+        } else if version == Some(2) {
             let cfg_v2 = toml::from_str::<ProxyConfigV2>(&text)?;
             compile_v2_to_runtime(&cfg_v2)?
         } else {
@@ -370,6 +365,11 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
     if cfg.version == Some(2) {
         let migrated = compact_v2_config(&migrate_legacy_to_v2(cfg))?;
         save_config_v2(&migrated).await?;
+        return Ok(());
+    }
+    if cfg.version == Some(3) {
+        let migrated = migrate_legacy_to_v3(cfg)?;
+        save_config_v3(&migrated).await?;
         return Ok(());
     }
 
@@ -411,6 +411,34 @@ pub async fn save_config_v2(cfg: &ProxyConfigV2) -> Result<PathBuf> {
     normalize_proxy_config(&mut runtime);
     validate_proxy_config(&runtime)?;
     normalized.version = 2;
+
+    let dir = config_dir();
+    fs::create_dir_all(&dir).await?;
+    let path = config_toml_path();
+    let backup_path = config_toml_backup_path();
+    let body = toml::to_string_pretty(&normalized)?;
+    let text = format!(
+        "{CONFIG_TOML_DOC_HEADER}
+{body}"
+    );
+    let data = text.into_bytes();
+
+    if path.exists()
+        && let Err(err) = fs::copy(&path, &backup_path).await
+    {
+        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+    }
+
+    write_bytes_file_async(&path, &data).await?;
+    Ok(path)
+}
+
+pub async fn save_config_v3(cfg: &ProxyConfigV3) -> Result<PathBuf> {
+    let mut normalized = cfg.clone();
+    normalized.version = 3;
+    let mut runtime = compile_v3_to_runtime(&normalized)?;
+    normalize_proxy_config(&mut runtime);
+    validate_proxy_config(&runtime)?;
 
     let dir = config_dir();
     fs::create_dir_all(&dir).await?;

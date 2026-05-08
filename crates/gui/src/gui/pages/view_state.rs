@@ -343,6 +343,7 @@ pub(super) struct ProfileEditorState {
 pub(super) enum ProxySettingsWorkingDocument {
     Legacy(crate::config::ProxyConfig),
     V2(crate::config::ProxyConfigV2),
+    V3(crate::config::ProxyConfigV3),
 }
 
 #[derive(Debug)]

@@ -344,6 +344,7 @@ pub enum RetryProfile {
 #[value(rename_all = "kebab-case")]
 pub enum ConfigSchemaTarget {
     V2,
+    V3,
 }
 
 #[derive(Subcommand, Debug)]
