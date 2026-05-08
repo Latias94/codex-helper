@@ -272,13 +272,13 @@ The migration should be deterministic and boring.
 Preview migration output:
 
 ```bash
-codex-helper config migrate --to v3 --dry-run
+codex-helper config migrate --dry-run
 ```
 
 Write the migrated TOML:
 
 ```bash
-codex-helper config migrate --to v3 --write --yes
+codex-helper config migrate --write --yes
 ```
 
 - `active_station` becomes the routing target for `manual-sticky`, or the first entry in `order` for `ordered-failover`.

@@ -1,12 +1,10 @@
 use super::config_doc::load_config_document;
-use crate::cli_types::ConfigSchemaTarget;
 use crate::config::{
     RetryConfig, RetryProfileName,
     bootstrap::{
         import_codex_config_from_codex_cli, overwrite_codex_config_from_codex_cli_in_place,
     },
-    compact_v2_config,
-    storage::{init_config_toml, load_config, save_config, save_config_v2, save_config_v3},
+    storage::{init_config_toml, load_config, save_config, save_config_v3},
 };
 use crate::{CliError, CliResult, ConfigCommand, RetryProfile};
 
@@ -109,10 +107,8 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             );
         }
         ConfigCommand::Migrate {
-            to,
             dry_run,
             write,
-            compact,
             yes,
         } => {
             if write && !yes {
@@ -123,52 +119,23 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
             }
 
             let preview = dry_run || !write;
-            match to {
-                ConfigSchemaTarget::V2 => {
-                    let document = load_config_document()
-                        .await
-                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                    let v2_view = document
-                        .v2_view()
-                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                    let migrated = if compact {
-                        compact_v2_config(&v2_view)
-                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?
-                    } else {
-                        v2_view
-                    };
+            let document = load_config_document()
+                .await
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let report = document
+                .v3_migration_report()
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            print_migration_warnings(&report.warnings);
 
-                    if preview {
-                        let text = toml::to_string_pretty(&migrated)
-                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                        println!("{text}");
-                    } else {
-                        let path = save_config_v2(&migrated)
-                            .await
-                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                        println!("Migrated config written to {:?}", path);
-                    }
-                }
-                ConfigSchemaTarget::V3 => {
-                    let document = load_config_document()
-                        .await
-                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                    let report = document
-                        .v3_migration_report()
-                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                    print_migration_warnings(&report.warnings);
-
-                    if preview {
-                        let text = toml::to_string_pretty(&report.config)
-                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                        println!("{text}");
-                    } else {
-                        let path = save_config_v3(&report.config)
-                            .await
-                            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                        println!("Migrated config written to {:?}", path);
-                    }
-                }
+            if preview {
+                let text = toml::to_string_pretty(&report.config)
+                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                println!("{text}");
+            } else {
+                let path = save_config_v3(&report.config)
+                    .await
+                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                println!("Migrated config written to {:?}", path);
             }
         }
     }

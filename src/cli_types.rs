@@ -217,20 +217,14 @@ pub enum ConfigCommand {
         yes: bool,
     },
 
-    /// Preview migration output for a target schema
+    /// Preview or write migration output for the routing-first v3 schema
     Migrate {
-        /// Target schema version
-        #[arg(long, value_enum)]
-        to: ConfigSchemaTarget,
         /// Preview only; print migrated TOML to stdout
         #[arg(long, conflicts_with = "write")]
         dry_run: bool,
         /// Write migrated TOML to ~/.codex-helper/config.toml
         #[arg(long, conflicts_with = "dry_run")]
         write: bool,
-        /// Merge same-provider endpoints into a cleaner v2 layout
-        #[arg(long)]
-        compact: bool,
         /// Confirm writing migrated config to disk
         #[arg(long, requires = "write")]
         yes: bool,
@@ -493,13 +487,6 @@ pub enum RetryProfile {
     AggressiveFailover,
     /// Cost-optimized primary/backup: enable cooldown exponential backoff for probe-back.
     CostPrimary,
-}
-
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-#[value(rename_all = "kebab-case")]
-pub enum ConfigSchemaTarget {
-    V2,
-    V3,
 }
 
 #[derive(Subcommand, Debug)]

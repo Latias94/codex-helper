@@ -154,7 +154,6 @@ For design/runtime boundaries, read:
 
 - `docs/workstreams/codex-control-plane-refactor/README.md`
 - `docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md`
-- `docs/workstreams/codex-control-plane-refactor/CONFIG_V2_MIGRATION.md`
 - `docs/workstreams/codex-routing-config-refactor/CONFIGURATION.md` (routing-first config guide)
 
 ---
@@ -285,8 +284,8 @@ profile = "balanced"
 Migrate an old config:
 
 ```bash
-codex-helper config migrate --to v3 --dry-run
-codex-helper config migrate --to v3 --write --yes
+codex-helper config migrate --dry-run
+codex-helper config migrate --write --yes
 ```
 
 `routing list` / `routing explain` are read-only runtime views. Add providers and edit routing with the `provider` and `routing` commands.
@@ -331,8 +330,8 @@ codex-helper config migrate --to v3 --write --yes
 
   ```bash
   codex-helper config init
-  codex-helper config migrate --to v3 --dry-run
-  codex-helper config migrate --to v3 --write --yes
+  codex-helper config migrate --dry-run
+  codex-helper config migrate --write --yes
   ```
 
 - Import accounts/config from Codex CLI:

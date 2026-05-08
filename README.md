@@ -152,7 +152,6 @@ ch
 
 - `docs/workstreams/codex-control-plane-refactor/README.md`
 - `docs/workstreams/codex-control-plane-refactor/CENTRAL_RELAY.md`
-- `docs/workstreams/codex-control-plane-refactor/CONFIG_V2_MIGRATION.md`
 - `docs/workstreams/codex-routing-config-refactor/CONFIGURATION.md`（routing-first 配置指南）
 
 ---
@@ -238,8 +237,8 @@ profile = "balanced"
 迁移旧配置：
 
 ```bash
-codex-helper config migrate --to v3 --dry-run
-codex-helper config migrate --to v3 --write --yes
+codex-helper config migrate --dry-run
+codex-helper config migrate --write --yes
 ```
 
 `routing list` / `routing explain` 用于查看编译后的运行时视图；新增 provider、调整顺序、启用禁用都使用 `provider` 和 `routing` 命令。
@@ -283,8 +282,8 @@ codex-helper config migrate --to v3 --write --yes
 
   ```bash
   codex-helper config init
-  codex-helper config migrate --to v3 --dry-run
-  codex-helper config migrate --to v3 --write --yes
+  codex-helper config migrate --dry-run
+  codex-helper config migrate --write --yes
   ```
 
 - 从 Codex CLI 导入账号/配置：

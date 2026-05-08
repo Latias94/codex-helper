@@ -1,4 +1,6 @@
-# Config V2 Migration Guide
+# Config V2 Migration Guide (Historical)
+
+> Historical status: this document explains the older v2 station/provider split. The current public CLI no longer targets v2. `codex-helper config migrate` always migrates to the routing-first `version = 3` schema.
 
 This guide explains how to move an existing `~/.codex-helper/config.toml` from the legacy `configs` layout to the station/provider-oriented `v2` layout.
 
@@ -23,37 +25,31 @@ For a personal relay manager, that quickly becomes hard to maintain when you wan
 - `stations`: routing entries, level/enabled state, provider membership
 - `profiles`: reusable session intent (`station`, `model`, `reasoning_effort`, `service_tier`)
 
-## Safe Migration Commands
+## Current Migration Commands
 
 Preview the migrated file first:
 
 ```powershell
-codex-helper config migrate --to v2 --dry-run
-```
-
-Preview a cleaner provider/endpoint layout:
-
-```powershell
-codex-helper config migrate --to v2 --compact --dry-run
+codex-helper config migrate --dry-run
 ```
 
 Write the migrated result back to `~/.codex-helper/config.toml`:
 
 ```powershell
-codex-helper config migrate --to v2 --compact --write --yes
+codex-helper config migrate --write --yes
 ```
 
-Generate a fresh `v2` template:
+Generate a fresh routing-first template:
 
 ```powershell
 codex-helper config init --force
 ```
 
-Notes:
+Historical notes:
 
-- `config init` now writes a `version = 2` TOML template.
-- If the current file is already `version = 2`, runtime saves now preserve `v2` instead of silently writing back the legacy `version = 1` shape.
-- Existing `v2` files that still use `active_group` / `groups` are still accepted on load.
+- `config init` now writes a `version = 3` TOML template.
+- Existing `version = 2` files can still load and migrate to v3.
+- Existing `v2` files that still use `active_group` / `groups` are accepted on load for migration.
 - Legacy boolean-like values such as `active = "true"` / `active = "false"` are normalized during load when they do not point to a real station name.
 
 ## Vocabulary Mapping
@@ -221,8 +217,8 @@ Current compatibility rules:
 
 ## Recommended Upgrade Path
 
-1. Run `codex-helper config migrate --to v2 --compact --dry-run`.
-2. Check whether provider names and station names match your mental model.
-3. If needed, edit provider/station names manually before writing.
-4. Run `codex-helper config migrate --to v2 --compact --write --yes`.
-5. Keep using `profiles` for fast/deep mode switching instead of cloning stations only to change `service_tier` or `reasoning_effort`.
+1. Run `codex-helper config migrate --dry-run`.
+2. Check whether provider names and routing order match your mental model.
+3. If needed, edit provider names or tags manually before writing.
+4. Run `codex-helper config migrate --write --yes`.
+5. Keep using `profiles` for fast/deep mode switching instead of cloning routes only to change `service_tier` or `reasoning_effort`.

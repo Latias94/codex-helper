@@ -1,8 +1,8 @@
 use crate::config::{
     ConfigV3MigrationReport, ProviderConfigV3, ProxyConfig, ProxyConfigV2, ProxyConfigV3,
     RoutingConfigV3, RoutingExhaustedActionV3, RoutingPolicyV3, ServiceConfigManager, ServiceKind,
-    ServiceViewV3, compile_v2_to_runtime, compile_v3_to_runtime, migrate_legacy_to_v2,
-    migrate_legacy_to_v3_with_report, migrate_v2_to_v3_with_report,
+    ServiceViewV3, compile_v2_to_runtime, compile_v3_to_runtime, migrate_legacy_to_v3_with_report,
+    migrate_v2_to_v3_with_report,
     storage::{config_file_path, load_config},
 };
 use std::collections::BTreeMap;
@@ -29,14 +29,6 @@ impl ConfigDocument {
             Self::Legacy(cfg) => Ok(cfg.clone()),
             Self::V2(cfg) => compile_v2_to_runtime(cfg),
             Self::V3(cfg) => compile_v3_to_runtime(cfg),
-        }
-    }
-
-    pub(super) fn v2_view(&self) -> anyhow::Result<ProxyConfigV2> {
-        match self {
-            Self::Legacy(cfg) => Ok(migrate_legacy_to_v2(cfg)),
-            Self::V2(cfg) => Ok(cfg.clone()),
-            Self::V3(cfg) => crate::config::compile_v3_to_v2(cfg),
         }
     }
 
@@ -126,7 +118,7 @@ pub(super) async fn load_v3_config(
     let document = load_config_document().await?;
     let ConfigDocument::V3(cfg) = document else {
         anyhow::bail!(
-            "{} commands require a version = 3 config; run `codex-helper config migrate --to v3 --write --yes` first",
+            "{} commands require a version = 3 config; run `codex-helper config migrate --write --yes` first",
             command_group
         );
     };
