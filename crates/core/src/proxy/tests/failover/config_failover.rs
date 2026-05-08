@@ -493,14 +493,14 @@ async fn proxy_runtime_config_reports_resolved_retry_profile() {
     );
     assert_eq!(
         retry
-            .get("provider")
+            .get("route")
             .and_then(|x| x.get("strategy"))
             .and_then(|x| x.as_str()),
         Some("failover")
     );
     assert_eq!(
         retry
-            .get("provider")
+            .get("route")
             .and_then(|x| x.get("max_attempts"))
             .and_then(|x| x.as_u64()),
         Some(2)

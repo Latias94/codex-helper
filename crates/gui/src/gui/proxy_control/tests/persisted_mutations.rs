@@ -96,7 +96,7 @@ fn attached_persisted_retry_config_uses_v1_retry_endpoint() {
                                 "on_class": ["upstream_transport_error"],
                                 "strategy": "same_upstream"
                             },
-                            "provider": {
+                            "route": {
                                 "max_attempts": 2,
                                 "backoff_ms": 0,
                                 "backoff_max_ms": 0,
@@ -218,7 +218,7 @@ fn attached_persisted_retry_config_uses_operator_summary_link() {
                                 "on_class": ["upstream_transport_error"],
                                 "strategy": "same_upstream"
                             },
-                            "provider": {
+                            "route": {
                                 "max_attempts": 2,
                                 "backoff_ms": 0,
                                 "backoff_max_ms": 0,

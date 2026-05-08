@@ -18,15 +18,12 @@ fn retry_profile_defaults_to_balanced_when_unset() {
             .any(|c| c == "upstream_transport_error")
     );
 
-    assert_eq!(resolved.provider.strategy, RetryStrategy::Failover);
-    assert_eq!(resolved.provider.max_attempts, 2);
-    assert_eq!(
-        resolved.provider.on_status,
-        "401,403,404,408,429,500-599,524"
-    );
+    assert_eq!(resolved.route.strategy, RetryStrategy::Failover);
+    assert_eq!(resolved.route.max_attempts, 2);
+    assert_eq!(resolved.route.on_status, "401,403,404,408,429,500-599,524");
     assert!(
         resolved
-            .provider
+            .route
             .on_class
             .iter()
             .any(|c| c == "routing_mismatch_capability")
@@ -53,7 +50,7 @@ fn retry_profile_cost_primary_sets_probe_back_defaults() {
         ..RetryConfig::default()
     };
     let resolved = cfg.resolve();
-    assert_eq!(resolved.provider.strategy, RetryStrategy::Failover);
+    assert_eq!(resolved.route.strategy, RetryStrategy::Failover);
     assert_eq!(resolved.cooldown_backoff_factor, 2);
     assert_eq!(resolved.cooldown_backoff_max_secs, 900);
     assert_eq!(resolved.transport_cooldown_secs, 30);
@@ -67,15 +64,12 @@ fn retry_profile_aggressive_failover_enables_broader_failover_with_guardrails() 
         ..RetryConfig::default()
     };
     let resolved = cfg.resolve();
-    assert_eq!(resolved.provider.max_attempts, 3);
-    assert_eq!(resolved.provider.strategy, RetryStrategy::Failover);
-    assert_eq!(
-        resolved.provider.on_status,
-        "401,403,404,408,429,500-599,524"
-    );
+    assert_eq!(resolved.route.max_attempts, 3);
+    assert_eq!(resolved.route.strategy, RetryStrategy::Failover);
+    assert_eq!(resolved.route.on_status, "401,403,404,408,429,500-599,524");
     assert!(
         resolved
-            .provider
+            .route
             .on_class
             .iter()
             .any(|c| c == "routing_mismatch_capability")

@@ -162,7 +162,7 @@ pub(super) async fn build_operator_summary(
             configured_profile: configured_retry.profile,
             supports_write: surface_capabilities.retry_config,
             upstream_max_attempts: resolved_retry.upstream.max_attempts,
-            provider_max_attempts: resolved_retry.provider.max_attempts,
+            provider_max_attempts: resolved_retry.route.max_attempts,
             allow_cross_station_before_first_output: resolved_retry
                 .allow_cross_station_before_first_output,
             recent_retried_requests: retry_observations.recent_retried_requests,

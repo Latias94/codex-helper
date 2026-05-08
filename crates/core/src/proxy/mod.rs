@@ -39,6 +39,7 @@ mod retry;
 mod route_attempts;
 mod route_provenance;
 mod router_setup;
+mod routing_plan;
 mod runtime_admin_api;
 mod runtime_config;
 mod selected_upstream_request;

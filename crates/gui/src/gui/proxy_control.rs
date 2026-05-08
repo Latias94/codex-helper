@@ -577,7 +577,7 @@ fn local_operator_retry_summary(r: &RunningProxy) -> OperatorRetrySummary {
         configured_profile: r.configured_retry.as_ref().and_then(|retry| retry.profile),
         supports_write: true,
         upstream_max_attempts: resolved_retry.upstream.max_attempts,
-        provider_max_attempts: resolved_retry.provider.max_attempts,
+        provider_max_attempts: resolved_retry.route.max_attempts,
         allow_cross_station_before_first_output: resolved_retry
             .allow_cross_station_before_first_output,
         recent_retried_requests: retry_observations.recent_retried_requests,

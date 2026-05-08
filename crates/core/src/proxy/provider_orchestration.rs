@@ -204,7 +204,7 @@ mod tests {
         };
         let mut plan = RetryPlan {
             upstream: provider_opt.clone(),
-            provider: provider_opt.clone(),
+            route: provider_opt.clone(),
             allow_cross_station_before_first_output: true,
             never_status_ranges: Vec::new(),
             never_error_classes: Vec::new(),
@@ -223,12 +223,13 @@ mod tests {
 
         let same_upstream_provider = RetryLayerOptions {
             strategy: RetryStrategy::SameUpstream,
-            ..provider_opt
+            ..provider_opt.clone()
         };
         assert!(!cross_station_failover_enabled(
             true,
             &RetryPlan {
                 allow_cross_station_before_first_output: true,
+                route: provider_opt.clone(),
                 ..plan
             },
             &same_upstream_provider,

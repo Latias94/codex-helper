@@ -48,7 +48,7 @@ fn retry_layer_preview(label: &str, layer: &ResolvedRetryLayerConfig) -> String 
 fn retry_policy_preview_lines(retry: &ResolvedRetryConfig) -> Vec<String> {
     let mut lines = vec![
         retry_layer_preview("upstream", &retry.upstream),
-        retry_layer_preview("provider", &retry.provider),
+        retry_layer_preview("route", &retry.route),
     ];
     let boundary = if retry.allow_cross_station_before_first_output {
         "boundary: cross-station failover allowed before first output; after output stays on committed route"
@@ -705,7 +705,7 @@ mod tests {
     fn retry_policy_preview_lines_explain_layers_and_boundary() {
         let retry = ResolvedRetryConfig {
             upstream: retry_layer(RetryStrategy::SameUpstream, 2),
-            provider: retry_layer(RetryStrategy::Failover, 3),
+            route: retry_layer(RetryStrategy::Failover, 3),
             allow_cross_station_before_first_output: true,
             never_on_status: "400,401,403".to_string(),
             never_on_class: vec!["client_error_non_retryable".to_string()],
@@ -719,7 +719,7 @@ mod tests {
         let lines = retry_policy_preview_lines(&retry);
 
         assert!(lines[0].contains("upstream: strategy=same_upstream attempts=2"));
-        assert!(lines[1].contains("provider: strategy=failover attempts=3"));
+        assert!(lines[1].contains("route: strategy=failover attempts=3"));
         assert!(lines[2].contains("cross-station failover allowed before first output"));
         assert!(lines[3].contains("never_status=[400,401,403]"));
         assert!(lines[4].contains("transport=45s"));

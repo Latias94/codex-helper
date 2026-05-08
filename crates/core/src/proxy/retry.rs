@@ -21,7 +21,7 @@ pub(super) struct RetryLayerOptions {
 #[derive(Clone)]
 pub(super) struct RetryPlan {
     pub(super) upstream: RetryLayerOptions,
-    pub(super) provider: RetryLayerOptions,
+    pub(super) route: RetryLayerOptions,
     pub(super) allow_cross_station_before_first_output: bool,
     pub(super) never_status_ranges: Vec<(u16, u16)>,
     pub(super) never_error_classes: Vec<String>,
@@ -69,7 +69,7 @@ fn layer_options(cfg: &ResolvedRetryLayerConfig) -> RetryLayerOptions {
 
 pub(super) fn retry_plan(cfg: &ResolvedRetryConfig) -> RetryPlan {
     let upstream = layer_options(&cfg.upstream);
-    let provider = layer_options(&cfg.provider);
+    let route = layer_options(&cfg.route);
     let never_status_ranges = parse_status_ranges(cfg.never_on_status.as_str());
     let never_error_classes = cfg.never_on_class.clone();
     let cloudflare_challenge_cooldown_secs = cfg.cloudflare_challenge_cooldown_secs;
@@ -80,7 +80,7 @@ pub(super) fn retry_plan(cfg: &ResolvedRetryConfig) -> RetryPlan {
 
     RetryPlan {
         upstream,
-        provider,
+        route,
         allow_cross_station_before_first_output: cfg.allow_cross_station_before_first_output,
         never_status_ranges,
         never_error_classes,
@@ -163,7 +163,7 @@ pub(super) fn should_never_retry(plan: &RetryPlan, status_code: u16, class: Opti
     }
 
     let class_is_explicitly_retryable =
-        should_retry_class(&plan.upstream, class) || should_retry_class(&plan.provider, class);
+        should_retry_class(&plan.upstream, class) || should_retry_class(&plan.route, class);
     !class_is_explicitly_retryable
 }
 

@@ -71,7 +71,7 @@ pub(super) struct ProviderExecutionState {
 
 pub(super) fn log_retry_options(service_name: &str, request_id: u64, plan: &RetryPlan) {
     let upstream_opt = &plan.upstream;
-    let provider_opt = &plan.provider;
+    let provider_opt = &plan.route;
 
     log_retry_trace(serde_json::json!({
         "event": "retry_options",
@@ -144,7 +144,7 @@ pub(super) async fn execute_provider_chain(
         cooldown_backoff,
     } = params;
 
-    let provider_opt = &plan.provider;
+    let provider_opt = &plan.route;
     let total_upstreams = lbs
         .iter()
         .map(|lb| lb.service.upstreams.len())
@@ -360,7 +360,7 @@ async fn execute_station_upstreams(
             route_attempts,
             avoided_total,
             provider_attempt,
-            plan.provider.max_attempts,
+            plan.route.max_attempts,
             total_upstreams,
         );
         let Some(selected) = selected else {
@@ -401,7 +401,7 @@ async fn execute_station_upstreams(
             client_body_warn,
             plan,
             upstream_opt: &plan.upstream,
-            provider_opt: &plan.provider,
+            provider_opt: &plan.route,
             provider_attempt,
             total_upstreams,
             cooldown_backoff,

@@ -184,8 +184,8 @@ pub(super) fn render_retry_panel(
                 ));
                 ui.label(format!(
                     "provider: {} / attempts={}",
-                    retry_strategy_label(retry.provider.strategy),
-                    retry.provider.max_attempts
+                    retry_strategy_label(retry.route.strategy),
+                    retry.route.max_attempts
                 ));
             });
             ui.horizontal(|ui| {
@@ -213,8 +213,8 @@ pub(super) fn render_retry_panel(
                 "upstream backoff={}..{} ms  provider backoff={}..{} ms",
                 retry.upstream.backoff_ms,
                 retry.upstream.backoff_max_ms,
-                retry.provider.backoff_ms,
-                retry.provider.backoff_max_ms
+                retry.route.backoff_ms,
+                retry.route.backoff_max_ms
             ));
             ui.small(pick(
                 ctx.lang,
@@ -275,8 +275,8 @@ fn retry_policy_preview_text(
         profile,
         retry_strategy_label(retry.upstream.strategy),
         retry.upstream.max_attempts,
-        retry_strategy_label(retry.provider.strategy),
-        retry.provider.max_attempts,
+        retry_strategy_label(retry.route.strategy),
+        retry.route.max_attempts,
         pick(lang, "首包前跨站", "cross-station before first output"),
         cross_station
     )

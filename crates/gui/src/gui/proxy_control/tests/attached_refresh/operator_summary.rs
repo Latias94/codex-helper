@@ -235,7 +235,7 @@ fn refresh_attached_prefers_operator_summary_for_runtime_card_fields() {
                             "on_class": ["transport"],
                             "strategy": "failover"
                         },
-                        "provider": {
+                        "route": {
                             "max_attempts": 2,
                             "backoff_ms": 100,
                             "backoff_max_ms": 200,
@@ -552,7 +552,7 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
                             "on_class": ["upstream_transport_error"],
                             "strategy": "same_upstream"
                         },
-                        "provider": {
+                        "route": {
                             "max_attempts": 2,
                             "backoff_ms": 0,
                             "backoff_max_ms": 0,

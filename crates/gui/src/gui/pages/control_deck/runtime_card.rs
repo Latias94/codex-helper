@@ -317,7 +317,7 @@ fn runtime_retry_hint(
             pick(lang, "上游尝试", "upstream tries"),
             retry.upstream.max_attempts,
             pick(lang, "Provider 尝试", "provider tries"),
-            retry.provider.max_attempts,
+            retry.route.max_attempts,
         );
     }
 

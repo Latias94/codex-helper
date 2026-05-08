@@ -347,6 +347,8 @@ Current implementation slice:
 - GUI retry editing now shows a draft resolved policy before writeback and highlights whether the draft enables cross-station failover before first output.
 - Added a GUI station routing preview that explains the current source (`global pin` or automatic active/level routing), candidate station order, skipped station reasons, session pin caveats, and after-first-output failover behavior.
 - Added a compact TUI Settings retry policy preview that splits upstream policy, provider policy, cross-station boundary, guardrails, and cooldown behavior into readable lines.
+- Core proxy routing now builds an explicit station routing plan before request dispatch, which keeps pinned selection, active fallback, and single-level/multi-level ordering out of the orchestration layer.
+- Next cleanup target is route-policy vocabulary: the current `retry.provider` naming still reads like provider-local retry, but the actual boundary is route/station selection policy.
 
 ## P2 - Productization and Long-horizon Control
 

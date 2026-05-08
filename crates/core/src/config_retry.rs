@@ -23,7 +23,7 @@ pub struct ResolvedRetryLayerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolvedRetryConfig {
     pub upstream: ResolvedRetryLayerConfig,
-    pub provider: ResolvedRetryLayerConfig,
+    pub route: ResolvedRetryLayerConfig,
     /// Guarded cross-station failover before any upstream output is committed to the client.
     pub allow_cross_station_before_first_output: bool,
     pub never_on_status: String,
@@ -132,7 +132,7 @@ impl RetryProfileName {
                     ],
                     strategy: RetryStrategy::SameUpstream,
                 },
-                provider: ResolvedRetryLayerConfig {
+                route: ResolvedRetryLayerConfig {
                     max_attempts: 2,
                     backoff_ms: 0,
                     backoff_max_ms: 0,
@@ -158,9 +158,9 @@ impl RetryProfileName {
                     max_attempts: 3,
                     ..RetryProfileName::Balanced.defaults().upstream
                 },
-                provider: ResolvedRetryLayerConfig {
+                route: ResolvedRetryLayerConfig {
                     max_attempts: 1,
-                    ..RetryProfileName::Balanced.defaults().provider
+                    ..RetryProfileName::Balanced.defaults().route
                 },
                 ..RetryProfileName::Balanced.defaults()
             },
@@ -178,7 +178,7 @@ impl RetryProfileName {
                     ],
                     strategy: RetryStrategy::SameUpstream,
                 },
-                provider: ResolvedRetryLayerConfig {
+                route: ResolvedRetryLayerConfig {
                     max_attempts: 3,
                     backoff_ms: 0,
                     backoff_max_ms: 0,
@@ -194,9 +194,9 @@ impl RetryProfileName {
                 ..RetryProfileName::Balanced.defaults()
             },
             RetryProfileName::CostPrimary => ResolvedRetryConfig {
-                provider: ResolvedRetryLayerConfig {
+                route: ResolvedRetryLayerConfig {
                     max_attempts: 2,
-                    ..RetryProfileName::Balanced.defaults().provider
+                    ..RetryProfileName::Balanced.defaults().route
                 },
                 allow_cross_station_before_first_output: true,
                 transport_cooldown_secs: 30,
@@ -240,25 +240,25 @@ impl RetryConfig {
         }
         if let Some(layer) = self.provider.as_ref() {
             if let Some(v) = layer.max_attempts {
-                out.provider.max_attempts = v;
+                out.route.max_attempts = v;
             }
             if let Some(v) = layer.backoff_ms {
-                out.provider.backoff_ms = v;
+                out.route.backoff_ms = v;
             }
             if let Some(v) = layer.backoff_max_ms {
-                out.provider.backoff_max_ms = v;
+                out.route.backoff_max_ms = v;
             }
             if let Some(v) = layer.jitter_ms {
-                out.provider.jitter_ms = v;
+                out.route.jitter_ms = v;
             }
             if let Some(v) = layer.on_status.as_deref() {
-                out.provider.on_status = v.to_string();
+                out.route.on_status = v.to_string();
             }
             if let Some(v) = layer.on_class.as_ref() {
-                out.provider.on_class = v.clone();
+                out.route.on_class = v.clone();
             }
             if let Some(v) = layer.strategy {
-                out.provider.strategy = v;
+                out.route.strategy = v;
             }
         }
         if let Some(v) = self.allow_cross_station_before_first_output {

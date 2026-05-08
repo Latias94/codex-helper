@@ -37,6 +37,8 @@ This workstream assumes those concepts are the canonical base. It should not ren
   - Refactor doctrine, deletion candidates, compatibility rules, and "do this right" boundaries.
 - `DESIGN.md`
   - Target product architecture for request observability, pricing, balances, route decision chains, TUI/GUI parity, and policy UX.
+- `ROUTING_STRATEGY.md`
+  - Current provider/station switching semantics, fearless refactor targets, and the priority order for route-policy cleanup.
 - `MILESTONES.md`
   - Prioritized execution plan with P0/P1/P2 sequencing and acceptance gates.
 - `GAP_MATRIX.md`
@@ -51,6 +53,7 @@ Current strengths:
 - Request JSONL logging and control trace logging already exist.
 - `service_tier` observability is stronger than a basic proxy: requested/effective/actual values are represented in request logs.
 - Provider usage polling already exists in `crates/core/src/usage_providers.rs` and can mark upstreams as usage-exhausted.
+- Proxy route selection is being pulled into an explicit routing plan so request orchestration stops carrying station-candidate assembly logic.
 
 Current weak points:
 

@@ -350,17 +350,17 @@ fn retry_boundary_from_config(retry: Option<&ResolvedRetryConfig>) -> StationRet
     };
 
     let provider_failover =
-        retry.provider.strategy == RetryStrategy::Failover && retry.provider.max_attempts > 1;
+        retry.route.strategy == RetryStrategy::Failover && retry.route.max_attempts > 1;
     if retry.allow_cross_station_before_first_output && provider_failover {
         return StationRetryBoundary::CrossStationBeforeFirstOutput {
-            provider_max_attempts: retry.provider.max_attempts,
+            provider_max_attempts: retry.route.max_attempts,
         };
     }
 
-    if retry.provider.max_attempts > 1 {
+    if retry.route.max_attempts > 1 {
         return StationRetryBoundary::CurrentStationFirst {
-            provider_strategy: retry.provider.strategy,
-            provider_max_attempts: retry.provider.max_attempts,
+            provider_strategy: retry.route.strategy,
+            provider_max_attempts: retry.route.max_attempts,
         };
     }
 
