@@ -507,6 +507,16 @@ fn append_new_provider_to_explicit_v3_order(
     routing.order.push(provider_name.to_string());
 }
 
+fn ensure_provider_in_v3_routing_order(
+    view: &mut crate::config::ServiceViewV3,
+    provider_name: &str,
+) {
+    let routing = view.routing.get_or_insert_with(Default::default);
+    if !routing.order.iter().any(|name| name == provider_name) {
+        routing.order.push(provider_name.to_string());
+    }
+}
+
 fn validate_station_members_for_view(
     service_name: &str,
     station_name: &str,
@@ -768,7 +778,17 @@ pub(super) async fn update_persisted_station(
         };
         if let Some(enabled) = payload.enabled {
             provider.enabled = enabled;
+            if enabled {
+                ensure_provider_in_v3_routing_order(view, station_name.as_str());
+            } else if let Some(routing) = view.routing.as_mut()
+                && routing.target.as_deref() == Some(station_name.as_str())
+            {
+                routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
+                routing.target = None;
+            }
         }
+        crate::config::compile_v3_to_runtime(&document)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         save_persisted_proxy_settings_document_and_reload(
             &proxy,
             PersistedProxySettingsDocument::V3(document),
@@ -825,6 +845,12 @@ pub(super) async fn set_persisted_active_station(
                 }
             }
             Some(name) => {
+                let provider = view
+                    .providers
+                    .get_mut(name)
+                    .expect("provider existence was validated above");
+                provider.enabled = true;
+                ensure_provider_in_v3_routing_order(view, name);
                 let routing = view.routing.get_or_insert_with(Default::default);
                 routing.policy = crate::config::RoutingPolicyV3::ManualSticky;
                 routing.target = Some(name.to_string());
@@ -837,6 +863,8 @@ pub(super) async fn set_persisted_active_station(
             }
         }
 
+        crate::config::compile_v3_to_runtime(&document)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         save_persisted_proxy_settings_document_and_reload(
             &proxy,
             PersistedProxySettingsDocument::V3(document),

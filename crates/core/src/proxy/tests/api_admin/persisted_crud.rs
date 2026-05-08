@@ -382,7 +382,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         "input".to_string(),
         crate::config::ProviderConfigV3 {
             alias: Some("Input".to_string()),
-            enabled: true,
+            enabled: false,
             base_url: Some("https://input.example.com/v1".to_string()),
             inline_auth: UpstreamAuth {
                 auth_token: None,
@@ -475,6 +475,29 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         .expect("set v3 active provider send");
     assert_eq!(set_active.status(), StatusCode::NO_CONTENT);
 
+    let station_specs_after_active = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/stations/specs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v3 station specs after active send")
+        .error_for_status()
+        .expect("get v3 station specs after active status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v3 station specs after active json");
+    let input_after_active = station_specs_after_active["providers"]
+        .as_array()
+        .and_then(|providers| {
+            providers
+                .iter()
+                .find(|provider| provider["name"].as_str() == Some("input"))
+        })
+        .expect("input provider after active");
+    assert_eq!(input_after_active["enabled"].as_bool(), Some(true));
+
     let update_provider_meta = client
         .put(format!(
             "http://{}/__codex_helper/api/v1/stations/input",
@@ -566,8 +589,11 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         .codex
         .routing
         .expect("v3 routing should remain");
-    assert_eq!(routing.policy, crate::config::RoutingPolicyV3::ManualSticky);
-    assert_eq!(routing.target.as_deref(), Some("input"));
+    assert_eq!(
+        routing.policy,
+        crate::config::RoutingPolicyV3::OrderedFailover
+    );
+    assert_eq!(routing.target.as_deref(), None);
     assert_eq!(routing.order, vec!["input", "backup", "utility"]);
     assert_eq!(
         persisted_cfg.codex.default_profile.as_deref(),
