@@ -101,7 +101,7 @@ Use it for:
 | Balance/quota | `usage_providers.rs` marks exhausted | Balance scripts/adapters | Provider limit/cost windows | Promote to first-class balance state | P1 |
 | Health vs quota | Partially separated by `usage_exhausted` | Provider/circuit UI | Circuit + limits | Need clear semantics and UI | P1 |
 | Automatic switching | HA/failover base exists; GUI/TUI previews explain retry boundaries and GUI draft edits warn on cross-station pre-output failover | Failover queue | Intelligent failover/sticky | Need deeper policy simulation and weighted strategy controls | P1/P2 |
-| Long-horizon audit | JSONL + runtime rollups | SQLite | SQLite + charts | Consider SQLite after v2 schema | P2 |
+| Long-horizon audit | JSONL + runtime rollups + `usage find` filters | SQLite | SQLite + charts | Consider SQLite after v2 schema | P2 |
 | Provider presets | Configurable, not polished as marketplace | 50+ presets | Provider management | Add curated Codex relay templates later | P2 |
 | LAN/remote attach | Strong existing workstream | Desktop-local | Desktop-local gateway | Preserve remote-safe boundaries | Keep/P2 |
 

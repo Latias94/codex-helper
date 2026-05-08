@@ -502,9 +502,11 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
   codex-helper usage summary
   codex-helper usage tail --limit 20
   codex-helper usage tail --limit 20 --raw
+  codex-helper usage find --errors --model gpt-5 --retried --limit 10
+  codex-helper usage find --session <SESSION_ID> --raw
   ```
 
-  Text output shows station/provider/model, service_tier/fast, input/output/cache/reasoning tokens, duration, TTFB, output speed, and estimated cost when possible; `--raw` still prints the original JSONL.
+  Text output shows station/provider/model, service_tier/fast, input/output/cache/reasoning tokens, duration, TTFB, output speed, and estimated cost when possible. `usage find` filters by session/model/station/provider/status/fast/retry; `--raw` still prints the original JSONL.
 
 - Status & doctor:
 

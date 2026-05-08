@@ -474,9 +474,11 @@ codex-helper config set-level openai 2
   codex-helper usage summary
   codex-helper usage tail --limit 20
   codex-helper usage tail --limit 20 --raw
+  codex-helper usage find --errors --model gpt-5 --retried --limit 10
+  codex-helper usage find --session <SESSION_ID> --raw
   ```
 
-  普通文本输出会展示 station/provider/model、service_tier/fast、input/output/cache/reasoning token、耗时、TTFB、输出速度和可估算成本；`--raw` 仍输出原始 JSONL。
+  普通文本输出会展示 station/provider/model、service_tier/fast、input/output/cache/reasoning token、耗时、TTFB、输出速度和可估算成本；`usage find` 可按 session/model/station/provider/status/fast/retry 过滤，`--raw` 仍输出原始 JSONL。
 
 - 状态与诊断：
 

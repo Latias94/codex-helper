@@ -68,9 +68,152 @@ pub async fn handle_usage_cmd(cmd: UsageCommand) -> CliResult<()> {
                 println!("{}", aggregate.summary_line(&name));
             }
         }
+        UsageCommand::Find {
+            limit,
+            session,
+            model,
+            station,
+            provider,
+            status_min,
+            status_max,
+            errors,
+            fast,
+            retried,
+            raw,
+        } => {
+            let file = File::open(&log_path)
+                .map_err(|e| CliError::Usage(format!("无法打开请求日志 {:?}: {}", log_path, e)))?;
+            let reader = BufReader::new(file);
+            let lines = reader.lines().map_while(Result::ok).collect::<Vec<_>>();
+            let filters = UsageFindFilters {
+                session: session.as_deref(),
+                model: model.as_deref(),
+                station: station.as_deref(),
+                provider: provider.as_deref(),
+                status_min: status_min.or(errors.then_some(400)),
+                status_max,
+                fast,
+                retried,
+            };
+            let mut printed = 0usize;
+            for line in lines.iter().rev() {
+                let Ok(v) = serde_json::from_str::<JsonValue>(line) else {
+                    continue;
+                };
+                if !request_matches_filters(&v, &filters) {
+                    continue;
+                }
+
+                if raw {
+                    println!("{line}");
+                } else {
+                    for out in tail_record_lines(&v) {
+                        println!("{out}");
+                    }
+                }
+                printed += 1;
+                if printed >= limit {
+                    break;
+                }
+            }
+            if printed == 0 && !raw {
+                println!("No request records matched the filters in {:?}.", log_path);
+            }
+        }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct UsageFindFilters<'a> {
+    session: Option<&'a str>,
+    model: Option<&'a str>,
+    station: Option<&'a str>,
+    provider: Option<&'a str>,
+    status_min: Option<u64>,
+    status_max: Option<u64>,
+    fast: bool,
+    retried: bool,
+}
+
+fn request_matches_filters(v: &JsonValue, filters: &UsageFindFilters<'_>) -> bool {
+    if let Some(expected) = filters.session
+        && !field_contains(str_field(v, "session_id"), expected)
+    {
+        return false;
+    }
+    if let Some(expected) = filters.model
+        && !field_contains(request_model(v).as_deref(), expected)
+    {
+        return false;
+    }
+    if let Some(expected) = filters.station
+        && !field_contains(Some(station_name(v)), expected)
+    {
+        return false;
+    }
+    if let Some(expected) = filters.provider
+        && !field_contains(str_field(v, "provider_id"), expected)
+    {
+        return false;
+    }
+    if let Some(min) = filters.status_min
+        && u64_field(v, "status_code").unwrap_or(0) < min
+    {
+        return false;
+    }
+    if let Some(max) = filters.status_max
+        && u64_field(v, "status_code").unwrap_or(0) > max
+    {
+        return false;
+    }
+    if filters.fast && !request_is_fast(v) {
+        return false;
+    }
+    if filters.retried && !request_was_retried(v) {
+        return false;
+    }
+    true
+}
+
+fn field_contains(value: Option<&str>, expected: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.is_empty() {
+        return true;
+    }
+    value
+        .map(|value| value.to_ascii_lowercase().contains(&expected))
+        .unwrap_or(false)
+}
+
+fn request_is_fast(v: &JsonValue) -> bool {
+    v.get("observability")
+        .and_then(|observability| observability.get("fast_mode"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || service_tier_display(v).eq_ignore_ascii_case("priority(fast)")
+}
+
+fn request_was_retried(v: &JsonValue) -> bool {
+    if v.get("observability")
+        .and_then(|observability| observability.get("retried"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if v.get("observability")
+        .and_then(|observability| observability.get("attempt_count"))
+        .and_then(|value| value.as_u64())
+        .is_some_and(|attempts| attempts > 1)
+    {
+        return true;
+    }
+    v.get("retry")
+        .and_then(|retry| retry.get("route_attempts"))
+        .and_then(|attempts| attempts.as_array())
+        .is_some_and(|attempts| attempts.len() > 1)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -427,5 +570,53 @@ mod tests {
             aggregate.summary_line("main"),
             "main | 2 | 10 | 5 | 3 | 2 | 4 | 20 | 300"
         );
+    }
+
+    #[test]
+    fn request_matches_filters_uses_route_model_fast_retry_and_status() {
+        let record = json!({
+            "session_id": "sid-abc",
+            "station_name": "main-station",
+            "provider_id": "relay-one",
+            "status_code": 429,
+            "service_tier": { "actual": "priority" },
+            "observability": {
+                "attempt_count": 2,
+                "retried": true
+            },
+            "retry": {
+                "route_attempts": [
+                    { "decision": "failed_status", "model": "gpt-5.4-high" },
+                    { "decision": "completed", "model": "gpt-5.4-high" }
+                ]
+            }
+        });
+
+        let filters = UsageFindFilters {
+            session: Some("abc"),
+            model: Some("5.4"),
+            station: Some("main"),
+            provider: Some("relay"),
+            status_min: Some(400),
+            status_max: Some(499),
+            fast: true,
+            retried: true,
+        };
+
+        assert!(request_matches_filters(&record, &filters));
+    }
+
+    #[test]
+    fn request_matches_filters_rejects_nonmatching_model() {
+        let record = json!({
+            "model": "gpt-5.4-high",
+            "status_code": 200
+        });
+        let filters = UsageFindFilters {
+            model: Some("mini"),
+            ..UsageFindFilters::default()
+        };
+
+        assert!(!request_matches_filters(&record, &filters));
     }
 }

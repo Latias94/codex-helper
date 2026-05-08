@@ -255,6 +255,7 @@ Current implementation slice:
 
 - CLI `usage tail` now shows station/provider/model, service tier/fast, duration, TTFB, output speed, cache-aware token parts, and cost estimates when model/usage are available.
 - CLI `usage summary` now includes cache read/create and reasoning token totals by station instead of only input/output/total tokens.
+- CLI `usage find` now provides JSONL-backed request filtering by session, model, station, provider, status, fast mode, and retry/failover state as a low-risk bridge before a durable ledger.
 - GUI Requests list rows now surface fast mode, token/cache totals, output speed, cost confidence, retry/failover state, and route-attempt counts before opening the detail pane.
 
 ### P1.4 TUI Parity Pass
@@ -335,6 +336,10 @@ Acceptance:
 
 - Long-horizon request history is fast and queryable.
 - JSONL remains export/debug friendly.
+
+Current implementation slice:
+
+- Added `codex-helper usage find` as a JSONL-backed search bridge for session/model/station/provider/status/fast/retry filters. This does not replace the future ledger, but validates the query surface before adding durable indexed storage.
 
 ### P2.2 Advanced Route Policy Engine
 

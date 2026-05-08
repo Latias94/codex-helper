@@ -483,6 +483,42 @@ pub enum UsageCommand {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Find matching request records in ~/.codex-helper/logs/requests.jsonl
+    Find {
+        /// Maximum number of matching entries to print, newest first
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Match session id substring
+        #[arg(long)]
+        session: Option<String>,
+        /// Match model id substring
+        #[arg(long)]
+        model: Option<String>,
+        /// Match station/config name substring
+        #[arg(long)]
+        station: Option<String>,
+        /// Match provider id substring
+        #[arg(long)]
+        provider: Option<String>,
+        /// Match status_code >= this value
+        #[arg(long)]
+        status_min: Option<u64>,
+        /// Match status_code <= this value
+        #[arg(long)]
+        status_max: Option<u64>,
+        /// Shortcut for status_code >= 400
+        #[arg(long)]
+        errors: bool,
+        /// Match fast/priority requests
+        #[arg(long)]
+        fast: bool,
+        /// Match retried/failover requests
+        #[arg(long)]
+        retried: bool,
+        /// Print raw JSON lines instead of human-friendly format
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
