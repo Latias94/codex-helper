@@ -675,7 +675,7 @@ input_per_1m_usd = "0.50"
 output_per_1m_usd = "1.50"
 ```
 
-When the GUI is running the local proxy, `Stats -> Local pricing overrides` can edit the same file directly. In attached mode this area stays read-only so the GUI does not write the current machine while showing a remote proxy.
+When the GUI is running the local proxy, `Stats -> Pricing catalog` can save catalog rows as local overrides, and `Stats -> Local pricing overrides` can edit the same file directly. In attached mode this area stays read-only so the GUI does not write the current machine while showing a remote proxy.
 
 You can also manage this file through the CLI instead of hand-writing TOML:
 

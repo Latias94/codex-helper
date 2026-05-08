@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use crate::pricing::{CostConfidence, ModelPriceView};
 
-use super::stats_pricing_editor::render_local_pricing_overrides;
+use super::stats_pricing_editor::{
+    import_catalog_price_to_local_override, render_local_pricing_overrides,
+};
 use super::*;
 
 pub(super) fn render_pricing_catalog(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
@@ -45,13 +47,14 @@ fn render_operator_pricing_catalog(
     let rows = snapshot
         .pricing_catalog
         .prioritized_models(recent_model_order(snapshot), 30);
+    let can_import = matches!(snapshot.kind, ProxyModeKind::Running);
     egui::ScrollArea::vertical()
         .id_salt("stats_pricing_catalog_scroll")
         .max_height(260.0)
         .show(ui, |ui| {
             egui::Grid::new("stats_pricing_catalog_grid")
                 .striped(true)
-                .num_columns(6)
+                .num_columns(if can_import { 7 } else { 6 })
                 .show(ui, |ui| {
                     ui.label(pick(ctx.lang, "模型", "Model"));
                     ui.label("input / 1m");
@@ -59,6 +62,9 @@ fn render_operator_pricing_catalog(
                     ui.label("cache read / 1m");
                     ui.label("cache create / 1m");
                     ui.label(pick(ctx.lang, "来源", "Source"));
+                    if can_import {
+                        ui.label(pick(ctx.lang, "操作", "Action"));
+                    }
                     ui.end_row();
 
                     for row in rows {
@@ -76,6 +82,13 @@ fn render_operator_pricing_catalog(
                                 .as_str(),
                             30,
                         ));
+                        if can_import
+                            && ui
+                                .button(pick(ctx.lang, "保存为本地覆盖", "Save override"))
+                                .clicked()
+                        {
+                            import_catalog_price_to_local_override(ctx, row);
+                        }
                         ui.end_row();
                     }
                 });

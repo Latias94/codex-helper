@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::pricing::{
     CostConfidence, LocalModelPriceOverride, LocalModelPriceOverridesDocument,
-    ModelPriceCatalogSnapshot,
+    ModelPriceCatalogSnapshot, ModelPriceView,
 };
 
 use super::view_state::StatsPricingEditorState;
@@ -450,6 +450,64 @@ fn save_pricing_override_from_editor(ctx: &mut PageCtx<'_>) {
     }
 }
 
+pub(super) fn import_catalog_price_to_local_override(ctx: &mut PageCtx<'_>, row: &ModelPriceView) {
+    let model_id = row.model_id.trim();
+    if model_id.is_empty() {
+        *ctx.last_error = Some("pricing catalog row has an empty model id".to_string());
+        return;
+    }
+
+    let mut document = match load_local_pricing_overrides_document() {
+        Ok(document) => document,
+        Err(err) => {
+            *ctx.last_error = Some(format!("failed to load local pricing overrides: {err}"));
+            return;
+        }
+    };
+    let override_row = local_override_from_catalog_row(row);
+    document
+        .models
+        .insert(model_id.to_string(), override_row.clone());
+
+    match crate::pricing::save_model_price_overrides_document(&document) {
+        Ok(path) => {
+            load_pricing_editor_from_override(
+                &mut ctx.view.stats.pricing_editor,
+                model_id,
+                &override_row,
+            );
+            ctx.proxy
+                .refresh_current_if_due(ctx.rt, Duration::from_secs(0));
+            *ctx.last_info = Some(format!(
+                "{} '{}' ({})",
+                pick(
+                    ctx.lang,
+                    "已从价格目录保存本地覆盖",
+                    "Saved local override from catalog"
+                ),
+                model_id,
+                path.display()
+            ));
+            *ctx.last_error = None;
+        }
+        Err(err) => {
+            *ctx.last_error = Some(format!("failed to save local pricing overrides: {err}"));
+        }
+    }
+}
+
+fn local_override_from_catalog_row(row: &ModelPriceView) -> LocalModelPriceOverride {
+    LocalModelPriceOverride {
+        display_name: row.display_name.clone(),
+        aliases: row.aliases.clone(),
+        input_per_1m_usd: row.input_per_1m_usd.clone(),
+        output_per_1m_usd: row.output_per_1m_usd.clone(),
+        cache_read_input_per_1m_usd: row.cache_read_input_per_1m_usd.clone(),
+        cache_creation_input_per_1m_usd: row.cache_creation_input_per_1m_usd.clone(),
+        confidence: Some(row.confidence),
+    }
+}
+
 fn delete_selected_pricing_override(ctx: &mut PageCtx<'_>) {
     let Some(model_id) = ctx.view.stats.pricing_editor.selected_model_id.clone() else {
         return;
@@ -677,5 +735,36 @@ mod tests {
         );
 
         assert_eq!(models, vec!["relay-gpt-5", "relay-codex"]);
+    }
+
+    #[test]
+    fn local_override_from_catalog_row_preserves_price_fields() {
+        let row = ModelPriceView {
+            model_id: "relay-model".to_string(),
+            display_name: Some("Relay Model".to_string()),
+            aliases: vec!["alias-a".to_string(), "alias-b".to_string()],
+            input_per_1m_usd: "1.25".to_string(),
+            output_per_1m_usd: "9.50".to_string(),
+            cache_read_input_per_1m_usd: Some("0.125".to_string()),
+            cache_creation_input_per_1m_usd: Some("1.00".to_string()),
+            source: "remote-catalog".to_string(),
+            confidence: CostConfidence::Exact,
+        };
+
+        let override_row = local_override_from_catalog_row(&row);
+
+        assert_eq!(override_row.display_name.as_deref(), Some("Relay Model"));
+        assert_eq!(override_row.aliases, vec!["alias-a", "alias-b"]);
+        assert_eq!(override_row.input_per_1m_usd, "1.25");
+        assert_eq!(override_row.output_per_1m_usd, "9.50");
+        assert_eq!(
+            override_row.cache_read_input_per_1m_usd.as_deref(),
+            Some("0.125")
+        );
+        assert_eq!(
+            override_row.cache_creation_input_per_1m_usd.as_deref(),
+            Some("1.00")
+        );
+        assert_eq!(override_row.confidence, Some(CostConfidence::Exact));
     }
 }

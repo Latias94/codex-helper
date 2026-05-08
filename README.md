@@ -647,7 +647,7 @@ input_per_1m_usd = "0.50"
 output_per_1m_usd = "1.50"
 ```
 
-也可以在本机运行 GUI 代理时，从 `Stats -> Local pricing overrides` 直接编辑本地覆盖；附着远端代理时该区域保持只读，避免误写当前机器但不影响远端代理。
+也可以在本机运行 GUI 代理时，从 `Stats -> Pricing catalog` 把目录行保存为本地覆盖，或从 `Stats -> Local pricing overrides` 直接编辑本地覆盖；附着远端代理时该区域保持只读，避免误写当前机器但不影响远端代理。
 
 也可以用 CLI 管理该文件，避免手动拼 TOML：
 

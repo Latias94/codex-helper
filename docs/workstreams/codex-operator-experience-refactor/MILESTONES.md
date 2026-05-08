@@ -189,6 +189,7 @@ Current implementation slice:
 - Added `~/.codex-helper/pricing_overrides.toml` local model price overrides; request cost calculation and GUI/TUI pricing catalog views now use the merged operator catalog.
 - Added `codex-helper pricing path/list/set/remove/sync` so local overrides can be managed through a typed CLI, including pulling `ModelPriceCatalogSnapshot` JSON from a remote operator catalog.
 - Added a GUI local pricing override editor under Stats for local-running mode; attached mode remains read-only against the remote pricing catalog.
+- GUI pricing catalog rows can be saved directly as local overrides while the proxy is running locally, reusing the same override validation and refresh path as the editor.
 - Added an observed-unpriced model strip in the GUI pricing editor so relay aliases seen in recent requests can be turned into local override rows without retyping the model id.
 
 ### P1.2 Balance Adapter Model
