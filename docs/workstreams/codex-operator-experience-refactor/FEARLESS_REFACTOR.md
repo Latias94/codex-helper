@@ -130,6 +130,7 @@ Removal condition:
 Current direction:
 
 - Runtime state, request JSONL, control trace, and UI snapshots all carry overlapping pieces.
+- JSONL request reading/querying has been centralized in core `request_ledger`, but completion event construction is still broader than one internal event.
 
 Target:
 

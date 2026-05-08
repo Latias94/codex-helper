@@ -13,6 +13,7 @@ pub mod model_routing;
 pub mod notify;
 pub mod pricing;
 pub mod proxy;
+pub mod request_ledger;
 pub mod sessions;
 pub mod state;
 pub mod usage;

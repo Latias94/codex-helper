@@ -630,7 +630,7 @@ struct RequestLogOptions {
     only_errors: bool,
 }
 
-fn log_path() -> PathBuf {
+pub fn request_log_path() -> PathBuf {
     proxy_home_dir().join("logs").join("requests.jsonl")
 }
 
@@ -766,7 +766,7 @@ pub fn log_request_with_debug(
     let mut http_debug_for_main = http_debug;
     let mut http_debug_ref: Option<HttpDebugRef> = None;
 
-    let log_file_path = log_path();
+    let log_file_path = request_log_path();
     ensure_log_parent(&log_file_path);
 
     let _guard = match log_lock().lock() {

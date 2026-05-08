@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crate::config::{
     codex_auth_path, codex_config_path, load_config, probe_codex_bootstrap_from_cli, proxy_home_dir,
 };
+use crate::logging::request_log_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoctorLang {
@@ -383,7 +384,7 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
     }
 
     // 4) logs and usage_providers
-    let log_path: PathBuf = proxy_home_dir().join("logs").join("requests.jsonl");
+    let log_path = request_log_path();
     if log_path.exists() {
         checks.push(DoctorCheck {
             id: "logs.requests",

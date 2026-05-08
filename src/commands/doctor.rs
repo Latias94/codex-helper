@@ -2,6 +2,7 @@ use crate::CliResult;
 use crate::config::{
     codex_auth_path, codex_config_path, load_config, probe_codex_bootstrap_from_cli, proxy_home_dir,
 };
+use crate::request_ledger::request_log_path;
 use owo_colors::OwoColorize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -454,7 +455,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
     }
 
     // 4) 检查请求日志与 usage_providers 配置
-    let log_path: PathBuf = proxy_home_dir().join("logs").join("requests.jsonl");
+    let log_path = request_log_path();
     if log_path.exists() {
         let msg = format!("检测到请求日志文件：{:?}", log_path);
         if !json {

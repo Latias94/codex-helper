@@ -98,6 +98,7 @@ Current local modules relevant to this workstream:
   - `crates/core/src/usage.rs`
 - Request logs and control trace:
   - `crates/core/src/logging.rs`
+  - `crates/core/src/request_ledger.rs`
 - Runtime/session/request state:
   - `crates/core/src/state.rs`
   - `crates/core/src/state/session_identity.rs`
@@ -545,6 +546,12 @@ SQLite becomes useful for:
 - retention policies
 
 Do not start with SQLite until the request/usage/cost schema is stable enough.
+
+Current bridge:
+
+- `crates/core/src/request_ledger.rs` owns JSONL-backed request log reading, filtering, usage aggregation, and compact request formatting.
+- `codex-helper usage tail/summary/find` now uses that core query API instead of carrying private CLI parsing logic.
+- This validates the operator query surface before choosing a durable index. Future SQLite should be a rebuildable query/cache layer over canonical request records, while JSONL remains the export/debug source.
 
 ## Migration Strategy
 

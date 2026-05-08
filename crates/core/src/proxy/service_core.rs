@@ -22,9 +22,7 @@ impl ProxyService {
         ProxyState::spawn_cleanup_task(state.clone());
         if !cfg!(test) {
             let state = state.clone();
-            let log_path = crate::config::proxy_home_dir()
-                .join("logs")
-                .join("requests.jsonl");
+            let log_path = crate::logging::request_log_path();
             let mut base_url_to_provider_id = HashMap::new();
             let mgr = match service_name {
                 "claude" => &config.claude,
