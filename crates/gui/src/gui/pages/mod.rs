@@ -7,9 +7,7 @@ use super::config::GuiConfig;
 use super::i18n::{Language, pick};
 use super::proxy_control::{DiscoveredProxy, GuiRuntimeSnapshot, PortInUseAction, ProxyModeKind};
 use super::util::open_in_file_manager;
-use crate::config::{
-    PersistedStationProviderRef, PersistedStationSpec, RetryConfig, RetryProfileName, RetryStrategy,
-};
+use crate::config::{RetryConfig, RetryProfileName, RetryStrategy};
 use crate::dashboard_core::{
     CapabilitySupport, ControlProfileOption, HostLocalControlPlaneCapabilities, ModelCatalogKind,
     RemoteAdminAccessCapabilities, StationCapabilitySummary, StationOption,
@@ -66,11 +64,6 @@ mod overview_runtime_status;
 mod overview_runtime_status_attached;
 mod overview_runtime_status_running;
 mod overview_station_summary;
-mod profile_preview;
-mod profile_preview_render;
-mod profile_preview_state;
-#[cfg(test)]
-mod profile_preview_tests;
 mod proxy_discovery;
 mod proxy_settings_document;
 mod proxy_settings_form;
@@ -115,7 +108,6 @@ mod session_views_summary;
 mod sessions;
 mod sessions_controller;
 mod sessions_controller_actions;
-mod sessions_controller_catalogs;
 mod sessions_controller_render_data;
 mod sessions_controller_types;
 mod sessions_detail_controls;
@@ -177,13 +169,6 @@ use history_tools::*;
 #[allow(unused_imports)]
 use navigation::page_nav_groups;
 #[allow(unused_imports)]
-use profile_preview::{
-    ProfilePreviewStationSource, ProfileRoutePreview, build_profile_route_preview,
-    local_profile_preview_catalogs_from_text, render_profile_route_preview,
-    session_profile_target_station_value, session_profile_target_value,
-    session_route_preview_value,
-};
-#[allow(unused_imports)]
 use proxy_settings_document::{
     parse_proxy_settings_document, save_proxy_settings_document,
     sync_codex_auth_into_settings_document,
@@ -195,6 +180,8 @@ use retry_editor::*;
 use runtime_station::*;
 use session_bridge::*;
 use session_controls::*;
+#[allow(unused_imports)]
+use session_route_explanations::*;
 use session_route_logic::*;
 use session_row::*;
 use session_rows_builder::*;

@@ -105,3 +105,26 @@ pub(super) fn binding_profile_reference(row: &SessionRow, lang: Language) -> Str
         None => pick(lang, "当前绑定 profile", "the bound profile").to_string(),
     }
 }
+
+pub(super) fn session_route_preview_value(
+    resolved: Option<&ResolvedRouteValue>,
+    fallback: Option<&str>,
+    lang: Language,
+) -> String {
+    resolved
+        .map(|value| value.value.clone())
+        .or_else(|| {
+            fallback
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| pick(lang, "<未解析>", "<unresolved>").to_string())
+}
+
+pub(super) fn session_profile_target_value(raw: Option<&str>, lang: Language) -> String {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| pick(lang, "<自动>", "<auto>").to_string())
+}

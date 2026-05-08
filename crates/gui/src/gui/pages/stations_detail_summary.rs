@@ -10,7 +10,6 @@ pub(super) fn render_station_identity_summary(
     health_status: Option<&HealthCheckStatus>,
     balances: Option<&[ProviderBalanceSnapshot]>,
     lb: Option<&LbConfigView>,
-    referencing_profiles: &[String],
     configured_active_station: Option<&str>,
     effective_active_station: Option<&str>,
 ) {
@@ -67,15 +66,6 @@ pub(super) fn render_station_identity_summary(
         super::stations_detail_health::format_station_balance_summary(balances)
     ));
     ui.label(format!("breaker: {}", format_runtime_lb_summary(lb)));
-    ui.label(format!(
-        "{}: {}",
-        pick(ctx.lang, "Profiles", "Profiles"),
-        if referencing_profiles.is_empty() {
-            pick(ctx.lang, "<无>", "<none>").to_string()
-        } else {
-            referencing_profiles.join(", ")
-        }
-    ));
     ui.small(format_runtime_config_capability_label(
         ctx.lang,
         &cfg.capabilities,

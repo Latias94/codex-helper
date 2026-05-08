@@ -252,7 +252,6 @@ pub(super) enum ProxySettingsMode {
 #[derive(Debug)]
 pub struct ProxySettingsViewState {
     pub(super) mode: ProxySettingsMode,
-    pub(super) service: crate::config::ServiceKind,
     pub(super) working: Option<ProxySettingsWorkingDocument>,
     pub(super) load_error: Option<String>,
     pub(super) import_codex: ImportCodexModalState,
@@ -262,7 +261,6 @@ impl Default for ProxySettingsViewState {
     fn default() -> Self {
         Self {
             mode: ProxySettingsMode::Form,
-            service: crate::config::ServiceKind::Codex,
             working: None,
             load_error: None,
             import_codex: ImportCodexModalState::default(),

@@ -10,22 +10,20 @@ pub(super) fn format_profile_display(name: &str, profile: Option<&ControlProfile
 
 pub(super) fn format_profile_summary(profile: &ControlProfileOption) -> String {
     let extends = profile.extends.as_deref().unwrap_or("<none>");
-    let station = profile.station.as_deref().unwrap_or("auto");
     let model = profile.model.as_deref().unwrap_or("auto");
     let effort = profile.reasoning_effort.as_deref().unwrap_or("auto");
     let tier = profile.service_tier.as_deref().unwrap_or("auto");
-    format!("extends={extends}, station={station}, model={model}, effort={effort}, tier={tier}")
+    format!("extends={extends}, model={model}, effort={effort}, tier={tier}")
 }
 
 pub(super) fn format_service_profile_summary(
     profile: &crate::config::ServiceControlProfile,
 ) -> String {
     let extends = profile.extends.as_deref().unwrap_or("<none>");
-    let station = profile.station.as_deref().unwrap_or("auto");
     let model = profile.model.as_deref().unwrap_or("auto");
     let effort = profile.reasoning_effort.as_deref().unwrap_or("auto");
     let tier = profile.service_tier.as_deref().unwrap_or("auto");
-    format!("extends={extends}, station={station}, model={model}, effort={effort}, tier={tier}")
+    format!("extends={extends}, model={model}, effort={effort}, tier={tier}")
 }
 
 pub(super) fn service_profile_from_option(
@@ -33,7 +31,7 @@ pub(super) fn service_profile_from_option(
 ) -> crate::config::ServiceControlProfile {
     crate::config::ServiceControlProfile {
         extends: profile.extends.clone(),
-        station: profile.station.clone(),
+        station: None,
         model: profile.model.clone(),
         reasoning_effort: profile.reasoning_effort.clone(),
         service_tier: profile.service_tier.clone(),
@@ -81,7 +79,6 @@ pub(super) fn render_session_profile_apply_preview(
     row: &SessionRow,
     profile_name: &str,
     profile: &crate::config::ServiceControlProfile,
-    preview: &ProfileRoutePreview,
 ) {
     let has_manual_overrides = session_has_manual_overrides(row);
 
@@ -90,8 +87,8 @@ pub(super) fn render_session_profile_apply_preview(
         ui.label(pick(lang, "应用预览", "Apply preview"));
         ui.small(pick(
             lang,
-            "应用 profile 会重写当前 session binding，并清空当前会话的 station / model / reasoning / service_tier overrides。",
-            "Applying a profile rewrites the current session binding and clears the session's station / model / reasoning / service_tier overrides.",
+            "应用 profile 会重写当前 session binding，并清空当前会话的手动覆盖（包括 station / model / reasoning / service_tier）。",
+            "Applying a profile rewrites the current session binding and clears the session's manual overrides, including station / model / reasoning / service_tier.",
         ));
 
         if row.binding_profile_name.as_deref() == Some(profile_name) {
@@ -119,11 +116,6 @@ pub(super) fn render_session_profile_apply_preview(
             profile_name
         ));
         ui.small(format!(
-            "station: {} -> {}",
-            session_route_preview_value(row.effective_station(), row.last_station_name(), lang),
-            session_profile_target_station_value(preview, lang)
-        ));
-        ui.small(format!(
             "model: {} -> {}",
             session_route_preview_value(row.effective_model.as_ref(), row.last_model.as_deref(), lang),
             session_profile_target_value(profile.model.as_deref(), lang)
@@ -147,6 +139,4 @@ pub(super) fn render_session_profile_apply_preview(
             session_profile_target_value(profile.service_tier.as_deref(), lang)
         ));
     });
-
-    render_profile_route_preview(ui, lang, profile, preview);
 }

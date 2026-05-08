@@ -212,7 +212,7 @@ fn session_binding_profile_summary_resolves_inherited_profile() {
     let summary =
         session_binding_profile_summary(&row, &profiles, Language::En).expect("profile summary");
 
-    assert!(summary.contains("station=right"));
+    assert!(!summary.contains("station=right"));
     assert!(summary.contains("model=gpt-5.4"));
     assert!(summary.contains("effort=medium"));
     assert!(summary.contains("tier=priority"));

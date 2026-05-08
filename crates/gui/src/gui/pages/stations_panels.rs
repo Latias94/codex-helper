@@ -78,12 +78,6 @@ fn render_station_detail_panel(
         .get(cfg.name.as_str())
         .map(Vec::as_slice);
     let lb = runtime_maps.lb_view.get(cfg.name.as_str());
-    let referencing_profiles = snapshot
-        .profiles
-        .iter()
-        .filter(|profile| profile.station.as_deref() == Some(cfg.name.as_str()))
-        .map(|profile| format_profile_display(profile.name.as_str(), Some(profile)))
-        .collect::<Vec<_>>();
 
     render_station_identity_summary(
         ui,
@@ -94,7 +88,6 @@ fn render_station_detail_panel(
         health_status,
         balances,
         lb,
-        &referencing_profiles,
         configured_active_station,
         effective_active_station,
     );

@@ -18,7 +18,7 @@ fn profile_option_to_service_profile(
 ) -> crate::config::ServiceControlProfile {
     crate::config::ServiceControlProfile {
         extends: profile.extends.clone(),
-        station: profile.station.clone(),
+        station: None,
         model: profile.model.clone(),
         reasoning_effort: profile.reasoning_effort.clone(),
         service_tier: profile.service_tier.clone(),
@@ -43,8 +43,7 @@ fn resolve_profile_from_options(
 
 fn format_profile_route_summary(profile: &crate::config::ServiceControlProfile) -> String {
     format!(
-        "station={}  model={}  reasoning={}  tier={}",
-        profile.station.as_deref().unwrap_or("<auto>"),
+        "model={}  reasoning={}  tier={}",
         profile.model.as_deref().unwrap_or("<auto>"),
         profile.reasoning_effort.as_deref().unwrap_or("<auto>"),
         profile.service_tier.as_deref().unwrap_or("<auto>"),
@@ -56,10 +55,6 @@ fn profile_declared_summary(profile: &ControlProfileOption, lang: Language) -> S
     if let Some(extends) = profile.extends.as_deref() {
         parts.push(format!("extends={extends}"));
     }
-    parts.push(format!(
-        "station={}",
-        profile.station.as_deref().unwrap_or("<auto>")
-    ));
     parts.push(format!(
         "model={}",
         profile.model.as_deref().unwrap_or("<auto>")
@@ -1606,7 +1601,6 @@ mod tests {
 
         assert!(summary.contains("declared:"));
         assert!(summary.contains("extends=base"));
-        assert!(summary.contains("station=<auto>"));
         assert!(summary.contains("reasoning=low"));
         assert!(summary.contains("tier=<auto>"));
     }
@@ -1614,7 +1608,6 @@ mod tests {
     #[test]
     fn profile_resolved_summary_uses_inherited_values() {
         let mut base = make_profile("base");
-        base.station = Some("primary".to_string());
         base.model = Some("gpt-5.4".to_string());
         base.service_tier = Some("priority".to_string());
 
@@ -1626,7 +1619,6 @@ mod tests {
 
         assert!(!failed);
         assert!(summary.contains("resolved:"));
-        assert!(summary.contains("station=primary"));
         assert!(summary.contains("model=gpt-5.4"));
         assert!(summary.contains("reasoning=low"));
         assert!(summary.contains("tier=priority"));

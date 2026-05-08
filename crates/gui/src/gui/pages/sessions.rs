@@ -1,6 +1,5 @@
 use super::sessions_controller::{
-    apply_session_page_actions, build_runtime_station_catalog, build_session_render_data,
-    build_session_rows_for_snapshot, resolve_session_preview_catalogs,
+    apply_session_page_actions, build_session_render_data, build_session_rows_for_snapshot,
     sync_default_profile_selection, sync_session_editor_from_selection,
 };
 use super::sessions_split_view::render_sessions_split_view;
@@ -25,27 +24,6 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let profiles = snapshot.profiles.clone();
     let default_profile = snapshot.default_profile.clone();
     let global_station_override = snapshot.global_station_override.clone();
-    let configured_active_station = snapshot.configured_active_station.clone();
-    let effective_active_station = snapshot.effective_active_station.clone();
-
-    let runtime_station_catalog = build_runtime_station_catalog(&snapshot);
-    let session_preview_service_name =
-        snapshot
-            .service_name
-            .as_deref()
-            .unwrap_or(match ctx.view.proxy_settings.service {
-                crate::config::ServiceKind::Claude => "claude",
-                crate::config::ServiceKind::Codex => "codex",
-            });
-    let session_preview_catalogs =
-        resolve_session_preview_catalogs(ctx, session_preview_service_name);
-    let session_preview_station_specs = session_preview_catalogs
-        .as_ref()
-        .map(|(stations, _)| stations);
-    let session_preview_provider_catalog = session_preview_catalogs
-        .as_ref()
-        .map(|(_, providers)| providers);
-    let session_preview_runtime_station_catalog = Some(&runtime_station_catalog);
 
     sync_default_profile_selection(
         &mut ctx.view.sessions,
@@ -90,11 +68,6 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         &render_data,
         &profiles,
         global_station_override.as_deref(),
-        configured_active_station.as_deref(),
-        effective_active_station.as_deref(),
-        session_preview_station_specs,
-        session_preview_provider_catalog,
-        session_preview_runtime_station_catalog,
         has_session_cards,
         host_local_session_features,
     );

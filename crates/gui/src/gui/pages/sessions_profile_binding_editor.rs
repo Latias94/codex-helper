@@ -7,11 +7,6 @@ pub(super) fn render_session_profile_binding_editor(
     row: &SessionRow,
     sid: &str,
     profiles: &[ControlProfileOption],
-    configured_active_station: Option<&str>,
-    effective_active_station: Option<&str>,
-    session_preview_station_specs: Option<&BTreeMap<String, PersistedStationSpec>>,
-    session_preview_provider_catalog: Option<&BTreeMap<String, PersistedStationProviderRef>>,
-    session_preview_runtime_station_catalog: Option<&BTreeMap<String, StationOption>>,
     action_apply_session_profile: &mut Option<(String, String)>,
     action_clear_session_profile_binding: &mut Option<String>,
 ) {
@@ -106,21 +101,6 @@ pub(super) fn render_session_profile_binding_editor(
             Ok(profile) => profile,
             Err(_) => service_profile_from_option(profile),
         };
-        let preview = build_profile_route_preview(
-            &preview_profile,
-            configured_active_station,
-            effective_active_station,
-            session_preview_station_specs,
-            session_preview_provider_catalog,
-            session_preview_runtime_station_catalog,
-        );
-        render_session_profile_apply_preview(
-            ui,
-            ctx.lang,
-            row,
-            profile_name,
-            &preview_profile,
-            &preview,
-        );
+        render_session_profile_apply_preview(ui, ctx.lang, row, profile_name, &preview_profile);
     }
 }
