@@ -1,9 +1,9 @@
 use crate::cli_types::ConfigSchemaTarget;
 use crate::config::{
     ConfigV3MigrationReport, ProviderConfigV3, ProxyConfig, ProxyConfigV2, ProxyConfigV3,
-    RetryConfig, RetryProfileName, RoutingConfigV3, RoutingPolicyV3, ServiceConfig,
-    ServiceConfigManager, ServiceKind, ServiceRoutingExplanation, ServiceViewV3, UpstreamAuth,
-    UpstreamConfig,
+    RetryConfig, RetryProfileName, RoutingConfigV3, RoutingExhaustedActionV3, RoutingPolicyV3,
+    ServiceConfig, ServiceConfigManager, ServiceKind, ServiceRoutingExplanation, ServiceViewV3,
+    UpstreamAuth, UpstreamConfig,
     bootstrap::{
         import_codex_config_from_codex_cli, overwrite_codex_config_from_codex_cli_in_place,
     },
@@ -167,6 +167,17 @@ fn select_v3_service_view_mut<'a>(
     }
 }
 
+fn select_v3_service_view<'a>(
+    cfg: &'a ProxyConfigV3,
+    service: &str,
+) -> (&'a ServiceViewV3, &'static str) {
+    if service == "claude" {
+        (&cfg.claude, "Claude")
+    } else {
+        (&cfg.codex, "Codex")
+    }
+}
+
 fn ensure_v3_routing(view: &mut ServiceViewV3) -> &mut RoutingConfigV3 {
     view.routing.get_or_insert_with(RoutingConfigV3::default)
 }
@@ -179,6 +190,123 @@ fn ensure_v3_routing_order_contains(view: &mut ServiceViewV3, provider_name: &st
         .any(|candidate| candidate == provider_name)
     {
         routing.order.push(provider_name.to_string());
+    }
+}
+
+fn routing_policy_label(policy: RoutingPolicyV3) -> &'static str {
+    match policy {
+        RoutingPolicyV3::ManualSticky => "manual-sticky",
+        RoutingPolicyV3::OrderedFailover => "ordered-failover",
+        RoutingPolicyV3::TagPreferred => "tag-preferred",
+    }
+}
+
+fn routing_exhausted_label(action: RoutingExhaustedActionV3) -> &'static str {
+    match action {
+        RoutingExhaustedActionV3::Continue => "continue",
+        RoutingExhaustedActionV3::Stop => "stop",
+    }
+}
+
+fn v3_provider_endpoint_count(provider: &ProviderConfigV3) -> usize {
+    let inline = provider
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty()) as usize;
+    inline + provider.endpoints.len()
+}
+
+fn push_v3_provider_name_once(names: &mut Vec<String>, view: &ServiceViewV3, name: &str) {
+    if view.providers.contains_key(name) && !names.iter().any(|existing| existing == name) {
+        names.push(name.to_string());
+    }
+}
+
+fn ordered_v3_provider_names(view: &ServiceViewV3) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(routing) = view.routing.as_ref() {
+        if let Some(target) = routing.target.as_deref() {
+            push_v3_provider_name_once(&mut names, view, target);
+        }
+        for provider_name in &routing.order {
+            push_v3_provider_name_once(&mut names, view, provider_name);
+        }
+    }
+    for provider_name in view.providers.keys() {
+        push_v3_provider_name_once(&mut names, view, provider_name);
+    }
+    names
+}
+
+fn print_v3_provider_list(label: &str, view: &ServiceViewV3) {
+    let provider_names = ordered_v3_provider_names(view);
+    if view.providers.is_empty() {
+        println!("No {label} providers in v3 config.");
+        return;
+    }
+
+    if let Some(routing) = view.routing.as_ref() {
+        let target = routing.target.as_deref().unwrap_or("<none>");
+        let order = if routing.order.is_empty() {
+            "<provider key order>".to_string()
+        } else {
+            routing.order.join(", ")
+        };
+        println!(
+            "{label} providers (v3): policy={} target={} order=[{}] on_exhausted={}",
+            routing_policy_label(routing.policy),
+            target,
+            order,
+            routing_exhausted_label(routing.on_exhausted)
+        );
+    } else {
+        println!("{label} providers (v3): routing=<implicit ordered-failover>");
+    }
+
+    let target = view
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.target.as_deref());
+    let first_ordered = view
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.order.first().map(String::as_str));
+
+    for provider_name in provider_names {
+        let Some(provider) = view.providers.get(provider_name.as_str()) else {
+            continue;
+        };
+        let marker = if target == Some(provider_name.as_str())
+            || (target.is_none() && first_ordered == Some(provider_name.as_str()))
+        {
+            "*"
+        } else {
+            " "
+        };
+        let enabled = if provider.enabled { "on" } else { "off" };
+        let endpoints = v3_provider_endpoint_count(provider);
+        let tags = if provider.tags.is_empty() {
+            "-".to_string()
+        } else {
+            provider
+                .tags
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        if let Some(alias) = provider.alias.as_deref() {
+            println!(
+                "  {} {} {} [{}] ({} endpoints, tags={})",
+                marker, enabled, provider_name, alias, endpoints, tags
+            );
+        } else {
+            println!(
+                "  {} {} {} ({} endpoints, tags={})",
+                marker, enabled, provider_name, endpoints, tags
+            );
+        }
     }
 }
 
@@ -291,13 +419,23 @@ pub async fn handle_station_cmd(cmd: StationCommand) -> CliResult<()> {
             let service = resolve_service(codex, claude)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let cfg = load_config()
+            let document = load_config_document()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+
+            if let ConfigDocument::V3(cfg) = &document {
+                let (view, label) = select_v3_service_view(cfg, service);
+                print_v3_provider_list(label, view);
+                return Ok(());
+            }
+
+            let runtime = document
+                .runtime()
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let (mgr, label) = if service == "claude" {
-                (&cfg.claude, "Claude")
+                (&runtime.claude, "Claude")
             } else {
-                (&cfg.codex, "Codex")
+                (&runtime.codex, "Codex")
             };
             let cfg_path = config_file_path();
 

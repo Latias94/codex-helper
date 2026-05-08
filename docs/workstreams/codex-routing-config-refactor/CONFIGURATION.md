@@ -220,6 +220,7 @@ codex-helper station enable input
 codex-helper station disable input
 ```
 
+- `station list` shows v3 providers plus policy, target, order, and exhaustion behavior.
 - `station add` creates `[codex.providers.input]` and appends `input` to `codex.routing.order`.
 - `station set-active input` pins `codex.routing.policy = "manual-sticky"` and `target = "input"`.
 - `station enable/disable` toggles the provider, keeping `routing.order` stable.
