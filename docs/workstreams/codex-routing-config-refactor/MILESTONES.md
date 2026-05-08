@@ -29,6 +29,20 @@ Acceptance:
 - the migrated config is shorter or clearer for common single-endpoint cases;
 - the migration output does not invent business tags.
 
+## P1 - CLI Authoring Surface
+
+- [x] Add a first-class `routing` command group for v3 files.
+- [x] Support `routing show`, `routing pin`, `routing order`, `routing prefer-tag`, `routing clear-target`, and low-level `routing set`.
+- [x] Keep `routing` writes v3-native and reject legacy/v2 documents instead of silently projecting through station schema.
+- [x] Normalize CLI-written order so listed providers are promoted and remaining providers are retained.
+- [ ] Add a first-class provider command group once station compatibility becomes more confusing than useful.
+
+Acceptance:
+
+- common routing policies are editable without touching `[codex.stations.*]`;
+- pinning, ordering, and monthly-tag preference are one-command operations;
+- route edits preserve the user's provider catalog and explicit fallback order.
+
 ## P1 - UI / UX
 
 - Update the provider editor to prioritize identity, auth, endpoint, and tags.

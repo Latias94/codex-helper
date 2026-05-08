@@ -211,23 +211,32 @@ Best when you would rather fail than spill into a non-monthly provider.
 
 ## CLI Editing Notes
 
-The old `station` CLI surface remains as a compatibility command group, but on a `version = 3` file it edits providers and routing directly:
+`routing` is the canonical CLI surface for `version = 3` routing files. It edits the routing recipe directly and refuses non-v3 configs so the command cannot silently rewrite a legacy station shape.
 
 ```bash
-codex-helper station add input --base-url https://ai.input.im/v1 --auth-token-env INPUT_API_KEY --tag billing=monthly --tag region=hk
-codex-helper station set-active input
-codex-helper station enable input
-codex-helper station disable input
+codex-helper routing show
+codex-helper routing pin input
+codex-helper routing order input backup
+codex-helper routing prefer-tag --tag billing=monthly --order monthly,paygo --on-exhausted continue
+codex-helper routing clear-target
 ```
+
+- `routing show` prints the current policy, target, order, preferred tags, and provider references; `--json` returns the same structured shape as the v3 routing API.
+- `routing pin input` writes `policy = "manual-sticky"` and `target = "input"`, while keeping the full provider order available for later unpinning.
+- `routing order input backup` writes `policy = "ordered-failover"` and promotes the listed providers, then appends any remaining providers so they are not accidentally dropped.
+- `routing prefer-tag --tag billing=monthly --order monthly,paygo` writes `policy = "tag-preferred"` and keeps fallback order explicit.
+- `routing clear-target` removes the manual target and returns to ordered failover.
+- `routing set` is the low-level patch command for advanced edits: `--policy`, `--target`, `--order`, `--prefer-tag`, `--clear-prefer-tags`, and `--on-exhausted`.
+
+The old `station` CLI surface remains for migration, listing/explaining older configs, and temporary provider bootstrapping:
 
 - `station list` shows v3 providers plus policy, target, order, and exhaustion behavior.
 - `station explain` shows the v3 routing recipe; `--station <name>` is treated as a provider detail selector on v3 files.
 - `station add` creates `[codex.providers.input]` and appends `input` to `codex.routing.order`.
 - repeated `--tag key=value` flags are written to provider tags and can drive `tag-preferred` policies.
-- `station set-active input` pins `codex.routing.policy = "manual-sticky"` and `target = "input"`.
-- `station enable/disable` toggles the provider, keeping `routing.order` stable.
-- `station disable` clears a manual target if it disables that target.
 - `station set-level` is rejected for v3; provider priority is `routing.order`.
+
+For v3 routing changes, prefer `routing pin`, `routing order`, and `routing prefer-tag` over `station set-active`.
 
 ## Control Plane Editing Notes
 

@@ -76,6 +76,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: StationCommand,
     },
+    /// Manage routing-first provider selection and fallback policy
+    Routing {
+        #[command(subcommand)]
+        cmd: RoutingCommand,
+    },
     /// Session-related helper commands (Codex sessions)
     Session {
         #[command(subcommand)]
@@ -328,6 +333,143 @@ pub enum StationCommand {
         #[arg(long, requires = "write")]
         yes: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RoutingCommand {
+    /// Show the v3 routing recipe for Codex or Claude
+    Show {
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Patch routing fields directly
+    Set {
+        /// Routing policy
+        #[arg(long, value_enum)]
+        policy: Option<RoutingPolicy>,
+        /// Manual-sticky target provider; implies manual-sticky when policy is omitted
+        #[arg(long)]
+        target: Option<String>,
+        /// Clear manual target; switches manual-sticky back to ordered-failover
+        #[arg(long, conflicts_with = "target")]
+        clear_target: bool,
+        /// Ordered provider list; comma-separated values are accepted
+        #[arg(
+            long = "order",
+            value_delimiter = ',',
+            value_name = "PROVIDER[,PROVIDER...]"
+        )]
+        order: Vec<String>,
+        /// Preferred provider tag in KEY=VALUE form; can be passed multiple times
+        #[arg(long = "prefer-tag", value_name = "KEY=VALUE")]
+        prefer_tags: Vec<String>,
+        /// Clear all preferred tag filters
+        #[arg(long, conflicts_with = "prefer_tags")]
+        clear_prefer_tags: bool,
+        /// What to do after preferred providers are exhausted
+        #[arg(long, value_enum)]
+        on_exhausted: Option<RoutingExhaustedAction>,
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Pin routing to one provider
+    Pin {
+        provider: String,
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Switch to ordered failover with an explicit provider order
+    Order {
+        /// Provider order, first provider is tried first
+        #[arg(value_name = "PROVIDER", required = true)]
+        providers: Vec<String>,
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Prefer providers matching tags, then fall back by order unless stopped
+    PreferTag {
+        /// Preferred provider tag in KEY=VALUE form; can be passed multiple times
+        #[arg(long = "tag", value_name = "KEY=VALUE", required = true)]
+        tags: Vec<String>,
+        /// Optional fallback order; comma-separated values are accepted
+        #[arg(
+            long = "order",
+            value_delimiter = ',',
+            value_name = "PROVIDER[,PROVIDER...]"
+        )]
+        order: Vec<String>,
+        /// What to do after preferred providers are exhausted
+        #[arg(long, value_enum)]
+        on_exhausted: Option<RoutingExhaustedAction>,
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Clear manual target and return to ordered failover
+    ClearTarget {
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+    },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub enum RoutingPolicy {
+    ManualSticky,
+    OrderedFailover,
+    TagPreferred,
+}
+
+impl From<RoutingPolicy> for codex_helper_core::config::RoutingPolicyV3 {
+    fn from(value: RoutingPolicy) -> Self {
+        match value {
+            RoutingPolicy::ManualSticky => Self::ManualSticky,
+            RoutingPolicy::OrderedFailover => Self::OrderedFailover,
+            RoutingPolicy::TagPreferred => Self::TagPreferred,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub enum RoutingExhaustedAction {
+    Continue,
+    Stop,
+}
+
+impl From<RoutingExhaustedAction> for codex_helper_core::config::RoutingExhaustedActionV3 {
+    fn from(value: RoutingExhaustedAction) -> Self {
+        match value {
+            RoutingExhaustedAction::Continue => Self::Continue,
+            RoutingExhaustedAction::Stop => Self::Stop,
+        }
+    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
