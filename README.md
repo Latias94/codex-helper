@@ -75,7 +75,7 @@ ch
 
 从当前版本开始，`codex-helper` 不再只是“本地代理 + 多上游切换工具”，而是一个 **Codex-first 本地控制平面**：
 
-- 用 `station` / `provider` 管理中转站与上游，而不是只靠零散 `base_url` 记忆配置；
+- 用 `provider` / `routing` 管理上游与兜底，而不是只靠零散 `base_url` 记忆配置；
 - 用 `profile` 表达常用意图，例如 `daily` / `fast` / `deep`；
 - 用 **session identity card** 回答“这个 Codex 会话现在到底走哪个 station / upstream / model / fast mode / reasoning”；
 - 支持 **session 级覆盖**：`model`、`reasoning_effort`、`service_tier`、`station`；
@@ -90,14 +90,14 @@ ch
 
 ## 三个核心概念
 
-### 1. Station
+### 1. Provider / Routing
 
-`station` 是操作层面对“一个中转站 / 一组 provider 成员”的抽象。你平时做的启用、禁用、切换、探活、熔断，核心都发生在这一层。
+`provider` 是一个中转或上游账号的目录项；`routing` 决定是固定一个 provider、按顺序兜底，还是优先匹配某些标签后再降级。
 
 兼容说明：
 
-- 代码和部分旧配置里仍然会看到 `config` 这个名字；
-- 在当前公开 API / GUI / 文档语义里，优先把它理解为 `station`。
+- 代码和部分运行时视图里仍然会看到 `station` / `config` 这些名字；
+- 在当前公开配置面里，新增上游用 `provider`，选择策略用 `routing`。
 
 ### 2. Profile
 
@@ -188,192 +188,61 @@ ch
 
 ---
 
-## 常见配置：多上游自动切换
+## 常见配置：provider + routing
 
-最常见、也是最“物有所值”的用法，是让 codex-helper 在多个上游之间自动切换：
+当前推荐的配置模型是 `version = 3`：`provider` 只描述账号、认证、endpoint 和标签；`routing` 只描述顺序、首选和兜底策略。旧的 `active/level/station` 仍可读取和迁移，但不再是公共写入面。
 
-- 某条线路频繁失败（例如 5xx / 连接失败）；
-- 或被用量提供商标记为“额度用尽”（`usage_exhausted = true`）；
-- 在这种情况下，LB 会优先选择同一配置下的其他 upstream 作为备份。
-
-**关键点：主线路 + 备份线路优先放在同一个配置的 `upstreams` 里。**
-
-  > 提示：如果你把每个供应商都拆成一个 config，并且它们的 `level` 都是默认的 `1`（例如 `config list` 全是 `L1 on ...`），codex-helper 仍会**优先**使用 `active`，但同级其他 config 也会参与 failover（避免 `active` 单点）。  
-  > 如果你想要明确的“跨配置降级”（例如 `L1=中转优先`、`L2=官方兜底`），请至少设置两档不同的 `level`（见下文），或把备份线路放回同一 config 的 `upstreams`。
-  >
-  > 注意：如果你设置了 **pinned override**（例如 TUI 的 `p`：session provider override/pinned；旧版本也可能存在全局 pinned），路由会进入 `pinned` 模式，只会使用那一个 config，因此**不会跨 config failover**。  
-  > 想要“首选 + 可 failover”，请使用 `active`（TUI：`P` 选择全局 active，或在 Configs 页 `Enter` 设 active），并清除 pinned override。
-
-### 配置场景速查表
-
-把配置理解成两层就不容易迷路：
-
-1) **分组（routing）**：每个 config 有 `level`（1..=10），`active` 是首选，`enabled=false` 可把它排除出自动路由（但如果它是 active 仍会参与）。
-2) **策略（retry）**：决定失败时怎么重试/怎么冷却/是否“回切探测”。
-
-如果你已经用 `codex-helper config overwrite-from-codex --yes` 同步过账号信息（最常见），通常不需要手写 `[[...upstreams]]`；你只需要：
-
-- 分组：`codex-helper config set-level <name> <level>` + `codex-helper config set-active <name>`
-- 策略：`codex-helper config set-retry-profile <balanced|same-upstream|aggressive-failover|cost-primary>`
-
-> 注意：`set-retry-profile` 会覆盖整个 `[retry]` 段；如果你要高级微调（例如 `retry.upstream.max_attempts`、`retry.provider.on_status`、`transport_cooldown_secs`，以及用于兜底的 `never_on_status` / `never_on_class`），可以在执行 profile 后再手改配置文件。retry 微调必须写在 `retry.upstream` / `retry.provider` 两层配置里。
-
-| 场景目标 | 你只需要怎么“分组”（导入后） | 建议策略（profile） | 备注 |
-| --- | --- | --- | --- |
-| 单账号多 endpoint 自动切换 | 需要把多个 endpoint 合并到同一个 config 的 `upstreams`（见模板 A） | `balanced` | 最简单、最稳定；优先推荐 |
-| 多供应商同级互为备份（避免 active 单点） | 让多个 config 都是同一个 `level`（默认就是 1），并设置一个 `active`（见模板 B） | `balanced` | 同级会优先 `active`，但其他同级也会参与 failover |
-| 中转优先，官方/直连兜底 | 把中转设 `level=1`，把直连/官方设 `level=2`（见模板 C） | `balanced` | 失败时跨 level 降级；有其他候选时会跳过处于 cooldown 的 config |
-| 包月中转为主，按量备选为从（省钱+回切探测） | 同上（`L1=包月中转`，`L2=按量直连`），并把包月中转设为 `active`（见模板 D） | `cost-primary` | 主线路不稳会降级到备选，并通过冷却/退避“隔一段时间探测回切” |
-
-#### 模板 A：单账号多 endpoint（同一个 config 多 upstream）
-
-适合你希望“同一类账号/同一中转商”的多个 endpoint 自动切换（最快最稳）。这需要你手动把多个 endpoint 放进同一个 config 的 `upstreams`：
-
-```toml
-version = 1
-
-[codex]
-active = "codex-main"
-
-[codex.configs.codex-main]
-name = "codex-main"
-enabled = true
-level = 1
-
-[[codex.configs.codex-main.upstreams]]
-base_url = "https://codex-api.packycode.com/v1"
-auth = { auth_token_env = "PACKYCODE_API_KEY" }
-tags = { provider_id = "packycode", source = "codex-config" }
-
-[[codex.configs.codex-main.upstreams]]
-base_url = "https://co.yes.vg/v1"
-auth = { auth_token_env = "YESCODE_API_KEY" }
-tags = { provider_id = "yes", source = "codex-config" }
-```
-
-说明：
-
-- `active` 指向这个 config，LB 会在多个 upstream 之间自动切换。
-- 当某个 upstream 失败/被标记为 `usage_exhausted` 时，会尽量选择其他 upstream；全部不可用时会兜底返回第一个，避免硬断流。
-
-#### 模板 B：多供应商同级互备（导入后只改 active）
+最常见的流程：
 
 ```bash
-codex-helper config overwrite-from-codex --yes
-
-# 选择一个首选（但仍允许同级 failover）
-codex-helper config set-active right
-
-# 同级互备一般用默认 profile 即可
+codex-helper config init
+codex-helper provider add input --base-url https://ai.input.im/v1 --auth-token-env INPUT_API_KEY --tag billing=monthly
+codex-helper provider add openai --base-url https://api.openai.com/v1 --auth-token-env OPENAI_API_KEY --tag billing=paygo
+codex-helper routing order input openai
 codex-helper config set-retry-profile balanced
 ```
 
-如果你更想直接改 `config.toml`，等价写法是：
+常用策略：
+
+| 场景目标 | 推荐配置 | 说明 |
+| --- | --- | --- |
+| 固定只用一个供应商 | `codex-helper routing pin <provider>` | 手动粘住；如果该 provider 不可用，请手动切换 |
+| 按顺序兜底 | `codex-helper routing order a b c` | 最直观，适合“这个中转不能用就换下一个” |
+| 包月优先、按量兜底 | `codex-helper routing prefer-tag --tag billing=monthly --order paygo --on-exhausted continue` | provider 用标签表达业务含义；包月全耗尽后继续兜底 |
+| 包月全耗尽即停止 | 同上但 `--on-exhausted stop` | 防止误走按量线路 |
+
+对应的 TOML 很薄：
 
 ```toml
-[codex]
-active = "right"
+version = 3
+
+[codex.providers.input]
+base_url = "https://ai.input.im/v1"
+auth_token_env = "INPUT_API_KEY"
+tags = { billing = "monthly" }
+
+[codex.providers.openai]
+base_url = "https://api.openai.com/v1"
+auth_token_env = "OPENAI_API_KEY"
+tags = { billing = "paygo" }
+
+[codex.routing]
+policy = "ordered-failover"
+order = ["input", "openai"]
+on_exhausted = "continue"
 
 [retry]
 profile = "balanced"
 ```
 
-> 想缩小候选集：把你不希望参与自动路由的 config `disable` 掉（active 除外）。例如：`codex-helper config disable some-provider`。
-
-#### 模板 C：中转优先，直连/官方兜底（level 分级）
-
-> 下面的 `right/packyapi/yescode/openai` 仅为示例，请以 `codex-helper config list` 输出的真实名称替换。
+迁移旧配置：
 
 ```bash
-codex-helper config overwrite-from-codex --yes
-
-# L1：各类中转
-codex-helper config set-level right 1
-codex-helper config set-level packyapi 1
-codex-helper config set-level yescode 1
-
-# L2：直连/官方兜底
-codex-helper config set-level openai 2
-
-# 首选一个中转（仍允许跨 level 降级）
-codex-helper config set-active right
-codex-helper config set-retry-profile balanced
+codex-helper config migrate --to v3 --dry-run
+codex-helper config migrate --to v3 --write --yes
 ```
 
-等价的 `config.toml`（示例）：
-
-```toml
-[codex]
-active = "right"
-
-[codex.configs.right]
-level = 1
-
-[codex.configs.openai]
-level = 2
-
-[retry]
-profile = "balanced"
-```
-
-#### 模板 D：包月中转主、按量直连从（省钱 + 回切探测）
-
-> 下面的 `right/openai` 仅为示例，请以 `codex-helper config list` 输出的真实名称替换。
-
-```bash
-codex-helper config overwrite-from-codex --yes
-
-# L1：包月中转（便宜但可能不稳）
-codex-helper config set-level right 1
-codex-helper config set-active right
-
-# L2：按量直连（贵但稳）
-codex-helper config set-level openai 2
-
-# 开启 cost-primary：失败越多，冷却越久；冷却到期会“探测回切”
-codex-helper config set-retry-profile cost-primary
-```
-
-等价的 `config.toml`（示例）：
-
-```toml
-[codex]
-active = "right"
-
-[codex.configs.right]
-level = 1
-
-[codex.configs.openai]
-level = 2
-
-[retry]
-profile = "cost-primary"
-```
-
-> 注意：如果 config 名称包含 `-` 等字符，请在 TOML 里用引号，例如：`[codex.configs."openai-main"]`。
-
-### Level 分组（跨配置降级，可选）
-
-如果你更希望把不同供应商/通道拆成多个 config，codex-helper 也支持 **按 level 分组的跨配置降级**（推荐用于“中转优先，直连兜底”等场景）：
-
-- 每个 config 有一个 `level`（1..=10，越小优先级越高）。
-- 如果存在 **多个不同的 level**，会按 level 从小到大路由/降级（低 level 优先）。
-- 如果所有 config 都是同一个 level，则视为“同级候选”：仍会优先 `active`，但同级其他 config 也会参与 failover（避免 active 单点）。
-- 同一 level 内会优先使用 `active` 配置。
-- `enabled = false` 可把该 config 排除出自动路由（除非它是 active）。
-- 实操建议：把“同一类线路”放同一 level（例如 `L1=各类中转`、`L2=官方/直连兜底`），并把 `retry.provider.max_attempts` 设到足够覆盖你希望每次请求尝试的候选数量（而 `retry.upstream.max_attempts` 控制单个候选内的重试次数）。
-
-一个常见成本优化策略是“包月中转为主，按量备选为从”：把包月中转设为 `active` 且 `level=1`，把按量直连设为 `level=2`；当主线路不稳定时会自动降级到备选，同时通过冷却（以及可选的冷却退避）“隔一段时间探测回切”，避免一直按量计费。
-
-例如：让 `L1` 优先使用中转（`right/packyapi/yescode/...`），失败时再降级到 `L2` 的直连 OpenAI：
-
-```bash
-codex-helper config set-level right 1
-codex-helper config set-level packyapi 1
-codex-helper config set-level yescode 1
-
-codex-helper config set-level openai 2
-```
+`station list` / `station explain` 只用于查看编译后的运行时视图；新增 provider、调整顺序、启用禁用都使用 `provider` 和 `routing` 命令。
 
 ---
 
@@ -408,27 +277,49 @@ codex-helper config set-level openai 2
   codex-helper switch status
   ```
 
-### 配置管理（上游 / 中转）
+### 配置管理（provider / routing）
 
-- 列出配置：
+- 初始化或迁移配置：
 
   ```bash
-  codex-helper config list
+  codex-helper config init
+  codex-helper config migrate --to v3 --dry-run
+  codex-helper config migrate --to v3 --write --yes
   ```
 
-- 添加新配置：
+- 从 Codex CLI 导入账号/配置：
 
   ```bash
-  codex-helper config add openai-main \
+  codex-helper config import-from-codex --force
+  codex-helper config overwrite-from-codex --dry-run
+  codex-helper config overwrite-from-codex --yes
+  ```
+
+- 添加和查看 provider：
+
+  ```bash
+  codex-helper provider add openai-main \
     --base-url https://api.openai.com/v1 \
     --auth-token-env OPENAI_API_KEY \
     --alias "OpenAI 主额度"
+  codex-helper provider list
+  codex-helper provider show openai-main
   ```
 
-- 切换当前 active 配置：
+- 调整 routing：
 
   ```bash
-  codex-helper config set-active openai-main
+  codex-helper routing order openai-main packy-main
+  codex-helper routing pin openai-main
+  codex-helper routing prefer-tag --tag billing=monthly --order openai-main --on-exhausted continue
+  codex-helper routing show
+  ```
+
+- 启用 / 禁用 provider：
+
+  ```bash
+  codex-helper provider disable packy-main
+  codex-helper provider enable packy-main
   ```
 
 - 设置重试策略预设（写入 `[retry]` 段，适合“只选策略，不想调一堆参数”的用法）：
@@ -438,20 +329,11 @@ codex-helper config set-level openai 2
   codex-helper config set-retry-profile cost-primary
   ```
 
-- 调整 Level 分组 / 启用禁用（用于跨配置降级）：
-  
-  ```bash
-  codex-helper config set-level openai-main 1
-  codex-helper config disable packy-main
-  codex-helper config enable packy-main
-  ```
+- 查看编译后的运行时视图：
 
-- 从 Codex CLI 覆盖导入账号/配置（重置为默认分组）：
-  
   ```bash
-  # 覆盖 codex-helper 的 Codex 配置（active/enabled/level 等回到默认）
-  codex-helper config overwrite-from-codex --dry-run
-  codex-helper config overwrite-from-codex --yes
+  codex-helper station list
+  codex-helper station explain
   ```
 
 ### TUI 设置页（运行态）
@@ -499,27 +381,28 @@ codex-helper config set-level openai 2
 ### 场景 1：多中转 / 多 key 集中管理 + 快速切换
 
 ```bash
-# 1. 为不同供应商添加配置
-codex-helper config add openai-main \
+# 1. 为不同供应商添加 provider
+codex-helper provider add openai-main \
   --base-url https://api.openai.com/v1 \
   --auth-token-env OPENAI_API_KEY \
   --alias "OpenAI 主额度"
 
-codex-helper config add packy-main \
+codex-helper provider add packy-main \
   --base-url https://codex-api.packycode.com/v1 \
   --auth-token-env PACKYCODE_API_KEY \
-  --alias "Packy 中转"
+  --alias "Packy 中转" \
+  --tag billing=monthly
 
-codex-helper config list
+codex-helper provider list
 
-# 2. 全局选择当前使用的供应商（active 配置）
-codex-helper config set-active openai-main   # 使用 OpenAI
-codex-helper config set-active packy-main    # 使用 Packy
+# 2. 选择路由方式
+codex-helper routing pin openai-main          # 固定使用 OpenAI
+codex-helper routing order packy-main openai-main  # Packy 优先，OpenAI 兜底
 
 # 3. 一次性让 Codex 使用本地代理（只需执行一次）
 codex-helper switch on
 
-# 4. 在当前 active 配置下启动代理
+# 4. 按当前 routing 启动代理
 codex-helper
 ```
 
@@ -603,33 +486,36 @@ Codex 官方文件：
 
 ### 配置文件简要结构（推荐 TOML）
 
-codex-helper 支持 `config.toml` 与 `config.json`，字段结构基本一致；如同时存在，以 `config.toml` 为准。
+codex-helper 支持 `config.toml` 与 `config.json`；如同时存在，以 `config.toml` 为准。新配置推荐使用 `version = 3` 的 routing-first 结构：
 
 ```toml
-version = 1
+version = 3
 
-[codex]
-active = "openai-main"
-
-[codex.configs.openai-main]
-name = "openai-main"
+[codex.providers.openai-main]
 alias = "主 OpenAI 额度"
-enabled = true
-level = 1
-
-[[codex.configs.openai-main.upstreams]]
 base_url = "https://api.openai.com/v1"
-auth = { auth_token_env = "OPENAI_API_KEY" }
-tags = { source = "codex-config", provider_id = "openai" }
+auth_token_env = "OPENAI_API_KEY"
+tags = { billing = "paygo", vendor = "openai" }
+
+[codex.providers.packy-main]
+alias = "Packy 中转"
+base_url = "https://codex-api.packycode.com/v1"
+auth_token_env = "PACKYCODE_API_KEY"
+tags = { billing = "monthly", vendor = "packy" }
+
+[codex.routing]
+policy = "ordered-failover"
+order = ["packy-main", "openai-main"]
+on_exhausted = "continue"
 ```
 
 关键点：
 
-- `active`：当前生效的配置名；
-- `configs`：按名称索引的配置集合；
-- `level`：用于跨配置分组路由（1..=10，越小优先级越高；默认 1）；
-- `enabled`：该配置是否参与自动路由（默认 true）；
-- 每个 `upstream` 表示一个上游 endpoint，顺序 = 优先级（primary → backup...）。
+- `providers`：按名称索引的供应商 / 中转配置，单 endpoint 直接写 `base_url`；
+- `tags`：业务标签，例如 `billing=monthly`，用于 `routing prefer-tag`；
+- `routing.order`：明确的兜底顺序，越靠前越优先；
+- `routing.policy`：`manual-sticky`、`ordered-failover` 或 `tag-preferred`；
+- `station` 只保留为运行时视图，不再作为新增/切换 provider 的写入入口。
 
 ### 价格覆盖（Pricing Overrides）
 

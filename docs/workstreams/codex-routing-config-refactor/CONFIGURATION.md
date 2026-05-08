@@ -250,8 +250,8 @@ The old `station` CLI surface remains for migration and for listing/explaining o
 
 - `station list` shows v3 providers plus policy, target, order, and exhaustion behavior.
 - `station explain` shows the v3 routing recipe; `--station <name>` is treated as a provider detail selector on v3 files.
-- `station add`, `station set-active`, `station enable`, and `station disable` are rejected on v3 files; use `provider` and `routing` instead.
-- `station set-level` is rejected for v3; provider priority is `routing.order`.
+- `station` is now read-only (`list` / `explain`) in the public CLI; use `provider` and `routing` for authoring.
+- `level` is a legacy migration source; provider priority is `routing.order`.
 
 ## Control Plane Editing Notes
 
@@ -272,13 +272,13 @@ The migration should be deterministic and boring.
 Preview migration output:
 
 ```bash
-codex-helper station migrate --to v3 --dry-run
+codex-helper config migrate --to v3 --dry-run
 ```
 
 Write the migrated TOML:
 
 ```bash
-codex-helper station migrate --to v3 --write --yes
+codex-helper config migrate --to v3 --write --yes
 ```
 
 - `active_station` becomes the routing target for `manual-sticky`, or the first entry in `order` for `ordered-failover`.

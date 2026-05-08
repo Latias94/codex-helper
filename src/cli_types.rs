@@ -70,11 +70,16 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: SwitchCommand,
     },
-    /// Manage proxy stations for Codex / Claude
+    /// Inspect compiled routing stations for Codex / Claude
     #[command(name = "station")]
     Station {
         #[command(subcommand)]
         cmd: StationCommand,
+    },
+    /// Manage codex-helper config files and schema migration
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCommand,
     },
     /// Manage routing-first provider selection and fallback policy
     Routing {
@@ -97,7 +102,7 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show a brief status summary of codex-helper and upstream stations
+    /// Show a brief status summary of codex-helper and upstream routing
     Status {
         /// Output status as JSON (machine-readable), without ANSI colors
         #[arg(long)]
@@ -184,7 +189,36 @@ pub(crate) enum SwitchCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum StationCommand {
-    /// Initialize a commented config template (TOML)
+    /// List legacy stations or v3 providers from the current config
+    List {
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+    },
+
+    /// Explain effective routing order for a service
+    Explain {
+        /// Target Codex routing (default if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Target Claude routing
+        #[arg(long)]
+        claude: bool,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+        /// Show details for a single legacy station or v3 provider
+        #[arg(long, alias = "group")]
+        station: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Initialize a commented routing-first TOML config template
     Init {
         /// Overwrite existing config.toml (backing up to config.toml.bak)
         #[arg(long)]
@@ -193,123 +227,21 @@ pub enum StationCommand {
         #[arg(long)]
         no_import: bool,
     },
-    /// List stations in ~/.codex-helper/config.toml (or config.json)
-    List {
-        /// Target Codex stations (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude stations
-        #[arg(long)]
-        claude: bool,
-    },
-
-    /// Explain effective routing order for a service
-    Explain {
-        /// Target Codex stations (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude stations
-        #[arg(long)]
-        claude: bool,
-        /// Output JSON instead of text
-        #[arg(long)]
-        json: bool,
-        /// Show details for a single station
-        #[arg(long, alias = "group")]
-        station: Option<String>,
-    },
-    /// Add a new station
-    Add {
-        name: String,
-        #[arg(long)]
-        base_url: String,
-        #[arg(long)]
-        auth_token: Option<String>,
-        /// Read bearer token from an environment variable instead of storing it on disk
-        #[arg(long, conflicts_with = "auth_token")]
-        auth_token_env: Option<String>,
-        /// Use X-API-Key header value (some providers)
-        #[arg(long, conflicts_with = "api_key_env")]
-        api_key: Option<String>,
-        /// Read X-API-Key header value from an environment variable
-        #[arg(long, conflicts_with = "api_key")]
-        api_key_env: Option<String>,
-        /// Optional alias for this station
-        #[arg(long)]
-        alias: Option<String>,
-        /// Provider/upstream tag in KEY=VALUE form; can be passed multiple times
-        #[arg(long = "tag", value_name = "KEY=VALUE")]
-        tags: Vec<String>,
-        /// Priority group for level-based station routing (1..=10, lower is higher priority)
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=10))]
-        level: u8,
-        /// Exclude this station from automatic routing (unless it is active)
-        #[arg(long)]
-        disabled: bool,
-        /// Target Codex stations (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude stations
-        #[arg(long)]
-        claude: bool,
-    },
-    /// Set active station
-    SetActive {
-        name: String,
-        /// Target Codex stations (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude stations
-        #[arg(long)]
-        claude: bool,
-    },
-    /// Set a station's level (1..=10, lower is higher priority)
-    SetLevel {
-        name: String,
-        #[arg(value_parser = clap::value_parser!(u8).range(1..=10))]
-        level: u8,
-        /// Target Codex stations (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude stations
-        #[arg(long)]
-        claude: bool,
-    },
-    /// Enable a station for automatic routing
-    Enable {
-        name: String,
-        /// Target Codex stations (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude stations
-        #[arg(long)]
-        claude: bool,
-    },
-    /// Disable a station for automatic routing (unless it is active)
-    Disable {
-        name: String,
-        /// Target Codex stations (default if neither flag is set)
-        #[arg(long)]
-        codex: bool,
-        /// Target Claude stations
-        #[arg(long)]
-        claude: bool,
-    },
     /// Set retry policy to a curated profile (writes to ~/.codex-helper/config.*)
     #[command(name = "set-retry-profile")]
     SetRetryProfile {
         #[arg(value_enum)]
         profile: RetryProfile,
     },
-    /// Import Codex upstream stations from ~/.codex/config.toml + auth.json into ~/.codex-helper/config (toml/json)
+    /// Import Codex providers from ~/.codex/config.toml + auth.json into codex-helper config
     ImportFromCodex {
-        /// Overwrite existing Codex stations in ~/.codex-helper/config (toml/json)
+        /// Overwrite existing Codex providers in codex-helper config
         #[arg(long)]
         force: bool,
     },
-    /// Overwrite Codex upstream stations from ~/.codex/config.toml + auth.json
+    /// Overwrite Codex providers from ~/.codex/config.toml + auth.json
     ///
-    /// This resets Codex stations in codex-helper back to Codex CLI defaults (including grouping/levels).
+    /// This resets Codex providers in codex-helper back to Codex CLI defaults.
     #[command(name = "overwrite-from-codex")]
     OverwriteFromCodex {
         /// Preview changes without writing ~/.codex-helper/config (toml/json)
@@ -857,5 +789,3 @@ impl From<PricingConfidence> for codex_helper_core::pricing::CostConfidence {
         }
     }
 }
-
-pub type ConfigCommand = StationCommand;

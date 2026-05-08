@@ -36,7 +36,8 @@ Acceptance:
 - [x] Keep `routing` writes v3-native and reject legacy/v2 documents instead of silently projecting through station schema.
 - [x] Normalize CLI-written order so listed providers are promoted and remaining providers are retained.
 - [x] Add a first-class provider command group for v3 catalog edits.
-- [x] Reject compatibility `station add/set-active/enable/disable` writes on v3 files now that provider/routing commands exist.
+- [x] Remove compatibility `station add/set-active/set-level/enable/disable` writes from the public CLI now that provider/routing commands exist.
+- [x] Move schema/file operations to `config init` / `config migrate`, and make `station` read-only in the public CLI.
 
 Acceptance:
 

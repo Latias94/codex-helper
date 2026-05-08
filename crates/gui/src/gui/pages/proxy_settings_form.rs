@@ -327,8 +327,8 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ui.add_space(6.0);
         ui.label(pick(
             ctx.lang,
-            "当前文件是 v3 routing-first 配置。结构化 routing 编辑器还在接入中；请先使用“原始”视图或 `codex-helper station migrate --to v3 --dry-run` 预览配置。",
-            "This file uses the v3 routing-first schema. Structured routing editing is not wired here yet; use the Raw view or `codex-helper station migrate --to v3 --dry-run` for now.",
+            "当前文件是 v3 routing-first 配置。结构化 routing 编辑器还在接入中；请先使用“原始”视图或 `codex-helper config migrate --to v3 --dry-run` 预览配置。",
+            "This file uses the v3 routing-first schema. Structured routing editing is not wired here yet; use the Raw view or `codex-helper config migrate --to v3 --dry-run` for now.",
         ));
         return;
     }

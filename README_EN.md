@@ -92,14 +92,14 @@ The practical mental model is now:
 
 ## Three Core Concepts
 
-### 1. Station
+### 1. Provider / Routing
 
-A `station` is the operator-facing routing target: a relay or a grouped provider target that you enable, disable, probe, drain, or quick-switch.
+`provider` is the catalog entry for a relay or upstream account. `routing` decides whether to pin one provider, try providers in order, or prefer tagged providers before falling back.
 
 Compatibility note:
 
-- older config/runtime naming still uses `config` in places;
-- on current public API / GUI / docs surfaces, you should read that as `station` first.
+- older runtime naming still uses `station` / `config` in places;
+- on the current public config surface, add providers with `provider` and select behavior with `routing`.
 
 ### 2. Profile
 
@@ -235,172 +235,61 @@ Notes:
 
 ---
 
-## Common configuration: multi-upstream failover
+## Common configuration: provider + routing
 
-The most common and powerful way to use codex-helper is to let it **fail over between multiple upstreams automatically** when one is failing or out of quota.
+The recommended config model is `version = 3`: `provider` describes account/auth/endpoint/tags, while `routing` describes order, preference, and fallback behavior. Legacy `active/level/station` files still load and can be migrated, but they are no longer the public authoring surface.
 
-The key idea: put your primary and backup upstreams **in the same config’s `upstreams` array**.
-
-> Note: if you split each provider into its own config and keep them all at the same `level` (e.g. everything is `level = 1`), codex-helper will still prefer the `active` config, but other same-level configs can participate in failover (to avoid a single point of failure).
->
-> Important: a **pinned override** (e.g. TUI `p`: session provider override/pinned; older builds may also have a global pinned override) forces `pinned` routing mode and will only use that single config, so it will **not fail over across configs**.  
-> If you want “preferred + failover”, use `active` (TUI: `P` global active, or `Enter` on the Configs page) and clear any pinned override.
-
-### Scenario quick matrix
-
-Think of codex-helper config in 2 layers:
-
-1) **Grouping (routing)**: each config has a `level` (1..=10). `active` is preferred. `enabled=false` excludes a config from automatic routing (unless it is the active config).
-2) **Strategy (retry)**: controls how codex-helper retries/cools down/probes back.
-
-If you already imported accounts via `codex-helper config overwrite-from-codex --yes` (most common), you usually don’t need to hand-write `[[...upstreams]]`. You only need:
-
-- Grouping: `codex-helper config set-level <name> <level>` + `codex-helper config set-active <name>`
-- Strategy: `codex-helper config set-retry-profile <balanced|same-upstream|aggressive-failover|cost-primary>`
-
-> Note: `set-retry-profile` overwrites the whole `[retry]` block. If you want advanced tweaks (e.g. `retry.upstream.max_attempts`, `retry.provider.on_status`, `transport_cooldown_secs`, and guardrails like `never_on_status` / `never_on_class`), apply a profile first, then edit the config file. Retry tweaks must live under the layered `retry.upstream` / `retry.provider` blocks.
-
-| Goal | What to change after import | Suggested retry profile | Notes |
-| --- | --- | --- | --- |
-| One account, multiple endpoints (auto failover) | Merge multiple endpoints into one config’s `upstreams` (see Template A) | `balanced` | Simplest and most reliable |
-| Multiple providers as same-level backups | Keep them at the same `level` (default is 1) and set one `active` (see Template B) | `balanced` | `active` is preferred; other same-level configs still participate in failover |
-| Relay-first, direct/official backup | Put relays at `level=1`, direct/official at `level=2` (see Template C) | `balanced` | Degrades across levels; fully cooled configs are skipped when alternatives exist |
-| Monthly primary + pay-as-you-go backup (cost) | Same grouping as above, set the monthly relay as `active` (see Template D) | `cost-primary` | Degrade to backup when unstable, and “probe back” via cooldown/backoff |
-
-#### Template A: one config with multiple upstream endpoints
-
-```toml
-version = 1
-
-[codex]
-active = "codex-main"
-
-[codex.configs.codex-main]
-name = "codex-main"
-enabled = true
-level = 1
-
-[[codex.configs.codex-main.upstreams]]
-base_url = "https://codex-api.packycode.com/v1"
-auth = { auth_token_env = "PACKYCODE_API_KEY" }
-tags = { provider_id = "packycode", source = "codex-config" }
-
-[[codex.configs.codex-main.upstreams]]
-base_url = "https://co.yes.vg/v1"
-auth = { auth_token_env = "YESCODE_API_KEY" }
-tags = { provider_id = "yes", source = "codex-config" }
-```
-
-Notes:
-
-- `active` points to this config, so the LB can fail over between multiple upstream endpoints.
-- When an upstream fails or is marked `usage_exhausted`, codex-helper prefers other upstreams when possible.
-
-#### Template B: multiple providers as same-level backups (import-first)
+Typical setup:
 
 ```bash
-codex-helper config overwrite-from-codex --yes
-
-# Pick a preferred config (still allows same-level failover)
-codex-helper config set-active right
-
+codex-helper config init
+codex-helper provider add input --base-url https://ai.input.im/v1 --auth-token-env INPUT_API_KEY --tag billing=monthly
+codex-helper provider add openai --base-url https://api.openai.com/v1 --auth-token-env OPENAI_API_KEY --tag billing=paygo
+codex-helper routing order input openai
 codex-helper config set-retry-profile balanced
 ```
 
-If you prefer editing `config.toml` directly, the equivalent is:
+Common routing policies:
+
+| Goal | Recommended command | Notes |
+| --- | --- | --- |
+| Always use one provider | `codex-helper routing pin <provider>` | Manual sticky mode; switch manually if it fails |
+| Ordered fallback | `codex-helper routing order a b c` | Most intuitive: try the next provider when the current one cannot be used |
+| Monthly first, pay-as-you-go fallback | `codex-helper routing prefer-tag --tag billing=monthly --order paygo --on-exhausted continue` | Use tags for business intent; continue after all preferred providers are exhausted |
+| Stop when monthly providers are exhausted | Same command with `--on-exhausted stop` | Prevent accidental pay-as-you-go spend |
+
+The equivalent TOML stays small:
 
 ```toml
-[codex]
-active = "right"
+version = 3
+
+[codex.providers.input]
+base_url = "https://ai.input.im/v1"
+auth_token_env = "INPUT_API_KEY"
+tags = { billing = "monthly" }
+
+[codex.providers.openai]
+base_url = "https://api.openai.com/v1"
+auth_token_env = "OPENAI_API_KEY"
+tags = { billing = "paygo" }
+
+[codex.routing]
+policy = "ordered-failover"
+order = ["input", "openai"]
+on_exhausted = "continue"
 
 [retry]
 profile = "balanced"
 ```
 
-> Want fewer candidates? Disable configs you don’t want in automatic routing (active is still eligible): `codex-helper config disable some-provider`.
-
-#### Template C: relay-first, direct/official backup (level grouping)
-
-> `right/packyapi/yescode/openai` are just example names; replace them with what you see in `codex-helper config list`.
+Migrate an old config:
 
 ```bash
-codex-helper config overwrite-from-codex --yes
-
-# L1: relays
-codex-helper config set-level right 1
-codex-helper config set-level packyapi 1
-codex-helper config set-level yescode 1
-
-# L2: direct/official backup
-codex-helper config set-level openai 2
-
-codex-helper config set-active right
-codex-helper config set-retry-profile balanced
+codex-helper config migrate --to v3 --dry-run
+codex-helper config migrate --to v3 --write --yes
 ```
 
-Equivalent `config.toml` (example):
-
-```toml
-[codex]
-active = "right"
-
-[codex.configs.right]
-level = 1
-
-[codex.configs.openai]
-level = 2
-
-[retry]
-profile = "balanced"
-```
-
-#### Template D: monthly primary + pay-as-you-go backup (cost + probe-back)
-
-> `right/openai` are just example names; replace them with what you see in `codex-helper config list`.
-
-```bash
-codex-helper config overwrite-from-codex --yes
-
-# L1: monthly relay (cheap, may be flaky)
-codex-helper config set-level right 1
-codex-helper config set-active right
-
-# L2: pay-as-you-go direct (more expensive, more reliable)
-codex-helper config set-level openai 2
-
-# Cost-primary enables cooldown exponential backoff for probe-back.
-codex-helper config set-retry-profile cost-primary
-```
-
-Equivalent `config.toml` (example):
-
-```toml
-[codex]
-active = "right"
-
-[codex.configs.right]
-level = 1
-
-[codex.configs.openai]
-level = 2
-
-[retry]
-profile = "cost-primary"
-```
-
-> Note: if a config name contains `-` etc, quote it in TOML, e.g. `[codex.configs."openai-main"]`.
-
-### Level-based multi-config failover (optional)
-
-If you prefer to keep upstreams in separate configs, codex-helper also supports **level-based config grouping**:
-
-- Each config has a `level` (1..=10, lower is higher priority).
-- If there are **multiple distinct levels**, codex-helper routes from low to high (lower level is preferred).
-- If all configs share the same level, they are treated as same-level candidates: `active` is preferred, but other configs can still be used for failover.
-- Within the same level, the `active` config is preferred.
-- Set `enabled = false` to exclude a config from automatic routing (unless it is the active config).
-
-A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go as backup”: set the cheaper relay as `active` with `level = 1`, keep your direct/official provider at `level = 2`, and use cooldown penalties (optionally with cooldown backoff) to periodically probe back to the primary without hammering it on every request.
+`station list` / `station explain` are read-only runtime views. Add providers and edit routing with the `provider` and `routing` commands.
 
 ---
 
@@ -436,27 +325,49 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
   codex-helper switch status
   ```
 
-### Manage upstream configs (providers / relays)
+### Manage config, providers, and routing
 
-- List configs:
+- Initialize or migrate config:
 
   ```bash
-  codex-helper config list
+  codex-helper config init
+  codex-helper config migrate --to v3 --dry-run
+  codex-helper config migrate --to v3 --write --yes
   ```
 
-- Add a new config:
+- Import accounts/config from Codex CLI:
 
   ```bash
-  codex-helper config add openai-main \
+  codex-helper config import-from-codex --force
+  codex-helper config overwrite-from-codex --dry-run
+  codex-helper config overwrite-from-codex --yes
+  ```
+
+- Add and inspect providers:
+
+  ```bash
+  codex-helper provider add openai-main \
     --base-url https://api.openai.com/v1 \
     --auth-token-env OPENAI_API_KEY \
     --alias "Main OpenAI quota"
+  codex-helper provider list
+  codex-helper provider show openai-main
   ```
 
-- Set the active config:
+- Edit routing:
 
   ```bash
-  codex-helper config set-active openai-main
+  codex-helper routing order openai-main packy-main
+  codex-helper routing pin openai-main
+  codex-helper routing prefer-tag --tag billing=monthly --order openai-main --on-exhausted continue
+  codex-helper routing show
+  ```
+
+- Enable / disable providers:
+
+  ```bash
+  codex-helper provider disable packy-main
+  codex-helper provider enable packy-main
   ```
 
 - Set a curated retry profile (writes the `[retry]` block; good when you only want “pick a strategy”):
@@ -466,20 +377,11 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
   codex-helper config set-retry-profile cost-primary
   ```
 
-- Level-based routing controls (multi-config failover):
-  
-  ```bash
-  codex-helper config set-level openai-main 1
-  codex-helper config disable packy-main
-  codex-helper config enable packy-main
-  ```
+- Inspect the compiled runtime view:
 
-- Overwrite Codex configs from Codex CLI (reset to defaults):
-  
   ```bash
-  # overwrite codex-helper Codex configs (resets active/enabled/level to defaults)
-  codex-helper config overwrite-from-codex --dry-run
-  codex-helper config overwrite-from-codex --yes
+  codex-helper station list
+  codex-helper station explain
   ```
 
 ### TUI Settings (runtime)
@@ -527,27 +429,28 @@ A common cost-optimization pattern is “monthly relay as primary, pay-as-you-go
 ### Scenario 1: Manage multiple relays / keys and switch quickly
 
 ```bash
-# 1. Add configs for different providers
-codex-helper config add openai-main \
+# 1. Add providers
+codex-helper provider add openai-main \
   --base-url https://api.openai.com/v1 \
   --auth-token-env OPENAI_API_KEY \
   --alias "Main OpenAI quota"
 
-codex-helper config add packy-main \
+codex-helper provider add packy-main \
   --base-url https://codex-api.packycode.com/v1 \
   --auth-token-env PACKYCODE_API_KEY \
-  --alias "Packy relay"
+  --alias "Packy relay" \
+  --tag billing=monthly
 
-codex-helper config list
+codex-helper provider list
 
-# 2. Select which config is active
-codex-helper config set-active openai-main   # use OpenAI
-codex-helper config set-active packy-main    # use Packy
+# 2. Select routing behavior
+codex-helper routing pin openai-main
+codex-helper routing order packy-main openai-main
 
 # 3. Point Codex at the local proxy (once)
 codex-helper switch on
 
-# 4. Start the proxy with the current active config
+# 4. Start the proxy with the current routing
 codex-helper
 ```
 
@@ -634,30 +537,33 @@ Codex official files:
 codex-helper supports both `config.toml` (preferred) and `config.json` (legacy). If both exist, `config.toml` wins.
 
 ```toml
-version = 1
+version = 3
 
-[codex]
-active = "openai-main"
-
-[codex.configs.openai-main]
-name = "openai-main"
+[codex.providers.openai-main]
 alias = "Main OpenAI quota"
-enabled = true
-level = 1
-
-[[codex.configs.openai-main.upstreams]]
 base_url = "https://api.openai.com/v1"
-auth = { auth_token_env = "OPENAI_API_KEY" }
-tags = { source = "codex-config", provider_id = "openai" }
+auth_token_env = "OPENAI_API_KEY"
+tags = { billing = "paygo", provider_id = "openai" }
+
+[codex.providers.packy-main]
+alias = "Packy relay"
+base_url = "https://codex-api.packycode.com/v1"
+auth_token_env = "PACKYCODE_API_KEY"
+tags = { billing = "monthly", provider_id = "packy" }
+
+[codex.routing]
+policy = "ordered-failover"
+order = ["packy-main", "openai-main"]
+on_exhausted = "continue"
 ```
 
 Key ideas:
 
-- `active`: the name of the currently active config;
-- `configs`: a map of named configs;
-- `level`: priority group for level-based config routing (1..=10, lower is higher priority; defaults to 1);
-- `enabled`: whether the config participates in automatic routing (defaults to true);
-- each `upstream` is one endpoint, ordered by priority (primary → backups).
+- `providers`: the named provider / relay catalog;
+- `tags`: operator metadata such as `billing=monthly`;
+- `routing.order`: explicit fallback order, earliest entries are preferred first;
+- `routing.policy`: `manual-sticky`, `ordered-failover`, or `tag-preferred`;
+- `station` remains a runtime view, not the public write surface.
 
 ### `pricing_overrides.toml`
 

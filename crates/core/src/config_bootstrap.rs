@@ -318,7 +318,7 @@ pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
             Err(err) => {
                 warn!(
                     "无法从 ~/.codex 引导 Codex 配置: {err}; \
-                     如果尚未安装或配置 Codex CLI 可以忽略，否则请检查 ~/.codex/config.toml 和 ~/.codex/auth.json，或使用 `codex-helper config add` 手动添加上游"
+                     如果尚未安装或配置 Codex CLI 可以忽略，否则请检查 ~/.codex/config.toml 和 ~/.codex/auth.json，或使用 `codex-helper provider add` 手动添加 provider"
                 );
             }
         }
@@ -326,7 +326,7 @@ pub async fn load_or_bootstrap_from_codex() -> Result<ProxyConfig> {
         // 已存在配置但没有 active，提示用户检查
         if cfg.codex.active.is_none() && cfg.codex.has_stations() {
             warn!(
-                "检测到 Codex 配置但没有激活项，将使用任意一条配置作为默认；如需指定，请使用 `codex-helper config set-active <name>`"
+                "检测到 Codex 配置但没有明确路由目标，将按配置顺序选择；如需指定，请使用 `codex-helper routing pin <provider>` 或 `codex-helper routing order ...`"
             );
         }
     }
@@ -373,13 +373,13 @@ pub async fn load_or_bootstrap_from_claude() -> Result<ProxyConfig> {
             Err(err) => {
                 warn!(
                     "无法从 ~/.claude 引导 Claude 配置: {err}; \
-                     如果尚未安装或配置 Claude Code 可以忽略，否则请检查 ~/.claude/settings.json，或在 ~/.codex-helper/config.json 中手动添加 claude 配置"
+                     如果尚未安装或配置 Claude Code 可以忽略，否则请检查 ~/.claude/settings.json，或在 ~/.codex-helper/config.toml 中手动添加 claude provider/routing 配置"
                 );
             }
         }
     } else if cfg.claude.active.is_none() && cfg.claude.has_stations() {
         warn!(
-            "检测到 Claude 配置但没有激活项，将使用任意一条配置作为默认；如需指定，请使用 `codex-helper config set-active <name>`（后续将扩展对 Claude 的专用子命令）"
+            "检测到 Claude 配置但没有明确路由目标，将按配置顺序选择；如需指定，请使用 `codex-helper routing pin <provider> --claude` 或 `codex-helper routing order ... --claude`"
         );
     }
     Ok(cfg)

@@ -126,7 +126,7 @@ pub(super) async fn load_v3_config(
     let document = load_config_document().await?;
     let ConfigDocument::V3(cfg) = document else {
         anyhow::bail!(
-            "{} commands require a version = 3 config; run `codex-helper station migrate --to v3 --write --yes` first",
+            "{} commands require a version = 3 config; run `codex-helper config migrate --to v3 --write --yes` first",
             command_group
         );
     };

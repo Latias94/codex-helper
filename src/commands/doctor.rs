@@ -138,7 +138,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         Ok(cfg) => {
             let codex_count = cfg.codex.configs.len();
             if codex_count == 0 {
-                let msg = "检测到 ~/.codex-helper/config.json 中尚无 Codex 站点；建议使用 `codex-helper station add` 手动添加，或运行 `codex-helper station import-from-codex` 从 Codex CLI 配置导入。".to_string();
+                let msg = "检测到 ~/.codex-helper/config.toml/json 中尚无 Codex provider；建议先运行 `codex-helper config init`，再用 `codex-helper provider add` 手动添加，或运行 `codex-helper config import-from-codex` 从 Codex CLI 配置导入。".to_string();
                 if !json {
                     println!("{} {}", "[WARN]".yellow(), msg);
                 }
@@ -149,7 +149,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
                 });
             } else {
                 let msg = format!(
-                    "已从 ~/.codex-helper/config.json 读取到 {} 个 Codex 站点（active_station = {:?}）",
+                    "已从 ~/.codex-helper/config.toml/json 读取到 {} 个 Codex 路由候选（runtime active_station = {:?}）",
                     codex_count, cfg.codex.active
                 );
                 if !json {
@@ -428,7 +428,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
     // 3) 尝试模拟一次从 Codex CLI 配置推导上游（不落盘），用于验证整体链路
     match probe_codex_bootstrap_from_cli().await {
         Ok(()) => {
-            let msg = "成功从 ~/.codex/config.toml 与 ~/.codex/auth.json 模拟推导 Codex 上游；如需导入，可运行 `codex-helper station import-from-codex`".to_string();
+            let msg = "成功从 ~/.codex/config.toml 与 ~/.codex/auth.json 模拟推导 Codex 上游；如需导入，可运行 `codex-helper config import-from-codex`".to_string();
             if !json {
                 println!("{}   {}", "[OK]".green(), msg);
             }
@@ -440,7 +440,7 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
         }
         Err(err) => {
             let msg = format!(
-                "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-helper/config.json 中配置站点/上游，但自动导入功能将不可用。",
+                "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-helper/config.toml 中配置 provider/routing，但自动导入功能将不可用。",
                 err
             );
             if !json {

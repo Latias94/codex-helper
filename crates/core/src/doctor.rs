@@ -57,8 +57,8 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                     status: DoctorStatus::Warn,
                     message: pick(
                         lang,
-                        "检测到 ~/.codex-helper/config.json 中尚无 Codex upstream 配置；建议使用 `codex-helper config add` 手动添加，或运行 `codex-helper config import-from-codex` 从 Codex CLI 配置导入。",
-                        "No Codex upstreams found in ~/.codex-helper/config.json; use `codex-helper config add`, or run `codex-helper config import-from-codex` to import from Codex CLI.",
+                        "检测到 ~/.codex-helper/config.toml/json 中尚无 Codex provider；建议先运行 `codex-helper config init`，再用 `codex-helper provider add` 手动添加，或运行 `codex-helper config import-from-codex` 从 Codex CLI 配置导入。",
+                        "No Codex providers found in ~/.codex-helper/config.toml/json; run `codex-helper config init`, then use `codex-helper provider add`, or run `codex-helper config import-from-codex` to import from Codex CLI.",
                     )
                     .to_string(),
                 });
@@ -68,11 +68,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                     status: DoctorStatus::Ok,
                     message: match lang {
                         DoctorLang::Zh => format!(
-                            "已从 ~/.codex-helper/config.json 读取到 {} 条 Codex 站点配置（active_station = {:?}）",
+                            "已从 ~/.codex-helper/config.toml/json 读取到 {} 条 Codex 路由候选（runtime active_station = {:?}）",
                             codex_count, cfg.codex.active
                         ),
                         DoctorLang::En => format!(
-                            "Loaded {} Codex stations from ~/.codex-helper/config.json (active_station = {:?})",
+                            "Loaded {} Codex routing candidates from ~/.codex-helper/config.toml/json (runtime active_station = {:?})",
                             codex_count, cfg.codex.active
                         ),
                     },
@@ -143,11 +143,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                             status: DoctorStatus::Warn,
                             message: match lang {
                                 DoctorLang::Zh => format!(
-                                    "{} active station '{}' upstream[{}] 在 ~/.codex-helper/config.json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
+                                    "{} active station '{}' upstream[{}] 在 ~/.codex-helper/config.toml/json 中检测到明文密钥字段（建议改用 auth_token_env/api_key_env 以避免落盘泄露）",
                                     svc_label, active_name, idx
                                 ),
                                 DoctorLang::En => format!(
-                                    "{} active station '{}' upstream[{}] contains plaintext secrets in ~/.codex-helper/config.json (prefer auth_token_env/api_key_env)",
+                                    "{} active station '{}' upstream[{}] contains plaintext secrets in ~/.codex-helper/config.toml/json (prefer auth_token_env/api_key_env)",
                                     svc_label, active_name, idx
                                 ),
                             },
@@ -162,11 +162,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
                 status: DoctorStatus::Fail,
                 message: match lang {
                     DoctorLang::Zh => format!(
-                        "无法读取 ~/.codex-helper/config.json：{}；请检查该文件是否为有效 JSON，或尝试备份后删除以重新初始化。",
+                        "无法读取 ~/.codex-helper/config.toml/json：{}；请检查该文件是否为有效 TOML/JSON，或尝试备份后重新初始化。",
                         err
                     ),
                     DoctorLang::En => format!(
-                        "Failed to read ~/.codex-helper/config.json: {err}; ensure it is valid JSON, or back it up and reinitialize.",
+                        "Failed to read ~/.codex-helper/config.toml/json: {err}; ensure it is valid TOML/JSON, or back it up and reinitialize.",
                     ),
                 },
             });
@@ -373,11 +373,11 @@ pub async fn run_doctor(lang: DoctorLang) -> DoctorReport {
             status: DoctorStatus::Warn,
             message: match lang {
                 DoctorLang::Zh => format!(
-                    "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-helper/config.json 中配置上游，但自动导入功能将不可用。",
+                    "无法从 ~/.codex 自动推导 Codex 上游：{}；这不会影响手动在 ~/.codex-helper/config.toml 中配置 provider/routing，但自动导入功能将不可用。",
                     err
                 ),
                 DoctorLang::En => format!(
-                    "Failed to infer Codex upstreams from ~/.codex: {err}; manual ~/.codex-helper config still works but auto-import won't.",
+                    "Failed to infer Codex upstreams from ~/.codex: {err}; manual ~/.codex-helper config.toml provider/routing config still works but auto-import won't.",
                 ),
             },
         }),

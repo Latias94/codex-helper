@@ -41,8 +41,8 @@ pub(super) fn render_station_runtime_control_section(
                         *ctx.last_info = Some(
                             pick(
                                 ctx.lang,
-                                "已应用站点运行时状态",
-                                "Runtime station state updated",
+                                "已应用运行时路由状态",
+                                "Runtime route state updated",
                             )
                             .to_string(),
                         );
@@ -72,8 +72,8 @@ pub(super) fn render_station_runtime_control_section(
                         *ctx.last_info = Some(
                             pick(
                                 ctx.lang,
-                                "已应用站点运行时开关",
-                                "Runtime station enabled updated",
+                                "已应用运行时路由开关",
+                                "Runtime route enabled updated",
                             )
                             .to_string(),
                         );
@@ -106,8 +106,8 @@ pub(super) fn render_station_runtime_control_section(
                         *ctx.last_info = Some(
                             pick(
                                 ctx.lang,
-                                "已应用站点运行时等级",
-                                "Runtime station level updated",
+                                "已应用运行时路由优先级",
+                                "Runtime route priority updated",
                             )
                             .to_string(),
                         );
