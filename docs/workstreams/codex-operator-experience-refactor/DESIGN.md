@@ -403,7 +403,7 @@ Refresh policy:
 - `refresh_on_request` can disable the automatic request-driven path for a provider.
 - `poll_interval_secs` is the provider-level throttle/cache window so high-frequency Codex traffic does not hammer balance APIs; `0` means no automatic refresh.
 - UI surfaces should show balance amount, status, and routing eligibility; refresh timing is implementation detail unless exposed through an explicit diagnostics view.
-- A manual refresh action can be added later, but it should still call the same core adapter path.
+- Manual refresh is exposed through `POST /__codex_helper/api/v1/providers/balances/refresh`; it bypasses request-driven throttles while still calling the same core adapter/LB/snapshot path.
 
 Adapter types:
 

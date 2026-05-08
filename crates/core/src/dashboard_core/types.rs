@@ -83,6 +83,8 @@ pub struct ControlPlaneSurfaceCapabilities {
     #[serde(default)]
     pub provider_runtime: bool,
     #[serde(default)]
+    pub provider_balance_refresh: bool,
+    #[serde(default)]
     pub provider_specs: bool,
     #[serde(default)]
     pub profiles: bool,

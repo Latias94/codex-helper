@@ -558,6 +558,10 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         Some("/__codex_helper/api/v1/healthcheck/cancel")
     );
     assert_eq!(
+        summary["links"]["provider_balance_refresh"].as_str(),
+        Some("/__codex_helper/api/v1/providers/balances/refresh")
+    );
+    assert_eq!(
         summary["links"]["global_station_override"].as_str(),
         Some("/__codex_helper/api/v1/overrides/global-station")
     );

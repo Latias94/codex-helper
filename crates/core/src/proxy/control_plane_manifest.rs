@@ -34,6 +34,8 @@ pub(super) const API_V1_STATION_SPECS: &str = "/__codex_helper/api/v1/stations/s
 pub(super) const API_V1_STATION_SPEC_BY_NAME: &str = "/__codex_helper/api/v1/stations/specs/{name}";
 pub(super) const API_V1_PROVIDERS: &str = "/__codex_helper/api/v1/providers";
 pub(super) const API_V1_PROVIDERS_RUNTIME: &str = "/__codex_helper/api/v1/providers/runtime";
+pub(super) const API_V1_PROVIDERS_BALANCES_REFRESH: &str =
+    "/__codex_helper/api/v1/providers/balances/refresh";
 pub(super) const API_V1_PROVIDER_SPECS: &str = "/__codex_helper/api/v1/providers/specs";
 pub(super) const API_V1_PROVIDER_SPEC_BY_NAME: &str =
     "/__codex_helper/api/v1/providers/specs/{name}";
@@ -89,6 +91,7 @@ const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_PROVIDERS_RUNTIME,
     API_V1_PROVIDER_SPECS,
     API_V1_PROVIDER_SPEC_BY_NAME,
+    API_V1_PROVIDERS_BALANCES_REFRESH,
     API_V1_PROFILES,
     API_V1_PROFILES_DEFAULT,
     API_V1_PROFILES_DEFAULT_PERSISTED,
@@ -136,6 +139,7 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
         station_probe: true,
         providers: true,
         provider_runtime: true,
+        provider_balance_refresh: true,
         provider_specs: true,
         profiles: true,
         default_profile_override: true,
@@ -181,6 +185,7 @@ pub(super) fn api_v1_operator_summary_links() -> OperatorSummaryLinks {
         healthcheck_start: API_V1_HEALTHCHECK_START.to_string(),
         healthcheck_cancel: API_V1_HEALTHCHECK_CANCEL.to_string(),
         providers: API_V1_PROVIDERS.to_string(),
+        provider_balance_refresh: API_V1_PROVIDERS_BALANCES_REFRESH.to_string(),
         provider_specs: API_V1_PROVIDER_SPECS.to_string(),
         provider_spec_by_name_template: API_V1_PROVIDER_SPEC_BY_NAME.to_string(),
         profiles: API_V1_PROFILES.to_string(),

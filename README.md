@@ -719,6 +719,7 @@ codex-helper pricing remove custom-codex
 - 自研接口可以通过 `extract.remaining_balance_paths`、`extract.monthly_spent_paths`、`extract.monthly_budget_paths`、`extract.exhausted_paths` 和 divisor 字段扩展，不需要改 Rust 代码；
 - `refresh_on_request` 控制请求结束后是否自动查询额度，默认 `true`；设为 `false` 可关闭该 provider 的请求后自动刷新；
 - `poll_interval_secs` 控制该 provider 两次额度查询之间的最小间隔，省略时默认 `60`；当前触发点是请求结束后的按需轮询，不跟随 TUI/GUI 的界面刷新频率，低于 20 会按 20 秒处理，设为 `0` 可禁用请求后自动刷新；
+- `POST /__codex_helper/api/v1/providers/balances/refresh` 可手动触发同一套 core adapter 余额刷新；可用 query 参数 `station_name` / `provider_id` 定向刷新，手动刷新不受 `refresh_on_request` 和请求后节流限制；
 - 请求结束后，codex-helper 按需调用 `endpoint` 查询额度，记录 `ok` / `exhausted` / `stale` / `error` / `unknown` 余额快照；
 - 当额度用尽时，对应 upstream 在 LB 中被标记为 `usage_exhausted = true`，优先避开该线路。
 

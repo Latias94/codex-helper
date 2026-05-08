@@ -148,6 +148,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/providers/balances/refresh"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/providers/specs"))
     }));
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
@@ -204,6 +209,10 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     );
     assert_eq!(
         caps["surface_capabilities"]["provider_runtime"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["provider_balance_refresh"].as_bool(),
         Some(true)
     );
     assert_eq!(
@@ -272,6 +281,30 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
         caps["remote_admin_access"]["token_env_var"].as_str(),
         Some(crate::proxy::ADMIN_TOKEN_ENV_VAR)
     );
+
+    let refresh = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/providers/balances/refresh?station_name=test",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("provider balance refresh send")
+        .error_for_status()
+        .expect("provider balance refresh status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("provider balance refresh json");
+    assert_eq!(
+        refresh.get("service_name").and_then(|v| v.as_str()),
+        Some("codex")
+    );
+    assert_eq!(
+        refresh["refresh"]["attempted"].as_u64(),
+        Some(0),
+        "tests should not call real usage provider endpoints"
+    );
+    assert!(refresh["provider_balances"].as_object().is_some());
 
     let trace_dir = make_temp_test_dir();
     let trace_path = trace_dir.join("control_trace.jsonl");

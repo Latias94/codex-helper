@@ -4,6 +4,7 @@ pub(super) fn provider_routes(proxy: ProxyService) -> Router {
     let specs_proxy = proxy.clone();
     let providers_proxy = proxy.clone();
     let runtime_proxy = proxy.clone();
+    let balance_refresh_proxy = proxy.clone();
     let upsert_proxy = proxy.clone();
 
     Router::new()
@@ -18,6 +19,10 @@ pub(super) fn provider_routes(proxy: ProxyService) -> Router {
         .route(
             API_V1_PROVIDERS_RUNTIME,
             post(move |payload| apply_provider_runtime_meta(runtime_proxy.clone(), payload)),
+        )
+        .route(
+            API_V1_PROVIDERS_BALANCES_REFRESH,
+            post(move |query| refresh_provider_balances(balance_refresh_proxy.clone(), query)),
         )
         .route(
             API_V1_PROVIDER_SPEC_BY_NAME,

@@ -1,11 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use axum::Json;
+use axum::extract::Query;
 use axum::http::StatusCode;
 
+use crate::balance::ProviderBalanceSnapshot;
 use crate::dashboard_core::{ProviderOption, build_provider_options_from_view};
 use crate::logging::{log_retry_trace, now_ms};
 use crate::state::RuntimeConfigState;
+use crate::usage_providers::{UsageProviderRefreshSummary, refresh_balances_for_service};
 
 use super::ProxyService;
 use super::control_plane_service::{load_persisted_proxy_settings_v2, service_view_v2};
@@ -25,6 +28,21 @@ pub(super) struct ProviderRuntimeMetaRequest {
     clear_runtime_state: bool,
 }
 
+#[derive(serde::Deserialize, Default)]
+pub(super) struct ProviderBalanceRefreshQuery {
+    #[serde(default)]
+    station_name: Option<String>,
+    #[serde(default)]
+    provider_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct ProviderBalanceRefreshResponse {
+    service_name: String,
+    refresh: UsageProviderRefreshSummary,
+    provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+}
+
 fn normalize_provider_name(value: &str) -> Result<String, (StatusCode, String)> {
     let value = value.trim();
     if value.is_empty() {
@@ -37,6 +55,14 @@ fn normalize_provider_name(value: &str) -> Result<String, (StatusCode, String)> 
 }
 
 fn normalize_optional_endpoint_name(value: Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_optional_filter(value: Option<String>) -> Option<String> {
     value
         .as_deref()
         .map(str::trim)
@@ -168,4 +194,32 @@ pub(super) async fn apply_provider_runtime_meta(
     }));
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn refresh_provider_balances(
+    proxy: ProxyService,
+    Query(query): Query<ProviderBalanceRefreshQuery>,
+) -> Result<Json<ProviderBalanceRefreshResponse>, (StatusCode, String)> {
+    let station_name = normalize_optional_filter(query.station_name);
+    let provider_id = normalize_optional_filter(query.provider_id);
+    let cfg = proxy.config.snapshot().await;
+    let refresh = refresh_balances_for_service(
+        cfg,
+        proxy.lb_states.clone(),
+        proxy.state.clone(),
+        proxy.service_name,
+        station_name.as_deref(),
+        provider_id.as_deref(),
+    )
+    .await;
+    let provider_balances = proxy
+        .state
+        .get_provider_balance_view(proxy.service_name)
+        .await;
+
+    Ok(Json(ProviderBalanceRefreshResponse {
+        service_name: proxy.service_name.to_string(),
+        refresh,
+        provider_balances,
+    }))
 }

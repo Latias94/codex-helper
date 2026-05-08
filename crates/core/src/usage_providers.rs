@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::balance::ProviderBalanceSnapshot;
-use crate::config::{ProxyConfig, proxy_home_dir};
+use crate::config::{ProxyConfig, ServiceConfigManager, proxy_home_dir};
 use crate::lb::LbState;
 use crate::pricing::UsdAmount;
 use crate::state::ProxyState;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ProviderKind {
     /// 简单预算接口，返回 total/used，判断是否用尽
@@ -127,6 +127,30 @@ struct UpstreamRef {
     index: usize,
 }
 
+#[derive(Debug, Clone)]
+struct UsageProviderTarget {
+    upstream: UpstreamRef,
+    base_url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UsageProviderRefreshSummary {
+    pub providers_configured: usize,
+    pub providers_matched: usize,
+    pub upstreams_matched: usize,
+    pub attempted: usize,
+    pub refreshed: usize,
+    pub failed: usize,
+    pub missing_token: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageProviderRefreshOutcome {
+    Refreshed,
+    Failed,
+    MissingToken,
+}
+
 // 全局节流状态：按 provider.id 记录最近一次查询时间，避免高频请求。
 static LAST_USAGE_POLL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
@@ -157,6 +181,17 @@ fn stale_after_ms(fetched_at_ms: u64, interval_secs: u64) -> Option<u64> {
     fetched_at_ms.checked_add(interval_secs.saturating_mul(3).saturating_mul(1_000))
 }
 
+fn snapshot_refresh_interval_secs(provider: &UsageProviderConfig) -> u64 {
+    let interval_secs = provider
+        .poll_interval_secs
+        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
+    if interval_secs == 0 {
+        DEFAULT_POLL_INTERVAL_SECS
+    } else {
+        interval_secs.max(MIN_POLL_INTERVAL_SECS)
+    }
+}
+
 fn effective_poll_interval_secs(provider: &UsageProviderConfig) -> Option<u64> {
     if !provider.refresh_on_request {
         return None;
@@ -173,6 +208,13 @@ fn effective_poll_interval_secs(provider: &UsageProviderConfig) -> Option<u64> {
 
 fn usage_providers_path() -> std::path::PathBuf {
     proxy_home_dir().join("usage_providers.json")
+}
+
+fn service_manager<'a>(cfg: &'a ProxyConfig, service_name: &str) -> &'a ServiceConfigManager {
+    match service_name {
+        "claude" => &cfg.claude,
+        _ => &cfg.codex,
+    }
 }
 
 fn default_providers() -> UsageProvidersFile {
@@ -243,10 +285,44 @@ fn domain_matches(base_url: &str, domains: &[String]) -> bool {
     false
 }
 
+fn matching_provider_targets(
+    cfg: &ProxyConfig,
+    service_name: &str,
+    provider: &UsageProviderConfig,
+    station_name_filter: Option<&str>,
+) -> Vec<UsageProviderTarget> {
+    let mut stations: Vec<_> = service_manager(cfg, service_name)
+        .stations()
+        .iter()
+        .collect();
+    stations.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+
+    let mut targets = Vec::new();
+    for (station_name, service) in stations {
+        if station_name_filter.is_some_and(|filter| filter != station_name.as_str()) {
+            continue;
+        }
+        for (index, upstream) in service.upstreams.iter().enumerate() {
+            if domain_matches(&upstream.base_url, &provider.domains) {
+                targets.push(UsageProviderTarget {
+                    upstream: UpstreamRef {
+                        station_name: station_name.clone(),
+                        index,
+                    },
+                    base_url: upstream.base_url.clone(),
+                });
+            }
+        }
+    }
+
+    targets
+}
+
 fn resolve_token(
     provider: &UsageProviderConfig,
     upstreams: &[UpstreamRef],
     cfg: &ProxyConfig,
+    service_name: &str,
 ) -> Option<String> {
     // 优先: token_env 环境变量
     if let Some(env_name) = &provider.token_env
@@ -258,7 +334,7 @@ fn resolve_token(
 
     // 否则: 使用绑定 upstream 的 auth_token（当前 Codex 正在使用的 token）
     for uref in upstreams {
-        if let Some(service) = cfg.codex.station(&uref.station_name)
+        if let Some(service) = service_manager(cfg, service_name).station(&uref.station_name)
             && let Some(up) = service.upstreams.get(uref.index)
         {
             if let Some(token) = up.auth.resolve_auth_token() {
@@ -778,6 +854,7 @@ fn new_api_snapshot_from_json(
 fn update_usage_exhausted(
     lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
     cfg: &ProxyConfig,
+    service_name: &str,
     upstreams: &[UpstreamRef],
     exhausted: bool,
 ) {
@@ -787,7 +864,7 @@ fn update_usage_exhausted(
     };
 
     for uref in upstreams {
-        let service = match cfg.codex.station(&uref.station_name) {
+        let service = match service_manager(cfg, service_name).station(&uref.station_name) {
             Some(s) => s,
             None => continue,
         };
@@ -805,6 +882,214 @@ fn update_usage_exhausted(
             entry.usage_exhausted[uref.index] = exhausted;
         }
     }
+}
+
+fn provider_hosts_for_diagnostics(
+    cfg: &ProxyConfig,
+    service_name: &str,
+    provider: &UsageProviderConfig,
+) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for service in service_manager(cfg, service_name).stations().values() {
+        for upstream in &service.upstreams {
+            if domain_matches(&upstream.base_url, &provider.domains)
+                && let Ok(url) = reqwest::Url::parse(&upstream.base_url)
+                && let Some(host) = url.host_str()
+            {
+                hosts.push(host.to_string());
+            }
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+fn warn_if_provider_spans_hosts(
+    cfg: &ProxyConfig,
+    service_name: &str,
+    provider: &UsageProviderConfig,
+) {
+    let hosts = provider_hosts_for_diagnostics(cfg, service_name, provider);
+    if hosts.len() > 1 {
+        warn!(
+            "usage provider '{}' is associated with multiple hosts: {:?}; \
+将按统一额度处理这些 upstream，如需区分配额请拆分为多个 provider 配置",
+            provider.id, hosts
+        );
+    }
+}
+
+fn snapshot_from_provider_json(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    value: &serde_json::Value,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    match provider.kind {
+        ProviderKind::BudgetHttpJson => {
+            budget_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
+        }
+        ProviderKind::YescodeProfile => {
+            yescode_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
+        }
+        ProviderKind::OpenAiBalanceHttpJson => balance_http_snapshot_from_json(
+            provider,
+            upstream,
+            value,
+            fetched_at_ms,
+            stale_after_ms,
+        ),
+        ProviderKind::NewApiUserSelf => {
+            new_api_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
+        }
+    }
+}
+
+async fn refresh_provider_target(
+    client: &Client,
+    provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
+    cfg: &ProxyConfig,
+    lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
+    state: &Arc<ProxyState>,
+    service_name: &str,
+    interval_secs: u64,
+) -> UsageProviderRefreshOutcome {
+    let upstreams = vec![target.upstream.clone()];
+    let fetched_at_ms = unix_now_ms();
+    let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
+
+    let Some(token) = resolve_token(provider, &upstreams, cfg, service_name) else {
+        state
+            .record_provider_balance_snapshot(
+                service_name,
+                base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+                    .with_error("no usable token; checked provider token_env and upstream auth"),
+            )
+            .await;
+        warn!(
+            "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
+跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.json",
+            provider.id
+        );
+        return UsageProviderRefreshOutcome::MissingToken;
+    };
+
+    match poll_provider_http_json(client, provider, &target.base_url, &token).await {
+        Ok(value) => {
+            let snapshot = snapshot_from_provider_json(
+                provider,
+                &upstreams[0],
+                &value,
+                fetched_at_ms,
+                stale_after_ms,
+            );
+            let exhausted_for_lb = snapshot.exhausted.unwrap_or(false);
+            update_usage_exhausted(lb_states, cfg, service_name, &upstreams, exhausted_for_lb);
+            state
+                .record_provider_balance_snapshot(service_name, snapshot)
+                .await;
+            info!(
+                "usage provider '{}' refreshed {}[{}], exhausted = {}",
+                provider.id, target.upstream.station_name, target.upstream.index, exhausted_for_lb
+            );
+            UsageProviderRefreshOutcome::Refreshed
+        }
+        Err(err) => {
+            state
+                .record_provider_balance_snapshot(
+                    service_name,
+                    base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+                        .with_error(err.to_string()),
+                )
+                .await;
+            warn!(
+                "usage provider '{}' poll failed for {}[{}]: {}",
+                provider.id, target.upstream.station_name, target.upstream.index, err
+            );
+            UsageProviderRefreshOutcome::Failed
+        }
+    }
+}
+
+pub async fn refresh_balances_for_service(
+    cfg: Arc<ProxyConfig>,
+    lb_states: Arc<Mutex<HashMap<String, LbState>>>,
+    state: Arc<ProxyState>,
+    service_name: &str,
+    station_name_filter: Option<&str>,
+    provider_id_filter: Option<&str>,
+) -> UsageProviderRefreshSummary {
+    // Tests should be hermetic and must not depend on real user `usage_providers.json`.
+    if cfg!(test) {
+        return UsageProviderRefreshSummary::default();
+    }
+
+    let station_name_filter = station_name_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let provider_id_filter = provider_id_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let providers_file = load_providers();
+    let mut summary = UsageProviderRefreshSummary {
+        providers_configured: providers_file.providers.len(),
+        ..UsageProviderRefreshSummary::default()
+    };
+    if providers_file.providers.is_empty() {
+        return summary;
+    }
+
+    let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut client: Option<Client> = None;
+    for provider in providers_file.providers {
+        if provider_id_filter.is_some_and(|filter| filter != provider.id.as_str()) {
+            continue;
+        }
+
+        let targets = matching_provider_targets(&cfg, service_name, &provider, station_name_filter);
+        if targets.is_empty() {
+            continue;
+        }
+
+        summary.providers_matched += 1;
+        summary.upstreams_matched += targets.len();
+        warn_if_provider_spans_hosts(&cfg, service_name, &provider);
+
+        let interval_secs = snapshot_refresh_interval_secs(&provider);
+        let mut refreshed_any_target = false;
+        for target in targets {
+            summary.attempted += 1;
+            let c = client.get_or_insert_with(Client::new);
+            match refresh_provider_target(
+                c,
+                &provider,
+                &target,
+                &cfg,
+                &lb_states,
+                &state,
+                service_name,
+                interval_secs,
+            )
+            .await
+            {
+                UsageProviderRefreshOutcome::Refreshed => {
+                    refreshed_any_target = true;
+                    summary.refreshed += 1;
+                }
+                UsageProviderRefreshOutcome::Failed => summary.failed += 1,
+                UsageProviderRefreshOutcome::MissingToken => summary.missing_token += 1,
+            }
+        }
+
+        if refreshed_any_target && let Ok(mut map) = poll_map.lock() {
+            map.insert(provider.id.clone(), Instant::now());
+        }
+    }
+
+    summary
 }
 
 /// 在特定 Codex upstream 请求结束后，按需查询一次用量并更新 LB 状态。
@@ -829,7 +1114,7 @@ pub async fn poll_for_codex_upstream(
     }
 
     // Locate the current upstream once; if it no longer exists, bail out quietly.
-    let current_service = match cfg.codex.station(station_name) {
+    let current_service = match service_manager(&cfg, service_name).station(station_name) {
         Some(s) => s,
         None => return,
     };
@@ -837,16 +1122,20 @@ pub async fn poll_for_codex_upstream(
         Some(u) => u,
         None => return,
     };
-    let current_base_url = current_upstream.base_url.clone();
+    let current_target = UsageProviderTarget {
+        upstream: UpstreamRef {
+            station_name: station_name.to_string(),
+            index: upstream_index,
+        },
+        base_url: current_upstream.base_url.clone(),
+    };
 
     let now = Instant::now();
     let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
-
     let mut client: Option<Client> = None;
 
     for provider in providers_file.providers {
-        // Only providers whose domains match the current upstream are considered.
-        if !domain_matches(&current_base_url, &provider.domains) {
+        if !domain_matches(&current_target.base_url, &provider.domains) {
             continue;
         }
 
@@ -867,126 +1156,19 @@ pub async fn poll_for_codex_upstream(
             map.insert(provider.id.clone(), now);
         }
 
-        // For diagnostics, still check whether this provider is associated with
-        // multiple hosts across stations, but only once per poll.
-        let mut hosts: Vec<String> = Vec::new();
-        for service in cfg.codex.stations().values() {
-            for upstream in &service.upstreams {
-                if domain_matches(&upstream.base_url, &provider.domains)
-                    && let Ok(url) = reqwest::Url::parse(&upstream.base_url)
-                    && let Some(host) = url.host_str()
-                {
-                    hosts.push(host.to_string());
-                }
-            }
-        }
-        hosts.sort();
-        hosts.dedup();
-        if hosts.len() > 1 {
-            warn!(
-                "usage provider '{}' is associated with multiple hosts: {:?}; \
-将按统一额度处理这些 upstream，如需区分配额请拆分为多个 provider 配置",
-                provider.id, hosts
-            );
-        }
-
-        // Only the current upstream participates in token resolution and usage update.
-        let current_ref = UpstreamRef {
-            station_name: station_name.to_string(),
-            index: upstream_index,
-        };
-        let upstreams = vec![current_ref];
-
+        warn_if_provider_spans_hosts(&cfg, service_name, &provider);
         let c = client.get_or_insert_with(Client::new);
-        let fetched_at_ms = unix_now_ms();
-        let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
-
-        if let Some(token) = resolve_token(&provider, &upstreams, &cfg) {
-            let snapshot_result = match provider.kind {
-                ProviderKind::BudgetHttpJson
-                | ProviderKind::OpenAiBalanceHttpJson
-                | ProviderKind::NewApiUserSelf
-                | ProviderKind::YescodeProfile => {
-                    match poll_provider_http_json(c, &provider, &current_base_url, &token).await {
-                        Ok(value) => {
-                            let snapshot = match provider.kind {
-                                ProviderKind::BudgetHttpJson => budget_snapshot_from_json(
-                                    &provider,
-                                    &upstreams[0],
-                                    &value,
-                                    fetched_at_ms,
-                                    stale_after_ms,
-                                ),
-                                ProviderKind::YescodeProfile => yescode_snapshot_from_json(
-                                    &provider,
-                                    &upstreams[0],
-                                    &value,
-                                    fetched_at_ms,
-                                    stale_after_ms,
-                                ),
-                                ProviderKind::OpenAiBalanceHttpJson => {
-                                    balance_http_snapshot_from_json(
-                                        &provider,
-                                        &upstreams[0],
-                                        &value,
-                                        fetched_at_ms,
-                                        stale_after_ms,
-                                    )
-                                }
-                                ProviderKind::NewApiUserSelf => new_api_snapshot_from_json(
-                                    &provider,
-                                    &upstreams[0],
-                                    &value,
-                                    fetched_at_ms,
-                                    stale_after_ms,
-                                ),
-                            };
-                            Ok(snapshot)
-                        }
-                        Err(err) => Err(err),
-                    }
-                }
-            };
-
-            match snapshot_result {
-                Ok(snapshot) => {
-                    let exhausted_for_lb = snapshot.exhausted.unwrap_or(false);
-                    update_usage_exhausted(&lb_states, &cfg, &upstreams, exhausted_for_lb);
-                    state
-                        .record_provider_balance_snapshot(service_name, snapshot.clone())
-                        .await;
-                    info!(
-                        "usage provider '{}' exhausted = {}",
-                        provider.id, exhausted_for_lb
-                    );
-                }
-                Err(err) => {
-                    state
-                        .record_provider_balance_snapshot(
-                            service_name,
-                            base_snapshot(&provider, &upstreams[0], fetched_at_ms, stale_after_ms)
-                                .with_error(err.to_string()),
-                        )
-                        .await;
-                    warn!("usage provider '{}' poll failed: {}", provider.id, err);
-                }
-            }
-        } else {
-            state
-                .record_provider_balance_snapshot(
-                    service_name,
-                    base_snapshot(&provider, &upstreams[0], fetched_at_ms, stale_after_ms)
-                        .with_error(
-                            "no usable token; checked provider token_env and upstream auth",
-                        ),
-                )
-                .await;
-            warn!(
-                "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
-跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.json",
-                provider.id
-            );
-        }
+        let _ = refresh_provider_target(
+            c,
+            &provider,
+            &current_target,
+            &cfg,
+            &lb_states,
+            &state,
+            service_name,
+            interval_secs,
+        )
+        .await;
     }
 }
 

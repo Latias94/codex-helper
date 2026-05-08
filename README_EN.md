@@ -752,6 +752,7 @@ For the new generic adapters:
 - custom/self-hosted providers can extend the parser with `extract.remaining_balance_paths`, `extract.monthly_spent_paths`, `extract.monthly_budget_paths`, `extract.exhausted_paths`, and divisor fields without touching Rust code;
 - `refresh_on_request` controls whether a request finish automatically triggers a balance poll for that provider; it defaults to `true`, and `false` disables the request-driven refresh path;
 - `poll_interval_secs` controls the minimum interval between balance polls for that provider; when omitted it defaults to `60`, the current trigger is on-demand polling after a routed request finishes rather than the TUI/GUI repaint loop, values below 20 seconds are clamped up to 20, and `0` disables request-driven refresh entirely;
+- `POST /__codex_helper/api/v1/providers/balances/refresh` manually triggers the same core adapter path; optional `station_name` / `provider_id` query parameters narrow the refresh target, and manual refresh bypasses `refresh_on_request` plus the request-driven throttle;
 - after a request finishes, codex-helper polls `endpoint` on demand and stores `ok` / `exhausted` / `stale` / `error` / `unknown` balance snapshots;
 - matching upstreams are then marked `usage_exhausted = true` in LB state; when possible, LB avoids these upstreams.
 

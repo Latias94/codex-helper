@@ -227,6 +227,7 @@ Current implementation slice:
 - Added shared GUI station balance summaries to the Stations list, identity summary, and balance detail section so exhausted/stale/error quota state is visible before drilling into rows.
 - Added TUI balance summaries to the Stations list/detail and Settings overview so operators can inspect balance state and amounts without drilling into logs.
 - Kept balance refresh in the core adapter layer: `usage_providers.json` owns provider-level `refresh_on_request` and `poll_interval_secs`, and request-driven polling reuses the cached snapshot path instead of pushing refresh timing into the UI.
+- Added a manual provider balance refresh admin API so TUI/GUI can trigger the same core adapter/LB/snapshot path without learning provider-specific balance endpoints.
 
 ### P1.2.1 Thin Provider Config
 

@@ -197,6 +197,8 @@ pub struct OperatorSummaryLinks {
     #[serde(default)]
     pub healthcheck_cancel: String,
     pub providers: String,
+    #[serde(default)]
+    pub provider_balance_refresh: String,
     pub provider_specs: String,
     pub provider_spec_by_name_template: String,
     pub profiles: String,
