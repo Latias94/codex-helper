@@ -369,6 +369,235 @@ async fn proxy_api_v1_station_settings_crud_persists_active_and_meta() {
 }
 
 #[tokio::test]
+async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
+    let _env_lock = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let mut cfg = crate::config::ProxyConfigV3::default();
+    cfg.codex.providers.insert(
+        "input".to_string(),
+        crate::config::ProviderConfigV3 {
+            alias: Some("Input".to_string()),
+            enabled: true,
+            base_url: Some("https://input.example.com/v1".to_string()),
+            inline_auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: Some("INPUT_KEY".to_string()),
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: [("billing".to_string(), "monthly".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+    );
+    cfg.codex.providers.insert(
+        "backup".to_string(),
+        crate::config::ProviderConfigV3 {
+            enabled: true,
+            base_url: Some("https://backup.example.com/v1".to_string()),
+            inline_auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: Some("BACKUP_KEY".to_string()),
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: [("billing".to_string(), "paygo".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+    );
+    cfg.codex.routing = Some(crate::config::RoutingConfigV3 {
+        policy: crate::config::RoutingPolicyV3::OrderedFailover,
+        order: vec!["input".to_string(), "backup".to_string()],
+        target: None,
+        prefer_tags: Vec::new(),
+        on_exhausted: crate::config::RoutingExhaustedActionV3::Continue,
+    });
+
+    crate::config::save_config_v3(&cfg)
+        .await
+        .expect("write initial v3 config");
+    let loaded = crate::config::load_config()
+        .await
+        .expect("load initial runtime config");
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(loaded),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let station_specs = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/stations/specs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v3 station specs send")
+        .error_for_status()
+        .expect("get v3 station specs status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v3 station specs json");
+    assert_eq!(
+        station_specs["stations"][0]
+            .get("name")
+            .and_then(|value| value.as_str()),
+        Some("routing")
+    );
+    assert_eq!(
+        station_specs["providers"]
+            .as_array()
+            .map(|providers| providers.len()),
+        Some(2)
+    );
+
+    let set_active = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/stations/active",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "station_name": "input" }))
+        .send()
+        .await
+        .expect("set v3 active provider send");
+    assert_eq!(set_active.status(), StatusCode::NO_CONTENT);
+
+    let update_provider_meta = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/stations/input",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "enabled": false }))
+        .send()
+        .await
+        .expect("update v3 provider meta send");
+    assert_eq!(update_provider_meta.status(), StatusCode::NO_CONTENT);
+
+    let upsert_provider = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/input",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "alias": "Input Relay",
+            "enabled": false,
+            "auth_token_env": "INPUT_NEXT_KEY",
+            "endpoints": [
+                {
+                    "name": "default",
+                    "base_url": "https://input-next.example.com/v1",
+                    "enabled": false
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("upsert v3 provider spec send");
+    assert_eq!(upsert_provider.status(), StatusCode::NO_CONTENT);
+
+    let upsert_new_provider = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/utility",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "alias": "Utility",
+            "enabled": true,
+            "auth_token_env": "UTILITY_KEY",
+            "endpoints": [
+                {
+                    "name": "default",
+                    "base_url": "https://utility.example.com/v1",
+                    "enabled": true
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("upsert new v3 provider spec send");
+    assert_eq!(upsert_new_provider.status(), StatusCode::NO_CONTENT);
+
+    let upsert_profile = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/profiles/daily",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "station": "routing",
+            "model": "gpt-5.4",
+            "reasoning_effort": "medium"
+        }))
+        .send()
+        .await
+        .expect("upsert v3 profile send");
+    assert_eq!(upsert_profile.status(), StatusCode::OK);
+
+    let set_default_profile = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/profiles/default/persisted",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "profile_name": "daily" }))
+        .send()
+        .await
+        .expect("set v3 default profile send");
+    assert_eq!(set_default_profile.status(), StatusCode::OK);
+
+    let config_text =
+        std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted v3 config");
+    assert!(config_text.contains("version = 3"));
+    assert!(!config_text.contains("[codex.stations."));
+    let persisted_cfg: crate::config::ProxyConfigV3 =
+        toml::from_str(&config_text).expect("parse persisted v3 config");
+    let routing = persisted_cfg
+        .codex
+        .routing
+        .expect("v3 routing should remain");
+    assert_eq!(routing.policy, crate::config::RoutingPolicyV3::ManualSticky);
+    assert_eq!(routing.target.as_deref(), Some("input"));
+    assert_eq!(routing.order, vec!["input", "backup", "utility"]);
+    assert_eq!(
+        persisted_cfg.codex.default_profile.as_deref(),
+        Some("daily")
+    );
+    assert!(persisted_cfg.codex.profiles.contains_key("daily"));
+    let input = persisted_cfg
+        .codex
+        .providers
+        .get("input")
+        .expect("input provider");
+    assert_eq!(input.alias.as_deref(), Some("Input Relay"));
+    assert!(!input.enabled);
+    assert_eq!(
+        input.base_url.as_deref(),
+        Some("https://input-next.example.com/v1")
+    );
+    assert_eq!(
+        input.inline_auth.auth_token_env.as_deref(),
+        Some("INPUT_NEXT_KEY")
+    );
+    assert_eq!(
+        input.tags.get("billing").map(|value| value.as_str()),
+        Some("monthly")
+    );
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_api_v1_retry_config_crud_persists_profile_and_cooldowns() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();

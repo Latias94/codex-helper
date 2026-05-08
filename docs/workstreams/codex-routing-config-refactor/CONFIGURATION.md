@@ -229,6 +229,17 @@ codex-helper station disable input
 - `station disable` clears a manual target if it disables that target.
 - `station set-level` is rejected for v3; provider priority is `routing.order`.
 
+## Control Plane Editing Notes
+
+Local GUI, remote attach clients, and TUI-backed admin flows should edit the same v3 document instead of writing a compacted v2 projection.
+
+- provider spec writes update `[codex.providers.<name>]` directly;
+- new providers are appended to an existing explicit `codex.routing.order`;
+- station quick-switch is a compatibility bridge that sets `codex.routing.policy = "manual-sticky"` and `target = "<provider>"`;
+- station enable/disable is a compatibility bridge that toggles the provider's `enabled` field;
+- profile CRUD writes `[codex.profiles]` and `default_profile` directly;
+- v2 station-structure editing is rejected on v3 files until a first-class routing editor replaces it.
+
 ## Migration From Legacy Config
 
 The migration should be deterministic and boring.
