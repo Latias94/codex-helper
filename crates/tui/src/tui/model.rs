@@ -412,41 +412,44 @@ pub(in crate::tui) fn status_style(p: Palette, status: Option<u16>) -> Style {
 fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRow> {
     let mut rows = cards
         .iter()
-        .map(|card| SessionRow {
-            session_id: card.session_id.clone(),
-            observation_scope: card.observation_scope,
-            host_local_transcript_path: card.host_local_transcript_path.clone(),
-            last_client_name: card.last_client_name.clone(),
-            last_client_addr: card.last_client_addr.clone(),
-            cwd: card.cwd.clone(),
-            active_count: card.active_count as usize,
-            active_started_at_ms_min: card.active_started_at_ms_min,
-            active_last_method: None,
-            active_last_path: None,
-            last_status: card.last_status,
-            last_duration_ms: card.last_duration_ms,
-            last_ended_at_ms: card.last_ended_at_ms,
-            last_model: card.last_model.clone(),
-            last_reasoning_effort: card.last_reasoning_effort.clone(),
-            last_service_tier: card.last_service_tier.clone(),
-            last_provider_id: card.last_provider_id.clone(),
-            last_station_name: card.last_station_name.clone(),
-            last_upstream_base_url: card.last_upstream_base_url.clone(),
-            last_usage: card.last_usage.clone(),
-            total_usage: card.total_usage.clone(),
-            turns_total: card.turns_total,
-            turns_with_usage: card.turns_with_usage,
-            binding_profile_name: card.binding_profile_name.clone(),
-            binding_continuity_mode: card.binding_continuity_mode,
-            effective_model: card.effective_model.clone(),
-            effective_reasoning_effort: card.effective_reasoning_effort.clone(),
-            effective_service_tier: card.effective_service_tier.clone(),
-            effective_station: card.effective_station.clone(),
-            effective_upstream_base_url: card.effective_upstream_base_url.clone(),
-            override_model: card.override_model.clone(),
-            override_effort: card.override_effort.clone(),
-            override_station_name: card.override_station_name.clone(),
-            override_service_tier: card.override_service_tier.clone(),
+        .filter_map(|card| {
+            let session_id = card.session_id.clone()?;
+            Some(SessionRow {
+                session_id: Some(session_id),
+                observation_scope: card.observation_scope,
+                host_local_transcript_path: card.host_local_transcript_path.clone(),
+                last_client_name: card.last_client_name.clone(),
+                last_client_addr: card.last_client_addr.clone(),
+                cwd: card.cwd.clone(),
+                active_count: card.active_count as usize,
+                active_started_at_ms_min: card.active_started_at_ms_min,
+                active_last_method: None,
+                active_last_path: None,
+                last_status: card.last_status,
+                last_duration_ms: card.last_duration_ms,
+                last_ended_at_ms: card.last_ended_at_ms,
+                last_model: card.last_model.clone(),
+                last_reasoning_effort: card.last_reasoning_effort.clone(),
+                last_service_tier: card.last_service_tier.clone(),
+                last_provider_id: card.last_provider_id.clone(),
+                last_station_name: card.last_station_name.clone(),
+                last_upstream_base_url: card.last_upstream_base_url.clone(),
+                last_usage: card.last_usage.clone(),
+                total_usage: card.total_usage.clone(),
+                turns_total: card.turns_total,
+                turns_with_usage: card.turns_with_usage,
+                binding_profile_name: card.binding_profile_name.clone(),
+                binding_continuity_mode: card.binding_continuity_mode,
+                effective_model: card.effective_model.clone(),
+                effective_reasoning_effort: card.effective_reasoning_effort.clone(),
+                effective_service_tier: card.effective_service_tier.clone(),
+                effective_station: card.effective_station.clone(),
+                effective_upstream_base_url: card.effective_upstream_base_url.clone(),
+                override_model: card.override_model.clone(),
+                override_effort: card.override_effort.clone(),
+                override_station_name: card.override_station_name.clone(),
+                override_service_tier: card.override_service_tier.clone(),
+            })
         })
         .collect::<Vec<_>>();
     rows.sort_by_key(|r| std::cmp::Reverse(session_sort_key(r)));
@@ -487,10 +490,8 @@ pub(in crate::tui) fn session_observation_scope_label(
 pub(in crate::tui) fn session_transcript_host_status(row: &SessionRow) -> String {
     if row.host_local_transcript_path.is_some() {
         "linked under ~/.codex/sessions".to_string()
-    } else if row.session_id.is_some() {
-        "no host-local transcript detected".to_string()
     } else {
-        "no session_id to match".to_string()
+        "no host-local transcript detected".to_string()
     }
 }
 
@@ -522,15 +523,6 @@ pub(in crate::tui) fn session_control_posture(
     row: &SessionRow,
     global_station: Option<&str>,
 ) -> SessionControlPosture {
-    if row.session_id.is_none() {
-        return SessionControlPosture {
-            headline: "aggregated runtime-only row".to_string(),
-            detail: "This row has no concrete session_id, so it cannot own per-session overrides."
-                .to_string(),
-            color: Color::Rgb(210, 153, 34),
-        };
-    }
-
     let override_fields = session_override_fields(row);
     if let Some(profile_name) = row.binding_profile_name.as_deref() {
         if override_fields.is_empty() {
@@ -917,6 +909,23 @@ mod tests {
         let count = filtered_request_page_len(&snapshot, Some("sid-explicit"), 0, false, true);
 
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn build_session_rows_from_cards_skips_sessionless_cards() {
+        let rows = build_session_rows_from_cards(&[
+            SessionIdentityCard {
+                session_id: None,
+                ..SessionIdentityCard::default()
+            },
+            SessionIdentityCard {
+                session_id: Some("sid-1".to_string()),
+                ..SessionIdentityCard::default()
+            },
+        ]);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id.as_deref(), Some("sid-1"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 
@@ -37,6 +37,36 @@ fn sample_session_row() -> SessionRow {
         override_effort: None,
         override_station: None,
         override_service_tier: None,
+    }
+}
+
+fn sample_finished_request(session_id: Option<&str>, ended_at_ms: u64) -> FinishedRequest {
+    FinishedRequest {
+        id: ended_at_ms,
+        trace_id: Some(format!("trace-{ended_at_ms}")),
+        session_id: session_id.map(ToOwned::to_owned),
+        client_name: None,
+        client_addr: None,
+        cwd: None,
+        model: None,
+        reasoning_effort: None,
+        service_tier: None,
+        station_name: None,
+        provider_id: None,
+        upstream_base_url: None,
+        route_decision: None,
+        usage: None,
+        cost: crate::pricing::CostBreakdown::default(),
+        retry: None,
+        observability: crate::state::RequestObservability::default(),
+        service: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/v1/responses".to_string(),
+        status_code: 200,
+        duration_ms: 120,
+        ttfb_ms: None,
+        streaming: false,
+        ended_at_ms,
     }
 }
 
@@ -334,6 +364,45 @@ fn build_session_rows_from_cards_preserves_last_route_decision() {
             .map(|value| value.value.as_str()),
         Some("gpt-5.4-fast")
     );
+}
+
+#[test]
+fn build_session_rows_from_cards_skips_sessionless_cards() {
+    let rows = build_session_rows_from_cards(&[
+        SessionIdentityCard {
+            session_id: None,
+            ..SessionIdentityCard::default()
+        },
+        SessionIdentityCard {
+            session_id: Some("sid-1".to_string()),
+            ..SessionIdentityCard::default()
+        },
+    ]);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id.as_deref(), Some("sid-1"));
+}
+
+#[test]
+fn build_session_rows_skips_sessionless_runtime_buckets() {
+    let recent = [
+        sample_finished_request(None, 1),
+        sample_finished_request(Some("sid-1"), 2),
+    ];
+
+    let rows = build_session_rows(
+        Vec::new(),
+        &recent,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+    );
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id.as_deref(), Some("sid-1"));
 }
 
 #[test]

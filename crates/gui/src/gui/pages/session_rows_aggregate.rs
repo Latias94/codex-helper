@@ -218,6 +218,7 @@ pub(super) fn build_session_rows(
     );
 
     let mut rows = map.into_values().collect::<Vec<_>>();
+    rows.retain(|row| row.session_id.is_some());
     for row in &mut rows {
         if row.cwd.is_some() {
             row.observation_scope = SessionObservationScope::HostLocalEnriched;

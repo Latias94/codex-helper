@@ -71,15 +71,13 @@ pub(super) fn session_transcript_host_status_label(lang: Language, row: &Session
             "linked under ~/.codex/sessions",
         )
         .to_string()
-    } else if row.session_id.is_some() {
+    } else {
         pick(
             lang,
             "未检测到 host-local transcript",
             "no host-local transcript detected",
         )
         .to_string()
-    } else {
-        pick(lang, "无 session_id，无法匹配", "no session_id to match").to_string()
     }
 }
 
@@ -89,35 +87,28 @@ pub(super) fn session_transcript_access_message(
     host_local_session_features: bool,
 ) -> String {
     match (
-        row.session_id.is_some(),
         row.host_local_transcript_path.is_some(),
         host_local_session_features,
     ) {
-        (false, _, _) => pick(
-            lang,
-            "当前记录没有 session_id，不能建立 transcript 映射。",
-            "This record has no session_id, so transcript mapping is unavailable.",
-        )
-        .to_string(),
-        (true, true, true) => pick(
+        (true, true) => pick(
             lang,
             "这台设备可直接打开这个 host-local transcript。",
             "This device can open the linked host-local transcript directly.",
         )
         .to_string(),
-        (true, true, false) => pick(
+        (true, false) => pick(
             lang,
             "代理主机已链接到 transcript，但当前附着设备不能直接访问代理主机的文件系统。",
             "The proxy host has a linked transcript, but this attached device cannot access the proxy host filesystem directly.",
         )
         .to_string(),
-        (true, false, true) => pick(
+        (false, true) => pick(
             lang,
             "这台设备具备 host-local 能力，但当前未在 ~/.codex/sessions 下找到匹配文件。",
             "This device has host-local access, but no matching file was found under ~/.codex/sessions yet.",
         )
         .to_string(),
-        (true, false, false) => pick(
+        (false, false) => pick(
             lang,
             "当前是远端附着视角；可控制该 session_id，但不能假设本机可读取代理主机的 transcript。",
             "This is a remote-attached view; the session_id is controllable, but local transcript access on the proxy host cannot be assumed here.",
