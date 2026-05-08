@@ -137,7 +137,7 @@ If you want the shortest path to the current feature set, these are the main ent
 - TUI / GUI
   - `Stations`: station capability, health, breaker, quick switch
   - `Sessions`: session identity, effective route, session overrides
-  - `Profiles` / Config v2: profile and station/provider structure management
+  - `Profiles` / Config: profile and provider/routing structure management
 - Read APIs
   - `GET /__codex_helper/api/v1/capabilities`
   - `GET /__codex_helper/api/v1/snapshot`
@@ -171,7 +171,7 @@ It is:
 Current capability boundary:
 
 - Shareable:
-  - station/profile management
+  - routing/profile management
   - session identity
   - observed request history
   - session overrides

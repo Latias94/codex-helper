@@ -135,7 +135,7 @@ ch
 - TUI / GUI
   - `Stations`：看 station、能力、健康、breaker、快速切换
   - `Sessions`：看 session identity、effective route、session override
-  - `Profiles` / Config v2：管理 profile、station/provider 结构
+  - `Profiles` / Config：管理 profile、provider/routing 结构
 - 只读 API
   - `GET /__codex_helper/api/v1/capabilities`
   - `GET /__codex_helper/api/v1/snapshot`
@@ -167,7 +167,7 @@ ch
 当前边界很明确：
 
 - 可以共享：
-  - station/profile 管理
+  - routing/profile 管理
   - session identity
   - observed request history
   - session override
