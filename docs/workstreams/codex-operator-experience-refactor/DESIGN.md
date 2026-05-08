@@ -400,7 +400,8 @@ Refresh policy:
 
 - Balance fetching belongs to the core adapter layer, with GUI/TUI reading cached snapshots.
 - The default trigger is request-driven: after a routed request finishes, the matching balance adapter may poll its endpoint.
-- `poll_interval_secs` is the provider-level throttle/cache window so high-frequency Codex traffic does not hammer balance APIs.
+- `refresh_on_request` can disable the automatic request-driven path for a provider.
+- `poll_interval_secs` is the provider-level throttle/cache window so high-frequency Codex traffic does not hammer balance APIs; `0` means no automatic refresh.
 - UI surfaces should show balance amount, status, and routing eligibility; refresh timing is implementation detail unless exposed through an explicit diagnostics view.
 - A manual refresh action can be added later, but it should still call the same core adapter path.
 

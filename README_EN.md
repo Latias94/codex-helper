@@ -750,7 +750,8 @@ For the new generic adapters:
 - `openai_balance_http_json` covers the cc-switch style generic template / common sub2api relays: it defaults to `{{base_url}}/user/balance` and reads fields such as `balance`, `remaining`, `credit`, `subscription_balance`, and `pay_as_you_go_balance`;
 - `new_api_user_self` covers New API style relays: it defaults to `{{base_url}}/api/user/self` and parses `data.quota` / `data.used_quota`, converting the quota units to USD with the cc-switch-style `500000` divisor by default;
 - custom/self-hosted providers can extend the parser with `extract.remaining_balance_paths`, `extract.monthly_spent_paths`, `extract.monthly_budget_paths`, `extract.exhausted_paths`, and divisor fields without touching Rust code;
-- `poll_interval_secs` controls the minimum interval between balance polls for that provider; the current trigger is on-demand polling after a routed request finishes, not the TUI/GUI repaint loop, and values below 20 seconds are clamped up to 20;
+- `refresh_on_request` controls whether a request finish automatically triggers a balance poll for that provider; it defaults to `true`, and `false` disables the request-driven refresh path;
+- `poll_interval_secs` controls the minimum interval between balance polls for that provider; when omitted it defaults to `60`, the current trigger is on-demand polling after a routed request finishes rather than the TUI/GUI repaint loop, values below 20 seconds are clamped up to 20, and `0` disables request-driven refresh entirely;
 - after a request finishes, codex-helper polls `endpoint` on demand and stores `ok` / `exhausted` / `stale` / `error` / `unknown` balance snapshots;
 - matching upstreams are then marked `usage_exhausted = true` in LB state; when possible, LB avoids these upstreams.
 

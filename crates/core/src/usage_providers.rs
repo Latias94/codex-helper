@@ -102,6 +102,11 @@ struct UsageProviderConfig {
     token_env: Option<String>,
     #[serde(default)]
     poll_interval_secs: Option<u64>,
+    #[serde(
+        default = "default_refresh_on_request",
+        skip_serializing_if = "bool_is_true"
+    )]
+    refresh_on_request: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -125,11 +130,20 @@ struct UpstreamRef {
 // 全局节流状态：按 provider.id 记录最近一次查询时间，避免高频请求。
 static LAST_USAGE_POLL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 // Minimal poll interval per provider to avoid hammering usage APIs.
 const MIN_POLL_INTERVAL_SECS: u64 = 20;
 
 fn bool_is_false(value: &bool) -> bool {
     !*value
+}
+
+fn bool_is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_refresh_on_request() -> bool {
+    true
 }
 
 fn unix_now_ms() -> u64 {
@@ -141,6 +155,20 @@ fn unix_now_ms() -> u64 {
 
 fn stale_after_ms(fetched_at_ms: u64, interval_secs: u64) -> Option<u64> {
     fetched_at_ms.checked_add(interval_secs.saturating_mul(3).saturating_mul(1_000))
+}
+
+fn effective_poll_interval_secs(provider: &UsageProviderConfig) -> Option<u64> {
+    if !provider.refresh_on_request {
+        return None;
+    }
+
+    let interval_secs = provider
+        .poll_interval_secs
+        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
+    if interval_secs == 0 {
+        return None;
+    }
+    Some(interval_secs.max(MIN_POLL_INTERVAL_SECS))
 }
 
 fn usage_providers_path() -> std::path::PathBuf {
@@ -157,6 +185,7 @@ fn default_providers() -> UsageProvidersFile {
                 endpoint: "https://www.packycode.com/api/backend/users/info".to_string(),
                 token_env: None,
                 poll_interval_secs: Some(60),
+                refresh_on_request: true,
                 headers: BTreeMap::new(),
                 variables: BTreeMap::new(),
                 extract: UsageProviderExtractConfig::default(),
@@ -169,6 +198,7 @@ fn default_providers() -> UsageProvidersFile {
                 endpoint: "https://co.yes.vg/api/v1/auth/profile".to_string(),
                 token_env: None,
                 poll_interval_secs: Some(60),
+                refresh_on_request: true,
                 headers: BTreeMap::new(),
                 variables: BTreeMap::new(),
                 extract: UsageProviderExtractConfig::default(),
@@ -820,15 +850,11 @@ pub async fn poll_for_codex_upstream(
             continue;
         }
 
-        // Compute effective poll interval with a global minimum to avoid hammering.
-        let mut interval_secs = provider
-            .poll_interval_secs
-            .unwrap_or(MIN_POLL_INTERVAL_SECS);
-        if interval_secs < MIN_POLL_INTERVAL_SECS {
-            interval_secs = MIN_POLL_INTERVAL_SECS;
-        }
+        let Some(interval_secs) = effective_poll_interval_secs(&provider) else {
+            continue;
+        };
 
-        if interval_secs > 0 {
+        {
             let mut map = match poll_map.lock() {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -978,6 +1004,7 @@ mod tests {
             endpoint: "https://example.com/usage".to_string(),
             token_env: None,
             poll_interval_secs: Some(60),
+            refresh_on_request: true,
             headers: BTreeMap::new(),
             variables: BTreeMap::new(),
             extract: UsageProviderExtractConfig::default(),
@@ -1067,6 +1094,29 @@ mod tests {
             .expect("endpoint");
 
         assert_eq!(endpoint, "https://newapi.example.com/api/user/self?user=42");
+    }
+
+    #[test]
+    fn effective_poll_interval_respects_disable_flag_zero_and_minimum() {
+        let mut provider = provider("sub2api", ProviderKind::OpenAiBalanceHttpJson);
+
+        provider.poll_interval_secs = Some(0);
+        assert_eq!(effective_poll_interval_secs(&provider), None);
+
+        provider.poll_interval_secs = Some(10);
+        assert_eq!(
+            effective_poll_interval_secs(&provider),
+            Some(MIN_POLL_INTERVAL_SECS)
+        );
+
+        provider.poll_interval_secs = None;
+        assert_eq!(
+            effective_poll_interval_secs(&provider),
+            Some(DEFAULT_POLL_INTERVAL_SECS)
+        );
+
+        provider.refresh_on_request = false;
+        assert_eq!(effective_poll_interval_secs(&provider), None);
     }
 
     #[test]

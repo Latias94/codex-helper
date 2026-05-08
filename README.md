@@ -717,7 +717,8 @@ codex-helper pricing remove custom-codex
 - `openai_balance_http_json` 适配 cc-switch 通用模板 / 常见 sub2api：默认请求 `{{base_url}}/user/balance`，解析 `balance`、`remaining`、`credit`、`subscription_balance`、`pay_as_you_go_balance` 等常见字段；
 - `new_api_user_self` 适配 New API：默认请求 `{{base_url}}/api/user/self`，按 cc-switch 模板解析 `data.quota` / `data.used_quota`，默认除以 `500000` 转成 USD；
 - 自研接口可以通过 `extract.remaining_balance_paths`、`extract.monthly_spent_paths`、`extract.monthly_budget_paths`、`extract.exhausted_paths` 和 divisor 字段扩展，不需要改 Rust 代码；
-- `poll_interval_secs` 控制该 provider 两次额度查询之间的最小间隔；当前触发点是请求结束后的按需轮询，不跟随 TUI/GUI 的界面刷新频率，低于 20 会按 20 秒处理；
+- `refresh_on_request` 控制请求结束后是否自动查询额度，默认 `true`；设为 `false` 可关闭该 provider 的请求后自动刷新；
+- `poll_interval_secs` 控制该 provider 两次额度查询之间的最小间隔，省略时默认 `60`；当前触发点是请求结束后的按需轮询，不跟随 TUI/GUI 的界面刷新频率，低于 20 会按 20 秒处理，设为 `0` 可禁用请求后自动刷新；
 - 请求结束后，codex-helper 按需调用 `endpoint` 查询额度，记录 `ok` / `exhausted` / `stale` / `error` / `unknown` 余额快照；
 - 当额度用尽时，对应 upstream 在 LB 中被标记为 `usage_exhausted = true`，优先避开该线路。
 

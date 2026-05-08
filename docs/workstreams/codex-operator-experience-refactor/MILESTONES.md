@@ -226,7 +226,7 @@ Current implementation slice:
 - Added balance snapshot summaries to the shared station routing posture DTO so GUI/TUI auto-switch previews can mark `ok`, `exhausted`, `stale`, and `error` balance states in candidate order.
 - Added shared GUI station balance summaries to the Stations list, identity summary, and balance detail section so exhausted/stale/error quota state is visible before drilling into rows.
 - Added TUI balance summaries to the Stations list/detail and Settings overview so operators can inspect balance state and amounts without drilling into logs.
-- Kept balance refresh in the core adapter layer: `usage_providers.json` owns provider-level `poll_interval_secs`, and request-driven polling reuses the cached snapshot path instead of pushing refresh timing into the UI.
+- Kept balance refresh in the core adapter layer: `usage_providers.json` owns provider-level `refresh_on_request` and `poll_interval_secs`, and request-driven polling reuses the cached snapshot path instead of pushing refresh timing into the UI.
 
 ### P1.2.1 Thin Provider Config
 
