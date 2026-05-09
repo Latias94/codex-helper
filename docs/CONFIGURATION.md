@@ -1,19 +1,54 @@
 # Configuration Guide
 
-This guide describes the public `version = 3` configuration model.
+This guide documents the public `version = 3` config format.
 
-The short version: define providers once, then choose one routing recipe. You do not need one Codex config file per relay, and you do not need to model station groups for the common case.
+The short version: define providers once, then choose one routing recipe. Most users only need `[codex.providers.*]`, `[codex.routing]`, and `[retry]`.
 
 ## Mental Model
 
-- `providers` are the catalog: relay identity, auth reference, base URL, optional endpoints, and tags.
-- `routing` is the active route recipe: policy, fallback order, tag preference, and exhaustion behavior.
-- `profiles` describe reusable session defaults such as model, reasoning effort, and service tier. Provider selection belongs to `routing`.
-- `retry` controls how hard the proxy retries inside or across candidates before returning an error.
+- `providers` are your upstream catalog: base URL, auth, optional tags, optional endpoints.
+- `routing` is the active provider-selection recipe: ordered fallback, manual pin, or tag preference.
+- `profiles` are request defaults such as model and reasoning effort. They should not pick providers.
+- `retry` controls how hard the proxy retries before returning an error.
 
-Runtime and UI screens can still use the word `station` because the internal proxy engine routes through station candidates. For hand-written config, think in `provider` plus `routing`.
+Runtime and UI screens may still say `station` because the proxy engine routes through compiled station candidates. For hand-written config, think in `provider` plus `routing`.
 
-## Minimal Config
+## File Locations
+
+- Main config: `~/.codex-helper/config.toml`
+- Balance adapters: `~/.codex-helper/usage_providers.json`
+- Pricing overrides: `~/.codex-helper/pricing_overrides.toml`
+- Request log: `~/.codex-helper/logs/requests.jsonl`
+
+Codex-owned files remain owned by Codex:
+
+- `~/.codex/auth.json`
+- `~/.codex/config.toml`
+
+`switch on/off` and one-command startup only patch the local Codex proxy section. They do not overwrite unrelated Codex config changes.
+
+## Recommended Start
+
+Use CLI commands when possible:
+
+```bash
+codex-helper config init
+
+codex-helper provider add input \
+  --base-url https://ai.input.im/v1 \
+  --auth-token-env INPUT_API_KEY \
+  --tag billing=monthly
+
+codex-helper provider add openai \
+  --base-url https://api.openai.com/v1 \
+  --auth-token-env OPENAI_API_KEY \
+  --tag billing=paygo
+
+codex-helper routing order input openai
+codex-helper config set-retry-profile balanced
+```
+
+This creates the same thin TOML shape you would write by hand:
 
 ```toml
 version = 3
@@ -21,12 +56,12 @@ version = 3
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
 auth_token_env = "INPUT_API_KEY"
-tags = { billing = "monthly", region = "hk" }
+tags = { billing = "monthly" }
 
 [codex.providers.openai]
 base_url = "https://api.openai.com/v1"
 auth_token_env = "OPENAI_API_KEY"
-tags = { billing = "paygo", vendor = "openai" }
+tags = { billing = "paygo" }
 
 [codex.routing]
 policy = "ordered-failover"
@@ -37,21 +72,121 @@ on_exhausted = "continue"
 profile = "balanced"
 ```
 
-This is the recommended default for most users: the monthly relay is tried first, OpenAI is the backup, and routing stays deterministic.
+## Recipes
 
-## Provider Fields
+Pick one recipe first. You can refine fields later.
 
-Use the inline shape for one endpoint:
+### One Provider
+
+Use this when you only want codex-helper as a local proxy and dashboard.
 
 ```toml
-[codex.providers.packy]
-alias = "Packy monthly"
-base_url = "https://codex-api.packycode.com/v1"
-auth_token_env = "PACKYCODE_API_KEY"
-tags = { billing = "monthly", vendor = "packy" }
+version = 3
+
+[codex.providers.main]
+base_url = "https://api.example.com/v1"
+auth_token_env = "MAIN_API_KEY"
+
+[codex.routing]
+policy = "manual-sticky"
+target = "main"
+order = ["main"]
+
+[retry]
+profile = "balanced"
 ```
 
-Use explicit endpoints only when the same provider has multiple real targets:
+### Ordered Fallback
+
+Use this as the default for multiple relays: first working provider wins, then fallback in order.
+
+```toml
+version = 3
+
+[codex.providers.monthly]
+base_url = "https://monthly.example/v1"
+auth_token_env = "MONTHLY_API_KEY"
+tags = { billing = "monthly" }
+
+[codex.providers.backup]
+base_url = "https://backup.example/v1"
+auth_token_env = "BACKUP_API_KEY"
+tags = { billing = "paygo" }
+
+[codex.providers.openai]
+base_url = "https://api.openai.com/v1"
+auth_token_env = "OPENAI_API_KEY"
+tags = { billing = "official" }
+
+[codex.routing]
+policy = "ordered-failover"
+order = ["monthly", "backup", "openai"]
+on_exhausted = "continue"
+```
+
+This is the most direct replacement for old priority or level-based setups.
+
+### Monthly First
+
+Use this when the business intent matters: prefer every provider tagged `billing=monthly`, then continue to the rest.
+
+```toml
+version = 3
+
+[codex.providers.monthly_a]
+base_url = "https://monthly-a.example/v1"
+auth_token_env = "MONTHLY_A_API_KEY"
+tags = { billing = "monthly", region = "hk" }
+
+[codex.providers.monthly_b]
+base_url = "https://monthly-b.example/v1"
+auth_token_env = "MONTHLY_B_API_KEY"
+tags = { billing = "monthly", region = "jp" }
+
+[codex.providers.paygo]
+base_url = "https://paygo.example/v1"
+auth_token_env = "PAYGO_API_KEY"
+tags = { billing = "paygo" }
+
+[codex.routing]
+policy = "tag-preferred"
+prefer_tags = [{ billing = "monthly" }]
+order = ["monthly_a", "monthly_b", "paygo"]
+on_exhausted = "continue"
+```
+
+Only known fully exhausted monthly candidates are demoted. A balance lookup failure is shown as `unknown` and does not mean exhausted.
+
+### Monthly Only
+
+Use this when you would rather fail than spill into a paid fallback.
+
+```toml
+[codex.routing]
+policy = "tag-preferred"
+prefer_tags = [{ billing = "monthly" }]
+order = ["monthly_a", "monthly_b", "paygo"]
+on_exhausted = "stop"
+```
+
+`paygo` can stay in the file for later use, but the stop rule prevents automatic spillover after the preferred set is exhausted.
+
+### Manual Pin
+
+Use this for debugging, strict vendor selection, or temporary steering.
+
+```toml
+[codex.routing]
+policy = "manual-sticky"
+target = "input"
+order = ["input", "openai"]
+```
+
+A pinned target is explicit. If it fails, codex-helper does not silently pretend a different provider was selected.
+
+### Multiple Endpoints For One Provider
+
+Use explicit endpoints only when one account really has several upstream targets.
 
 ```toml
 [codex.providers.relay]
@@ -70,21 +205,59 @@ priority = 1
 tags = { region = "us" }
 ```
 
-Common fields:
+Do not use endpoints just to model unrelated providers. Put unrelated accounts under separate provider names.
+
+## Routing Policies
+
+| Policy | Best For | UI Mental Model |
+| --- | --- | --- |
+| `ordered-failover` | Simple fallback chains | Reorder a provider list |
+| `tag-preferred` | Monthly-first, region-first, vendor-class-first setups | Choose a preferred tag, then order fallback |
+| `manual-sticky` | Debugging or strict manual selection | Pick one active provider |
+
+`on_exhausted` controls what happens after the preferred set is known to be depleted:
+
+| Value | Behavior |
+| --- | --- |
+| `continue` | Continue into the remaining fallback order. Best for availability. |
+| `stop` | Stop after preferred providers are exhausted. Best for budget isolation. |
+
+codex-helper does not infer billing class from names. If a provider is monthly, tag it explicitly:
+
+```toml
+tags = { billing = "monthly" }
+```
+
+## Provider Fields
+
+Common provider fields:
 
 | Field | Meaning | Recommendation |
 | --- | --- | --- |
-| `base_url` | Main OpenAI-compatible endpoint | Use this for single-endpoint providers. |
-| `auth_token_env` | Environment variable for bearer auth | Prefer this over inline secrets. |
-| `api_key_env` | Environment variable for `X-API-Key` auth | Use only for providers that require it. |
-| `tags` | Free-form provider metadata | Use clear tags such as `billing`, `vendor`, `region`. |
-| `enabled` | Whether the provider is routeable | Use `provider disable` instead of deleting providers temporarily. |
-| `supported_models` | Optional model allowlist | Advanced; leave empty unless the relay is model-limited. |
-| `model_mapping` | Optional model name translation | Advanced; use only when a relay needs aliases. |
+| `alias` | Human-friendly display name | Optional |
+| `base_url` | OpenAI-compatible endpoint | Use for single-endpoint providers |
+| `auth_token_env` | Environment variable for bearer auth | Preferred for secrets |
+| `auth_token` | Inline bearer token | Supported, but avoid committing it |
+| `api_key_env` | Environment variable for `X-API-Key` auth | Use only when required |
+| `api_key` | Inline `X-API-Key` value | Supported, but avoid committing it |
+| `tags` | Free-form metadata | Use stable tags like `billing`, `vendor`, `region` |
+| `enabled` | Whether the provider is routeable | Prefer `provider disable/enable` for temporary changes |
+| `supported_models` | Optional model allowlist | Advanced |
+| `model_mapping` | Optional model alias map | Advanced |
+
+Example with an inline secret:
+
+```toml
+[codex.providers.local_test]
+base_url = "https://test.example/v1"
+auth_token = "sk-..."
+```
+
+Inline secrets are useful for local scratch configs. For real use, prefer environment variables.
 
 ## Profiles
 
-Profiles are optional. Use them when you want named request defaults without changing the routing policy.
+Profiles are optional request defaults. They should not decide provider routing.
 
 ```toml
 [codex]
@@ -100,145 +273,21 @@ extends = "daily"
 reasoning_effort = "high"
 ```
 
-Common fields:
-
-| Field | Meaning | Recommendation |
-| --- | --- | --- |
-| `extends` | Inherit another profile, then override selected fields | Useful for `daily` plus `deep` variants. |
-| `model` | Default model for sessions using the profile | Keep provider capability limits in mind. |
-| `reasoning_effort` | Default reasoning effort | Use Codex-supported values only. |
-| `service_tier` | Default service tier / fast mode intent | Leave empty unless you deliberately want a tier. |
-
-Do not use profile-level provider selection in new v3 config. Legacy profile `station` bindings are migration-only; `routing` is the durable provider-selection surface.
-
-## Routing Policies
-
-### `ordered-failover`
-
-Best for "try this relay first, then this backup".
-
-```toml
-[codex.routing]
-policy = "ordered-failover"
-order = ["monthly", "paygo", "openai"]
-on_exhausted = "continue"
-```
-
-Evaluation:
-
-| Dimension | Result |
-| --- | --- |
-| Clarity | Highest. The file order is the fallback order. |
-| Availability | Good when backups exist. |
-| Cost control | Explicit but not semantic; put cheaper providers first. |
-| UI fit | Very easy: reorder a list. |
-
-Use this as the default unless you need a pinned target or tag preference.
-
-### `manual-sticky`
-
-Best for "do not switch unless I manually change it".
-
-```toml
-[codex.routing]
-policy = "manual-sticky"
-target = "input"
-order = ["input", "openai"]
-```
-
-Evaluation:
-
-| Dimension | Result |
-| --- | --- |
-| Clarity | High. One visible target is active. |
-| Availability | Lower. The pinned target can fail instead of silently moving. |
-| Cost control | High if the target is deliberate. |
-| UI fit | Easy: a provider picker with a clear "pinned" state. |
-
-Use this for debugging, strict vendor selection, or temporary manual steering.
-
-### `tag-preferred`
-
-Best for "prefer all monthly providers, then use backups".
-
-```toml
-[codex.providers.monthly-a]
-base_url = "https://monthly-a.example/v1"
-auth_token_env = "MONTHLY_A_API_KEY"
-tags = { billing = "monthly" }
-
-[codex.providers.monthly-b]
-base_url = "https://monthly-b.example/v1"
-auth_token_env = "MONTHLY_B_API_KEY"
-tags = { billing = "monthly" }
-
-[codex.providers.paygo]
-base_url = "https://paygo.example/v1"
-auth_token_env = "PAYGO_API_KEY"
-tags = { billing = "paygo" }
-
-[codex.routing]
-policy = "tag-preferred"
-prefer_tags = [{ billing = "monthly" }]
-order = ["monthly-a", "monthly-b", "paygo"]
-on_exhausted = "continue"
-```
-
-Evaluation:
-
-| Dimension | Result |
-| --- | --- |
-| Clarity | Good when tags are named honestly. |
-| Availability | Good with `on_exhausted = "continue"`. |
-| Cost control | Stronger than raw order because billing intent is explicit. |
-| UI fit | Good: users choose a tag filter, then reorder fallback. |
-
-Use this for monthly-first or region-first setups. Do not expect codex-helper to infer "monthly" from a provider name or balance API.
-
-## Exhaustion Behavior
-
-`on_exhausted` controls what happens after the preferred routing set is known to be depleted.
-
-```toml
-on_exhausted = "continue"
-```
-
-Use `continue` when availability matters more than strict budget isolation. Known fully exhausted candidates are demoted during automatic routing when their balance adapter is trusted.
-
-```toml
-on_exhausted = "stop"
-```
-
-Use `stop` when you would rather fail than spill into a non-preferred provider, for example monthly-only work.
-
-Balance adapters default to trusting exhausted snapshots for routing. If a provider's balance endpoint is known to return misleading zeroes, set `trust_exhaustion_for_routing = false` in `~/.codex-helper/usage_providers.json`. The raw balance still appears in UI and logs, but it will not demote the route.
+Legacy profile station bindings are migration-only. New v3 configs should use `[codex.routing]`.
 
 ## Balance Adapters
 
-Balance and quota live in a separate local file:
+Most relay users do not need to write `usage_providers.json` just to see balances. If no explicit adapter matches an upstream, codex-helper tries common relay probes:
 
-`~/.codex-helper/usage_providers.json`
+1. `sub2api_usage`: `GET {{base_url}}/v1/usage` with the model API key.
+2. `new_api_user_self`: `GET {{base_url}}/api/user/self` with the model API key.
+3. `openai_balance_http_json`: `GET {{base_url}}/user/balance` with the model API key.
 
-This file describes how codex-helper should fetch provider balance state. Keep it separate from the relay config so provider onboarding stays thin.
+Explicit adapters are still useful when a relay needs dashboard credentials, custom headers, a custom endpoint, or safer exhaustion handling.
 
-Most relay users do not need to create this file just to see a balance. If no configured adapter matches an upstream, codex-helper automatically tries the common relay probes in this order:
+In balance adapter templates, `{{base_url}}` is normalized without a trailing `/v1`. Use `{{upstream_base_url}}` only when a balance endpoint really lives under the same `/v1` prefix as model requests.
 
-1. `sub2api_usage`: `GET {{base_url}}/v1/usage` with the upstream model API key.
-2. `new_api_user_self`: `GET {{base_url}}/api/user/self` with the upstream model API key.
-3. `openai_balance_http_json`: `GET {{base_url}}/user/balance` with the upstream model API key.
-
-The auto probe records only the first usable `ok` or `exhausted` snapshot. Failed guesses are logged but are not surfaced as three separate UI errors. If any configured provider in `usage_providers.json` matches an upstream host, that explicit configuration wins and the auto probe is skipped for that upstream.
-
-Use explicit adapters when a relay needs a custom endpoint, custom headers, dashboard credentials, or `trust_exhaustion_for_routing = false`:
-
-- `sub2api_usage`: Sub2API API-key telemetry, usually `GET {{base_url}}/v1/usage`.
-- `sub2api_auth_me`: Sub2API dashboard JWT account balance, usually `GET {{base_url}}/api/v1/auth/me`.
-- `new_api_user_self`: New API dashboard quota, usually `GET {{base_url}}/api/user/self`.
-- `openai_balance_http_json`: generic OpenAI-compatible relay balance, usually `GET {{base_url}}/user/balance`.
-
-`{{base_url}}` is the upstream URL normalized without a trailing `/v1`. Use `{{upstream_base_url}}` if a relay really exposes its balance endpoint under the same `/v1` prefix as chat/completions.
-
-Sub2API API-key telemetry, modeled after all-api-hub's `/v1/usage` probe. If the upstream already has a configured `auth_token_env`, `token_env` can be omitted and codex-helper will reuse the upstream key:
+Sub2API API-key telemetry:
 
 ```json
 {
@@ -255,27 +304,7 @@ Sub2API API-key telemetry, modeled after all-api-hub's `/v1/usage` probe. If the
 }
 ```
 
-Sub2API dashboard JWT balance:
-
-```json
-{
-  "providers": [
-    {
-      "id": "input-dashboard",
-      "kind": "sub2api_auth_me",
-      "domains": ["ai.input.im"],
-      "token_env": "INPUT_DASHBOARD_JWT",
-      "poll_interval_secs": 60,
-      "refresh_on_request": true,
-      "trust_exhaustion_for_routing": false
-    }
-  ]
-}
-```
-
-For Sub2API, `sub2api_usage` uses the model API key and can expose remaining quota plus aggregate usage when the relay implements `/v1/usage`. `sub2api_auth_me` uses the dashboard JWT, not the model API key, and is mainly useful when you already maintain that credential separately. Because it needs dashboard auth, `sub2api_auth_me` is explicit-only and is not part of the zero-config auto probe. Keep `trust_exhaustion_for_routing = false` if a dashboard endpoint reports misleading zero balances for active subscriptions.
-
-New API-style quota:
+New API dashboard-style quota:
 
 ```json
 {
@@ -297,124 +326,50 @@ New API-style quota:
 }
 ```
 
-For New API, the dashboard access token and `New-Api-User` value are often not the same as the model API key. Keep them in environment variables.
+Important balance behavior:
 
-The generated default file also includes fixed-domain official balance adapters modeled after CC Switch's built-ins: DeepSeek, StepFun, SiliconFlow, OpenRouter, and Novita AI. These are safe as defaults because their domains and account endpoints are unambiguous. Ordinary relays are auto-probed first; add an explicit `sub2api_usage`, `sub2api_auth_me`, or `new_api_user_self` entry only when the default probe order is not correct for that relay.
+- Lookup failure is displayed as `unknown`, not `err`, and is not treated as exhausted.
+- Known exhausted snapshots can demote automatic routing only when `trust_exhaustion_for_routing = true`.
+- If a provider reports misleading zero balances for active subscriptions, set `trust_exhaustion_for_routing = false`.
+- UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh`.
 
-Supported adapter kinds include:
+Common adapter kinds:
 
-- `openai_balance_http_json`
-- `relay_balance_http_json`
 - `sub2api_usage`
-- `sub2api_usage_http_json`
 - `sub2api_auth_me`
 - `new_api_user_self`
+- `openai_balance_http_json`
+- `relay_balance_http_json`
 - `yescode_profile`
 - `budget_http_json`
 
-Useful fields:
+Useful adapter fields:
 
 | Field | Meaning |
 | --- | --- |
-| `domains` | Which relay hosts this adapter should apply to. |
-| `endpoint` | Balance endpoint URL, with optional `{{base_url}}` templating. |
-| `token_env` | Environment variable used for auth. |
-| `poll_interval_secs` | Refresh throttle / cache window. `0` disables automatic refresh. |
-| `refresh_on_request` | Whether routed requests may trigger a balance refresh. |
-| `trust_exhaustion_for_routing` | Whether an exhausted snapshot may demote routing. |
-| `headers` / `variables` | Adapter-specific request templating. |
-| `extract` | JSON path extraction rules for balance fields. |
+| `domains` | Relay hosts this adapter applies to |
+| `endpoint` | Balance endpoint URL, with optional `{{base_url}}` templating |
+| `token_env` | Environment variable used for adapter auth |
+| `headers` / `variables` | Request templating |
+| `poll_interval_secs` | Refresh throttle / cache window |
+| `refresh_on_request` | Whether routed requests may trigger balance refresh |
+| `trust_exhaustion_for_routing` | Whether exhausted snapshots may demote routing |
+| `extract` | JSON path extraction rules for custom balance fields |
 
-Useful `extract` fields:
+## Pricing
 
-| Field | Meaning |
-| --- | --- |
-| `remaining_balance_paths` | Candidate JSON paths for remaining balance. Array indexes are supported, for example `balance_infos.0.total_balance`. |
-| `monthly_budget_paths` / `monthly_spent_paths` | Candidate JSON paths for plan limit and spent amount. |
-| `remaining_divisor` / `monthly_budget_divisor` / `monthly_spent_divisor` | Convert minor units into display units. |
-| `derive_budget_from_remaining_and_spent` | Compute budget as remaining + spent. |
-| `derive_remaining_from_budget_and_spent` | Compute remaining as budget - spent. |
-| `exhausted_paths` | Candidate JSON paths for an explicit exhausted boolean. |
+Pricing is separate from relay config:
 
-Refresh policy:
+- Local overrides: `~/.codex-helper/pricing_overrides.toml`
+- Built-in and synced catalog: rendered by TUI/GUI and used for estimated cost
+- Sync commands:
 
-- request-driven refresh is the default;
-- unmatched relay upstreams are auto-probed after requests and by manual refresh;
-- UI surfaces read cached snapshots only;
-- manual refresh is exposed through `POST /__codex_helper/api/v1/providers/balances/refresh`;
-- if a provider returns misleading zeroes, keep the raw exhausted state visible but set `trust_exhaustion_for_routing = false`.
-
-## Pricing Catalog
-
-Price data is also separate from the relay config.
-
-- local overrides live in `~/.codex-helper/pricing_overrides.toml`
-- the merged catalog is exposed by the proxy and rendered by GUI/TUI
-- `codex-helper pricing sync` and `codex-helper pricing sync-basellm` refresh the local catalog from source-backed inputs
-
-Use price overrides for local corrections or relay-specific multipliers; do not duplicate pricing tables inside the relay config itself.
-
-## Common Recipes
-
-### One Provider
-
-```toml
-version = 3
-
-[codex.providers.main]
-base_url = "https://api.example.com/v1"
-auth_token_env = "MAIN_API_KEY"
-
-[codex.routing]
-policy = "manual-sticky"
-target = "main"
-order = ["main"]
+```bash
+codex-helper pricing sync <URL> --dry-run
+codex-helper pricing sync-basellm --model gpt-5 --dry-run
 ```
 
-### Monthly First, Pay-As-You-Go Fallback
-
-```toml
-version = 3
-
-[codex.providers.monthly]
-base_url = "https://monthly.example/v1"
-auth_token_env = "MONTHLY_API_KEY"
-tags = { billing = "monthly" }
-
-[codex.providers.paygo]
-base_url = "https://paygo.example/v1"
-auth_token_env = "PAYGO_API_KEY"
-tags = { billing = "paygo" }
-
-[codex.routing]
-policy = "tag-preferred"
-prefer_tags = [{ billing = "monthly" }]
-order = ["monthly", "paygo"]
-on_exhausted = "continue"
-```
-
-### Monthly Only, Stop On Exhaustion
-
-```toml
-[codex.routing]
-policy = "tag-preferred"
-prefer_tags = [{ billing = "monthly" }]
-order = ["monthly", "paygo"]
-on_exhausted = "stop"
-```
-
-This keeps `paygo` visible in the file for later use but prevents silent spillover while the stop rule is active.
-
-### Ordered Relay Chain
-
-```toml
-[codex.routing]
-policy = "ordered-failover"
-order = ["work-relay", "personal-relay", "openai"]
-on_exhausted = "continue"
-```
-
-This is the most direct replacement for older "priority level" setups.
+Use pricing overrides for local corrections or relay-specific multipliers. Do not duplicate pricing tables inside provider config.
 
 ## CLI Editing
 
@@ -449,75 +404,61 @@ codex-helper routing show
 codex-helper routing explain
 ```
 
-Rules:
-
-- `provider add` appends new providers to `routing.order`.
-- `routing order a b c` writes an explicit ordered failover chain.
-- `routing pin a` writes `manual-sticky` with target `a`.
-- `routing prefer-tag --tag billing=monthly --order a,b` writes `tag-preferred`.
-- `routing set` is the low-level patch command for advanced edits.
-
 Use `--claude` on provider/routing commands when editing the Claude service instead of Codex.
 
-`routing show` reads the persisted v3 route recipe. `routing list` and `routing explain` read the compiled runtime candidate view.
+`routing show` reads persisted config. `routing list` and `routing explain` read the compiled runtime candidate view.
 
-## GUI And TUI
+## UI Editing
 
-Current UI behavior intentionally separates runtime steering from persisted routing edits.
+TUI and GUI should keep the same mental model as the config file:
 
-- The GUI proxy settings screen accepts v3 routing-first TOML. Legacy station-first files are auto-migrated on load; use `config migrate --dry-run` if you want to inspect the rewrite first.
-- GUI form view can add, edit, enable/disable, tag, and remove common single-endpoint v3 providers. It writes the short inline provider shape and appends new providers to `routing.order`; advanced multi-endpoint providers still belong in raw TOML or CLI commands.
-- GUI form view also includes a v3 routing editor for `policy`, `order`, `target`, `prefer_tags`, and `on_exhausted`, with a static preview of preferred providers and fallback candidates.
-- TUI station switching is runtime-only for legacy station configs. Under v3, provider choice belongs to persisted routing; `p` / `P` / `Enter` route users to the routing editor instead of pinning the internal `routing` station.
-- TUI page 2 becomes `Routing` under v3. It shows real providers, fallback order, provider balance, tags, and enabled state instead of the internal compiled `routing` station.
-- TUI `Routing` page `r` opens the persisted v3 routing editor. It can pin a provider, switch back to ordered failover, reorder `routing.order`, enable or disable a provider, enable monthly-first tag preference, toggle `on_exhausted`, and set/clear the selected provider's `billing` tag.
-- Persistent provider and routing edits should use the TUI routing editor, `provider`, `routing`, or the v3 raw config.
+- Provider list: names, aliases, enabled state, tags, balance, and fallback order.
+- Routing editor: policy, target, order, preferred tags, and exhaustion behavior.
+- Runtime steering: useful for temporary choices, but durable provider intent belongs in `[service.providers]` and `[service.routing]`.
 
 TUI routing editor shortcuts:
 
-- `Enter`: `manual-sticky` pin selected provider.
-- `a`: `ordered-failover` using the visible order.
+- `Enter`: pin selected provider with `manual-sticky`.
+- `a`: switch to `ordered-failover` using the visible order.
 - `[` / `]` or `u` / `d`: move selected provider in `routing.order`.
-- `f`: `tag-preferred` with `prefer_tags = [{ billing = "monthly" }]`.
-- `e`: enable or disable the selected provider. Disabling a pinned `manual-sticky` target also downgrades routing to `ordered-failover`.
+- `f`: enable monthly-first tag preference with `prefer_tags = [{ billing = "monthly" }]`.
+- `e`: enable or disable the selected provider.
 - `s`: toggle `on_exhausted` between `continue` and `stop`.
 - `1` / `2` / `0`: set `billing=monthly`, set `billing=paygo`, or clear `billing`.
 
-This keeps the UI mental model simple: temporary station steering remains runtime-only; durable provider intent lives in `[service.providers]` and `[service.routing]`.
+Advanced multi-endpoint providers, model mappings, and custom balance extraction rules are still best edited with CLI or raw TOML/JSON.
 
-## Migration Notes
+## Migration
 
-`v0.13.0` treats `version = 3` as the public persisted schema. Existing files are migrated automatically the first time they are loaded by the CLI, proxy, GUI, or TUI:
+`v0.13.0` treats `version = 3` as the public persisted schema.
 
-- `version = 3` TOML loads directly.
-- `version = 2` TOML, unversioned legacy TOML, and legacy `config.json` are loaded, compiled, and written back as `config.toml` with `version = 3`.
-- The previous source file is copied to `config.toml.bak` for TOML or `config.json.bak` for JSON before the new v3 file is written.
-- If automatic migration cannot be written, startup continues with the loaded runtime config and logs a warning.
+On load, legacy `version = 2`, unversioned TOML, and legacy `config.json` are migrated to `config.toml` with `version = 3`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
 
-You can still preview the exact migration output before starting the proxy:
+Preview migration before starting the proxy:
 
 ```bash
 codex-helper config migrate --dry-run
 codex-helper config migrate --write --yes
 ```
 
-Migration is intentionally deterministic:
+Migration rules:
 
 - old `active_station` becomes part of the initial routing order;
-- old `level` becomes ordering input only, not a primary authoring knob;
+- old `level` becomes ordering input only;
 - old station/group members flatten into provider entries and `routing.order`;
-- provider tags are preserved;
+- existing provider tags are preserved;
 - business tags such as `billing=monthly` are never guessed;
 - endpoint-scoped station groups may warn because v3 routing is provider-level by default.
 
-After migration, treat `provider` and `routing` as the public write surface.
+After migration, treat provider and routing as the public write surface.
 
 ## Design Boundaries
 
-codex-helper intentionally avoids these patterns:
+codex-helper intentionally avoids:
 
 - one full Codex config per provider;
 - inferring billing class from provider names;
-- making speed or cost balancing primary before real measurements exist;
+- pretending speed-first or cost-first routing is reliable before real measurements exist;
 - keeping `level` as the main user-facing priority control;
+- treating balance lookup failure as provider exhaustion;
 - silently writing legacy station schema from GUI or TUI.
