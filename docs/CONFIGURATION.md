@@ -221,7 +221,15 @@ Balance and quota live in a separate local file:
 
 This file describes how codex-helper should fetch provider balance state. Keep it separate from the relay config so provider onboarding stays thin.
 
-For most relay users, start with one of these adapters:
+Most relay users do not need to create this file just to see a balance. If no configured adapter matches an upstream, codex-helper automatically tries the common relay probes in this order:
+
+1. `sub2api_usage`: `GET {{base_url}}/v1/usage` with the upstream model API key.
+2. `new_api_user_self`: `GET {{base_url}}/api/user/self` with the upstream model API key.
+3. `openai_balance_http_json`: `GET {{base_url}}/user/balance` with the upstream model API key.
+
+The auto probe records only the first usable `ok` or `exhausted` snapshot. Failed guesses are logged but are not surfaced as three separate UI errors. If any configured provider in `usage_providers.json` matches an upstream host, that explicit configuration wins and the auto probe is skipped for that upstream.
+
+Use explicit adapters when a relay needs a custom endpoint, custom headers, dashboard credentials, or `trust_exhaustion_for_routing = false`:
 
 - `sub2api_usage`: Sub2API API-key telemetry, usually `GET {{base_url}}/v1/usage`.
 - `sub2api_auth_me`: Sub2API dashboard JWT account balance, usually `GET {{base_url}}/api/v1/auth/me`.
@@ -265,7 +273,7 @@ Sub2API dashboard JWT balance:
 }
 ```
 
-For Sub2API, `sub2api_usage` uses the model API key and can expose remaining quota plus aggregate usage when the relay implements `/v1/usage`. `sub2api_auth_me` uses the dashboard JWT, not the model API key, and is mainly useful when you already maintain that credential separately. Keep `trust_exhaustion_for_routing = false` if a dashboard endpoint reports misleading zero balances for active subscriptions.
+For Sub2API, `sub2api_usage` uses the model API key and can expose remaining quota plus aggregate usage when the relay implements `/v1/usage`. `sub2api_auth_me` uses the dashboard JWT, not the model API key, and is mainly useful when you already maintain that credential separately. Because it needs dashboard auth, `sub2api_auth_me` is explicit-only and is not part of the zero-config auto probe. Keep `trust_exhaustion_for_routing = false` if a dashboard endpoint reports misleading zero balances for active subscriptions.
 
 New API-style quota:
 
@@ -291,7 +299,7 @@ New API-style quota:
 
 For New API, the dashboard access token and `New-Api-User` value are often not the same as the model API key. Keep them in environment variables.
 
-The generated default file also includes fixed-domain official balance adapters modeled after CC Switch's built-ins: DeepSeek, StepFun, SiliconFlow, OpenRouter, and Novita AI. These are safe as defaults because their domains and account endpoints are unambiguous. For ordinary relays, prefer the explicit `sub2api_usage`, `sub2api_auth_me`, or `new_api_user_self` examples above.
+The generated default file also includes fixed-domain official balance adapters modeled after CC Switch's built-ins: DeepSeek, StepFun, SiliconFlow, OpenRouter, and Novita AI. These are safe as defaults because their domains and account endpoints are unambiguous. Ordinary relays are auto-probed first; add an explicit `sub2api_usage`, `sub2api_auth_me`, or `new_api_user_self` entry only when the default probe order is not correct for that relay.
 
 Supported adapter kinds include:
 
@@ -331,6 +339,7 @@ Useful `extract` fields:
 Refresh policy:
 
 - request-driven refresh is the default;
+- unmatched relay upstreams are auto-probed after requests and by manual refresh;
 - UI surfaces read cached snapshots only;
 - manual refresh is exposed through `POST /__codex_helper/api/v1/providers/balances/refresh`;
 - if a provider returns misleading zeroes, keep the raw exhausted state visible but set `trust_exhaustion_for_routing = false`.

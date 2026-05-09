@@ -223,6 +223,7 @@ Current implementation slice:
 - Projected provider balance snapshots through the dashboard API, local GUI runtime state, attach refresh, and TUI snapshot.
 - Converted PackyCode budget and YesCode profile polling into balance snapshots while keeping quota exhaustion as an LB eligibility flag, not a health failure.
 - Added generic OpenAI/sub2api balance polling plus New API quota polling, with configurable JSON paths, divisors, headers, and endpoint/variable templating for self-hosted relays.
+- Added zero-config relay balance probing for unmatched upstreams: Sub2API `/v1/usage`, New API `/api/user/self`, then generic `/user/balance`, while keeping explicit `usage_providers.json` adapters authoritative.
 - Added balance snapshot summaries to the shared station routing posture DTO so GUI/TUI auto-switch previews can mark `ok`, `exhausted`, `stale`, and `error` balance states in candidate order.
 - Added shared GUI station balance summaries to the Stations list, identity summary, and balance detail section so exhausted/stale/error quota state is visible before drilling into rows.
 - Added TUI balance summaries to the Stations list/detail and Settings overview so operators can inspect balance state and amounts without drilling into logs.

@@ -560,6 +560,8 @@ codex-helper pricing remove custom-codex
 
 ### 用量提供商（Usage Providers）
 
+通常不需要为了常见中转手动配置余额查询。没有显式匹配的 `usage_providers.json` 条目时，codex-helper 会用当前 upstream 的模型 API key 依次尝试 `sub2api_usage` (`/v1/usage`)、`new_api_user_self` (`/api/user/self`) 和 `openai_balance_http_json` (`/user/balance`)，只记录第一个可用结果。显式配置仍然优先，适合自定义接口、额外 header、dashboard JWT 或关闭耗尽路由信任。
+
 路径：`~/.codex-helper/usage_providers.json`，示例：
 
 ```jsonc
@@ -608,10 +610,11 @@ codex-helper pricing remove custom-codex
 行为简述：
 
 - upstream 的 `base_url` host 匹配 `domains` 中任一项，即视为该 provider 的管理对象；
+- 未匹配任何显式 provider 的 upstream 会进入零配置兜底探测：先试 Sub2API `/v1/usage`，再试 New API `/api/user/self`，最后试通用 `/user/balance`；失败探测只写日志，不在 UI 中刷出多条错误余额；
 - 调用 `endpoint` 的认证 token 优先来自 `token_env`，否则尝试使用绑定 upstream 的 `auth.auth_token` / `auth.auth_token_env`（运行时从环境变量解析）；
 - `endpoint` 支持 `{{base_url}}`、`{{upstream_base_url}}`、`{{token}}` / `{{apiKey}}` / `{{accessToken}}`、`{{env:NAME}}` 和 `variables` 模板；`{{base_url}}` 会自动去掉常见的尾部 `/v1`；
 - `sub2api_usage` 适配 all-api-hub 风格的 Sub2API API-key 用量探针：默认请求 `{{base_url}}/v1/usage`，解析 `remaining` 和 `usage.total.cost`；如果 upstream 已配置 `auth_token_env`，可以不写 `token_env`；
-- `sub2api_auth_me` 适配 Sub2API 控制台 JWT：默认请求 `{{base_url}}/api/v1/auth/me`，解析 `data.balance`；这通常不是模型 API key；
+- `sub2api_auth_me` 适配 Sub2API 控制台 JWT：默认请求 `{{base_url}}/api/v1/auth/me`，解析 `data.balance`；这通常不是模型 API key，因此不会参与零配置兜底探测；
 - `openai_balance_http_json` 适配 cc-switch 通用模板：默认请求 `{{base_url}}/user/balance`，解析 `balance`、`remaining`、`credit`、`subscription_balance`、`pay_as_you_go_balance` 等常见字段；
 - `new_api_user_self` 适配 New API：默认请求 `{{base_url}}/api/user/self`，按 cc-switch 模板解析 `data.quota` / `data.used_quota`，默认除以 `500000` 转成 USD；
 - 自研接口可以通过 `extract.remaining_balance_paths`、`extract.monthly_spent_paths`、`extract.monthly_budget_paths`、`extract.exhausted_paths` 和 divisor 字段扩展，不需要改 Rust 代码；

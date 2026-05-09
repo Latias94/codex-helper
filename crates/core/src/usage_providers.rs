@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::balance::ProviderBalanceSnapshot;
+use crate::balance::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
 use crate::config::{ProxyConfig, ServiceConfigManager, proxy_home_dir};
 use crate::lb::LbState;
 use crate::pricing::UsdAmount;
@@ -150,6 +150,12 @@ struct UsageProviderTarget {
     base_url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct UsageProviderTargetKey {
+    station_name: String,
+    upstream_index: usize,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageProviderRefreshSummary {
     pub providers_configured: usize,
@@ -159,6 +165,12 @@ pub struct UsageProviderRefreshSummary {
     pub refreshed: usize,
     pub failed: usize,
     pub missing_token: usize,
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub auto_attempted: usize,
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub auto_refreshed: usize,
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub auto_failed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +197,12 @@ static LAST_USAGE_POLL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::ne
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 // Minimal poll interval per provider to avoid hammering usage APIs.
 const MIN_POLL_INTERVAL_SECS: u64 = 20;
+const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
+const AUTO_PROBE_KINDS: [ProviderKind; 3] = [
+    ProviderKind::Sub2ApiUsage,
+    ProviderKind::NewApiUserSelf,
+    ProviderKind::OpenAiBalanceHttpJson,
+];
 
 fn bool_is_false(value: &bool) -> bool {
     !*value
@@ -192,6 +210,10 @@ fn bool_is_false(value: &bool) -> bool {
 
 fn bool_is_true(value: &bool) -> bool {
     *value
+}
+
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 fn default_refresh_on_request() -> bool {
@@ -268,6 +290,59 @@ fn default_provider_config(
         headers: BTreeMap::new(),
         variables: BTreeMap::new(),
         extract,
+    }
+}
+
+fn host_from_base_url(base_url: &str) -> Option<String> {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+}
+
+fn provider_id_component(value: &str) -> String {
+    let component = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if component.is_empty() {
+        "station".to_string()
+    } else {
+        component
+    }
+}
+
+fn auto_provider_id(target: &UsageProviderTarget) -> String {
+    format!(
+        "{}{}:{}",
+        AUTO_PROVIDER_ID_PREFIX,
+        provider_id_component(&target.upstream.station_name),
+        target.upstream.index
+    )
+}
+
+fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> UsageProviderConfig {
+    UsageProviderConfig {
+        id: auto_provider_id(target),
+        kind,
+        domains: host_from_base_url(&target.base_url)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        endpoint: String::new(),
+        token_env: None,
+        poll_interval_secs: Some(DEFAULT_POLL_INTERVAL_SECS),
+        refresh_on_request: true,
+        trust_exhaustion_for_routing: true,
+        headers: BTreeMap::new(),
+        variables: BTreeMap::new(),
+        extract: UsageProviderExtractConfig::default(),
     }
 }
 
@@ -408,6 +483,58 @@ fn matching_provider_targets(
     }
 
     targets
+}
+
+fn usage_provider_targets(
+    cfg: &ProxyConfig,
+    service_name: &str,
+    station_name_filter: Option<&str>,
+) -> Vec<UsageProviderTarget> {
+    let mut stations: Vec<_> = service_manager(cfg, service_name)
+        .stations()
+        .iter()
+        .collect();
+    stations.sort_by_key(|(name, _)| name.as_str());
+
+    let mut targets = Vec::new();
+    for (station_name, service) in stations {
+        if station_name_filter.is_some_and(|filter| filter != station_name.as_str()) {
+            continue;
+        }
+        for (index, upstream) in service.upstreams.iter().enumerate() {
+            targets.push(UsageProviderTarget {
+                upstream: UpstreamRef {
+                    station_name: station_name.clone(),
+                    index,
+                },
+                base_url: upstream.base_url.clone(),
+            });
+        }
+    }
+
+    targets
+}
+
+fn target_key(target: &UsageProviderTarget) -> UsageProviderTargetKey {
+    UsageProviderTargetKey {
+        station_name: target.upstream.station_name.clone(),
+        upstream_index: target.upstream.index,
+    }
+}
+
+fn configured_target_keys(
+    cfg: &ProxyConfig,
+    service_name: &str,
+    providers: &[UsageProviderConfig],
+    station_name_filter: Option<&str>,
+) -> HashSet<UsageProviderTargetKey> {
+    providers
+        .iter()
+        .flat_map(|provider| {
+            matching_provider_targets(cfg, service_name, provider, station_name_filter)
+        })
+        .map(|target| target_key(&target))
+        .collect()
 }
 
 fn resolve_token(
@@ -1285,6 +1412,88 @@ async fn refresh_provider_target(
     }
 }
 
+fn auto_snapshot_is_usable(snapshot: &ProviderBalanceSnapshot) -> bool {
+    snapshot.error.is_none()
+        && matches!(
+            snapshot.status,
+            BalanceSnapshotStatus::Ok | BalanceSnapshotStatus::Exhausted
+        )
+}
+
+async fn auto_probe_provider_target(
+    client: &Client,
+    target: &UsageProviderTarget,
+    cfg: &ProxyConfig,
+    lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
+    state: &Arc<ProxyState>,
+    service_name: &str,
+) -> UsageProviderRefreshOutcome {
+    let upstreams = vec![target.upstream.clone()];
+    let fetched_at_ms = unix_now_ms();
+    let interval_secs = DEFAULT_POLL_INTERVAL_SECS;
+    let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
+    let first_provider = auto_usage_provider(target, AUTO_PROBE_KINDS[0]);
+
+    let Some(token) = resolve_token(&first_provider, &upstreams, cfg, service_name) else {
+        return UsageProviderRefreshOutcome::MissingToken;
+    };
+
+    let mut last_error: Option<String> = None;
+    for kind in AUTO_PROBE_KINDS {
+        let provider = auto_usage_provider(target, kind);
+        match poll_provider_http_json(client, &provider, &target.base_url, &token).await {
+            Ok(value) => {
+                let snapshot = snapshot_from_provider_json(
+                    &provider,
+                    &upstreams[0],
+                    &value,
+                    fetched_at_ms,
+                    stale_after_ms,
+                );
+                if auto_snapshot_is_usable(&snapshot) {
+                    let exhausted_for_lb = snapshot.routing_exhausted();
+                    update_usage_exhausted(
+                        lb_states,
+                        cfg,
+                        service_name,
+                        &upstreams,
+                        exhausted_for_lb,
+                    );
+                    state
+                        .record_provider_balance_snapshot(service_name, snapshot)
+                        .await;
+                    info!(
+                        "auto usage provider '{}' refreshed {}[{}] via {:?}, exhausted = {}",
+                        provider.id,
+                        target.upstream.station_name,
+                        target.upstream.index,
+                        kind,
+                        exhausted_for_lb
+                    );
+                    return UsageProviderRefreshOutcome::Refreshed;
+                }
+                last_error = snapshot.error.or_else(|| {
+                    Some(format!(
+                        "auto probe {:?} returned no usable balance fields",
+                        kind
+                    ))
+                });
+            }
+            Err(err) => {
+                last_error = Some(err.to_string());
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        warn!(
+            "auto usage provider '{}' found no usable balance endpoint for {}[{}]: {}",
+            first_provider.id, target.upstream.station_name, target.upstream.index, error
+        );
+    }
+    UsageProviderRefreshOutcome::Failed
+}
+
 pub async fn refresh_balances_for_service(
     cfg: Arc<ProxyConfig>,
     lb_states: Arc<Mutex<HashMap<String, LbState>>>,
@@ -1309,9 +1518,16 @@ pub async fn refresh_balances_for_service(
         providers_configured: providers_file.providers.len(),
         ..UsageProviderRefreshSummary::default()
     };
-    if providers_file.providers.is_empty() {
-        return summary;
-    }
+    let configured_keys = if provider_id_filter.is_none() {
+        configured_target_keys(
+            &cfg,
+            service_name,
+            &providers_file.providers,
+            station_name_filter,
+        )
+    } else {
+        HashSet::new()
+    };
 
     let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
     let mut client: Option<Client> = None;
@@ -1360,6 +1576,33 @@ pub async fn refresh_balances_for_service(
         }
     }
 
+    if provider_id_filter.is_none() {
+        for target in usage_provider_targets(&cfg, service_name, station_name_filter) {
+            if configured_keys.contains(&target_key(&target)) {
+                continue;
+            }
+
+            summary.attempted += 1;
+            summary.auto_attempted += 1;
+            let c = client.get_or_insert_with(Client::new);
+            match auto_probe_provider_target(c, &target, &cfg, &lb_states, &state, service_name)
+                .await
+            {
+                UsageProviderRefreshOutcome::Refreshed => {
+                    summary.refreshed += 1;
+                    summary.auto_refreshed += 1;
+                }
+                UsageProviderRefreshOutcome::Failed => {
+                    summary.failed += 1;
+                    summary.auto_failed += 1;
+                }
+                UsageProviderRefreshOutcome::MissingToken => {
+                    summary.missing_token += 1;
+                }
+            }
+        }
+    }
+
     summary
 }
 
@@ -1380,9 +1623,6 @@ pub async fn poll_for_codex_upstream(
     }
 
     let providers_file = load_providers();
-    if providers_file.providers.is_empty() {
-        return;
-    }
 
     // Locate the current upstream once; if it no longer exists, bail out quietly.
     let current_service = match service_manager(&cfg, service_name).station(station_name) {
@@ -1404,11 +1644,13 @@ pub async fn poll_for_codex_upstream(
     let now = Instant::now();
     let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
     let mut client: Option<Client> = None;
+    let mut matched_configured_provider = false;
 
     for provider in providers_file.providers {
         if !domain_matches(&current_target.base_url, &provider.domains) {
             continue;
         }
+        matched_configured_provider = true;
 
         let Some(interval_secs) = effective_poll_interval_secs(&provider) else {
             continue;
@@ -1441,6 +1683,32 @@ pub async fn poll_for_codex_upstream(
         })
         .await;
     }
+
+    if matched_configured_provider {
+        return;
+    }
+
+    let auto_provider = auto_usage_provider(&current_target, AUTO_PROBE_KINDS[0]);
+    let Some(interval_secs) = effective_poll_interval_secs(&auto_provider) else {
+        return;
+    };
+
+    {
+        let mut map = match poll_map.lock() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        if let Some(last) = map.get(&auto_provider.id)
+            && now.duration_since(*last) < Duration::from_secs(interval_secs)
+        {
+            return;
+        }
+        map.insert(auto_provider.id.clone(), now);
+    }
+
+    let c = client.get_or_insert_with(Client::new);
+    let _ = auto_probe_provider_target(c, &current_target, &cfg, &lb_states, &state, service_name)
+        .await;
 }
 
 #[cfg(test)]
@@ -1448,6 +1716,7 @@ mod tests {
     use super::*;
 
     use crate::balance::BalanceSnapshotStatus;
+    use crate::config::{ServiceConfig, UpstreamAuth, UpstreamConfig};
 
     fn provider(id: &str, kind: ProviderKind) -> UsageProviderConfig {
         UsageProviderConfig {
@@ -1470,6 +1739,35 @@ mod tests {
             station_name: "right".to_string(),
             index: 1,
         }
+    }
+
+    fn upstream_config(base_url: &str) -> UpstreamConfig {
+        UpstreamConfig {
+            base_url: base_url.to_string(),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }
+    }
+
+    fn service_config(name: &str, upstreams: Vec<UpstreamConfig>) -> ServiceConfig {
+        ServiceConfig {
+            name: name.to_string(),
+            alias: None,
+            enabled: true,
+            level: 1,
+            upstreams,
+        }
+    }
+
+    fn proxy_config(stations: Vec<ServiceConfig>) -> ProxyConfig {
+        let mut cfg = ProxyConfig::default();
+        cfg.codex.configs = stations
+            .into_iter()
+            .map(|station| (station.name.clone(), station))
+            .collect();
+        cfg
     }
 
     #[test]
@@ -1593,6 +1891,73 @@ mod tests {
 
         provider.refresh_on_request = false;
         assert_eq!(effective_poll_interval_secs(&provider), None);
+    }
+
+    #[test]
+    fn auto_provider_uses_stable_target_id_across_probe_kinds() {
+        let target = UsageProviderTarget {
+            upstream: UpstreamRef {
+                station_name: "input/sub".to_string(),
+                index: 2,
+            },
+            base_url: "https://ai.input.im/v1".to_string(),
+        };
+
+        let sub2api = auto_usage_provider(&target, ProviderKind::Sub2ApiUsage);
+        let newapi = auto_usage_provider(&target, ProviderKind::NewApiUserSelf);
+
+        assert_eq!(sub2api.id, "auto:balance:input-sub:2");
+        assert_eq!(sub2api.id, newapi.id);
+        assert_eq!(sub2api.domains, vec!["ai.input.im".to_string()]);
+        assert_eq!(
+            resolve_endpoint(&sub2api, &target.base_url, "token").unwrap(),
+            "https://ai.input.im/v1/usage"
+        );
+    }
+
+    #[test]
+    fn configured_target_keys_prevent_auto_probe_for_explicit_balance_domains() {
+        let cfg = proxy_config(vec![
+            service_config("explicit", vec![upstream_config("https://example.com/v1")]),
+            service_config("auto", vec![upstream_config("https://ai.input.im/v1")]),
+        ]);
+        let configured = configured_target_keys(
+            &cfg,
+            "codex",
+            &[provider("relay", ProviderKind::OpenAiBalanceHttpJson)],
+            None,
+        );
+        let auto_targets = usage_provider_targets(&cfg, "codex", None)
+            .into_iter()
+            .filter(|target| !configured.contains(&target_key(target)))
+            .map(|target| target.upstream.station_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(auto_targets, vec!["auto".to_string()]);
+    }
+
+    #[test]
+    fn auto_probe_accepts_only_usable_balance_snapshots() {
+        let usable = sub2api_usage_snapshot_from_json(
+            &provider("auto", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": true,
+                "remaining": 1
+            }),
+            100,
+            Some(1_000),
+        );
+        let unusable = balance_http_snapshot_from_json(
+            &provider("auto", ProviderKind::OpenAiBalanceHttpJson),
+            &upstream(),
+            &serde_json::json!({ "ok": true }),
+            100,
+            Some(1_000),
+        );
+
+        assert!(auto_snapshot_is_usable(&usable));
+        assert!(!auto_snapshot_is_usable(&unusable));
     }
 
     #[test]
