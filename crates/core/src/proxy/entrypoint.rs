@@ -10,7 +10,7 @@ use super::provider_execution::{
 };
 use super::request_context::prepare_proxy_request;
 use super::request_failures::finish_failed_proxy_request;
-use super::retry::retry_info_for_observed_attempts;
+use super::retry::retry_info_for_failed_attempts;
 
 #[instrument(skip_all, fields(service = %proxy.service_name))]
 pub async fn handle_proxy(
@@ -68,7 +68,7 @@ pub async fn handle_proxy(
     };
 
     let dur = start.elapsed().as_millis() as u64;
-    let retry = retry_info_for_observed_attempts(&upstream_chain, &route_attempts);
+    let retry = retry_info_for_failed_attempts(&upstream_chain, &route_attempts);
     let (status, msg) = last_err.unwrap_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,

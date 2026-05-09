@@ -96,22 +96,26 @@ pub(super) fn retry_info_for_observed_attempts(
     chain: &[String],
     route_attempts: &[RouteAttemptLog],
 ) -> Option<RetryInfo> {
-    let mut attempts = chain.len() as u32;
-    if !route_attempts.is_empty() {
-        attempts = route_attempts
-            .iter()
-            .filter(|attempt| attempt.decision != "all_upstreams_avoided")
-            .count() as u32;
-    } else if chain
-        .last()
-        .is_some_and(|s| s.starts_with("all_upstreams_avoided"))
-    {
-        attempts = attempts.saturating_sub(1);
-    }
+    retry_info_with_min_attempts(chain, route_attempts, 2)
+}
 
-    if attempts <= 1 {
+pub(super) fn retry_info_for_failed_attempts(
+    chain: &[String],
+    route_attempts: &[RouteAttemptLog],
+) -> Option<RetryInfo> {
+    retry_info_with_min_attempts(chain, route_attempts, 1)
+}
+
+fn retry_info_with_min_attempts(
+    chain: &[String],
+    route_attempts: &[RouteAttemptLog],
+    min_attempts: u32,
+) -> Option<RetryInfo> {
+    let attempts = observed_attempt_count(chain, route_attempts);
+    if attempts < min_attempts {
         return None;
     }
+
     Some(RetryInfo {
         attempts,
         upstream_chain: chain.to_vec(),
@@ -121,6 +125,24 @@ pub(super) fn retry_info_for_observed_attempts(
             route_attempts.to_vec()
         },
     })
+}
+
+fn observed_attempt_count(chain: &[String], route_attempts: &[RouteAttemptLog]) -> u32 {
+    if !route_attempts.is_empty() {
+        return route_attempts
+            .iter()
+            .filter(|attempt| attempt.decision != "all_upstreams_avoided")
+            .count() as u32;
+    }
+
+    let mut attempts = chain.len() as u32;
+    if chain
+        .last()
+        .is_some_and(|s| s.starts_with("all_upstreams_avoided"))
+    {
+        attempts = attempts.saturating_sub(1);
+    }
+    attempts
 }
 
 pub(super) fn should_retry_status(opt: &RetryLayerOptions, status_code: u16) -> bool {
@@ -322,6 +344,26 @@ mod tests {
             "all_upstreams_avoided total=1".to_string(),
         ];
         assert!(retry_info_for_observed_attempts(&chain, &[]).is_none());
+    }
+
+    #[test]
+    fn failed_retry_info_keeps_single_failed_attempt_for_logs() {
+        let chain = vec![
+            "alpha:https://a.example/v1 (idx=0) status=502 class=upstream_server_error model=gpt"
+                .to_string(),
+        ];
+        let info = retry_info_for_failed_attempts(&chain, &[]).unwrap();
+
+        assert_eq!(info.attempts, 1);
+        assert_eq!(info.upstream_chain, chain);
+        assert_eq!(info.route_attempts.len(), 1);
+        assert_eq!(info.route_attempts[0].decision, "failed_status");
+        assert_eq!(info.route_attempts[0].status_code, Some(502));
+    }
+
+    #[test]
+    fn failed_retry_info_is_none_without_any_route_decision() {
+        assert!(retry_info_for_failed_attempts(&[], &[]).is_none());
     }
 
     #[test]

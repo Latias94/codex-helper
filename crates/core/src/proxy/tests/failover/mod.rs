@@ -1370,3 +1370,102 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
     u1_handle.abort();
     u2_handle.abort();
 }
+
+#[tokio::test]
+async fn failed_single_attempt_records_route_attempts_for_logs() {
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "err": "single 502" })),
+            )
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let retry = RetryConfig {
+        upstream: Some(crate::config::RetryLayerConfig {
+            max_attempts: Some(1),
+            backoff_ms: Some(0),
+            backoff_max_ms: Some(0),
+            jitter_ms: Some(0),
+            on_status: Some("502".to_string()),
+            on_class: Some(Vec::new()),
+            strategy: Some(RetryStrategy::SameUpstream),
+        }),
+        provider: Some(crate::config::RetryLayerConfig {
+            max_attempts: Some(1),
+            backoff_ms: Some(0),
+            backoff_max_ms: Some(0),
+            jitter_ms: Some(0),
+            on_status: Some("502".to_string()),
+            on_class: Some(Vec::new()),
+            strategy: Some(RetryStrategy::Failover),
+        }),
+        cloudflare_challenge_cooldown_secs: Some(0),
+        cloudflare_timeout_cooldown_secs: Some(0),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..Default::default()
+    };
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", upstream_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: {
+                let mut tags = HashMap::new();
+                tags.insert("provider_id".to_string(), "solo".to_string());
+                tags
+            },
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = resp.text().await.expect("read body");
+    assert!(
+        body.contains("all upstream attempts failed") && body.contains("single 502"),
+        "expected single-attempt failure summary, got: {body}"
+    );
+
+    let finished = state.list_recent_finished(1).await;
+    let retry = finished
+        .first()
+        .and_then(|request| request.retry.as_ref())
+        .expect("failed single attempt should keep route attempts in request logs");
+    assert_eq!(retry.attempts, 1);
+    assert_eq!(retry.route_attempts.len(), 1);
+    assert_eq!(retry.route_attempts[0].decision, "failed_status");
+    assert_eq!(retry.route_attempts[0].provider_id.as_deref(), Some("solo"));
+    assert_eq!(retry.route_attempts[0].status_code, Some(502));
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
