@@ -375,6 +375,15 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
             .map(|providers| providers.len()),
         Some(2)
     );
+    let input_spec = provider_specs["providers"]
+        .as_array()
+        .and_then(|providers| {
+            providers.iter().find(|provider| {
+                provider.get("name").and_then(|value| value.as_str()) == Some("input")
+            })
+        })
+        .expect("input provider spec");
+    assert_eq!(input_spec["tags"]["billing"].as_str(), Some("monthly"));
 
     let capabilities = client
         .get(format!(
@@ -457,6 +466,31 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         .await
         .expect("enable v3 provider spec send");
     assert_eq!(enable_provider.status(), StatusCode::NO_CONTENT);
+    let after_enable_provider_specs = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v3 provider specs after enable send")
+        .error_for_status()
+        .expect("get v3 provider specs after enable status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v3 provider specs after enable json");
+    let input_after_enable = after_enable_provider_specs["providers"]
+        .as_array()
+        .and_then(|providers| {
+            providers.iter().find(|provider| {
+                provider.get("name").and_then(|value| value.as_str()) == Some("input")
+            })
+        })
+        .expect("input provider after enable");
+    assert_eq!(
+        input_after_enable["tags"]["billing"].as_str(),
+        Some("monthly")
+    );
 
     let set_routing_target = client
         .put(format!(
@@ -511,6 +545,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
             "alias": "Input Relay",
             "enabled": false,
             "auth_token_env": "INPUT_NEXT_KEY",
+            "tags": { "billing": "paygo", "region": "hk" },
             "endpoints": [
                 {
                     "name": "default",
@@ -631,7 +666,11 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
     );
     assert_eq!(
         input.tags.get("billing").map(|value| value.as_str()),
-        Some("monthly")
+        Some("paygo")
+    );
+    assert_eq!(
+        input.tags.get("region").map(|value| value.as_str()),
+        Some("hk")
     );
 
     proxy_handle.abort();

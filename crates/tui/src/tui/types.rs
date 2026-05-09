@@ -37,6 +37,7 @@ pub(in crate::tui) enum Overlay {
     ProfileMenuDefaultPersisted,
     ProviderMenuSession,
     ProviderMenuGlobal,
+    RoutingMenu,
     StationInfo,
     SessionTranscript,
 }

@@ -463,14 +463,24 @@ Use `--claude` on provider/routing commands when editing the Claude service inst
 
 ## GUI And TUI
 
-Current UI behavior intentionally separates runtime controls from file editing.
+Current UI behavior intentionally separates runtime steering from persisted routing edits.
 
 - The GUI proxy settings screen accepts v3 routing-first TOML. Legacy station-first files are auto-migrated on load; use `config migrate --dry-run` if you want to inspect the rewrite first.
 - GUI form view summarizes providers, profiles, and routing; detailed edits currently go through raw TOML or CLI commands.
 - TUI station switching is runtime-only. It pins or clears the active route for the running proxy and does not write the config file.
-- Persistent provider and routing edits should use `provider`, `routing`, or the v3 raw config.
+- TUI `Stations` page `r` opens the persisted v3 routing editor. It can pin a provider, switch back to ordered failover, reorder `routing.order`, enable monthly-first tag preference, toggle `on_exhausted`, and set/clear the selected provider's `billing` tag.
+- Persistent provider and routing edits should use the TUI routing editor, `provider`, `routing`, or the v3 raw config.
 
-This keeps the UI mental model simple: temporary steering happens in runtime controls; durable intent lives in `[service.providers]` and `[service.routing]`.
+TUI routing editor shortcuts:
+
+- `Enter`: `manual-sticky` pin selected provider.
+- `a`: `ordered-failover` using the visible order.
+- `[` / `]` or `u` / `d`: move selected provider in `routing.order`.
+- `f`: `tag-preferred` with `prefer_tags = [{ billing = "monthly" }]`.
+- `s`: toggle `on_exhausted` between `continue` and `stop`.
+- `1` / `2` / `0`: set `billing=monthly`, set `billing=paygo`, or clear `billing`.
+
+This keeps the UI mental model simple: temporary station steering remains runtime-only; durable provider intent lives in `[service.providers]` and `[service.routing]`.
 
 ## Migration Notes
 

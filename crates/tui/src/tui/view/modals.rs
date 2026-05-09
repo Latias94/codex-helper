@@ -8,8 +8,9 @@ use crate::dashboard_core::ControlProfileOption;
 use crate::tui::Language;
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, balance_status_style, compute_window_stats, now_ms, provider_tags_brief,
-    shorten, shorten_middle, station_balance_brief, station_balance_status,
+    Palette, Snapshot, balance_status_style, compute_window_stats, now_ms,
+    provider_balance_compact, provider_tags_brief, shorten, shorten_middle, station_balance_brief,
+    station_balance_status,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{EffortChoice, Overlay, ServiceTierChoice};
@@ -1595,6 +1596,227 @@ pub(super) fn render_provider_modal(
 
     let max = items.len().saturating_sub(1);
     ui.menu_list.select(Some(ui.provider_menu_idx.min(max)));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
+        .highlight_symbol("  ");
+    f.render_stateful_widget(list, area, &mut ui.menu_list);
+}
+
+fn routing_policy_label(policy: crate::config::RoutingPolicyV3) -> &'static str {
+    match policy {
+        crate::config::RoutingPolicyV3::ManualSticky => "manual-sticky",
+        crate::config::RoutingPolicyV3::OrderedFailover => "ordered-failover",
+        crate::config::RoutingPolicyV3::TagPreferred => "tag-preferred",
+    }
+}
+
+fn routing_exhausted_label(action: crate::config::RoutingExhaustedActionV3) -> &'static str {
+    match action {
+        crate::config::RoutingExhaustedActionV3::Continue => "continue",
+        crate::config::RoutingExhaustedActionV3::Stop => "stop",
+    }
+}
+
+fn routing_tags_label(tags: &BTreeMap<String, String>, max_width: usize) -> String {
+    if tags.is_empty() {
+        return "-".to_string();
+    }
+    let parts = tags
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    shorten_middle(&parts.join(" "), max_width)
+}
+
+fn routing_prefer_tags_label(filters: &[BTreeMap<String, String>], max_width: usize) -> String {
+    if filters.is_empty() {
+        return "-".to_string();
+    }
+    let parts = filters
+        .iter()
+        .map(|tags| routing_tags_label(tags, max_width))
+        .collect::<Vec<_>>();
+    shorten_middle(&parts.join(" OR "), max_width)
+}
+
+fn routing_provider_balance_line<'a>(
+    snapshot: &'a Snapshot,
+    provider_name: &str,
+) -> Option<(&'a crate::state::ProviderBalanceSnapshot, String)> {
+    let mut matches = snapshot
+        .provider_balances
+        .values()
+        .flat_map(|balances| balances.iter())
+        .filter(|balance| balance.provider_id == provider_name)
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.upstream_index
+            .cmp(&right.upstream_index)
+            .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
+    });
+    let balance = matches.into_iter().next()?;
+    Some((balance, provider_balance_compact(balance, 38)))
+}
+
+pub(super) fn render_routing_modal(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+) {
+    let area = centered_rect(76, 78, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            "Routing",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let Some(spec) = ui.routing_spec.as_ref() else {
+        let text = Text::from(vec![
+            Line::from("routing spec not loaded"),
+            Line::from(Span::styled(
+                "g refresh   Esc close",
+                Style::default().fg(p.muted),
+            )),
+        ]);
+        f.render_widget(
+            Paragraph::new(text)
+                .block(block)
+                .style(Style::default().fg(p.text))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let order = {
+        let mut order = if spec.order.is_empty() {
+            spec.providers
+                .iter()
+                .map(|provider| provider.name.clone())
+                .collect::<Vec<_>>()
+        } else {
+            spec.order.clone()
+        };
+        for provider in &spec.providers {
+            if !order.iter().any(|name| name == &provider.name) {
+                order.push(provider.name.clone());
+            }
+        }
+        order
+    };
+    let provider_by_name = spec
+        .providers
+        .iter()
+        .map(|provider| (provider.name.as_str(), provider))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut items = Vec::new();
+    items.push(ListItem::new(Text::from(vec![
+        Line::from(vec![
+            Span::styled("policy: ", Style::default().fg(p.muted)),
+            Span::styled(routing_policy_label(spec.policy), Style::default().fg(p.text)),
+            Span::raw("  "),
+            Span::styled("target: ", Style::default().fg(p.muted)),
+            Span::styled(
+                spec.target.as_deref().unwrap_or("-"),
+                Style::default().fg(if spec.target.is_some() { p.accent } else { p.muted }),
+            ),
+            Span::raw("  "),
+            Span::styled("on_exhausted: ", Style::default().fg(p.muted)),
+            Span::styled(routing_exhausted_label(spec.on_exhausted), Style::default().fg(p.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("prefer_tags: ", Style::default().fg(p.muted)),
+            Span::styled(
+                routing_prefer_tags_label(&spec.prefer_tags, 72),
+                Style::default().fg(if spec.prefer_tags.is_empty() {
+                    p.muted
+                } else {
+                    p.accent
+                }),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Enter pin  a ordered  f monthly-first  s stop/continue  [/]/u/d reorder  1 monthly  2 paygo  0 clear billing  g refresh  Esc close",
+            Style::default().fg(p.muted),
+        )),
+    ])));
+
+    for (idx, name) in order.iter().enumerate() {
+        let provider = provider_by_name.get(name.as_str()).copied();
+        let enabled = provider.map(|provider| provider.enabled).unwrap_or(false);
+        let tags = provider
+            .map(|provider| routing_tags_label(&provider.tags, 42))
+            .unwrap_or_else(|| "-".to_string());
+        let alias = provider
+            .and_then(|provider| provider.alias.as_deref())
+            .filter(|alias| !alias.trim().is_empty() && *alias != name)
+            .map(|alias| format!(" ({alias})"))
+            .unwrap_or_default();
+        let marker = if spec.target.as_deref() == Some(name.as_str()) {
+            "PIN"
+        } else if matches!(spec.policy, crate::config::RoutingPolicyV3::TagPreferred)
+            && provider.is_some_and(|provider| {
+                spec.prefer_tags.iter().any(|filter| {
+                    !filter.is_empty()
+                        && filter
+                            .iter()
+                            .all(|(key, value)| provider.tags.get(key) == Some(value))
+                })
+            })
+        {
+            "PREF"
+        } else {
+            "    "
+        };
+        let (balance_style, balance_text) =
+            if let Some((balance, text)) = routing_provider_balance_line(snapshot, name) {
+                (balance_status_style(p, balance.status), text)
+            } else {
+                (Style::default().fg(p.muted), "-".to_string())
+            };
+
+        let mut title_style = Style::default().fg(if enabled { p.text } else { p.muted });
+        if spec.target.as_deref() == Some(name.as_str()) {
+            title_style = title_style.fg(p.accent).add_modifier(Modifier::BOLD);
+        }
+        items.push(
+            ListItem::new(Text::from(vec![
+                Line::from(vec![
+                    Span::styled(format!("{:>2}. ", idx + 1), Style::default().fg(p.muted)),
+                    Span::styled(marker, Style::default().fg(p.accent)),
+                    Span::raw("  "),
+                    Span::styled(format!("{name}{alias}"), title_style),
+                    if enabled {
+                        Span::raw("")
+                    } else {
+                        Span::styled(" [off]", Style::default().fg(p.warn))
+                    },
+                ]),
+                Line::from(vec![
+                    Span::styled("     balance: ", Style::default().fg(p.muted)),
+                    Span::styled(balance_text, balance_style),
+                    Span::raw("  "),
+                    Span::styled("tags: ", Style::default().fg(p.muted)),
+                    Span::styled(tags, Style::default().fg(p.muted)),
+                ]),
+            ]))
+            .style(Style::default().fg(if enabled { p.text } else { p.muted })),
+        );
+    }
+
+    let selected = if order.is_empty() {
+        0
+    } else {
+        ui.routing_menu_idx.min(order.len().saturating_sub(1)) + 1
+    };
+    ui.menu_list.select(Some(selected));
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))

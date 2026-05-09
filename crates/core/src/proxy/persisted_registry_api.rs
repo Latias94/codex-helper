@@ -56,6 +56,8 @@ pub(super) struct PersistedProviderEndpointSpecUpsertRequest {
     enabled: bool,
     #[serde(default)]
     priority: u32,
+    #[serde(default)]
+    tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -69,7 +71,15 @@ pub(super) struct PersistedProviderSpecUpsertRequest {
     #[serde(default)]
     api_key_env: Option<String>,
     #[serde(default)]
+    tags: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
     endpoints: Vec<PersistedProviderEndpointSpecUpsertRequest>,
+}
+
+struct SanitizedPersistedProviderSpec {
+    spec: crate::config::PersistedProviderSpec,
+    tags_provided: bool,
+    endpoint_tags_provided: std::collections::BTreeMap<String, bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -189,6 +199,28 @@ fn normalize_optional_config_string(value: Option<String>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn sanitize_tag_map(
+    tags: std::collections::BTreeMap<String, String>,
+    context: &str,
+) -> Result<std::collections::BTreeMap<String, String>, (StatusCode, String)> {
+    let mut out = std::collections::BTreeMap::new();
+    for (key, value) in tags {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{context} tag key is required"),
+            ));
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        out.insert(key.to_string(), value.to_string());
+    }
+    Ok(out)
+}
+
 fn sanitize_station_spec_request(
     payload: PersistedStationSpecUpsertRequest,
 ) -> Result<crate::config::PersistedStationSpec, (StatusCode, String)> {
@@ -228,8 +260,9 @@ fn sanitize_station_spec_request(
 
 fn sanitize_provider_spec_request(
     payload: PersistedProviderSpecUpsertRequest,
-) -> Result<crate::config::PersistedProviderSpec, (StatusCode, String)> {
+) -> Result<SanitizedPersistedProviderSpec, (StatusCode, String)> {
     let mut endpoints = Vec::new();
+    let mut endpoint_tags_provided = std::collections::BTreeMap::new();
     let mut seen = std::collections::BTreeSet::new();
     for endpoint in payload.endpoints {
         let endpoint_name = endpoint.name.trim();
@@ -252,49 +285,74 @@ fn sanitize_provider_spec_request(
                 format!("duplicate provider endpoint '{}'", endpoint_name),
             ));
         }
+        let tags_provided = endpoint.tags.is_some();
+        let tags = endpoint
+            .tags
+            .map(|tags| sanitize_tag_map(tags, &format!("provider endpoint '{}'", endpoint_name)))
+            .transpose()?
+            .unwrap_or_default();
 
+        endpoint_tags_provided.insert(endpoint_name.to_string(), tags_provided);
         endpoints.push(crate::config::PersistedProviderEndpointSpec {
             name: endpoint_name.to_string(),
             base_url: base_url.to_string(),
             enabled: endpoint.enabled,
             priority: endpoint.priority,
+            tags,
         });
     }
 
-    Ok(crate::config::PersistedProviderSpec {
-        name: String::new(),
-        alias: normalize_optional_config_string(payload.alias),
-        enabled: payload.enabled,
-        auth_token_env: normalize_optional_config_string(payload.auth_token_env),
-        api_key_env: normalize_optional_config_string(payload.api_key_env),
-        endpoints,
+    let tags_provided = payload.tags.is_some();
+    let tags = payload
+        .tags
+        .map(|tags| sanitize_tag_map(tags, "provider"))
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(SanitizedPersistedProviderSpec {
+        spec: crate::config::PersistedProviderSpec {
+            name: String::new(),
+            alias: normalize_optional_config_string(payload.alias),
+            enabled: payload.enabled,
+            auth_token_env: normalize_optional_config_string(payload.auth_token_env),
+            api_key_env: normalize_optional_config_string(payload.api_key_env),
+            tags,
+            endpoints,
+        },
+        tags_provided,
+        endpoint_tags_provided,
     })
 }
 
 fn merge_persisted_provider_spec(
     existing: Option<&crate::config::ProviderConfigV2>,
-    provider: &crate::config::PersistedProviderSpec,
+    provider: &SanitizedPersistedProviderSpec,
 ) -> crate::config::ProviderConfigV2 {
+    let spec = &provider.spec;
     let mut auth = existing
         .map(|provider| provider.auth.clone())
         .unwrap_or_default();
-    auth.auth_token_env = provider.auth_token_env.clone();
-    auth.api_key_env = provider.api_key_env.clone();
+    auth.auth_token_env = spec.auth_token_env.clone();
+    auth.api_key_env = spec.api_key_env.clone();
 
     crate::config::ProviderConfigV2 {
-        alias: provider.alias.clone(),
-        enabled: provider.enabled,
+        alias: spec.alias.clone(),
+        enabled: spec.enabled,
         auth,
-        tags: existing
-            .map(|provider| provider.tags.clone())
-            .unwrap_or_default(),
+        tags: if provider.tags_provided {
+            spec.tags.clone()
+        } else {
+            existing
+                .map(|provider| provider.tags.clone())
+                .unwrap_or_default()
+        },
         supported_models: existing
             .map(|provider| provider.supported_models.clone())
             .unwrap_or_default(),
         model_mapping: existing
             .map(|provider| provider.model_mapping.clone())
             .unwrap_or_default(),
-        endpoints: provider
+        endpoints: spec
             .endpoints
             .iter()
             .map(|endpoint| {
@@ -306,9 +364,18 @@ fn merge_persisted_provider_spec(
                         base_url: endpoint.base_url.clone(),
                         enabled: endpoint.enabled,
                         priority: endpoint.priority,
-                        tags: existing_endpoint
-                            .map(|endpoint| endpoint.tags.clone())
-                            .unwrap_or_default(),
+                        tags: if provider
+                            .endpoint_tags_provided
+                            .get(endpoint.name.as_str())
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            endpoint.tags.clone()
+                        } else {
+                            existing_endpoint
+                                .map(|endpoint| endpoint.tags.clone())
+                                .unwrap_or_default()
+                        },
                         supported_models: existing_endpoint
                             .map(|endpoint| endpoint.supported_models.clone())
                             .unwrap_or_default(),
@@ -338,6 +405,7 @@ fn persisted_provider_spec_from_v3(
             base_url: base_url.to_string(),
             enabled: provider.enabled,
             priority: 0,
+            tags: std::collections::BTreeMap::new(),
         });
     }
     endpoints.extend(provider.endpoints.iter().map(|(endpoint_name, endpoint)| {
@@ -346,6 +414,7 @@ fn persisted_provider_spec_from_v3(
             base_url: endpoint.base_url.clone(),
             enabled: endpoint.enabled,
             priority: endpoint.priority,
+            tags: endpoint.tags.clone(),
         }
     }));
 
@@ -355,6 +424,7 @@ fn persisted_provider_spec_from_v3(
         enabled: provider.enabled,
         auth_token_env: provider.inline_auth.auth_token_env.clone(),
         api_key_env: provider.inline_auth.api_key_env.clone(),
+        tags: provider.tags.clone(),
         endpoints,
     }
 }
@@ -488,24 +558,29 @@ fn v3_default_endpoint_can_be_inlined(existing: Option<&crate::config::ProviderC
 
 fn merge_persisted_provider_spec_v3(
     existing: Option<&crate::config::ProviderConfigV3>,
-    provider: &crate::config::PersistedProviderSpec,
+    provider: &SanitizedPersistedProviderSpec,
 ) -> crate::config::ProviderConfigV3 {
+    let spec = &provider.spec;
     let mut out = crate::config::ProviderConfigV3 {
-        alias: provider.alias.clone(),
-        enabled: provider.enabled,
+        alias: spec.alias.clone(),
+        enabled: spec.enabled,
         base_url: None,
         auth: existing
             .map(|provider| provider.auth.clone())
             .unwrap_or_default(),
         inline_auth: crate::config::UpstreamAuth {
             auth_token: existing.and_then(|provider| provider.inline_auth.auth_token.clone()),
-            auth_token_env: provider.auth_token_env.clone(),
+            auth_token_env: spec.auth_token_env.clone(),
             api_key: existing.and_then(|provider| provider.inline_auth.api_key.clone()),
-            api_key_env: provider.api_key_env.clone(),
+            api_key_env: spec.api_key_env.clone(),
         },
-        tags: existing
-            .map(|provider| provider.tags.clone())
-            .unwrap_or_default(),
+        tags: if provider.tags_provided {
+            spec.tags.clone()
+        } else {
+            existing
+                .map(|provider| provider.tags.clone())
+                .unwrap_or_default()
+        },
         supported_models: existing
             .map(|provider| provider.supported_models.clone())
             .unwrap_or_default(),
@@ -515,14 +590,15 @@ fn merge_persisted_provider_spec_v3(
         endpoints: std::collections::BTreeMap::new(),
     };
 
-    if provider.endpoints.len() == 1
-        && provider.endpoints[0].name == "default"
-        && provider.endpoints[0].priority == 0
+    if spec.endpoints.len() == 1
+        && spec.endpoints[0].name == "default"
+        && spec.endpoints[0].priority == 0
+        && spec.endpoints[0].tags.is_empty()
         && v3_default_endpoint_can_be_inlined(existing)
     {
-        out.base_url = Some(provider.endpoints[0].base_url.clone());
+        out.base_url = Some(spec.endpoints[0].base_url.clone());
     } else {
-        out.endpoints = provider
+        out.endpoints = spec
             .endpoints
             .iter()
             .map(|endpoint| {
@@ -534,9 +610,18 @@ fn merge_persisted_provider_spec_v3(
                         base_url: endpoint.base_url.clone(),
                         enabled: endpoint.enabled,
                         priority: endpoint.priority,
-                        tags: existing_endpoint
-                            .map(|endpoint| endpoint.tags.clone())
-                            .unwrap_or_default(),
+                        tags: if provider
+                            .endpoint_tags_provided
+                            .get(endpoint.name.as_str())
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            endpoint.tags.clone()
+                        } else {
+                            existing_endpoint
+                                .map(|endpoint| endpoint.tags.clone())
+                                .unwrap_or_default()
+                        },
                         supported_models: existing_endpoint
                             .map(|endpoint| endpoint.supported_models.clone())
                             .unwrap_or_default(),
@@ -1049,7 +1134,7 @@ pub(super) async fn upsert_persisted_provider_spec(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let provider_name = sanitize_provider_name(provider_name.as_str())?;
     let mut provider = sanitize_provider_spec_request(payload)?;
-    provider.name = provider_name.clone();
+    provider.spec.name = provider_name.clone();
 
     if let PersistedProxySettingsDocument::V3(mut document) =
         load_persisted_proxy_settings_document().await?
@@ -1064,7 +1149,7 @@ pub(super) async fn upsert_persisted_provider_spec(
         if is_new_provider {
             append_new_provider_to_explicit_v3_order(view, provider_name.as_str());
         }
-        if !provider.enabled
+        if !provider.spec.enabled
             && let Some(routing) = view.routing.as_mut()
             && routing.target.as_deref() == Some(provider_name.as_str())
         {

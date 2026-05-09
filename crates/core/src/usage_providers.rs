@@ -148,6 +148,7 @@ struct UpstreamRef {
 struct UsageProviderTarget {
     upstream: UpstreamRef,
     base_url: String,
+    provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -320,6 +321,14 @@ fn provider_id_component(value: &str) -> String {
 }
 
 fn auto_provider_id(target: &UsageProviderTarget) -> String {
+    if let Some(provider_id) = target
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return provider_id.to_string();
+    }
     format!(
         "{}{}:{}",
         AUTO_PROVIDER_ID_PREFIX,
@@ -477,6 +486,7 @@ fn matching_provider_targets(
                         index,
                     },
                     base_url: upstream.base_url.clone(),
+                    provider_id: upstream.tags.get("provider_id").cloned(),
                 });
             }
         }
@@ -508,6 +518,7 @@ fn usage_provider_targets(
                     index,
                 },
                 base_url: upstream.base_url.clone(),
+                provider_id: upstream.tags.get("provider_id").cloned(),
             });
         }
     }
@@ -1639,6 +1650,7 @@ pub async fn poll_for_codex_upstream(
             index: upstream_index,
         },
         base_url: current_upstream.base_url.clone(),
+        provider_id: current_upstream.tags.get("provider_id").cloned(),
     };
 
     let now = Instant::now();
@@ -1901,6 +1913,7 @@ mod tests {
                 index: 2,
             },
             base_url: "https://ai.input.im/v1".to_string(),
+            provider_id: None,
         };
 
         let sub2api = auto_usage_provider(&target, ProviderKind::Sub2ApiUsage);
@@ -1913,6 +1926,22 @@ mod tests {
             resolve_endpoint(&sub2api, &target.base_url, "token").unwrap(),
             "https://ai.input.im/v1/usage"
         );
+    }
+
+    #[test]
+    fn auto_provider_id_prefers_runtime_provider_tag() {
+        let target = UsageProviderTarget {
+            upstream: UpstreamRef {
+                station_name: "routing".to_string(),
+                index: 0,
+            },
+            base_url: "https://ai.input.im/v1".to_string(),
+            provider_id: Some("input".to_string()),
+        };
+
+        let provider = auto_usage_provider(&target, ProviderKind::Sub2ApiUsage);
+
+        assert_eq!(provider.id, "input");
     }
 
     #[test]

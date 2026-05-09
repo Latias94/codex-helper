@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,9 +26,9 @@ use crate::state::{FinishedRequest, ProxyState, StationHealth, UpstreamHealth};
 
 use super::Language;
 use super::model::{
-    CODEX_RECENT_WINDOWS, ProviderOption, SessionRow, Snapshot, codex_recent_window_label,
-    codex_recent_window_threshold_ms, filtered_request_page_len, filtered_requests_len,
-    find_session_idx, format_age, now_ms, request_matches_page_filters,
+    CODEX_RECENT_WINDOWS, ProviderOption, RoutingSpecView, SessionRow, Snapshot,
+    codex_recent_window_label, codex_recent_window_threshold_ms, filtered_request_page_len,
+    filtered_requests_len, find_session_idx, format_age, now_ms, request_matches_page_filters,
     request_page_focus_session_id, session_row_has_any_override, short_sid,
 };
 use super::report::build_stats_report;
@@ -207,6 +208,7 @@ pub(in crate::tui) async fn handle_key_event(
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             handle_key_provider_menu(&state, providers, ui, snapshot, key).await
         }
+        Overlay::RoutingMenu => handle_key_routing_menu(providers, ui, key).await,
     }
 }
 
@@ -749,6 +751,156 @@ async fn apply_global_station_pin(
         state.clear_global_station_override().await;
     }
     Ok(())
+}
+
+pub(in crate::tui) async fn refresh_routing_control_state(ui: &mut UiState) -> anyhow::Result<()> {
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/__codex_helper/api/v1/routing",
+            ui.admin_port
+        ))
+        .timeout(Duration::from_millis(1200))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RoutingSpecView>()
+        .await?;
+    ui.routing_menu_idx = ui
+        .routing_menu_idx
+        .min(response.providers.len().saturating_sub(1));
+    ui.routing_spec = Some(response);
+    Ok(())
+}
+
+async fn apply_persisted_routing(
+    ui: &mut UiState,
+    mut routing: RoutingSpecView,
+) -> anyhow::Result<()> {
+    routing.providers.clear();
+    let response = reqwest::Client::new()
+        .put(format!(
+            "http://127.0.0.1:{}/__codex_helper/api/v1/routing",
+            ui.admin_port
+        ))
+        .timeout(Duration::from_millis(1500))
+        .json(&routing)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RoutingSpecView>()
+        .await?;
+    ui.routing_menu_idx = ui
+        .routing_menu_idx
+        .min(response.providers.len().saturating_sub(1));
+    ui.routing_spec = Some(response);
+    ui.needs_snapshot_refresh = true;
+    ui.needs_config_refresh = true;
+    Ok(())
+}
+
+async fn load_provider_specs(ui: &UiState) -> anyhow::Result<ProviderSpecsCatalogResponse> {
+    reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/__codex_helper/api/v1/providers/specs",
+            ui.admin_port
+        ))
+        .timeout(Duration::from_millis(1200))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<ProviderSpecsCatalogResponse>()
+        .await
+        .map_err(Into::into)
+}
+
+async fn apply_provider_spec(ui: &UiState, provider: &ProviderSpecPayload) -> anyhow::Result<()> {
+    reqwest::Client::new()
+        .put(format!(
+            "http://127.0.0.1:{}/__codex_helper/api/v1/providers/specs/{}",
+            ui.admin_port,
+            url_path_component(provider.name.as_str())
+        ))
+        .timeout(Duration::from_millis(1500))
+        .json(provider)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+fn url_path_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(*byte));
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+async fn set_provider_billing_tag(
+    ui: &mut UiState,
+    provider_name: &str,
+    billing: Option<&str>,
+) -> anyhow::Result<()> {
+    let catalog = load_provider_specs(ui).await?;
+    let mut provider = catalog
+        .providers
+        .into_iter()
+        .find(|provider| provider.name == provider_name)
+        .ok_or_else(|| anyhow::anyhow!("provider '{provider_name}' not found"))?;
+    match billing {
+        Some(value) => {
+            provider
+                .tags
+                .insert("billing".to_string(), value.to_string());
+        }
+        None => {
+            provider.tags.remove("billing");
+        }
+    }
+    apply_provider_spec(ui, &provider).await?;
+    refresh_routing_control_state(ui).await?;
+    ui.needs_snapshot_refresh = true;
+    ui.needs_config_refresh = true;
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ProviderSpecsCatalogResponse {
+    providers: Vec<ProviderSpecPayload>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ProviderEndpointSpecPayload {
+    name: String,
+    base_url: String,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    priority: u32,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ProviderSpecPayload {
+    name: String,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    auth_token_env: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    #[serde(default)]
+    endpoints: Vec<ProviderEndpointSpecPayload>,
 }
 
 async fn persist_ui_language(language: Language) -> anyhow::Result<()> {
@@ -1406,6 +1558,21 @@ async fn handle_key_normal(
                 }
                 Err(err) => {
                     ui.toast = Some((format!("set global pin failed: {err}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Char('r') if ui.page == Page::Stations => {
+            match refresh_routing_control_state(ui).await {
+                Ok(()) => {
+                    ui.overlay = Overlay::RoutingMenu;
+                    ui.toast = Some((
+                        "routing: edit persisted policy/order".to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("routing: load failed: {err}"), Instant::now()));
                 }
             }
             true
@@ -3027,8 +3194,11 @@ async fn handle_key_profile_menu(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::default_profile_menu_idx;
+    use super::{default_profile_menu_idx, routing_provider_names, routing_spec_with_order};
+    use crate::config::{RoutingExhaustedActionV3, RoutingPolicyV3};
     use crate::dashboard_core::ControlProfileOption;
+    use crate::tui::model::{RoutingProviderRef, RoutingSpecView};
+    use std::collections::BTreeMap;
 
     fn make_profile(name: &str) -> ControlProfileOption {
         ControlProfileOption {
@@ -3063,6 +3233,59 @@ mod tests {
 
         assert_eq!(default_profile_menu_idx(&profiles, None), 1);
         assert_eq!(default_profile_menu_idx(&[], None), 0);
+    }
+
+    #[test]
+    fn routing_provider_names_appends_missing_catalog_entries() {
+        let spec = RoutingSpecView {
+            policy: RoutingPolicyV3::OrderedFailover,
+            order: vec!["backup".to_string()],
+            target: None,
+            prefer_tags: Vec::new(),
+            on_exhausted: RoutingExhaustedActionV3::Continue,
+            providers: vec![
+                RoutingProviderRef {
+                    name: "input".to_string(),
+                    alias: None,
+                    enabled: true,
+                    tags: BTreeMap::new(),
+                },
+                RoutingProviderRef {
+                    name: "backup".to_string(),
+                    alias: None,
+                    enabled: true,
+                    tags: BTreeMap::new(),
+                },
+            ],
+        };
+
+        assert_eq!(routing_provider_names(&spec), vec!["backup", "input"]);
+    }
+
+    #[test]
+    fn routing_spec_with_order_clears_target_for_ordered_policy() {
+        let spec = RoutingSpecView {
+            policy: RoutingPolicyV3::ManualSticky,
+            order: vec!["input".to_string()],
+            target: Some("input".to_string()),
+            prefer_tags: vec![BTreeMap::from([(
+                "billing".to_string(),
+                "monthly".to_string(),
+            )])],
+            on_exhausted: RoutingExhaustedActionV3::Stop,
+            providers: Vec::new(),
+        };
+
+        let next = routing_spec_with_order(
+            &spec,
+            vec!["backup".to_string(), "input".to_string()],
+            RoutingPolicyV3::OrderedFailover,
+        );
+
+        assert_eq!(next.policy, RoutingPolicyV3::OrderedFailover);
+        assert_eq!(next.target, None);
+        assert!(next.prefer_tags.is_empty());
+        assert_eq!(next.order, vec!["backup", "input"]);
     }
 }
 
@@ -3349,6 +3572,249 @@ async fn handle_key_provider_menu(
             }
 
             ui.overlay = Overlay::None;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn routing_provider_names(spec: &RoutingSpecView) -> Vec<String> {
+    let mut names = if spec.order.is_empty() {
+        spec.providers
+            .iter()
+            .map(|provider| provider.name.clone())
+            .collect::<Vec<_>>()
+    } else {
+        spec.order.clone()
+    };
+    for provider in &spec.providers {
+        if !names.iter().any(|name| name == &provider.name) {
+            names.push(provider.name.clone());
+        }
+    }
+    names
+}
+
+fn selected_routing_provider_name(ui: &UiState) -> Option<String> {
+    let spec = ui.routing_spec.as_ref()?;
+    let names = routing_provider_names(spec);
+    names.get(ui.routing_menu_idx).cloned()
+}
+
+fn routing_spec_with_order(
+    spec: &RoutingSpecView,
+    order: Vec<String>,
+    policy: crate::config::RoutingPolicyV3,
+) -> RoutingSpecView {
+    let mut next = spec.clone();
+    next.policy = policy;
+    next.order = order;
+    if !matches!(policy, crate::config::RoutingPolicyV3::ManualSticky) {
+        next.target = None;
+    }
+    if !matches!(policy, crate::config::RoutingPolicyV3::TagPreferred) {
+        next.prefer_tags.clear();
+    }
+    next
+}
+
+async fn handle_key_routing_menu(
+    _providers: &mut [ProviderOption],
+    ui: &mut UiState,
+    key: KeyEvent,
+) -> bool {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('r') => {
+            ui.overlay = Overlay::None;
+            true
+        }
+        KeyCode::Char('g') => {
+            match refresh_routing_control_state(ui).await {
+                Ok(()) => {
+                    ui.toast = Some(("routing: refreshed".to_string(), Instant::now()));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("routing: refresh failed: {err}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.routing_menu_idx = ui.routing_menu_idx.saturating_sub(1);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let max = ui
+                .routing_spec
+                .as_ref()
+                .map(|spec| routing_provider_names(spec).len().saturating_sub(1))
+                .unwrap_or(0);
+            ui.routing_menu_idx = (ui.routing_menu_idx + 1).min(max);
+            true
+        }
+        KeyCode::Char('[') | KeyCode::Char('u') => {
+            let Some(spec) = ui.routing_spec.clone() else {
+                return true;
+            };
+            let mut order = routing_provider_names(&spec);
+            if ui.routing_menu_idx == 0 || ui.routing_menu_idx >= order.len() {
+                return true;
+            }
+            order.swap(ui.routing_menu_idx, ui.routing_menu_idx - 1);
+            ui.routing_menu_idx = ui.routing_menu_idx.saturating_sub(1);
+            let next = routing_spec_with_order(
+                &spec,
+                order,
+                crate::config::RoutingPolicyV3::OrderedFailover,
+            );
+            match apply_persisted_routing(ui, next).await {
+                Ok(()) => ui.toast = Some(("routing: moved up".to_string(), Instant::now())),
+                Err(err) => {
+                    ui.toast = Some((format!("routing: move failed: {err}"), Instant::now()))
+                }
+            }
+            true
+        }
+        KeyCode::Char(']') | KeyCode::Char('d') => {
+            let Some(spec) = ui.routing_spec.clone() else {
+                return true;
+            };
+            let mut order = routing_provider_names(&spec);
+            if ui.routing_menu_idx + 1 >= order.len() {
+                return true;
+            }
+            order.swap(ui.routing_menu_idx, ui.routing_menu_idx + 1);
+            ui.routing_menu_idx += 1;
+            let next = routing_spec_with_order(
+                &spec,
+                order,
+                crate::config::RoutingPolicyV3::OrderedFailover,
+            );
+            match apply_persisted_routing(ui, next).await {
+                Ok(()) => ui.toast = Some(("routing: moved down".to_string(), Instant::now())),
+                Err(err) => {
+                    ui.toast = Some((format!("routing: move failed: {err}"), Instant::now()))
+                }
+            }
+            true
+        }
+        KeyCode::Enter => {
+            let Some(spec) = ui.routing_spec.clone() else {
+                return true;
+            };
+            let Some(target) = selected_routing_provider_name(ui) else {
+                return true;
+            };
+            let mut next = spec.clone();
+            next.policy = crate::config::RoutingPolicyV3::ManualSticky;
+            next.target = Some(target.clone());
+            next.order = routing_provider_names(&spec);
+            next.prefer_tags.clear();
+            match apply_persisted_routing(ui, next).await {
+                Ok(()) => {
+                    ui.toast = Some((format!("routing: pinned {target}"), Instant::now()));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("routing: pin failed: {err}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Char('a') => {
+            let Some(spec) = ui.routing_spec.clone() else {
+                return true;
+            };
+            let order = routing_provider_names(&spec);
+            let next = routing_spec_with_order(
+                &spec,
+                order,
+                crate::config::RoutingPolicyV3::OrderedFailover,
+            );
+            match apply_persisted_routing(ui, next).await {
+                Ok(()) => {
+                    ui.toast = Some(("routing: ordered-failover".to_string(), Instant::now()));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("routing: apply failed: {err}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Char('f') => {
+            let Some(spec) = ui.routing_spec.clone() else {
+                return true;
+            };
+            let mut next = spec.clone();
+            next.policy = crate::config::RoutingPolicyV3::TagPreferred;
+            next.order = routing_provider_names(&spec);
+            next.target = None;
+            next.prefer_tags = vec![BTreeMap::from([(
+                "billing".to_string(),
+                "monthly".to_string(),
+            )])];
+            match apply_persisted_routing(ui, next).await {
+                Ok(()) => {
+                    ui.toast = Some((
+                        "routing: prefer billing=monthly".to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("routing: apply failed: {err}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Char('s') => {
+            let Some(spec) = ui.routing_spec.clone() else {
+                return true;
+            };
+            let mut next = spec.clone();
+            next.on_exhausted = match spec.on_exhausted {
+                crate::config::RoutingExhaustedActionV3::Continue => {
+                    crate::config::RoutingExhaustedActionV3::Stop
+                }
+                crate::config::RoutingExhaustedActionV3::Stop => {
+                    crate::config::RoutingExhaustedActionV3::Continue
+                }
+            };
+            match apply_persisted_routing(ui, next).await {
+                Ok(()) => {
+                    let label = match ui.routing_spec.as_ref().map(|spec| spec.on_exhausted) {
+                        Some(crate::config::RoutingExhaustedActionV3::Continue) => "continue",
+                        Some(crate::config::RoutingExhaustedActionV3::Stop) => "stop",
+                        None => "-",
+                    };
+                    ui.toast = Some((format!("routing: on_exhausted={label}"), Instant::now()));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("routing: apply failed: {err}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Char('1') | KeyCode::Char('2') | KeyCode::Char('0') => {
+            let Some(provider_name) = selected_routing_provider_name(ui) else {
+                return true;
+            };
+            let value = match key.code {
+                KeyCode::Char('1') => Some("monthly"),
+                KeyCode::Char('2') => Some("paygo"),
+                KeyCode::Char('0') => None,
+                _ => unreachable!(),
+            };
+            match set_provider_billing_tag(ui, provider_name.as_str(), value).await {
+                Ok(()) => {
+                    let label = value.unwrap_or("<clear>");
+                    ui.toast = Some((
+                        format!("provider {provider_name}: billing={label}"),
+                        Instant::now(),
+                    ));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("provider tag failed: {err}"), Instant::now()));
+                }
+            }
             true
         }
         _ => false,

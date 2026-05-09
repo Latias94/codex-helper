@@ -9,7 +9,7 @@ use crate::sessions::{
 use std::collections::HashMap;
 
 use super::Language;
-use super::model::{Snapshot, filtered_requests_len};
+use super::model::{RoutingSpecView, Snapshot, filtered_requests_len};
 use super::types::{Focus, Overlay, Page, StatsFocus};
 
 #[derive(Debug, Clone)]
@@ -60,6 +60,8 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_tier_menu_idx: usize,
     pub(in crate::tui) profile_menu_idx: usize,
     pub(in crate::tui) provider_menu_idx: usize,
+    pub(in crate::tui) routing_menu_idx: usize,
+    pub(in crate::tui) routing_spec: Option<RoutingSpecView>,
     pub(in crate::tui) session_model_options: Vec<String>,
     pub(in crate::tui) session_model_input: String,
     pub(in crate::tui) session_model_input_hint: Option<String>,
@@ -75,6 +77,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_stats_station_idx: usize,
     pub(in crate::tui) selected_stats_provider_idx: usize,
     pub(in crate::tui) needs_snapshot_refresh: bool,
+    pub(in crate::tui) needs_config_refresh: bool,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
     pub(in crate::tui) codex_history_sessions: Vec<SessionSummary>,
     pub(in crate::tui) codex_history_error: Option<String>,
@@ -145,6 +148,8 @@ impl Default for UiState {
             service_tier_menu_idx: 0,
             profile_menu_idx: 0,
             provider_menu_idx: 0,
+            routing_menu_idx: 0,
+            routing_spec: None,
             session_model_options: Vec::new(),
             session_model_input: String::new(),
             session_model_input_hint: None,
@@ -160,6 +165,7 @@ impl Default for UiState {
             selected_stats_station_idx: 0,
             selected_stats_provider_idx: 0,
             needs_snapshot_refresh: false,
+            needs_config_refresh: false,
             toast: None,
             codex_history_sessions: Vec::new(),
             codex_history_error: None,

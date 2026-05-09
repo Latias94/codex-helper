@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,6 +35,41 @@ pub struct ProviderOption {
     pub level: u8,
     pub active: bool,
     pub upstreams: Vec<UpstreamSummary>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+pub(in crate::tui) struct RoutingProviderRef {
+    pub(in crate::tui) name: String,
+    #[serde(default)]
+    pub(in crate::tui) alias: Option<String>,
+    #[serde(default)]
+    pub(in crate::tui) enabled: bool,
+    #[serde(default)]
+    pub(in crate::tui) tags: BTreeMap<String, String>,
+}
+
+fn default_tui_routing_policy() -> crate::config::RoutingPolicyV3 {
+    crate::config::RoutingPolicyV3::OrderedFailover
+}
+
+fn default_tui_routing_on_exhausted() -> crate::config::RoutingExhaustedActionV3 {
+    crate::config::RoutingExhaustedActionV3::Continue
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub(in crate::tui) struct RoutingSpecView {
+    #[serde(default = "default_tui_routing_policy")]
+    pub(in crate::tui) policy: crate::config::RoutingPolicyV3,
+    #[serde(default)]
+    pub(in crate::tui) order: Vec<String>,
+    #[serde(default)]
+    pub(in crate::tui) target: Option<String>,
+    #[serde(default)]
+    pub(in crate::tui) prefer_tags: Vec<BTreeMap<String, String>>,
+    #[serde(default = "default_tui_routing_on_exhausted")]
+    pub(in crate::tui) on_exhausted: crate::config::RoutingExhaustedActionV3,
+    #[serde(default)]
+    pub(in crate::tui) providers: Vec<RoutingProviderRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -26,6 +26,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::watch;
 
 use crate::config::ProxyConfig;
+use crate::config::storage::load_config;
 use crate::state::ProxyState;
 
 use self::model::{Palette, now_ms, refresh_snapshot};
@@ -144,6 +145,7 @@ pub async fn run_dashboard(
 
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
 
+    let mut cfg = cfg;
     let mut snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
     let mut providers = providers;
     ui.clamp_selection(&snapshot, providers.len());
@@ -238,6 +240,22 @@ pub async fn run_dashboard(
                     Event::Key(key) if input::should_accept_key_event(&key) => {
                         let before_surface = RenderSurfaceKey::capture(&ui);
                         if input::handle_key_event(state.clone(), &mut providers, &mut ui, &snapshot, key).await {
+                            if ui.needs_config_refresh {
+                                match load_config().await {
+                                    Ok(new_cfg) => {
+                                        cfg = Arc::new(new_cfg);
+                                        providers = build_provider_options(&cfg, service_name);
+                                        ui.clamp_selection(&snapshot, providers.len());
+                                    }
+                                    Err(err) => {
+                                        ui.toast = Some((
+                                            format!("config refresh failed: {err}"),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
+                                ui.needs_config_refresh = false;
+                            }
                             if ui.needs_snapshot_refresh {
                                 snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
                                 ui.clamp_selection(&snapshot, providers.len());

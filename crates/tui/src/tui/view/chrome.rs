@@ -576,8 +576,8 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Stations => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  i 详情  Enter 设为全局 pin  Backspace 清除  o 会话站点 override  O 清除  h 检查  H 全部检查  c 取消  C 全部取消  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  i details  Enter set global pin  Backspace clear  o session station override  O clear  h check  H check all  c cancel  C cancel all  ? help",
+                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r routing  i 详情  Enter 全局 pin  Backspace 清除  o 会话站点 override  O 清除  h/H 检查  c/C 取消  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ select  r routing  i details  Enter global pin  Backspace clear  o session station override  O clear  h/H check  c/C cancel  ? help",
             ),
             Page::Requests => crate::tui::i18n::pick(
                 ui.language,
@@ -667,6 +667,11 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ui.language,
             "↑/↓ 选择  Enter 应用  Esc 取消",
             "↑/↓ select  Enter apply  Esc cancel",
+        ),
+        Overlay::RoutingMenu => crate::tui::i18n::pick(
+            ui.language,
+            "↑/↓ 选择  Enter pin  a 顺序  f 包月优先  s 耗尽策略  []/u/d 重排  1/2/0 billing tag  g 刷新  Esc 关闭",
+            "↑/↓ select  Enter pin  a ordered  f monthly-first  s exhausted action  []/u/d reorder  1/2/0 billing tag  g refresh  Esc close",
         ),
         Overlay::StationInfo => crate::tui::i18n::pick(
             ui.language,

@@ -253,11 +253,25 @@ Use `routing list` / `routing explain` to inspect the compiled runtime view:
 - The old `station` CLI surface has been removed from the public command tree.
 - `level` is a legacy migration source; provider priority is `routing.order`.
 
+## TUI Editing Notes
+
+The TUI `Stations` page exposes a v3 routing editor with `r`.
+
+- `Enter` pins the selected provider with `manual-sticky`.
+- `a` returns to `ordered-failover`.
+- `[` / `]` and `u` / `d` reorder `routing.order`.
+- `f` switches to `tag-preferred` with `prefer_tags = [{ billing = "monthly" }]`.
+- `s` toggles `on_exhausted` between `continue` and `stop`.
+- `1`, `2`, and `0` set `billing=monthly`, set `billing=paygo`, or clear the `billing` tag for the selected provider.
+
+This is intentionally a fast common-case editor, not a full TOML editor. Arbitrary provider metadata, endpoint inventory, model support, and auth details remain better suited to the CLI, raw config, or GUI form editor.
+
 ## Control Plane Editing Notes
 
 Local GUI, remote attach clients, and TUI-backed admin flows should edit the same v3 document instead of writing a compacted v2 projection.
 
 - provider spec writes update `[codex.providers.<name>]` directly;
+- provider spec reads/writes preserve and can update provider-level and endpoint-level `tags`;
 - new providers are appended to an existing explicit `codex.routing.order`;
 - `GET /__codex_helper/api/v1/routing` reads the v3 routing block plus provider references;
 - `PUT /__codex_helper/api/v1/routing` is the canonical structured write path for `policy`, `order`, `target`, `prefer_tags`, and `on_exhausted`;

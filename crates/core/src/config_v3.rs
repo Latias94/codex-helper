@@ -80,11 +80,15 @@ fn provider_v3_to_v2(
         anyhow::bail!("[{service_name}] provider '{provider_name}' has no base_url or endpoints");
     }
 
+    let mut tags = provider.tags.clone();
+    tags.entry("provider_id".to_string())
+        .or_insert_with(|| provider_name.to_string());
+
     Ok(ProviderConfigV2 {
         alias: provider.alias.clone(),
         enabled: provider.enabled,
         auth: merge_auth(&provider.auth, &provider.inline_auth),
-        tags: provider.tags.clone(),
+        tags,
         supported_models: provider.supported_models.clone(),
         model_mapping: provider.model_mapping.clone(),
         endpoints,

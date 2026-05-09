@@ -62,5 +62,6 @@ pub(in crate::tui) fn render_app(
             };
             modals::render_provider_modal(f, p, ui, snapshot, providers, title);
         }
+        Overlay::RoutingMenu => modals::render_routing_modal(f, p, ui, snapshot),
     }
 }

@@ -693,6 +693,9 @@ pub(super) fn render_stations_page(
         lines.push(Line::from("  Enter        set global pin"));
         lines.push(Line::from("  Backspace    clear global pin (auto)"));
         lines.push(Line::from(
+            "  r            routing editor (policy/order/tags)",
+        ));
+        lines.push(Line::from(
             "  o            set session override to selected station",
         ));
         lines.push(Line::from("  O            clear session override"));

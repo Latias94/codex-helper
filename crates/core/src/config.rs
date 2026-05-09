@@ -834,6 +834,8 @@ pub struct PersistedProviderEndpointSpec {
         skip_serializing_if = "is_default_provider_endpoint_priority"
     )]
     pub priority: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -847,6 +849,8 @@ pub struct PersistedProviderSpec {
     pub auth_token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<PersistedProviderEndpointSpec>,
 }
