@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,7 +22,9 @@ use crate::sessions::{
     SessionSummary, SessionSummarySource, find_codex_session_file_by_id, read_codex_session_meta,
     read_codex_session_transcript,
 };
-use crate::state::{FinishedRequest, ProxyState, StationHealth, UpstreamHealth};
+use crate::state::{
+    FinishedRequest, ProviderBalanceSnapshot, ProxyState, StationHealth, UpstreamHealth,
+};
 
 use super::Language;
 use super::model::{
@@ -208,7 +210,7 @@ pub(in crate::tui) async fn handle_key_event(
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             handle_key_provider_menu(&state, providers, ui, snapshot, key).await
         }
-        Overlay::RoutingMenu => handle_key_routing_menu(providers, ui, key).await,
+        Overlay::RoutingMenu => handle_key_routing_menu(providers, ui, snapshot, key).await,
     }
 }
 
@@ -773,8 +775,57 @@ pub(in crate::tui) async fn refresh_routing_control_state(ui: &mut UiState) -> a
     Ok(())
 }
 
-async fn open_routing_editor(ui: &mut UiState, reason: &'static str) {
-    let balance_started = request_provider_balance_refresh(ui);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BalanceRefreshMode {
+    Auto,
+    Force,
+}
+
+fn balance_auto_refresh_cooldown(
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    now_ms: u64,
+) -> Option<Duration> {
+    let mut seen = false;
+    let mut all_expired = true;
+
+    for snapshot in provider_balances.values().flatten() {
+        seen = true;
+        let expired = snapshot.stale
+            || snapshot
+                .stale_after_ms
+                .is_some_and(|stale_after_ms| now_ms > stale_after_ms);
+        all_expired &= expired;
+    }
+
+    if !seen {
+        Some(Duration::from_secs(10))
+    } else if all_expired {
+        Some(Duration::from_secs(60))
+    } else {
+        None
+    }
+}
+
+fn should_request_provider_balance_refresh(
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    mode: BalanceRefreshMode,
+    now_ms: u64,
+    last_request_elapsed: Option<Duration>,
+) -> bool {
+    let cooldown = match mode {
+        BalanceRefreshMode::Force => Some(Duration::from_secs(2)),
+        BalanceRefreshMode::Auto => balance_auto_refresh_cooldown(provider_balances, now_ms),
+    };
+
+    let Some(cooldown) = cooldown else {
+        return false;
+    };
+
+    last_request_elapsed.is_none_or(|elapsed| elapsed >= cooldown)
+}
+
+async fn open_routing_editor(ui: &mut UiState, snapshot: &Snapshot, reason: &'static str) {
+    let balance_started = request_provider_balance_refresh(ui, snapshot, BalanceRefreshMode::Auto);
     if ui.page == Page::Stations {
         ui.routing_menu_idx = ui.selected_station_idx;
     }
@@ -796,12 +847,21 @@ async fn open_routing_editor(ui: &mut UiState, reason: &'static str) {
     }
 }
 
-fn request_provider_balance_refresh(ui: &mut UiState) -> bool {
+fn request_provider_balance_refresh(
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    mode: BalanceRefreshMode,
+) -> bool {
     let now = Instant::now();
-    if ui
+    let last_request_elapsed = ui
         .last_balance_refresh_requested_at
-        .is_some_and(|last| now.duration_since(last) < Duration::from_secs(10))
-    {
+        .map(|last| now.duration_since(last));
+    if !should_request_provider_balance_refresh(
+        &snapshot.provider_balances,
+        mode,
+        now_ms(),
+        last_request_elapsed,
+    ) {
         return false;
     }
     ui.last_balance_refresh_requested_at = Some(now);
@@ -1467,7 +1527,7 @@ async fn handle_key_normal(
         }
         KeyCode::Char('i') if ui.page == Page::Stations => {
             if ui.uses_v3_routing() {
-                open_routing_editor(ui, "routing: provider details/edit").await;
+                open_routing_editor(ui, snapshot, "routing: provider details/edit").await;
                 return true;
             }
             ui.overlay = Overlay::StationInfo;
@@ -1626,7 +1686,7 @@ async fn handle_key_normal(
         }
         KeyCode::Enter if ui.page == Page::Stations => {
             if ui.uses_v3_routing() {
-                open_routing_editor(ui, "routing: edit provider policy/order/tags").await;
+                open_routing_editor(ui, snapshot, "routing: edit provider policy/order/tags").await;
                 return true;
             }
             let Some(name) = providers
@@ -1646,7 +1706,7 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('r') if ui.page == Page::Stations => {
-            open_routing_editor(ui, "routing: edit persisted policy/order").await;
+            open_routing_editor(ui, snapshot, "routing: edit persisted policy/order").await;
             true
         }
         KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
@@ -1734,7 +1794,7 @@ async fn handle_key_normal(
                 return true;
             }
             ui.routing_menu_idx = ui.selected_station_idx;
-            let handled = handle_key_routing_menu(providers, ui, key).await;
+            let handled = handle_key_routing_menu(providers, ui, snapshot, key).await;
             ui.selected_station_idx = ui.routing_menu_idx;
             handled
         }
@@ -3083,7 +3143,12 @@ async fn handle_key_normal(
                 return false;
             }
             if ui.uses_v3_routing() {
-                open_routing_editor(ui, "v3 routing is global; editing persisted routing").await;
+                open_routing_editor(
+                    ui,
+                    snapshot,
+                    "v3 routing is global; editing persisted routing",
+                )
+                .await;
                 return true;
             }
             let Some(sid) = snapshot
@@ -3103,14 +3168,17 @@ async fn handle_key_normal(
                 .position(|p| p.name == current)
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            request_provider_balance_refresh(ui);
+            let balance_started =
+                request_provider_balance_refresh(ui, snapshot, BalanceRefreshMode::Auto);
             ui.overlay = Overlay::ProviderMenuSession;
-            ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
+            if balance_started {
+                ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
+            }
             true
         }
         KeyCode::Char('P') => {
             if ui.uses_v3_routing() {
-                open_routing_editor(ui, "routing: edit provider policy/order/tags").await;
+                open_routing_editor(ui, snapshot, "routing: edit provider policy/order/tags").await;
                 return true;
             }
             let current = snapshot
@@ -3123,9 +3191,12 @@ async fn handle_key_normal(
                 .position(|p| p.name == current)
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            request_provider_balance_refresh(ui);
+            let balance_started =
+                request_provider_balance_refresh(ui, snapshot, BalanceRefreshMode::Auto);
             ui.overlay = Overlay::ProviderMenuGlobal;
-            ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
+            if balance_started {
+                ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
+            }
             true
         }
         _ => false,
@@ -3316,13 +3387,15 @@ async fn handle_key_profile_menu(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        default_profile_menu_idx, routing_spec_after_provider_enabled_change,
-        routing_spec_with_order,
+        BalanceRefreshMode, default_profile_menu_idx, routing_spec_after_provider_enabled_change,
+        routing_spec_with_order, should_request_provider_balance_refresh,
     };
     use crate::config::{RoutingExhaustedActionV3, RoutingPolicyV3};
     use crate::dashboard_core::ControlProfileOption;
+    use crate::state::ProviderBalanceSnapshot;
     use crate::tui::model::{RoutingProviderRef, RoutingSpecView, routing_provider_names};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::time::Duration;
 
     fn make_profile(name: &str) -> ControlProfileOption {
         ControlProfileOption {
@@ -3335,6 +3408,95 @@ mod tests {
             fast_mode: false,
             is_default: false,
         }
+    }
+
+    fn balance_snapshot(stale: bool, stale_after_ms: Option<u64>) -> ProviderBalanceSnapshot {
+        ProviderBalanceSnapshot {
+            provider_id: "input".to_string(),
+            station_name: Some("input".to_string()),
+            upstream_index: Some(0),
+            source: "test".to_string(),
+            fetched_at_ms: 100,
+            stale_after_ms,
+            stale,
+            ..ProviderBalanceSnapshot::default()
+        }
+    }
+
+    fn balance_map(
+        snapshot: ProviderBalanceSnapshot,
+    ) -> HashMap<String, Vec<ProviderBalanceSnapshot>> {
+        HashMap::from([("input".to_string(), vec![snapshot])])
+    }
+
+    #[test]
+    fn auto_balance_refresh_requests_when_cache_is_empty() {
+        assert!(should_request_provider_balance_refresh(
+            &HashMap::new(),
+            BalanceRefreshMode::Auto,
+            1_000,
+            None
+        ));
+    }
+
+    #[test]
+    fn auto_balance_refresh_reuses_fresh_cache() {
+        let balances = balance_map(balance_snapshot(false, Some(2_000)));
+
+        assert!(!should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Auto,
+            1_000,
+            None
+        ));
+    }
+
+    #[test]
+    fn auto_balance_refresh_requests_when_all_cached_balances_are_stale() {
+        let balances = balance_map(balance_snapshot(true, Some(500)));
+
+        assert!(should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Auto,
+            1_000,
+            None
+        ));
+        assert!(!should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Auto,
+            1_000,
+            Some(Duration::from_secs(30))
+        ));
+        assert!(should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Auto,
+            1_000,
+            Some(Duration::from_secs(61))
+        ));
+    }
+
+    #[test]
+    fn forced_balance_refresh_bypasses_cache_but_keeps_click_cooldown() {
+        let balances = balance_map(balance_snapshot(false, Some(2_000)));
+
+        assert!(should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Force,
+            1_000,
+            None
+        ));
+        assert!(!should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Force,
+            1_000,
+            Some(Duration::from_secs(1))
+        ));
+        assert!(should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Force,
+            1_000,
+            Some(Duration::from_secs(2))
+        ));
     }
 
     #[test]
@@ -3789,6 +3951,7 @@ fn routing_spec_after_provider_enabled_change(
 async fn handle_key_routing_menu(
     _providers: &mut [ProviderOption],
     ui: &mut UiState,
+    snapshot: &Snapshot,
     key: KeyEvent,
 ) -> bool {
     match key.code {
@@ -3797,7 +3960,8 @@ async fn handle_key_routing_menu(
             true
         }
         KeyCode::Char('g') => {
-            let balance_started = request_provider_balance_refresh(ui);
+            let balance_started =
+                request_provider_balance_refresh(ui, snapshot, BalanceRefreshMode::Force);
             match refresh_routing_control_state(ui).await {
                 Ok(()) => {
                     ui.toast = Some((

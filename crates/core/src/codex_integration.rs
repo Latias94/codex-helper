@@ -10,6 +10,10 @@ use crate::client_config::{
 use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
 use toml::Value;
+use toml_edit::{
+    Document as EditableTomlDocument, Item as EditableTomlItem, Table as EditableTomlTable,
+    Value as EditableTomlValue, value as editable_toml_value,
+};
 
 fn read_config_text(path: &Path) -> Result<String> {
     if !path.exists() {
@@ -24,6 +28,62 @@ fn read_config_text(path: &Path) -> Result<String> {
 
 fn atomic_write(path: &Path, data: &str) -> Result<()> {
     write_text_file(path, data)
+}
+
+fn set_toml_value_preserving_decor(item: &mut EditableTomlItem, mut value: EditableTomlValue) {
+    if let Some(current) = item.as_value_mut() {
+        let decor = current.decor().clone();
+        *value.decor_mut() = decor;
+        *current = value;
+    } else {
+        *item = EditableTomlItem::Value(value);
+    }
+}
+
+fn set_toml_string(table: &mut EditableTomlTable, key: &str, value: impl Into<String>) {
+    let item = table.entry(key).or_insert(EditableTomlItem::None);
+    set_toml_value_preserving_decor(item, EditableTomlValue::from(value.into()));
+}
+
+fn switch_on_codex_toml(text: &str, port: u16) -> Result<String> {
+    let mut doc = if text.trim().is_empty() {
+        EditableTomlDocument::new()
+    } else {
+        text.parse::<EditableTomlDocument>()?
+    };
+    let root = doc.as_table_mut();
+
+    if !root.contains_key("model_providers") {
+        root.insert(
+            "model_providers",
+            EditableTomlItem::Table(EditableTomlTable::new()),
+        );
+    }
+    let providers_table = root
+        .get_mut("model_providers")
+        .and_then(EditableTomlItem::as_table_mut)
+        .ok_or_else(|| anyhow!("model_providers must be a table"))?;
+
+    if !providers_table.contains_key("codex_proxy") {
+        providers_table.insert(
+            "codex_proxy",
+            EditableTomlItem::Table(EditableTomlTable::new()),
+        );
+    }
+    let proxy_table = providers_table
+        .get_mut("codex_proxy")
+        .and_then(EditableTomlItem::as_table_mut)
+        .ok_or_else(|| anyhow!("model_providers.codex_proxy must be a table"))?;
+
+    set_toml_string(proxy_table, "name", "codex-helper");
+    set_toml_string(proxy_table, "base_url", format!("http://127.0.0.1:{port}"));
+    set_toml_string(proxy_table, "wire_api", "responses");
+    if !proxy_table.contains_key("request_max_retries") {
+        proxy_table.insert("request_max_retries", editable_toml_value(0));
+    }
+
+    set_toml_string(root, "model_provider", "codex_proxy");
+    Ok(doc.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -147,42 +207,7 @@ pub fn switch_on(port: u16) -> Result<()> {
     }
 
     let text = read_config_text(&cfg_path)?;
-    let mut table: toml::Table = if text.trim().is_empty() {
-        toml::Table::new()
-    } else {
-        text.parse::<Value>()?
-            .as_table()
-            .cloned()
-            .ok_or_else(|| anyhow!("config.toml root must be table"))?
-    };
-
-    // Ensure [model_providers] table exists.
-    let providers = table
-        .entry("model_providers")
-        .or_insert_with(|| Value::Table(toml::Table::new()));
-
-    let providers_table = providers
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("model_providers must be a table"))?;
-
-    let base_url = format!("http://127.0.0.1:{}", port);
-    let mut proxy_table = providers_table
-        .get("codex_proxy")
-        .and_then(|v| v.as_table())
-        .cloned()
-        .unwrap_or_else(toml::Table::new);
-    proxy_table.insert("name".into(), Value::String("codex-helper".into()));
-    proxy_table.insert("base_url".into(), Value::String(base_url));
-    proxy_table.insert("wire_api".into(), Value::String("responses".into()));
-    // Avoid double-retry (Codex retries + codex-helper retries) by default.
-    proxy_table
-        .entry("request_max_retries")
-        .or_insert(Value::Integer(0));
-
-    providers_table.insert("codex_proxy".into(), Value::Table(proxy_table));
-    table.insert("model_provider".into(), Value::String("codex_proxy".into()));
-
-    let new_text = toml::to_string_pretty(&table)?;
+    let new_text = switch_on_codex_toml(&text, port)?;
     atomic_write(&cfg_path, &new_text)?;
     Ok(())
 }
@@ -559,6 +584,56 @@ mod tests {
 
     fn read_file(path: &Path) -> String {
         std::fs::read_to_string(path).expect("read test file")
+    }
+
+    #[test]
+    fn codex_switch_on_preserves_unrelated_toml_comments_and_fields() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+
+        let original = r#"# top comment
+model_provider = "openai"
+
+[model_providers.openai]
+# keep this comment
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+request_max_retries = 3
+
+[projects."D:\\Work"]
+trust_level = "trusted"
+"#;
+
+        write_file(&cfg_path, original);
+        switch_on(3211).expect("switch_on should preserve editable TOML structure");
+
+        let updated = read_file(&cfg_path);
+        assert!(updated.contains("# top comment"));
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("[model_providers.openai]"));
+        assert!(updated.contains("[projects."));
+        assert!(updated.contains("model_provider = \"codex_proxy\""));
+        assert!(updated.contains("[model_providers.codex_proxy]"));
+        assert!(updated.contains("base_url = \"http://127.0.0.1:3211\""));
+    }
+
+    #[test]
+    fn codex_switch_on_keeps_existing_proxy_retry_setting() {
+        let text = r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "custom"
+base_url = "http://127.0.0.1:1111"
+request_max_retries = 5
+"#;
+
+        let updated = switch_on_codex_toml(text, 3333)
+            .expect("switch_on should update the local proxy provider in place");
+
+        assert!(updated.contains("request_max_retries = 5"));
+        assert!(updated.contains("base_url = \"http://127.0.0.1:3333\""));
+        assert!(updated.contains("name = \"codex-helper\""));
     }
 
     #[test]
