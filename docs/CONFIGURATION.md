@@ -466,7 +466,7 @@ Use `--claude` on provider/routing commands when editing the Claude service inst
 Current UI behavior intentionally separates runtime steering from persisted routing edits.
 
 - The GUI proxy settings screen accepts v3 routing-first TOML. Legacy station-first files are auto-migrated on load; use `config migrate --dry-run` if you want to inspect the rewrite first.
-- GUI form view summarizes providers, profiles, and routing; detailed edits currently go through raw TOML or CLI commands.
+- GUI form view can add, edit, enable/disable, tag, and remove common single-endpoint v3 providers. It writes the short inline provider shape and appends new providers to `routing.order`; advanced multi-endpoint providers still belong in raw TOML or CLI commands.
 - TUI station switching is runtime-only for legacy station configs. Under v3, provider choice belongs to persisted routing; `p` / `P` / `Enter` route users to the routing editor instead of pinning the internal `routing` station.
 - TUI page 2 becomes `Routing` under v3. It shows real providers, fallback order, provider balance, tags, and enabled state instead of the internal compiled `routing` station.
 - TUI `Routing` page `r` opens the persisted v3 routing editor. It can pin a provider, switch back to ordered failover, reorder `routing.order`, enable or disable a provider, enable monthly-first tag preference, toggle `on_exhausted`, and set/clear the selected provider's `billing` tag.

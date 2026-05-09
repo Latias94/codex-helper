@@ -269,6 +269,19 @@ Under v3, provider choice is routing state rather than a station override. The T
 
 This is intentionally a fast common-case editor, not a full TOML editor. Arbitrary provider metadata, endpoint inventory, model support, and auth details remain better suited to the CLI, raw config, or GUI form editor.
 
+## GUI Provider Editing Notes
+
+The GUI proxy settings form exposes a common-case v3 provider editor.
+
+- choose `codex` or `claude`;
+- create a provider with `name`, `base_url`, `auth_token_env` / `api_key_env`, `enabled`, and comma- or newline-separated `tags`;
+- edit the same fields for simple single-endpoint providers;
+- append newly created providers to `routing.order`;
+- clear a disabled `manual-sticky` target back to `ordered-failover`;
+- remove a provider from both `[service.providers]` and `routing.order`.
+
+The form intentionally treats providers with extra `endpoints` or inline secrets as read-only, because rewriting those from a simple form can silently lose advanced intent. Use raw TOML or the CLI for those providers.
+
 ## Control Plane Editing Notes
 
 Local GUI, remote attach clients, and TUI-backed admin flows should edit the same v3 document instead of writing a compacted v2 projection.

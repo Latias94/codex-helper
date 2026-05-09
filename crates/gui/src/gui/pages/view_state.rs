@@ -255,6 +255,7 @@ pub struct ProxySettingsViewState {
     pub(super) working: Option<ProxySettingsWorkingDocument>,
     pub(super) load_error: Option<String>,
     pub(super) import_codex: ImportCodexModalState,
+    pub(super) provider_editor: ProxySettingsProviderEditorState,
 }
 
 impl Default for ProxySettingsViewState {
@@ -264,6 +265,7 @@ impl Default for ProxySettingsViewState {
             working: None,
             load_error: None,
             import_codex: ImportCodexModalState::default(),
+            provider_editor: ProxySettingsProviderEditorState::default(),
         }
     }
 }
@@ -292,6 +294,42 @@ impl Default for ImportCodexModalState {
             force: false,
             preview: None,
             last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ProxySettingsProviderEditorService {
+    #[default]
+    Codex,
+    Claude,
+}
+
+#[derive(Debug)]
+pub(super) struct ProxySettingsProviderEditorState {
+    pub(super) service: ProxySettingsProviderEditorService,
+    pub(super) selected_provider: Option<String>,
+    pub(super) draft_name: String,
+    pub(super) alias: String,
+    pub(super) base_url: String,
+    pub(super) auth_token_env: String,
+    pub(super) api_key_env: String,
+    pub(super) tags: String,
+    pub(super) enabled: bool,
+}
+
+impl Default for ProxySettingsProviderEditorState {
+    fn default() -> Self {
+        Self {
+            service: ProxySettingsProviderEditorService::Codex,
+            selected_provider: None,
+            draft_name: String::new(),
+            alias: String::new(),
+            base_url: String::new(),
+            auth_token_env: String::new(),
+            api_key_env: String::new(),
+            tags: String::new(),
+            enabled: true,
         }
     }
 }

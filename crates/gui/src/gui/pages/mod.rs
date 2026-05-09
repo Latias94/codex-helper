@@ -190,8 +190,8 @@ use session_views::*;
 use view_state::SessionOverrideEditor;
 pub use view_state::ViewState;
 use view_state::{
-    ProxySettingsMode, ProxySettingsWorkingDocument, RequestsViewState, SessionsViewState,
-    StationsRetryEditorState,
+    ProxySettingsMode, ProxySettingsProviderEditorService, ProxySettingsProviderEditorState,
+    ProxySettingsWorkingDocument, RequestsViewState, SessionsViewState, StationsRetryEditorState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

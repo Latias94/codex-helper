@@ -1,10 +1,11 @@
 use super::*;
+use std::collections::BTreeMap;
 
 pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.label(pick(
         ctx.lang,
-        "表单视图现在只保留 v3 配置摘要和导入；复杂结构请直接用“原始”视图编辑。",
-        "Form view now keeps only the v3 summary and Codex import; use Raw for direct edits.",
+        "表单视图可编辑常用 v3 provider；复杂 routing、endpoint、模型映射仍可在“原始”视图中精确编辑。",
+        "Form view edits common v3 providers; use Raw for advanced routing, endpoints, and model mappings.",
     ));
 
     let mut needs_load = ctx.view.proxy_settings.working.is_none();
@@ -125,14 +126,34 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
     ui.separator();
     let lang = ctx.lang;
-    match ctx.view.proxy_settings.working.as_ref() {
-        Some(ProxySettingsWorkingDocument::V3(cfg)) => render_v3_summary(ui, lang, cfg),
+    let mut editor_action = None;
+    match ctx.view.proxy_settings.working.as_mut() {
+        Some(ProxySettingsWorkingDocument::V3(cfg)) => {
+            render_v3_summary(ui, lang, cfg);
+            ui.separator();
+            editor_action = render_v3_provider_editor(
+                ui,
+                lang,
+                cfg,
+                &mut ctx.view.proxy_settings.provider_editor,
+            );
+        }
         None => {
             ui.label(pick(
                 ctx.lang,
                 "未加载设置。你可以切到“原始”视图，或者先从磁盘加载。",
                 "Settings not loaded. Switch to Raw view, or load from disk first.",
             ));
+        }
+    }
+
+    if let Some(action) = editor_action {
+        match action {
+            Ok(message) => persist_current_working_document(ctx, message),
+            Err(err) => {
+                *ctx.last_error = Some(err);
+                *ctx.last_info = None;
+            }
         }
     }
 }
@@ -155,6 +176,57 @@ fn reload_working_document_from_disk(ctx: &mut PageCtx<'_>) {
         Err(err) => {
             ctx.view.proxy_settings.working = None;
             ctx.view.proxy_settings.load_error = Some(format!("read settings failed: {err}"));
+        }
+    }
+}
+
+fn persist_current_working_document(ctx: &mut PageCtx<'_>, message: String) {
+    let Some(doc) = ctx.view.proxy_settings.working.as_ref() else {
+        *ctx.last_error = Some("no loaded settings document to save".to_string());
+        return;
+    };
+
+    match save_proxy_settings_document(ctx.rt, doc) {
+        Ok(()) => {
+            let path = crate::config::config_file_path();
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    *ctx.proxy_settings_text = text.clone();
+                    match parse_proxy_settings_document(&text) {
+                        Ok(doc) => {
+                            ctx.view.proxy_settings.working = Some(doc);
+                            ctx.view.proxy_settings.load_error = None;
+                        }
+                        Err(err) => {
+                            ctx.view.proxy_settings.working = None;
+                            ctx.view.proxy_settings.load_error =
+                                Some(format!("parse failed: {err}"));
+                            *ctx.last_error = Some(format!("re-read parse failed: {err}"));
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    *ctx.last_error = Some(format!("re-read settings failed: {err}"));
+                    return;
+                }
+            }
+
+            if matches!(
+                ctx.proxy.kind(),
+                ProxyModeKind::Running | ProxyModeKind::Attached
+            ) && let Err(err) = ctx.proxy.reload_runtime_config(ctx.rt)
+            {
+                *ctx.last_error = Some(format!("reload runtime failed: {err}"));
+                *ctx.last_info = Some(message);
+                return;
+            }
+
+            *ctx.last_info = Some(message);
+            *ctx.last_error = None;
+        }
+        Err(err) => {
+            *ctx.last_error = Some(format!("save failed: {err}"));
         }
     }
 }
@@ -267,14 +339,207 @@ fn render_v3_summary(ui: &mut egui::Ui, lang: Language, cfg: &crate::config::Pro
     ));
     ui.small(pick(
         lang,
-        "这里不再保留旧的 station/provider 工作区；需要改结构时请直接用“原始”视图。",
-        "The old station/provider workspace has been removed; edit structure directly in Raw.",
+        "Provider 只定义身份、地址、鉴权和标签；实际选择顺序由 routing 决定。",
+        "Providers define identity, endpoint, auth, and tags; routing decides selection order.",
     ));
     ui.add_space(6.0);
 
     render_service_summary(ui, lang, "codex", &cfg.codex);
     ui.add_space(4.0);
     render_service_summary(ui, lang, "claude", &cfg.claude);
+}
+
+fn render_v3_provider_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    cfg: &mut crate::config::ProxyConfigV3,
+    editor: &mut ProxySettingsProviderEditorState,
+) -> Option<Result<String, String>> {
+    ui.heading(pick(lang, "Provider 编辑", "Provider editor"));
+    ui.small(pick(
+        lang,
+        "这是常用单 endpoint provider 的快速表单。新增 provider 会自动加入 routing.order。",
+        "This is a quick editor for common single-endpoint providers. New providers are appended to routing.order.",
+    ));
+    ui.add_space(6.0);
+
+    let previous_service = editor.service;
+    ui.horizontal(|ui| {
+        ui.label(pick(lang, "服务", "Service"));
+        egui::ComboBox::from_id_salt("proxy_settings_provider_service")
+            .selected_text(provider_editor_service_label(lang, editor.service))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut editor.service,
+                    ProxySettingsProviderEditorService::Codex,
+                    "codex",
+                );
+                ui.selectable_value(
+                    &mut editor.service,
+                    ProxySettingsProviderEditorService::Claude,
+                    "claude",
+                );
+            });
+    });
+    if editor.service != previous_service {
+        reset_provider_editor_draft(editor);
+    }
+
+    let provider_names = {
+        let service = select_provider_editor_service(cfg, editor.service);
+        ordered_provider_names_for_editor(service)
+    };
+    if let Some(selected) = editor.selected_provider.as_deref()
+        && !provider_names.iter().any(|name| name == selected)
+    {
+        reset_provider_editor_draft(editor);
+    }
+
+    let mut selection = editor.selected_provider.clone();
+    ui.horizontal(|ui| {
+        ui.label(pick(lang, "Provider", "Provider"));
+        egui::ComboBox::from_id_salt("proxy_settings_provider_selector")
+            .selected_text(
+                selection
+                    .as_deref()
+                    .unwrap_or_else(|| pick(lang, "<新建>", "<new>")),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selection, None, pick(lang, "<新建>", "<new>"));
+                for name in &provider_names {
+                    ui.selectable_value(&mut selection, Some(name.clone()), name);
+                }
+            });
+        if ui.button(pick(lang, "新建", "New")).clicked() {
+            selection = None;
+        }
+    });
+    if selection != editor.selected_provider {
+        load_provider_editor_draft(cfg, editor, selection);
+    }
+
+    let selected_is_advanced = editor
+        .selected_provider
+        .as_deref()
+        .and_then(|name| {
+            select_provider_editor_service(cfg, editor.service)
+                .providers
+                .get(name)
+        })
+        .is_some_and(provider_is_advanced_for_form);
+
+    if selected_is_advanced {
+        ui.colored_label(
+            egui::Color32::from_rgb(200, 120, 40),
+            pick(
+                lang,
+                "此 provider 包含额外 endpoints 或内联密钥；表单只读，避免误删高级配置。请用 Raw 或 CLI 编辑。",
+                "This provider has extra endpoints or inline secrets; the form is read-only to avoid losing advanced config. Use Raw or CLI.",
+            ),
+        );
+    }
+
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(pick(lang, "名称", "Name"));
+            ui.add_enabled(
+                editor.selected_provider.is_none(),
+                egui::TextEdit::singleline(&mut editor.draft_name)
+                    .desired_width(180.0)
+                    .hint_text("input"),
+            );
+            ui.checkbox(&mut editor.enabled, pick(lang, "启用", "Enabled"));
+        });
+        ui.horizontal(|ui| {
+            ui.label("alias");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.alias)
+                    .desired_width(180.0)
+                    .hint_text("Input Relay"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("base_url");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.base_url)
+                    .desired_width(360.0)
+                    .hint_text("https://relay.example.com/v1"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("auth_token_env");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.auth_token_env)
+                    .desired_width(180.0)
+                    .hint_text("INPUT_API_KEY"),
+            );
+            ui.label("api_key_env");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.api_key_env)
+                    .desired_width(180.0)
+                    .hint_text("INPUT_API_KEY"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("tags");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.tags)
+                    .desired_width(420.0)
+                    .hint_text("billing=monthly, vendor=input"),
+            );
+        });
+        ui.small(pick(
+            lang,
+            "tags 使用 key=value，逗号或换行分隔；包月 provider 建议加 billing=monthly。",
+            "Tags use key=value separated by commas or newlines; monthly relays should use billing=monthly.",
+        ));
+    });
+
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                !selected_is_advanced,
+                egui::Button::new(pick(lang, "保存 provider", "Save provider")),
+            )
+            .clicked()
+        {
+            action = Some(save_provider_from_editor(cfg, editor, lang));
+        }
+
+        if let Some(selected) = editor.selected_provider.clone()
+            && ui
+                .button(pick(lang, "删除 provider", "Remove provider"))
+                .clicked()
+        {
+            action = Some(remove_provider_from_editor(
+                cfg,
+                editor,
+                selected.as_str(),
+                lang,
+            ));
+        }
+    });
+
+    let service = select_provider_editor_service(cfg, editor.service);
+    let order_preview = service
+        .routing
+        .as_ref()
+        .map(|routing| {
+            if routing.order.is_empty() {
+                "<provider key order>".to_string()
+            } else {
+                routing.order.join(" -> ")
+            }
+        })
+        .unwrap_or_else(|| "<implicit ordered-failover>".to_string());
+    ui.small(format!(
+        "{}: {}",
+        pick(lang, "当前 fallback 顺序", "Current fallback order"),
+        order_preview
+    ));
+
+    action
 }
 
 fn render_service_summary(
@@ -343,5 +608,388 @@ fn routing_policy_label(policy: crate::config::RoutingPolicyV3) -> &'static str 
         crate::config::RoutingPolicyV3::ManualSticky => "manual-sticky",
         crate::config::RoutingPolicyV3::OrderedFailover => "ordered-failover",
         crate::config::RoutingPolicyV3::TagPreferred => "tag-preferred",
+    }
+}
+
+fn provider_editor_service_label(
+    lang: Language,
+    service: ProxySettingsProviderEditorService,
+) -> &'static str {
+    match service {
+        ProxySettingsProviderEditorService::Codex => "codex",
+        ProxySettingsProviderEditorService::Claude => pick(lang, "claude", "claude"),
+    }
+}
+
+fn select_provider_editor_service(
+    cfg: &crate::config::ProxyConfigV3,
+    service: ProxySettingsProviderEditorService,
+) -> &crate::config::ServiceViewV3 {
+    match service {
+        ProxySettingsProviderEditorService::Codex => &cfg.codex,
+        ProxySettingsProviderEditorService::Claude => &cfg.claude,
+    }
+}
+
+fn select_provider_editor_service_mut(
+    cfg: &mut crate::config::ProxyConfigV3,
+    service: ProxySettingsProviderEditorService,
+) -> &mut crate::config::ServiceViewV3 {
+    match service {
+        ProxySettingsProviderEditorService::Codex => &mut cfg.codex,
+        ProxySettingsProviderEditorService::Claude => &mut cfg.claude,
+    }
+}
+
+fn ordered_provider_names_for_editor(view: &crate::config::ServiceViewV3) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(routing) = view.routing.as_ref() {
+        if matches!(routing.policy, crate::config::RoutingPolicyV3::ManualSticky)
+            && let Some(target) = routing.target.as_deref()
+        {
+            push_provider_name_once(&mut names, view, target);
+        }
+        for name in &routing.order {
+            push_provider_name_once(&mut names, view, name);
+        }
+    }
+    for name in view.providers.keys() {
+        push_provider_name_once(&mut names, view, name);
+    }
+    names
+}
+
+fn push_provider_name_once(
+    names: &mut Vec<String>,
+    view: &crate::config::ServiceViewV3,
+    name: &str,
+) {
+    if view.providers.contains_key(name) && !names.iter().any(|existing| existing == name) {
+        names.push(name.to_string());
+    }
+}
+
+fn reset_provider_editor_draft(editor: &mut ProxySettingsProviderEditorState) {
+    editor.selected_provider = None;
+    editor.draft_name.clear();
+    editor.alias.clear();
+    editor.base_url.clear();
+    editor.auth_token_env.clear();
+    editor.api_key_env.clear();
+    editor.tags.clear();
+    editor.enabled = true;
+}
+
+fn load_provider_editor_draft(
+    cfg: &crate::config::ProxyConfigV3,
+    editor: &mut ProxySettingsProviderEditorState,
+    selection: Option<String>,
+) {
+    editor.selected_provider = selection.clone();
+    let Some(name) = selection else {
+        reset_provider_editor_draft(editor);
+        return;
+    };
+
+    let Some(provider) = select_provider_editor_service(cfg, editor.service)
+        .providers
+        .get(name.as_str())
+    else {
+        reset_provider_editor_draft(editor);
+        return;
+    };
+
+    editor.draft_name = name;
+    editor.alias = provider.alias.clone().unwrap_or_default();
+    editor.base_url = provider.base_url.clone().unwrap_or_default();
+    editor.auth_token_env = provider
+        .inline_auth
+        .auth_token_env
+        .clone()
+        .or_else(|| provider.auth.auth_token_env.clone())
+        .unwrap_or_default();
+    editor.api_key_env = provider
+        .inline_auth
+        .api_key_env
+        .clone()
+        .or_else(|| provider.auth.api_key_env.clone())
+        .unwrap_or_default();
+    editor.tags = format_provider_editor_tags(&provider.tags);
+    editor.enabled = provider.enabled;
+}
+
+fn provider_is_advanced_for_form(provider: &crate::config::ProviderConfigV3) -> bool {
+    !provider.endpoints.is_empty()
+        || provider.inline_auth.auth_token.is_some()
+        || provider.inline_auth.api_key.is_some()
+        || provider.auth.auth_token.is_some()
+        || provider.auth.api_key.is_some()
+}
+
+fn save_provider_from_editor(
+    cfg: &mut crate::config::ProxyConfigV3,
+    editor: &mut ProxySettingsProviderEditorState,
+    lang: Language,
+) -> Result<String, String> {
+    let name = normalize_provider_editor_name(&editor.draft_name)?;
+    let base_url = normalize_required_provider_editor_field(&editor.base_url, "base_url")?;
+    let tags = parse_provider_editor_tags(&editor.tags)?;
+    let selected = editor.selected_provider.clone();
+    let service = select_provider_editor_service_mut(cfg, editor.service);
+
+    if let Some(selected) = selected.as_deref() {
+        if selected != name {
+            return Err("renaming providers is not supported in the form editor; create a new provider instead".to_string());
+        }
+        let Some(existing) = service.providers.get(selected) else {
+            return Err(format!("provider '{selected}' no longer exists"));
+        };
+        if provider_is_advanced_for_form(existing) {
+            return Err(format!(
+                "provider '{selected}' has advanced fields; edit it in Raw or CLI"
+            ));
+        }
+    } else if service.providers.contains_key(name.as_str()) {
+        return Err(format!(
+            "provider '{}' already exists; select it to edit",
+            name
+        ));
+    }
+
+    let mut provider = selected
+        .as_deref()
+        .and_then(|selected| service.providers.get(selected).cloned())
+        .unwrap_or_default();
+    provider.alias = normalize_optional_provider_editor_field(&editor.alias);
+    provider.enabled = editor.enabled;
+    provider.base_url = Some(base_url);
+    provider.auth = crate::config::UpstreamAuth::default();
+    provider.inline_auth = crate::config::UpstreamAuth {
+        auth_token: None,
+        auth_token_env: normalize_optional_provider_editor_field(&editor.auth_token_env),
+        api_key: None,
+        api_key_env: normalize_optional_provider_editor_field(&editor.api_key_env),
+    };
+    provider.tags = tags;
+    service.providers.insert(name.clone(), provider);
+    ensure_provider_editor_routing_order_contains(service, name.as_str());
+    if !editor.enabled {
+        clear_provider_editor_manual_target(service, name.as_str());
+    }
+
+    editor.selected_provider = Some(name.clone());
+    Ok(format!(
+        "{} {} '{}'",
+        pick(lang, "已保存 provider", "Saved provider"),
+        provider_editor_service_label(lang, editor.service),
+        name
+    ))
+}
+
+fn remove_provider_from_editor(
+    cfg: &mut crate::config::ProxyConfigV3,
+    editor: &mut ProxySettingsProviderEditorState,
+    provider_name: &str,
+    lang: Language,
+) -> Result<String, String> {
+    let service = select_provider_editor_service_mut(cfg, editor.service);
+    if service.providers.remove(provider_name).is_none() {
+        return Err(format!("provider '{provider_name}' no longer exists"));
+    }
+    if let Some(routing) = service.routing.as_mut() {
+        routing.order.retain(|name| name != provider_name);
+        if routing.target.as_deref() == Some(provider_name) {
+            routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
+            routing.target = None;
+            routing.prefer_tags.clear();
+            routing.on_exhausted = crate::config::RoutingExhaustedActionV3::Continue;
+        }
+    }
+    reset_provider_editor_draft(editor);
+    Ok(format!(
+        "{} {} '{}'",
+        pick(lang, "已删除 provider", "Removed provider"),
+        provider_editor_service_label(lang, editor.service),
+        provider_name
+    ))
+}
+
+fn ensure_provider_editor_routing_order_contains(
+    service: &mut crate::config::ServiceViewV3,
+    provider_name: &str,
+) {
+    let routing = service
+        .routing
+        .get_or_insert_with(crate::config::RoutingConfigV3::default);
+    if !routing.order.iter().any(|name| name == provider_name) {
+        routing.order.push(provider_name.to_string());
+    }
+}
+
+fn clear_provider_editor_manual_target(
+    service: &mut crate::config::ServiceViewV3,
+    provider_name: &str,
+) {
+    let Some(routing) = service.routing.as_mut() else {
+        return;
+    };
+    if routing.target.as_deref() == Some(provider_name) {
+        routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
+        routing.target = None;
+        routing.prefer_tags.clear();
+        routing.on_exhausted = crate::config::RoutingExhaustedActionV3::Continue;
+    }
+}
+
+fn normalize_provider_editor_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("provider name is required".to_string());
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(
+            "provider name may only contain ASCII letters, numbers, '.', '_' and '-'".to_string(),
+        );
+    }
+    Ok(name.to_string())
+}
+
+fn normalize_required_provider_editor_field(raw: &str, field: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        Err(format!("{field} is required"))
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn normalize_optional_provider_editor_field(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_provider_editor_tags(raw: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut tags = BTreeMap::new();
+    for part in raw.split([',', '\n']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            return Err(format!("tag '{part}' must use KEY=VALUE form"));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            return Err(format!("tag '{part}' has an empty key"));
+        }
+        if value.is_empty() {
+            return Err(format!("tag '{part}' has an empty value"));
+        }
+        if tags.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(format!("duplicate tag key '{key}'"));
+        }
+    }
+    Ok(tags)
+}
+
+fn format_provider_editor_tags(tags: &BTreeMap<String, String>) -> String {
+    tags.iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_editor_tags_parse_comma_and_newline_separated_pairs() {
+        let tags = parse_provider_editor_tags("billing=monthly, vendor=input\nregion=hk")
+            .expect("tags should parse");
+
+        assert_eq!(tags.get("billing").map(String::as_str), Some("monthly"));
+        assert_eq!(tags.get("vendor").map(String::as_str), Some("input"));
+        assert_eq!(tags.get("region").map(String::as_str), Some("hk"));
+    }
+
+    #[test]
+    fn provider_editor_tags_reject_duplicate_keys() {
+        let err = parse_provider_editor_tags("billing=monthly,billing=paygo")
+            .expect_err("duplicate keys should fail");
+
+        assert!(err.contains("duplicate tag key"));
+    }
+
+    #[test]
+    fn provider_editor_save_adds_inline_provider_and_routing_order() {
+        let mut cfg = crate::config::ProxyConfigV3::default();
+        let mut editor = ProxySettingsProviderEditorState {
+            draft_name: "input".to_string(),
+            base_url: "https://ai.input.im/v1".to_string(),
+            auth_token_env: "INPUT_API_KEY".to_string(),
+            tags: "billing=monthly, vendor=input".to_string(),
+            ..ProxySettingsProviderEditorState::default()
+        };
+
+        save_provider_from_editor(&mut cfg, &mut editor, Language::En)
+            .expect("provider should save");
+
+        let provider = cfg.codex.providers.get("input").expect("provider exists");
+        assert_eq!(provider.base_url.as_deref(), Some("https://ai.input.im/v1"));
+        assert_eq!(
+            provider.inline_auth.auth_token_env.as_deref(),
+            Some("INPUT_API_KEY")
+        );
+        assert_eq!(
+            provider.tags.get("billing").map(String::as_str),
+            Some("monthly")
+        );
+        assert_eq!(
+            cfg.codex
+                .routing
+                .as_ref()
+                .map(|routing| routing.order.as_slice()),
+            Some(&["input".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn provider_editor_disable_clears_manual_target() {
+        let mut cfg = crate::config::ProxyConfigV3::default();
+        cfg.codex.providers.insert(
+            "input".to_string(),
+            crate::config::ProviderConfigV3 {
+                base_url: Some("https://ai.input.im/v1".to_string()),
+                ..crate::config::ProviderConfigV3::default()
+            },
+        );
+        cfg.codex.routing = Some(crate::config::RoutingConfigV3 {
+            policy: crate::config::RoutingPolicyV3::ManualSticky,
+            target: Some("input".to_string()),
+            order: vec!["input".to_string()],
+            ..crate::config::RoutingConfigV3::default()
+        });
+        let mut editor = ProxySettingsProviderEditorState {
+            selected_provider: Some("input".to_string()),
+            draft_name: "input".to_string(),
+            base_url: "https://ai.input.im/v1".to_string(),
+            enabled: false,
+            ..ProxySettingsProviderEditorState::default()
+        };
+
+        save_provider_from_editor(&mut cfg, &mut editor, Language::En)
+            .expect("provider should save");
+
+        let routing = cfg.codex.routing.as_ref().expect("routing exists");
+        assert_eq!(
+            routing.policy,
+            crate::config::RoutingPolicyV3::OrderedFailover
+        );
+        assert_eq!(routing.target, None);
     }
 }
