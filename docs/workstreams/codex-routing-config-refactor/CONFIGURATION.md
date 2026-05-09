@@ -255,7 +255,7 @@ Use `routing list` / `routing explain` to inspect the compiled runtime view:
 
 ## TUI Editing Notes
 
-The TUI `Stations` page exposes a v3 routing editor with `r`.
+The TUI `Routing` page exposes a v3 routing editor with `r`.
 
 - `Enter` pins the selected provider with `manual-sticky`.
 - `a` returns to `ordered-failover`.
@@ -265,7 +265,7 @@ The TUI `Stations` page exposes a v3 routing editor with `r`.
 - `s` toggles `on_exhausted` between `continue` and `stop`.
 - `1`, `2`, and `0` set `billing=monthly`, set `billing=paygo`, or clear the `billing` tag for the selected provider.
 
-Under v3, provider choice is routing state rather than a station override. The TUI therefore sends `p` / `P` / `Enter` toward the routing editor and keeps legacy station override shortcuts only for clearing old runtime overrides.
+Under v3, provider choice is routing state rather than a station override. The TUI therefore sends `p` / `P` / `Enter` toward the routing editor, renders page 2 as a routing/provider view, and keeps legacy station override shortcuts only for clearing old runtime overrides.
 
 This is intentionally a fast common-case editor, not a full TOML editor. Arbitrary provider metadata, endpoint inventory, model support, and auth details remain better suited to the CLI, raw config, or GUI form editor.
 

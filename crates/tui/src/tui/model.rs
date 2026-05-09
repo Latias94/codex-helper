@@ -72,6 +72,23 @@ pub(in crate::tui) struct RoutingSpecView {
     pub(in crate::tui) providers: Vec<RoutingProviderRef>,
 }
 
+pub(in crate::tui) fn routing_provider_names(spec: &RoutingSpecView) -> Vec<String> {
+    let mut names = if spec.order.is_empty() {
+        spec.providers
+            .iter()
+            .map(|provider| provider.name.clone())
+            .collect::<Vec<_>>()
+    } else {
+        spec.order.clone()
+    };
+    for provider in &spec.providers {
+        if !names.iter().any(|name| name == &provider.name) {
+            names.push(provider.name.clone());
+        }
+    }
+    names
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) session_id: Option<String>,

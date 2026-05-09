@@ -53,6 +53,7 @@ Acceptance:
 - [x] Show explicit provider tags in the TUI switch menu so tag-preferred routing is inspectable before editing.
 - [x] Add a TUI v3 routing quick editor for pinning, ordered failover, provider enable/disable, monthly tag preference, exhausted behavior, fallback order, and `billing` tags.
 - [x] Retarget legacy TUI station/provider shortcut keys under v3 so provider switching uses routing instead of the internal `routing` station.
+- [x] Render the TUI v3 second page as real provider routing instead of the compiled internal `routing` station.
 - Update the provider editor to prioritize identity, auth, endpoint, and tags.
 - Add a routing editor with policy, order, target, and tag-preference controls.
 - Show a preview of preferred candidates and fallback behavior.

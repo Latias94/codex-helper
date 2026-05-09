@@ -149,7 +149,7 @@ pub async fn run_dashboard(
     let mut cfg = cfg;
     let mut snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
     let mut providers = providers;
-    ui.clamp_selection(&snapshot, providers.len());
+    ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
 
     let mut render_invalidation = RenderInvalidation::FullClear;
     let mut last_drawn_page = ui.page;
@@ -190,7 +190,7 @@ pub async fn run_dashboard(
                 let refresh = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days);
                 if let Ok(new_snapshot) = tokio::time::timeout(io_timeout, refresh).await {
                     snapshot = new_snapshot;
-                    ui.clamp_selection(&snapshot, providers.len());
+                    ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
                 }
                 if ui.page == crate::tui::types::Page::Settings
                     && ui
@@ -222,6 +222,27 @@ pub async fn run_dashboard(
                     }
                     ui.last_runtime_config_refresh_at = Some(Instant::now());
                 }
+                if ui.uses_v3_routing()
+                    && ui.page == crate::tui::types::Page::Stations
+                    && ui
+                        .last_routing_control_refresh_at
+                        .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+                {
+                    let refresh = input::refresh_routing_control_state(&mut ui);
+                    match tokio::time::timeout(io_timeout, refresh).await {
+                        Ok(Ok(())) => {
+                            ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
+                        }
+                        Ok(Err(err)) => {
+                            ui.last_routing_control_refresh_at = Some(Instant::now());
+                            ui.toast =
+                                Some((format!("routing refresh failed: {err}"), Instant::now()));
+                        }
+                        Err(_) => {
+                            ui.last_routing_control_refresh_at = Some(Instant::now());
+                        }
+                    }
+                }
                 request_redraw(&mut render_invalidation);
             }
             changed = shutdown_rx.changed() => {
@@ -247,7 +268,10 @@ pub async fn run_dashboard(
                                         cfg = Arc::new(new_cfg);
                                         ui.config_version = cfg.version;
                                         providers = build_provider_options(&cfg, service_name);
-                                        ui.clamp_selection(&snapshot, providers.len());
+                                        ui.clamp_selection(
+                                            &snapshot,
+                                            ui.station_page_rows_len(providers.len()),
+                                        );
                                     }
                                     Err(err) => {
                                         ui.toast = Some((
@@ -260,7 +284,10 @@ pub async fn run_dashboard(
                             }
                             if ui.needs_snapshot_refresh {
                                 snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
-                                ui.clamp_selection(&snapshot, providers.len());
+                                ui.clamp_selection(
+                                    &snapshot,
+                                    ui.station_page_rows_len(providers.len()),
+                                );
                                 ui.needs_snapshot_refresh = false;
                             }
                             if ui.needs_codex_history_refresh {

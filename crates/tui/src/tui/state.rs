@@ -9,7 +9,7 @@ use crate::sessions::{
 use std::collections::HashMap;
 
 use super::Language;
-use super::model::{RoutingSpecView, Snapshot, filtered_requests_len};
+use super::model::{RoutingSpecView, Snapshot, filtered_requests_len, routing_provider_names};
 use super::types::{Focus, Overlay, Page, StatsFocus};
 
 #[derive(Debug, Clone)]
@@ -63,6 +63,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) provider_menu_idx: usize,
     pub(in crate::tui) routing_menu_idx: usize,
     pub(in crate::tui) routing_spec: Option<RoutingSpecView>,
+    pub(in crate::tui) last_routing_control_refresh_at: Option<std::time::Instant>,
     pub(in crate::tui) session_model_options: Vec<String>,
     pub(in crate::tui) session_model_input: String,
     pub(in crate::tui) session_model_input_hint: Option<String>,
@@ -152,6 +153,7 @@ impl Default for UiState {
             provider_menu_idx: 0,
             routing_menu_idx: 0,
             routing_spec: None,
+            last_routing_control_refresh_at: None,
             session_model_options: Vec::new(),
             session_model_input: String::new(),
             session_model_input_hint: None,
@@ -216,6 +218,17 @@ impl Default for UiState {
 impl UiState {
     pub(in crate::tui) fn uses_v3_routing(&self) -> bool {
         self.config_version == Some(3)
+    }
+
+    pub(in crate::tui) fn station_page_rows_len(&self, legacy_len: usize) -> usize {
+        if self.uses_v3_routing() {
+            return self
+                .routing_spec
+                .as_ref()
+                .map(|spec| routing_provider_names(spec).len())
+                .unwrap_or(legacy_len);
+        }
+        legacy_len
     }
 
     pub(in crate::tui) fn clamp_selection(&mut self, snapshot: &Snapshot, providers_len: usize) {

@@ -793,7 +793,11 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  Clear binding  清除当前会话已存储的 profile 绑定（保留其他会话覆盖）"),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "站点页（Stations）",
+                if is_v3 {
+                    "路由页（Routing）"
+                } else {
+                    "站点页（Stations）"
+                },
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from(if is_v3 {
@@ -942,7 +946,11 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             ),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "Stations page",
+                if is_v3 {
+                    "Routing page"
+                } else {
+                    "Stations page"
+                },
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from(if is_v3 {

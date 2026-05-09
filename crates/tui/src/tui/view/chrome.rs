@@ -105,7 +105,7 @@ fn tab_style(p: Palette, selected: bool) -> Style {
 
 fn header_tabs_line(p: Palette, ui: &UiState, max_width: u16) -> Line<'static> {
     let selected = page_index(ui.page);
-    let titles = page_titles(ui.language);
+    let titles = page_titles(ui.language, ui.uses_v3_routing());
 
     let mut full = Vec::new();
     for (idx, title) in titles.iter().enumerate() {
@@ -208,6 +208,9 @@ pub(super) fn render_header(
     let focus = match ui.focus {
         Focus::Sessions => crate::tui::i18n::pick(ui.language, "会话", "Sessions"),
         Focus::Requests => crate::tui::i18n::pick(ui.language, "请求", "Requests"),
+        Focus::Stations if ui.uses_v3_routing() => {
+            crate::tui::i18n::pick(ui.language, "路由", "Routing")
+        }
         Focus::Stations => crate::tui::i18n::pick(ui.language, "站点", "Stations"),
     };
     let title = if inner.width >= 72 {
@@ -574,6 +577,11 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
                 "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话站点  P 全局 pin  O/H(会话) o/h(请求) 跳转  ? 帮助",
                 "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session station  P global pin  O/H(session) o/h(request) jump  ? help",
             ),
+            Page::Stations if ui.uses_v3_routing() => crate::tui::i18n::pick(
+                ui.language,
+                "1-8 页面  q 退出  L 语言  ↑/↓ provider  r/Enter routing编辑  e 启停  f 包月优先  1/2/0 billing  s 耗尽策略  ? 帮助",
+                "1-8 pages  q quit  L language  ↑/↓ provider  r/Enter routing editor  e enable  f monthly-first  1/2/0 billing  s exhausted action  ? help",
+            ),
             Page::Stations => crate::tui::i18n::pick(
                 ui.language,
                 "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r routing  i 详情  Enter 全局 pin  Backspace 清除  o 会话站点 override  O 清除  h/H 检查  c/C 取消  ? 帮助",
@@ -762,6 +770,20 @@ mod tests {
 
         assert!(line_width(&line) <= 24);
         assert!(line_text(&line).contains("6 Settings"));
+    }
+
+    #[test]
+    fn header_tabs_line_uses_routing_label_for_v3() {
+        let ui = UiState {
+            page: Page::Stations,
+            language: crate::tui::Language::En,
+            config_version: Some(3),
+            ..Default::default()
+        };
+
+        let line = header_tabs_line(Palette::default(), &ui, 80);
+
+        assert!(line_text(&line).contains("2 Routing"));
     }
 
     #[test]

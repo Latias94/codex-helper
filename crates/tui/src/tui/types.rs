@@ -101,10 +101,14 @@ impl ServiceTierChoice {
     }
 }
 
-pub(in crate::tui) fn page_titles(lang: Language) -> [&'static str; 8] {
+pub(in crate::tui) fn page_titles(lang: Language, uses_v3_routing: bool) -> [&'static str; 8] {
     [
         crate::tui::i18n::pick(lang, "1 总览", "1 Dashboard"),
-        crate::tui::i18n::pick(lang, "2 站点", "2 Stations"),
+        if uses_v3_routing {
+            crate::tui::i18n::pick(lang, "2 路由", "2 Routing")
+        } else {
+            crate::tui::i18n::pick(lang, "2 站点", "2 Stations")
+        },
         crate::tui::i18n::pick(lang, "3 会话", "3 Sessions"),
         crate::tui::i18n::pick(lang, "4 请求", "4 Requests"),
         crate::tui::i18n::pick(lang, "5 统计", "5 Stats"),

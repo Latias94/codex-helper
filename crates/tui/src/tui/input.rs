@@ -29,7 +29,7 @@ use super::model::{
     CODEX_RECENT_WINDOWS, ProviderOption, RoutingSpecView, SessionRow, Snapshot,
     codex_recent_window_label, codex_recent_window_threshold_ms, filtered_request_page_len,
     filtered_requests_len, find_session_idx, format_age, now_ms, request_matches_page_filters,
-    request_page_focus_session_id, session_row_has_any_override, short_sid,
+    request_page_focus_session_id, routing_provider_names, session_row_has_any_override, short_sid,
 };
 use super::report::build_stats_report;
 use super::state::{
@@ -767,12 +767,16 @@ pub(in crate::tui) async fn refresh_routing_control_state(ui: &mut UiState) -> a
         .await?;
     ui.routing_menu_idx = ui
         .routing_menu_idx
-        .min(response.providers.len().saturating_sub(1));
+        .min(routing_provider_names(&response).len().saturating_sub(1));
     ui.routing_spec = Some(response);
+    ui.last_routing_control_refresh_at = Some(Instant::now());
     Ok(())
 }
 
 async fn open_routing_editor(ui: &mut UiState, reason: &'static str) {
+    if ui.page == Page::Stations {
+        ui.routing_menu_idx = ui.selected_station_idx;
+    }
     match refresh_routing_control_state(ui).await {
         Ok(()) => {
             ui.overlay = Overlay::RoutingMenu;
@@ -803,8 +807,9 @@ async fn apply_persisted_routing(
         .await?;
     ui.routing_menu_idx = ui
         .routing_menu_idx
-        .min(response.providers.len().saturating_sub(1));
+        .min(routing_provider_names(&response).len().saturating_sub(1));
     ui.routing_spec = Some(response);
+    ui.last_routing_control_refresh_at = Some(Instant::now());
     ui.needs_snapshot_refresh = true;
     ui.needs_config_refresh = true;
     Ok(())
@@ -1430,6 +1435,10 @@ async fn handle_key_normal(
             }
         }
         KeyCode::Char('i') if ui.page == Page::Stations => {
+            if ui.uses_v3_routing() {
+                open_routing_editor(ui, "routing: provider details/edit").await;
+                return true;
+            }
             ui.overlay = Overlay::StationInfo;
             ui.station_info_scroll = 0;
             true
@@ -1462,15 +1471,16 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stations => {
-            if let Some(next) = adjust_table_selection(&mut ui.stations_table, -1, providers.len())
-            {
+            let len = ui.station_page_rows_len(providers.len());
+            if let Some(next) = adjust_table_selection(&mut ui.stations_table, -1, len) {
                 ui.selected_station_idx = next;
                 return true;
             }
             false
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stations => {
-            if let Some(next) = adjust_table_selection(&mut ui.stations_table, 1, providers.len()) {
+            let len = ui.station_page_rows_len(providers.len());
+            if let Some(next) = adjust_table_selection(&mut ui.stations_table, 1, len) {
                 ui.selected_station_idx = next;
                 return true;
             }
@@ -1666,6 +1676,29 @@ async fn handle_key_normal(
             };
             ui.toast = Some((message.to_string(), Instant::now()));
             true
+        }
+        KeyCode::Char('e')
+        | KeyCode::Char('f')
+        | KeyCode::Char('s')
+        | KeyCode::Char('1')
+        | KeyCode::Char('2')
+        | KeyCode::Char('0')
+        | KeyCode::Char('[')
+        | KeyCode::Char(']')
+        | KeyCode::Char('u')
+        | KeyCode::Char('d')
+            if ui.page == Page::Stations && ui.uses_v3_routing() =>
+        {
+            if ui.routing_spec.is_none()
+                && let Err(err) = refresh_routing_control_state(ui).await
+            {
+                ui.toast = Some((format!("routing: load failed: {err}"), Instant::now()));
+                return true;
+            }
+            ui.routing_menu_idx = ui.selected_station_idx;
+            let handled = handle_key_routing_menu(providers, ui, key).await;
+            ui.selected_station_idx = ui.routing_menu_idx;
+            handled
         }
         KeyCode::Char('h') if ui.page == Page::Stations => {
             let Some(pvd) = providers.get(ui.selected_station_idx) else {
@@ -3241,12 +3274,12 @@ async fn handle_key_profile_menu(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        default_profile_menu_idx, routing_provider_names,
-        routing_spec_after_provider_enabled_change, routing_spec_with_order,
+        default_profile_menu_idx, routing_spec_after_provider_enabled_change,
+        routing_spec_with_order,
     };
     use crate::config::{RoutingExhaustedActionV3, RoutingPolicyV3};
     use crate::dashboard_core::ControlProfileOption;
-    use crate::tui::model::{RoutingProviderRef, RoutingSpecView};
+    use crate::tui::model::{RoutingProviderRef, RoutingSpecView, routing_provider_names};
     use std::collections::BTreeMap;
 
     fn make_profile(name: &str) -> ControlProfileOption {
@@ -3658,23 +3691,6 @@ async fn handle_key_provider_menu(
         }
         _ => false,
     }
-}
-
-fn routing_provider_names(spec: &RoutingSpecView) -> Vec<String> {
-    let mut names = if spec.order.is_empty() {
-        spec.providers
-            .iter()
-            .map(|provider| provider.name.clone())
-            .collect::<Vec<_>>()
-    } else {
-        spec.order.clone()
-    };
-    for provider in &spec.providers {
-        if !names.iter().any(|name| name == &provider.name) {
-            names.push(provider.name.clone());
-        }
-    }
-    names
 }
 
 fn selected_routing_provider_name(ui: &UiState) -> Option<String> {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -12,8 +12,8 @@ use crate::dashboard_core::{
 };
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, balance_status_style, format_age, now_ms, shorten, shorten_middle,
-    station_balance_brief,
+    Palette, Snapshot, balance_status_style, format_age, now_ms, provider_balance_compact,
+    routing_provider_names, shorten, shorten_middle, station_balance_brief,
 };
 use crate::tui::state::UiState;
 
@@ -236,6 +236,384 @@ fn format_skip_reason(reason: &StationRoutingSkipReason) -> String {
     }
 }
 
+fn routing_policy_label(policy: crate::config::RoutingPolicyV3) -> &'static str {
+    match policy {
+        crate::config::RoutingPolicyV3::ManualSticky => "manual-sticky",
+        crate::config::RoutingPolicyV3::OrderedFailover => "ordered-failover",
+        crate::config::RoutingPolicyV3::TagPreferred => "tag-preferred",
+    }
+}
+
+fn routing_exhausted_label(action: crate::config::RoutingExhaustedActionV3) -> &'static str {
+    match action {
+        crate::config::RoutingExhaustedActionV3::Continue => "continue",
+        crate::config::RoutingExhaustedActionV3::Stop => "stop",
+    }
+}
+
+fn routing_tags_label(tags: &BTreeMap<String, String>, max_width: usize) -> String {
+    if tags.is_empty() {
+        return "-".to_string();
+    }
+    shorten_middle(
+        &tags
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        max_width,
+    )
+}
+
+fn routing_prefer_tags_label(filters: &[BTreeMap<String, String>], max_width: usize) -> String {
+    if filters.is_empty() {
+        return "-".to_string();
+    }
+    shorten_middle(
+        &filters
+            .iter()
+            .map(|tags| routing_tags_label(tags, max_width))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+        max_width,
+    )
+}
+
+fn routing_provider_matches_preference(
+    spec: &crate::tui::model::RoutingSpecView,
+    provider: &crate::tui::model::RoutingProviderRef,
+) -> bool {
+    matches!(spec.policy, crate::config::RoutingPolicyV3::TagPreferred)
+        && spec.prefer_tags.iter().any(|filter| {
+            !filter.is_empty()
+                && filter
+                    .iter()
+                    .all(|(key, value)| provider.tags.get(key) == Some(value))
+        })
+}
+
+fn routing_provider_balance_snapshots<'a>(
+    snapshot: &'a Snapshot,
+    provider_name: &str,
+) -> Vec<&'a crate::state::ProviderBalanceSnapshot> {
+    let mut matches = snapshot
+        .provider_balances
+        .values()
+        .flat_map(|balances| balances.iter())
+        .filter(|balance| balance.provider_id == provider_name)
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.upstream_index
+            .cmp(&right.upstream_index)
+            .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
+    });
+    matches
+}
+
+fn routing_provider_balance_brief(snapshot: &Snapshot, provider_name: &str) -> String {
+    routing_provider_balance_snapshots(snapshot, provider_name)
+        .first()
+        .map(|balance| provider_balance_compact(balance, 24))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn routing_provider_marker(
+    spec: &crate::tui::model::RoutingSpecView,
+    provider_name: &str,
+    provider: Option<&crate::tui::model::RoutingProviderRef>,
+) -> &'static str {
+    if spec.target.as_deref() == Some(provider_name) {
+        "PIN"
+    } else if provider.is_some_and(|provider| routing_provider_matches_preference(spec, provider)) {
+        "PREF"
+    } else {
+        ""
+    }
+}
+
+fn render_v3_routing_page(
+    f: &mut Frame<'_>,
+    p: Palette,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    area: Rect,
+) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    let Some(spec) = ui.routing_spec.clone() else {
+        let block = Block::default()
+            .title(Span::styled(
+                "Routing",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.border))
+            .style(Style::default().bg(p.panel));
+        let text = Text::from(vec![
+            Line::from("loading routing providers..."),
+            Line::from(Span::styled(
+                "press r to open the editor immediately",
+                Style::default().fg(p.muted),
+            )),
+        ]);
+        f.render_widget(
+            Paragraph::new(text)
+                .block(block)
+                .style(Style::default().fg(p.text))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let order = routing_provider_names(&spec);
+    let provider_by_name = spec
+        .providers
+        .iter()
+        .map(|provider| (provider.name.as_str(), provider))
+        .collect::<HashMap<_, _>>();
+
+    let left_block = Block::default()
+        .title(Span::styled(
+            format!(
+                "Routing providers  policy={}  exhausted={}",
+                routing_policy_label(spec.policy),
+                routing_exhausted_label(spec.on_exhausted)
+            ),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border))
+        .style(Style::default().bg(p.panel));
+
+    let header = Row::new(["#", "Provider", "On", "Route", "Balance"])
+        .style(Style::default().fg(p.muted))
+        .height(1);
+    let rows = order
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            let provider = provider_by_name.get(name.as_str()).copied();
+            let enabled = provider.map(|provider| provider.enabled).unwrap_or(false);
+            let marker = routing_provider_marker(&spec, name, provider);
+            let mut label = name.clone();
+            if let Some(alias) = provider
+                .and_then(|provider| provider.alias.as_deref())
+                .filter(|alias| !alias.trim().is_empty() && *alias != name)
+            {
+                label = format!("{label} ({alias})");
+            }
+            let balance = routing_provider_balance_brief(snapshot, name);
+            let style = if !enabled {
+                Style::default().fg(p.muted)
+            } else if spec.target.as_deref() == Some(name.as_str()) {
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+            } else if provider
+                .is_some_and(|provider| routing_provider_matches_preference(&spec, provider))
+            {
+                Style::default().fg(p.good)
+            } else {
+                Style::default().fg(p.text)
+            };
+            Row::new([
+                (idx + 1).to_string(),
+                shorten_middle(&label, 28),
+                if enabled { "on" } else { "off" }.to_string(),
+                marker.to_string(),
+                balance,
+            ])
+            .style(style)
+            .height(1)
+        })
+        .collect::<Vec<_>>();
+
+    let table_visible_rows = usize::from(left_block.inner(columns[0]).height.saturating_sub(1));
+    ui.sync_stations_table_viewport(order.len(), table_visible_rows);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),
+            Constraint::Min(12),
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Length(12),
+        ],
+    )
+    .header(header)
+    .block(left_block)
+    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
+    .highlight_symbol("  ")
+    .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(table, columns[0], &mut ui.stations_table);
+
+    let selected_name = order.get(ui.selected_station_idx).map(String::as_str);
+    let selected_provider = selected_name.and_then(|name| provider_by_name.get(name).copied());
+    let right_title = selected_name
+        .map(|name| format!("Provider routing: {name}"))
+        .unwrap_or_else(|| "Provider routing".to_string());
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("policy: ", Style::default().fg(p.muted)),
+        Span::styled(
+            routing_policy_label(spec.policy),
+            Style::default().fg(p.text),
+        ),
+        Span::raw("   "),
+        Span::styled("target: ", Style::default().fg(p.muted)),
+        Span::styled(
+            spec.target.as_deref().unwrap_or("-"),
+            Style::default().fg(if spec.target.is_some() {
+                p.accent
+            } else {
+                p.muted
+            }),
+        ),
+        Span::raw("   "),
+        Span::styled("on_exhausted: ", Style::default().fg(p.muted)),
+        Span::styled(
+            routing_exhausted_label(spec.on_exhausted),
+            Style::default().fg(p.text),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("prefer_tags: ", Style::default().fg(p.muted)),
+        Span::styled(
+            routing_prefer_tags_label(&spec.prefer_tags, 80),
+            Style::default().fg(if spec.prefer_tags.is_empty() {
+                p.muted
+            } else {
+                p.accent
+            }),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("order: ", Style::default().fg(p.muted)),
+        Span::styled(
+            shorten_middle(&order.join(" > "), 96),
+            Style::default().fg(p.text),
+        ),
+    ]));
+
+    if let Some(name) = selected_name {
+        lines.push(Line::from(""));
+        if let Some(provider) = selected_provider {
+            if let Some(alias) = provider
+                .alias
+                .as_deref()
+                .filter(|alias| !alias.trim().is_empty())
+            {
+                lines.push(Line::from(vec![
+                    Span::styled("alias: ", Style::default().fg(p.muted)),
+                    Span::styled(alias.to_string(), Style::default().fg(p.text)),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("enabled: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    if provider.enabled { "true" } else { "false" },
+                    Style::default().fg(if provider.enabled { p.good } else { p.warn }),
+                ),
+                Span::raw("   "),
+                Span::styled("route: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    routing_provider_marker(&spec, name, Some(provider)).to_string(),
+                    Style::default().fg(p.accent),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("tags: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    routing_tags_label(&provider.tags, 96),
+                    Style::default().fg(p.text),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "provider is referenced by routing.order but missing from catalog",
+                Style::default().fg(p.warn),
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Balance",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+        let balances = routing_provider_balance_snapshots(snapshot, name);
+        if balances.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "(none)",
+                Style::default().fg(p.muted),
+            )));
+        } else {
+            for balance in balances.into_iter().take(10) {
+                let idx = balance
+                    .upstream_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
+                    Span::styled(
+                        balance.status.as_str(),
+                        balance_status_style(p, balance.status),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        provider_balance_compact(balance, 72),
+                        Style::default().fg(p.text),
+                    ),
+                ]));
+                if let Some(err) = balance
+                    .error
+                    .as_deref()
+                    .filter(|err| !err.trim().is_empty())
+                {
+                    lines.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled(shorten(err, 80), Style::default().fg(p.muted)),
+                    ]));
+                }
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Actions",
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from("  Enter/r      open routing editor"));
+    lines.push(Line::from(
+        "  e            enable/disable selected provider",
+    ));
+    lines.push(Line::from("  f            prefer billing=monthly"));
+    lines.push(Line::from(
+        "  1/2/0        set monthly/paygo/clear billing tag",
+    ));
+    lines.push(Line::from(
+        "  s            toggle on_exhausted continue/stop",
+    ));
+    lines.push(Line::from("  [/]/u/d      reorder fallback order"));
+
+    let right_block = Block::default()
+        .title(Span::styled(
+            right_title,
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border))
+        .style(Style::default().bg(p.panel));
+    let content = Paragraph::new(Text::from(lines))
+        .block(right_block)
+        .style(Style::default().fg(p.muted))
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, columns[1]);
+}
+
 pub(super) fn render_stations_page(
     f: &mut Frame<'_>,
     p: Palette,
@@ -244,6 +622,11 @@ pub(super) fn render_stations_page(
     providers: &[ProviderOption],
     area: Rect,
 ) {
+    if ui.uses_v3_routing() {
+        render_v3_routing_page(f, p, ui, snapshot, area);
+        return;
+    }
+
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
