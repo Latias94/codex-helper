@@ -69,6 +69,7 @@ mod proxy_settings_document;
 mod proxy_settings_form;
 mod proxy_settings_raw;
 mod proxy_settings_shell;
+mod proxy_settings_v3_editors;
 mod remote_attach;
 mod remote_attach_admin;
 mod remote_attach_host_local;
