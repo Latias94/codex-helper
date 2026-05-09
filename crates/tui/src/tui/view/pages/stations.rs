@@ -690,15 +690,30 @@ pub(super) fn render_stations_page(
             "  i            Provider 详情（可滚动）",
             "  i            provider details (scrollable)",
         )));
-        lines.push(Line::from("  Enter        set global pin"));
-        lines.push(Line::from("  Backspace    clear global pin (auto)"));
-        lines.push(Line::from(
-            "  r            routing editor (policy/order/tags)",
-        ));
-        lines.push(Line::from(
-            "  o            set session override to selected station",
-        ));
-        lines.push(Line::from("  O            clear session override"));
+        if ui.uses_v3_routing() {
+            lines.push(Line::from(
+                "  Enter/r      routing editor (policy/order/tags/enable)",
+            ));
+            lines.push(Line::from(
+                "  Backspace    clear legacy runtime station pin",
+            ));
+            lines.push(Line::from(
+                "  o            disabled: provider choice is v3 routing policy",
+            ));
+            lines.push(Line::from(
+                "  O            clear legacy session station override",
+            ));
+        } else {
+            lines.push(Line::from("  Enter        set global pin"));
+            lines.push(Line::from("  Backspace    clear global pin (auto)"));
+            lines.push(Line::from(
+                "  r            routing editor (policy/order/tags)",
+            ));
+            lines.push(Line::from(
+                "  o            set session override to selected station",
+            ));
+            lines.push(Line::from("  O            clear session override"));
+        }
         lines.push(Line::from("  h            health check selected station"));
         lines.push(Line::from("  H            health check all stations"));
         lines.push(Line::from("  c            cancel health check (selected)"));

@@ -134,6 +134,7 @@ pub async fn run_dashboard(
         admin_port,
         language,
         refresh_ms,
+        config_version: cfg.version,
         ..Default::default()
     };
     let _ = input::refresh_profile_control_state(&mut ui).await;
@@ -244,6 +245,7 @@ pub async fn run_dashboard(
                                 match load_config().await {
                                     Ok(new_cfg) => {
                                         cfg = Arc::new(new_cfg);
+                                        ui.config_version = cfg.version;
                                         providers = build_provider_options(&cfg, service_name);
                                         ui.clamp_selection(&snapshot, providers.len());
                                     }

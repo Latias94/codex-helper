@@ -261,8 +261,11 @@ The TUI `Stations` page exposes a v3 routing editor with `r`.
 - `a` returns to `ordered-failover`.
 - `[` / `]` and `u` / `d` reorder `routing.order`.
 - `f` switches to `tag-preferred` with `prefer_tags = [{ billing = "monthly" }]`.
+- `e` enables or disables the selected provider; disabling a pinned `manual-sticky` provider also moves routing back to `ordered-failover`.
 - `s` toggles `on_exhausted` between `continue` and `stop`.
 - `1`, `2`, and `0` set `billing=monthly`, set `billing=paygo`, or clear the `billing` tag for the selected provider.
+
+Under v3, provider choice is routing state rather than a station override. The TUI therefore sends `p` / `P` / `Enter` toward the routing editor and keeps legacy station override shortcuts only for clearing old runtime overrides.
 
 This is intentionally a fast common-case editor, not a full TOML editor. Arbitrary provider metadata, endpoint inventory, model support, and auth details remain better suited to the CLI, raw config, or GUI form editor.
 

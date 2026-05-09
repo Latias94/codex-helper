@@ -670,8 +670,8 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
         ),
         Overlay::RoutingMenu => crate::tui::i18n::pick(
             ui.language,
-            "↑/↓ 选择  Enter pin  a 顺序  f 包月优先  s 耗尽策略  []/u/d 重排  1/2/0 billing tag  g 刷新  Esc 关闭",
-            "↑/↓ select  Enter pin  a ordered  f monthly-first  s exhausted action  []/u/d reorder  1/2/0 billing tag  g refresh  Esc close",
+            "↑/↓ 选择  Enter pin  a 顺序  f 包月优先  e 启停  s 耗尽策略  []/u/d 重排  1/2/0 billing tag  g 刷新  Esc 关闭",
+            "↑/↓ select  Enter pin  a ordered  f monthly-first  e enable  s exhausted action  []/u/d reorder  1/2/0 billing tag  g refresh  Esc close",
         ),
         Overlay::StationInfo => crate::tui::i18n::pick(
             ui.language,

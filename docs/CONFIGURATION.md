@@ -467,8 +467,8 @@ Current UI behavior intentionally separates runtime steering from persisted rout
 
 - The GUI proxy settings screen accepts v3 routing-first TOML. Legacy station-first files are auto-migrated on load; use `config migrate --dry-run` if you want to inspect the rewrite first.
 - GUI form view summarizes providers, profiles, and routing; detailed edits currently go through raw TOML or CLI commands.
-- TUI station switching is runtime-only. It pins or clears the active route for the running proxy and does not write the config file.
-- TUI `Stations` page `r` opens the persisted v3 routing editor. It can pin a provider, switch back to ordered failover, reorder `routing.order`, enable monthly-first tag preference, toggle `on_exhausted`, and set/clear the selected provider's `billing` tag.
+- TUI station switching is runtime-only for legacy station configs. Under v3, provider choice belongs to persisted routing; `p` / `P` / `Enter` route users to the routing editor instead of pinning the internal `routing` station.
+- TUI `Stations` page `r` opens the persisted v3 routing editor. It can pin a provider, switch back to ordered failover, reorder `routing.order`, enable or disable a provider, enable monthly-first tag preference, toggle `on_exhausted`, and set/clear the selected provider's `billing` tag.
 - Persistent provider and routing edits should use the TUI routing editor, `provider`, `routing`, or the v3 raw config.
 
 TUI routing editor shortcuts:
@@ -477,6 +477,7 @@ TUI routing editor shortcuts:
 - `a`: `ordered-failover` using the visible order.
 - `[` / `]` or `u` / `d`: move selected provider in `routing.order`.
 - `f`: `tag-preferred` with `prefer_tags = [{ billing = "monthly" }]`.
+- `e`: enable or disable the selected provider. Disabling a pinned `manual-sticky` target also downgrades routing to `ordered-failover`.
 - `s`: toggle `on_exhausted` between `continue` and `stop`.
 - `1` / `2` / `0`: set `billing=monthly`, set `billing=paygo`, or clear `billing`.
 

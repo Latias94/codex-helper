@@ -37,7 +37,7 @@ pub(in crate::tui) fn render_app(
 
     match ui.overlay {
         Overlay::None => {}
-        Overlay::Help => modals::render_help_modal(f, p, ui.language),
+        Overlay::Help => modals::render_help_modal(f, p, ui),
         Overlay::StationInfo => modals::render_station_info_modal(f, p, ui, snapshot, providers),
         Overlay::EffortMenu => modals::render_effort_modal(f, p, ui),
         Overlay::ModelMenuSession => modals::render_model_modal(f, p, ui),

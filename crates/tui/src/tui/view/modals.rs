@@ -715,7 +715,9 @@ pub(super) fn render_station_info_modal(
     f.render_widget(content, area);
 }
 
-pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui::Language) {
+pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
+    let lang = ui.language;
+    let is_v3 = ui.uses_v3_routing();
     let area = centered_rect(70, 70, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -736,7 +738,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
             Line::from("  ↑/↓, j/k   移动选中项"),
             Line::from("  1-8        切换页面"),
             Line::from(
-                "            1 总览  2 配置  3 会话  4 请求  5 统计  6 设置  7 历史  8 最近",
+                "            1 总览  2 站点  3 会话  4 请求  5 统计  6 设置  7 历史  8 最近",
             ),
             Line::from("  L          切换语言（中/英，自动落盘）"),
             Line::from("  6 设置     查看运行态与关键配置入口"),
@@ -777,8 +779,16 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 "Provider 覆盖",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  p          会话级 provider 覆盖（固定）"),
-            Line::from("  P          全局站点 pin（运行时）"),
+            Line::from(if is_v3 {
+                "  p/P        打开 v3 routing 编辑器（provider 选择由 routing policy 管理）"
+            } else {
+                "  p          会话级 provider 覆盖（固定）"
+            }),
+            Line::from(if is_v3 {
+                "  r          在 Stations 页打开 routing 编辑器"
+            } else {
+                "  P          全局站点 pin（运行时）"
+            }),
             Line::from("  b          打开 session profile 菜单（Dashboard/Sessions）"),
             Line::from("  Clear binding  清除当前会话已存储的 profile 绑定（保留其他会话覆盖）"),
             Line::from(""),
@@ -786,10 +796,26 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 "站点页（Stations）",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  Enter      设置为全局 pin"),
-            Line::from("  Backspace  清除全局 pin（自动）"),
-            Line::from("  o          设置会话 override 为当前站点"),
-            Line::from("  O          清除会话 override"),
+            Line::from(if is_v3 {
+                "  Enter/r    打开 routing 编辑器（策略/顺序/tags/启停）"
+            } else {
+                "  Enter      设置为全局 pin"
+            }),
+            Line::from(if is_v3 {
+                "  Backspace  清除遗留运行时 station pin"
+            } else {
+                "  Backspace  清除全局 pin（自动）"
+            }),
+            Line::from(if is_v3 {
+                "  o          v3 下不设置会话 station override"
+            } else {
+                "  o          设置会话 override 为当前站点"
+            }),
+            Line::from(if is_v3 {
+                "  O          清除遗留会话 station override"
+            } else {
+                "  O          清除会话 override"
+            }),
             Line::from("  i          查看 Provider 详情（可滚动）"),
             Line::from("  h/H        运行健康检查（当前/全部）"),
             Line::from("  c/C        取消健康检查（当前/全部）"),
@@ -900,8 +926,16 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 "Provider override",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  p          session provider override (pinned)"),
-            Line::from("  P          global station pin (runtime)"),
+            Line::from(if is_v3 {
+                "  p/P        open v3 routing editor (provider choice is routing policy)"
+            } else {
+                "  p          session provider override (pinned)"
+            }),
+            Line::from(if is_v3 {
+                "  r          open routing editor on the Stations page"
+            } else {
+                "  P          global station pin (runtime)"
+            }),
             Line::from("  b          open session profile menu (Dashboard/Sessions)"),
             Line::from(
                 "  Clear binding  clear the stored session profile binding and keep other session overrides",
@@ -911,10 +945,26 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, lang: crate::tui:
                 "Stations page",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from("  Enter      set global pin"),
-            Line::from("  Backspace  clear global pin (auto)"),
-            Line::from("  o          set session override to selected station"),
-            Line::from("  O          clear session override"),
+            Line::from(if is_v3 {
+                "  Enter/r    open routing editor (policy/order/tags/enable)"
+            } else {
+                "  Enter      set global pin"
+            }),
+            Line::from(if is_v3 {
+                "  Backspace  clear legacy runtime station pin"
+            } else {
+                "  Backspace  clear global pin (auto)"
+            }),
+            Line::from(if is_v3 {
+                "  o          session station override is disabled under v3 routing"
+            } else {
+                "  o          set session override to selected station"
+            }),
+            Line::from(if is_v3 {
+                "  O          clear legacy session station override"
+            } else {
+                "  O          clear session override"
+            }),
             Line::from("  i          open provider details (scrollable)"),
             Line::from("  h/H        run health checks (selected/all)"),
             Line::from("  c/C        cancel health checks (selected/all)"),
@@ -1743,7 +1793,7 @@ pub(super) fn render_routing_modal(
             ),
         ]),
         Line::from(Span::styled(
-            "Enter pin  a ordered  f monthly-first  s stop/continue  [/]/u/d reorder  1 monthly  2 paygo  0 clear billing  g refresh  Esc close",
+            "Enter pin  a ordered  f monthly-first  e enable/disable  s stop/continue  [/]/u/d reorder  1 monthly  2 paygo  0 clear billing  g refresh  Esc close",
             Style::default().fg(p.muted),
         )),
     ])));

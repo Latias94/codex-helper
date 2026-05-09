@@ -772,6 +772,18 @@ pub(in crate::tui) async fn refresh_routing_control_state(ui: &mut UiState) -> a
     Ok(())
 }
 
+async fn open_routing_editor(ui: &mut UiState, reason: &'static str) {
+    match refresh_routing_control_state(ui).await {
+        Ok(()) => {
+            ui.overlay = Overlay::RoutingMenu;
+            ui.toast = Some((reason.to_string(), Instant::now()));
+        }
+        Err(err) => {
+            ui.toast = Some((format!("routing: load failed: {err}"), Instant::now()));
+        }
+    }
+}
+
 async fn apply_persisted_routing(
     ui: &mut UiState,
     mut routing: RoutingSpecView,
@@ -862,6 +874,25 @@ async fn set_provider_billing_tag(
             provider.tags.remove("billing");
         }
     }
+    apply_provider_spec(ui, &provider).await?;
+    refresh_routing_control_state(ui).await?;
+    ui.needs_snapshot_refresh = true;
+    ui.needs_config_refresh = true;
+    Ok(())
+}
+
+async fn set_provider_enabled(
+    ui: &mut UiState,
+    provider_name: &str,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let catalog = load_provider_specs(ui).await?;
+    let mut provider = catalog
+        .providers
+        .into_iter()
+        .find(|provider| provider.name == provider_name)
+        .ok_or_else(|| anyhow::anyhow!("provider '{provider_name}' not found"))?;
+    provider.enabled = enabled;
     apply_provider_spec(ui, &provider).await?;
     refresh_routing_control_state(ui).await?;
     ui.needs_snapshot_refresh = true;
@@ -1546,6 +1577,10 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Enter if ui.page == Page::Stations => {
+            if ui.uses_v3_routing() {
+                open_routing_editor(ui, "routing: edit provider policy/order/tags").await;
+                return true;
+            }
             let Some(name) = providers
                 .get(ui.selected_station_idx)
                 .map(|p| p.name.clone())
@@ -1563,24 +1598,18 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('r') if ui.page == Page::Stations => {
-            match refresh_routing_control_state(ui).await {
-                Ok(()) => {
-                    ui.overlay = Overlay::RoutingMenu;
-                    ui.toast = Some((
-                        "routing: edit persisted policy/order".to_string(),
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((format!("routing: load failed: {err}"), Instant::now()));
-                }
-            }
+            open_routing_editor(ui, "routing: edit persisted policy/order").await;
             true
         }
         KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
             match apply_global_station_pin(state, providers, None).await {
                 Ok(()) => {
-                    ui.toast = Some(("global station pin: <auto>".to_string(), Instant::now()));
+                    let message = if ui.uses_v3_routing() {
+                        "runtime station pin cleared; v3 provider choice uses routing policy"
+                    } else {
+                        "global station pin: <auto>"
+                    };
+                    ui.toast = Some((message.to_string(), Instant::now()));
                 }
                 Err(err) => {
                     ui.toast = Some((format!("set global pin failed: {err}"), Instant::now()));
@@ -1589,6 +1618,13 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('o') if ui.page == Page::Stations => {
+            if ui.uses_v3_routing() {
+                ui.toast = Some((
+                    "v3 routing owns provider choice; press r to edit routing".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            }
             let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
@@ -1623,10 +1659,12 @@ async fn handle_key_normal(
                 return true;
             };
             apply_session_provider_override(state, sid, None).await;
-            ui.toast = Some((
-                "session station override: <clear>".to_string(),
-                Instant::now(),
-            ));
+            let message = if ui.uses_v3_routing() {
+                "legacy session station override cleared"
+            } else {
+                "session station override: <clear>"
+            };
+            ui.toast = Some((message.to_string(), Instant::now()));
             true
         }
         KeyCode::Char('h') if ui.page == Page::Stations => {
@@ -2973,6 +3011,10 @@ async fn handle_key_normal(
             if ui.focus != Focus::Sessions {
                 return false;
             }
+            if ui.uses_v3_routing() {
+                open_routing_editor(ui, "v3 routing is global; editing persisted routing").await;
+                return true;
+            }
             let Some(sid) = snapshot
                 .rows
                 .get(ui.selected_session_idx)
@@ -2994,6 +3036,10 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('P') => {
+            if ui.uses_v3_routing() {
+                open_routing_editor(ui, "routing: edit provider policy/order/tags").await;
+                return true;
+            }
             let current = snapshot
                 .global_station_override
                 .as_deref()
@@ -3194,7 +3240,10 @@ async fn handle_key_profile_menu(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{default_profile_menu_idx, routing_provider_names, routing_spec_with_order};
+    use super::{
+        default_profile_menu_idx, routing_provider_names,
+        routing_spec_after_provider_enabled_change, routing_spec_with_order,
+    };
     use crate::config::{RoutingExhaustedActionV3, RoutingPolicyV3};
     use crate::dashboard_core::ControlProfileOption;
     use crate::tui::model::{RoutingProviderRef, RoutingSpecView};
@@ -3286,6 +3335,39 @@ mod tests {
         assert_eq!(next.target, None);
         assert!(next.prefer_tags.is_empty());
         assert_eq!(next.order, vec!["backup", "input"]);
+    }
+
+    #[test]
+    fn disabling_manual_sticky_target_downgrades_to_ordered_failover() {
+        let spec = RoutingSpecView {
+            policy: RoutingPolicyV3::ManualSticky,
+            order: vec!["input".to_string(), "backup".to_string()],
+            target: Some("input".to_string()),
+            prefer_tags: Vec::new(),
+            on_exhausted: RoutingExhaustedActionV3::Continue,
+            providers: Vec::new(),
+        };
+
+        let next = routing_spec_after_provider_enabled_change(&spec, "input", false)
+            .expect("manual target disable should rewrite routing");
+
+        assert_eq!(next.policy, RoutingPolicyV3::OrderedFailover);
+        assert_eq!(next.target, None);
+        assert_eq!(next.order, vec!["input", "backup"]);
+    }
+
+    #[test]
+    fn enabling_provider_keeps_existing_routing_policy() {
+        let spec = RoutingSpecView {
+            policy: RoutingPolicyV3::ManualSticky,
+            order: vec!["input".to_string()],
+            target: Some("input".to_string()),
+            prefer_tags: Vec::new(),
+            on_exhausted: RoutingExhaustedActionV3::Continue,
+            providers: Vec::new(),
+        };
+
+        assert!(routing_spec_after_provider_enabled_change(&spec, "input", true).is_none());
     }
 }
 
@@ -3601,6 +3683,15 @@ fn selected_routing_provider_name(ui: &UiState) -> Option<String> {
     names.get(ui.routing_menu_idx).cloned()
 }
 
+fn selected_routing_provider_enabled(ui: &UiState) -> Option<bool> {
+    let spec = ui.routing_spec.as_ref()?;
+    let name = selected_routing_provider_name(ui)?;
+    spec.providers
+        .iter()
+        .find(|provider| provider.name == name)
+        .map(|provider| provider.enabled)
+}
+
 fn routing_spec_with_order(
     spec: &RoutingSpecView,
     order: Vec<String>,
@@ -3616,6 +3707,25 @@ fn routing_spec_with_order(
         next.prefer_tags.clear();
     }
     next
+}
+
+fn routing_spec_after_provider_enabled_change(
+    spec: &RoutingSpecView,
+    provider_name: &str,
+    enabled: bool,
+) -> Option<RoutingSpecView> {
+    if enabled
+        || !matches!(spec.policy, crate::config::RoutingPolicyV3::ManualSticky)
+        || spec.target.as_deref() != Some(provider_name)
+    {
+        return None;
+    }
+
+    Some(routing_spec_with_order(
+        spec,
+        routing_provider_names(spec),
+        crate::config::RoutingPolicyV3::OrderedFailover,
+    ))
 }
 
 async fn handle_key_routing_menu(
@@ -3761,6 +3871,48 @@ async fn handle_key_routing_menu(
                 }
                 Err(err) => {
                     ui.toast = Some((format!("routing: apply failed: {err}"), Instant::now()));
+                }
+            }
+            true
+        }
+        KeyCode::Char('e') => {
+            let Some(provider_name) = selected_routing_provider_name(ui) else {
+                return true;
+            };
+            let Some(enabled) = selected_routing_provider_enabled(ui) else {
+                ui.toast = Some((
+                    format!("provider {provider_name}: not in catalog"),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let next_enabled = !enabled;
+            let original_spec = ui.routing_spec.clone();
+            match set_provider_enabled(ui, provider_name.as_str(), next_enabled).await {
+                Ok(()) => {
+                    let mut suffix = String::new();
+                    if let Some(next_routing) = original_spec.as_ref().and_then(|spec| {
+                        routing_spec_after_provider_enabled_change(
+                            spec,
+                            provider_name.as_str(),
+                            next_enabled,
+                        )
+                    }) {
+                        match apply_persisted_routing(ui, next_routing).await {
+                            Ok(()) => suffix = "; routing=ordered-failover".to_string(),
+                            Err(err) => {
+                                suffix = format!("; routing update failed: {err}");
+                            }
+                        }
+                    }
+                    let label = if next_enabled { "enabled" } else { "disabled" };
+                    ui.toast = Some((
+                        format!("provider {provider_name}: {label}{suffix}"),
+                        Instant::now(),
+                    ));
+                }
+                Err(err) => {
+                    ui.toast = Some((format!("provider enable failed: {err}"), Instant::now()));
                 }
             }
             true

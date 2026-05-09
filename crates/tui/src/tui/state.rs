@@ -40,6 +40,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) admin_port: u16,
     pub(in crate::tui) language: Language,
     pub(in crate::tui) refresh_ms: u64,
+    pub(in crate::tui) config_version: Option<u32>,
     pub(in crate::tui) page: Page,
     pub(in crate::tui) focus: Focus,
     pub(in crate::tui) overlay: Overlay,
@@ -128,6 +129,7 @@ impl Default for UiState {
             admin_port: admin_port_for_proxy_port(3211),
             language: Language::En,
             refresh_ms: 500,
+            config_version: None,
             page: Page::Dashboard,
             focus: Focus::Sessions,
             overlay: Overlay::None,
@@ -212,6 +214,10 @@ impl Default for UiState {
 }
 
 impl UiState {
+    pub(in crate::tui) fn uses_v3_routing(&self) -> bool {
+        self.config_version == Some(3)
+    }
+
     pub(in crate::tui) fn clamp_selection(&mut self, snapshot: &Snapshot, providers_len: usize) {
         self.selected_station_idx = clamp_table_selection(
             &mut self.stations_table,
