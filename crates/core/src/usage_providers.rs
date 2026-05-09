@@ -1387,6 +1387,7 @@ async fn refresh_provider_target(
                     .with_error("no usable token; checked provider token_env and upstream auth"),
             )
             .await;
+        update_usage_exhausted(lb_states, cfg, service_name, &upstreams, false);
         warn!(
             "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
 跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.json",
@@ -1427,6 +1428,7 @@ async fn refresh_provider_target(
                         .with_error(err.to_string()),
                 )
                 .await;
+            update_usage_exhausted(lb_states, cfg, service_name, &upstreams, false);
             warn!(
                 "usage provider '{}' poll failed for {}[{}]: {}",
                 provider.id, target.upstream.station_name, target.upstream.index, err
@@ -1471,6 +1473,7 @@ async fn auto_probe_provider_target(
                 .with_error("no usable token; checked upstream auth"),
             )
             .await;
+        update_usage_exhausted(lb_states, cfg, service_name, &upstreams, false);
         return UsageProviderRefreshOutcome::MissingToken;
     };
 
@@ -1538,6 +1541,7 @@ async fn auto_probe_provider_target(
                 .with_error(error),
             )
             .await;
+        update_usage_exhausted(lb_states, cfg, service_name, &upstreams, false);
     }
     UsageProviderRefreshOutcome::Failed
 }
@@ -2271,6 +2275,58 @@ mod tests {
         .expect("provider config");
 
         assert!(provider.trust_exhaustion_for_routing);
+    }
+
+    #[tokio::test]
+    async fn provider_missing_token_clears_stale_lb_exhaustion_marker() {
+        let cfg = proxy_config(vec![service_config(
+            "right",
+            vec![
+                upstream_config("https://primary.example/v1"),
+                upstream_config("https://backup.example/v1"),
+            ],
+        )]);
+        let lb_states = Arc::new(Mutex::new(HashMap::new()));
+        let target = UsageProviderTarget {
+            upstream: upstream(),
+            base_url: "https://backup.example/v1".to_string(),
+            provider_id: Some("right".to_string()),
+        };
+        let upstreams = vec![target.upstream.clone()];
+        update_usage_exhausted(&lb_states, &cfg, "codex", &upstreams, true);
+        {
+            let guard = lb_states.lock().expect("lb states");
+            assert!(
+                guard
+                    .get("right")
+                    .and_then(|entry| entry.usage_exhausted.get(1))
+                    .copied()
+                    .unwrap_or(false)
+            );
+        }
+
+        let state = ProxyState::new();
+        let outcome = refresh_provider_target(RefreshProviderTargetParams {
+            client: &Client::new(),
+            provider: &provider("sub2api", ProviderKind::OpenAiBalanceHttpJson),
+            target: &target,
+            cfg: &cfg,
+            lb_states: &lb_states,
+            state: &state,
+            service_name: "codex",
+            interval_secs: 60,
+        })
+        .await;
+
+        assert_eq!(outcome, UsageProviderRefreshOutcome::MissingToken);
+        let guard = lb_states.lock().expect("lb states");
+        assert!(
+            !guard
+                .get("right")
+                .and_then(|entry| entry.usage_exhausted.get(1))
+                .copied()
+                .unwrap_or(true)
+        );
     }
 
     #[test]

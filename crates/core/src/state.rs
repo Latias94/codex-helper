@@ -49,6 +49,24 @@ type ProviderBalanceMap =
     HashMap<String, HashMap<String, HashMap<usize, HashMap<String, ProviderBalanceSnapshot>>>>;
 type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
 
+#[derive(Debug, Clone)]
+struct SessionTranscriptPathCacheEntry {
+    path: Option<String>,
+    last_checked_ms: u64,
+    last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimePolicy {
+    session_override_ttl_ms: u64,
+    session_binding_ttl_ms: u64,
+    session_binding_max_entries: usize,
+    session_cwd_cache_ttl_ms: u64,
+    session_cwd_cache_max_entries: usize,
+    session_transcript_path_cache_ttl_ms: u64,
+    session_transcript_path_cache_max_entries: usize,
+}
+
 pub struct PassiveUpstreamFailureRecord {
     pub service_name: String,
     pub station_name: String,
@@ -76,6 +94,26 @@ fn unix_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn prune_lru_cache<T>(
+    cache: &mut HashMap<String, T>,
+    max_entries: usize,
+    last_seen: impl Fn(&T) -> u64,
+) {
+    if max_entries == 0 || cache.len() <= max_entries {
+        return;
+    }
+
+    let mut keys = cache
+        .iter()
+        .map(|(key, value)| (key.clone(), last_seen(value)))
+        .collect::<Vec<_>>();
+    keys.sort_by_key(|(_, seen)| *seen);
+    let remove_count = keys.len().saturating_sub(max_entries);
+    for (key, _) in keys.into_iter().take(remove_count) {
+        cache.remove(&key);
+    }
 }
 
 fn service_layout_signature(mgr: &ServiceConfigManager) -> ServiceLayoutSignature {
@@ -107,8 +145,11 @@ pub struct ProxyState {
     session_override_ttl_ms: u64,
     // Bindings are sticky by default; operators can opt into pruning with a separate TTL.
     session_binding_ttl_ms: u64,
+    session_binding_max_entries: usize,
     session_cwd_cache_ttl_ms: u64,
     session_cwd_cache_max_entries: usize,
+    session_transcript_path_cache_ttl_ms: u64,
+    session_transcript_path_cache_max_entries: usize,
     session_effort_overrides: RwLock<HashMap<String, SessionEffortOverride>>,
     session_station_overrides: RwLock<HashMap<String, SessionStationOverride>>,
     session_model_overrides: RwLock<HashMap<String, SessionModelOverride>>,
@@ -119,6 +160,7 @@ pub struct ProxyState {
     station_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     upstream_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
+    session_transcript_path_cache: RwLock<HashMap<String, SessionTranscriptPathCacheEntry>>,
     session_stats: RwLock<HashMap<String, SessionStats>>,
     active_requests: RwLock<HashMap<u64, ActiveRequest>>,
     recent_finished: RwLock<VecDeque<FinishedRequest>>,
@@ -153,6 +195,10 @@ impl ProxyState {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
         let binding_ttl_ms = binding_ttl_secs.saturating_mul(1000);
+        let binding_max_entries = std::env::var("CODEX_HELPER_SESSION_BINDING_MAX_ENTRIES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(2_000);
 
         let cwd_cache_ttl_secs = std::env::var("CODEX_HELPER_SESSION_CWD_CACHE_TTL_SECS")
             .ok()
@@ -163,29 +209,46 @@ impl ProxyState {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(2_000);
+        let transcript_path_cache_ttl_secs =
+            std::env::var("CODEX_HELPER_SESSION_TRANSCRIPT_PATH_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(30);
+        let transcript_path_cache_ttl_ms = transcript_path_cache_ttl_secs.saturating_mul(1000);
+        let transcript_path_cache_max_entries =
+            std::env::var("CODEX_HELPER_SESSION_TRANSCRIPT_PATH_CACHE_MAX_ENTRIES")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(5_000);
 
         Self::new_with_runtime_policy(
             lb_states,
-            ttl_ms,
-            binding_ttl_ms,
-            cwd_cache_ttl_ms,
-            cwd_cache_max_entries,
+            RuntimePolicy {
+                session_override_ttl_ms: ttl_ms,
+                session_binding_ttl_ms: binding_ttl_ms,
+                session_binding_max_entries: binding_max_entries,
+                session_cwd_cache_ttl_ms: cwd_cache_ttl_ms,
+                session_cwd_cache_max_entries: cwd_cache_max_entries,
+                session_transcript_path_cache_ttl_ms: transcript_path_cache_ttl_ms,
+                session_transcript_path_cache_max_entries: transcript_path_cache_max_entries,
+            },
         )
     }
 
     fn new_with_runtime_policy(
         lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
-        session_override_ttl_ms: u64,
-        session_binding_ttl_ms: u64,
-        session_cwd_cache_ttl_ms: u64,
-        session_cwd_cache_max_entries: usize,
+        policy: RuntimePolicy,
     ) -> Arc<Self> {
         Arc::new(Self {
             next_request_id: AtomicU64::new(1),
-            session_override_ttl_ms,
-            session_binding_ttl_ms,
-            session_cwd_cache_ttl_ms,
-            session_cwd_cache_max_entries,
+            session_override_ttl_ms: policy.session_override_ttl_ms,
+            session_binding_ttl_ms: policy.session_binding_ttl_ms,
+            session_binding_max_entries: policy.session_binding_max_entries,
+            session_cwd_cache_ttl_ms: policy.session_cwd_cache_ttl_ms,
+            session_cwd_cache_max_entries: policy.session_cwd_cache_max_entries,
+            session_transcript_path_cache_ttl_ms: policy.session_transcript_path_cache_ttl_ms,
+            session_transcript_path_cache_max_entries: policy
+                .session_transcript_path_cache_max_entries,
             session_effort_overrides: RwLock::new(HashMap::new()),
             session_station_overrides: RwLock::new(HashMap::new()),
             session_model_overrides: RwLock::new(HashMap::new()),
@@ -196,6 +259,7 @@ impl ProxyState {
             station_meta_overrides: RwLock::new(HashMap::new()),
             upstream_meta_overrides: RwLock::new(HashMap::new()),
             session_cwd_cache: RwLock::new(HashMap::new()),
+            session_transcript_path_cache: RwLock::new(HashMap::new()),
             session_stats: RwLock::new(HashMap::new()),
             active_requests: RwLock::new(HashMap::new()),
             recent_finished: RwLock::new(VecDeque::new()),
@@ -1925,12 +1989,116 @@ impl ProxyState {
         })
     }
 
+    async fn resolve_host_transcript_paths_cached(
+        &self,
+        session_ids: &[String],
+    ) -> HashMap<String, Option<String>> {
+        let mut unique = session_ids
+            .iter()
+            .map(|sid| sid.trim())
+            .filter(|sid| !sid.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        unique.sort();
+        unique.dedup();
+        if unique.is_empty() {
+            return HashMap::new();
+        }
+
+        if self.session_transcript_path_cache_max_entries == 0 {
+            return sessions::find_codex_session_files_by_ids(&unique)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(sid, path)| (sid, Some(path.to_string_lossy().to_string())))
+                .collect();
+        }
+
+        let now_ms = unix_now_ms();
+        let ttl_ms = self.session_transcript_path_cache_ttl_ms;
+        let mut resolved = HashMap::<String, Option<String>>::new();
+        let mut stale_or_missing = Vec::<String>::new();
+
+        {
+            let cache = self.session_transcript_path_cache.read().await;
+            for sid in &unique {
+                let fresh = cache.get(sid).filter(|entry| {
+                    ttl_ms == 0 || now_ms.saturating_sub(entry.last_checked_ms) <= ttl_ms
+                });
+                if let Some(entry) = fresh {
+                    resolved.insert(sid.clone(), entry.path.clone());
+                } else {
+                    stale_or_missing.push(sid.clone());
+                }
+            }
+        }
+
+        if !stale_or_missing.is_empty() {
+            let found = sessions::find_codex_session_files_by_ids(&stale_or_missing)
+                .await
+                .unwrap_or_default();
+            let mut cache = self.session_transcript_path_cache.write().await;
+            for sid in stale_or_missing {
+                let path = found
+                    .get(&sid)
+                    .map(|path| path.to_string_lossy().to_string());
+                cache.insert(
+                    sid.clone(),
+                    SessionTranscriptPathCacheEntry {
+                        path: path.clone(),
+                        last_checked_ms: now_ms,
+                        last_seen_ms: now_ms,
+                    },
+                );
+                resolved.insert(sid, path);
+            }
+            prune_lru_cache(
+                &mut cache,
+                self.session_transcript_path_cache_max_entries,
+                |entry| entry.last_seen_ms,
+            );
+        }
+
+        {
+            let mut cache = self.session_transcript_path_cache.write().await;
+            for sid in &unique {
+                if let Some(entry) = cache.get_mut(sid) {
+                    entry.last_seen_ms = now_ms;
+                }
+            }
+        }
+
+        resolved
+    }
+
+    pub async fn enrich_session_identity_cards_with_cached_host_transcripts(
+        &self,
+        cards: &mut [SessionIdentityCard],
+    ) {
+        let session_ids = cards
+            .iter()
+            .filter_map(|card| card.session_id.as_deref())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let resolved = self
+            .resolve_host_transcript_paths_cached(&session_ids)
+            .await;
+        for card in cards {
+            card.host_local_transcript_path = card
+                .session_id
+                .as_deref()
+                .and_then(|sid| resolved.get(sid))
+                .and_then(Clone::clone);
+        }
+    }
+
     pub async fn list_session_identity_cards_with_host_transcripts(
         &self,
         recent_limit: usize,
     ) -> Vec<SessionIdentityCard> {
         let mut cards = self.list_session_identity_cards(recent_limit).await;
-        enrich_session_identity_cards_with_host_transcripts(&mut cards).await;
+        self.enrich_session_identity_cards_with_cached_host_transcripts(&mut cards)
+            .await;
         cards
     }
 
@@ -2014,6 +2182,24 @@ impl ProxyState {
                 entry.binding.last_seen_ms >= cutoff_binding
             });
         }
+        if self.session_binding_max_entries > 0 {
+            let mut bindings = self.session_bindings.write().await;
+            if bindings.len() > self.session_binding_max_entries {
+                let mut removable = bindings
+                    .iter()
+                    .filter(|(sid, _)| !active_sessions.contains_key(*sid))
+                    .map(|(sid, entry)| (sid.clone(), entry.binding.last_seen_ms))
+                    .collect::<Vec<_>>();
+                removable.sort_by_key(|(_, last_seen_ms)| *last_seen_ms);
+                let remove_count = bindings
+                    .len()
+                    .saturating_sub(self.session_binding_max_entries)
+                    .min(removable.len());
+                for (sid, _) in removable.into_iter().take(remove_count) {
+                    bindings.remove(&sid);
+                }
+            }
+        }
 
         // Keep a bounded number of days of rollup data to avoid unbounded growth.
         let keep_days: i32 = std::env::var("CODEX_HELPER_USAGE_ROLLUP_KEEP_DAYS")
@@ -2044,6 +2230,7 @@ impl ProxyState {
             };
         self.prune_session_cwd_cache(&active_sessions, cutoff_cwd)
             .await;
+        self.prune_session_transcript_path_cache(now_ms).await;
 
         if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
             let cutoff_stats = now_ms - self.session_override_ttl_ms;
@@ -2085,6 +2272,25 @@ impl ProxyState {
             cache.remove(&sid);
         }
     }
+
+    async fn prune_session_transcript_path_cache(&self, now_ms: u64) {
+        let mut cache = self.session_transcript_path_cache.write().await;
+        if self.session_transcript_path_cache_max_entries == 0 {
+            cache.clear();
+            return;
+        }
+
+        if self.session_transcript_path_cache_ttl_ms > 0 {
+            let cutoff = now_ms.saturating_sub(self.session_transcript_path_cache_ttl_ms);
+            cache.retain(|_, entry| entry.last_seen_ms >= cutoff);
+        }
+
+        prune_lru_cache(
+            &mut cache,
+            self.session_transcript_path_cache_max_entries,
+            |entry| entry.last_seen_ms,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2092,6 +2298,22 @@ mod tests {
     use super::*;
 
     use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamAuth, UpstreamConfig};
+
+    fn test_runtime_policy(
+        session_override_ttl_ms: u64,
+        session_binding_ttl_ms: u64,
+        session_binding_max_entries: usize,
+    ) -> RuntimePolicy {
+        RuntimePolicy {
+            session_override_ttl_ms,
+            session_binding_ttl_ms,
+            session_binding_max_entries,
+            session_cwd_cache_ttl_ms: 0,
+            session_cwd_cache_max_entries: 0,
+            session_transcript_path_cache_ttl_ms: 30_000,
+            session_transcript_path_cache_max_entries: 5_000,
+        }
+    }
 
     #[test]
     fn begin_and_finish_requests_keep_trace_id() {
@@ -3326,7 +3548,7 @@ mod tests {
     fn prune_periodic_keeps_sticky_binding_after_manual_override_ttl_expires() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let state = ProxyState::new_with_runtime_policy(None, 1, 0, 0, 0);
+            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(1, 0, 2_000));
             state
                 .set_session_model_override("sid-sticky".to_string(), "gpt-5.4".to_string(), 0)
                 .await;
@@ -3361,7 +3583,7 @@ mod tests {
     fn prune_periodic_honors_opt_in_binding_ttl() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let state = ProxyState::new_with_runtime_policy(None, 0, 1, 0, 0);
+            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 1, 2_000));
             state
                 .set_session_binding(SessionBinding {
                     session_id: "sid-expire".to_string(),
@@ -3380,6 +3602,51 @@ mod tests {
             state.prune_periodic().await;
 
             assert!(state.get_session_binding("sid-expire").await.is_none());
+        });
+    }
+
+    #[test]
+    fn prune_periodic_caps_sticky_bindings_by_last_seen() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2));
+            for idx in 0..3 {
+                state
+                    .set_session_binding(SessionBinding {
+                        session_id: format!("sid-{idx}"),
+                        profile_name: Some("daily".to_string()),
+                        station_name: Some("right".to_string()),
+                        model: Some("gpt-5.4".to_string()),
+                        reasoning_effort: Some("medium".to_string()),
+                        service_tier: Some("default".to_string()),
+                        continuity_mode: SessionContinuityMode::DefaultProfile,
+                        created_at_ms: idx,
+                        updated_at_ms: idx,
+                        last_seen_ms: idx,
+                    })
+                    .await;
+            }
+
+            state.prune_periodic().await;
+
+            assert!(state.get_session_binding("sid-0").await.is_none());
+            assert!(state.get_session_binding("sid-1").await.is_some());
+            assert!(state.get_session_binding("sid-2").await.is_some());
+        });
+    }
+
+    #[test]
+    fn transcript_path_cache_records_negative_lookups() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new_with_runtime_policy(None, test_runtime_policy(0, 0, 2_000));
+            let paths = state
+                .resolve_host_transcript_paths_cached(&["missing-session".to_string()])
+                .await;
+
+            assert_eq!(paths.get("missing-session"), Some(&None));
+            let cache = state.session_transcript_path_cache.read().await;
+            assert!(cache.contains_key("missing-session"));
         });
     }
 }

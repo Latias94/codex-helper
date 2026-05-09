@@ -444,6 +444,20 @@ mod tests {
         }]
     }
 
+    fn error_balance() -> Vec<ProviderBalanceSnapshot> {
+        vec![ProviderBalanceSnapshot {
+            provider_id: "provider-0".to_string(),
+            station_name: Some("ignored".to_string()),
+            upstream_index: Some(0),
+            source: "test".to_string(),
+            fetched_at_ms: 1,
+            status: BalanceSnapshotStatus::Error,
+            error: Some("usage provider poll failed: HTTP 404 Not Found".to_string()),
+            exhaustion_affects_routing: true,
+            ..ProviderBalanceSnapshot::default()
+        }]
+    }
+
     #[test]
     fn auto_single_level_prefers_active_then_alphabetical() {
         let mgr = manager(
@@ -702,6 +716,40 @@ mod tests {
             plan.selected_stations[0].balance.routing_ignored_exhausted,
             1
         );
+    }
+
+    #[test]
+    fn auto_keeps_balance_error_station_in_priority_group() {
+        let mgr = manager(
+            Some("monthly"),
+            vec![
+                service(
+                    "monthly",
+                    true,
+                    1,
+                    vec![upstream("https://monthly.example/v1")],
+                ),
+                service("paygo", true, 2, vec![upstream("https://paygo.example/v1")]),
+            ],
+        );
+        let provider_balances = HashMap::from([
+            ("monthly".to_string(), error_balance()),
+            ("paygo".to_string(), balance(&[BalanceSnapshotStatus::Ok])),
+        ]);
+
+        let plan = build_station_routing_plan(
+            &mgr,
+            mgr.active.as_deref(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &provider_balances,
+        );
+
+        assert_eq!(plan.mode, StationRoutingMode::MultiLevel);
+        assert_eq!(names(&plan.selected_stations), vec!["monthly", "paygo"]);
+        assert_eq!(plan.selected_stations[0].balance.error, 1);
+        assert_eq!(plan.selected_stations[0].balance.routing_exhausted, 0);
     }
 
     #[test]

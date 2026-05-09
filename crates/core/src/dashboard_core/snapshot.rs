@@ -9,7 +9,6 @@ use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
     ProxyState, SessionIdentityCard, SessionIdentityCardBuildInputs, SessionStats, StationHealth,
     UsageRollupView, build_session_identity_cards_from_parts,
-    enrich_session_identity_cards_with_host_transcripts,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,7 +131,9 @@ pub async fn build_dashboard_snapshot(
             global_station_override: global_station_override.as_deref(),
             stats: &session_stats,
         });
-    enrich_session_identity_cards_with_host_transcripts(&mut session_cards).await;
+    state
+        .enrich_session_identity_cards_with_cached_host_transcripts(&mut session_cards)
+        .await;
 
     if recent_all.len() > recent_limit {
         recent_all.truncate(recent_limit);

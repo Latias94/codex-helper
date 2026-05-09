@@ -101,8 +101,8 @@ on_exhausted = "stop"
   GUI settings can edit common single-endpoint providers and routing; complex providers stay read-only to avoid dropping advanced fields.
 - 请求记录和统计更实用：token、cache token、模型、provider、耗时、重试和估算成本会尽量汇总到 request ledger 与 UI。
   Request records and stats are more useful: tokens, cache tokens, model, provider, duration, retries, and estimated cost are aggregated into the request ledger and UI where available.
-- 长时间运行更稳：上游连接使用连接超时、TCP keepalive 和空闲连接回收；运行日志会自动轮转，降低日志无限增长风险。
-  Long-running sessions are more stable: upstream connections use connect timeout, TCP keepalive, and idle-pool cleanup; runtime logs rotate automatically.
+- 长时间运行更稳：上游连接使用连接超时、TCP keepalive 和空闲连接回收；运行日志会自动轮转；TUI/GUI 刷新不再高频重复扫描 Codex session 文件，长期 session 绑定也会保持有界。
+  Long-running sessions are more stable: upstream connections use connect timeout, TCP keepalive, and idle-pool cleanup; runtime logs rotate; TUI/GUI refreshes no longer repeatedly scan Codex session files, and long-running session bindings stay bounded.
 
 ### Fixed
 - 修复 Codex 启动/退出期间覆盖用户 `~/.codex/config.toml` 修改的问题，例如 Codex 自动写入的项目 trust 不会再被旧快照覆盖。
@@ -111,6 +111,8 @@ on_exhausted = "stop"
   Fixed several TUI provider-list and top-status refresh/layout issues, reducing duplicate rows and narrow-terminal truncation.
 - 修复 v3 provider/routing 保存后语义可能丢失的问题；provider tags、endpoint tags、模型支持和映射会被保留。
   Fixed cases where saving v3 provider/routing could lose semantics; provider tags, endpoint tags, model support, and mappings are preserved.
+- 修复余额查询失败（例如 HTTP 404）可能遗留旧的用量耗尽标记的问题；查询失败会显示为 balance error，但不会被当作已知耗尽来影响 routing。
+  Fixed balance query failures such as HTTP 404 leaving stale usage-exhausted markers behind; failed balance checks are shown as balance errors, but are not treated as known exhaustion for routing.
 
 ### Upgrade Notes
 - 配置会自动迁移到 v3 TOML；正常使用不需要手动重写配置。想查看新模板可以运行 `codex-helper config init --force`，执行前会尽力备份现有配置。
