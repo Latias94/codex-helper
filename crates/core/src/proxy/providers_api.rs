@@ -1,17 +1,25 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 use axum::Json;
 use axum::extract::Query;
 use axum::http::StatusCode;
 
 use crate::balance::ProviderBalanceSnapshot;
+use crate::config::{
+    ProxyConfig, ProxyConfigV2, ProxyConfigV3, ServiceConfig, ServiceConfigManager, ServiceViewV2,
+    ServiceViewV3, UpstreamAuth, UpstreamConfig,
+};
 use crate::dashboard_core::{ProviderOption, build_provider_options_from_view};
 use crate::logging::{log_retry_trace, now_ms};
 use crate::state::RuntimeConfigState;
 use crate::usage_providers::{UsageProviderRefreshSummary, refresh_balances_for_service};
 
 use super::ProxyService;
-use super::control_plane_service::{load_persisted_proxy_settings_v2, service_view_v2};
+use super::control_plane_service::{
+    PersistedProxySettingsDocument, load_persisted_proxy_settings_document,
+    load_persisted_proxy_settings_v2, service_view_v2, service_view_v3,
+};
 
 #[derive(serde::Deserialize)]
 pub(super) struct ProviderRuntimeMetaRequest {
@@ -68,6 +76,271 @@ fn normalize_optional_filter(value: Option<String>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn merge_refresh_summary(
+    summary: &mut UsageProviderRefreshSummary,
+    extra: UsageProviderRefreshSummary,
+) {
+    summary.providers_configured += extra.providers_configured;
+    summary.providers_matched += extra.providers_matched;
+    summary.upstreams_matched += extra.upstreams_matched;
+    summary.attempted += extra.attempted;
+    summary.refreshed += extra.refreshed;
+    summary.failed += extra.failed;
+    summary.missing_token += extra.missing_token;
+    summary.auto_attempted += extra.auto_attempted;
+    summary.auto_refreshed += extra.auto_refreshed;
+    summary.auto_failed += extra.auto_failed;
+}
+
+fn merge_auth_v3(block: &UpstreamAuth, inline: &UpstreamAuth) -> UpstreamAuth {
+    UpstreamAuth {
+        auth_token: inline
+            .auth_token
+            .clone()
+            .or_else(|| block.auth_token.clone()),
+        auth_token_env: inline
+            .auth_token_env
+            .clone()
+            .or_else(|| block.auth_token_env.clone()),
+        api_key: inline.api_key.clone().or_else(|| block.api_key.clone()),
+        api_key_env: inline
+            .api_key_env
+            .clone()
+            .or_else(|| block.api_key_env.clone()),
+    }
+}
+
+fn merge_string_maps(
+    base: &BTreeMap<String, String>,
+    overlay: &BTreeMap<String, String>,
+) -> HashMap<String, String> {
+    let mut out = base
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    for (key, value) in overlay {
+        out.insert(key.clone(), value.clone());
+    }
+    out
+}
+
+fn merge_bool_maps(
+    base: &BTreeMap<String, bool>,
+    overlay: &BTreeMap<String, bool>,
+) -> HashMap<String, bool> {
+    let mut out = base
+        .iter()
+        .map(|(key, value)| (key.clone(), *value))
+        .collect::<HashMap<_, _>>();
+    for (key, value) in overlay {
+        out.insert(key.clone(), *value);
+    }
+    out
+}
+
+fn provider_tags_for_balance(
+    provider_name: &str,
+    provider_tags: &BTreeMap<String, String>,
+    endpoint_tags: &BTreeMap<String, String>,
+) -> HashMap<String, String> {
+    let mut tags = merge_string_maps(provider_tags, endpoint_tags);
+    tags.insert("provider_id".to_string(), provider_name.to_string());
+    tags
+}
+
+fn service_manager_from_v3_provider_catalog(view: &ServiceViewV3) -> ServiceConfigManager {
+    let mut configs = HashMap::new();
+    for (provider_name, provider) in &view.providers {
+        if !provider.enabled {
+            continue;
+        }
+
+        let auth = merge_auth_v3(&provider.auth, &provider.inline_auth);
+        let mut upstreams = Vec::new();
+        if let Some(base_url) = provider
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            upstreams.push(UpstreamConfig {
+                base_url: base_url.to_string(),
+                auth: auth.clone(),
+                tags: provider_tags_for_balance(provider_name, &provider.tags, &BTreeMap::new()),
+                supported_models: provider
+                    .supported_models
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect(),
+                model_mapping: provider
+                    .model_mapping
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            });
+        }
+
+        let mut endpoints = provider.endpoints.iter().collect::<Vec<_>>();
+        endpoints.sort_by(|(left_name, left), (right_name, right)| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left_name.cmp(right_name))
+                .then_with(|| left.base_url.cmp(&right.base_url))
+        });
+        for (_, endpoint) in endpoints {
+            if !endpoint.enabled {
+                continue;
+            }
+            upstreams.push(UpstreamConfig {
+                base_url: endpoint.base_url.clone(),
+                auth: auth.clone(),
+                tags: provider_tags_for_balance(provider_name, &provider.tags, &endpoint.tags),
+                supported_models: merge_bool_maps(
+                    &provider.supported_models,
+                    &endpoint.supported_models,
+                ),
+                model_mapping: merge_string_maps(&provider.model_mapping, &endpoint.model_mapping),
+            });
+        }
+
+        if !upstreams.is_empty() {
+            configs.insert(
+                provider_name.clone(),
+                ServiceConfig {
+                    name: provider_name.clone(),
+                    alias: provider.alias.clone(),
+                    enabled: provider.enabled,
+                    level: 1,
+                    upstreams,
+                },
+            );
+        }
+    }
+
+    ServiceConfigManager {
+        active: view.routing.as_ref().and_then(|routing| {
+            routing
+                .target
+                .as_deref()
+                .filter(|target| configs.contains_key(*target))
+                .map(ToOwned::to_owned)
+        }),
+        default_profile: view.default_profile.clone(),
+        profiles: view.profiles.clone(),
+        configs,
+    }
+}
+
+fn service_manager_from_v2_provider_catalog(view: &ServiceViewV2) -> ServiceConfigManager {
+    let mut configs = HashMap::new();
+    for (provider_name, provider) in &view.providers {
+        if !provider.enabled {
+            continue;
+        }
+
+        let mut endpoints = provider.endpoints.iter().collect::<Vec<_>>();
+        endpoints.sort_by(|(left_name, left), (right_name, right)| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left_name.cmp(right_name))
+                .then_with(|| left.base_url.cmp(&right.base_url))
+        });
+
+        let upstreams = endpoints
+            .into_iter()
+            .filter(|(_, endpoint)| endpoint.enabled)
+            .map(|(_, endpoint)| UpstreamConfig {
+                base_url: endpoint.base_url.clone(),
+                auth: provider.auth.clone(),
+                tags: provider_tags_for_balance(provider_name, &provider.tags, &endpoint.tags),
+                supported_models: merge_bool_maps(
+                    &provider.supported_models,
+                    &endpoint.supported_models,
+                ),
+                model_mapping: merge_string_maps(&provider.model_mapping, &endpoint.model_mapping),
+            })
+            .collect::<Vec<_>>();
+
+        if !upstreams.is_empty() {
+            configs.insert(
+                provider_name.clone(),
+                ServiceConfig {
+                    name: provider_name.clone(),
+                    alias: provider.alias.clone(),
+                    enabled: provider.enabled,
+                    level: 1,
+                    upstreams,
+                },
+            );
+        }
+    }
+
+    ServiceConfigManager {
+        active: None,
+        default_profile: view.default_profile.clone(),
+        profiles: view.profiles.clone(),
+        configs,
+    }
+}
+
+fn provider_catalog_runtime_from_v3(cfg: &ProxyConfigV3, service_name: &str) -> ProxyConfig {
+    let mut runtime = ProxyConfig {
+        version: Some(3),
+        retry: cfg.retry.clone(),
+        notify: cfg.notify.clone(),
+        default_service: cfg.default_service,
+        ui: cfg.ui.clone(),
+        ..ProxyConfig::default()
+    };
+    let mgr = service_manager_from_v3_provider_catalog(service_view_v3(cfg, service_name));
+    match service_name {
+        "claude" => runtime.claude = mgr,
+        _ => runtime.codex = mgr,
+    }
+    runtime
+}
+
+fn provider_catalog_runtime_from_v2(cfg: &ProxyConfigV2, service_name: &str) -> ProxyConfig {
+    let mut runtime = ProxyConfig {
+        version: Some(2),
+        retry: cfg.retry.clone(),
+        notify: cfg.notify.clone(),
+        default_service: cfg.default_service,
+        ui: cfg.ui.clone(),
+        ..ProxyConfig::default()
+    };
+    let mgr = service_manager_from_v2_provider_catalog(service_view_v2(cfg, service_name));
+    match service_name {
+        "claude" => runtime.claude = mgr,
+        _ => runtime.codex = mgr,
+    }
+    runtime
+}
+
+async fn load_provider_catalog_runtime(
+    service_name: &str,
+) -> Result<Option<ProxyConfig>, (StatusCode, String)> {
+    let document = load_persisted_proxy_settings_document().await?;
+    let cfg = match document {
+        PersistedProxySettingsDocument::V3(cfg) => {
+            provider_catalog_runtime_from_v3(&cfg, service_name)
+        }
+        PersistedProxySettingsDocument::V2(cfg) => {
+            provider_catalog_runtime_from_v2(&cfg, service_name)
+        }
+    };
+
+    let mgr = match service_name {
+        "claude" => &cfg.claude,
+        _ => &cfg.codex,
+    };
+    if mgr.has_stations() {
+        Ok(Some(cfg))
+    } else {
+        Ok(None)
+    }
 }
 
 fn resolve_target_base_urls(
@@ -202,16 +475,12 @@ pub(super) async fn refresh_provider_balances(
 ) -> Result<Json<ProviderBalanceRefreshResponse>, (StatusCode, String)> {
     let station_name = normalize_optional_filter(query.station_name);
     let provider_id = normalize_optional_filter(query.provider_id);
-    let cfg = proxy.config.snapshot().await;
-    let refresh = refresh_balances_for_service(
-        cfg,
-        proxy.lb_states.clone(),
-        proxy.state.clone(),
-        proxy.service_name,
+    let refresh = refresh_provider_balances_for_proxy(
+        &proxy,
         station_name.as_deref(),
         provider_id.as_deref(),
     )
-    .await;
+    .await?;
     let provider_balances = proxy
         .state
         .get_provider_balance_view(proxy.service_name)
@@ -222,4 +491,37 @@ pub(super) async fn refresh_provider_balances(
         refresh,
         provider_balances,
     }))
+}
+
+pub(super) async fn refresh_provider_balances_for_proxy(
+    proxy: &ProxyService,
+    station_name_filter: Option<&str>,
+    provider_id_filter: Option<&str>,
+) -> Result<UsageProviderRefreshSummary, (StatusCode, String)> {
+    let cfg = proxy.config.snapshot().await;
+    let mut refresh = refresh_balances_for_service(
+        cfg,
+        proxy.lb_states.clone(),
+        proxy.state.clone(),
+        proxy.service_name,
+        station_name_filter,
+        provider_id_filter,
+    )
+    .await;
+
+    if let Some(provider_catalog_cfg) = load_provider_catalog_runtime(proxy.service_name).await? {
+        let display_lb_states = Arc::new(Mutex::new(HashMap::new()));
+        let provider_summary = refresh_balances_for_service(
+            Arc::new(provider_catalog_cfg),
+            display_lb_states,
+            proxy.state.clone(),
+            proxy.service_name,
+            station_name_filter,
+            provider_id_filter,
+        )
+        .await;
+        merge_refresh_summary(&mut refresh, provider_summary);
+    }
+
+    Ok(refresh)
 }

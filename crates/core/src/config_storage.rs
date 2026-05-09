@@ -342,9 +342,12 @@ pub async fn load_config() -> Result<ProxyConfig> {
         let text = fs::read_to_string(&toml_path).await?;
         let version = toml_schema_version_or_shape(&text);
 
+        let mut loaded_v3 = None;
         let mut cfg = if version == Some(3) {
             let cfg_v3 = toml::from_str::<ProxyConfigV3>(&text)?;
-            compile_v3_to_runtime(&cfg_v3)?
+            let runtime = compile_v3_to_runtime(&cfg_v3)?;
+            loaded_v3 = Some(cfg_v3);
+            runtime
         } else if version == Some(2) {
             let cfg_v2 = toml::from_str::<ProxyConfigV2>(&text)?;
             compile_v2_to_runtime(&cfg_v2)?
@@ -357,6 +360,8 @@ pub async fn load_config() -> Result<ProxyConfig> {
         validate_proxy_config(&cfg)?;
         if version != Some(3) {
             auto_migrate_loaded_config(&mut cfg, "config.toml", version).await;
+        } else if let Some(cfg_v3) = loaded_v3.as_ref() {
+            auto_compact_loaded_v3_config(cfg_v3, "config.toml").await;
         }
         return Ok(cfg);
     }
@@ -404,6 +409,46 @@ async fn auto_migrate_loaded_config(
 
 fn runtime_service_manager_value(mgr: &ServiceConfigManager) -> Result<JsonValue> {
     serde_json::to_value(mgr).context("serialize runtime service manager")
+}
+
+fn v3_service_has_import_metadata(view: &ServiceViewV3) -> bool {
+    view.providers.values().any(|provider| {
+        provider.tags.contains_key("provider_id")
+            || provider.tags.contains_key("requires_openai_auth")
+            || provider
+                .tags
+                .get("source")
+                .is_some_and(|value| value == "codex-config")
+            || provider.endpoints.values().any(|endpoint| {
+                endpoint.tags.contains_key("provider_id")
+                    || endpoint.tags.contains_key("requires_openai_auth")
+                    || endpoint
+                        .tags
+                        .get("source")
+                        .is_some_and(|value| value == "codex-config")
+            })
+    })
+}
+
+async fn auto_compact_loaded_v3_config(cfg: &ProxyConfigV3, source: &str) {
+    if !v3_service_has_import_metadata(&cfg.codex) && !v3_service_has_import_metadata(&cfg.claude) {
+        return;
+    }
+
+    match save_config_v3(cfg).await {
+        Ok(_) => {
+            info!(
+                "auto-compacted {} v3 provider config metadata for authoring format",
+                source
+            );
+        }
+        Err(err) => {
+            warn!(
+                "failed to auto-compact {} v3 provider config metadata: {}",
+                source, err
+            );
+        }
+    }
 }
 
 async fn save_existing_v3_if_only_runtime_metadata_changed(
@@ -494,6 +539,7 @@ pub async fn save_config_v2(cfg: &ProxyConfigV2) -> Result<PathBuf> {
 pub async fn save_config_v3(cfg: &ProxyConfigV3) -> Result<PathBuf> {
     let mut normalized = cfg.clone();
     normalized.version = 3;
+    compact_v3_config_for_write(&mut normalized);
     let mut runtime = compile_v3_to_runtime(&normalized)?;
     normalize_proxy_config(&mut runtime);
     validate_proxy_config(&runtime)?;

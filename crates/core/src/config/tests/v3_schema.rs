@@ -455,6 +455,11 @@ fn save_config_v3_writes_routing_first_schema() {
                             auth_token_env: Some("MAIN_API_KEY".to_string()),
                             ..UpstreamAuth::default()
                         },
+                        tags: BTreeMap::from([
+                            ("provider_id".to_string(), "main".to_string()),
+                            ("requires_openai_auth".to_string(), "false".to_string()),
+                            ("source".to_string(), "codex-config".to_string()),
+                        ]),
                         ..ProviderConfigV3::default()
                     },
                 )]),
@@ -474,7 +479,57 @@ fn save_config_v3_writes_routing_first_schema() {
         assert!(saved.contains("[codex.routing]"));
         assert!(saved.contains("policy = \"manual-sticky\""));
         assert!(saved.contains("auth_token_env = \"MAIN_API_KEY\""));
+        assert!(!saved.contains("enabled = true"));
+        assert!(!saved.contains("[codex.providers.main.tags]"));
+        assert!(!saved.contains("provider_id = \"main\""));
+        assert!(!saved.contains("requires_openai_auth"));
+        assert!(!saved.contains("source = \"codex-config\""));
         assert!(!saved.contains("[codex.stations."));
+    });
+}
+
+#[test]
+fn load_config_auto_compacts_v3_import_metadata() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        write_file(
+            &toml_path,
+            r#"
+version = 3
+
+[codex.providers.input]
+enabled = true
+base_url = "https://ai.input.im/v1"
+auth_token_env = "INPUT_API_KEY"
+
+[codex.providers.input.tags]
+provider_id = "input"
+requires_openai_auth = "false"
+source = "codex-config"
+
+[codex.routing]
+policy = "manual-sticky"
+target = "input"
+"#,
+        );
+
+        let cfg = super::load_config().await.expect("load v3 config");
+        assert_eq!(cfg.version, Some(3));
+        let saved = std::fs::read_to_string(&toml_path).expect("read compacted config");
+        assert!(saved.contains("[codex.providers.input]"));
+        assert!(saved.contains("auth_token_env = \"INPUT_API_KEY\""));
+        assert!(!saved.contains("enabled = true"));
+        assert!(!saved.contains("[codex.providers.input.tags]"));
+        assert!(!saved.contains("provider_id"));
+        assert!(!saved.contains("requires_openai_auth"));
+        assert!(!saved.contains("source = \"codex-config\""));
     });
 }
 

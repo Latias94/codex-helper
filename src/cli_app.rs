@@ -377,7 +377,7 @@ async fn run_server(
         proxy.clone(),
         Some(local_proxy_base_url(admin_addr.port())),
     );
-    let admin_app: Router = admin_listener_router(proxy);
+    let admin_app: Router = admin_listener_router(proxy.clone());
 
     if !host.is_loopback() {
         tracing::warn!(
@@ -411,6 +411,8 @@ async fn run_server(
         }
         tracing::warn!("==============================================");
     }
+
+    proxy.spawn_initial_balance_refresh();
 
     {
         let shutdown_tx = shutdown_tx.clone();

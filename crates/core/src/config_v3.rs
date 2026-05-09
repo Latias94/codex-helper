@@ -27,6 +27,31 @@ fn merge_auth(block: &UpstreamAuth, inline: &UpstreamAuth) -> UpstreamAuth {
     }
 }
 
+fn remove_import_metadata_tags(tags: &mut BTreeMap<String, String>) {
+    tags.remove("provider_id");
+    tags.remove("requires_openai_auth");
+    if tags
+        .get("source")
+        .is_some_and(|value| value == "codex-config")
+    {
+        tags.remove("source");
+    }
+}
+
+fn compact_service_view_v3_for_write(view: &mut ServiceViewV3) {
+    for provider in view.providers.values_mut() {
+        remove_import_metadata_tags(&mut provider.tags);
+        for endpoint in provider.endpoints.values_mut() {
+            remove_import_metadata_tags(&mut endpoint.tags);
+        }
+    }
+}
+
+pub fn compact_v3_config_for_write(cfg: &mut ProxyConfigV3) {
+    compact_service_view_v3_for_write(&mut cfg.codex);
+    compact_service_view_v3_for_write(&mut cfg.claude);
+}
+
 fn provider_v3_to_v2(
     service_name: &str,
     provider_name: &str,
@@ -81,8 +106,7 @@ fn provider_v3_to_v2(
     }
 
     let mut tags = provider.tags.clone();
-    tags.entry("provider_id".to_string())
-        .or_insert_with(|| provider_name.to_string());
+    tags.insert("provider_id".to_string(), provider_name.to_string());
 
     Ok(ProviderConfigV2 {
         alias: provider.alias.clone(),

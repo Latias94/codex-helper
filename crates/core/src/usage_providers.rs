@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -718,7 +718,20 @@ async fn poll_provider_http_json(
     if !resp.status().is_success() {
         anyhow::bail!("usage provider HTTP {}", resp.status());
     }
-    Ok(resp.json().await?)
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    let text = resp.text().await?;
+    serde_json::from_str(&text).with_context(|| {
+        format!(
+            "usage provider returned non-JSON response (content-type {}, {} bytes)",
+            content_type,
+            text.len()
+        )
+    })
 }
 
 fn amount_from_json(value: &serde_json::Value) -> Option<UsdAmount> {
@@ -1446,6 +1459,18 @@ async fn auto_probe_provider_target(
     let first_provider = auto_usage_provider(target, AUTO_PROBE_KINDS[0]);
 
     let Some(token) = resolve_token(&first_provider, &upstreams, cfg, service_name) else {
+        state
+            .record_provider_balance_snapshot(
+                service_name,
+                base_snapshot(
+                    &first_provider,
+                    &target.upstream,
+                    fetched_at_ms,
+                    stale_after_ms,
+                )
+                .with_error("no usable token; checked upstream auth"),
+            )
+            .await;
         return UsageProviderRefreshOutcome::MissingToken;
     };
 
@@ -1501,6 +1526,18 @@ async fn auto_probe_provider_target(
             "auto usage provider '{}' found no usable balance endpoint for {}[{}]: {}",
             first_provider.id, target.upstream.station_name, target.upstream.index, error
         );
+        state
+            .record_provider_balance_snapshot(
+                service_name,
+                base_snapshot(
+                    &first_provider,
+                    &target.upstream,
+                    fetched_at_ms,
+                    stale_after_ms,
+                )
+                .with_error(error),
+            )
+            .await;
     }
     UsageProviderRefreshOutcome::Failed
 }

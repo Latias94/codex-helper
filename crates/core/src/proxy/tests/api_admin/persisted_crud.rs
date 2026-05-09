@@ -1184,10 +1184,7 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
         alpha.inline_auth.api_key_env.as_deref(),
         Some("ALPHA_API_KEY")
     );
-    assert_eq!(
-        alpha.tags.get("provider_id").map(|value| value.as_str()),
-        Some("alpha")
-    );
+    assert!(!alpha.tags.contains_key("provider_id"));
     assert_eq!(
         alpha.tags.get("region").map(|value| value.as_str()),
         Some("hk")

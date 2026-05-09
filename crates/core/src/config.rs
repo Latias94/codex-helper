@@ -68,6 +68,7 @@ pub use v2_impl::{
     build_persisted_provider_catalog, build_persisted_station_catalog, compact_v2_config,
     compile_v2_to_runtime, migrate_legacy_to_v2,
 };
+pub(crate) use v3_impl::compact_v3_config_for_write;
 pub use v3_impl::{
     ConfigV3MigrationReport, compile_v3_to_runtime, compile_v3_to_v2, migrate_legacy_to_v3,
     migrate_legacy_to_v3_with_report, migrate_v2_to_v3, migrate_v2_to_v3_with_report,
@@ -258,6 +259,10 @@ pub struct ServiceConfig {
 
 fn default_service_config_enabled() -> bool {
     true
+}
+
+fn is_default_service_config_enabled(value: &bool) -> bool {
+    *value == default_service_config_enabled()
 }
 
 fn default_service_config_level() -> u8 {
@@ -510,7 +515,10 @@ pub struct ServiceViewV3 {
 pub struct ProviderConfigV3 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
-    #[serde(default = "default_service_config_enabled")]
+    #[serde(
+        default = "default_service_config_enabled",
+        skip_serializing_if = "is_default_service_config_enabled"
+    )]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -555,7 +563,10 @@ impl Default for ProviderConfigV3 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderEndpointV3 {
     pub base_url: String,
-    #[serde(default = "default_service_config_enabled")]
+    #[serde(
+        default = "default_service_config_enabled",
+        skip_serializing_if = "is_default_service_config_enabled"
+    )]
     pub enabled: bool,
     #[serde(
         default = "default_provider_endpoint_priority",
