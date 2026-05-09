@@ -137,7 +137,7 @@ If you want the shortest path to the current feature set, these are the main ent
 - TUI / GUI
   - `Stations`: station capability, health, breaker, quick switch
   - `Sessions`: session identity, effective route, session overrides
-  - `Proxy Settings` / Config: v3 routing-first summary and raw TOML; persistent provider/routing edits should use CLI commands or raw TOML
+  - `Proxy Settings` / Config: v3 routing-first summary; common single-endpoint providers and routing policies can be edited directly in the GUI form, while advanced endpoints / model mappings still belong in CLI commands or raw TOML
 - Read APIs
   - `GET /__codex_helper/api/v1/capabilities`
   - `GET /__codex_helper/api/v1/snapshot`
@@ -289,7 +289,7 @@ codex-helper config migrate --dry-run
 codex-helper config migrate --write --yes
 ```
 
-`routing show` reads the persisted route recipe. `routing list` / `routing explain` are read-only runtime views. Add providers and edit routing with the `provider` and `routing` commands.
+`routing show` reads the persisted route recipe. `routing list` / `routing explain` are read-only runtime views. Add providers and edit routing with the `provider` / `routing` commands, or use the GUI `Proxy Settings` form for common single-endpoint providers and routing policies.
 
 ---
 
@@ -607,6 +607,8 @@ codex-helper pricing remove custom-codex
 `pricing sync-basellm` pulls `https://basellm.github.io/llm-metadata/api/all.json` and converts its per-million model prices into this project's local override format. Use it to refresh bundled seed prices with an external catalog source while keeping local overrides on top.
 
 ### `usage_providers.json`
+
+You usually do not need to hand-write balance probes for common relays. When no explicit `usage_providers.json` entry matches an upstream, codex-helper reuses the upstream model API key and tries `sub2api_usage` (`/v1/usage`), `new_api_user_self` (`/api/user/self`), then `openai_balance_http_json` (`/user/balance`), recording only the first usable result. Explicit provider entries still take priority for custom endpoints, extra headers, dashboard JWTs, or disabling trusted exhaustion routing.
 
 Path: `~/.codex-helper/usage_providers.json`. If it does not exist, codex-helper will write a default file similar to:
 
