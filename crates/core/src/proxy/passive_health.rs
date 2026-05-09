@@ -126,6 +126,10 @@ mod tests {
                 usage_exhausted: vec![false, true],
                 last_good_index: Some(1),
                 penalty_streak: vec![3, 0],
+                upstream_signature: vec![
+                    "https://right.example/v1".to_string(),
+                    "https://backup.example/v1".to_string(),
+                ],
             },
         );
         LoadBalancer::new(Arc::new(service), Arc::new(Mutex::new(states)))

@@ -54,6 +54,7 @@ pub(super) enum RouteAttemptErrorKind {
     TargetBuild,
     Transport,
     BodyRead,
+    BodyTooLarge,
 }
 
 impl RouteAttemptErrorKind {
@@ -62,6 +63,7 @@ impl RouteAttemptErrorKind {
             RouteAttemptErrorKind::TargetBuild => "target_build_error",
             RouteAttemptErrorKind::Transport => "transport_error",
             RouteAttemptErrorKind::BodyRead => "body_read_error",
+            RouteAttemptErrorKind::BodyTooLarge => "body_too_large",
         }
     }
 
@@ -70,6 +72,7 @@ impl RouteAttemptErrorKind {
             RouteAttemptErrorKind::TargetBuild => "failed_target_build",
             RouteAttemptErrorKind::Transport => "failed_transport",
             RouteAttemptErrorKind::BodyRead => "failed_body_read",
+            RouteAttemptErrorKind::BodyTooLarge => "failed_body_too_large",
         }
     }
 
@@ -78,6 +81,7 @@ impl RouteAttemptErrorKind {
             RouteAttemptErrorKind::TargetBuild => "target_build_error",
             RouteAttemptErrorKind::Transport => "upstream_transport_error",
             RouteAttemptErrorKind::BodyRead => "upstream_body_read_error",
+            RouteAttemptErrorKind::BodyTooLarge => "upstream_response_body_too_large",
         }
     }
 }

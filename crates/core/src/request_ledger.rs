@@ -145,11 +145,9 @@ impl RequestUsageAggregate {
     }
 
     pub fn average_duration_ms(&self) -> u64 {
-        if self.requests == 0 {
-            0
-        } else {
-            self.duration_ms_total / self.requests
-        }
+        self.duration_ms_total
+            .checked_div(self.requests)
+            .unwrap_or(0)
     }
 
     pub fn summary_line(&self, station_name: &str) -> String {
@@ -168,19 +166,14 @@ impl RequestUsageAggregate {
     }
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestUsageSummaryGroup {
+    #[default]
     Station,
     Provider,
     Model,
     Session,
-}
-
-impl Default for RequestUsageSummaryGroup {
-    fn default() -> Self {
-        Self::Station
-    }
 }
 
 impl RequestUsageSummaryGroup {

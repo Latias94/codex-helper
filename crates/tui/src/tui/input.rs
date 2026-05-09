@@ -3282,7 +3282,7 @@ async fn handle_key_model_input(
 
 async fn handle_key_provider_menu(
     state: &ProxyState,
-    providers: &mut Vec<ProviderOption>,
+    providers: &mut [ProviderOption],
     ui: &mut UiState,
     snapshot: &Snapshot,
     key: KeyEvent,

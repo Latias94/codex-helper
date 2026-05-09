@@ -541,11 +541,7 @@ pub struct ModelPriceCatalogSnapshot {
 }
 
 impl ModelPriceCatalogSnapshot {
-    pub fn prioritized_models<'a, I, S>(
-        &'a self,
-        observed_models: I,
-        limit: usize,
-    ) -> Vec<&'a ModelPriceView>
+    pub fn prioritized_models<I, S>(&self, observed_models: I, limit: usize) -> Vec<&ModelPriceView>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,

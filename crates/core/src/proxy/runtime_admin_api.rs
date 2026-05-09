@@ -8,7 +8,9 @@ use super::api_responses::{
     build_reload_result, build_retry_config_response, build_runtime_status_response,
     make_profiles_response,
 };
-use super::control_plane_service::save_runtime_proxy_settings_and_reload;
+use super::control_plane_service::{
+    prune_runtime_observability_after_reload, save_runtime_proxy_settings_and_reload,
+};
 
 #[derive(serde::Deserialize)]
 pub(super) struct ControlTraceQuery {
@@ -160,6 +162,9 @@ pub(super) async fn reload_runtime_config(
         .force_reload_from_disk()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if changed {
+        prune_runtime_observability_after_reload(&proxy).await;
+    }
     let status = build_runtime_status_response(&proxy).await;
     Ok(Json(build_reload_result(changed, status)))
 }

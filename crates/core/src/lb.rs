@@ -46,17 +46,38 @@ pub struct LbState {
     pub usage_exhausted: Vec<bool>,
     pub last_good_index: Option<usize>,
     pub penalty_streak: Vec<u32>,
+    pub(crate) upstream_signature: Vec<String>,
 }
 
 impl LbState {
-    fn ensure_len(&mut self, len: usize) {
-        if self.failure_counts.len() != len {
-            self.failure_counts = vec![0; len];
-            self.cooldown_until = vec![None; len];
-            self.usage_exhausted = vec![false; len];
-            self.penalty_streak = vec![0; len];
-            // 如果 upstream 数量发生变化，原来的 last_good_index 很可能已经无效，直接清空。
-            self.last_good_index = None;
+    fn reset_for_layout(&mut self, signature: Vec<String>) {
+        let len = signature.len();
+        self.failure_counts = vec![0; len];
+        self.cooldown_until = vec![None; len];
+        self.usage_exhausted = vec![false; len];
+        self.penalty_streak = vec![0; len];
+        // upstream 布局变化时，原来的粘性索引不再可信，直接清空。
+        self.last_good_index = None;
+        self.upstream_signature = signature;
+    }
+
+    pub(crate) fn ensure_layout(&mut self, upstreams: &[UpstreamConfig]) {
+        let signature = upstreams
+            .iter()
+            .map(|upstream| upstream.base_url.clone())
+            .collect::<Vec<_>>();
+        if self.upstream_signature != signature {
+            self.reset_for_layout(signature);
+            return;
+        }
+
+        let len = upstreams.len();
+        if self.failure_counts.len() != len
+            || self.cooldown_until.len() != len
+            || self.usage_exhausted.len() != len
+            || self.penalty_streak.len() != len
+        {
+            self.reset_for_layout(signature);
         }
     }
 }
@@ -111,7 +132,7 @@ impl LoadBalancer {
             Err(e) => e.into_inner(),
         };
         let entry = map.entry(self.service.name.clone()).or_default();
-        entry.ensure_len(self.service.upstreams.len());
+        entry.ensure_layout(&self.service.upstreams);
 
         let now = std::time::Instant::now();
 
@@ -226,7 +247,7 @@ impl LoadBalancer {
         let entry = map
             .entry(self.service.name.clone())
             .or_insert_with(LbState::default);
-        entry.ensure_len(self.service.upstreams.len());
+        entry.ensure_layout(&self.service.upstreams);
         if index >= entry.failure_counts.len() {
             return;
         }
@@ -265,7 +286,7 @@ impl LoadBalancer {
         let entry = map
             .entry(self.service.name.clone())
             .or_insert_with(LbState::default);
-        entry.ensure_len(self.service.upstreams.len());
+        entry.ensure_layout(&self.service.upstreams);
         if index >= entry.failure_counts.len() {
             return;
         }
@@ -368,7 +389,7 @@ mod tests {
             let entry = guard
                 .entry("codex-main".to_string())
                 .or_insert_with(LbState::default);
-            entry.ensure_len(2);
+            entry.ensure_layout(&lb.service.upstreams);
             entry.usage_exhausted[0] = true;
             entry.usage_exhausted[1] = false;
         }
@@ -395,7 +416,7 @@ mod tests {
             let entry = guard
                 .entry("codex-main".to_string())
                 .or_insert_with(LbState::default);
-            entry.ensure_len(2);
+            entry.ensure_layout(&lb.service.upstreams);
             entry.usage_exhausted[0] = true;
             entry.usage_exhausted[1] = true;
         }
@@ -405,6 +426,50 @@ mod tests {
             .select_upstream()
             .expect("should still select an upstream");
         assert_eq!(selected.index, 0);
+    }
+
+    #[test]
+    fn lb_resets_state_when_upstream_layout_changes() {
+        let states = Arc::new(Mutex::new(HashMap::new()));
+        let initial = LoadBalancer::new(
+            Arc::new(make_service(
+                "codex-main",
+                &["https://primary.example", "https://backup.example"],
+            )),
+            states.clone(),
+        );
+        initial.record_result_with_backoff(
+            0,
+            false,
+            COOLDOWN_SECS,
+            CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        );
+
+        {
+            let guard = states.lock().unwrap();
+            let entry = guard.get("codex-main").expect("state exists");
+            assert_eq!(entry.failure_counts, vec![1, 0]);
+        }
+
+        let reordered = LoadBalancer::new(
+            Arc::new(make_service(
+                "codex-main",
+                &["https://backup.example", "https://primary.example"],
+            )),
+            states.clone(),
+        );
+        let selected = reordered
+            .select_upstream()
+            .expect("should select an upstream");
+        assert_eq!(selected.index, 0);
+
+        let guard = states.lock().unwrap();
+        let entry = guard.get("codex-main").expect("state exists");
+        assert_eq!(entry.failure_counts, vec![0, 0]);
+        assert_eq!(entry.last_good_index, None);
     }
 
     #[test]

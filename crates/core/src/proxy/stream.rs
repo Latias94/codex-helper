@@ -48,6 +48,17 @@ struct StreamUsageState {
     service_tier_scan_pos: usize,
 }
 
+fn trim_stream_buffer(state: &mut StreamUsageState, max_keep: usize) {
+    if max_keep == 0 || state.buffer.len() <= max_keep {
+        return;
+    }
+
+    let drop_len = state.buffer.len().saturating_sub(max_keep);
+    state.buffer.drain(..drop_len);
+    state.usage_scan_pos = state.usage_scan_pos.saturating_sub(drop_len);
+    state.service_tier_scan_pos = state.service_tier_scan_pos.saturating_sub(drop_len);
+}
+
 struct StreamFinalize {
     service_name: String,
     method: String,
@@ -76,6 +87,23 @@ struct StreamFinalize {
     upstream_index: usize,
     transport_cooldown_secs: u64,
     cooldown_backoff: crate::lb::CooldownBackoff,
+}
+
+fn summarize_error_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+
+    let preview = make_body_preview(body, content_type, 2048);
+    Some(if preview.encoding == "utf8" {
+        if preview.truncated {
+            format!("{}…", preview.data)
+        } else {
+            preview.data
+        }
+    } else {
+        format!("binary response body ({} bytes)", preview.original_len)
+    })
 }
 
 impl StreamFinalize {
@@ -155,7 +183,6 @@ impl Drop for StreamFinalize {
         let ttfb_ms_for_state = guard.first_chunk_ms;
         let service_tier_for_state = guard.service_tier.clone();
         let stream_error = guard.stream_error;
-        let response_body = guard.buffer.clone();
 
         let dur = self.start.elapsed().as_millis() as u64;
 
@@ -200,7 +227,12 @@ impl Drop for StreamFinalize {
             );
         }
 
+        let response_body = std::mem::take(&mut guard.buffer);
         drop(guard);
+        let resp_ct = self
+            .resp_headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok());
 
         let passive_failure = if stream_error {
             self.lb.record_result_with_backoff(
@@ -218,11 +250,7 @@ impl Drop for StreamFinalize {
             Some((
                 Some(status_code),
                 Some("upstream_stream_error".to_string()),
-                if response_body.is_empty() {
-                    None
-                } else {
-                    Some(String::from_utf8_lossy(response_body.as_slice()).to_string())
-                },
+                summarize_error_body(response_body.as_slice(), resp_ct),
             ))
         } else if (200..300).contains(&status_code) {
             self.lb.record_result_with_backoff(
@@ -249,11 +277,7 @@ impl Drop for StreamFinalize {
             Some((
                 Some(status_code),
                 cls,
-                if response_body.is_empty() {
-                    None
-                } else {
-                    Some(String::from_utf8_lossy(response_body.as_slice()).to_string())
-                },
+                summarize_error_body(response_body.as_slice(), resp_ct),
             ))
         };
 
@@ -429,20 +453,16 @@ pub(super) async fn build_sse_success_response(
                     guard.first_chunk_ms = Some(_finalize.upstream_start.elapsed().as_millis() as u64);
                 }
 
-                // Keep collecting / scanning even for long streams; cap memory by discarding already-scanned bytes.
-                if guard.buffer.len().saturating_add(chunk.len()) > max_keep && guard.usage_scan_pos > 0 {
-                    let pos = guard.usage_scan_pos;
-                    guard.buffer.drain(..pos);
-                    guard.usage_scan_pos = 0;
-                }
                 if chunk.len() > max_keep {
                     // Extremely large chunks are unexpected; keep the tail to avoid unbounded growth.
                     guard.buffer.clear();
                     guard.buffer
                         .extend_from_slice(&chunk[chunk.len().saturating_sub(max_keep)..]);
                     guard.usage_scan_pos = 0;
+                    guard.service_tier_scan_pos = 0;
                 } else {
                     guard.buffer.extend_from_slice(&chunk);
+                    trim_stream_buffer(&mut guard, max_keep);
                 }
                 if !guard.warned_non_success && !(200..300).contains(&status_code) {
                     if should_include_http_warn(status_code)
@@ -480,12 +500,6 @@ pub(super) async fn build_sse_success_response(
                         service_tier_scan_pos,
                         service_tier,
                     );
-                }
-                // If the buffer grew large, drop already-scanned bytes to cap memory.
-                if guard.buffer.len() > max_keep && guard.usage_scan_pos > 0 {
-                    let pos = guard.usage_scan_pos;
-                    guard.buffer.drain(..pos);
-                    guard.usage_scan_pos = 0;
                 }
                 if let Some(usage) = guard.usage.clone() {
                     guard.logged = true;

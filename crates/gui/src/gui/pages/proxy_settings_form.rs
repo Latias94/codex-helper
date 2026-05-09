@@ -138,7 +138,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 }
 
 fn reload_working_document_from_disk(ctx: &mut PageCtx<'_>) {
-    match std::fs::read_to_string(&ctx.proxy_settings_path) {
+    match std::fs::read_to_string(ctx.proxy_settings_path) {
         Ok(text) => {
             *ctx.proxy_settings_text = text.clone();
             match parse_proxy_settings_document(&text) {

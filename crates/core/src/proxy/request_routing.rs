@@ -58,63 +58,6 @@ fn station_balance_state(candidate: &StationRoutingCandidate) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::config::ServiceConfig;
-    use crate::dashboard_core::StationRoutingBalanceSummary;
-    use crate::state::RuntimeConfigState;
-
-    fn candidate(balance: StationRoutingBalanceSummary) -> StationRoutingCandidate {
-        StationRoutingCandidate {
-            name: "alpha".to_string(),
-            service: ServiceConfig {
-                name: "alpha".to_string(),
-                alias: None,
-                enabled: true,
-                level: 1,
-                upstreams: vec![],
-            },
-            level: 1,
-            enabled: true,
-            runtime_state: RuntimeConfigState::Normal,
-            upstream_count: 0,
-            balance,
-        }
-    }
-
-    #[test]
-    fn balance_state_marks_ignored_exhaustion_separately() {
-        let candidate = candidate(StationRoutingBalanceSummary {
-            snapshots: 1,
-            exhausted: 1,
-            routing_ignored_exhausted: 1,
-            ..StationRoutingBalanceSummary::default()
-        });
-
-        assert_eq!(station_balance_state(&candidate), "ignored_exhausted");
-        let json = station_candidate_json(&candidate);
-        assert_eq!(
-            json["balance"]["routing_ignored_exhausted"].as_u64(),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn balance_state_marks_trusted_all_exhausted() {
-        let candidate = candidate(StationRoutingBalanceSummary {
-            snapshots: 1,
-            exhausted: 1,
-            routing_snapshots: 1,
-            routing_exhausted: 1,
-            ..StationRoutingBalanceSummary::default()
-        });
-
-        assert_eq!(station_balance_state(&candidate), "all_exhausted");
-    }
-}
-
 impl ProxyService {
     pub(super) async fn pinned_config(
         &self,
@@ -326,5 +269,62 @@ impl ProxyService {
             .into_iter()
             .map(|candidate| LoadBalancer::new(Arc::new(candidate.service), self.lb_states.clone()))
             .collect::<Vec<_>>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::config::ServiceConfig;
+    use crate::dashboard_core::StationRoutingBalanceSummary;
+    use crate::state::RuntimeConfigState;
+
+    fn candidate(balance: StationRoutingBalanceSummary) -> StationRoutingCandidate {
+        StationRoutingCandidate {
+            name: "alpha".to_string(),
+            service: ServiceConfig {
+                name: "alpha".to_string(),
+                alias: None,
+                enabled: true,
+                level: 1,
+                upstreams: vec![],
+            },
+            level: 1,
+            enabled: true,
+            runtime_state: RuntimeConfigState::Normal,
+            upstream_count: 0,
+            balance,
+        }
+    }
+
+    #[test]
+    fn balance_state_marks_ignored_exhaustion_separately() {
+        let candidate = candidate(StationRoutingBalanceSummary {
+            snapshots: 1,
+            exhausted: 1,
+            routing_ignored_exhausted: 1,
+            ..StationRoutingBalanceSummary::default()
+        });
+
+        assert_eq!(station_balance_state(&candidate), "ignored_exhausted");
+        let json = station_candidate_json(&candidate);
+        assert_eq!(
+            json["balance"]["routing_ignored_exhausted"].as_u64(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn balance_state_marks_trusted_all_exhausted() {
+        let candidate = candidate(StationRoutingBalanceSummary {
+            snapshots: 1,
+            exhausted: 1,
+            routing_snapshots: 1,
+            routing_exhausted: 1,
+            ..StationRoutingBalanceSummary::default()
+        });
+
+        assert_eq!(station_balance_state(&candidate), "all_exhausted");
     }
 }

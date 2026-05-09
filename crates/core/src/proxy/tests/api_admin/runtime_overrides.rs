@@ -131,6 +131,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
                 usage_exhausted: vec![true],
                 last_good_index: Some(0),
                 penalty_streak: vec![0],
+                upstream_signature: vec!["http://127.0.0.1:9/v1".to_string()],
             },
         );
     }
@@ -449,7 +450,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
     );
     assert_eq!(
         summary["surface_capabilities"]["station_persisted_settings"].as_bool(),
-        Some(true)
+        Some(false)
     );
     assert_eq!(
         summary["remote_admin_access"]["remote_requires_token"].as_bool(),

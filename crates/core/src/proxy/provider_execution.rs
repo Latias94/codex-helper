@@ -14,7 +14,9 @@ use super::ProxyService;
 use super::attempt_execution::{
     ExecuteSelectedUpstreamParams, SelectedUpstreamExecutionOutcome, execute_selected_upstream,
 };
-use super::attempt_selection::{select_supported_upstream, station_upstreams_exhausted};
+use super::attempt_selection::{
+    SelectSupportedUpstreamParams, select_supported_upstream, station_upstreams_exhausted,
+};
 use super::provider_orchestration::{
     CrossStationFailoverBlockedParams, cross_station_failover_enabled,
     log_cross_station_failover_blocked, log_same_station_failover_trace,
@@ -351,7 +353,7 @@ async fn execute_station_upstreams(
             break 'upstreams;
         }
 
-        let selected = select_supported_upstream(
+        let selected = select_supported_upstream(SelectSupportedUpstreamParams {
             lb,
             request_model,
             strict_multi_config,
@@ -360,9 +362,9 @@ async fn execute_station_upstreams(
             route_attempts,
             avoided_total,
             provider_attempt,
-            plan.route.max_attempts,
+            provider_max_attempts: plan.route.max_attempts,
             total_upstreams,
-        );
+        });
         let Some(selected) = selected else {
             break 'upstreams;
         };

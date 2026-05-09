@@ -146,18 +146,12 @@ impl TrayController {
 
     pub fn drain_actions(&self) -> Vec<TrayAction> {
         let mut out = Vec::new();
-        loop {
-            let Ok(event) = TrayIconEvent::receiver().try_recv() else {
-                break;
-            };
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
             if let TrayIconEvent::DoubleClick { .. } = event {
                 out.push(TrayAction::Show);
             }
         }
-        loop {
-            let Ok(event) = MenuEvent::receiver().try_recv() else {
-                break;
-            };
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
             out.extend(self.map_event(&event));
         }
         out

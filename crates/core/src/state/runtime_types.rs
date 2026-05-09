@@ -214,6 +214,7 @@ impl PassiveUpstreamHealth {
             | Some("upstream_body_read_error")
             | Some("upstream_body_read_error_final")
             | Some("upstream_stream_error")
+            | Some("upstream_response_body_too_large")
             | Some("cloudflare_timeout") => 25,
             Some("cloudflare_challenge") => 20,
             Some("client_error_non_retryable") => 15,

@@ -1,9 +1,11 @@
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use futures_util::StreamExt;
 
 use crate::lb::{LoadBalancer, SelectedUpstream};
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog};
@@ -35,6 +37,86 @@ pub(super) enum AttemptReadBodyOutcome {
     RetrySameUpstream,
     TryNextUpstream,
     Continue(Bytes),
+}
+
+enum ResponseBodyReadError {
+    Read(reqwest::Error),
+    TooLarge {
+        limit: usize,
+        observed: usize,
+        content_length: Option<u64>,
+    },
+}
+
+fn upstream_response_body_max_bytes() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("CODEX_HELPER_UPSTREAM_RESPONSE_BODY_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(32 * 1024 * 1024)
+            .clamp(1024 * 1024, 128 * 1024 * 1024)
+    })
+}
+
+impl ResponseBodyReadError {
+    fn message(&self) -> String {
+        match self {
+            Self::Read(error) => format_reqwest_error_for_retry_chain(error),
+            Self::TooLarge {
+                limit,
+                observed,
+                content_length,
+            } => match content_length {
+                Some(len) => format!(
+                    "upstream response body too large: content_length={} limit={} observed={}",
+                    len, limit, observed
+                ),
+                None => format!(
+                    "upstream response body too large: observed={} limit={}",
+                    observed, limit
+                ),
+            },
+        }
+    }
+}
+
+async fn read_response_body_with_limit(
+    response: reqwest::Response,
+) -> Result<Bytes, ResponseBodyReadError> {
+    let max = upstream_response_body_max_bytes();
+    let content_length = response.content_length();
+    if content_length.is_some_and(|len| len > max as u64) {
+        return Err(ResponseBodyReadError::TooLarge {
+            limit: max,
+            observed: max.saturating_add(1),
+            content_length,
+        });
+    }
+
+    let mut body = Vec::with_capacity(
+        content_length
+            .and_then(|len| usize::try_from(len).ok())
+            .unwrap_or(0)
+            .min(max),
+    );
+    let stream = response.bytes_stream();
+    futures_util::pin_mut!(stream);
+    while let Some(item) = stream.next().await {
+        let chunk = item.map_err(ResponseBodyReadError::Read)?;
+        let next_len = body.len().saturating_add(chunk.len());
+        if next_len > max {
+            return Err(ResponseBodyReadError::TooLarge {
+                limit: max,
+                observed: next_len,
+                content_length,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(Bytes::from(body))
 }
 
 pub(super) struct AttemptTransportParams<'a> {
@@ -270,27 +352,43 @@ pub(super) async fn read_attempt_response_body(
         model_note,
     } = params;
 
-    match response.bytes().await {
+    match read_response_body_with_limit(response).await {
         Ok(bytes) => AttemptReadBodyOutcome::Continue(bytes),
         Err(error) => {
-            let err_str = format_reqwest_error_for_retry_chain(&error);
-            let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
-                && should_retry_class(upstream_opt, Some("upstream_transport_error"));
+            let err_str = error.message();
+            let (route_kind, can_retry_upstream, error_class, cooldown_reason) = match &error {
+                ResponseBodyReadError::Read(_) => {
+                    let can_retry_upstream = upstream_attempt + 1 < upstream_opt.max_attempts
+                        && should_retry_class(upstream_opt, Some("upstream_transport_error"));
+                    (
+                        RouteAttemptErrorKind::BodyRead,
+                        can_retry_upstream,
+                        "upstream_body_read_error",
+                        "upstream_body_read_error",
+                    )
+                }
+                ResponseBodyReadError::TooLarge { .. } => (
+                    RouteAttemptErrorKind::BodyTooLarge,
+                    false,
+                    "upstream_response_body_too_large",
+                    "upstream_response_body_too_large",
+                ),
+            };
             record_error_route_attempt(
                 upstream_chain,
                 route_attempts,
                 ErrorRouteAttemptParams {
                     selected,
                     route_attempt_index,
-                    kind: RouteAttemptErrorKind::BodyRead,
+                    kind: route_kind,
                     reason: err_str.as_str(),
                     model_note,
                     duration_ms: None,
                     cooldown_secs: (!can_retry_upstream).then_some(transport_cooldown_secs),
-                    cooldown_reason: (!can_retry_upstream).then_some("upstream_body_read_error"),
+                    cooldown_reason: (!can_retry_upstream).then_some(cooldown_reason),
                 },
             );
-            if can_retry_upstream {
+            if matches!(error, ResponseBodyReadError::Read(_)) && can_retry_upstream {
                 backoff_sleep(upstream_opt, upstream_attempt).await;
                 return AttemptReadBodyOutcome::RetrySameUpstream;
             }
@@ -299,8 +397,8 @@ pub(super) async fn read_attempt_response_body(
                 proxy,
                 lb: Some(lb),
                 selected,
-                error_class: "upstream_body_read_error",
-                penalize_reason: Some("upstream_body_read_error"),
+                error_class,
+                penalize_reason: Some(error_class),
                 cooldown_secs: transport_cooldown_secs,
                 cooldown_backoff,
                 error_message: err_str,

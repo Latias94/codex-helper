@@ -78,16 +78,18 @@ impl RuntimeConfig {
     }
 
     #[cfg(test)]
-    pub(super) async fn maybe_reload_from_disk(&self) {}
+    pub(super) async fn maybe_reload_from_disk(&self) -> bool {
+        false
+    }
 
     #[cfg(not(test))]
-    pub(super) async fn maybe_reload_from_disk(&self) {
+    pub(super) async fn maybe_reload_from_disk(&self) -> bool {
         const MIN_CHECK_INTERVAL: Duration = Duration::from_millis(800);
 
         let last_mtime = {
             let mut st = self.reload.lock().await;
             if st.last_check_at.elapsed() < MIN_CHECK_INTERVAL {
-                return;
+                return false;
             }
             st.last_check_at = Instant::now();
             st.last_mtime
@@ -99,9 +101,10 @@ impl RuntimeConfig {
             .ok()
             .and_then(|m| m.modified().ok());
         if mtime == last_mtime {
-            return;
+            return false;
         }
 
+        let mut reloaded = false;
         match crate::config::load_config().await {
             Ok(cfg) => {
                 *self.current.write().await = Arc::new(cfg);
@@ -110,6 +113,7 @@ impl RuntimeConfig {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 self.last_loaded_at_ms.store(now, Ordering::Relaxed);
+                reloaded = true;
             }
             Err(err) => {
                 warn!("failed to reload config from disk: {}", err);
@@ -118,5 +122,6 @@ impl RuntimeConfig {
 
         let mut st = self.reload.lock().await;
         st.last_mtime = mtime;
+        reloaded
     }
 }

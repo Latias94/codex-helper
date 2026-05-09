@@ -539,9 +539,11 @@ mod tests {
 
     #[test]
     fn reset_table_viewports_keeps_selection_but_clears_offsets() {
-        let mut ui = UiState::default();
-        ui.stations_table = TableState::default().with_offset(8).with_selected(Some(9));
-        ui.sessions_table = TableState::default().with_offset(3).with_selected(Some(4));
+        let mut ui = UiState {
+            stations_table: TableState::default().with_offset(8).with_selected(Some(9)),
+            sessions_table: TableState::default().with_offset(3).with_selected(Some(4)),
+            ..UiState::default()
+        };
 
         ui.reset_table_viewports();
 

@@ -56,6 +56,15 @@ pub(super) enum PersistedProxySettingsDocument {
     V3(ProxyConfigV3),
 }
 
+pub(super) async fn prune_runtime_observability_after_reload(proxy: &ProxyService) {
+    let cfg = proxy.config.snapshot().await;
+    let mgr = proxy.service_manager(cfg.as_ref());
+    proxy
+        .state
+        .prune_runtime_observability_for_service(proxy.service_name, mgr)
+        .await;
+}
+
 pub(super) async fn save_runtime_proxy_settings_and_reload(
     proxy: &ProxyService,
     cfg: ProxyConfig,
@@ -63,11 +72,14 @@ pub(super) async fn save_runtime_proxy_settings_and_reload(
     crate::config::save_config(&cfg)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    proxy
+    let changed = proxy
         .config
         .force_reload_from_disk()
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if changed {
+        prune_runtime_observability_after_reload(proxy).await;
+    }
     Ok(())
 }
 
@@ -154,15 +166,9 @@ pub(super) async fn save_persisted_proxy_settings_v2_and_reload(
     proxy: &ProxyService,
     cfg: ProxyConfigV2,
 ) -> Result<(), (StatusCode, String)> {
-    crate::config::save_config_v2(&cfg)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    proxy
-        .config
-        .force_reload_from_disk()
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    Ok(())
+    let runtime = crate::config::compile_v2_to_runtime(&cfg)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    save_runtime_proxy_settings_and_reload(proxy, runtime).await
 }
 
 pub(super) async fn save_persisted_proxy_settings_document_and_reload(
@@ -171,20 +177,23 @@ pub(super) async fn save_persisted_proxy_settings_document_and_reload(
 ) -> Result<(), (StatusCode, String)> {
     match document {
         PersistedProxySettingsDocument::V2(cfg) => {
-            crate::config::save_config_v2(&cfg)
-                .await
-                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            let runtime = crate::config::compile_v2_to_runtime(&cfg)
+                .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+            save_runtime_proxy_settings_and_reload(proxy, runtime).await?;
         }
         PersistedProxySettingsDocument::V3(cfg) => {
             crate::config::save_config_v3(&cfg)
                 .await
                 .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            let changed = proxy
+                .config
+                .force_reload_from_disk()
+                .await
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            if changed {
+                prune_runtime_observability_after_reload(proxy).await;
+            }
         }
     }
-    proxy
-        .config
-        .force_reload_from_disk()
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(())
 }

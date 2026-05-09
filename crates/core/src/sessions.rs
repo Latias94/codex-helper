@@ -379,7 +379,7 @@ pub async fn list_codex_sessions_in_day_dir(
         });
     }
 
-    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    out.sort_by_key(|item| Reverse(item.mtime_ms));
     Ok(out)
 }
 
@@ -457,10 +457,7 @@ async fn find_recent_codex_sessions_in_dir(
         }
     }
 
-    out.sort_by(|a, b| match b.mtime_ms.cmp(&a.mtime_ms) {
-        Ordering::Equal => b.id.cmp(&a.id),
-        other => other,
-    });
+    out.sort_by_key(|item| Reverse((item.mtime_ms, item.id.clone())));
     out.truncate(limit);
     Ok(out)
 }
@@ -812,7 +809,7 @@ async fn select_and_expand_headers(
     let mut chosen = if !matched.is_empty() { matched } else { others };
     // Use file mtime for cheap recency ordering; this correctly surfaces sessions that were resumed
     // (older filename timestamp but recently appended to).
-    chosen.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    chosen.sort_by_key(|item| Reverse(item.mtime_ms));
     if chosen.len() > limit {
         chosen.truncate(limit);
     }

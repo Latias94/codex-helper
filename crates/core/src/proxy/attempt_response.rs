@@ -5,7 +5,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 
 use crate::lb::{CooldownBackoff, LoadBalancer, SelectedUpstream};
-use crate::logging::{RouteAttemptLog, ServiceTierLog};
+use crate::logging::{RouteAttemptLog, ServiceTierLog, make_body_preview};
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
 
 use super::ProxyService;
@@ -92,6 +92,22 @@ pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) cooldown_backoff: CooldownBackoff,
     pub(super) method: &'a Method,
     pub(super) path: &'a str,
+}
+
+fn summarize_upstream_error_body(response_body: &Bytes, response_headers: &HeaderMap) -> String {
+    let content_type = response_headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok());
+    let preview = make_body_preview(response_body.as_ref(), content_type, 2048);
+    if preview.encoding == "utf8" {
+        if preview.truncated {
+            format!("{}…", preview.data)
+        } else {
+            preview.data
+        }
+    } else {
+        format!("binary response body ({} bytes)", preview.original_len)
+    }
 }
 
 pub(super) async fn handle_streaming_attempt_success(
@@ -295,7 +311,7 @@ pub(super) async fn handle_attempt_response(
         );
     }
 
-    let response_text = String::from_utf8_lossy(response_body.as_ref()).to_string();
+    let response_text = summarize_upstream_error_body(&response_body, &response_headers);
     if never_retry {
         if !class_is_health_neutral(cls.as_deref()) {
             lb.record_result_with_backoff(

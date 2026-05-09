@@ -475,6 +475,17 @@ fn validate_v3_routing_spec_for_view(
     Ok(())
 }
 
+fn v3_default_endpoint_can_be_inlined(existing: Option<&crate::config::ProviderConfigV3>) -> bool {
+    existing
+        .and_then(|provider| provider.endpoints.get("default"))
+        .map(|endpoint| {
+            endpoint.tags.is_empty()
+                && endpoint.supported_models.is_empty()
+                && endpoint.model_mapping.is_empty()
+        })
+        .unwrap_or(true)
+}
+
 fn merge_persisted_provider_spec_v3(
     existing: Option<&crate::config::ProviderConfigV3>,
     provider: &crate::config::PersistedProviderSpec,
@@ -507,6 +518,7 @@ fn merge_persisted_provider_spec_v3(
     if provider.endpoints.len() == 1
         && provider.endpoints[0].name == "default"
         && provider.endpoints[0].priority == 0
+        && v3_default_endpoint_can_be_inlined(existing)
     {
         out.base_url = Some(provider.endpoints[0].base_url.clone());
     } else {
@@ -1167,7 +1179,7 @@ pub(super) async fn set_persisted_default_profile(
     {
         if let Some(profile_name) = profile_name.as_deref() {
             let view = service_view_v3(&document, proxy.service_name);
-            if view.profiles.get(profile_name).is_none() {
+            if !view.profiles.contains_key(profile_name) {
                 return Err((
                     StatusCode::NOT_FOUND,
                     format!("profile '{}' not found", profile_name),

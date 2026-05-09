@@ -491,6 +491,11 @@ fn parse_route_attempt_from_chain_entry(raw: &str, attempt_index: u32) -> RouteA
         attempt.reason = Some(error);
         attempt.error_class = Some("upstream_body_read_error".to_string());
     }
+    if let Some(error) = route_chain_value(metadata, "body_too_large") {
+        attempt.decision = "failed_body_too_large".to_string();
+        attempt.reason = Some(error);
+        attempt.error_class = Some("upstream_response_body_too_large".to_string());
+    }
 
     attempt
 }
@@ -585,6 +590,7 @@ const ROUTE_CHAIN_KEYS: &[&str] = &[
     "transport_error",
     "target_build_error",
     "body_read_error",
+    "body_too_large",
     "skipped_unsupported_model",
     "total",
 ];

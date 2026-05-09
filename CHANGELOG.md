@@ -5,21 +5,88 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
-## [0.13.0] - 2026-03-07
+## [0.13.0] - 2026-05-09
 
 ### 新增 / Added
-- 新增更清晰的 `v2` 配置视图：`config.toml` 现在支持 `version = 2` 的 `service -> providers + groups` 结构，并编译到现有运行时路由模型，在不改变当前负载均衡行为的前提下提升多 provider / 多 endpoint 场景的可读性。 Add a clearer `v2` config view: `config.toml` now supports a `version = 2` `service -> providers + groups` layout that compiles into the existing runtime routing model, improving readability for multi-provider / multi-endpoint setups without changing current load-balancing behavior.
-- 新增 `codex-helper config explain` 与 `codex-helper config migrate --to v2`：支持 `--compact` 紧凑化预览，以及 `--write --yes` 安全写回，便于把 legacy 配置迁移成更易维护的 TOML。 Add `codex-helper config explain` and `codex-helper config migrate --to v2`: supports compact previews via `--compact` and safe write-back via `--write --yes`, making it easier to migrate legacy configs into a more maintainable TOML format.
+- `version = 3` routing-first 配置成为公开默认格式：用户只需要定义 `providers`，再用 `[codex.routing]` / `[claude.routing]` 描述顺序、pin、标签优先和耗尽处理。 `version = 3` routing-first config is now the public default: users define `providers` once and express order, pins, tag preference, and exhaustion behavior through `[codex.routing]` / `[claude.routing]`.
+- 新增 provider / routing 持久化控制面和 CLI 写入面，用于新增 provider、调整 `routing.order`、pin provider、按标签优先路由，而不再要求用户维护多份 Codex config。 Add provider / routing persisted control-plane and CLI write surfaces for adding providers, editing `routing.order`, pinning providers, and preferring tags without maintaining one Codex config per relay.
+- 新增余额适配与价格目录能力：支持常见 OpenAI-compatible / sub2api 风格余额响应、可配置刷新节流与 `trust_exhaustion_for_routing`，并基于可更新价格目录展示请求成本、cache token 和速度指标。 Add balance adapters and pricing catalog support: common OpenAI-compatible / sub2api-style balance responses, configurable refresh throttling and `trust_exhaustion_for_routing`, plus request cost, cache-token, and speed metrics from an updatable price catalog.
+
+### 可复制 routing 示例 / Copyable Routing Recipes
+
+先定义 provider，再复制其中一个 `[codex.routing]` 策略；Claude 同理把 `codex` 换成 `claude`。 Define providers once, then copy one `[codex.routing]` recipe; for Claude, replace `codex` with `claude`.
+
+```toml
+version = 3
+
+[codex.providers.monthly_a]
+base_url = "https://monthly-a.example.com/v1"
+auth_token_env = "MONTHLY_A_API_KEY"
+tags = { billing = "monthly", vendor = "relay-a" }
+
+[codex.providers.monthly_b]
+base_url = "https://monthly-b.example.com/v1"
+auth_token_env = "MONTHLY_B_API_KEY"
+tags = { billing = "monthly", vendor = "relay-b" }
+
+[codex.providers.paygo]
+base_url = "https://api.openai.com/v1"
+auth_token_env = "OPENAI_API_KEY"
+tags = { billing = "paygo", vendor = "openai" }
+```
+
+顺序兜底：最直观的优先级链，适合“大多数请求先走 A，失败或耗尽再走 B/C”。 Ordered failover: the clearest priority chain, good for “try A first, then B/C when it fails or is exhausted”.
+
+```toml
+[codex.routing]
+policy = "ordered-failover"
+order = ["monthly_a", "monthly_b", "paygo"]
+on_exhausted = "continue"
+```
+
+手动固定：只固定到一个 provider，适合临时调试或强制使用某个账号；目标不可用时不会自动切走。 Manual sticky: pin one provider for temporary debugging or forced account use; it does not automatically leave the target.
+
+```toml
+[codex.routing]
+policy = "manual-sticky"
+target = "monthly_a"
+order = ["monthly_a", "monthly_b", "paygo"]
+on_exhausted = "continue"
+```
+
+包月优先且保可用：所有 `billing = "monthly"` 的 provider 排在前面，已知全耗尽后继续 fallback 到 pay-as-you-go。 Monthly first with availability fallback: providers tagged `billing = "monthly"` are tried first, then known fully exhausted routes can fall back to pay-as-you-go.
+
+```toml
+[codex.routing]
+policy = "tag-preferred"
+prefer_tags = [{ billing = "monthly" }]
+order = ["monthly_a", "monthly_b", "paygo"]
+on_exhausted = "continue"
+```
+
+包月严格止损：只使用包月 provider；如果都已知全耗尽，就停止而不是走付费兜底。 Strict monthly budget: use only monthly providers; when all matching routes are known exhausted, stop instead of falling back to pay-as-you-go.
+
+```toml
+[codex.routing]
+policy = "tag-preferred"
+prefer_tags = [{ billing = "monthly" }]
+order = ["monthly_a", "monthly_b", "paygo"]
+on_exhausted = "stop"
+```
 
 ### 改进 / Improved
-- 配置模块内部做了一轮收口重构：把 Codex / Claude 客户端配置的路径、备份、sentinel 判断收口到 `client_config`，并在 `config` 下新增 `storage` / `bootstrap` / `auth_sync` 门面，为后续继续拆分配置管理做好边界，同时保持现有 CLI / GUI / TUI 调用方式兼容。  Internal config management refactor: consolidate Codex / Claude client-config path, backup, and sentinel handling into `client_config`, and add `storage` / `bootstrap` / `auth_sync` facades under `config` to prepare for further modularization while keeping existing CLI / GUI / TUI call sites compatible.
-- 代理主监听新增 `/.well-known/codex-helper-admin` 发现文档，GUI 的本地扫描附着与 `notify` 现在会优先发现并使用真实管理端地址，从而兼容“代理端口 / 管理端口拆分”的新拓扑。  Add `/.well-known/codex-helper-admin` discovery on the proxy listener so GUI local attach scanning and `notify` can prefer the real admin base URL when proxy and admin listeners are split.
+- `load_config()` / `save_config()` / `config init` 统一写出 v3 TOML；旧 `config.json`、无版本 legacy TOML、`version = 2` TOML 会在加载时自动迁移为 `config.toml version = 3`，并保留 `.bak` 备份。 `load_config()` / `save_config()` / `config init` now write v3 TOML; old `config.json`, unversioned legacy TOML, and `version = 2` TOML auto-migrate to `config.toml version = 3` on load with `.bak` backups.
+- GUI/TUI 的站点操作收口为运行时控制，持久化编辑收口到 v3 raw config、provider/routing CLI 和 provider/routing API，避免 UI 再写回旧 station schema。 GUI/TUI station actions are now runtime controls, while persisted edits go through v3 raw config, provider/routing CLI, and provider/routing APIs so UI no longer writes legacy station schema.
+- 代理转发与观测路径做了稳定性整理：请求体预览限流、HTTP debug 大对象落盘、请求 ledger 聚合、会话扫描排序和运行时观测清理更稳。 Proxy forwarding and observability paths were tightened: bounded request body previews, large HTTP debug payload spillover, request ledger aggregation, session ordering, and runtime observability pruning are more robust.
 
 ### 修复 / Fixed
-- 修复 `switch on/off` 在重复切换时可能复用陈旧备份的问题：恢复原始配置后现在会清理旧备份，使下一次 `switch on` 能重新抓取最新的原始配置，避免用户手动修改后再次 `switch off` 被回滚到更早版本。  Fix stale backup snapshots across repeated `switch on/off` cycles: restoring from backup now removes the old backup so the next `switch on` captures the latest original config instead of rolling users back to an older pre-edit snapshot.
-- 修复代理对 `~/.codex/auth.json` / `~/.claude/settings.json` 的鉴权缓存不会刷新的问题；同时为 `__codex_helper` 管理 API 增加默认 loopback 限制，非 loopback 访问需要 `CODEX_HELPER_ADMIN_TOKEN` + `x-codex-helper-admin-token`。  Fix stale auth-file caching for `~/.codex/auth.json` / `~/.claude/settings.json`, and protect `__codex_helper` admin routes by defaulting them to loopback-only access unless `CODEX_HELPER_ADMIN_TOKEN` and `x-codex-helper-admin-token` are provided for remote requests.
-- 进一步将 `__codex_helper` 管理 API 从主代理 listener 拆分到独立 loopback 管理端口（默认 `proxy_port + 1000`），让 GUI/TUI/notify 走本地管理面而不与主代理流量混用。  Further split `__codex_helper` admin routes onto a dedicated loopback-only admin port (default `proxy_port + 1000`) so local GUI/TUI/notify management traffic no longer shares the main proxy listener.
-- 修复 Windows 下配置覆盖写入会因目标文件已存在而失败的问题：`config init` / `save_config` / `switch on/off` / Claude settings 更新现在统一通过同目录临时文件 + 替换写入，重复保存时也会正确刷新 `.bak` 备份。  Fix Windows overwrite failures when the target config file already exists: `config init`, `save_config`, `switch on/off`, and Claude settings updates now use same-directory temp writes plus replacement, and repeated saves correctly refresh `.bak` backups.
+- 修复 v3 persisted provider/routing 写入会经由 runtime 退化再迁移、导致 routing/provider 原始语义可能丢失的问题；v3 文档现在直接按 v3 保存并重新加载。 Fix v3 persisted provider/routing writes degrading through runtime and losing original routing/provider semantics; v3 documents are now saved directly as v3 and reloaded.
+- 修复 provider spec 更新默认端点时可能丢失既有端点级标签、模型支持与映射的问题。 Fix provider spec updates for default endpoints potentially dropping existing endpoint-level tags, model support, and mappings.
+- 修复并清零 workspace `clippy -D warnings`，覆盖 core / GUI / TUI 的新 lint。 Fix all workspace `clippy -D warnings` issues across core / GUI / TUI.
+
+### 破坏性变更 / Breaking Changes
+- v3 配置下，旧 persisted station settings / station specs API 不再作为写入面；请改用 routing/provider API、CLI 或 v3 TOML。 In v3 configs, old persisted station settings / station specs APIs are no longer write surfaces; use routing/provider APIs, CLI, or v3 TOML instead.
+- v3 profile 不再支持 station 绑定；provider 选择统一归 routing 负责，profile 只保留模型、reasoning effort、service tier 等会话默认值。 v3 profiles no longer support station bindings; provider selection belongs to routing, while profiles keep session defaults such as model, reasoning effort, and service tier.
 
 ## [0.12.1] - 2026-02-09
 ### 新增 / Added

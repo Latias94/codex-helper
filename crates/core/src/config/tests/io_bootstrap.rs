@@ -80,6 +80,48 @@ auth_token_env = "RIGHTCODE_API_KEY"
 }
 
 #[test]
+fn load_config_auto_migrates_unversioned_legacy_toml_to_v3() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        write_file(
+            &toml_path,
+            r#"
+[codex]
+active = "right"
+
+[codex.configs.right]
+
+[[codex.configs.right.upstreams]]
+base_url = "https://www.right.codes/codex/v1"
+[codex.configs.right.upstreams.auth]
+auth_token_env = "RIGHTCODE_API_KEY"
+"#,
+        );
+
+        let cfg = super::load_config()
+            .await
+            .expect("load unversioned legacy config");
+        assert_eq!(cfg.version, Some(3));
+        assert_eq!(
+            cfg.codex.active_station().map(|svc| svc.name.as_str()),
+            Some("right")
+        );
+
+        let saved = std::fs::read_to_string(&toml_path).expect("read migrated config.toml");
+        assert!(saved.contains("version = 3"));
+        assert!(saved.contains("[codex.providers.rightcode]"));
+        assert!(saved.contains("[codex.routing]"));
+        assert!(!saved.contains("[codex.configs.right]"));
+    });
+}
+
+#[test]
 fn save_config_overwrites_existing_toml_and_updates_backup() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -369,10 +411,20 @@ env_key = "RIGHTCODE_API_KEY"
             .filter(|l| !l.trim_start().starts_with('#'))
             .collect::<Vec<_>>()
             .join("\n");
-        let loaded: ProxyConfig =
-            toml::from_str(&text).expect("config.toml should be valid ProxyConfig");
-        let svc2 = loaded.codex.active_station().expect("active codex station");
-        assert_eq!(svc2.name, "right");
+        let loaded: ProxyConfigV3 =
+            toml::from_str(&text).expect("config.toml should be valid ProxyConfigV3");
+        assert_eq!(loaded.version, 3);
+        let runtime = super::compile_v3_to_runtime(&loaded).expect("compile v3 runtime");
+        let svc2 = runtime
+            .codex
+            .active_station()
+            .expect("active codex station");
+        assert_eq!(svc2.name, "routing");
+        assert_eq!(svc2.upstreams.len(), 1);
+        assert_eq!(
+            svc2.upstreams[0].base_url,
+            "https://www.right.codes/codex/v1"
+        );
         assert!(svc2.upstreams[0].auth.auth_token.is_none());
         assert_eq!(
             svc2.upstreams[0].auth.auth_token_env.as_deref(),

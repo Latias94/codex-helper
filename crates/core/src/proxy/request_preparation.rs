@@ -4,9 +4,9 @@ use axum::http::{HeaderMap, Method};
 use crate::logging::{BodyPreview, ServiceTierLog, make_body_preview};
 
 use super::request_body::{
-    apply_model_override, apply_reasoning_effort_override, apply_service_tier_override,
-    extract_model_from_request_body, extract_reasoning_effort_from_request_body,
-    extract_service_tier_from_request_body,
+    apply_model_override_value, apply_reasoning_effort_override_value,
+    apply_service_tier_override_value, extract_model_from_value,
+    extract_reasoning_effort_from_value, extract_service_tier_from_value,
 };
 
 #[derive(Debug, Clone)]
@@ -69,48 +69,47 @@ pub(super) fn prepare_request_body(
     override_service_tier: Option<&str>,
     binding_service_tier: Option<&str>,
 ) -> PreparedRequestBody {
-    let original_effort = extract_reasoning_effort_from_request_body(raw_body);
-    let mut body_for_upstream = match (override_effort, binding_effort) {
-        (Some(effort), _) => Bytes::from(
-            apply_reasoning_effort_override(raw_body, effort)
-                .unwrap_or_else(|| raw_body.as_ref().to_vec()),
-        ),
-        (None, Some(effort)) => Bytes::from(
-            apply_reasoning_effort_override(raw_body, effort)
-                .unwrap_or_else(|| raw_body.as_ref().to_vec()),
-        ),
-        (None, None) => raw_body.clone(),
+    let mut request_json = serde_json::from_slice::<serde_json::Value>(raw_body).ok();
+    let original_effort = request_json
+        .as_ref()
+        .and_then(extract_reasoning_effort_from_value);
+    let original_service_tier = request_json
+        .as_ref()
+        .and_then(extract_service_tier_from_value);
+
+    let is_object_root = request_json
+        .as_ref()
+        .is_some_and(serde_json::Value::is_object);
+    if is_object_root && let Some(value) = request_json.as_mut() {
+        if let Some(effort) = override_effort.or(binding_effort) {
+            apply_reasoning_effort_override_value(value, effort);
+        }
+        if let Some(model) = override_model.or(binding_model) {
+            apply_model_override_value(value, model);
+        }
+        if let Some(service_tier) = override_service_tier.or(binding_service_tier) {
+            apply_service_tier_override_value(value, service_tier);
+        }
+    }
+
+    let body_for_upstream = if is_object_root {
+        request_json
+            .as_ref()
+            .and_then(|value| serde_json::to_vec(value).ok())
+            .map(Bytes::from)
+            .unwrap_or_else(|| raw_body.clone())
+    } else {
+        raw_body.clone()
     };
-    let effective_effort =
-        extract_reasoning_effort_from_request_body(body_for_upstream.as_ref()).or(original_effort);
 
-    if let Some(model) = override_model {
-        body_for_upstream = Bytes::from(
-            apply_model_override(body_for_upstream.as_ref(), model)
-                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
-        );
-    } else if let Some(model) = binding_model {
-        body_for_upstream = Bytes::from(
-            apply_model_override(body_for_upstream.as_ref(), model)
-                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
-        );
-    }
-
-    let original_service_tier = extract_service_tier_from_request_body(raw_body);
-    if let Some(service_tier) = override_service_tier {
-        body_for_upstream = Bytes::from(
-            apply_service_tier_override(body_for_upstream.as_ref(), service_tier)
-                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
-        );
-    } else if let Some(service_tier) = binding_service_tier {
-        body_for_upstream = Bytes::from(
-            apply_service_tier_override(body_for_upstream.as_ref(), service_tier)
-                .unwrap_or_else(|| body_for_upstream.as_ref().to_vec()),
-        );
-    }
-
-    let request_model = extract_model_from_request_body(body_for_upstream.as_ref());
-    let effective_service_tier = extract_service_tier_from_request_body(body_for_upstream.as_ref())
+    let request_model = request_json.as_ref().and_then(extract_model_from_value);
+    let effective_effort = request_json
+        .as_ref()
+        .and_then(extract_reasoning_effort_from_value)
+        .or(original_effort);
+    let effective_service_tier = request_json
+        .as_ref()
+        .and_then(extract_service_tier_from_value)
         .or(original_service_tier.clone());
 
     PreparedRequestBody {

@@ -59,7 +59,6 @@ async fn proxy_api_v1_profile_config_crud_persists_and_clears_stale_runtime_over
             proxy_addr
         ))
         .json(&serde_json::json!({
-            "station": "test",
             "model": "gpt-5.4",
             "reasoning_effort": "medium",
             "service_tier": "default",
@@ -178,7 +177,7 @@ async fn proxy_api_v1_profile_config_crud_persists_and_clears_stale_runtime_over
 }
 
 #[tokio::test]
-async fn proxy_api_v1_station_settings_crud_persists_active_and_meta() {
+async fn proxy_api_v1_station_settings_rejects_persisted_writes_after_v2_auto_migration() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -244,7 +243,12 @@ async fn proxy_api_v1_station_settings_crud_persists_active_and_meta() {
         .send()
         .await
         .expect("update station send");
-    assert_eq!(update_station.status(), StatusCode::NO_CONTENT);
+    assert_eq!(update_station.status(), StatusCode::BAD_REQUEST);
+    let update_station_body = update_station.text().await.expect("update station body");
+    assert!(
+        update_station_body.contains("v3 routing configs do not support station settings writes"),
+        "{update_station_body}"
+    );
 
     let set_active = client
         .post(format!(
@@ -257,113 +261,17 @@ async fn proxy_api_v1_station_settings_crud_persists_active_and_meta() {
         .send()
         .await
         .expect("set persisted active station send");
-    assert_eq!(set_active.status(), StatusCode::NO_CONTENT);
-
-    let snapshot = client
-        .get(format!(
-            "http://{}/__codex_helper/api/v1/snapshot",
-            proxy_addr
-        ))
-        .send()
-        .await
-        .expect("snapshot send")
-        .error_for_status()
-        .expect("snapshot status")
-        .json::<serde_json::Value>()
-        .await
-        .expect("snapshot json");
-    assert_eq!(
-        snapshot
-            .get("configured_active_station")
-            .and_then(|value| value.as_str()),
-        Some("zeta")
+    assert_eq!(set_active.status(), StatusCode::BAD_REQUEST);
+    let set_active_body = set_active.text().await.expect("set active body");
+    assert!(
+        set_active_body.contains("v3 routing configs do not support station active writes"),
+        "{set_active_body}"
     );
-    assert_eq!(
-        snapshot
-            .get("effective_active_station")
-            .and_then(|value| value.as_str()),
-        Some("zeta")
-    );
-
-    let stations = client
-        .get(format!(
-            "http://{}/__codex_helper/api/v1/stations",
-            proxy_addr
-        ))
-        .send()
-        .await
-        .expect("stations send")
-        .error_for_status()
-        .expect("stations status")
-        .json::<Vec<crate::dashboard_core::StationOption>>()
-        .await
-        .expect("stations json");
-    let zeta = stations
-        .iter()
-        .find(|station| station.name == "zeta")
-        .expect("zeta station");
-    assert!(!zeta.enabled);
-    assert_eq!(zeta.level, 7);
-    assert!(!zeta.configured_enabled);
-    assert_eq!(zeta.configured_level, 7);
-
-    let clear_active = client
-        .post(format!(
-            "http://{}/__codex_helper/api/v1/stations/active",
-            proxy_addr
-        ))
-        .json(&serde_json::json!({
-            "station_name": serde_json::Value::Null,
-        }))
-        .send()
-        .await
-        .expect("clear persisted active station send");
-    assert_eq!(clear_active.status(), StatusCode::NO_CONTENT);
-
-    let snapshot = client
-        .get(format!(
-            "http://{}/__codex_helper/api/v1/snapshot",
-            proxy_addr
-        ))
-        .send()
-        .await
-        .expect("snapshot after clear send")
-        .error_for_status()
-        .expect("snapshot after clear status")
-        .json::<serde_json::Value>()
-        .await
-        .expect("snapshot after clear json");
-    assert_eq!(
-        snapshot
-            .get("configured_active_station")
-            .and_then(|value| value.as_str()),
-        None
-    );
-    assert_eq!(
-        snapshot
-            .get("effective_active_station")
-            .and_then(|value| value.as_str()),
-        Some("test")
-    );
-
-    let reloaded_cfg = crate::config::load_config()
-        .await
-        .expect("reload config from disk after station CRUD");
-    assert_eq!(reloaded_cfg.codex.active.as_deref(), None);
-    let zeta = reloaded_cfg
-        .codex
-        .configs
-        .get("zeta")
-        .expect("zeta config from disk");
-    assert!(!zeta.enabled);
-    assert_eq!(zeta.level, 7);
 
     let config_text =
         std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
-    assert!(config_text.contains("[codex.stations.zeta]"));
-    assert!(config_text.contains("enabled = false"));
-    assert!(config_text.contains("level = 7"));
-    assert!(!config_text.contains("active_station = \"zeta\""));
+    assert!(config_text.contains("version = 3"));
+    assert!(!config_text.contains("[codex.stations."));
 
     proxy_handle.abort();
 }
@@ -864,7 +772,7 @@ async fn proxy_api_v1_retry_config_crud_persists_profile_and_cooldowns() {
 }
 
 #[tokio::test]
-async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
+async fn proxy_api_v1_station_specs_rejects_crud_after_v2_auto_migration() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -962,23 +870,12 @@ async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
         ))
         .send()
         .await
-        .expect("get station specs send")
-        .error_for_status()
-        .expect("get station specs status")
-        .json::<serde_json::Value>()
-        .await
-        .expect("get station specs json");
-    assert_eq!(
-        initial["stations"]
-            .as_array()
-            .map(|stations| stations.len()),
-        Some(1)
-    );
-    assert_eq!(
-        initial["providers"]
-            .as_array()
-            .map(|providers| providers.len()),
-        Some(1)
+        .expect("get station specs send");
+    assert_eq!(initial.status(), StatusCode::BAD_REQUEST);
+    let initial_body = initial.text().await.expect("get station specs body");
+    assert!(
+        initial_body.contains("v3 routing configs do not expose station specs"),
+        "{initial_body}"
     );
 
     let update = client
@@ -1001,48 +898,7 @@ async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
         .send()
         .await
         .expect("upsert station spec send");
-    assert_eq!(update.status(), StatusCode::NO_CONTENT);
-
-    let after_update = client
-        .get(format!(
-            "http://{}/__codex_helper/api/v1/stations/specs",
-            proxy_addr
-        ))
-        .send()
-        .await
-        .expect("get station specs after update send")
-        .error_for_status()
-        .expect("get station specs after update status")
-        .json::<serde_json::Value>()
-        .await
-        .expect("get station specs after update json");
-    let beta = after_update["stations"]
-        .as_array()
-        .and_then(|stations| {
-            stations.iter().find(|station| {
-                station.get("name").and_then(|value| value.as_str()) == Some("beta")
-            })
-        })
-        .expect("beta station");
-    assert_eq!(
-        beta.get("enabled").and_then(|value| value.as_bool()),
-        Some(false)
-    );
-    assert_eq!(beta.get("level").and_then(|value| value.as_u64()), Some(7));
-    assert_eq!(
-        beta["members"][0]
-            .get("provider")
-            .and_then(|value| value.as_str()),
-        Some("right")
-    );
-    assert_eq!(
-        beta["members"][0]
-            .get("endpoint_names")
-            .and_then(|value| value.as_array())
-            .and_then(|items| items.first())
-            .and_then(|value| value.as_str()),
-        Some("hk")
-    );
+    assert_eq!(update.status(), StatusCode::BAD_REQUEST);
 
     let delete = client
         .delete(format!(
@@ -1052,19 +908,13 @@ async fn proxy_api_v1_station_specs_crud_persists_members_and_providers() {
         .send()
         .await
         .expect("delete station spec send");
-    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
-
-    let reloaded_cfg = crate::config::load_config()
-        .await
-        .expect("reload config from disk after station spec CRUD");
-    assert!(reloaded_cfg.codex.configs.contains_key("alpha"));
-    assert!(!reloaded_cfg.codex.configs.contains_key("beta"));
+    assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
 
     let config_text =
         std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
     assert!(config_text.contains("[codex.providers.right]"));
-    assert!(config_text.contains("[codex.stations.alpha]"));
-    assert!(!config_text.contains("[codex.stations.beta]"));
+    assert!(!config_text.contains("[codex.stations."));
+    assert!(!config_text.contains("[codex.providers.beta]"));
 
     proxy_handle.abort();
 }
@@ -1274,8 +1124,8 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
 
     let persisted_text =
         std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
-    let persisted_cfg: ProxyConfigV2 =
-        toml::from_str(&persisted_text).expect("parse persisted provider v2 config");
+    let persisted_cfg: crate::config::ProxyConfigV3 =
+        toml::from_str(&persisted_text).expect("parse persisted provider v3 config");
     let alpha = persisted_cfg
         .codex
         .providers
@@ -1283,9 +1133,18 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
         .expect("alpha provider should still exist");
     assert_eq!(alpha.alias.as_deref(), Some("Relay Alpha"));
     assert!(!alpha.enabled);
-    assert_eq!(alpha.auth.auth_token.as_deref(), Some("inline-alpha-token"));
-    assert_eq!(alpha.auth.auth_token_env.as_deref(), Some("ALPHA_NEXT_KEY"));
-    assert_eq!(alpha.auth.api_key_env.as_deref(), Some("ALPHA_API_KEY"));
+    assert_eq!(
+        alpha.inline_auth.auth_token.as_deref(),
+        Some("inline-alpha-token")
+    );
+    assert_eq!(
+        alpha.inline_auth.auth_token_env.as_deref(),
+        Some("ALPHA_NEXT_KEY")
+    );
+    assert_eq!(
+        alpha.inline_auth.api_key_env.as_deref(),
+        Some("ALPHA_API_KEY")
+    );
     assert_eq!(
         alpha.tags.get("provider_id").map(|value| value.as_str()),
         Some("alpha")
@@ -1313,16 +1172,20 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
             .map(|value| value.as_str()),
         Some("gpt-5.4")
     );
-    let alpha_default = alpha
-        .endpoints
-        .get("default")
-        .expect("alpha default endpoint should exist");
-    assert_eq!(alpha_default.base_url, "https://alpha2.example.com/v1");
-    assert!(!alpha_default.enabled);
+    assert_eq!(
+        alpha.base_url.as_deref(),
+        Some("https://alpha2.example.com/v1")
+    );
+    assert!(alpha.endpoints.is_empty());
+    let routing = persisted_cfg
+        .codex
+        .routing
+        .expect("routing should remain after provider CRUD");
+    assert!(!routing.order.iter().any(|provider| provider == "beta"));
     let reloaded_cfg = crate::config::load_config()
         .await
         .expect("reload config from disk after provider spec CRUD");
-    assert!(reloaded_cfg.codex.configs.contains_key("main"));
+    assert!(reloaded_cfg.codex.configs.contains_key("routing"));
     assert!(!reloaded_cfg.codex.configs.contains_key("beta"));
     assert!(persisted_text.contains("[codex.providers.alpha]"));
     assert!(!persisted_text.contains("[codex.providers.beta]"));

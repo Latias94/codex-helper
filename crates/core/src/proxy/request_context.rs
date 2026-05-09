@@ -66,9 +66,15 @@ pub(super) async fn prepare_proxy_request(
     let session_id = extract_session_id(&client_headers);
     let client_name = extract_client_name(&client_headers);
 
-    proxy.config.maybe_reload_from_disk().await;
+    let config_reloaded = proxy.config.maybe_reload_from_disk().await;
     let cfg_snapshot = proxy.config.snapshot().await;
     let mgr = proxy.service_manager(cfg_snapshot.as_ref());
+    if config_reloaded {
+        proxy
+            .state
+            .prune_runtime_observability_for_service(proxy.service_name, mgr)
+            .await;
+    }
     let session_binding = if let Some(id) = session_id.as_deref() {
         proxy
             .ensure_default_session_binding(mgr, id, started_at_ms)

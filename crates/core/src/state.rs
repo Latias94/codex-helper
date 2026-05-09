@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,6 +45,7 @@ use self::session_identity::{
 type PassiveStationHealthMap =
     HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>;
 type ProviderBalanceMap = HashMap<String, HashMap<String, HashMap<usize, ProviderBalanceSnapshot>>>;
+type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
 
 pub struct PassiveUpstreamFailureRecord {
     pub service_name: String,
@@ -73,6 +74,25 @@ fn unix_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn service_layout_signature(mgr: &ServiceConfigManager) -> ServiceLayoutSignature {
+    let mut entries = mgr
+        .stations()
+        .iter()
+        .map(|(station_name, service)| {
+            (
+                station_name.clone(),
+                service
+                    .upstreams
+                    .iter()
+                    .map(|upstream| upstream.base_url.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    entries
 }
 
 /// Runtime-only state for the proxy process.
@@ -105,6 +125,7 @@ pub struct ProxyState {
     passive_station_health: RwLock<PassiveStationHealthMap>,
     provider_balances: RwLock<ProviderBalanceMap>,
     station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
+    service_layout_signatures: RwLock<HashMap<String, ServiceLayoutSignature>>,
     lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
 }
 
@@ -181,6 +202,7 @@ impl ProxyState {
             passive_station_health: RwLock::new(HashMap::new()),
             provider_balances: RwLock::new(HashMap::new()),
             station_health_checks: RwLock::new(HashMap::new()),
+            service_layout_signatures: RwLock::new(HashMap::new()),
             lb_states,
         })
     }
@@ -739,6 +761,145 @@ impl ProxyState {
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default()
+    }
+
+    pub async fn prune_runtime_observability_for_service(
+        &self,
+        service_name: &str,
+        mgr: &ServiceConfigManager,
+    ) {
+        let active_stations = mgr.stations().keys().cloned().collect::<HashSet<_>>();
+        let active_upstreams = mgr
+            .stations()
+            .iter()
+            .map(|(station_name, service)| {
+                (
+                    station_name.clone(),
+                    service
+                        .upstreams
+                        .iter()
+                        .map(|upstream| upstream.base_url.clone())
+                        .collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let active_base_urls = active_upstreams
+            .values()
+            .flat_map(|upstreams| upstreams.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut active_provider_ids = HashSet::from(["-".to_string()]);
+        for service in mgr.stations().values() {
+            for upstream in &service.upstreams {
+                if let Some(provider_id) = upstream.tags.get("provider_id") {
+                    active_provider_ids.insert(provider_id.clone());
+                }
+            }
+        }
+
+        let layout = service_layout_signature(mgr);
+        let layout_changed = {
+            let mut signatures = self.service_layout_signatures.write().await;
+            let changed = signatures.get(service_name) != Some(&layout);
+            signatures.insert(service_name.to_string(), layout);
+            changed
+        };
+
+        if layout_changed {
+            let mut provider_balances = self.provider_balances.write().await;
+            provider_balances.remove(service_name);
+        }
+
+        {
+            let mut guard = self.station_meta_overrides.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                per_service.retain(|station_name, _| active_stations.contains(station_name));
+                if per_service.is_empty() {
+                    guard.remove(service_name);
+                }
+            }
+        }
+
+        {
+            let mut guard = self.upstream_meta_overrides.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                per_service.retain(|base_url, _| active_base_urls.contains(base_url));
+                if per_service.is_empty() {
+                    guard.remove(service_name);
+                }
+            }
+        }
+
+        {
+            let mut guard = self.station_health.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                per_service.retain(|station_name, station_health| {
+                    if !active_stations.contains(station_name) {
+                        return false;
+                    }
+                    if let Some(allowed_upstreams) = active_upstreams.get(station_name) {
+                        station_health
+                            .upstreams
+                            .retain(|upstream| allowed_upstreams.contains(&upstream.base_url));
+                    }
+                    !station_health.upstreams.is_empty()
+                });
+                if per_service.is_empty() {
+                    guard.remove(service_name);
+                }
+            }
+        }
+
+        {
+            let mut guard = self.passive_station_health.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                per_service.retain(|station_name, station_health| {
+                    if !active_stations.contains(station_name) {
+                        return false;
+                    }
+                    if let Some(allowed_upstreams) = active_upstreams.get(station_name) {
+                        station_health.retain(|base_url, _| allowed_upstreams.contains(base_url));
+                    }
+                    !station_health.is_empty()
+                });
+                if per_service.is_empty() {
+                    guard.remove(service_name);
+                }
+            }
+        }
+
+        {
+            let mut guard = self.station_health_checks.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                per_service.retain(|station_name, _| active_stations.contains(station_name));
+                if per_service.is_empty() {
+                    guard.remove(service_name);
+                }
+            }
+        }
+
+        {
+            let mut guard = self.usage_rollups.write().await;
+            if let Some(rollup) = guard.get_mut(service_name) {
+                rollup
+                    .by_config
+                    .retain(|station_name, _| active_stations.contains(station_name));
+                rollup.by_config_day.retain(|station_name, _day_map| {
+                    if !active_stations.contains(station_name) {
+                        return false;
+                    }
+                    true
+                });
+                rollup
+                    .by_provider
+                    .retain(|provider_id, _| active_provider_ids.contains(provider_id));
+                rollup.by_provider_day.retain(|provider_id, _day_map| {
+                    if !active_provider_ids.contains(provider_id) {
+                        return false;
+                    }
+                    true
+                });
+            }
+        }
     }
 
     pub async fn record_station_health(
@@ -2504,6 +2665,149 @@ mod tests {
             assert_eq!(balances[0].provider_id, "packycode");
             assert_eq!(balances[0].status, BalanceSnapshotStatus::Stale);
             assert_eq!(balances[0].exhausted, Some(false));
+        });
+    }
+
+    #[test]
+    fn prune_runtime_observability_removes_stale_service_keys() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+
+            state
+                .set_station_enabled_override("codex", "old".to_string(), false, 1)
+                .await;
+            state
+                .set_upstream_enabled_override(
+                    "codex",
+                    "https://old.example/v1".to_string(),
+                    false,
+                    1,
+                )
+                .await;
+            state
+                .record_station_health(
+                    "codex",
+                    "old".to_string(),
+                    StationHealth {
+                        checked_at_ms: 10,
+                        upstreams: vec![UpstreamHealth {
+                            base_url: "https://old.example/v1".to_string(),
+                            ok: Some(false),
+                            status_code: Some(500),
+                            latency_ms: Some(10),
+                            error: Some("boom".to_string()),
+                            passive: None,
+                        }],
+                    },
+                )
+                .await;
+            state
+                .record_passive_upstream_failure(PassiveUpstreamFailureRecord {
+                    service_name: "codex".to_string(),
+                    station_name: "old".to_string(),
+                    base_url: "https://old.example/v1".to_string(),
+                    status_code: Some(500),
+                    error_class: Some("upstream_transport_error".to_string()),
+                    error: Some("boom".to_string()),
+                    now_ms: 20,
+                })
+                .await;
+            state
+                .record_provider_balance_snapshot(
+                    "codex",
+                    ProviderBalanceSnapshot {
+                        provider_id: "provider-old".to_string(),
+                        station_name: Some("old".to_string()),
+                        upstream_index: Some(0),
+                        source: "usage_provider:budget_http_json".to_string(),
+                        fetched_at_ms: 10,
+                        stale_after_ms: None,
+                        stale: false,
+                        status: BalanceSnapshotStatus::Ok,
+                        exhausted: Some(false),
+                        exhaustion_affects_routing: true,
+                        total_balance_usd: Some("3.5".to_string()),
+                        subscription_balance_usd: None,
+                        paygo_balance_usd: None,
+                        monthly_budget_usd: None,
+                        monthly_spent_usd: None,
+                        error: None,
+                    },
+                )
+                .await;
+
+            let request_id = state
+                .begin_request(
+                    "codex",
+                    "POST",
+                    "/v1/responses",
+                    Some("sid-old".to_string()),
+                    None,
+                    None,
+                    None,
+                    Some("gpt-5".to_string()),
+                    None,
+                    None,
+                    30,
+                )
+                .await;
+            state
+                .update_request_route(
+                    request_id,
+                    "old".to_string(),
+                    Some("provider-old".to_string()),
+                    "https://old.example/v1".to_string(),
+                    None,
+                )
+                .await;
+            state
+                .finish_request(FinishRequestParams {
+                    id: request_id,
+                    status_code: 200,
+                    duration_ms: 5,
+                    ended_at_ms: 35,
+                    observed_service_tier: None,
+                    usage: None,
+                    retry: None,
+                    ttfb_ms: None,
+                    streaming: false,
+                })
+                .await;
+
+            let mut mgr = ServiceConfigManager::default();
+            mgr.configs.insert(
+                "new".to_string(),
+                ServiceConfig {
+                    name: "new".to_string(),
+                    alias: None,
+                    enabled: true,
+                    level: 1,
+                    upstreams: vec![UpstreamConfig {
+                        base_url: "https://new.example/v1".to_string(),
+                        auth: UpstreamAuth::default(),
+                        tags: HashMap::from([(
+                            "provider_id".to_string(),
+                            "provider-new".to_string(),
+                        )]),
+                        supported_models: HashMap::new(),
+                        model_mapping: HashMap::new(),
+                    }],
+                },
+            );
+
+            state
+                .prune_runtime_observability_for_service("codex", &mgr)
+                .await;
+
+            assert!(state.get_station_meta_overrides("codex").await.is_empty());
+            assert!(state.get_upstream_meta_overrides("codex").await.is_empty());
+            assert!(state.get_station_health("codex").await.is_empty());
+            assert!(state.get_provider_balance_view("codex").await.is_empty());
+
+            let rollup = state.get_usage_rollup_view("codex", 10, 10).await;
+            assert!(rollup.by_config.is_empty());
+            assert!(rollup.by_provider.is_empty());
         });
     }
 

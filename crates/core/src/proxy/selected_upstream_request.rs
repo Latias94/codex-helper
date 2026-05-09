@@ -7,7 +7,7 @@ use crate::model_routing;
 use crate::state::{RouteDecisionProvenance, SessionBinding};
 
 use super::ProxyService;
-use super::request_body::apply_model_override;
+use super::request_body::apply_model_override_value;
 use super::request_preparation::build_body_previews;
 use super::route_provenance::{RouteDecisionProvenanceParams, build_route_decision_provenance};
 
@@ -113,7 +113,13 @@ fn apply_selected_model_mapping(
     let effective_model =
         model_routing::effective_model(&selected.upstream.model_mapping, requested_model);
     if effective_model != requested_model {
-        let body = apply_model_override(body_for_upstream.as_ref(), effective_model.as_str())
+        let body = serde_json::from_slice::<serde_json::Value>(body_for_upstream.as_ref())
+            .ok()
+            .and_then(|mut value| {
+                value.as_object_mut()?;
+                apply_model_override_value(&mut value, effective_model.as_str());
+                serde_json::to_vec(&value).ok()
+            })
             .map(Bytes::from)
             .unwrap_or_else(|| body_for_upstream.clone());
         return (format!("{requested_model}->{effective_model}"), body);

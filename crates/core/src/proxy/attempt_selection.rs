@@ -6,6 +6,19 @@ use crate::model_routing;
 
 use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
 
+pub(super) struct SelectSupportedUpstreamParams<'a> {
+    pub lb: &'a LoadBalancer,
+    pub request_model: Option<&'a str>,
+    pub strict_multi_config: bool,
+    pub avoid_set: &'a mut HashSet<usize>,
+    pub upstream_chain: &'a mut Vec<String>,
+    pub route_attempts: &'a mut Vec<RouteAttemptLog>,
+    pub avoided_total: &'a mut usize,
+    pub provider_attempt: u32,
+    pub provider_max_attempts: u32,
+    pub total_upstreams: usize,
+}
+
 pub(super) fn station_upstreams_exhausted(
     upstream_total: usize,
     avoid_set: &HashSet<usize>,
@@ -14,17 +27,21 @@ pub(super) fn station_upstreams_exhausted(
 }
 
 pub(super) fn select_supported_upstream(
-    lb: &LoadBalancer,
-    request_model: Option<&str>,
-    strict_multi_config: bool,
-    avoid_set: &mut HashSet<usize>,
-    upstream_chain: &mut Vec<String>,
-    route_attempts: &mut Vec<RouteAttemptLog>,
-    avoided_total: &mut usize,
-    provider_attempt: u32,
-    provider_max_attempts: u32,
-    total_upstreams: usize,
+    params: SelectSupportedUpstreamParams<'_>,
 ) -> Option<SelectedUpstream> {
+    let SelectSupportedUpstreamParams {
+        lb,
+        request_model,
+        strict_multi_config,
+        avoid_set,
+        upstream_chain,
+        route_attempts,
+        avoided_total,
+        provider_attempt,
+        provider_max_attempts,
+        total_upstreams,
+    } = params;
+
     loop {
         let upstream_total = lb.service.upstreams.len();
         if station_upstreams_exhausted(upstream_total, avoid_set) {
@@ -120,18 +137,18 @@ mod tests {
         let mut route_attempts = Vec::new();
         let mut avoided_total = 0;
 
-        let selected = select_supported_upstream(
-            &lb,
-            Some("gpt-5"),
-            false,
-            &mut avoid_set,
-            &mut upstream_chain,
-            &mut route_attempts,
-            &mut avoided_total,
-            0,
-            2,
-            2,
-        )
+        let selected = select_supported_upstream(SelectSupportedUpstreamParams {
+            lb: &lb,
+            request_model: Some("gpt-5"),
+            strict_multi_config: false,
+            avoid_set: &mut avoid_set,
+            upstream_chain: &mut upstream_chain,
+            route_attempts: &mut route_attempts,
+            avoided_total: &mut avoided_total,
+            provider_attempt: 0,
+            provider_max_attempts: 2,
+            total_upstreams: 2,
+        })
         .expect("selected");
 
         assert_eq!(selected.index, 1);
@@ -157,18 +174,18 @@ mod tests {
         let mut route_attempts = Vec::new();
         let mut avoided_total = 0;
 
-        let selected = select_supported_upstream(
-            &lb,
-            Some("gpt-5"),
-            true,
-            &mut avoid_set,
-            &mut upstream_chain,
-            &mut route_attempts,
-            &mut avoided_total,
-            0,
-            2,
-            2,
-        );
+        let selected = select_supported_upstream(SelectSupportedUpstreamParams {
+            lb: &lb,
+            request_model: Some("gpt-5"),
+            strict_multi_config: true,
+            avoid_set: &mut avoid_set,
+            upstream_chain: &mut upstream_chain,
+            route_attempts: &mut route_attempts,
+            avoided_total: &mut avoided_total,
+            provider_attempt: 0,
+            provider_max_attempts: 2,
+            total_upstreams: 2,
+        });
 
         assert!(selected.is_none());
         assert_eq!(avoid_set.len(), 2);

@@ -22,6 +22,20 @@ fn config_toml_backup_path() -> PathBuf {
     config_dir().join("config.toml.bak")
 }
 
+fn config_backup_source_and_path() -> (PathBuf, PathBuf) {
+    let toml_path = config_toml_path();
+    if toml_path.exists() {
+        return (toml_path, config_toml_backup_path());
+    }
+
+    let json_path = config_path();
+    if json_path.exists() {
+        return (json_path, config_backup_path());
+    }
+
+    (toml_path, config_toml_backup_path())
+}
+
 /// Return the primary config file path that will be used by `load_config()`.
 pub fn config_file_path() -> PathBuf {
     let toml_path = config_toml_path();
@@ -34,7 +48,7 @@ pub fn config_file_path() -> PathBuf {
     }
 }
 
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 3;
 
 fn ensure_config_version(cfg: &mut ProxyConfig) {
     if cfg.version.is_none() {
@@ -341,6 +355,9 @@ pub async fn load_config() -> Result<ProxyConfig> {
         };
         normalize_proxy_config(&mut cfg);
         validate_proxy_config(&cfg)?;
+        if version != Some(3) {
+            auto_migrate_loaded_config(&mut cfg, "config.toml", version).await;
+        }
         return Ok(cfg);
     }
 
@@ -348,9 +365,11 @@ pub async fn load_config() -> Result<ProxyConfig> {
     if json_path.exists() {
         let bytes = fs::read(json_path).await?;
         let mut cfg = serde_json::from_slice::<ProxyConfig>(&bytes)?;
+        let version = cfg.version;
         ensure_config_version(&mut cfg);
         normalize_proxy_config(&mut cfg);
         validate_proxy_config(&cfg)?;
+        auto_migrate_loaded_config(&mut cfg, "config.json", version).await;
         return Ok(cfg);
     }
 
@@ -359,6 +378,28 @@ pub async fn load_config() -> Result<ProxyConfig> {
     normalize_proxy_config(&mut cfg);
     validate_proxy_config(&cfg)?;
     Ok(cfg)
+}
+
+async fn auto_migrate_loaded_config(
+    cfg: &mut ProxyConfig,
+    source: &str,
+    source_version: Option<u32>,
+) {
+    match save_config(cfg).await {
+        Ok(()) => {
+            cfg.version = Some(3);
+            info!(
+                "auto-migrated {} from version {:?} to version 3",
+                source, source_version
+            );
+        }
+        Err(err) => {
+            warn!(
+                "failed to auto-migrate {} from version {:?} to version 3: {}",
+                source, source_version, err
+            );
+        }
+    }
 }
 
 fn runtime_service_manager_value(mgr: &ServiceConfigManager) -> Result<JsonValue> {
@@ -402,11 +443,6 @@ async fn save_existing_v3_if_only_runtime_metadata_changed(
 }
 
 pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
-    if cfg.version == Some(2) {
-        let migrated = compact_v2_config(&migrate_legacy_to_v2(cfg))?;
-        save_config_v2(&migrated).await?;
-        return Ok(());
-    }
     if cfg.version == Some(3) {
         if save_existing_v3_if_only_runtime_metadata_changed(cfg)
             .await?
@@ -419,35 +455,8 @@ pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
         return Ok(());
     }
 
-    let mut cfg = cfg.clone();
-    cfg.version = Some(CONFIG_VERSION);
-    normalize_proxy_config(&mut cfg);
-    validate_proxy_config(&cfg)?;
-
-    let dir = config_dir();
-    fs::create_dir_all(&dir).await?;
-    let toml_path = config_toml_path();
-    let json_path = config_path();
-    let (path, backup_path, data) = if toml_path.exists() || !json_path.exists() {
-        let body = toml::to_string_pretty(&cfg)?;
-        let text = format!("{CONFIG_TOML_DOC_HEADER}\n{body}");
-        (toml_path, config_toml_backup_path(), text.into_bytes())
-    } else {
-        (
-            json_path,
-            config_backup_path(),
-            serde_json::to_vec_pretty(&cfg)?,
-        )
-    };
-
-    // 先备份旧文件（若存在），再采用临时文件 + rename 方式原子写入，尽量避免配置损坏。
-    if path.exists()
-        && let Err(err) = fs::copy(&path, &backup_path).await
-    {
-        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
-    }
-
-    write_bytes_file_async(&path, &data).await?;
+    let migrated = migrate_legacy_to_v3(cfg)?;
+    save_config_v3(&migrated).await?;
     Ok(())
 }
 
@@ -461,7 +470,7 @@ pub async fn save_config_v2(cfg: &ProxyConfigV2) -> Result<PathBuf> {
     let dir = config_dir();
     fs::create_dir_all(&dir).await?;
     let path = config_toml_path();
-    let backup_path = config_toml_backup_path();
+    let (backup_source_path, backup_path) = config_backup_source_and_path();
     let body = toml::to_string_pretty(&normalized)?;
     let text = format!(
         "{CONFIG_TOML_DOC_HEADER}
@@ -469,10 +478,13 @@ pub async fn save_config_v2(cfg: &ProxyConfigV2) -> Result<PathBuf> {
     );
     let data = text.into_bytes();
 
-    if path.exists()
-        && let Err(err) = fs::copy(&path, &backup_path).await
+    if backup_source_path.exists()
+        && let Err(err) = fs::copy(&backup_source_path, &backup_path).await
     {
-        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+        warn!(
+            "failed to backup {:?} to {:?}: {}",
+            backup_source_path, backup_path, err
+        );
     }
 
     write_bytes_file_async(&path, &data).await?;
@@ -489,7 +501,7 @@ pub async fn save_config_v3(cfg: &ProxyConfigV3) -> Result<PathBuf> {
     let dir = config_dir();
     fs::create_dir_all(&dir).await?;
     let path = config_toml_path();
-    let backup_path = config_toml_backup_path();
+    let (backup_source_path, backup_path) = config_backup_source_and_path();
     let body = toml::to_string_pretty(&normalized)?;
     let text = format!(
         "{CONFIG_TOML_DOC_HEADER}
@@ -497,10 +509,13 @@ pub async fn save_config_v3(cfg: &ProxyConfigV3) -> Result<PathBuf> {
     );
     let data = text.into_bytes();
 
-    if path.exists()
-        && let Err(err) = fs::copy(&path, &backup_path).await
+    if backup_source_path.exists()
+        && let Err(err) = fs::copy(&backup_source_path, &backup_path).await
     {
-        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+        warn!(
+            "failed to backup {:?} to {:?}: {}",
+            backup_source_path, backup_path, err
+        );
     }
 
     write_bytes_file_async(&path, &data).await?;

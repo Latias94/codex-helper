@@ -156,6 +156,17 @@ enum UsageProviderRefreshOutcome {
     MissingToken,
 }
 
+struct RefreshProviderTargetParams<'a> {
+    client: &'a Client,
+    provider: &'a UsageProviderConfig,
+    target: &'a UsageProviderTarget,
+    cfg: &'a ProxyConfig,
+    lb_states: &'a Arc<Mutex<HashMap<String, LbState>>>,
+    state: &'a Arc<ProxyState>,
+    service_name: &'a str,
+    interval_secs: u64,
+}
+
 // 全局节流状态：按 provider.id 记录最近一次查询时间，避免高频请求。
 static LAST_USAGE_POLL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
@@ -306,7 +317,7 @@ fn matching_provider_targets(
         .stations()
         .iter()
         .collect();
-    stations.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+    stations.sort_by_key(|(name, _)| name.as_str());
 
     let mut targets = Vec::new();
     for (station_name, service) in stations {
@@ -882,15 +893,10 @@ fn update_usage_exhausted(
             None => continue,
         };
 
-        let len = service.upstreams.len();
         let entry = map
             .entry(uref.station_name.clone())
             .or_insert_with(LbState::default);
-        if entry.failure_counts.len() != len {
-            entry.failure_counts.resize(len, 0);
-            entry.cooldown_until.resize(len, None);
-            entry.usage_exhausted.resize(len, false);
-        }
+        entry.ensure_layout(&service.upstreams);
         if uref.index < entry.usage_exhausted.len() {
             entry.usage_exhausted[uref.index] = exhausted;
         }
@@ -961,15 +967,19 @@ fn snapshot_from_provider_json(
 }
 
 async fn refresh_provider_target(
-    client: &Client,
-    provider: &UsageProviderConfig,
-    target: &UsageProviderTarget,
-    cfg: &ProxyConfig,
-    lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
-    state: &Arc<ProxyState>,
-    service_name: &str,
-    interval_secs: u64,
+    params: RefreshProviderTargetParams<'_>,
 ) -> UsageProviderRefreshOutcome {
+    let RefreshProviderTargetParams {
+        client,
+        provider,
+        target,
+        cfg,
+        lb_states,
+        state,
+        service_name,
+        interval_secs,
+    } = params;
+
     let upstreams = vec![target.upstream.clone()];
     let fetched_at_ms = unix_now_ms();
     let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
@@ -1080,16 +1090,16 @@ pub async fn refresh_balances_for_service(
         for target in targets {
             summary.attempted += 1;
             let c = client.get_or_insert_with(Client::new);
-            match refresh_provider_target(
-                c,
-                &provider,
-                &target,
-                &cfg,
-                &lb_states,
-                &state,
+            match refresh_provider_target(RefreshProviderTargetParams {
+                client: c,
+                provider: &provider,
+                target: &target,
+                cfg: &cfg,
+                lb_states: &lb_states,
+                state: &state,
                 service_name,
                 interval_secs,
-            )
+            })
             .await
             {
                 UsageProviderRefreshOutcome::Refreshed => {
@@ -1175,16 +1185,16 @@ pub async fn poll_for_codex_upstream(
 
         warn_if_provider_spans_hosts(&cfg, service_name, &provider);
         let c = client.get_or_insert_with(Client::new);
-        let _ = refresh_provider_target(
-            c,
-            &provider,
-            &current_target,
-            &cfg,
-            &lb_states,
-            &state,
+        let _ = refresh_provider_target(RefreshProviderTargetParams {
+            client: c,
+            provider: &provider,
+            target: &current_target,
+            cfg: &cfg,
+            lb_states: &lb_states,
+            state: &state,
             service_name,
             interval_secs,
-        )
+        })
         .await;
     }
 }

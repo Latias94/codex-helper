@@ -213,6 +213,74 @@ Use `stop` when you would rather fail than spill into a non-preferred provider, 
 
 Balance adapters default to trusting exhausted snapshots for routing. If a provider's balance endpoint is known to return misleading zeroes, set `trust_exhaustion_for_routing = false` in `~/.codex-helper/usage_providers.json`. The raw balance still appears in UI and logs, but it will not demote the route.
 
+## Balance Adapters
+
+Balance and quota live in a separate local file:
+
+`~/.codex-helper/usage_providers.json`
+
+This file describes how codex-helper should fetch provider balance state. Keep it separate from the relay config so provider onboarding stays thin.
+
+```json
+{
+  "providers": [
+    {
+      "id": "input-monthly",
+      "kind": "sub2api_balance_http_json",
+      "domains": ["ai.input.im"],
+      "endpoint": "https://ai.input.im/v1/user/balance",
+      "token_env": "INPUT_API_KEY",
+      "poll_interval_secs": 60,
+      "refresh_on_request": true,
+      "trust_exhaustion_for_routing": true,
+      "extract": {
+        "remaining_balance_paths": ["data.remaining_balance"],
+        "exhausted_paths": ["data.exhausted"]
+      }
+    }
+  ]
+}
+```
+
+Supported adapter kinds include:
+
+- `openai_balance_http_json`
+- `sub2api_balance_http_json`
+- `relay_balance_http_json`
+- `new_api_user_self`
+- `yescode_profile`
+- `budget_http_json`
+
+Useful fields:
+
+| Field | Meaning |
+| --- | --- |
+| `domains` | Which relay hosts this adapter should apply to. |
+| `endpoint` | Balance endpoint URL, with optional `{{base_url}}` templating. |
+| `token_env` | Environment variable used for auth. |
+| `poll_interval_secs` | Refresh throttle / cache window. `0` disables automatic refresh. |
+| `refresh_on_request` | Whether routed requests may trigger a balance refresh. |
+| `trust_exhaustion_for_routing` | Whether an exhausted snapshot may demote routing. |
+| `headers` / `variables` | Adapter-specific request templating. |
+| `extract` | JSON path extraction rules for balance fields. |
+
+Refresh policy:
+
+- request-driven refresh is the default;
+- UI surfaces read cached snapshots only;
+- manual refresh is exposed through `POST /__codex_helper/api/v1/providers/balances/refresh`;
+- if a provider returns misleading zeroes, keep the raw exhausted state visible but set `trust_exhaustion_for_routing = false`.
+
+## Pricing Catalog
+
+Price data is also separate from the relay config.
+
+- local overrides live in `~/.codex-helper/pricing_overrides.toml`
+- the merged catalog is exposed by the proxy and rendered by GUI/TUI
+- `codex-helper pricing sync` and `codex-helper pricing sync-basellm` refresh the local catalog from source-backed inputs
+
+Use price overrides for local corrections or relay-specific multipliers; do not duplicate pricing tables inside the relay config itself.
+
 ## Common Recipes
 
 ### One Provider
@@ -324,7 +392,7 @@ Use `--claude` on provider/routing commands when editing the Claude service inst
 
 Current UI behavior intentionally separates runtime controls from file editing.
 
-- The GUI proxy settings screen accepts v3 routing-first TOML. Legacy station-first files should be migrated first.
+- The GUI proxy settings screen accepts v3 routing-first TOML. Legacy station-first files are auto-migrated on load; use `config migrate --dry-run` if you want to inspect the rewrite first.
 - GUI form view summarizes providers, profiles, and routing; detailed edits currently go through raw TOML or CLI commands.
 - TUI station switching is runtime-only. It pins or clears the active route for the running proxy and does not write the config file.
 - Persistent provider and routing edits should use `provider`, `routing`, or the v3 raw config.
@@ -333,7 +401,14 @@ This keeps the UI mental model simple: temporary steering happens in runtime con
 
 ## Migration Notes
 
-Legacy v2 station/group files are still readable for migration.
+`v0.13.0` treats `version = 3` as the public persisted schema. Existing files are migrated automatically the first time they are loaded by the CLI, proxy, GUI, or TUI:
+
+- `version = 3` TOML loads directly.
+- `version = 2` TOML, unversioned legacy TOML, and legacy `config.json` are loaded, compiled, and written back as `config.toml` with `version = 3`.
+- The previous source file is copied to `config.toml.bak` for TOML or `config.json.bak` for JSON before the new v3 file is written.
+- If automatic migration cannot be written, startup continues with the loaded runtime config and logs a warning.
+
+You can still preview the exact migration output before starting the proxy:
 
 ```bash
 codex-helper config migrate --dry-run
