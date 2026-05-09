@@ -8,10 +8,10 @@ use ratatui::widgets::{
 
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, format_observed_client_identity, now_ms,
-    session_control_posture, session_observation_scope_label, session_row_has_any_override,
-    session_transcript_host_status, short_sid, shorten, shorten_middle, status_style, tokens_short,
-    usage_line,
+    Palette, Snapshot, balance_status_style, basename, format_age, format_observed_client_identity,
+    now_ms, session_balance_brief, session_balance_status, session_control_posture,
+    session_observation_scope_label, session_row_has_any_override, session_transcript_host_status,
+    short_sid, shorten, shorten_middle, status_style, tokens_short, usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -246,6 +246,14 @@ fn render_session_details(
     let provider = selected
         .and_then(|r| r.last_provider_id.as_deref())
         .unwrap_or("-");
+    let balance = selected.and_then(|r| session_balance_brief(r, &snapshot.provider_balances, 56));
+    let balance_status =
+        selected.and_then(|r| session_balance_status(r, &snapshot.provider_balances));
+    let provider_line = match balance.as_deref() {
+        Some(balance) if provider != "-" => format!("{provider} | {balance}"),
+        Some(balance) => balance.to_string(),
+        None => provider.to_string(),
+    };
     let cfg = selected
         .and_then(|r| r.last_station_name.as_deref())
         .unwrap_or("-");
@@ -341,8 +349,10 @@ fn render_session_details(
         kv_line(
             p,
             "provider",
-            provider.to_string(),
-            Style::default().fg(p.text),
+            provider_line,
+            balance_status
+                .map(|status| balance_status_style(p, status))
+                .unwrap_or_else(|| Style::default().fg(p.text)),
         ),
         kv_line(p, "station", cfg.to_string(), Style::default().fg(p.text)),
         kv_line(

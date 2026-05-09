@@ -184,11 +184,22 @@ The migration should be deterministic and boring.
 - The routing editor should mainly edit policy, order, target, and tag preferences.
 - A single provider should not force the user to think about station membership.
 - New providers should append to the end of the routing order unless the user explicitly promotes them.
+- TUI decision surfaces should show provider balance/package state and explicit tags before asking the user to switch.
 - The preview should show:
   - preferred candidates;
   - fallback order;
   - skipped candidates and reasons;
   - stop-vs-continue behavior when exhausted.
+
+### TUI Routing UX Direction
+
+The TUI should be split into three progressively stronger surfaces:
+
+1. Read-only confidence layer: session details, station/provider switch menus, and routing previews show balance, package name, exhaustion state, and useful tags such as `billing=monthly` or `region=hk`.
+2. Fast steering layer: session pin, global pin, and ordered routing promotion stay one-keystroke operations, but labels should say provider/routing intent instead of leaking the legacy station model where possible.
+3. Persisted editing layer: provider tags and routing policy are edited through the v3 provider/routing control-plane APIs, not by mutating a v2 station projection or by embedding a TOML editor into the TUI.
+
+For tag editing, the first TUI version should support common add/remove operations on provider-level tags. Endpoint-level tags should remain a detail/edit screen because most users only need provider-level `billing`, `vendor`, and `region`.
 
 ## Non-Goals
 

@@ -79,6 +79,7 @@ on_exhausted = "stop"
 ### 改进 / Improved
 - `load_config()` / `save_config()` / `config init` 统一写出 v3 TOML；旧 `config.json`、无版本 legacy TOML、`version = 2` TOML 会在加载时自动迁移为 `config.toml version = 3`，并保留 `.bak` 备份。 `load_config()` / `save_config()` / `config init` now write v3 TOML; old `config.json`, unversioned legacy TOML, and `version = 2` TOML auto-migrate to `config.toml version = 3` on load with `.bak` backups.
 - GUI/TUI 的站点操作收口为运行时控制，持久化编辑收口到 v3 raw config、provider/routing CLI 和 provider/routing API，避免 UI 再写回旧 station schema。 GUI/TUI station actions are now runtime controls, while persisted edits go through v3 raw config, provider/routing CLI, and provider/routing APIs so UI no longer writes legacy station schema.
+- TUI 在 Dashboard/Sessions 详情与 provider 切换菜单中展示余额、套餐名、耗尽状态和 provider tags，切换前能直接看到哪个候选更适合使用。 TUI now shows balance, plan/package name, exhaustion state, and provider tags in Dashboard/Sessions details and provider switch menus so users can judge candidates before switching.
 - 代理转发与观测路径做了稳定性整理：请求体预览限流、HTTP debug 大对象落盘、请求 ledger 聚合、会话扫描排序和运行时观测清理更稳。 Proxy forwarding and observability paths were tightened: bounded request body previews, large HTTP debug payload spillover, request ledger aggregation, session ordering, and runtime observability pruning are more robust.
 
 ### 修复 / Fixed

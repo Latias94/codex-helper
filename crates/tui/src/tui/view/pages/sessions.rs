@@ -5,10 +5,10 @@ use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, T
 
 use crate::state::{ResolvedRouteValue, RouteValueSource};
 use crate::tui::model::{
-    Palette, Snapshot, basename, format_age, format_observed_client_identity, now_ms,
-    session_control_posture, session_observation_scope_label, session_row_has_any_override,
-    session_transcript_host_status, short_sid, shorten, shorten_middle, status_style, tokens_short,
-    usage_line,
+    Palette, Snapshot, balance_status_style, basename, format_age, format_observed_client_identity,
+    now_ms, session_balance_brief, session_balance_status, session_control_posture,
+    session_observation_scope_label, session_row_has_any_override, session_transcript_host_status,
+    short_sid, shorten, shorten_middle, status_style, tokens_short, usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::view::widgets::kv_line;
@@ -210,6 +210,11 @@ pub(super) fn render_sessions_page(
         .unwrap_or_else(|| "-".to_string());
         let observed_model = row.last_model.as_deref().unwrap_or("-");
         let provider = row.last_provider_id.as_deref().unwrap_or("-");
+        let balance = session_balance_brief(row, &snapshot.provider_balances, 64)
+            .unwrap_or_else(|| "-".to_string());
+        let balance_style = session_balance_status(row, &snapshot.provider_balances)
+            .map(|status| balance_status_style(p, status))
+            .unwrap_or_else(|| Style::default().fg(p.muted));
         let observed_cfg = row.last_station_name.as_deref().unwrap_or("-");
         let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
         let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");
@@ -309,6 +314,7 @@ pub(super) fn render_sessions_page(
             provider.to_string(),
             Style::default().fg(p.text),
         ));
+        lines.push(kv_line(p, "balance", balance, balance_style));
         lines.push(kv_line(
             p,
             "station(last)",

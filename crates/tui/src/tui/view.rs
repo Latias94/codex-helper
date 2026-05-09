@@ -60,7 +60,7 @@ pub(in crate::tui) fn render_app(
                 }
                 _ => unreachable!(),
             };
-            modals::render_provider_modal(f, p, ui, providers, title);
+            modals::render_provider_modal(f, p, ui, snapshot, providers, title);
         }
     }
 }

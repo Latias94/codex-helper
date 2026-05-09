@@ -7,7 +7,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use crate::dashboard_core::ControlProfileOption;
 use crate::tui::Language;
 use crate::tui::ProviderOption;
-use crate::tui::model::{Palette, Snapshot, compute_window_stats, now_ms, shorten, shorten_middle};
+use crate::tui::model::{
+    Palette, Snapshot, balance_status_style, compute_window_stats, now_ms, provider_tags_brief,
+    shorten, shorten_middle, station_balance_brief, station_balance_status,
+};
 use crate::tui::state::UiState;
 use crate::tui::types::{EffortChoice, Overlay, ServiceTierChoice};
 
@@ -1529,6 +1532,7 @@ pub(super) fn render_provider_modal(
     f: &mut Frame<'_>,
     p: Palette,
     ui: &mut UiState,
+    snapshot: &Snapshot,
     providers: &[ProviderOption],
     title: &str,
 ) {
@@ -1559,8 +1563,34 @@ pub(super) fn render_provider_modal(
         {
             label.push_str(&format!(" ({alias})"));
         }
+        let balance = station_balance_brief(&snapshot.provider_balances, pvd.name.as_str(), 42);
+        let balance_style = if pvd.enabled {
+            station_balance_status(&snapshot.provider_balances, pvd.name.as_str())
+                .map(|status| balance_status_style(p, status))
+                .unwrap_or_else(|| Style::default().fg(p.muted))
+        } else {
+            Style::default().fg(p.muted)
+        };
+        let tags = provider_tags_brief(pvd, 46).unwrap_or_else(|| "-".to_string());
         let style = Style::default().fg(if pvd.enabled { p.text } else { p.muted });
-        items.push(ListItem::new(Line::from(label)).style(style));
+        items.push(
+            ListItem::new(Text::from(vec![
+                Line::from(Span::styled(label, style)),
+                Line::from(vec![
+                    Span::styled("balance: ", Style::default().fg(p.muted)),
+                    Span::styled(balance, balance_style),
+                    Span::raw("  "),
+                    Span::styled("tags: ", Style::default().fg(p.muted)),
+                    Span::styled(tags, Style::default().fg(p.muted)),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("upstreams={}", pvd.upstreams.len()),
+                        Style::default().fg(p.muted),
+                    ),
+                ]),
+            ]))
+            .style(style),
+        );
     }
 
     let max = items.len().saturating_sub(1);

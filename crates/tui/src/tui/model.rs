@@ -10,9 +10,9 @@ use crate::dashboard_core::WindowStats;
 pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::pricing::ModelPriceCatalogSnapshot;
 use crate::state::{
-    FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot, ProxyState,
-    ResolvedRouteValue, SessionIdentityCard, SessionObservationScope, StationHealth,
-    UsageRollupView,
+    BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
+    ProviderBalanceSnapshot, ProxyState, ResolvedRouteValue, SessionIdentityCard,
+    SessionObservationScope, StationHealth, UsageRollupView,
 };
 use crate::usage::UsageMetrics;
 
@@ -336,6 +336,351 @@ pub fn build_provider_options(
     };
     providers.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.name.cmp(&b.name)));
     providers
+}
+
+pub(in crate::tui) fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {
+    match status {
+        BalanceSnapshotStatus::Ok => Style::default().fg(p.good),
+        BalanceSnapshotStatus::Exhausted | BalanceSnapshotStatus::Error => {
+            Style::default().fg(p.bad)
+        }
+        BalanceSnapshotStatus::Stale => Style::default().fg(p.warn),
+        BalanceSnapshotStatus::Unknown => Style::default().fg(p.muted),
+    }
+}
+
+pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
+    if let Some(total) = snapshot
+        .total_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(format!("${total}"));
+    }
+
+    let subscription = snapshot
+        .subscription_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let paygo = snapshot
+        .paygo_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let (Some(sub), Some(paygo)) = (subscription, paygo) {
+        return Some(format!("sub ${sub} + paygo ${paygo}"));
+    }
+    if let Some(sub) = subscription {
+        return Some(format!("sub ${sub}"));
+    }
+    if let Some(paygo) = paygo {
+        return Some(format!("paygo ${paygo}"));
+    }
+
+    match (
+        snapshot
+            .monthly_spent_usd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        snapshot
+            .monthly_budget_usd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(spent), Some(budget)) => Some(format!("${spent}/${budget}")),
+        (Some(spent), None) => Some(format!("spent ${spent}")),
+        (None, Some(budget)) => Some(format!("budget ${budget}")),
+        (None, None) => snapshot
+            .total_used_usd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("used ${value}"))
+            .or_else(|| {
+                snapshot
+                    .today_used_usd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("today ${value}"))
+            }),
+    }
+}
+
+fn balance_status_brief(status: BalanceSnapshotStatus) -> &'static str {
+    match status {
+        BalanceSnapshotStatus::Ok => "ok",
+        BalanceSnapshotStatus::Exhausted => "exh",
+        BalanceSnapshotStatus::Stale => "stale",
+        BalanceSnapshotStatus::Error => "err",
+        BalanceSnapshotStatus::Unknown => "unk",
+    }
+}
+
+pub(in crate::tui) fn provider_balance_compact(
+    snapshot: &ProviderBalanceSnapshot,
+    max_width: usize,
+) -> String {
+    let mut parts = Vec::new();
+    if snapshot.status != BalanceSnapshotStatus::Ok {
+        parts.push(balance_status_brief(snapshot.status).to_string());
+    }
+    if let Some(plan) = snapshot
+        .plan_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(plan.to_string());
+    }
+    if let Some(amount) = balance_amount_brief(snapshot) {
+        parts.push(amount);
+    }
+    if parts.is_empty() {
+        parts.push(balance_status_brief(snapshot.status).to_string());
+    }
+    if snapshot.status == BalanceSnapshotStatus::Error
+        && let Some(error) = snapshot
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("err={error}"));
+    }
+
+    shorten_middle(&parts.join(" "), max_width)
+}
+
+fn balance_status_rank(status: BalanceSnapshotStatus) -> u8 {
+    match status {
+        BalanceSnapshotStatus::Ok => 0,
+        BalanceSnapshotStatus::Stale => 1,
+        BalanceSnapshotStatus::Unknown => 2,
+        BalanceSnapshotStatus::Exhausted => 3,
+        BalanceSnapshotStatus::Error => 4,
+    }
+}
+
+fn primary_balance_snapshot(
+    balances: &[ProviderBalanceSnapshot],
+) -> Option<&ProviderBalanceSnapshot> {
+    balances.iter().min_by(|left, right| {
+        balance_status_rank(left.status)
+            .cmp(&balance_status_rank(right.status))
+            .then_with(|| left.upstream_index.cmp(&right.upstream_index))
+            .then_with(|| left.provider_id.cmp(&right.provider_id))
+            .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
+    })
+}
+
+pub(in crate::tui) fn station_balance_status(
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    station_name: &str,
+) -> Option<BalanceSnapshotStatus> {
+    let balances = provider_balances.get(station_name)?;
+    primary_balance_snapshot(balances).map(|snapshot| snapshot.status)
+}
+
+pub(in crate::tui) fn station_balance_brief(
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    station_name: &str,
+    max_width: usize,
+) -> String {
+    let Some(balances) = provider_balances.get(station_name) else {
+        return "-".to_string();
+    };
+    if balances.is_empty() {
+        return "-".to_string();
+    }
+
+    if balances.len() == 1 {
+        return provider_balance_compact(&balances[0], max_width);
+    }
+
+    let total = balances.len();
+    let ok = balances
+        .iter()
+        .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Ok)
+        .count();
+    let stale = balances
+        .iter()
+        .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Stale)
+        .count();
+    let exhausted = balances
+        .iter()
+        .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Exhausted)
+        .count();
+    let error = balances
+        .iter()
+        .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Error)
+        .count();
+    let unknown = balances
+        .iter()
+        .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Unknown)
+        .count();
+
+    let mut parts = Vec::new();
+    if ok > 0 {
+        parts.push(format!("ok {ok}/{total}"));
+    } else if stale > 0 {
+        parts.push(format!("stale {stale}/{total}"));
+    } else if unknown > 0 {
+        parts.push(format!("unk {unknown}/{total}"));
+    } else if exhausted > 0 {
+        parts.push(format!("exh {exhausted}/{total}"));
+    } else if error > 0 {
+        parts.push(format!("err {error}/{total}"));
+    }
+
+    if let Some(primary) = primary_balance_snapshot(balances)
+        && let Some(amount) = balance_amount_brief(primary)
+    {
+        parts.push(amount);
+    }
+    if exhausted > 0 && ok > 0 {
+        parts.push(format!("exh {exhausted}"));
+    }
+    if error > 0 && (ok > 0 || stale > 0 || unknown > 0 || exhausted > 0) {
+        parts.push(format!("err {error}"));
+    }
+
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        shorten_middle(&parts.join(" "), max_width)
+    }
+}
+
+fn row_station_candidates(row: &SessionRow) -> impl Iterator<Item = &str> {
+    [
+        row.last_station_name.as_deref(),
+        row.effective_station
+            .as_ref()
+            .map(|value| value.value.as_str()),
+        row.override_station_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|value| !value.is_empty() && *value != "-")
+}
+
+fn balance_by_provider_id<'a>(
+    provider_balances: &'a HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    provider_id: &str,
+) -> Option<(&'a str, &'a ProviderBalanceSnapshot)> {
+    let mut matches = provider_balances
+        .iter()
+        .flat_map(|(station_name, balances)| {
+            balances
+                .iter()
+                .filter(move |snapshot| snapshot.provider_id == provider_id)
+                .map(move |snapshot| (station_name.as_str(), snapshot))
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort_by(|(_, left), (_, right)| {
+        balance_status_rank(left.status)
+            .cmp(&balance_status_rank(right.status))
+            .then_with(|| left.upstream_index.cmp(&right.upstream_index))
+            .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
+    });
+    matches.into_iter().next()
+}
+
+pub(in crate::tui) fn session_balance_brief(
+    row: &SessionRow,
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    max_width: usize,
+) -> Option<String> {
+    for station_name in row_station_candidates(row) {
+        if provider_balances.contains_key(station_name) {
+            return Some(station_balance_brief(
+                provider_balances,
+                station_name,
+                max_width,
+            ));
+        }
+    }
+
+    row.last_provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+        .and_then(|provider_id| balance_by_provider_id(provider_balances, provider_id))
+        .map(|(station_name, snapshot)| {
+            shorten_middle(
+                &format!(
+                    "{} {}",
+                    shorten_middle(station_name, 18),
+                    provider_balance_compact(snapshot, max_width)
+                ),
+                max_width,
+            )
+        })
+}
+
+pub(in crate::tui) fn session_balance_status(
+    row: &SessionRow,
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+) -> Option<BalanceSnapshotStatus> {
+    for station_name in row_station_candidates(row) {
+        if let Some(status) = station_balance_status(provider_balances, station_name) {
+            return Some(status);
+        }
+    }
+
+    row.last_provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+        .and_then(|provider_id| balance_by_provider_id(provider_balances, provider_id))
+        .map(|(_, snapshot)| snapshot.status)
+}
+
+pub(in crate::tui) fn provider_tags_brief(
+    provider: &ProviderOption,
+    max_width: usize,
+) -> Option<String> {
+    let mut tags = provider
+        .upstreams
+        .iter()
+        .flat_map(|upstream| upstream.tags.iter())
+        .filter(|(key, value)| {
+            !value.trim().is_empty()
+                && key.as_str() != "provider_id"
+                && key.as_str() != "source"
+                && key.as_str() != "requires_openai_auth"
+        })
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    tags.sort();
+    tags.dedup();
+
+    if tags.is_empty() {
+        tags = provider
+            .upstreams
+            .iter()
+            .filter_map(|upstream| upstream.provider_id.as_deref())
+            .map(|provider_id| format!("provider_id={provider_id}"))
+            .collect::<Vec<_>>();
+        tags.sort();
+        tags.dedup();
+    }
+
+    if tags.is_empty() {
+        None
+    } else {
+        Some(shorten_middle(&tags.join(" "), max_width))
+    }
 }
 
 fn session_sort_key(row: &SessionRow) -> u64 {
@@ -710,6 +1055,45 @@ mod tests {
     use crate::state::FinishedRequest;
     use unicode_width::UnicodeWidthStr;
 
+    fn empty_session_row() -> SessionRow {
+        SessionRow {
+            session_id: Some("sid".to_string()),
+            observation_scope: SessionObservationScope::ObservedOnly,
+            host_local_transcript_path: None,
+            last_client_name: None,
+            last_client_addr: None,
+            cwd: None,
+            active_count: 0,
+            active_started_at_ms_min: None,
+            active_last_method: None,
+            active_last_path: None,
+            last_status: None,
+            last_duration_ms: None,
+            last_ended_at_ms: None,
+            last_model: None,
+            last_reasoning_effort: None,
+            last_service_tier: None,
+            last_provider_id: None,
+            last_station_name: None,
+            last_upstream_base_url: None,
+            last_usage: None,
+            total_usage: None,
+            turns_total: None,
+            turns_with_usage: None,
+            binding_profile_name: None,
+            binding_continuity_mode: None,
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
+            effective_station: None,
+            effective_upstream_base_url: None,
+            override_model: None,
+            override_effort: None,
+            override_station_name: None,
+            override_service_tier: None,
+        }
+    }
+
     #[test]
     fn basename_handles_unix_and_windows_paths() {
         assert_eq!(basename("/a/b/c"), "c");
@@ -730,6 +1114,97 @@ mod tests {
     fn shorten_middle_keeps_both_ends() {
         let s = "abcdef";
         assert_eq!(shorten_middle(s, 5), "ab…ef");
+    }
+
+    #[test]
+    fn provider_balance_compact_includes_plan_and_amount() {
+        let snapshot = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Ok,
+            plan_name: Some("CodeX Air".to_string()),
+            total_balance_usd: Some("165.08".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+
+        assert_eq!(provider_balance_compact(&snapshot, 80), "CodeX Air $165.08");
+    }
+
+    #[test]
+    fn station_balance_brief_prefers_usable_snapshot_and_keeps_warnings() {
+        let balances = HashMap::from([(
+            "input".to_string(),
+            vec![
+                ProviderBalanceSnapshot {
+                    status: BalanceSnapshotStatus::Exhausted,
+                    ..ProviderBalanceSnapshot::default()
+                },
+                ProviderBalanceSnapshot {
+                    status: BalanceSnapshotStatus::Ok,
+                    total_balance_usd: Some("12.50".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                },
+            ],
+        )]);
+
+        assert_eq!(
+            station_balance_brief(&balances, "input", 24),
+            "ok 1/2 $12.50 exh 1"
+        );
+        assert_eq!(
+            station_balance_status(&balances, "input"),
+            Some(BalanceSnapshotStatus::Ok)
+        );
+    }
+
+    #[test]
+    fn session_balance_brief_uses_observed_station_then_provider_fallback() {
+        let balances = HashMap::from([(
+            "input".to_string(),
+            vec![ProviderBalanceSnapshot {
+                provider_id: "input-provider".to_string(),
+                status: BalanceSnapshotStatus::Ok,
+                plan_name: Some("Monthly".to_string()),
+                total_balance_usd: Some("8.00".to_string()),
+                ..ProviderBalanceSnapshot::default()
+            }],
+        )]);
+        let mut row = empty_session_row();
+        row.last_station_name = Some("input".to_string());
+
+        assert_eq!(
+            session_balance_brief(&row, &balances, 80).as_deref(),
+            Some("Monthly $8.00")
+        );
+
+        row.last_station_name = None;
+        row.last_provider_id = Some("input-provider".to_string());
+
+        assert_eq!(
+            session_balance_brief(&row, &balances, 80).as_deref(),
+            Some("input Monthly $8.00")
+        );
+    }
+
+    #[test]
+    fn provider_tags_brief_filters_internal_tags() {
+        let provider = ProviderOption {
+            name: "input".to_string(),
+            upstreams: vec![UpstreamSummary {
+                provider_id: Some("input".to_string()),
+                tags: vec![
+                    ("provider_id".to_string(), "input".to_string()),
+                    ("source".to_string(), "codex-config".to_string()),
+                    ("billing".to_string(), "monthly".to_string()),
+                    ("region".to_string(), "hk".to_string()),
+                ],
+                ..UpstreamSummary::default()
+            }],
+            ..ProviderOption::default()
+        };
+
+        assert_eq!(
+            provider_tags_brief(&provider, 80).as_deref(),
+            Some("billing=monthly region=hk")
+        );
     }
 
     #[test]

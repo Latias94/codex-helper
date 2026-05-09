@@ -49,6 +49,8 @@ Acceptance:
 
 ## P1 - UI / UX
 
+- [x] Show balance/package summaries in TUI session details and provider switch menus.
+- [x] Show explicit provider tags in the TUI switch menu so tag-preferred routing is inspectable before editing.
 - Update the provider editor to prioritize identity, auth, endpoint, and tags.
 - Add a routing editor with policy, order, target, and tag-preference controls.
 - Show a preview of preferred candidates and fallback behavior.
@@ -57,6 +59,7 @@ Acceptance:
 Acceptance:
 
 - a user can add a new provider without re-learning the entire config structure;
+- a user can see which candidate has balance/package quota before pinning or switching to it;
 - the routing preview explains why a provider is first, skipped, or used as fallback.
 
 ## P1 - Control Plane Write-Back

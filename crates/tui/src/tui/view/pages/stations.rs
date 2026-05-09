@@ -10,21 +10,12 @@ use crate::dashboard_core::{
     StationRoutingPostureInput, StationRoutingSkipReason, StationRoutingSource,
     build_station_routing_posture, summarize_recent_retry_observations,
 };
-use crate::state::BalanceSnapshotStatus;
 use crate::tui::ProviderOption;
-use crate::tui::model::{Palette, Snapshot, format_age, now_ms, shorten, shorten_middle};
+use crate::tui::model::{
+    Palette, Snapshot, balance_status_style, format_age, now_ms, shorten, shorten_middle,
+    station_balance_brief,
+};
 use crate::tui::state::UiState;
-
-fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {
-    match status {
-        BalanceSnapshotStatus::Ok => Style::default().fg(p.good),
-        BalanceSnapshotStatus::Exhausted | BalanceSnapshotStatus::Error => {
-            Style::default().fg(p.bad)
-        }
-        BalanceSnapshotStatus::Stale => Style::default().fg(p.warn),
-        BalanceSnapshotStatus::Unknown => Style::default().fg(p.muted),
-    }
-}
 
 fn station_routing_posture(
     providers: &[ProviderOption],
@@ -220,120 +211,6 @@ fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
     }
 }
 
-fn balance_amount_brief(snapshot: &crate::state::ProviderBalanceSnapshot) -> Option<String> {
-    if let Some(total) = snapshot
-        .total_balance_usd
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(format!("${total}"));
-    }
-
-    match (
-        snapshot
-            .monthly_spent_usd
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty()),
-        snapshot
-            .monthly_budget_usd
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty()),
-    ) {
-        (Some(spent), Some(budget)) => Some(format!("${spent}/${budget}")),
-        _ => snapshot
-            .subscription_balance_usd
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| format!("sub ${value}"))
-            .or_else(|| {
-                snapshot
-                    .paygo_balance_usd
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| format!("paygo ${value}"))
-            }),
-    }
-}
-
-fn station_balance_cell(
-    provider_balances: &HashMap<String, Vec<crate::state::ProviderBalanceSnapshot>>,
-    station_name: &str,
-) -> String {
-    let Some(balances) = provider_balances.get(station_name) else {
-        return "-".to_string();
-    };
-    if balances.is_empty() {
-        return "-".to_string();
-    }
-
-    if balances.len() == 1 {
-        let snapshot = &balances[0];
-        let amount = balance_amount_brief(snapshot);
-        return match snapshot.status {
-            BalanceSnapshotStatus::Ok => amount.unwrap_or_else(|| "ok".to_string()),
-            BalanceSnapshotStatus::Exhausted => amount
-                .map(|value| format!("exh {value}"))
-                .unwrap_or_else(|| "exh".to_string()),
-            BalanceSnapshotStatus::Stale => amount
-                .map(|value| format!("stale {value}"))
-                .unwrap_or_else(|| "stale".to_string()),
-            BalanceSnapshotStatus::Error => "err".to_string(),
-            BalanceSnapshotStatus::Unknown => amount
-                .map(|value| format!("unk {value}"))
-                .unwrap_or_else(|| "unk".to_string()),
-        };
-    }
-
-    let mut ok = 0usize;
-    let mut stale = 0usize;
-    let mut exhausted = 0usize;
-    let mut error = 0usize;
-    let mut unknown = 0usize;
-    for snapshot in balances {
-        match snapshot.status {
-            BalanceSnapshotStatus::Ok => ok += 1,
-            BalanceSnapshotStatus::Stale => stale += 1,
-            BalanceSnapshotStatus::Exhausted => exhausted += 1,
-            BalanceSnapshotStatus::Error => error += 1,
-            BalanceSnapshotStatus::Unknown => unknown += 1,
-        }
-    }
-
-    let total = balances.len();
-    if error > 0 {
-        return format!("err {error}/{total}");
-    }
-    if exhausted > 0 {
-        return format!("exh {exhausted}/{total}");
-    }
-    if stale > 0 && ok == 0 {
-        return format!("stale {stale}/{total}");
-    }
-    if ok > 0 {
-        if let Some(amount) = balances
-            .iter()
-            .find(|snapshot| snapshot.status == BalanceSnapshotStatus::Ok)
-            .and_then(balance_amount_brief)
-        {
-            return amount;
-        }
-        return format!("ok {ok}/{total}");
-    }
-    if stale > 0 {
-        return format!("stale {stale}/{total}");
-    }
-    if unknown > 0 {
-        return format!("unk {unknown}/{total}");
-    }
-
-    "-".to_string()
-}
-
 fn format_skipped_station(skipped: &crate::dashboard_core::StationRoutingSkipped) -> String {
     format!(
         "{}: {}",
@@ -415,7 +292,7 @@ pub(super) fn render_stations_page(
 
             let on = if enabled { "on" } else { "off" };
             let up = cfg.upstreams.len().to_string();
-            let balance = station_balance_cell(&snapshot.provider_balances, cfg.name.as_str());
+            let balance = station_balance_brief(&snapshot.provider_balances, cfg.name.as_str(), 18);
             let health = if let Some(st) = snapshot.health_checks.get(cfg.name.as_str())
                 && !st.done
             {
@@ -849,6 +726,7 @@ pub(super) fn render_stations_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::BalanceSnapshotStatus;
     use crate::tui::UpstreamSummary;
 
     fn provider(
@@ -1082,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn station_balance_cell_shows_single_amount() {
+    fn station_balance_brief_shows_single_amount() {
         let provider_balances = HashMap::from([(
             "alpha".to_string(),
             vec![crate::state::ProviderBalanceSnapshot {
@@ -1092,11 +970,14 @@ mod tests {
             }],
         )]);
 
-        assert_eq!(station_balance_cell(&provider_balances, "alpha"), "$3.50");
+        assert_eq!(
+            station_balance_brief(&provider_balances, "alpha", 18),
+            "$3.50"
+        );
     }
 
     #[test]
-    fn station_balance_cell_summarizes_multi_snapshot_states() {
+    fn station_balance_brief_prefers_usable_snapshot_and_keeps_warning() {
         let provider_balances = HashMap::from([(
             "alpha".to_string(),
             vec![
@@ -1112,6 +993,9 @@ mod tests {
             ],
         )]);
 
-        assert_eq!(station_balance_cell(&provider_balances, "alpha"), "exh 1/2");
+        assert_eq!(
+            station_balance_brief(&provider_balances, "alpha", 18),
+            "ok 1/2 $1.00 exh 1"
+        );
     }
 }
