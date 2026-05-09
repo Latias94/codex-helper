@@ -39,7 +39,14 @@ fn render_claude_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16
                 ),
                 status.base_url.as_deref().unwrap_or("-")
             ));
-            render_switch_enabled_state(ui, ctx.lang, status.enabled, status.has_backup);
+            render_switch_enabled_state(
+                ui,
+                ctx.lang,
+                status.enabled,
+                status.has_backup,
+                "提示：当前已指向本地代理但未找到备份文件；请手动检查 Claude settings。",
+                "Tip: enabled but no backup was found; inspect Claude settings manually.",
+            );
 
             ui.horizontal(|ui| {
                 let enable_label = match ctx.lang {
@@ -114,7 +121,14 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                 pick(ctx.lang, "当前 base_url", "Current base_url"),
                 status.base_url.as_deref().unwrap_or("-")
             ));
-            render_switch_enabled_state(ui, ctx.lang, status.enabled, status.has_backup);
+            render_switch_enabled_state(
+                ui,
+                ctx.lang,
+                status.enabled,
+                status.has_switch_state,
+                "提示：当前已指向本地代理但未找到 switch state；无法自动判断原 provider。",
+                "Tip: enabled but no switch state was found; the original provider cannot be inferred automatically.",
+            );
 
             ui.horizontal(|ui| {
                 let enable_label = match ctx.lang {
@@ -142,12 +156,8 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
 
                 if ui
                     .add_enabled(
-                        status.has_backup,
-                        egui::Button::new(pick(
-                            ctx.lang,
-                            "恢复（从备份）",
-                            "Restore (from backup)",
-                        )),
+                        status.has_switch_state,
+                        egui::Button::new(pick(ctx.lang, "关闭代理", "Disable proxy")),
                     )
                     .clicked()
                 {
@@ -156,8 +166,8 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                             *ctx.last_info = Some(
                                 pick(
                                     ctx.lang,
-                                    "已从备份恢复 ~/.codex/config.toml",
-                                    "Restored ~/.codex/config.toml from backup",
+                                    "已关闭 Codex 本地代理",
+                                    "Disabled Codex local proxy",
                                 )
                                 .to_string(),
                             );
@@ -167,13 +177,13 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                 }
             });
 
-            if !status.has_backup {
+            if !status.has_switch_state {
                 ui.colored_label(
                     egui::Color32::from_rgb(200, 120, 40),
                     pick(
                         ctx.lang,
-                        "提示：未检测到备份文件（首次 switch on 时会自动创建备份）。",
-                        "Tip: no backup detected (a backup is created on first switch on).",
+                        "提示：未检测到 switch state；如当前已指向本地代理，请手动检查 ~/.codex/config.toml。",
+                        "Tip: no switch state detected; if Codex points to the local proxy, inspect ~/.codex/config.toml manually.",
                     ),
                 );
             }
@@ -182,20 +192,23 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
     }
 }
 
-fn render_switch_enabled_state(ui: &mut egui::Ui, lang: Language, enabled: bool, has_backup: bool) {
+fn render_switch_enabled_state(
+    ui: &mut egui::Ui,
+    lang: Language,
+    enabled: bool,
+    has_state: bool,
+    missing_state_zh: &str,
+    missing_state_en: &str,
+) {
     if enabled {
         ui.colored_label(
             egui::Color32::from_rgb(60, 160, 90),
             pick(lang, "已启用（本地代理）", "Enabled (local proxy)"),
         );
-        if !has_backup {
+        if !has_state {
             ui.colored_label(
                 egui::Color32::from_rgb(200, 120, 40),
-                pick(
-                    lang,
-                    "提示：当前已指向本地代理但未找到备份文件；请勿重复 switch on，否则备份可能覆盖原始配置。",
-                    "Tip: enabled but no backup found; avoid repeated switch on (backup may not represent the original config).",
-                ),
+                pick(lang, missing_state_zh, missing_state_en),
             );
         }
     } else {

@@ -78,7 +78,7 @@ Common fields:
 | `auth_token_env` | Environment variable for bearer auth | Prefer this over inline secrets. |
 | `api_key_env` | Environment variable for `X-API-Key` auth | Use only for providers that require it. |
 | `tags` | Free-form provider metadata | Use clear tags such as `billing`, `vendor`, `region`. |
-| `enabled` | Whether the provider is routeable | Use `provider disable` instead of deleting temporary backups. |
+| `enabled` | Whether the provider is routeable | Use `provider disable` instead of deleting providers temporarily. |
 | `supported_models` | Optional model allowlist | Advanced; leave empty unless the relay is model-limited. |
 | `model_mapping` | Optional model name translation | Advanced; use only when a relay needs aliases. |
 

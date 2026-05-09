@@ -3,9 +3,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::client_config::{
-    CLAUDE_ABSENT_BACKUP_SENTINEL, CODEX_ABSENT_BACKUP_SENTINEL,
-    claude_settings_backup_path_for as claude_settings_backup_path, claude_settings_path,
-    codex_backup_config_path as codex_config_backup_path, codex_config_path,
+    CLAUDE_ABSENT_BACKUP_SENTINEL, claude_settings_backup_path_for as claude_settings_backup_path,
+    claude_settings_path, codex_config_path, codex_switch_state_path,
 };
 use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
@@ -43,6 +42,246 @@ fn set_toml_value_preserving_decor(item: &mut EditableTomlItem, mut value: Edita
 fn set_toml_string(table: &mut EditableTomlTable, key: &str, value: impl Into<String>) {
     let item = table.entry(key).or_insert(EditableTomlItem::None);
     set_toml_value_preserving_decor(item, EditableTomlValue::from(value.into()));
+}
+
+fn toml_string(table: &EditableTomlTable, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(EditableTomlItem::as_value)
+        .and_then(EditableTomlValue::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn local_helper_proxy_item(item: Option<&EditableTomlItem>) -> bool {
+    let Some(table) = item.and_then(EditableTomlItem::as_table) else {
+        return false;
+    };
+    let name_is_helper = toml_string(table, "name").as_deref() == Some("codex-helper");
+    let base_url_is_local = toml_string(table, "base_url")
+        .as_deref()
+        .is_some_and(|url| url.contains("127.0.0.1") || url.contains("localhost"));
+    name_is_helper || base_url_is_local
+}
+
+fn codex_text_points_to_local_helper(text: &str) -> Result<bool> {
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    let doc = text.parse::<EditableTomlDocument>()?;
+    let root = doc.as_table();
+    if toml_string(root, "model_provider").as_deref() != Some("codex_proxy") {
+        return Ok(false);
+    }
+    Ok(root
+        .get("model_providers")
+        .and_then(EditableTomlItem::as_table)
+        .and_then(|table| table.get("codex_proxy"))
+        .is_some_and(|item| local_helper_proxy_item(Some(item))))
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct CodexSwitchState {
+    version: u32,
+    original_config_absent: bool,
+    original_model_provider: Option<String>,
+    original_codex_proxy: Option<Value>,
+    had_model_providers: bool,
+}
+
+impl CodexSwitchState {
+    fn from_codex_config_text(text: &str, original_config_absent: bool) -> Result<Self> {
+        let doc = if text.trim().is_empty() {
+            EditableTomlDocument::new()
+        } else {
+            text.parse::<EditableTomlDocument>()?
+        };
+        let root = doc.as_table();
+        let providers_table = root
+            .get("model_providers")
+            .and_then(EditableTomlItem::as_table);
+
+        Ok(Self {
+            version: 1,
+            original_config_absent,
+            original_model_provider: toml_string(root, "model_provider"),
+            original_codex_proxy: original_codex_proxy_value(text)?,
+            had_model_providers: providers_table.is_some(),
+        })
+    }
+}
+
+fn original_codex_proxy_value(text: &str) -> Result<Option<Value>> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let value = text.parse::<Value>()?;
+    Ok(value
+        .as_table()
+        .and_then(|root| root.get("model_providers"))
+        .and_then(Value::as_table)
+        .and_then(|providers| providers.get("codex_proxy"))
+        .cloned())
+}
+
+fn editable_item_from_toml_value(value: &Value) -> Result<EditableTomlItem> {
+    match value {
+        Value::Table(table) => {
+            let body = toml::to_string(table)?;
+            let doc = format!("[codex_proxy]\n{body}").parse::<EditableTomlDocument>()?;
+            doc.as_table()
+                .get("codex_proxy")
+                .cloned()
+                .ok_or_else(|| anyhow!("failed to parse stored codex_proxy state"))
+        }
+        _ => Err(anyhow!("stored codex_proxy state must be a TOML table")),
+    }
+}
+
+fn read_codex_switch_state() -> Result<Option<CodexSwitchState>> {
+    let path = codex_switch_state_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = read_config_text(&path)?;
+    let state = serde_json::from_str::<CodexSwitchState>(&text)
+        .with_context(|| format!("parse {:?}", path))?;
+    Ok(Some(state))
+}
+
+fn write_codex_switch_state_if_absent(state: &CodexSwitchState) -> Result<()> {
+    let path = codex_switch_state_path();
+    if path.exists() {
+        return Ok(());
+    }
+    let text = serde_json::to_string_pretty(state)?;
+    atomic_write(&path, &text)
+}
+
+pub fn codex_switch_state_exists() -> bool {
+    codex_switch_state_path().exists()
+}
+
+enum CodexSwitchOffEdit {
+    Write(String),
+    RemoveFile,
+}
+
+fn switch_off_codex_toml(
+    current_text: &str,
+    original: &CodexSwitchState,
+) -> Result<CodexSwitchOffEdit> {
+    let mut doc = if current_text.trim().is_empty() {
+        EditableTomlDocument::new()
+    } else {
+        current_text.parse::<EditableTomlDocument>()?
+    };
+    let root = doc.as_table_mut();
+
+    let current_model_provider = toml_string(root, "model_provider");
+    let proxy_is_helper = root
+        .get("model_providers")
+        .and_then(EditableTomlItem::as_table)
+        .and_then(|table| table.get("codex_proxy"))
+        .map(|item| local_helper_proxy_item(Some(item)))
+        .unwrap_or(current_model_provider.as_deref() == Some("codex_proxy"));
+
+    if current_model_provider.as_deref() == Some("codex_proxy") && proxy_is_helper {
+        if let Some(provider) = original.original_model_provider.as_deref() {
+            set_toml_string(root, "model_provider", provider);
+        } else {
+            root.remove("model_provider");
+        }
+    }
+
+    let mut remove_model_providers = false;
+    if let Some(providers_table) = root
+        .get_mut("model_providers")
+        .and_then(EditableTomlItem::as_table_mut)
+    {
+        let proxy_is_helper = local_helper_proxy_item(providers_table.get("codex_proxy"));
+        if proxy_is_helper {
+            if let Some(original_proxy) = original.original_codex_proxy.as_ref() {
+                providers_table.insert(
+                    "codex_proxy",
+                    editable_item_from_toml_value(original_proxy)?,
+                );
+            } else {
+                providers_table.remove("codex_proxy");
+            }
+        }
+        remove_model_providers = !original.had_model_providers && providers_table.is_empty();
+    }
+    if remove_model_providers {
+        root.remove("model_providers");
+    }
+
+    if original.original_config_absent && root.is_empty() {
+        Ok(CodexSwitchOffEdit::RemoveFile)
+    } else {
+        Ok(CodexSwitchOffEdit::Write(doc.to_string()))
+    }
+}
+
+fn codex_config_text_with_switch_state(
+    current_text: &str,
+    state: &CodexSwitchState,
+) -> Result<String> {
+    let mut doc = if current_text.trim().is_empty() {
+        EditableTomlDocument::new()
+    } else {
+        current_text.parse::<EditableTomlDocument>()?
+    };
+    let root = doc.as_table_mut();
+    let current_model_provider = toml_string(root, "model_provider");
+    let proxy_is_helper = root
+        .get("model_providers")
+        .and_then(EditableTomlItem::as_table)
+        .and_then(|table| table.get("codex_proxy"))
+        .map(|item| local_helper_proxy_item(Some(item)))
+        .unwrap_or(current_model_provider.as_deref() == Some("codex_proxy"));
+
+    if current_model_provider.as_deref() != Some("codex_proxy") || !proxy_is_helper {
+        return Ok(current_text.to_string());
+    }
+
+    if let Some(provider) = state.original_model_provider.as_deref() {
+        set_toml_string(root, "model_provider", provider);
+    } else {
+        root.remove("model_provider");
+    }
+
+    let mut remove_model_providers = false;
+    if let Some(providers_table) = root
+        .get_mut("model_providers")
+        .and_then(EditableTomlItem::as_table_mut)
+    {
+        if let Some(original_proxy) = state.original_codex_proxy.as_ref() {
+            providers_table.insert(
+                "codex_proxy",
+                editable_item_from_toml_value(original_proxy)?,
+            );
+        } else {
+            providers_table.remove("codex_proxy");
+        }
+        remove_model_providers = !state.had_model_providers && providers_table.is_empty();
+    }
+    if remove_model_providers {
+        root.remove("model_providers");
+    }
+
+    Ok(doc.to_string())
+}
+
+pub fn codex_config_text_for_import() -> Result<Option<String>> {
+    let cfg_path = codex_config_path();
+    if !cfg_path.exists() {
+        return Ok(None);
+    }
+    let current_text = read_config_text(&cfg_path)?;
+    let Some(state) = read_codex_switch_state()? else {
+        return Ok(Some(current_text));
+    };
+    codex_config_text_with_switch_state(&current_text, &state).map(Some)
 }
 
 fn switch_on_codex_toml(text: &str, port: u16) -> Result<String> {
@@ -94,20 +333,20 @@ pub struct CodexSwitchStatus {
     pub model_provider: Option<String>,
     /// Current `model_providers.codex_proxy.base_url` (if any).
     pub base_url: Option<String>,
-    /// Whether a backup file exists for safe restore.
-    pub has_backup: bool,
+    /// Whether original switch metadata exists for disabling the local proxy patch.
+    pub has_switch_state: bool,
 }
 
 pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
     let cfg_path = codex_config_path();
-    let backup_path = codex_config_backup_path();
+    let state_path = codex_switch_state_path();
 
     if !cfg_path.exists() {
         return Ok(CodexSwitchStatus {
             enabled: false,
             model_provider: None,
             base_url: None,
-            has_backup: backup_path.exists(),
+            has_switch_state: state_path.exists(),
         });
     }
 
@@ -117,7 +356,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             enabled: false,
             model_provider: None,
             base_url: None,
-            has_backup: backup_path.exists(),
+            has_switch_state: state_path.exists(),
         });
     }
 
@@ -128,7 +367,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
                 enabled: false,
                 model_provider: None,
                 base_url: None,
-                has_backup: backup_path.exists(),
+                has_switch_state: state_path.exists(),
             });
         }
     };
@@ -139,7 +378,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
                 enabled: false,
                 model_provider: None,
                 base_url: None,
-                has_backup: backup_path.exists(),
+                has_switch_state: state_path.exists(),
             });
         }
     };
@@ -154,7 +393,7 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             enabled: false,
             model_provider,
             base_url: None,
-            has_backup: backup_path.exists(),
+            has_switch_state: state_path.exists(),
         });
     }
 
@@ -187,48 +426,59 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
         enabled: is_local || is_helper_name,
         model_provider,
         base_url,
-        has_backup: backup_path.exists(),
+        has_switch_state: state_path.exists(),
     })
 }
 
 /// Switch Codex to use the local codex-helper model provider.
 pub fn switch_on(port: u16) -> Result<()> {
     let cfg_path = codex_config_path();
-    let backup_path = codex_config_backup_path();
-
-    // Backup once if original exists and no backup yet.
-    if cfg_path.exists() && !backup_path.exists() {
-        fs::copy(&cfg_path, &backup_path)
-            .with_context(|| format!("backup {:?} -> {:?}", cfg_path, backup_path))?;
-    } else if !cfg_path.exists() && !backup_path.exists() {
-        // If Codex has no config.toml yet, create a sentinel backup so we can restore
-        // to the "absent" state on switch_off.
-        atomic_write(&backup_path, CODEX_ABSENT_BACKUP_SENTINEL)?;
-    }
-
+    let state_path = codex_switch_state_path();
     let text = read_config_text(&cfg_path)?;
+    if !state_path.exists() && codex_text_points_to_local_helper(&text)? {
+        return Err(anyhow!(
+            "Codex already points to the local codex-helper proxy, but no switch state was found at {:?}; refusing to treat the local proxy as the original provider. Please inspect ~/.codex/config.toml manually or run `codex-helper switch off` only if a switch state exists.",
+            state_path
+        ));
+    }
+    let state = CodexSwitchState::from_codex_config_text(&text, !cfg_path.exists())?;
+    write_codex_switch_state_if_absent(&state)?;
     let new_text = switch_on_codex_toml(&text, port)?;
     atomic_write(&cfg_path, &new_text)?;
     Ok(())
 }
 
-/// Restore Codex config.toml from backup if present.
+/// Undo the local Codex proxy patch while preserving config edits made during the run.
 pub fn switch_off() -> Result<()> {
     let cfg_path = codex_config_path();
-    let backup_path = codex_config_backup_path();
-    if backup_path.exists() {
-        let text = read_config_text(&backup_path)?;
-        if text.trim() == CODEX_ABSENT_BACKUP_SENTINEL {
-            if cfg_path.exists() {
-                fs::remove_file(&cfg_path)
-                    .with_context(|| format!("remove {:?} (restore absent)", cfg_path))?;
-            }
-        } else {
-            atomic_write(&cfg_path, &text)
-                .with_context(|| format!("restore {:?} -> {:?}", backup_path, cfg_path))?;
+    let state_path = codex_switch_state_path();
+    if state_path.exists() {
+        if !cfg_path.exists() {
+            fs::remove_file(&state_path)
+                .with_context(|| format!("remove stale switch state {:?}", state_path))?;
+            return Ok(());
         }
-        fs::remove_file(&backup_path)
-            .with_context(|| format!("remove stale backup {:?}", backup_path))?;
+        let state = read_codex_switch_state()?.ok_or_else(|| {
+            anyhow!(
+                "missing Codex switch state at {:?}",
+                codex_switch_state_path()
+            )
+        })?;
+        let current_text = read_config_text(&cfg_path)?;
+        match switch_off_codex_toml(&current_text, &state)? {
+            CodexSwitchOffEdit::RemoveFile => {
+                if cfg_path.exists() {
+                    fs::remove_file(&cfg_path)
+                        .with_context(|| format!("remove {:?} (restore absent)", cfg_path))?;
+                }
+            }
+            CodexSwitchOffEdit::Write(text) => {
+                atomic_write(&cfg_path, &text)
+                    .with_context(|| format!("patch {:?} to disable local proxy", cfg_path))?;
+            }
+        }
+        fs::remove_file(&state_path)
+            .with_context(|| format!("remove stale switch state {:?}", state_path))?;
     }
     Ok(())
 }
@@ -302,12 +552,12 @@ pub fn claude_switch_status() -> Result<ClaudeSwitchStatus> {
     })
 }
 
-/// 闂侀潻璐熼崝宀勫疮閳ь剚绻涢崱蹇婂亾閸愯尙鈧ジ鏌熼獮鍨仼闁糕晛鐭傚鐢割敆閳ь剙锕㈢€涙顩烽柨婵嗘处閸婄偤鏌涢幘宕団枌缂佽鲸绻勯埀?Codex 闂備焦婢樼粔鍫曟偪閸℃稑纾绘慨姗嗗亞椤忚鲸绻涢崱蹇婂亾閼碱剛顔旈梺纭呯堪閸婃牠鍩€椤戭剙瀚峰楣冩煛鐏炶鍔橀柍?
+/// Warn before replacing an existing local Codex proxy patch.
 pub fn guard_codex_config_before_switch_on_interactive() -> Result<()> {
     use std::io::{self, Write};
 
     let cfg_path = codex_config_path();
-    let backup_path = codex_config_backup_path();
+    let state_path = codex_switch_state_path();
 
     if !cfg_path.exists() {
         return Ok(());
@@ -361,10 +611,10 @@ pub fn guard_codex_config_before_switch_on_interactive() -> Result<()> {
         return Ok(());
     }
 
-    if !backup_path.exists() {
+    if !state_path.exists() {
         eprintln!(
-            "Warning: Codex currently points to the local proxy ({base_url}), but no backup file {:?} was found; please inspect ~/.codex/config.toml manually if this is unexpected.",
-            backup_path
+            "Warning: Codex currently points to the local proxy ({base_url}), but no codex-helper switch state {:?} was found; please inspect ~/.codex/config.toml manually if this is unexpected.",
+            state_path
         );
         return Ok(());
     }
@@ -372,15 +622,15 @@ pub fn guard_codex_config_before_switch_on_interactive() -> Result<()> {
     let is_tty = atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
     if !is_tty {
         eprintln!(
-            "Notice: Codex currently points to local codex-helper ({base_url}) and backup {:?} exists; run `codex-helper switch off` if you want to restore the original config.",
-            backup_path
+            "Notice: Codex currently points to local codex-helper ({base_url}) and switch state {:?} exists; run `codex-helper switch off` to disable the local proxy patch while preserving other config edits.",
+            state_path
         );
         return Ok(());
     }
 
     eprintln!(
-        "Codex currently points to local codex-helper ({base_url}), and backup {:?} exists.\nThis usually means the previous run did not switch off cleanly.\nRestore the original Codex config now? [Y/n] ",
-        backup_path
+        "Codex currently points to local codex-helper ({base_url}), and switch state {:?} exists.\nThis usually means the previous run did not switch off cleanly.\nDisable the local proxy patch now while preserving other config edits? [Y/n] ",
+        state_path
     );
     eprint!("> ");
     io::stdout().flush().ok();
@@ -396,9 +646,9 @@ pub fn guard_codex_config_before_switch_on_interactive() -> Result<()> {
 
     if yes {
         if let Err(err) = switch_off() {
-            eprintln!("Failed to restore original Codex config: {err}");
+            eprintln!("Failed to disable local Codex proxy patch: {err}");
         } else {
-            eprintln!("Restored original Codex config from backup.");
+            eprintln!("Disabled local Codex proxy patch.");
         }
     } else {
         eprintln!("Keeping current Codex config unchanged.");
@@ -637,10 +887,53 @@ request_max_retries = 5
     }
 
     #[test]
-    fn codex_switch_off_clears_backup_and_refreshes_next_snapshot() {
+    fn codex_switch_on_refuses_local_proxy_without_switch_state() {
         let env = setup_temp_env();
         let cfg_path = env.codex_home.join("config.toml");
-        let backup_path = env.codex_home.join("config.toml.codex-helper-backup");
+        let state_path = env.codex_home.join("codex-helper-switch-state.json");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "http://127.0.0.1:3211"
+"#
+            .trim_start(),
+        );
+
+        let err = switch_on(3211).expect_err("switch_on should not snapshot a local proxy");
+        assert!(err.to_string().contains("no switch state was found"));
+        assert!(
+            !state_path.exists(),
+            "switch_on must not create state from an already-patched local proxy"
+        );
+    }
+
+    #[test]
+    fn codex_config_text_for_import_hides_proxy_created_from_absent_config() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+
+        switch_on(3211).expect("switch_on should create config");
+        assert!(cfg_path.exists());
+
+        let import_text = codex_config_text_for_import()
+            .expect("read import view")
+            .expect("config exists");
+        assert!(
+            import_text.trim().is_empty(),
+            "import view should not expose helper proxy as a real upstream"
+        );
+    }
+
+    #[test]
+    fn codex_switch_off_clears_switch_state_and_refreshes_next_snapshot() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        let state_path = env.codex_home.join("codex-helper-switch-state.json");
 
         let original = r#"
 model_provider = "openai"
@@ -660,26 +953,155 @@ base_url = "https://codex-api.packycode.com/v1"
         write_file(&cfg_path, original.trim_start());
         switch_on(3211).expect("first switch_on should succeed");
         assert!(
-            backup_path.exists(),
-            "backup should exist while switched on"
+            state_path.exists(),
+            "switch state should exist while patched"
+        );
+        let state_text = read_file(&state_path);
+        assert!(state_text.contains("\"original_model_provider\": \"openai\""));
+        assert!(
+            !state_text.contains("api.openai.com"),
+            "switch state should not store the full Codex config"
         );
 
         switch_off().expect("first switch_off should succeed");
         assert_eq!(read_file(&cfg_path), original.trim_start());
         assert!(
-            !backup_path.exists(),
-            "backup should be removed after restore to avoid stale snapshots"
+            !state_path.exists(),
+            "switch state should be removed after patch-off to avoid stale snapshots"
         );
 
         write_file(&cfg_path, updated.trim_start());
         switch_on(3211).expect("second switch_on should succeed");
-        assert_eq!(read_file(&backup_path), updated.trim_start());
+        let state_text = read_file(&state_path);
+        assert!(state_text.contains("\"original_model_provider\": \"packycode\""));
 
         switch_off().expect("second switch_off should succeed");
         assert_eq!(read_file(&cfg_path), updated.trim_start());
         assert!(
-            !backup_path.exists(),
-            "backup should be cleaned up after the second restore as well"
+            !state_path.exists(),
+            "switch state should be cleaned up after the second patch-off as well"
+        );
+    }
+
+    #[test]
+    fn codex_switch_off_preserves_codex_runtime_config_edits() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        let state_path = env.codex_home.join("codex-helper-switch-state.json");
+
+        let original = r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#;
+
+        write_file(&cfg_path, original.trim_start());
+        switch_on(3211).expect("switch_on should succeed");
+
+        let mut during_run = read_file(&cfg_path);
+        during_run.push_str(
+            r#"
+[projects."D:\\Projects\\rust\\codex-helper"]
+trust_level = "trusted"
+"#,
+        );
+        write_file(&cfg_path, &during_run);
+
+        switch_off().expect("switch_off should patch rather than restore whole file");
+
+        let updated = read_file(&cfg_path);
+        assert!(updated.contains("model_provider = \"openai\""));
+        assert!(updated.contains("[model_providers.openai]"));
+        assert!(!updated.contains("[model_providers.codex_proxy]"));
+        assert!(updated.contains("[projects."));
+        assert!(updated.contains("trust_level = \"trusted\""));
+        assert!(
+            !state_path.exists(),
+            "switch state should be removed after successful patch-off"
+        );
+    }
+
+    #[test]
+    fn codex_switch_off_keeps_user_provider_change_made_during_run() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+
+        let original = r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#;
+        let user_changed = r#"
+model_provider = "packycode"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+request_max_retries = 0
+
+[model_providers.packycode]
+name = "packycode"
+base_url = "https://codex-api.packycode.com/v1"
+"#;
+
+        write_file(&cfg_path, original.trim_start());
+        switch_on(3211).expect("switch_on should succeed");
+        write_file(&cfg_path, user_changed.trim_start());
+
+        switch_off().expect("switch_off should not undo user's model_provider change");
+
+        let updated = read_file(&cfg_path);
+        assert!(updated.contains("model_provider = \"packycode\""));
+        assert!(updated.contains("[model_providers.packycode]"));
+        assert!(!updated.contains("[model_providers.codex_proxy]"));
+    }
+
+    #[test]
+    fn codex_switch_off_preserves_new_config_when_original_was_absent() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+
+        switch_on(3211).expect("switch_on should create config");
+        let mut during_run = read_file(&cfg_path);
+        during_run.push_str(
+            r#"
+[projects."D:\\Projects\\rust\\codex-helper"]
+trust_level = "trusted"
+"#,
+        );
+        write_file(&cfg_path, &during_run);
+
+        switch_off().expect("switch_off should remove only local proxy fields");
+
+        let updated = read_file(&cfg_path);
+        assert!(!updated.contains("model_provider = \"codex_proxy\""));
+        assert!(!updated.contains("[model_providers.codex_proxy]"));
+        assert!(updated.contains("[projects."));
+        assert!(updated.contains("trust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn codex_switch_off_removes_empty_config_created_by_switch_on() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+
+        switch_on(3211).expect("switch_on should create config");
+        assert!(cfg_path.exists());
+
+        switch_off().expect("switch_off should restore absent config state");
+
+        assert!(
+            !cfg_path.exists(),
+            "config created only for the local proxy should be removed"
         );
     }
 
@@ -729,7 +1151,7 @@ base_url = "https://codex-api.packycode.com/v1"
     }
 }
 
-/// 闂侀潻璐熼崝宀勫疮閳ь剚绻涢崱蹇婂亾閸愯尙鈧ジ鏌熼獮鍨仼闁糕晛鐭傚鐢割敆閳ь剙锕㈢€涙顩烽柨婵嗘处閸婄偤鏌涢幘宕団枌缂佽鲸绻勯埀?Claude settings 闂佺顑嗛惌顔剧博閺夋垟鏋庨柍銉ㄥ皺缁犱粙鏌熼煬鎻掆偓鏍焵椤戭剙瀚峰楣冩煛鐏炶鍔橀柍?
+/// Warn before replacing an existing local Claude proxy patch.
 pub fn guard_claude_settings_before_switch_on_interactive() -> Result<()> {
     use std::io::{self, Write};
 

@@ -73,15 +73,7 @@ pub fn sync_codex_auth_from_codex_cli(
         s.as_deref().is_some_and(|v| !v.trim().is_empty())
     }
 
-    let backup_path = codex_backup_config_path();
-    let cfg_path = codex_config_path();
-    let cfg_text_opt = if let Some(text) = read_file_if_exists(&backup_path)?
-        && !is_codex_absent_backup_sentinel(&text)
-    {
-        Some(text)
-    } else {
-        read_file_if_exists(&cfg_path)?
-    };
+    let cfg_text_opt = crate::codex_integration::codex_config_text_for_import()?;
     let cfg_text = match cfg_text_opt {
         Some(s) if !s.trim().is_empty() => s,
         _ => anyhow::bail!("未找到 ~/.codex/config.toml 或文件为空，无法同步 Codex 账号信息"),
@@ -112,8 +104,11 @@ pub fn sync_codex_auth_from_codex_cli(
     };
     let inferred_env_key = infer_env_key_from_auth_json(&auth_json).map(|(k, _)| k);
 
-    // Avoid syncing from a self-forwarding Codex config unless we have a valid backup.
-    if current_provider_id == "codex_proxy" && !backup_path.exists() {
+    // Avoid syncing from a self-forwarding Codex config unless we have switch state to recover
+    // the original provider view.
+    if current_provider_id == "codex_proxy"
+        && !crate::codex_integration::codex_switch_state_exists()
+    {
         let provider_table = providers_table.get(&current_provider_id);
         let is_local_helper = provider_table
             .and_then(|t| t.get("base_url"))
@@ -122,8 +117,8 @@ pub fn sync_codex_auth_from_codex_cli(
             .unwrap_or(false);
         if is_local_helper {
             anyhow::bail!(
-                "检测到 ~/.codex/config.toml 的当前 model_provider 指向本地代理 codex-helper，且未找到备份配置；\
-无法安全同步账号信息。请先恢复 ~/.codex/config.toml 后重试。"
+                "检测到 ~/.codex/config.toml 的当前 model_provider 指向本地代理 codex-helper，且未找到 codex-helper switch state；\
+无法安全同步账号信息。请先手动检查 ~/.codex/config.toml 后重试。"
             );
         }
     }

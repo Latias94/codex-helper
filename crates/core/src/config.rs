@@ -3,9 +3,7 @@ use std::env;
 use std::fs as stdfs;
 use std::path::{Path, PathBuf};
 
-use crate::client_config::{
-    codex_home, is_claude_absent_backup_sentinel, is_codex_absent_backup_sentinel,
-};
+use crate::client_config::{codex_home, is_claude_absent_backup_sentinel};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -14,8 +12,8 @@ use toml::Value as TomlValue;
 use tracing::{info, warn};
 
 pub use crate::client_config::{
-    claude_settings_backup_path, claude_settings_path, codex_auth_path, codex_backup_config_path,
-    codex_config_path,
+    claude_settings_backup_path, claude_settings_path, codex_auth_path, codex_config_path,
+    codex_switch_state_path,
 };
 
 #[path = "config_storage.rs"]

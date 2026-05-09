@@ -2,8 +2,8 @@ use crate::cli_types::{Cli, CliError, CliResult, Command, NotifyCommand, SwitchC
 use crate::codex_integration;
 use crate::commands;
 use crate::config::{
-    ServiceKind, claude_settings_backup_path, claude_settings_path, codex_backup_config_path,
-    codex_config_path, load_config, load_or_bootstrap_for_service, model_routing_warnings,
+    ServiceKind, claude_settings_backup_path, claude_settings_path, codex_config_path,
+    codex_switch_state_path, load_config, load_or_bootstrap_for_service, model_routing_warnings,
 };
 use crate::notify;
 use crate::proxy::{
@@ -245,7 +245,8 @@ async fn run_server(
 
     impl Drop for AutoRestoreGuard {
         fn drop(&mut self) {
-            // Always try to restore the upstream config on exit; if no backup exists, this is a no-op.
+            // Always try to remove the local client patch on exit. Codex uses a small switch state;
+            // Claude still uses a settings backup.
             if self.service_name == "claude" {
                 match codex_integration::claude_switch_off() {
                     Ok(()) => tracing::info!("Claude settings restored from backup"),
@@ -255,9 +256,9 @@ async fn run_server(
                 }
             } else if self.service_name == "codex" {
                 match codex_integration::switch_off() {
-                    Ok(()) => tracing::info!("Codex config restored from backup"),
+                    Ok(()) => tracing::info!("Codex local proxy patch disabled"),
                     Err(err) => {
-                        tracing::warn!("Failed to restore Codex config from backup: {}", err)
+                        tracing::warn!("Failed to disable Codex local proxy patch: {}", err)
                     }
                 }
             }
@@ -269,8 +270,8 @@ async fn run_server(
     // In Codex mode, automatically switch Codex to the local proxy; in Claude mode, try updating
     // settings.json as well (experimental).
     if service_name == "codex" {
-        // Guard before switching: if Codex is already pointing to the local proxy and a backup exists,
-        // ask whether to restore first (interactive only).
+        // Guard before switching: if Codex is already pointing to the local proxy with switch
+        // state, ask whether to disable the stale local proxy patch first (interactive only).
         if let Err(err) = codex_integration::guard_codex_config_before_switch_on_interactive() {
             tracing::warn!("Failed to guard Codex config before switch on: {}", err);
         }
@@ -904,7 +905,7 @@ fn print_codex_switch_status() {
     use std::fs;
 
     let cfg_path = codex_config_path();
-    let backup_path = codex_backup_config_path();
+    let state_path = codex_switch_state_path();
 
     println!("{}", "Codex 开关状态".bold());
     println!("  配置文件路径: {:?}", cfg_path);
@@ -914,6 +915,12 @@ fn print_codex_switch_status() {
             "  当前未检测到 {:?}，可能尚未安装或初始化 Codex CLI。",
             cfg_path
         );
+        if state_path.exists() {
+            println!(
+                "  已检测到 switch state：{:?}（配置文件不存在，switch off 会清理这份状态）",
+                state_path
+            );
+        }
         return;
     }
 
@@ -962,15 +969,15 @@ fn print_codex_switch_status() {
         }
     }
 
-    if backup_path.exists() {
+    if state_path.exists() {
         println!(
-            "  已检测到备份文件：{:?}（switch off 将尝试从此处恢复）",
-            backup_path
+            "  已检测到 switch state：{:?}（switch off 将局部撤销 codex_proxy patch）",
+            state_path
         );
     } else {
         println!(
-            "  未检测到备份文件：{:?}，如直接修改过 config.toml，建议手动备份。",
-            backup_path
+            "  未检测到 switch state：{:?}，switch off 不会猜测原 provider。",
+            state_path
         );
     }
 }

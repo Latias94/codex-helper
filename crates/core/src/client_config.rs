@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use dirs::home_dir;
 
-pub const CODEX_ABSENT_BACKUP_SENTINEL: &str = "# codex-helper-backup:absent";
 pub const CLAUDE_ABSENT_BACKUP_SENTINEL: &str = "{\"__codex_helper_backup_absent\":true}";
 
 fn resolve_home_dir(env_var: &str, default_dir_name: &str) -> PathBuf {
@@ -23,8 +22,8 @@ pub fn codex_config_path() -> PathBuf {
     codex_home().join("config.toml")
 }
 
-pub fn codex_backup_config_path() -> PathBuf {
-    codex_home().join("config.toml.codex-helper-backup")
+pub fn codex_switch_state_path() -> PathBuf {
+    codex_home().join("codex-helper-switch-state.json")
 }
 
 pub fn codex_auth_path() -> PathBuf {
@@ -60,10 +59,6 @@ pub fn claude_settings_backup_path_for(path: &Path) -> PathBuf {
 
 pub fn claude_settings_backup_path() -> PathBuf {
     claude_settings_backup_path_for(&claude_settings_path())
-}
-
-pub fn is_codex_absent_backup_sentinel(text: &str) -> bool {
-    text.trim() == CODEX_ABSENT_BACKUP_SENTINEL
 }
 
 pub fn is_claude_absent_backup_sentinel(text: &str) -> bool {

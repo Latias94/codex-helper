@@ -5,17 +5,9 @@ pub(crate) fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         return Ok(());
     }
 
-    // 优先从备份配置中推导原始上游，避免在 ~/.codex/config.toml 已被 codex-helper
-    // 写成本地 provider（codex_proxy）时出现“自我转发”。
-    let backup_path = codex_backup_config_path();
-    let cfg_path = codex_config_path();
-    let cfg_text_opt = if let Some(text) = read_file_if_exists(&backup_path)?
-        && !is_codex_absent_backup_sentinel(&text)
-    {
-        Some(text)
-    } else {
-        read_file_if_exists(&cfg_path)?
-    };
+    // 如果 Codex 当前被 patch 到本地 codex-helper，使用 switch state 还原后的视图来推导原始上游，
+    // 避免把 helper 指向自身。
+    let cfg_text_opt = crate::codex_integration::codex_config_text_for_import()?;
     let cfg_text = match cfg_text_opt {
         Some(s) if !s.trim().is_empty() => s,
         _ => {
@@ -48,9 +40,11 @@ pub(crate) fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
     };
     let inferred_env_key = infer_env_key_from_auth_json(&auth_json).map(|(k, _)| k);
 
-    // 如当前 provider 看起来是本地 codex-helper 代理且没有备份（或备份无效），
+    // 如当前 provider 看起来是本地 codex-helper 代理且没有 switch state，
     // 则无法安全推导原始上游，直接报错，避免将代理指向自身。
-    if current_provider_id == "codex_proxy" && !backup_path.exists() {
+    if current_provider_id == "codex_proxy"
+        && !crate::codex_integration::codex_switch_state_exists()
+    {
         let provider_table = providers_table.get(&current_provider_id);
         let is_local_helper = provider_table
             .and_then(|t| t.get("base_url"))
@@ -59,8 +53,8 @@ pub(crate) fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
             .unwrap_or(false);
         if is_local_helper {
             anyhow::bail!(
-                "检测到 ~/.codex/config.toml 的当前 model_provider 指向本地代理 codex-helper，且未找到备份配置；\
-无法自动推导原始 Codex 上游。请先恢复 ~/.codex/config.toml 后重试，或在 ~/.codex-helper/config.json 中手动添加 codex 上游配置。"
+                "检测到 ~/.codex/config.toml 的当前 model_provider 指向本地代理 codex-helper，且未找到 codex-helper switch state；\
+无法自动推导原始 Codex 上游。请先手动检查 ~/.codex/config.toml，或在 ~/.codex-helper/config.toml 中手动添加 codex provider。"
             );
         }
     }
@@ -104,10 +98,12 @@ pub(crate) fn bootstrap_from_codex(cfg: &mut ProxyConfig) -> Result<()> {
         if provider_id == "codex_proxy"
             && (base_url.contains("127.0.0.1") || base_url.contains("localhost"))
         {
-            if provider_id == &current_provider_id && !backup_path.exists() {
+            if provider_id == &current_provider_id
+                && !crate::codex_integration::codex_switch_state_exists()
+            {
                 anyhow::bail!(
-                    "检测到 ~/.codex/config.toml 的当前 model_provider 指向本地代理 codex-helper，且未找到备份配置；\
-无法自动推导原始 Codex 上游。请先恢复 ~/.codex/config.toml 后重试，或在 ~/.codex-helper/config.json 中手动添加 codex 上游配置。"
+                    "检测到 ~/.codex/config.toml 的当前 model_provider 指向本地代理 codex-helper，且未找到 codex-helper switch state；\
+无法自动推导原始 Codex 上游。请先手动检查 ~/.codex/config.toml，或在 ~/.codex-helper/config.toml 中手动添加 codex provider。"
                 );
             }
             warn!("skip model_provider 'codex_proxy' to avoid self-forwarding loop");

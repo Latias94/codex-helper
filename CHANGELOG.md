@@ -7,17 +7,22 @@ All notable changes to this project will be documented in this file.
 
 ## [0.13.0] - 2026-05-09
 
-### 新增 / Added
-- `version = 3` routing-first 配置成为公开默认格式：用户只需要定义 `providers`，再用 `[codex.routing]` / `[claude.routing]` 描述顺序、pin、标签优先和耗尽处理。 `version = 3` routing-first config is now the public default: users define `providers` once and express order, pins, tag preference, and exhaustion behavior through `[codex.routing]` / `[claude.routing]`.
-- 新增 provider / routing 持久化控制面和 CLI 写入面，用于新增 provider、调整 `routing.order`、pin provider、按标签优先路由，而不再要求用户维护多份 Codex config。 Add provider / routing persisted control-plane and CLI write surfaces for adding providers, editing `routing.order`, pinning providers, and preferring tags without maintaining one Codex config per relay.
-- TUI `Stations` 页新增 v3 routing 编辑器：支持 provider pin、顺序兜底重排、provider 启停、包月标签优先、`on_exhausted` 切换，以及常用 `billing=monthly/paygo` tag 快捷编辑。 TUI `Stations` adds a v3 routing editor for provider pins, ordered failover reordering, provider enable/disable, monthly tag preference, `on_exhausted` toggling, and quick `billing=monthly/paygo` tag edits.
-- 新增余额适配与价格目录能力：支持常见 OpenAI-compatible / sub2api 风格余额响应、可配置刷新节流与 `trust_exhaustion_for_routing`，并基于可更新价格目录展示请求成本、cache token 和速度指标。 Add balance adapters and pricing catalog support: common OpenAI-compatible / sub2api-style balance responses, configurable refresh throttling and `trust_exhaustion_for_routing`, plus request cost, cache-token, and speed metrics from an updatable price catalog.
-- 新增参考 all-api-hub 的 Sub2API 余额/用量适配：`sub2api_usage` 默认查询 `/v1/usage`，可用模型 API key 读取 `remaining` 和累计用量；`sub2api_auth_me` 默认查询 `/api/v1/auth/me`，用于 dashboard JWT 账号余额。 Add all-api-hub-inspired Sub2API balance/usage adapters: `sub2api_usage` defaults to `/v1/usage` for model API-key `remaining` and aggregate usage, while `sub2api_auth_me` defaults to `/api/v1/auth/me` for dashboard-JWT account balance.
-- 新增零配置余额兜底探测：当 upstream 没有匹配显式 `usage_providers.json` 配置时，会依次尝试 Sub2API `/v1/usage`、New API `/api/user/self`、通用 `/user/balance`，只记录第一个可用快照。 Add zero-config balance fallback probing: unmatched upstreams try Sub2API `/v1/usage`, New API `/api/user/self`, then generic `/user/balance`, recording only the first usable snapshot.
+### Highlights
+- 更简单的配置：`version = 3` 现在是默认配置格式。你只需要定义 provider，再选择 routing 策略；旧配置会在加载时自动迁移到 `config.toml`，并保留 `.bak` 备份。
+  Simpler config: `version = 3` is now the default. Define providers once, then choose a routing policy. Older configs migrate to `config.toml` automatically with a `.bak` backup.
+- 更直观的切换策略：支持按顺序兜底、手动固定、按标签优先等常用模式，适合“先用包月中转，用完再 fallback”这类场景。
+  Clearer routing: ordered failover, manual sticky, and tag-preferred policies cover common setups such as “use monthly relays first, then fall back”.
+- 余额、套餐和请求成本更可见：支持 Sub2API / New API / 通用余额接口的自动探测；TUI/GUI 会展示余额、套餐名、耗尽状态、token、cache token、耗时和估算成本。
+  Better visibility: automatic Sub2API / New API / generic balance probes, with balance, plan, exhaustion state, tokens, cache tokens, duration, and estimated cost shown in TUI/GUI.
+- Codex 开关更安全：`switch off` 不再把 `~/.codex/config.toml` 整文件恢复到旧快照，而是只撤销 codex-helper 写入的本地代理 patch，保留 Codex 运行期间新增的配置。
+  Safer Codex switching: `switch off` no longer restores a whole old `~/.codex/config.toml` snapshot; it only removes the local proxy patch and preserves Codex edits made during the run.
+- 更容易排查失败：上游全失败时，客户端错误和请求日志会包含脱敏后的 provider/upstream 尝试摘要、状态码、错误分类和最后错误。
+  Easier troubleshooting: all-upstream-failed errors and request logs include redacted provider/upstream attempt summaries, status codes, error classes, and the last error.
 
-### 可复制 routing 示例 / Copyable Routing Recipes
+### Routing Recipes
 
-先定义 provider，再复制其中一个 `[codex.routing]` 策略；Claude 同理把 `codex` 换成 `claude`。 Define providers once, then copy one `[codex.routing]` recipe; for Claude, replace `codex` with `claude`.
+先定义 provider，再复制其中一个 `[codex.routing]` 策略；Claude 同理把 `codex` 换成 `claude`。
+Define providers once, then copy one `[codex.routing]` recipe. For Claude, replace `codex` with `claude`.
 
 ```toml
 version = 3
@@ -38,7 +43,8 @@ auth_token_env = "OPENAI_API_KEY"
 tags = { billing = "paygo", vendor = "openai" }
 ```
 
-顺序兜底：最直观的优先级链，适合“大多数请求先走 A，失败或耗尽再走 B/C”。 Ordered failover: the clearest priority chain, good for “try A first, then B/C when it fails or is exhausted”.
+顺序兜底：最直观的优先级链，适合“大多数请求先走 A，失败或耗尽再走 B/C”。
+Ordered failover: the clearest priority chain.
 
 ```toml
 [codex.routing]
@@ -47,7 +53,8 @@ order = ["monthly_a", "monthly_b", "paygo"]
 on_exhausted = "continue"
 ```
 
-手动固定：只固定到一个 provider，适合临时调试或强制使用某个账号；目标不可用时不会自动切走。 Manual sticky: pin one provider for temporary debugging or forced account use; it does not automatically leave the target.
+手动固定：临时强制使用某个 provider；目标不可用时不会自动切走。
+Manual sticky: force one provider temporarily.
 
 ```toml
 [codex.routing]
@@ -57,7 +64,8 @@ order = ["monthly_a", "monthly_b", "paygo"]
 on_exhausted = "continue"
 ```
 
-包月优先且保可用：所有 `billing = "monthly"` 的 provider 排在前面，已知全耗尽后继续 fallback 到 pay-as-you-go。 Monthly first with availability fallback: providers tagged `billing = "monthly"` are tried first, then known fully exhausted routes can fall back to pay-as-you-go.
+包月优先并保持可用：先用 `billing = "monthly"` 的 provider，已知耗尽后再走付费兜底。
+Monthly first with fallback: prefer monthly providers, then fall back when they are known exhausted.
 
 ```toml
 [codex.routing]
@@ -67,7 +75,8 @@ order = ["monthly_a", "monthly_b", "paygo"]
 on_exhausted = "continue"
 ```
 
-包月严格止损：只使用包月 provider；如果都已知全耗尽，就停止而不是走付费兜底。 Strict monthly budget: use only monthly providers; when all matching routes are known exhausted, stop instead of falling back to pay-as-you-go.
+包月严格止损：只用包月 provider；都已知耗尽时停止，不走付费兜底。
+Strict monthly budget: stop instead of falling back to pay-as-you-go.
 
 ```toml
 [codex.routing]
@@ -77,26 +86,37 @@ order = ["monthly_a", "monthly_b", "paygo"]
 on_exhausted = "stop"
 ```
 
-### 改进 / Improved
-- `load_config()` / `save_config()` / `config init` 统一写出 v3 TOML；旧 `config.json`、无版本 legacy TOML、`version = 2` TOML 会在加载时自动迁移为 `config.toml version = 3`，并保留 `.bak` 备份。 `load_config()` / `save_config()` / `config init` now write v3 TOML; old `config.json`, unversioned legacy TOML, and `version = 2` TOML auto-migrate to `config.toml version = 3` on load with `.bak` backups.
-- GUI/TUI 的站点操作收口为运行时控制，持久化编辑收口到 v3 raw config、provider/routing CLI 和 provider/routing API，避免 UI 再写回旧 station schema。 GUI/TUI station actions are now runtime controls, while persisted edits go through v3 raw config, provider/routing CLI, and provider/routing APIs so UI no longer writes legacy station schema.
-- TUI 在 Dashboard/Sessions 详情与 provider 切换菜单中展示余额、套餐名、耗尽状态和 provider tags，切换前能直接看到哪个候选更适合使用。 TUI now shows balance, plan/package name, exhaustion state, and provider tags in Dashboard/Sessions details and provider switch menus so users can judge candidates before switching.
-- v3 配置下，TUI 第 2 页从旧 `Stations` 视图切换为 `Routing` 视图，直接展示真实 provider、routing policy、fallback order、余额、tags 和启停状态。 Under v3 configs, TUI page 2 changes from the old `Stations` view to a `Routing` view showing real providers, routing policy, fallback order, balances, tags, and enabled state.
-- v3 配置下，TUI 旧的 station pin / provider override 快捷键会转向 routing 编辑器或提示清理遗留运行时覆盖，避免把内部 `routing` station 误认为真实 provider。 Under v3 configs, old TUI station pin / provider override shortcuts now route users to the routing editor or clean legacy runtime overrides, avoiding confusion between the internal `routing` station and real providers.
-- GUI 配置表单现在可以新增、编辑、启停、打标签和删除常见单 endpoint v3 provider，并自动维护 `routing.order`；多 endpoint 或内联密钥 provider 保持只读，避免丢失高级配置。 GUI settings form can now add, edit, enable/disable, tag, and remove common single-endpoint v3 providers while maintaining `routing.order`; multi-endpoint or inline-secret providers stay read-only to avoid losing advanced config.
-- GUI 配置表单新增 v3 routing 编辑器，可编辑 `policy`、`order`、`target`、`prefer_tags` 和 `on_exhausted`，并预览标签优先与 fallback 候选。 GUI settings form adds a v3 routing editor for `policy`, `order`, `target`, `prefer_tags`, and `on_exhausted`, with a preview of tag-preferred and fallback candidates.
-- Provider specs API 现在会读写 provider / endpoint tags；v3 provider 会默认把 provider 名称暴露为运行时 `provider_id`，便于请求指标、余额快照和 UI 对齐。 Provider specs API now reads/writes provider and endpoint tags; v3 providers expose their provider name as the default runtime `provider_id` for request metrics, balance snapshots, and UI alignment.
-- 代理转发与观测路径做了稳定性整理：请求体预览限流、HTTP debug 大对象落盘、请求 ledger 聚合、会话扫描排序和运行时观测清理更稳。 Proxy forwarding and observability paths were tightened: bounded request body previews, large HTTP debug payload spillover, request ledger aggregation, session ordering, and runtime observability pruning are more robust.
-- 上游全失败时，返回给客户端的错误会包含脱敏后的 provider/station/upstream 尝试摘要、状态码、错误分类和最后错误；失败请求即使只有一次尝试，也会在 `requests.jsonl` / request ledger 中保留结构化 `retry.route_attempts`。 When all upstreams fail, the client error now includes a redacted provider/station/upstream attempt summary with status, error class, and last error; failed requests also keep structured `retry.route_attempts` in `requests.jsonl` / request ledger even when only one upstream was attempted.
+### Added
+- 新增 `provider` / `routing` 命令与 API，可新增 provider、调整顺序、pin provider、启停 provider、编辑标签和查看 routing 解释。
+  Added `provider` / `routing` commands and APIs for adding providers, reordering fallback, pinning, enabling/disabling, editing tags, and explaining routing.
+- 新增余额适配：Sub2API `/v1/usage`、Sub2API dashboard `/api/v1/auth/me`、New API `/api/user/self`、通用 `/user/balance`，未显式配置时会按常见接口自动探测。
+  Added balance adapters for Sub2API `/v1/usage`, Sub2API dashboard `/api/v1/auth/me`, New API `/api/user/self`, and generic `/user/balance`, with automatic fallback probing.
+- 新增价格目录刷新与请求成本估算；价格可随目录更新，不需要把模型价格写死在配置里。
+  Added price catalog refresh and request cost estimates, so model prices can update outside the main config.
 
-### 修复 / Fixed
-- 修复 v3 persisted provider/routing 写入会经由 runtime 退化再迁移、导致 routing/provider 原始语义可能丢失的问题；v3 文档现在直接按 v3 保存并重新加载。 Fix v3 persisted provider/routing writes degrading through runtime and losing original routing/provider semantics; v3 documents are now saved directly as v3 and reloaded.
-- 修复 provider spec 更新默认端点时可能丢失既有端点级标签、模型支持与映射的问题。 Fix provider spec updates for default endpoints potentially dropping existing endpoint-level tags, model support, and mappings.
-- 修复并清零 workspace `clippy -D warnings`，覆盖 core / GUI / TUI 的新 lint。 Fix all workspace `clippy -D warnings` issues across core / GUI / TUI.
+### Improved
+- TUI 的 provider/routing 页面现在直接展示 routing policy、fallback 顺序、余额、套餐、tags、启停状态，并在切换 provider 时显示候选状态。
+  TUI provider/routing pages now show policy, fallback order, balance, plan, tags, enabled state, and candidate status while switching.
+- GUI 设置页可以编辑常见单 endpoint provider 和 routing；复杂 provider 会保持只读，避免误删高级配置。
+  GUI settings can edit common single-endpoint providers and routing; complex providers stay read-only to avoid dropping advanced fields.
+- 请求记录和统计更实用：token、cache token、模型、provider、耗时、重试和估算成本会尽量汇总到 request ledger 与 UI。
+  Request records and stats are more useful: tokens, cache tokens, model, provider, duration, retries, and estimated cost are aggregated into the request ledger and UI where available.
+- 长时间运行更稳：上游连接使用连接超时、TCP keepalive 和空闲连接回收；运行日志会自动轮转，降低日志无限增长风险。
+  Long-running sessions are more stable: upstream connections use connect timeout, TCP keepalive, and idle-pool cleanup; runtime logs rotate automatically.
 
-### 破坏性变更 / Breaking Changes
-- v3 配置下，旧 persisted station settings / station specs API 不再作为写入面；请改用 routing/provider API、CLI 或 v3 TOML。 In v3 configs, old persisted station settings / station specs APIs are no longer write surfaces; use routing/provider APIs, CLI, or v3 TOML instead.
-- v3 profile 不再支持 station 绑定；provider 选择统一归 routing 负责，profile 只保留模型、reasoning effort、service tier 等会话默认值。 v3 profiles no longer support station bindings; provider selection belongs to routing, while profiles keep session defaults such as model, reasoning effort, and service tier.
+### Fixed
+- 修复 Codex 启动/退出期间覆盖用户 `~/.codex/config.toml` 修改的问题，例如 Codex 自动写入的项目 trust 不会再被旧快照覆盖。
+  Fixed Codex startup/exit overwriting user `~/.codex/config.toml` edits, such as project trust entries written by Codex itself.
+- 修复 TUI provider 列表与顶部状态栏的一些刷新/布局问题，减少重复行和窄终端显示不完整的情况。
+  Fixed several TUI provider-list and top-status refresh/layout issues, reducing duplicate rows and narrow-terminal truncation.
+- 修复 v3 provider/routing 保存后语义可能丢失的问题；provider tags、endpoint tags、模型支持和映射会被保留。
+  Fixed cases where saving v3 provider/routing could lose semantics; provider tags, endpoint tags, model support, and mappings are preserved.
+
+### Upgrade Notes
+- 配置会自动迁移到 v3 TOML；正常使用不需要手动重写配置。想查看新模板可以运行 `codex-helper config init --force`，执行前会尽力备份现有配置。
+  Config migrates to v3 TOML automatically. You do not need to rewrite it manually. To inspect the latest template, run `codex-helper config init --force`; existing config is backed up best-effort first.
+- v3 下 provider 选择统一由 routing 负责；脚本或外部工具如仍写旧 station 配置，请改用 `provider` / `routing` 命令、API 或 v3 TOML。
+  In v3, provider selection belongs to routing. Scripts or external tools that still write old station settings should move to `provider` / `routing` commands, APIs, or v3 TOML.
 
 ## [0.12.1] - 2026-02-09
 ### 新增 / Added

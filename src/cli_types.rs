@@ -161,7 +161,7 @@ pub(crate) enum SwitchCommand {
         #[arg(long)]
         claude: bool,
     },
-    /// Restore Codex/Claude config from backup (if present)
+    /// Disable local proxy integration (Codex is patched in place; Claude restores backup)
     Off {
         /// Target Codex config (default if neither flag is set)
         #[arg(long)]

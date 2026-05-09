@@ -387,13 +387,13 @@ impl eframe::App for GuiApp {
                             _ => {
                                 if let Ok(st) = crate::codex_integration::codex_switch_status()
                                     && st.enabled
-                                    && !st.has_backup
+                                    && !st.has_switch_state
                                 {
                                     self.page = Page::Setup;
                                     self.last_error = Some(pick(
                                         lang,
-                                        "检测到 Codex 已指向本地代理但未找到备份文件；为避免覆盖原始配置，已打开“快速设置”。",
-                                        "Codex is already pointing to local proxy but no backup was found; opened Setup to avoid overwriting the original config.",
+                                        "检测到 Codex 已指向本地代理但未找到 switch state；已打开“快速设置”供你检查。",
+                                        "Codex is already pointing to local proxy but no switch state was found; opened Setup for review.",
                                     ).to_string());
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -445,12 +445,12 @@ impl eframe::App for GuiApp {
                             }
                             _ => {
                                 if let Ok(st) = crate::codex_integration::codex_switch_status()
-                                    && !st.has_backup
+                                    && !st.has_switch_state
                                 {
                                     self.last_info = Some(pick(
                                         lang,
-                                        "未找到 Codex 配置备份文件；switch off 不会修改任何内容。",
-                                        "No Codex config backup found; switch off will not change anything.",
+                                        "未找到 Codex switch state；switch off 不会猜测原 provider。",
+                                        "No Codex switch state found; switch off will not guess the original provider.",
                                     ).to_string());
                                     continue;
                                 }
@@ -468,8 +468,8 @@ impl eframe::App for GuiApp {
                                 self.last_info = Some(
                                     pick(
                                         lang,
-                                        "已恢复客户端配置（switch off）",
-                                        "Client config restored (switch off)",
+                                        "已关闭客户端代理（switch off）",
+                                        "Client proxy disabled (switch off)",
                                     )
                                     .to_string(),
                                 );

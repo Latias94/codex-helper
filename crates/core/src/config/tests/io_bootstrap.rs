@@ -495,7 +495,7 @@ wire_api = "responses"
 }
 
 #[test]
-fn probe_codex_bootstrap_detects_codex_proxy_without_backup() {
+fn probe_codex_bootstrap_detects_codex_proxy_without_switch_state() {
     let env = setup_temp_codex_home();
     let home = env.home.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -514,13 +514,15 @@ wire_api = "responses"
 "#;
         write_file(&cfg_path, config_text);
 
-        // 不写备份文件，模拟“已经被本地代理接管且无原始备份”的场景
-        let err = super::probe_codex_bootstrap_from_cli()
-            .await
-            .expect_err("probe should fail when model_provider is codex_proxy without backup");
+        // 不写 switch state，模拟“已经被本地代理接管且无法推导原始 provider”的场景
+        let err = super::probe_codex_bootstrap_from_cli().await.expect_err(
+            "probe should fail when model_provider is codex_proxy without switch state",
+        );
         let msg = err.to_string();
         assert!(
-            msg.contains("当前 model_provider 指向本地代理 codex-helper，且未找到备份配置"),
+            msg.contains(
+                "当前 model_provider 指向本地代理 codex-helper，且未找到 codex-helper switch state"
+            ),
             "unexpected error message: {}",
             msg
         );
