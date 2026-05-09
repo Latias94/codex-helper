@@ -774,18 +774,49 @@ pub(in crate::tui) async fn refresh_routing_control_state(ui: &mut UiState) -> a
 }
 
 async fn open_routing_editor(ui: &mut UiState, reason: &'static str) {
+    let balance_started = request_provider_balance_refresh(ui);
     if ui.page == Page::Stations {
         ui.routing_menu_idx = ui.selected_station_idx;
     }
     match refresh_routing_control_state(ui).await {
         Ok(()) => {
             ui.overlay = Overlay::RoutingMenu;
-            ui.toast = Some((reason.to_string(), Instant::now()));
+            ui.toast = Some((
+                if balance_started {
+                    format!("{reason}; balance refresh started")
+                } else {
+                    reason.to_string()
+                },
+                Instant::now(),
+            ));
         }
         Err(err) => {
             ui.toast = Some((format!("routing: load failed: {err}"), Instant::now()));
         }
     }
+}
+
+fn request_provider_balance_refresh(ui: &mut UiState) -> bool {
+    let now = Instant::now();
+    if ui
+        .last_balance_refresh_requested_at
+        .is_some_and(|last| now.duration_since(last) < Duration::from_secs(10))
+    {
+        return false;
+    }
+    ui.last_balance_refresh_requested_at = Some(now);
+    ui.needs_snapshot_refresh = true;
+    let admin_port = ui.admin_port;
+    tokio::spawn(async move {
+        let _ = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{admin_port}/__codex_helper/api/v1/providers/balances/refresh"
+            ))
+            .timeout(Duration::from_secs(12))
+            .send()
+            .await;
+    });
+    true
 }
 
 async fn apply_persisted_routing(
@@ -3065,7 +3096,9 @@ async fn handle_key_normal(
                 .position(|p| p.name == current)
                 .map(|i| i + 1)
                 .unwrap_or(0);
+            request_provider_balance_refresh(ui);
             ui.overlay = Overlay::ProviderMenuSession;
+            ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
             true
         }
         KeyCode::Char('P') => {
@@ -3083,7 +3116,9 @@ async fn handle_key_normal(
                 .position(|p| p.name == current)
                 .map(|i| i + 1)
                 .unwrap_or(0);
+            request_provider_balance_refresh(ui);
             ui.overlay = Overlay::ProviderMenuGlobal;
+            ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
             true
         }
         _ => false,
@@ -3755,9 +3790,18 @@ async fn handle_key_routing_menu(
             true
         }
         KeyCode::Char('g') => {
+            let balance_started = request_provider_balance_refresh(ui);
             match refresh_routing_control_state(ui).await {
                 Ok(()) => {
-                    ui.toast = Some(("routing: refreshed".to_string(), Instant::now()));
+                    ui.toast = Some((
+                        if balance_started {
+                            "routing: refreshed; balance refresh started"
+                        } else {
+                            "routing: refreshed"
+                        }
+                        .to_string(),
+                        Instant::now(),
+                    ));
                 }
                 Err(err) => {
                     ui.toast = Some((format!("routing: refresh failed: {err}"), Instant::now()));

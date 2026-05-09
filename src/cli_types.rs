@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::net::IpAddr;
 
 #[derive(Parser, Debug)]
-#[command(name = "codex-helper")]
+#[command(name = "codex-helper", version)]
 #[command(about = "Helper proxy for Codex CLI", long_about = None)]
 pub(crate) struct Cli {
     #[command(subcommand)]

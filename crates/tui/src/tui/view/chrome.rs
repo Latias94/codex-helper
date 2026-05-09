@@ -84,6 +84,45 @@ fn fit_spans_to_width(spans: Vec<Span<'static>>, max_width: u16) -> Line<'static
     Line::from(fitted)
 }
 
+fn split_footer_help(text: &str, max_width: u16) -> (String, String) {
+    let max_width = usize::from(max_width);
+    if max_width == 0 {
+        return (String::new(), String::new());
+    }
+
+    let parts = text
+        .split("  ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    let mut first = String::new();
+    let mut split_at = parts.len();
+    for (idx, part) in parts.iter().enumerate() {
+        let candidate = if first.is_empty() {
+            (*part).to_string()
+        } else {
+            format!("{first}  {part}")
+        };
+        if UnicodeWidthStr::width(candidate.as_str()) <= max_width || first.is_empty() {
+            first = candidate;
+        } else {
+            split_at = idx;
+            break;
+        }
+    }
+
+    let second = if split_at < parts.len() {
+        parts[split_at..].join("  ")
+    } else {
+        String::new()
+    };
+    (first, second)
+}
+
 fn fit_line_to_width(line: Line<'static>, max_width: u16) -> Line<'static> {
     fit_spans_to_width(line.spans, max_width)
 }
@@ -694,16 +733,32 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
     };
     let right = ui.toast.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
 
-    let mut spans = vec![Span::styled(left, Style::default().fg(p.muted))];
+    let (first, second) = split_footer_help(left, area.width);
+    let first_line = fit_spans_to_width(
+        vec![Span::styled(first, Style::default().fg(p.muted))],
+        area.width,
+    );
+    let mut second_spans = Vec::new();
     if !right.is_empty() {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
+        second_spans.push(Span::styled(
             right.to_string(),
             Style::default().fg(p.accent),
         ));
+        if !second.is_empty() {
+            second_spans.push(Span::raw("  "));
+        }
     }
-    let line = fit_spans_to_width(spans, area.width);
-    f.render_widget(Paragraph::new(Text::from(line)), area);
+    if !second.is_empty() {
+        second_spans.push(Span::styled(second, Style::default().fg(p.muted)));
+    }
+    if second_spans.is_empty() {
+        second_spans.push(Span::raw(""));
+    }
+    let second_line = fit_spans_to_width(second_spans, area.width);
+    f.render_widget(
+        Paragraph::new(Text::from(vec![first_line, second_line])),
+        area,
+    );
 }
 
 #[cfg(test)]
@@ -744,6 +799,16 @@ mod tests {
 
         assert!(line_width(&line) <= 8);
         assert_eq!(line.spans[0].content.as_ref(), "状态 运…");
+    }
+
+    #[test]
+    fn split_footer_help_uses_second_line_for_overflow() {
+        let (first, second) =
+            split_footer_help("1-8 pages  q quit  L language  Tab focus  P global pin", 26);
+
+        assert!(UnicodeWidthStr::width(first.as_str()) <= 26);
+        assert!(!second.is_empty());
+        assert!(second.contains("Tab focus"));
     }
 
     #[test]

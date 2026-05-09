@@ -8,10 +8,11 @@ use ratatui::widgets::{
 
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, balance_status_style, basename, format_age, format_observed_client_identity,
-    now_ms, session_balance_brief, session_balance_status, session_control_posture,
-    session_observation_scope_label, session_row_has_any_override, session_transcript_host_status,
-    short_sid, shorten, shorten_middle, status_style, tokens_short, usage_line,
+    Palette, Snapshot, balance_status_style, basename, duration_short, format_age,
+    format_observed_client_identity, now_ms, session_balance_brief, session_balance_status,
+    session_control_posture, session_observation_scope_label, session_row_has_any_override,
+    session_transcript_host_status, short_sid, shorten, shorten_middle, status_style, tokens_short,
+    usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -472,9 +473,12 @@ fn render_requests_panel(
     let header = Row::new(vec![
         Cell::from(Span::styled("Age", Style::default().fg(p.muted))),
         Cell::from(Span::styled("St", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("Method", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("Path", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("Dur", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("TTFB", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("Total", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("In", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("Out", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("CRead", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("CNew", Style::default().fg(p.muted))),
         Cell::from(Span::styled("Tok", Style::default().fg(p.muted))),
     ]);
 
@@ -487,22 +491,38 @@ fn render_requests_panel(
                 r.status_code.to_string(),
                 status_style(p, Some(r.status_code)),
             );
-            let method = Span::styled(r.method.clone(), Style::default().fg(p.muted));
-            let path = shorten_middle(&r.path, 48);
-            let dur = format!("{}ms", r.duration_ms);
-            let tok = r
-                .usage
-                .as_ref()
+            let ttfb = r
+                .ttfb_ms
+                .map(duration_short)
+                .unwrap_or_else(|| "-".to_string());
+            let total_dur = duration_short(r.duration_ms);
+            let usage = r.usage.as_ref();
+            let input = usage
+                .map(|u| tokens_short(u.input_tokens))
+                .unwrap_or_else(|| "-".to_string());
+            let output = usage
+                .map(|u| tokens_short(u.output_tokens))
+                .unwrap_or_else(|| "-".to_string());
+            let cache_read = usage
+                .map(|u| tokens_short(u.cache_read_input_tokens.max(u.cached_input_tokens)))
+                .unwrap_or_else(|| "-".to_string());
+            let cache_new = usage
+                .map(|u| tokens_short(u.cache_creation_tokens_total()))
+                .unwrap_or_else(|| "-".to_string());
+            let total_tokens = usage
                 .map(|u| tokens_short(u.total_tokens))
                 .unwrap_or_else(|| "-".to_string());
 
             Row::new(vec![
                 Cell::from(Span::styled(age, Style::default().fg(p.muted))),
                 Cell::from(Line::from(vec![status])),
-                Cell::from(Line::from(vec![method])),
-                Cell::from(path),
-                Cell::from(Span::styled(dur, Style::default().fg(p.muted))),
-                Cell::from(Span::styled(tok, Style::default().fg(p.muted))),
+                Cell::from(Span::styled(ttfb, Style::default().fg(p.muted))),
+                Cell::from(Span::styled(total_dur, Style::default().fg(p.muted))),
+                Cell::from(input),
+                Cell::from(output),
+                Cell::from(cache_read),
+                Cell::from(cache_new),
+                Cell::from(Span::styled(total_tokens, Style::default().fg(p.accent))),
             ])
             .style(Style::default().bg(p.panel).fg(p.text))
         })
@@ -513,9 +533,12 @@ fn render_requests_panel(
         [
             Constraint::Length(6),
             Constraint::Length(4),
-            Constraint::Length(8),
-            Constraint::Min(20),
-            Constraint::Length(8),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(6),
             Constraint::Length(6),
         ],
     )

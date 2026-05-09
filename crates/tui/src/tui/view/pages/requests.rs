@@ -4,7 +4,7 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
 use crate::tui::model::{
-    Palette, Snapshot, format_age, now_ms, request_matches_page_filters,
+    Palette, Snapshot, duration_short, format_age, now_ms, request_matches_page_filters,
     request_page_focus_session_id, short_sid, shorten, shorten_middle, status_style, usage_line,
 };
 use crate::tui::state::UiState;
@@ -88,7 +88,7 @@ pub(super) fn render_requests_page(
                 r.status_code.to_string(),
                 status_style(p, Some(r.status_code)),
             );
-            let dur = format!("{}ms", r.duration_ms);
+            let dur = duration_short(r.duration_ms);
             let attempts_n = r.attempt_count();
             let attempts = attempts_n.to_string();
             let model = r.model.as_deref().unwrap_or("-").to_string();
@@ -168,7 +168,7 @@ pub(super) fn render_requests_page(
             ),
             Span::raw("  "),
             Span::styled("dur: ", Style::default().fg(p.muted)),
-            Span::styled(format!("{}ms", r.duration_ms), Style::default().fg(p.muted)),
+            Span::styled(duration_short(r.duration_ms), Style::default().fg(p.muted)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("trace: ", Style::default().fg(p.muted)),
@@ -234,7 +234,7 @@ pub(super) fn render_requests_page(
             Span::styled(
                 observability
                     .ttfb_ms
-                    .map(|value| format!("{value}ms"))
+                    .map(duration_short)
                     .unwrap_or_else(|| "-".to_string()),
                 Style::default().fg(p.text),
             ),
@@ -243,7 +243,7 @@ pub(super) fn render_requests_page(
             Span::styled(
                 observability
                     .generation_ms
-                    .map(|value| format!("{value}ms"))
+                    .map(duration_short)
                     .unwrap_or_else(|| "-".to_string()),
                 Style::default().fg(p.text),
             ),

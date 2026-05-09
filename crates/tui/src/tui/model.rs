@@ -409,7 +409,7 @@ pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Some(format!("${total}"));
+        return Some(format!("left {}", usd_brief(total)));
     }
 
     let subscription = snapshot
@@ -424,13 +424,17 @@ pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -
         .filter(|value| !value.is_empty());
 
     if let (Some(sub), Some(paygo)) = (subscription, paygo) {
-        return Some(format!("sub ${sub} + paygo ${paygo}"));
+        return Some(format!(
+            "left sub {} + paygo {}",
+            usd_brief(sub),
+            usd_brief(paygo)
+        ));
     }
     if let Some(sub) = subscription {
-        return Some(format!("sub ${sub}"));
+        return Some(format!("sub left {}", usd_brief(sub)));
     }
     if let Some(paygo) = paygo {
-        return Some(format!("paygo ${paygo}"));
+        return Some(format!("paygo left {}", usd_brief(paygo)));
     }
 
     match (
@@ -445,24 +449,55 @@ pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -
             .map(str::trim)
             .filter(|value| !value.is_empty()),
     ) {
-        (Some(spent), Some(budget)) => Some(format!("${spent}/${budget}")),
-        (Some(spent), None) => Some(format!("spent ${spent}")),
-        (None, Some(budget)) => Some(format!("budget ${budget}")),
+        (Some(spent), Some(budget)) => Some(format!(
+            "spent {} / budget {}",
+            usd_brief(spent),
+            usd_brief(budget)
+        )),
+        (Some(spent), None) => Some(format!("spent {}", usd_brief(spent))),
+        (None, Some(budget)) => Some(format!("budget {}", usd_brief(budget))),
         (None, None) => snapshot
             .total_used_usd
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(|value| format!("used ${value}"))
+            .map(|value| format!("used {}", usd_brief(value)))
             .or_else(|| {
                 snapshot
                     .today_used_usd
                     .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
-                    .map(|value| format!("today ${value}"))
+                    .map(|value| format!("today used {}", usd_brief(value)))
             }),
     }
+}
+
+fn usd_brief(raw: &str) -> String {
+    format!("${}", decimal_brief(raw))
+}
+
+fn decimal_brief(raw: &str) -> String {
+    let raw = raw.trim();
+    let Ok(value) = raw.parse::<f64>() else {
+        return raw.to_string();
+    };
+    if !value.is_finite() {
+        return raw.to_string();
+    }
+    let decimals = if value.abs() >= 1.0 { 2 } else { 4 };
+    let mut out = format!("{value:.decimals$}");
+    if value.abs() < 1.0
+        && let Some(dot) = out.find('.')
+    {
+        while out.ends_with('0') {
+            out.pop();
+        }
+        if out.len() == dot + 1 {
+            out.pop();
+        }
+    }
+    if out == "-0" { "0".to_string() } else { out }
 }
 
 fn balance_status_brief(status: BalanceSnapshotStatus) -> &'static str {
@@ -578,22 +613,24 @@ pub(in crate::tui) fn station_balance_brief(
         .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Unknown)
         .count();
 
+    let primary_amount = primary_balance_snapshot(balances).and_then(balance_amount_brief);
+
     let mut parts = Vec::new();
-    if ok > 0 {
-        parts.push(format!("ok {ok}/{total}"));
-    } else if stale > 0 {
-        parts.push(format!("stale {stale}/{total}"));
-    } else if unknown > 0 {
-        parts.push(format!("unk {unknown}/{total}"));
-    } else if exhausted > 0 {
-        parts.push(format!("exh {exhausted}/{total}"));
-    } else if error > 0 {
-        parts.push(format!("err {error}/{total}"));
+    if primary_amount.is_none() || ok == 0 {
+        if ok > 0 {
+            parts.push(format!("ok {ok}/{total}"));
+        } else if stale > 0 {
+            parts.push(format!("stale {stale}/{total}"));
+        } else if unknown > 0 {
+            parts.push(format!("unk {unknown}/{total}"));
+        } else if exhausted > 0 {
+            parts.push(format!("exh {exhausted}/{total}"));
+        } else if error > 0 {
+            parts.push(format!("err {error}/{total}"));
+        }
     }
 
-    if let Some(primary) = primary_balance_snapshot(balances)
-        && let Some(amount) = balance_amount_brief(primary)
-    {
+    if let Some(amount) = primary_amount {
         parts.push(amount);
     }
     if exhausted > 0 && ok > 0 {
@@ -764,6 +801,27 @@ pub(in crate::tui) fn format_age(now_ms: u64, ts_ms: Option<u64>) -> String {
         format!("{mins}m{secs}s")
     } else {
         format!("{secs}s")
+    }
+}
+
+pub(in crate::tui) fn duration_short(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 10_000 {
+        let mut out = format!("{:.1}s", ms as f64 / 1_000.0);
+        if out.ends_with(".0s") {
+            out.replace_range(out.len() - 3..out.len() - 1, "");
+        }
+        out
+    } else if ms < 60_000 {
+        format!("{}s", ms / 1_000)
+    } else if ms < 3_600_000 {
+        let secs = ms / 1_000;
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        let secs = ms / 1_000;
+        let mins = (secs % 3_600) / 60;
+        format!("{}h{}m", secs / 3_600, mins)
     }
 }
 
@@ -1178,7 +1236,10 @@ mod tests {
             ..ProviderBalanceSnapshot::default()
         };
 
-        assert_eq!(provider_balance_compact(&snapshot, 80), "CodeX Air $165.08");
+        assert_eq!(
+            provider_balance_compact(&snapshot, 80),
+            "CodeX Air left $165.08"
+        );
     }
 
     #[test]
@@ -1200,7 +1261,7 @@ mod tests {
 
         assert_eq!(
             station_balance_brief(&balances, "input", 24),
-            "ok 1/2 $12.50 exh 1"
+            "left $12.50 exh 1"
         );
         assert_eq!(
             station_balance_status(&balances, "input"),
@@ -1225,7 +1286,7 @@ mod tests {
 
         assert_eq!(
             session_balance_brief(&row, &balances, 80).as_deref(),
-            Some("Monthly $8.00")
+            Some("Monthly left $8.00")
         );
 
         row.last_station_name = None;
@@ -1233,8 +1294,16 @@ mod tests {
 
         assert_eq!(
             session_balance_brief(&row, &balances, 80).as_deref(),
-            Some("input Monthly $8.00")
+            Some("input Monthly left $8.00")
         );
+    }
+
+    #[test]
+    fn duration_short_uses_readable_units() {
+        assert_eq!(duration_short(842), "842ms");
+        assert_eq!(duration_short(1_250), "1.2s");
+        assert_eq!(duration_short(12_000), "12s");
+        assert_eq!(duration_short(83_000), "1m23s");
     }
 
     #[test]

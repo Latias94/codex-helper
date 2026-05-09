@@ -748,11 +748,11 @@ pub(super) fn render_stations_page(
         rows,
         [
             Constraint::Length(4),
-            Constraint::Min(10),
+            Constraint::Min(8),
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Length(10),
-            Constraint::Length(10),
+            Constraint::Length(18),
+            Constraint::Length(8),
         ],
     )
     .header(header)
@@ -1373,7 +1373,7 @@ mod tests {
 
         assert_eq!(
             station_balance_brief(&provider_balances, "alpha", 18),
-            "$3.50"
+            "left $3.50"
         );
     }
 
@@ -1396,7 +1396,7 @@ mod tests {
 
         assert_eq!(
             station_balance_brief(&provider_balances, "alpha", 18),
-            "ok 1/2 $1.00 exh 1"
+            "left $1.00 exh 1"
         );
     }
 }

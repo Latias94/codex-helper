@@ -27,7 +27,7 @@ pub(in crate::tui) fn render_app(
         .constraints([
             Constraint::Length(4),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(f.area());
 
