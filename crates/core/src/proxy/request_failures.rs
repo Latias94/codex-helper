@@ -1,12 +1,13 @@
 use axum::http::{Method, StatusCode};
 
 use crate::logging::{
-    HeaderEntry, HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug,
+    HeaderEntry, HttpDebugLog, RetryInfo, RouteAttemptLog, ServiceTierLog, log_request_with_debug,
     should_include_http_warn,
 };
 use crate::state::FinishRequestParams;
 
 use super::ProxyService;
+use super::failure_summary::failed_proxy_client_message;
 
 const EMPTY_TARGET_URL: &str = "-";
 const NO_ROUTABLE_STATION_HINT: &str =
@@ -40,6 +41,7 @@ pub(super) struct FailedProxyRequestParams<'a> {
     pub(super) effective_effort: Option<String>,
     pub(super) service_tier: ServiceTierLog,
     pub(super) retry: Option<RetryInfo>,
+    pub(super) failure_route_attempts: Vec<RouteAttemptLog>,
 }
 
 pub(super) fn log_no_routable_station(
@@ -150,7 +152,15 @@ pub(super) async fn finish_failed_proxy_request(
         effective_effort,
         service_tier,
         retry,
+        failure_route_attempts,
     } = params;
+    let client_message = failed_proxy_client_message(
+        status,
+        message.as_str(),
+        request_id,
+        retry.as_ref(),
+        &failure_route_attempts,
+    );
 
     proxy
         .state
@@ -187,14 +197,7 @@ pub(super) async fn finish_failed_proxy_request(
         None,
     );
 
-    (status, message)
-}
-
-pub(super) fn no_upstreams_available_error() -> (StatusCode, String) {
-    (
-        StatusCode::BAD_GATEWAY,
-        "no upstreams available".to_string(),
-    )
+    (status, client_message)
 }
 
 fn build_early_error_http_debug(

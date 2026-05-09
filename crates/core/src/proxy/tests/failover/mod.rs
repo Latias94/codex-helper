@@ -1350,6 +1350,19 @@ async fn proxy_retries_each_upstream_once_and_stops_when_all_avoided() {
         .expect("send");
 
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = resp.text().await.expect("read body");
+    assert!(
+        body.contains("all upstream attempts failed"),
+        "expected aggregated failure summary, got: {body}"
+    );
+    assert!(
+        body.contains("upstream[0]") && body.contains("upstream[1]"),
+        "expected both upstream attempts in failure summary, got: {body}"
+    );
+    assert!(
+        body.contains("last_error:") && body.contains("u2 502"),
+        "expected final upstream error body in failure summary, got: {body}"
+    );
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 1);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 1);
 

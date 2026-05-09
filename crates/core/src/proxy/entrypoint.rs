@@ -9,7 +9,7 @@ use super::provider_execution::{
     ExecuteProviderChainParams, ProviderExecutionOutcome, execute_provider_chain, log_retry_options,
 };
 use super::request_context::prepare_proxy_request;
-use super::request_failures::{finish_failed_proxy_request, no_upstreams_available_error};
+use super::request_failures::finish_failed_proxy_request;
 use super::retry::retry_info_for_observed_attempts;
 
 #[instrument(skip_all, fields(service = %proxy.service_name))]
@@ -67,28 +67,32 @@ pub async fn handle_proxy(
         }
     };
 
-    if let Some((status, msg)) = last_err {
-        let dur = start.elapsed().as_millis() as u64;
-        let retry = retry_info_for_observed_attempts(&upstream_chain, &route_attempts);
-        return Err(finish_failed_proxy_request(
-            super::request_failures::FailedProxyRequestParams {
-                proxy: &proxy,
-                method: &prepared.method,
-                path: prepared.uri.path(),
-                request_id: prepared.request_id,
-                status,
-                message: msg,
-                duration_ms: dur,
-                started_at_ms,
-                session_id: prepared.session_id.clone(),
-                cwd: prepared.cwd.clone(),
-                effective_effort: prepared.effective_effort.clone(),
-                service_tier: prepared.base_service_tier.clone(),
-                retry,
-            },
+    let dur = start.elapsed().as_millis() as u64;
+    let retry = retry_info_for_observed_attempts(&upstream_chain, &route_attempts);
+    let (status, msg) = last_err.unwrap_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "no upstreams available".to_string(),
         )
-        .await);
-    }
+    });
 
-    Err(no_upstreams_available_error())
+    Err(
+        finish_failed_proxy_request(super::request_failures::FailedProxyRequestParams {
+            proxy: &proxy,
+            method: &prepared.method,
+            path: prepared.uri.path(),
+            request_id: prepared.request_id,
+            status,
+            message: msg,
+            duration_ms: dur,
+            started_at_ms,
+            session_id: prepared.session_id.clone(),
+            cwd: prepared.cwd.clone(),
+            effective_effort: prepared.effective_effort.clone(),
+            service_tier: prepared.base_service_tier.clone(),
+            retry,
+            failure_route_attempts: route_attempts,
+        })
+        .await,
+    )
 }

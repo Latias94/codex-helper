@@ -20,6 +20,7 @@ mod control_plane_manifest;
 mod control_plane_routes;
 mod control_plane_service;
 mod entrypoint;
+mod failure_summary;
 mod headers;
 mod healthcheck_api;
 mod http_debug;
