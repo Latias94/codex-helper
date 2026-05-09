@@ -29,7 +29,7 @@ pub(super) fn format_station_balance_summary(
         .iter()
         .min_by(|left, right| balance_priority(left, right));
     let headline = primary
-        .map(|balance| balance.status.as_str())
+        .map(|balance| balance_status_label(balance.status))
         .unwrap_or("unknown");
     let mut parts = vec![
         format!("status={headline}"),
@@ -38,8 +38,7 @@ pub(super) fn format_station_balance_summary(
     push_nonzero_count(&mut parts, "ok", ok);
     push_nonzero_count(&mut parts, "exhausted", exhausted);
     push_nonzero_count(&mut parts, "stale", stale);
-    push_nonzero_count(&mut parts, "error", error);
-    push_nonzero_count(&mut parts, "unknown", unknown);
+    push_nonzero_count(&mut parts, "unknown", unknown + error);
 
     if let Some(primary) = primary {
         let target = match primary.upstream_index {
@@ -75,11 +74,19 @@ fn balance_priority(
 
 fn balance_status_rank(status: BalanceSnapshotStatus) -> u8 {
     match status {
-        BalanceSnapshotStatus::Error => 0,
-        BalanceSnapshotStatus::Exhausted => 1,
-        BalanceSnapshotStatus::Stale => 2,
-        BalanceSnapshotStatus::Unknown => 3,
-        BalanceSnapshotStatus::Ok => 4,
+        BalanceSnapshotStatus::Exhausted => 0,
+        BalanceSnapshotStatus::Stale => 1,
+        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => 2,
+        BalanceSnapshotStatus::Ok => 3,
+    }
+}
+
+fn balance_status_label(status: BalanceSnapshotStatus) -> &'static str {
+    match status {
+        BalanceSnapshotStatus::Ok => "ok",
+        BalanceSnapshotStatus::Exhausted => "exhausted",
+        BalanceSnapshotStatus::Stale => "stale",
+        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => "unknown",
     }
 }
 
@@ -232,14 +239,7 @@ pub(super) fn render_station_balance_section(
             .max_height(150.0)
             .show(ui, |ui| {
                 for snapshot in balances.iter().rev().take(12) {
-                    let status = match snapshot.status {
-                        BalanceSnapshotStatus::Unknown => "unknown",
-                        BalanceSnapshotStatus::Ok => "ok",
-                        BalanceSnapshotStatus::Exhausted => "exhausted",
-                        BalanceSnapshotStatus::Stale => "stale",
-                        BalanceSnapshotStatus::Error => "error",
-                    };
-                    let mut parts = vec![status.to_string()];
+                    let mut parts = vec![balance_status_label(snapshot.status).to_string()];
                     if let Some(total) = snapshot.total_balance_usd.as_deref() {
                         parts.push(format!("total=${total}"));
                     }
@@ -278,7 +278,7 @@ pub(super) fn render_station_balance_section(
                     if let Some(err) = snapshot.error.as_deref()
                         && !err.trim().is_empty()
                     {
-                        parts.push(shorten(err, 50));
+                        parts.push(format!("lookup_failed={}", shorten(err, 50)));
                     }
 
                     ui.label(format!(

@@ -191,9 +191,8 @@ fn balance_status_rank(status: BalanceSnapshotStatus) -> u8 {
     match status {
         BalanceSnapshotStatus::Ok => 0,
         BalanceSnapshotStatus::Stale => 1,
-        BalanceSnapshotStatus::Unknown => 2,
+        BalanceSnapshotStatus::Unknown | BalanceSnapshotStatus::Error => 2,
         BalanceSnapshotStatus::Exhausted => 3,
-        BalanceSnapshotStatus::Error => 4,
     }
 }
 

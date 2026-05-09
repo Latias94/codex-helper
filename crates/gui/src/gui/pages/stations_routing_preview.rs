@@ -287,14 +287,12 @@ fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
             balance.routing_ignored_exhausted
         ));
     }
-    if balance.error > 0 {
-        parts.push(format!("error={}", balance.error));
-    }
     if balance.stale > 0 {
         parts.push(format!("stale={}", balance.stale));
     }
-    if balance.unknown > 0 {
-        parts.push(format!("unknown={}", balance.unknown));
+    let unknown = balance.unknown + balance.error;
+    if unknown > 0 {
+        parts.push(format!("unknown={unknown}"));
     }
     if parts.is_empty() {
         format!("balance=ok({})", balance.snapshots)

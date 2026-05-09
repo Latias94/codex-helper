@@ -394,9 +394,8 @@ pub fn build_provider_options(
 pub(in crate::tui) fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {
     match status {
         BalanceSnapshotStatus::Ok => Style::default().fg(p.good),
-        BalanceSnapshotStatus::Exhausted | BalanceSnapshotStatus::Error => {
-            Style::default().fg(p.bad)
-        }
+        BalanceSnapshotStatus::Exhausted => Style::default().fg(p.bad),
+        BalanceSnapshotStatus::Error => Style::default().fg(p.warn),
         BalanceSnapshotStatus::Stale => Style::default().fg(p.warn),
         BalanceSnapshotStatus::Unknown => Style::default().fg(p.muted),
     }
@@ -505,8 +504,16 @@ fn balance_status_brief(status: BalanceSnapshotStatus) -> &'static str {
         BalanceSnapshotStatus::Ok => "ok",
         BalanceSnapshotStatus::Exhausted => "exh",
         BalanceSnapshotStatus::Stale => "stale",
-        BalanceSnapshotStatus::Error => "err",
-        BalanceSnapshotStatus::Unknown => "unk",
+        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => "unknown",
+    }
+}
+
+pub(in crate::tui) fn balance_status_label(status: BalanceSnapshotStatus) -> &'static str {
+    match status {
+        BalanceSnapshotStatus::Ok => "ok",
+        BalanceSnapshotStatus::Exhausted => "exhausted",
+        BalanceSnapshotStatus::Stale => "stale",
+        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => "unknown",
     }
 }
 
@@ -532,15 +539,6 @@ pub(in crate::tui) fn provider_balance_compact(
     if parts.is_empty() {
         parts.push(balance_status_brief(snapshot.status).to_string());
     }
-    if snapshot.status == BalanceSnapshotStatus::Error
-        && let Some(error) = snapshot
-            .error
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    {
-        parts.push(format!("err={error}"));
-    }
 
     shorten_middle(&parts.join(" "), max_width)
 }
@@ -549,9 +547,8 @@ fn balance_status_rank(status: BalanceSnapshotStatus) -> u8 {
     match status {
         BalanceSnapshotStatus::Ok => 0,
         BalanceSnapshotStatus::Stale => 1,
-        BalanceSnapshotStatus::Unknown => 2,
+        BalanceSnapshotStatus::Unknown | BalanceSnapshotStatus::Error => 2,
         BalanceSnapshotStatus::Exhausted => 3,
-        BalanceSnapshotStatus::Error => 4,
     }
 }
 
@@ -612,6 +609,7 @@ pub(in crate::tui) fn station_balance_brief(
         .iter()
         .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Unknown)
         .count();
+    let displayed_unknown = unknown + error;
 
     let primary_amount = primary_balance_snapshot(balances).and_then(balance_amount_brief);
 
@@ -621,12 +619,10 @@ pub(in crate::tui) fn station_balance_brief(
             parts.push(format!("ok {ok}/{total}"));
         } else if stale > 0 {
             parts.push(format!("stale {stale}/{total}"));
-        } else if unknown > 0 {
-            parts.push(format!("unk {unknown}/{total}"));
+        } else if displayed_unknown > 0 {
+            parts.push(format!("unknown {displayed_unknown}/{total}"));
         } else if exhausted > 0 {
             parts.push(format!("exh {exhausted}/{total}"));
-        } else if error > 0 {
-            parts.push(format!("err {error}/{total}"));
         }
     }
 
@@ -637,7 +633,7 @@ pub(in crate::tui) fn station_balance_brief(
         parts.push(format!("exh {exhausted}"));
     }
     if error > 0 && (ok > 0 || stale > 0 || unknown > 0 || exhausted > 0) {
-        parts.push(format!("err {error}"));
+        parts.push(format!("unknown {error}"));
     }
 
     if parts.is_empty() {

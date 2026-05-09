@@ -12,8 +12,9 @@ use crate::dashboard_core::{
 };
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, balance_status_style, format_age, now_ms, provider_balance_compact,
-    routing_provider_names, shorten, shorten_middle, station_balance_brief,
+    Palette, Snapshot, balance_status_label, balance_status_style, format_age, now_ms,
+    provider_balance_compact, routing_provider_names, shorten, shorten_middle,
+    station_balance_brief,
 };
 use crate::tui::state::UiState;
 
@@ -195,14 +196,12 @@ fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
             balance.routing_ignored_exhausted
         ));
     }
-    if balance.error > 0 {
-        parts.push(format!("error={}", balance.error));
-    }
     if balance.stale > 0 {
         parts.push(format!("stale={}", balance.stale));
     }
-    if balance.unknown > 0 {
-        parts.push(format!("unknown={}", balance.unknown));
+    let unknown = balance.unknown + balance.error;
+    if unknown > 0 {
+        parts.push(format!("unknown={unknown}"));
     }
     if parts.is_empty() {
         format!("balance=ok({})", balance.snapshots)
@@ -558,7 +557,7 @@ fn render_v3_routing_page(
                 lines.push(Line::from(vec![
                     Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
                     Span::styled(
-                        balance.status.as_str(),
+                        balance_status_label(balance.status),
                         balance_status_style(p, balance.status),
                     ),
                     Span::raw("  "),
@@ -574,7 +573,10 @@ fn render_v3_routing_page(
                 {
                     lines.push(Line::from(vec![
                         Span::raw("     "),
-                        Span::styled(shorten(err, 80), Style::default().fg(p.muted)),
+                        Span::styled(
+                            format!("balance lookup failed: {}", shorten(err, 56)),
+                            Style::default().fg(p.muted),
+                        ),
                     ]));
                 }
             }
@@ -1009,7 +1011,7 @@ pub(super) fn render_stations_page(
                         ),
                         Span::raw("  "),
                         Span::styled(
-                            balance.status.as_str(),
+                            balance_status_label(balance.status),
                             balance_status_style(p, balance.status),
                         ),
                         Span::raw("  "),
@@ -1023,7 +1025,10 @@ pub(super) fn render_stations_page(
                     {
                         lines.push(Line::from(vec![
                             Span::raw("     "),
-                            Span::styled(shorten(err, 80), Style::default().fg(p.muted)),
+                            Span::styled(
+                                format!("balance lookup failed: {}", shorten(err, 56)),
+                                Style::default().fg(p.muted),
+                            ),
                         ]));
                     }
                 }

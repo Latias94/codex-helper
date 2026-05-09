@@ -9,7 +9,7 @@ use crate::config::{ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryStrategy
 use crate::healthcheck::{
     HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
 };
-use crate::tui::model::{Palette, Snapshot, now_ms, shorten, shorten_middle};
+use crate::tui::model::{Palette, Snapshot, balance_status_label, now_ms, shorten, shorten_middle};
 use crate::tui::state::UiState;
 
 fn retry_strategy_name(strategy: RetryStrategy) -> &'static str {
@@ -127,29 +127,28 @@ fn balance_overview_lines(snapshot: &Snapshot, limit: usize) -> Vec<String> {
         .iter()
         .map(|station| station.stale_rows)
         .sum::<usize>();
-    let error_rows = stations
+    let unknown_rows = stations
         .iter()
-        .map(|station| station.error_rows)
+        .map(|station| station.unknown_rows + station.error_rows)
         .sum::<usize>();
 
     let mut lines = vec![format!(
-        "stations={}  rows={}  exhausted={}  stale={}  error={}",
+        "stations={}  rows={}  exhausted={}  stale={}  unknown={}",
         stations.len(),
         total_rows,
         exhausted_rows,
         stale_rows,
-        error_rows
+        unknown_rows
     )];
     for station in stations.into_iter().take(limit) {
         lines.push(format!(
-            "{}  rows={} ok={} stale={} exhausted={} err={} unknown={}  {}",
+            "{}  rows={} ok={} stale={} exhausted={} unknown={}  {}",
             shorten_middle(&station.station_name, 20),
             station.total_rows,
             station.ok_rows,
             station.stale_rows,
             station.exhausted_rows,
-            station.error_rows,
-            station.unknown_rows,
+            station.unknown_rows + station.error_rows,
             station
                 .primary
                 .as_ref()
@@ -286,11 +285,11 @@ fn balance_priority(
 
 fn balance_status_rank(status: crate::state::BalanceSnapshotStatus) -> u8 {
     match status {
-        crate::state::BalanceSnapshotStatus::Error => 0,
-        crate::state::BalanceSnapshotStatus::Exhausted => 1,
-        crate::state::BalanceSnapshotStatus::Stale => 2,
-        crate::state::BalanceSnapshotStatus::Unknown => 3,
-        crate::state::BalanceSnapshotStatus::Ok => 4,
+        crate::state::BalanceSnapshotStatus::Exhausted => 0,
+        crate::state::BalanceSnapshotStatus::Stale => 1,
+        crate::state::BalanceSnapshotStatus::Error
+        | crate::state::BalanceSnapshotStatus::Unknown => 2,
+        crate::state::BalanceSnapshotStatus::Ok => 3,
     }
 }
 
@@ -310,13 +309,13 @@ fn format_primary_balance(snapshot: &crate::state::ProviderBalanceSnapshot) -> S
             .upstream_index
             .map(|idx| idx.to_string())
             .unwrap_or_else(|| "-".to_string()),
-        snapshot.status.as_str(),
+        balance_status_label(snapshot.status),
         snapshot.amount_summary()
     );
     if let Some(err) = snapshot.error.as_deref()
         && !err.trim().is_empty()
     {
-        line.push_str(&format!("  err={}", shorten(err, 48)));
+        line.push_str(&format!("  lookup_failed={}", shorten(err, 48)));
     }
     line
 }

@@ -40,20 +40,20 @@ pub(super) fn render_balance_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) 
         .iter()
         .map(|station| station.stale_rows)
         .sum::<usize>();
-    let error_rows = stations
-        .iter()
-        .map(|station| station.error_rows)
-        .sum::<usize>();
-
     ui.separator();
     ui.label(pick(ctx.lang, "余额 / 额度", "Balance / quota"));
+    let unknown_rows = stations
+        .iter()
+        .map(|station| station.unknown_rows + station.error_rows)
+        .sum::<usize>();
+
     ui.label(format!(
-        "stations={}  rows={}  exhausted={}  stale={}  error={}",
+        "stations={}  rows={}  exhausted={}  stale={}  unknown={}",
         stations.len(),
         total_rows,
         exhausted_rows,
         stale_rows,
-        error_rows
+        unknown_rows
     ));
 
     egui::ScrollArea::vertical()
@@ -72,13 +72,12 @@ pub(super) fn render_balance_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) 
                     for station in &stations {
                         ui.label(shorten(&station.station_name, 24));
                         ui.label(format!(
-                            "rows={} ok={} stale={} exhausted={} err={} unknown={}",
+                            "rows={} ok={} stale={} exhausted={} unknown={}",
                             station.total_rows,
                             station.ok_rows,
                             station.stale_rows,
                             station.exhausted_rows,
-                            station.error_rows,
-                            station.unknown_rows
+                            station.unknown_rows + station.error_rows
                         ));
                         ui.label(shorten(
                             station
@@ -144,11 +143,11 @@ fn balance_priority(
 
 fn balance_status_rank(status: crate::state::BalanceSnapshotStatus) -> u8 {
     match status {
-        crate::state::BalanceSnapshotStatus::Error => 0,
-        crate::state::BalanceSnapshotStatus::Exhausted => 1,
-        crate::state::BalanceSnapshotStatus::Stale => 2,
-        crate::state::BalanceSnapshotStatus::Unknown => 3,
-        crate::state::BalanceSnapshotStatus::Ok => 4,
+        crate::state::BalanceSnapshotStatus::Exhausted => 0,
+        crate::state::BalanceSnapshotStatus::Stale => 1,
+        crate::state::BalanceSnapshotStatus::Error
+        | crate::state::BalanceSnapshotStatus::Unknown => 2,
+        crate::state::BalanceSnapshotStatus::Ok => 3,
     }
 }
 
@@ -168,15 +167,25 @@ fn format_primary_balance(snapshot: &crate::state::ProviderBalanceSnapshot) -> S
             .upstream_index
             .map(|idx| idx.to_string())
             .unwrap_or_else(|| "-".to_string()),
-        snapshot.status.as_str(),
+        balance_status_label(snapshot.status),
         snapshot.amount_summary()
     );
     if let Some(err) = snapshot.error.as_deref()
         && !err.trim().is_empty()
     {
-        line.push_str(&format!("  err={}", shorten(err, 48)));
+        line.push_str(&format!("  lookup_failed={}", shorten(err, 48)));
     }
     line
+}
+
+fn balance_status_label(status: crate::state::BalanceSnapshotStatus) -> &'static str {
+    match status {
+        crate::state::BalanceSnapshotStatus::Ok => "ok",
+        crate::state::BalanceSnapshotStatus::Exhausted => "exhausted",
+        crate::state::BalanceSnapshotStatus::Stale => "stale",
+        crate::state::BalanceSnapshotStatus::Error
+        | crate::state::BalanceSnapshotStatus::Unknown => "unknown",
+    }
 }
 
 #[cfg(test)]
