@@ -772,13 +772,15 @@ Note: retries may replay **non-idempotent POST requests** (potential double-bill
 
 ---
 
-## Relationship to cli_proxy and cc-switch
+## Relationship to Related Projects
 
 - [cli_proxy](https://github.com/guojinpeng/cli_proxy): a multi-service daemon + Web UI with centralized monitoring.
-- [cc-switch](https://github.com/farion1231/cc-switch): a desktop GUI supplier/MCP manager focused on “manage configs in one place, apply to many clients”.
+- [cc-switch](https://github.com/farion1231/cc-switch): a desktop GUI supplier/MCP manager focused on “manage configs in one place, apply to many clients”. codex-helper references its provider UX, balance/quota query templates, and request usage visibility ideas.
+- [aio-coding-hub](https://github.com/dyndynjyxa/aio-coding-hub): a broader multi-CLI gateway and desktop control console. codex-helper references its request-chain observability, cost tracking, provider limit, and dashboard direction.
 
-codex-helper takes inspiration from both, but stays deliberately lightweight:
+codex-helper takes inspiration from these projects, but stays deliberately focused:
 
 - focused on Codex CLI;
-- single binary, no daemon, no Web UI;
-- designed to be a small CLI companion you can run ad hoc, or embed into your own scripts and tooling.
+- single binary, local-first, without requiring an always-on desktop console;
+- configuration is centered on Codex provider / routing / profile rather than cloning a full multi-client manager;
+- designed as a Codex local relay and control plane you can use directly or embed into your own scripts and tooling.

@@ -221,6 +221,15 @@ Balance and quota live in a separate local file:
 
 This file describes how codex-helper should fetch provider balance state. Keep it separate from the relay config so provider onboarding stays thin.
 
+For most relay users, start with one of these two adapters:
+
+- `sub2api_balance_http_json`: OpenAI-compatible relay balance, usually `GET {{base_url}}/user/balance`.
+- `new_api_user_self`: New API dashboard quota, usually `GET {{base_url}}/api/user/self`.
+
+`{{base_url}}` is the upstream URL normalized without a trailing `/v1`. Use `{{upstream_base_url}}` if a relay really exposes its balance endpoint under the same `/v1` prefix as chat/completions.
+
+Sub2API-style balance:
+
 ```json
 {
   "providers": [
@@ -228,7 +237,7 @@ This file describes how codex-helper should fetch provider balance state. Keep i
       "id": "input-monthly",
       "kind": "sub2api_balance_http_json",
       "domains": ["ai.input.im"],
-      "endpoint": "https://ai.input.im/v1/user/balance",
+      "endpoint": "{{base_url}}/user/balance",
       "token_env": "INPUT_API_KEY",
       "poll_interval_secs": 60,
       "refresh_on_request": true,
@@ -241,6 +250,32 @@ This file describes how codex-helper should fetch provider balance state. Keep i
   ]
 }
 ```
+
+New API-style quota:
+
+```json
+{
+  "providers": [
+    {
+      "id": "right-newapi",
+      "kind": "new_api_user_self",
+      "domains": ["www.right.codes"],
+      "endpoint": "{{base_url}}/api/user/self",
+      "token_env": "RIGHTCODE_NEWAPI_ACCESS_TOKEN",
+      "headers": {
+        "New-Api-User": "{{env:RIGHTCODE_NEWAPI_USER_ID}}"
+      },
+      "poll_interval_secs": 60,
+      "refresh_on_request": true,
+      "trust_exhaustion_for_routing": true
+    }
+  ]
+}
+```
+
+For New API, the dashboard access token and `New-Api-User` value are often not the same as the model API key. Keep them in environment variables.
+
+The generated default file also includes fixed-domain official balance adapters modeled after CC Switch's built-ins: DeepSeek, StepFun, SiliconFlow, OpenRouter, and Novita AI. These are safe as defaults because their domains and account endpoints are unambiguous. For ordinary relays, prefer the explicit `sub2api_balance_http_json` or `new_api_user_self` examples above.
 
 Supported adapter kinds include:
 
@@ -263,6 +298,17 @@ Useful fields:
 | `trust_exhaustion_for_routing` | Whether an exhausted snapshot may demote routing. |
 | `headers` / `variables` | Adapter-specific request templating. |
 | `extract` | JSON path extraction rules for balance fields. |
+
+Useful `extract` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `remaining_balance_paths` | Candidate JSON paths for remaining balance. Array indexes are supported, for example `balance_infos.0.total_balance`. |
+| `monthly_budget_paths` / `monthly_spent_paths` | Candidate JSON paths for plan limit and spent amount. |
+| `remaining_divisor` / `monthly_budget_divisor` / `monthly_spent_divisor` | Convert minor units into display units. |
+| `derive_budget_from_remaining_and_spent` | Compute budget as remaining + spent. |
+| `derive_remaining_from_budget_and_spent` | Compute remaining as budget - spent. |
+| `exhausted_paths` | Candidate JSON paths for an explicit exhausted boolean. |
 
 Refresh policy:
 

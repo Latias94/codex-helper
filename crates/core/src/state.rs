@@ -44,7 +44,8 @@ use self::session_identity::{
 
 type PassiveStationHealthMap =
     HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>;
-type ProviderBalanceMap = HashMap<String, HashMap<String, HashMap<usize, ProviderBalanceSnapshot>>>;
+type ProviderBalanceMap =
+    HashMap<String, HashMap<String, HashMap<usize, HashMap<String, ProviderBalanceSnapshot>>>>;
 type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
 
 pub struct PassiveUpstreamFailureRecord {
@@ -943,7 +944,9 @@ impl ProxyState {
             .or_default()
             .entry(station_name)
             .or_default()
-            .insert(upstream_index, snapshot);
+            .entry(upstream_index)
+            .or_default()
+            .insert(snapshot.provider_id.clone(), snapshot);
     }
 
     pub async fn get_provider_balance_view(
@@ -959,7 +962,10 @@ impl ProxyState {
         per_service
             .iter()
             .map(|(station_name, upstreams)| {
-                let mut snapshots = upstreams.values().cloned().collect::<Vec<_>>();
+                let mut snapshots = upstreams
+                    .values()
+                    .flat_map(|providers| providers.values().cloned())
+                    .collect::<Vec<_>>();
                 for snapshot in &mut snapshots {
                     snapshot.refresh_status(now_ms);
                 }
@@ -2665,6 +2671,65 @@ mod tests {
             assert_eq!(balances[0].provider_id, "packycode");
             assert_eq!(balances[0].status, BalanceSnapshotStatus::Stale);
             assert_eq!(balances[0].exhausted, Some(false));
+        });
+    }
+
+    #[test]
+    fn provider_balance_snapshots_keep_multiple_providers_per_upstream() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            for (provider_id, status) in [
+                ("general", BalanceSnapshotStatus::Error),
+                ("newapi", BalanceSnapshotStatus::Ok),
+            ] {
+                state
+                    .record_provider_balance_snapshot(
+                        "codex",
+                        ProviderBalanceSnapshot {
+                            provider_id: provider_id.to_string(),
+                            station_name: Some("routing".to_string()),
+                            upstream_index: Some(1),
+                            source: "usage_provider:test".to_string(),
+                            fetched_at_ms: 10,
+                            stale_after_ms: None,
+                            stale: false,
+                            status,
+                            exhausted: if status == BalanceSnapshotStatus::Ok {
+                                Some(false)
+                            } else {
+                                None
+                            },
+                            exhaustion_affects_routing: true,
+                            total_balance_usd: if status == BalanceSnapshotStatus::Ok {
+                                Some("3.5".to_string())
+                            } else {
+                                None
+                            },
+                            subscription_balance_usd: None,
+                            paygo_balance_usd: None,
+                            monthly_budget_usd: None,
+                            monthly_spent_usd: None,
+                            error: if status == BalanceSnapshotStatus::Error {
+                                Some("decode failed".to_string())
+                            } else {
+                                None
+                            },
+                        },
+                    )
+                    .await;
+            }
+
+            let view = state.get_provider_balance_view("codex").await;
+            let balances = view.get("routing").expect("station balance");
+            assert_eq!(balances.len(), 2);
+            assert_eq!(
+                balances
+                    .iter()
+                    .map(|snapshot| snapshot.provider_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["general", "newapi"]
+            );
         });
     }
 

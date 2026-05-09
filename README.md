@@ -700,13 +700,15 @@ cooldown_backoff_max_secs = 600
 
 ---
 
-## 与 cli_proxy / cc-switch 的关系
+## 与相关项目的关系
 
 - [cli_proxy](https://github.com/guojinpeng/cli_proxy)：多服务守护进程 + Web UI，看板 + 管理功能很全面；
-- [cc-switch](https://github.com/farion1231/cc-switch)：桌面 GUI 级供应商 / MCP 管理器，主打“一处管理、按需应用到各客户端”。
+- [cc-switch](https://github.com/farion1231/cc-switch)：桌面 GUI 级供应商 / MCP 管理器，主打“一处管理、按需应用到各客户端”；codex-helper 的 provider 体验、余额/套餐查询模板、请求用量展示思路参考了它；
+- [aio-coding-hub](https://github.com/dyndynjyxa/aio-coding-hub)：更完整的多 CLI 网关 / 桌面控制台；codex-helper 参考了它在请求链路、成本统计、provider 限额与可观测性上的产品方向。
 
-codex-helper 借鉴了它们的设计思路，但定位更轻量：
+codex-helper 借鉴了这些项目的成熟设计，但定位更聚焦：
 
 - 专注 Codex CLI；
-- 单一二进制，无守护进程、无 Web UI；
-- 更适合作为你日常使用的“命令行小助手”，或者集成进你自己的脚本 / 工具链中。
+- 单一二进制，默认本地运行，不要求常驻桌面控制台；
+- 配置模型围绕 Codex provider / routing / profile，而不是复制完整多客户端管理器；
+- 更适合作为你日常使用的 Codex 本地中转与控制平面，或者集成进自己的脚本 / 工具链中。

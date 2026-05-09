@@ -165,11 +165,21 @@ Observed from local files:
   - results update load-balancer `usage_exhausted`
 - `crates/core/src/lb.rs`
   - load balancer can skip usage-exhausted upstreams
+- `repo-ref/cc-switch`
+  - third-party relay balance is template-driven rather than fully inferred
+  - common template: `GET {{baseUrl}}/user/balance`
+  - New API template: `GET {{baseUrl}}/api/user/self` with `Authorization: Bearer {{accessToken}}` and `New-Api-User: {{userId}}`
+  - New API quota math uses `quota / 500000`, `used_quota / 500000`, and `quota + used_quota` as total
+  - official provider balances are separate fixed adapters, not a generic relay rule
+- `repo-ref/aio-coding-hub`
+  - does not appear to use a generic third-party balance script model
+  - emphasizes request logs, provider limit windows, cost multipliers, and Basellm-backed model price sync
 
 Gap:
 
 - useful behavior now exists and is surfaced in TUI/GUI, but balance adapter coverage is still incomplete
-- balance/quota still needs clearer policy weighting and operator-facing refresh controls
+- sub2api and New API should be the primary relay adapters; official/provider-specific balances are secondary
+- balance/quota still needs clearer policy weighting and operator-facing diagnostics
 - stale/error/exhausted states need to keep feeding routing preview and station eligibility
 
 Recommended fix:
@@ -178,6 +188,7 @@ Recommended fix:
 - UI station balance display
 - route eligibility reason: quota exhausted
 - provider-level refresh policy and adapter extension points
+- keep multiple adapter results per upstream so a failed probe does not overwrite a successful one
 
 ### Request Chain
 

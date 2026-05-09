@@ -65,6 +65,10 @@ impl UsdAmount {
         Self::from_femto_usd(self.femto_usd.saturating_add(other.femto_usd))
     }
 
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self::from_femto_usd(self.femto_usd.saturating_sub(other.femto_usd))
+    }
+
     pub fn cost_for_tokens_per_million(tokens: i64, price_per_million: Self) -> Self {
         let tokens = tokens.max(0) as i128;
         Self::from_femto_usd(

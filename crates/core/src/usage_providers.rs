@@ -74,6 +74,8 @@ struct UsageProviderExtractConfig {
     monthly_spent_divisor: Option<u64>,
     #[serde(skip_serializing_if = "bool_is_false")]
     derive_budget_from_remaining_and_spent: bool,
+    #[serde(skip_serializing_if = "bool_is_false")]
+    derive_remaining_from_budget_and_spent: bool,
 }
 
 impl UsageProviderExtractConfig {
@@ -88,6 +90,7 @@ impl UsageProviderExtractConfig {
             && self.monthly_budget_divisor.is_none()
             && self.monthly_spent_divisor.is_none()
             && !self.derive_budget_from_remaining_and_spent
+            && !self.derive_remaining_from_budget_and_spent
     }
 }
 
@@ -237,36 +240,94 @@ fn service_manager<'a>(cfg: &'a ProxyConfig, service_name: &str) -> &'a ServiceC
     }
 }
 
+fn default_provider_config(
+    id: &str,
+    kind: ProviderKind,
+    domains: Vec<&str>,
+    endpoint: &str,
+    extract: UsageProviderExtractConfig,
+) -> UsageProviderConfig {
+    UsageProviderConfig {
+        id: id.to_string(),
+        kind,
+        domains: domains.into_iter().map(str::to_string).collect(),
+        endpoint: endpoint.to_string(),
+        token_env: None,
+        poll_interval_secs: Some(60),
+        refresh_on_request: true,
+        trust_exhaustion_for_routing: true,
+        headers: BTreeMap::new(),
+        variables: BTreeMap::new(),
+        extract,
+    }
+}
+
 fn default_providers() -> UsageProvidersFile {
+    let openrouter_extract = UsageProviderExtractConfig {
+        monthly_budget_paths: vec!["data.total_credits".to_string()],
+        monthly_spent_paths: vec!["data.total_usage".to_string()],
+        derive_remaining_from_budget_and_spent: true,
+        ..Default::default()
+    };
+
+    let novita_extract = UsageProviderExtractConfig {
+        remaining_balance_paths: vec!["availableBalance".to_string()],
+        remaining_divisor: Some(10_000),
+        ..Default::default()
+    };
+
     UsageProvidersFile {
         providers: vec![
-            UsageProviderConfig {
-                id: "packycode".to_string(),
-                kind: ProviderKind::BudgetHttpJson,
-                domains: vec!["packycode.com".to_string()],
-                endpoint: "https://www.packycode.com/api/backend/users/info".to_string(),
-                token_env: None,
-                poll_interval_secs: Some(60),
-                refresh_on_request: true,
-                trust_exhaustion_for_routing: true,
-                headers: BTreeMap::new(),
-                variables: BTreeMap::new(),
-                extract: UsageProviderExtractConfig::default(),
-            },
-            UsageProviderConfig {
-                id: "yescode".to_string(),
-                kind: ProviderKind::YescodeProfile,
-                // yes.vg 匹配 co.yes.vg / cotest.yes.vg 等子域名
-                domains: vec!["yes.vg".to_string()],
-                endpoint: "https://co.yes.vg/api/v1/auth/profile".to_string(),
-                token_env: None,
-                poll_interval_secs: Some(60),
-                refresh_on_request: true,
-                trust_exhaustion_for_routing: true,
-                headers: BTreeMap::new(),
-                variables: BTreeMap::new(),
-                extract: UsageProviderExtractConfig::default(),
-            },
+            default_provider_config(
+                "packycode",
+                ProviderKind::BudgetHttpJson,
+                vec!["packycode.com"],
+                "https://www.packycode.com/api/backend/users/info",
+                UsageProviderExtractConfig::default(),
+            ),
+            default_provider_config(
+                "yescode",
+                ProviderKind::YescodeProfile,
+                // Match co.yes.vg, cotest.yes.vg, and sibling subdomains.
+                vec!["yes.vg"],
+                "https://co.yes.vg/api/v1/auth/profile",
+                UsageProviderExtractConfig::default(),
+            ),
+            default_provider_config(
+                "deepseek",
+                ProviderKind::OpenAiBalanceHttpJson,
+                vec!["api.deepseek.com"],
+                "https://api.deepseek.com/user/balance",
+                UsageProviderExtractConfig::default(),
+            ),
+            default_provider_config(
+                "stepfun",
+                ProviderKind::OpenAiBalanceHttpJson,
+                vec!["api.stepfun.ai", "api.stepfun.com"],
+                "https://api.stepfun.com/v1/accounts",
+                UsageProviderExtractConfig::default(),
+            ),
+            default_provider_config(
+                "siliconflow",
+                ProviderKind::OpenAiBalanceHttpJson,
+                vec!["api.siliconflow.cn", "api.siliconflow.com"],
+                "{{base_url}}/v1/user/info",
+                UsageProviderExtractConfig::default(),
+            ),
+            default_provider_config(
+                "openrouter",
+                ProviderKind::OpenAiBalanceHttpJson,
+                vec!["openrouter.ai"],
+                "https://openrouter.ai/api/v1/credits",
+                openrouter_extract,
+            ),
+            default_provider_config(
+                "novita",
+                ProviderKind::OpenAiBalanceHttpJson,
+                vec!["api.novita.ai"],
+                "https://api.novita.ai/v3/user/balance",
+                novita_extract,
+            ),
         ],
     }
 }
@@ -543,7 +604,13 @@ fn json_value_at_path<'a>(
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
     {
-        current = current.get(segment)?;
+        current = match current {
+            serde_json::Value::Array(items) => {
+                let index = segment.parse::<usize>().ok()?;
+                items.get(index)?
+            }
+            _ => current.get(segment)?,
+        };
     }
     Some(current)
 }
@@ -704,6 +771,10 @@ fn balance_http_snapshot_from_json(
             "credits",
             "total_balance",
             "total_balance_usd",
+            "totalBalance",
+            "availableBalance",
+            "available_balance_usd",
+            "balance_infos.0.total_balance",
             "data.balance",
             "data.remaining",
             "data.available",
@@ -711,6 +782,8 @@ fn balance_http_snapshot_from_json(
             "data.credit",
             "data.credits",
             "data.total_balance",
+            "data.totalBalance",
+            "data.availableBalance",
         ],
         provider.extract.remaining_divisor,
     );
@@ -720,8 +793,10 @@ fn balance_http_snapshot_from_json(
         &[
             "subscription_balance",
             "subscription_balance_usd",
+            "subscriptionBalance",
             "data.subscription_balance",
             "data.subscription_balance_usd",
+            "data.subscriptionBalance",
         ],
         provider.extract.remaining_divisor,
     );
@@ -732,19 +807,24 @@ fn balance_http_snapshot_from_json(
             "pay_as_you_go_balance",
             "paygo_balance",
             "paygo",
+            "paygoBalance",
+            "chargeBalance",
+            "voucherBalance",
             "data.pay_as_you_go_balance",
             "data.paygo_balance",
             "data.paygo",
+            "data.paygoBalance",
+            "data.chargeBalance",
+            "data.voucherBalance",
         ],
         provider.extract.remaining_divisor,
     );
-    let derived_remaining = match (subscription_balance, paygo_balance) {
+    let component_remaining = match (subscription_balance, paygo_balance) {
         (Some(subscription), Some(paygo)) => Some(subscription.saturating_add(paygo)),
         (Some(subscription), None) => Some(subscription),
         (None, Some(paygo)) => Some(paygo),
         (None, None) => None,
     };
-    let total_balance = remaining_balance.or(derived_remaining);
     let monthly_spent = first_amount_from_paths(
         value,
         &provider.extract.monthly_spent_paths,
@@ -753,10 +833,14 @@ fn balance_http_snapshot_from_json(
             "spent",
             "used",
             "used_balance",
+            "usedBalance",
+            "total_usage",
             "data.monthly_spent_usd",
             "data.spent",
             "data.used",
             "data.used_balance",
+            "data.usedBalance",
+            "data.total_usage",
         ],
         provider.extract.monthly_spent_divisor,
     );
@@ -768,21 +852,35 @@ fn balance_http_snapshot_from_json(
             "budget",
             "limit",
             "quota_total",
+            "creditLimit",
+            "total_credits",
             "data.monthly_budget_usd",
             "data.budget",
             "data.limit",
             "data.quota_total",
+            "data.creditLimit",
+            "data.total_credits",
         ],
         provider.extract.monthly_budget_divisor,
     )
     .or_else(|| {
         if provider.extract.derive_budget_from_remaining_and_spent {
-            match (total_balance, monthly_spent) {
+            match (remaining_balance.or(component_remaining), monthly_spent) {
                 (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
                 _ => None,
             }
         } else {
             None
+        }
+    });
+    let total_balance = remaining_balance.or(component_remaining).or_else(|| {
+        match (
+            provider.extract.derive_remaining_from_budget_and_spent,
+            monthly_budget,
+            monthly_spent,
+        ) {
+            (true, Some(budget), Some(spent)) => Some(budget.saturating_sub(spent)),
+            _ => None,
         }
     });
     let exhausted = first_bool_from_paths(
@@ -1344,6 +1442,105 @@ mod tests {
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
         assert_eq!(snapshot.exhausted, Some(false));
         assert_eq!(snapshot.total_balance_usd.as_deref(), Some("1.25"));
+    }
+
+    #[test]
+    fn json_path_supports_array_indices_for_official_balance_shapes() {
+        let value = serde_json::json!({
+            "balance_infos": [
+                { "currency": "CNY", "total_balance": "3.25" }
+            ]
+        });
+
+        assert_eq!(
+            json_value_at_path(&value, "balance_infos.0.total_balance")
+                .and_then(|value| value.as_str()),
+            Some("3.25")
+        );
+    }
+
+    #[test]
+    fn openai_balance_snapshot_reads_cc_switch_official_balance_shapes() {
+        let snapshot = balance_http_snapshot_from_json(
+            &provider("deepseek", ProviderKind::OpenAiBalanceHttpJson),
+            &upstream(),
+            &serde_json::json!({
+                "balance_infos": [
+                    { "currency": "CNY", "total_balance": "3.25" }
+                ],
+                "is_available": true
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("3.25"));
+
+        let snapshot = balance_http_snapshot_from_json(
+            &provider("siliconflow", ProviderKind::OpenAiBalanceHttpJson),
+            &upstream(),
+            &serde_json::json!({
+                "code": 20000,
+                "data": {
+                    "totalBalance": "8.5",
+                    "chargeBalance": "2.5"
+                }
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("8.5"));
+        assert_eq!(snapshot.paygo_balance_usd.as_deref(), Some("2.5"));
+    }
+
+    #[test]
+    fn openai_balance_snapshot_can_derive_remaining_from_total_and_used() {
+        let mut provider = provider("openrouter", ProviderKind::OpenAiBalanceHttpJson);
+        provider.extract.monthly_budget_paths = vec!["data.total_credits".to_string()];
+        provider.extract.monthly_spent_paths = vec!["data.total_usage".to_string()];
+        provider.extract.derive_remaining_from_budget_and_spent = true;
+
+        let snapshot = balance_http_snapshot_from_json(
+            &provider,
+            &upstream(),
+            &serde_json::json!({
+                "data": {
+                    "total_credits": "10",
+                    "total_usage": "4"
+                }
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("6"));
+        assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("10"));
+        assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn openai_balance_snapshot_supports_divisor_for_minor_units() {
+        let mut provider = provider("novita", ProviderKind::OpenAiBalanceHttpJson);
+        provider.extract.remaining_balance_paths = vec!["availableBalance".to_string()];
+        provider.extract.remaining_divisor = Some(10_000);
+
+        let snapshot = balance_http_snapshot_from_json(
+            &provider,
+            &upstream(),
+            &serde_json::json!({
+                "availableBalance": 12345
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("1.2345"));
     }
 
     #[test]
