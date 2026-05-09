@@ -135,7 +135,7 @@ ch
 - TUI / GUI
   - `Stations`：看 station、能力、健康、breaker、快速切换
   - `Sessions`：看 session identity、effective route、session override
-  - `Proxy Settings` / Config：查看 v3 routing-first 配置摘要；持久化 provider/routing 编辑优先用 CLI 或 raw TOML
+  - `Proxy Settings` / Config：查看 v3 routing-first 配置摘要；常见单 endpoint provider 和 routing 策略可直接用 GUI 表单编辑，复杂 endpoint / 模型映射继续用 CLI 或 raw TOML
 - 只读 API
   - `GET /__codex_helper/api/v1/capabilities`
   - `GET /__codex_helper/api/v1/snapshot`
@@ -242,7 +242,7 @@ codex-helper config migrate --dry-run
 codex-helper config migrate --write --yes
 ```
 
-`routing show` 用于查看持久化策略；`routing list` / `routing explain` 用于查看编译后的运行时视图。新增 provider、调整顺序、启用禁用都使用 `provider` 和 `routing` 命令。
+`routing show` 用于查看持久化策略；`routing list` / `routing explain` 用于查看编译后的运行时视图。新增 provider、调整顺序、启用禁用都可以使用 `provider` / `routing` 命令；GUI 的 `Proxy Settings` 表单也可以完成常见单 endpoint provider 与 routing 策略编辑。
 
 ---
 
