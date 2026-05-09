@@ -256,6 +256,7 @@ pub struct ProxySettingsViewState {
     pub(super) load_error: Option<String>,
     pub(super) import_codex: ImportCodexModalState,
     pub(super) provider_editor: ProxySettingsProviderEditorState,
+    pub(super) routing_editor: ProxySettingsRoutingEditorState,
 }
 
 impl Default for ProxySettingsViewState {
@@ -266,6 +267,7 @@ impl Default for ProxySettingsViewState {
             load_error: None,
             import_codex: ImportCodexModalState::default(),
             provider_editor: ProxySettingsProviderEditorState::default(),
+            routing_editor: ProxySettingsRoutingEditorState::default(),
         }
     }
 }
@@ -330,6 +332,29 @@ impl Default for ProxySettingsProviderEditorState {
             api_key_env: String::new(),
             tags: String::new(),
             enabled: true,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ProxySettingsRoutingEditorState {
+    pub(super) source_signature: Option<String>,
+    pub(super) policy: crate::config::RoutingPolicyV3,
+    pub(super) target: String,
+    pub(super) order: String,
+    pub(super) prefer_tags: String,
+    pub(super) on_exhausted: crate::config::RoutingExhaustedActionV3,
+}
+
+impl Default for ProxySettingsRoutingEditorState {
+    fn default() -> Self {
+        Self {
+            source_signature: None,
+            policy: crate::config::RoutingPolicyV3::OrderedFailover,
+            target: String::new(),
+            order: String::new(),
+            prefer_tags: String::new(),
+            on_exhausted: crate::config::RoutingExhaustedActionV3::Continue,
         }
     }
 }

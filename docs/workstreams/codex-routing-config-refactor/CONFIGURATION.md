@@ -282,6 +282,16 @@ The GUI proxy settings form exposes a common-case v3 provider editor.
 
 The form intentionally treats providers with extra `endpoints` or inline secrets as read-only, because rewriting those from a simple form can silently lose advanced intent. Use raw TOML or the CLI for those providers.
 
+The same GUI form also exposes a v3 routing editor for the currently selected service.
+
+- `policy`: `ordered-failover`, `manual-sticky`, or `tag-preferred`;
+- `order`: comma- or newline-separated provider names; unlisted providers remain as tail fallbacks;
+- `target`: required only for `manual-sticky`;
+- `prefer_tags`: `key=value` pairs, with multiple groups separated by semicolons;
+- `on_exhausted`: `continue` keeps non-matching fallbacks after preferred tags are exhausted, while `stop` limits routing to preferred matches.
+
+The preview is intentionally static: it explains provider order, tag preference, disabled providers, and fallback candidates from the persisted config. Live balance/package state is still shown in the runtime/TUI surfaces.
+
 ## Control Plane Editing Notes
 
 Local GUI, remote attach clients, and TUI-backed admin flows should edit the same v3 document instead of writing a compacted v2 projection.

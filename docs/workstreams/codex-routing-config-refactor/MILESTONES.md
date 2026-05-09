@@ -55,8 +55,8 @@ Acceptance:
 - [x] Retarget legacy TUI station/provider shortcut keys under v3 so provider switching uses routing instead of the internal `routing` station.
 - [x] Render the TUI v3 second page as real provider routing instead of the compiled internal `routing` station.
 - [x] Update the provider editor to prioritize identity, auth, endpoint, and tags.
-- Add a routing editor with policy, order, target, and tag-preference controls.
-- Show a preview of preferred candidates and fallback behavior.
+- [x] Add a routing editor with policy, order, target, and tag-preference controls.
+- [x] Show a preview of preferred candidates and fallback behavior.
 - [x] Ensure GUI raw config parsing/saving accepts v3 documents.
 
 Acceptance:
