@@ -21,6 +21,27 @@ pub struct UsageBucket {
 }
 
 impl UsageBucket {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.requests_total = self.requests_total.saturating_add(other.requests_total);
+        self.requests_error = self.requests_error.saturating_add(other.requests_error);
+        self.duration_ms_total = self
+            .duration_ms_total
+            .saturating_add(other.duration_ms_total);
+        self.requests_with_usage = self
+            .requests_with_usage
+            .saturating_add(other.requests_with_usage);
+        self.duration_ms_with_usage_total = self
+            .duration_ms_with_usage_total
+            .saturating_add(other.duration_ms_with_usage_total);
+        self.generation_ms_total = self
+            .generation_ms_total
+            .saturating_add(other.generation_ms_total);
+        self.ttfb_ms_total = self.ttfb_ms_total.saturating_add(other.ttfb_ms_total);
+        self.ttfb_samples = self.ttfb_samples.saturating_add(other.ttfb_samples);
+        self.usage.add_assign(&other.usage);
+        self.cost.add_assign(&other.cost);
+    }
+
     pub(super) fn record(
         &mut self,
         status_code: u16,
@@ -60,8 +81,25 @@ impl UsageBucket {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct UsageRollupCoverage {
+    pub requested_days: usize,
+    pub all_loaded: bool,
+    pub loaded_first_day: Option<i32>,
+    pub loaded_last_day: Option<i32>,
+    pub loaded_days_with_data: usize,
+    pub loaded_requests: u64,
+    pub window_first_day: Option<i32>,
+    pub window_last_day: Option<i32>,
+    pub window_days_with_data: usize,
+    pub window_requests: u64,
+    pub window_exceeds_loaded_start: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UsageRollupView {
-    pub since_start: UsageBucket,
+    pub loaded: UsageBucket,
+    pub window: UsageBucket,
+    pub coverage: UsageRollupCoverage,
     pub by_day: Vec<(i32, UsageBucket)>,
     pub by_config: Vec<(String, UsageBucket)>,
     pub by_config_day: HashMap<String, Vec<(i32, UsageBucket)>>,
@@ -71,7 +109,7 @@ pub struct UsageRollupView {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct UsageRollup {
-    pub(super) since_start: UsageBucket,
+    pub(super) loaded: UsageBucket,
     pub(super) by_day: HashMap<i32, UsageBucket>,
     pub(super) by_config: HashMap<String, UsageBucket>,
     pub(super) by_config_day: HashMap<String, HashMap<i32, UsageBucket>>,

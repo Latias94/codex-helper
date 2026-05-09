@@ -27,7 +27,8 @@ use self::runtime_types::{
 };
 pub use self::runtime_types::{
     HealthCheckStatus, LbConfigView, LbUpstreamView, PassiveHealthState, PassiveUpstreamHealth,
-    RuntimeConfigState, StationHealth, UpstreamHealth, UsageBucket, UsageRollupView,
+    RuntimeConfigState, StationHealth, UpstreamHealth, UsageBucket, UsageRollupCoverage,
+    UsageRollupView,
 };
 pub use self::session_identity::{
     ActiveRequest, FinishRequestParams, FinishedRequest, RequestObservability, ResolvedRouteValue,
@@ -1225,61 +1226,193 @@ impl ProxyState {
             return UsageRollupView::default();
         };
 
-        fn day_series(map: &HashMap<i32, UsageBucket>, days: usize) -> Vec<(i32, UsageBucket)> {
+        fn now_day() -> i32 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| (d.as_millis() / 86_400_000) as i32)
+                .unwrap_or(0)
+        }
+
+        fn sorted_day_series(map: &HashMap<i32, UsageBucket>) -> Vec<(i32, UsageBucket)> {
             let mut out = map.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>();
             out.sort_by_key(|(k, _)| *k);
-            if out.len() > days {
-                out = out[out.len().saturating_sub(days)..].to_vec();
+            out
+        }
+
+        fn filled_day_series(
+            map: &HashMap<i32, UsageBucket>,
+            start_day: i32,
+            end_day: i32,
+        ) -> Vec<(i32, UsageBucket)> {
+            if start_day > end_day {
+                return Vec::new();
+            }
+            (start_day..=end_day)
+                .map(|day| (day, map.get(&day).cloned().unwrap_or_default()))
+                .collect()
+        }
+
+        fn sum_series(series: &[(i32, UsageBucket)]) -> UsageBucket {
+            let mut out = UsageBucket::default();
+            for (_, bucket) in series {
+                out.add_assign(bucket);
             }
             out
         }
 
-        let mut by_day = rollup
-            .by_day
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect::<Vec<_>>();
-        by_day.sort_by_key(|(k, _)| *k);
-        if by_day.len() > days {
-            by_day = by_day[by_day.len().saturating_sub(days)..].to_vec();
+        fn aggregate_entity_window(
+            source: &HashMap<String, HashMap<i32, UsageBucket>>,
+            start_day: Option<i32>,
+            end_day: Option<i32>,
+            top_n: usize,
+        ) -> Vec<(String, UsageBucket)> {
+            let mut out = Vec::new();
+            for (name, days) in source {
+                let mut bucket = UsageBucket::default();
+                for (day, value) in days {
+                    let include = match (start_day, end_day) {
+                        (Some(start), Some(end)) => *day >= start && *day <= end,
+                        _ => true,
+                    };
+                    if include {
+                        bucket.add_assign(value);
+                    }
+                }
+                if bucket.requests_total > 0 {
+                    out.push((name.clone(), bucket));
+                }
+            }
+            out.sort_by(|(left_name, left), (right_name, right)| {
+                right
+                    .usage
+                    .total_tokens
+                    .cmp(&left.usage.total_tokens)
+                    .then_with(|| right.requests_total.cmp(&left.requests_total))
+                    .then_with(|| left_name.cmp(right_name))
+            });
+            out.truncate(top_n);
+            out
         }
 
-        let mut by_config = rollup
-            .by_config
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<Vec<_>>();
-        by_config.sort_by_key(|(_, v)| std::cmp::Reverse(v.usage.total_tokens));
-        by_config.truncate(top_n);
+        let all_loaded = days == 0;
+        let loaded_first_day = rollup.by_day.keys().min().copied();
+        let loaded_last_day = rollup.by_day.keys().max().copied();
+        let loaded_days_with_data = rollup
+            .by_day
+            .values()
+            .filter(|bucket| bucket.requests_total > 0)
+            .count();
 
-        let mut by_provider = rollup
-            .by_provider
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<Vec<_>>();
-        by_provider.sort_by_key(|(_, v)| std::cmp::Reverse(v.usage.total_tokens));
-        by_provider.truncate(top_n);
+        let (start_day, end_day) = if all_loaded {
+            (loaded_first_day, loaded_last_day)
+        } else {
+            let end = now_day();
+            let offset = i32::try_from(days.saturating_sub(1)).unwrap_or(i32::MAX);
+            (Some(end.saturating_sub(offset)), Some(end))
+        };
+
+        let by_day = match (all_loaded, start_day, end_day) {
+            (true, _, _) => sorted_day_series(&rollup.by_day),
+            (false, Some(start), Some(end)) => filled_day_series(&rollup.by_day, start, end),
+            _ => Vec::new(),
+        };
+        let window = if all_loaded {
+            rollup.loaded.clone()
+        } else {
+            sum_series(&by_day)
+        };
+
+        let mut by_config =
+            aggregate_entity_window(&rollup.by_config_day, start_day, end_day, top_n);
+        if all_loaded && by_config.is_empty() {
+            by_config = rollup
+                .by_config
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>();
+            by_config.sort_by(|(left_name, left), (right_name, right)| {
+                right
+                    .usage
+                    .total_tokens
+                    .cmp(&left.usage.total_tokens)
+                    .then_with(|| right.requests_total.cmp(&left.requests_total))
+                    .then_with(|| left_name.cmp(right_name))
+            });
+            by_config.truncate(top_n);
+        }
+
+        let mut by_provider =
+            aggregate_entity_window(&rollup.by_provider_day, start_day, end_day, top_n);
+        if all_loaded && by_provider.is_empty() {
+            by_provider = rollup
+                .by_provider
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>();
+            by_provider.sort_by(|(left_name, left), (right_name, right)| {
+                right
+                    .usage
+                    .total_tokens
+                    .cmp(&left.usage.total_tokens)
+                    .then_with(|| right.requests_total.cmp(&left.requests_total))
+                    .then_with(|| left_name.cmp(right_name))
+            });
+            by_provider.truncate(top_n);
+        }
 
         let mut by_config_day = HashMap::new();
         for (name, _) in &by_config {
-            if let Some(m) = rollup.by_config_day.get(name) {
-                by_config_day.insert(name.clone(), day_series(m, days));
-            } else {
-                by_config_day.insert(name.clone(), Vec::new());
-            }
+            let series = rollup
+                .by_config_day
+                .get(name)
+                .map(|m| match (all_loaded, start_day, end_day) {
+                    (true, _, _) => sorted_day_series(m),
+                    (false, Some(start), Some(end)) => filled_day_series(m, start, end),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default();
+            by_config_day.insert(name.clone(), series);
         }
 
         let mut by_provider_day = HashMap::new();
         for (name, _) in &by_provider {
-            if let Some(m) = rollup.by_provider_day.get(name) {
-                by_provider_day.insert(name.clone(), day_series(m, days));
-            } else {
-                by_provider_day.insert(name.clone(), Vec::new());
-            }
+            let series = rollup
+                .by_provider_day
+                .get(name)
+                .map(|m| match (all_loaded, start_day, end_day) {
+                    (true, _, _) => sorted_day_series(m),
+                    (false, Some(start), Some(end)) => filled_day_series(m, start, end),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default();
+            by_provider_day.insert(name.clone(), series);
         }
 
+        let window_days_with_data = by_day
+            .iter()
+            .filter(|(_, bucket)| bucket.requests_total > 0)
+            .count();
+        let coverage = UsageRollupCoverage {
+            requested_days: days,
+            all_loaded,
+            loaded_first_day,
+            loaded_last_day,
+            loaded_days_with_data,
+            loaded_requests: rollup.loaded.requests_total,
+            window_first_day: start_day,
+            window_last_day: end_day,
+            window_days_with_data,
+            window_requests: window.requests_total,
+            window_exceeds_loaded_start: matches!(
+                (all_loaded, start_day, loaded_first_day),
+                (false, Some(start), Some(first)) if start < first
+            ),
+        };
+
         UsageRollupView {
-            since_start: rollup.since_start.clone(),
+            loaded: rollup.loaded.clone(),
+            window,
+            coverage,
             by_day,
             by_config,
             by_config_day,
@@ -1311,7 +1444,7 @@ impl ProxyState {
             let guard = self.usage_rollups.read().await;
             guard
                 .get(service_name)
-                .is_some_and(|r| r.since_start.requests_total > 0)
+                .is_some_and(|r| r.loaded.requests_total > 0)
         };
         if already_has_data {
             return 0;
@@ -1422,7 +1555,7 @@ impl ProxyState {
         {
             let day = (*ended_at_ms / 86_400_000) as i32;
             rollup
-                .since_start
+                .loaded
                 .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
             rollup.by_day.entry(day).or_default().record(
                 *status_code,
@@ -1625,7 +1758,7 @@ impl ProxyState {
 
             let mut rollups = self.usage_rollups.write().await;
             let rollup = rollups.entry(finished.service.clone()).or_default();
-            rollup.since_start.record(
+            rollup.loaded.record(
                 finished.status_code,
                 finished.duration_ms,
                 finished.usage.as_ref(),
@@ -2052,11 +2185,118 @@ mod tests {
 
             let rollup = state.get_usage_rollup_view("codex", 12, 1).await;
             assert_eq!(
-                rollup.since_start.cost.total_cost_usd.as_deref(),
+                rollup.loaded.cost.total_cost_usd.as_deref(),
                 Some("0.0061375")
             );
-            assert_eq!(rollup.since_start.cost.priced_requests, 1);
-            assert_eq!(rollup.since_start.cost.unpriced_requests, 0);
+            assert_eq!(rollup.loaded.cost.priced_requests, 1);
+            assert_eq!(rollup.loaded.cost.unpriced_requests, 0);
+        });
+    }
+
+    #[test]
+    fn usage_rollup_view_scores_entities_inside_selected_window() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let old_ms = now_ms.saturating_sub(10 * 86_400_000);
+
+            let old_id = state
+                .begin_request(
+                    "codex",
+                    "POST",
+                    "/v1/responses",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("gpt-5".to_string()),
+                    None,
+                    None,
+                    old_ms.saturating_sub(1_000),
+                )
+                .await;
+            state
+                .update_request_route(
+                    old_id,
+                    "old-station".to_string(),
+                    Some("old-provider".to_string()),
+                    "https://old.example/v1".to_string(),
+                    None,
+                )
+                .await;
+            state
+                .finish_request(FinishRequestParams {
+                    id: old_id,
+                    status_code: 200,
+                    duration_ms: 20,
+                    ended_at_ms: old_ms,
+                    observed_service_tier: None,
+                    usage: Some(UsageMetrics {
+                        total_tokens: 100_000,
+                        ..UsageMetrics::default()
+                    }),
+                    retry: None,
+                    ttfb_ms: Some(5),
+                    streaming: false,
+                })
+                .await;
+
+            let fresh_id = state
+                .begin_request(
+                    "codex",
+                    "POST",
+                    "/v1/responses",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("gpt-5".to_string()),
+                    None,
+                    None,
+                    now_ms.saturating_sub(1_000),
+                )
+                .await;
+            state
+                .update_request_route(
+                    fresh_id,
+                    "fresh-station".to_string(),
+                    Some("fresh-provider".to_string()),
+                    "https://fresh.example/v1".to_string(),
+                    None,
+                )
+                .await;
+            state
+                .finish_request(FinishRequestParams {
+                    id: fresh_id,
+                    status_code: 200,
+                    duration_ms: 10,
+                    ended_at_ms: now_ms,
+                    observed_service_tier: None,
+                    usage: Some(UsageMetrics {
+                        total_tokens: 10,
+                        ..UsageMetrics::default()
+                    }),
+                    retry: None,
+                    ttfb_ms: Some(3),
+                    streaming: false,
+                })
+                .await;
+
+            let week = state.get_usage_rollup_view("codex", 10, 7).await;
+            assert_eq!(week.loaded.requests_total, 2);
+            assert_eq!(week.window.requests_total, 1);
+            assert_eq!(week.by_day.len(), 7);
+            assert_eq!(week.by_config[0].0, "fresh-station");
+            assert_eq!(week.by_provider[0].0, "fresh-provider");
+
+            let loaded = state.get_usage_rollup_view("codex", 10, 0).await;
+            assert_eq!(loaded.window.requests_total, 2);
+            assert_eq!(loaded.by_config[0].0, "old-station");
+            assert_eq!(loaded.by_provider[0].0, "old-provider");
         });
     }
 

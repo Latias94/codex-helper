@@ -15,10 +15,7 @@ pub(in crate::tui) enum StatsTarget {
 fn sum_buckets(buckets: &[(i32, UsageBucket)]) -> UsageBucket {
     let mut out = UsageBucket::default();
     for (_, b) in buckets {
-        out.requests_total = out.requests_total.saturating_add(b.requests_total);
-        out.requests_error = out.requests_error.saturating_add(b.requests_error);
-        out.duration_ms_total = out.duration_ms_total.saturating_add(b.duration_ms_total);
-        out.usage.add_assign(&b.usage);
+        out.add_assign(b);
     }
     out
 }
@@ -168,39 +165,19 @@ pub(in crate::tui) fn build_stats_report(
 ) -> Option<String> {
     let target = selected_stats_target(ui, snapshot)?;
 
-    let (since_start_bucket, window_series) = match &target {
-        StatsTarget::Station(name) => {
-            let since = snapshot
-                .usage_rollup
-                .by_config
-                .iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, b)| b.clone())
-                .unwrap_or_default();
-            let series = snapshot
-                .usage_rollup
-                .by_config_day
-                .get(name)
-                .cloned()
-                .unwrap_or_default();
-            (since, series)
-        }
-        StatsTarget::Provider(name) => {
-            let since = snapshot
-                .usage_rollup
-                .by_provider
-                .iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, b)| b.clone())
-                .unwrap_or_default();
-            let series = snapshot
-                .usage_rollup
-                .by_provider_day
-                .get(name)
-                .cloned()
-                .unwrap_or_default();
-            (since, series)
-        }
+    let window_series = match &target {
+        StatsTarget::Station(name) => snapshot
+            .usage_rollup
+            .by_config_day
+            .get(name)
+            .cloned()
+            .unwrap_or_default(),
+        StatsTarget::Provider(name) => snapshot
+            .usage_rollup
+            .by_provider_day
+            .get(name)
+            .cloned()
+            .unwrap_or_default(),
     };
 
     let window_bucket = sum_buckets(&window_series);
@@ -216,7 +193,20 @@ pub(in crate::tui) fn build_stats_report(
     out.push_str(&format!("generated_at_ms: {now_ms}\n"));
     out.push_str(&format!("service: {}\n", ui.service_name));
     out.push_str(&format!("target: {kind} {name}\n"));
-    out.push_str(&format!("window_days: {}\n", ui.stats_days));
+    let window_label = match ui.stats_days {
+        0 => "loaded".to_string(),
+        1 => "today".to_string(),
+        n => format!("{n}d"),
+    };
+    out.push_str(&format!("window: {window_label}\n"));
+    out.push_str(&format!(
+        "loaded_requests: {}  loaded_days_with_data: {}\n",
+        snapshot.usage_rollup.coverage.loaded_requests,
+        snapshot.usage_rollup.coverage.loaded_days_with_data
+    ));
+    if snapshot.usage_rollup.coverage.window_exceeds_loaded_start {
+        out.push_str("coverage_warning: selected window starts before loaded log data\n");
+    }
     out.push_str(&format!(
         "recent_filter: errors_only={}\n",
         ui.stats_errors_only
@@ -237,24 +227,7 @@ pub(in crate::tui) fn build_stats_report(
     out.push_str(&format!("{}\n", fmt_usage_line(&window_bucket.usage)));
     out.push('\n');
 
-    out.push_str("[since start rollup]\n");
-    out.push_str(&format!(
-        "requests: {} (errors {} / {})  avg {}\n",
-        since_start_bucket.requests_total,
-        since_start_bucket.requests_error,
-        fmt_pct(
-            since_start_bucket.requests_error,
-            since_start_bucket.requests_total
-        ),
-        fmt_avg_ms(
-            since_start_bucket.duration_ms_total,
-            since_start_bucket.requests_total
-        ),
-    ));
-    out.push_str(&format!("{}\n", fmt_usage_line(&since_start_bucket.usage)));
-    out.push('\n');
-
-    out.push_str("[recent breakdown (<=200)]\n");
+    out.push_str("[recent sample]\n");
     out.push_str(&format!(
         "requests: {}  errors: {}  2xx/3xx/4xx/5xx: {}/{}/{}/{}\n",
         recent.total,

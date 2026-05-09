@@ -248,6 +248,17 @@ impl CostSummary {
         self.priced_requests == 0 && self.unpriced_requests == 0 && self.total_cost_usd.is_none()
     }
 
+    pub fn add_assign(&mut self, other: &Self) {
+        self.priced_requests = self.priced_requests.saturating_add(other.priced_requests);
+        self.unpriced_requests = self
+            .unpriced_requests
+            .saturating_add(other.unpriced_requests);
+        self.total_cost_femto_usd = self
+            .total_cost_femto_usd
+            .saturating_add(other.total_cost_femto_usd);
+        self.refresh_display();
+    }
+
     pub fn record_usage_cost(&mut self, cost: &CostBreakdown) {
         if matches!(cost.confidence, CostConfidence::Unknown) {
             self.unpriced_requests = self.unpriced_requests.saturating_add(1);

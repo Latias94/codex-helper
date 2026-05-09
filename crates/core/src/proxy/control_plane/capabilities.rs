@@ -56,7 +56,7 @@ pub(in crate::proxy) async fn api_v1_snapshot(
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<ApiV1Snapshot>, (StatusCode, String)> {
     let recent_limit = query.recent_limit.unwrap_or(200).clamp(1, 2_000);
-    let stats_days = query.stats_days.unwrap_or(21).clamp(1, 365);
+    let stats_days = query.stats_days.unwrap_or(7).min(365);
 
     let cfg = proxy.config.snapshot().await;
     let mgr = proxy.service_manager(cfg.as_ref());

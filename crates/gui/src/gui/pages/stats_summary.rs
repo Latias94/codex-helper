@@ -34,46 +34,46 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     egui::Grid::new("stats_kpis_grid")
         .striped(true)
         .show(ui, |ui| {
-            let since = &rollup.since_start;
-            ui.label(pick(ctx.lang, "请求(累计)", "Requests (since start)"));
+            let window = &rollup.window;
+            ui.label(pick(ctx.lang, "请求(窗口)", "Requests (window)"));
             ui.label(format!(
                 "total={}  errors={}  err%={}",
-                since.requests_total,
-                since.requests_error,
-                if since.requests_total == 0 {
+                window.requests_total,
+                window.requests_error,
+                if window.requests_total == 0 {
                     "-".to_string()
                 } else {
                     format!(
                         "{:.1}%",
-                        (since.requests_error as f64) * 100.0 / (since.requests_total as f64)
+                        (window.requests_error as f64) * 100.0 / (window.requests_total as f64)
                     )
                 }
             ));
             ui.end_row();
 
-            ui.label(pick(ctx.lang, "Tokens(累计)", "Tokens (since start)"));
+            ui.label(pick(ctx.lang, "Tokens(窗口)", "Tokens (window)"));
             ui.label(format!(
                 "in={}  out={}  rsn={}  ttl={}",
-                tokens_short(since.usage.input_tokens),
-                tokens_short(since.usage.output_tokens),
-                tokens_short(since.usage.reasoning_output_tokens_total()),
-                tokens_short(since.usage.total_tokens)
+                tokens_short(window.usage.input_tokens),
+                tokens_short(window.usage.output_tokens),
+                tokens_short(window.usage.reasoning_output_tokens_total()),
+                tokens_short(window.usage.total_tokens)
             ));
             ui.end_row();
 
-            if since.usage.has_cache_tokens() {
+            if window.usage.has_cache_tokens() {
                 ui.label(pick(ctx.lang, "Cache Tokens", "Cache tokens"));
                 ui.label(format!(
                     "cached={}  read={}  create={}",
-                    tokens_short(since.usage.cached_input_tokens),
-                    tokens_short(since.usage.cache_read_input_tokens),
-                    tokens_short(since.usage.cache_creation_tokens_total())
+                    tokens_short(window.usage.cached_input_tokens),
+                    tokens_short(window.usage.cache_read_input_tokens),
+                    tokens_short(window.usage.cache_creation_tokens_total())
                 ));
                 ui.end_row();
             }
 
             ui.label(pick(ctx.lang, "成本", "Cost"));
-            ui.label(since.cost.display_total_with_confidence());
+            ui.label(window.cost.display_total_with_confidence());
             ui.end_row();
 
             ui.label(pick(ctx.lang, "窗口(5m)", "Window (5m)"));
@@ -113,8 +113,8 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.separator();
     ui.label(pick(
         ctx.lang,
-        "Tokens / day（最近 14 天）",
-        "Tokens / day (last 14 days)",
+        "Tokens / day（当前窗口）",
+        "Tokens / day (current window)",
     ));
 
     let now_day = (now_ms() / 86_400_000) as i32;
@@ -167,8 +167,8 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.separator();
     ui.label(pick(
         ctx.lang,
-        "Top stations/providers（累计）",
-        "Top stations/providers (since start)",
+        "Top stations/providers（当前窗口）",
+        "Top stations/providers (current window)",
     ));
 
     ui.columns(2, |cols| {

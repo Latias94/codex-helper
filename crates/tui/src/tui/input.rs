@@ -1558,7 +1558,7 @@ async fn handle_key_normal(
             false
         }
         KeyCode::Char('d') if ui.page == Page::Stats => {
-            let options = [7usize, 21usize, 60usize];
+            let options = [1usize, 7usize, 30usize, 0usize];
             let idx = options
                 .iter()
                 .position(|&n| n == ui.stats_days)
@@ -1566,7 +1566,14 @@ async fn handle_key_normal(
             let next = options[(idx + 1) % options.len()];
             ui.stats_days = next;
             ui.needs_snapshot_refresh = true;
-            ui.toast = Some((format!("stats days: {next}"), Instant::now()));
+            let label = if next == 0 {
+                "loaded".to_string()
+            } else if next == 1 {
+                "today".to_string()
+            } else {
+                format!("{next}d")
+            };
+            ui.toast = Some((format!("stats window: {label}"), Instant::now()));
             true
         }
         KeyCode::Char('e') if ui.page == Page::Stats => {

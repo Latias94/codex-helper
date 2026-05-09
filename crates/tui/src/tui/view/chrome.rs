@@ -638,8 +638,8 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
             ),
             Page::Stats => crate::tui::i18n::pick(
                 ui.language,
-                "1-8 页面  q 退出  L 语言  Tab 焦点(station/provider)  ↑/↓ 选择  d 天数(7/21/60)  e 仅看错误(recent)  y 复制+导出报告  ? 帮助",
-                "1-8 pages  q quit  L language  Tab focus(station/provider)  ↑/↓ select  d days(7/21/60)  e errors_only(recent)  y copy+export report  ? help",
+                "1-8 页面  q 退出  L 语言  Tab 焦点(station/provider)  ↑/↓ 选择  d 窗口(today/7d/30d/loaded)  e 仅看错误(recent)  y 复制+导出报告  ? 帮助",
+                "1-8 pages  q quit  L language  Tab focus(station/provider)  ↑/↓ select  d window(today/7d/30d/loaded)  e errors_only(recent)  y copy+export report  ? help",
             ),
             Page::Settings => crate::tui::i18n::pick(
                 ui.language,
