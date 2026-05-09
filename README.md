@@ -575,9 +575,16 @@ codex-helper pricing remove custom-codex
     },
     {
       "id": "my-sub2api",
-      "kind": "openai_balance_http_json",
+      "kind": "sub2api_usage",
       "domains": ["relay.example.com"],
-      "endpoint": "{{base_url}}/user/balance",
+      "poll_interval_secs": 60
+    },
+    {
+      "id": "my-sub2api-dashboard",
+      "kind": "sub2api_auth_me",
+      "domains": ["relay.example.com"],
+      "token_env": "SUB2API_DASHBOARD_JWT",
+      "trust_exhaustion_for_routing": false,
       "poll_interval_secs": 60
     },
     {
@@ -603,7 +610,9 @@ codex-helper pricing remove custom-codex
 - upstream 的 `base_url` host 匹配 `domains` 中任一项，即视为该 provider 的管理对象；
 - 调用 `endpoint` 的认证 token 优先来自 `token_env`，否则尝试使用绑定 upstream 的 `auth.auth_token` / `auth.auth_token_env`（运行时从环境变量解析）；
 - `endpoint` 支持 `{{base_url}}`、`{{upstream_base_url}}`、`{{token}}` / `{{apiKey}}` / `{{accessToken}}`、`{{env:NAME}}` 和 `variables` 模板；`{{base_url}}` 会自动去掉常见的尾部 `/v1`；
-- `openai_balance_http_json` 适配 cc-switch 通用模板 / 常见 sub2api：默认请求 `{{base_url}}/user/balance`，解析 `balance`、`remaining`、`credit`、`subscription_balance`、`pay_as_you_go_balance` 等常见字段；
+- `sub2api_usage` 适配 all-api-hub 风格的 Sub2API API-key 用量探针：默认请求 `{{base_url}}/v1/usage`，解析 `remaining` 和 `usage.total.cost`；如果 upstream 已配置 `auth_token_env`，可以不写 `token_env`；
+- `sub2api_auth_me` 适配 Sub2API 控制台 JWT：默认请求 `{{base_url}}/api/v1/auth/me`，解析 `data.balance`；这通常不是模型 API key；
+- `openai_balance_http_json` 适配 cc-switch 通用模板：默认请求 `{{base_url}}/user/balance`，解析 `balance`、`remaining`、`credit`、`subscription_balance`、`pay_as_you_go_balance` 等常见字段；
 - `new_api_user_self` 适配 New API：默认请求 `{{base_url}}/api/user/self`，按 cc-switch 模板解析 `data.quota` / `data.used_quota`，默认除以 `500000` 转成 USD；
 - 自研接口可以通过 `extract.remaining_balance_paths`、`extract.monthly_spent_paths`、`extract.monthly_budget_paths`、`extract.exhausted_paths` 和 divisor 字段扩展，不需要改 Rust 代码；
 - `refresh_on_request` 控制请求结束后是否自动查询额度，默认 `true`；设为 `false` 可关闭该 provider 的请求后自动刷新；
@@ -705,6 +714,7 @@ cooldown_backoff_max_secs = 600
 - [cli_proxy](https://github.com/guojinpeng/cli_proxy)：多服务守护进程 + Web UI，看板 + 管理功能很全面；
 - [cc-switch](https://github.com/farion1231/cc-switch)：桌面 GUI 级供应商 / MCP 管理器，主打“一处管理、按需应用到各客户端”；codex-helper 的 provider 体验、余额/套餐查询模板、请求用量展示思路参考了它；
 - [aio-coding-hub](https://github.com/dyndynjyxa/aio-coding-hub)：更完整的多 CLI 网关 / 桌面控制台；codex-helper 参考了它在请求链路、成本统计、provider 限额与可观测性上的产品方向。
+- [all-api-hub](https://github.com/qixing-jk/all-api-hub)：浏览器扩展形态的中转账号 / token 管理器；codex-helper 参考了它对 Sub2API、New API、余额历史和用量聚合的适配经验。
 
 codex-helper 借鉴了这些项目的成熟设计，但定位更聚焦：
 

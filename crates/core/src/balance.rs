@@ -46,6 +46,8 @@ pub struct ProviderBalanceSnapshot {
     )]
     pub exhaustion_affects_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_balance_usd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_balance_usd: Option<String>,
@@ -55,6 +57,18 @@ pub struct ProviderBalanceSnapshot {
     pub monthly_budget_usd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monthly_spent_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_used_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub today_used_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_requests: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub today_requests: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub today_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -72,11 +86,18 @@ impl Default for ProviderBalanceSnapshot {
             status: BalanceSnapshotStatus::Unknown,
             exhausted: None,
             exhaustion_affects_routing: true,
+            plan_name: None,
             total_balance_usd: None,
             subscription_balance_usd: None,
             paygo_balance_usd: None,
             monthly_budget_usd: None,
             monthly_spent_usd: None,
+            total_used_usd: None,
+            today_used_usd: None,
+            total_requests: None,
+            today_requests: None,
+            total_tokens: None,
+            today_tokens: None,
             error: None,
         }
     }
@@ -142,10 +163,17 @@ impl ProviderBalanceSnapshot {
             || self.paygo_balance_usd.is_some()
             || self.monthly_budget_usd.is_some()
             || self.monthly_spent_usd.is_some()
+            || self.total_used_usd.is_some()
+            || self.today_used_usd.is_some()
     }
 
     pub fn amount_summary(&self) -> String {
         let mut parts = Vec::new();
+        if let Some(plan) = self.plan_name.as_deref()
+            && !plan.trim().is_empty()
+        {
+            parts.push(format!("plan={plan}"));
+        }
         if let Some(total) = self.total_balance_usd.as_deref() {
             parts.push(format!("total=${total}"));
         }
@@ -155,11 +183,23 @@ impl ProviderBalanceSnapshot {
         if let Some(spent) = self.monthly_spent_usd.as_deref() {
             parts.push(format!("spent=${spent}"));
         }
+        if let Some(used) = self.total_used_usd.as_deref() {
+            parts.push(format!("used=${used}"));
+        }
+        if let Some(today) = self.today_used_usd.as_deref() {
+            parts.push(format!("today=${today}"));
+        }
         if let Some(sub) = self.subscription_balance_usd.as_deref() {
             parts.push(format!("sub=${sub}"));
         }
         if let Some(paygo) = self.paygo_balance_usd.as_deref() {
             parts.push(format!("paygo=${paygo}"));
+        }
+        if let Some(requests) = self.total_requests {
+            parts.push(format!("req={requests}"));
+        }
+        if let Some(tokens) = self.total_tokens {
+            parts.push(format!("tok={tokens}"));
         }
         if parts.is_empty() {
             "-".to_string()
@@ -193,17 +233,22 @@ mod tests {
     #[test]
     fn provider_balance_amount_summary_formats_known_amounts() {
         let snapshot = ProviderBalanceSnapshot {
+            plan_name: Some("monthly".to_string()),
             total_balance_usd: Some("3.5".to_string()),
             monthly_budget_usd: Some("5".to_string()),
             monthly_spent_usd: Some("1.25".to_string()),
+            total_used_usd: Some("7".to_string()),
+            today_used_usd: Some("0.5".to_string()),
             subscription_balance_usd: Some("2".to_string()),
             paygo_balance_usd: Some("1.5".to_string()),
+            total_requests: Some(42),
+            total_tokens: Some(1234),
             ..Default::default()
         };
 
         assert_eq!(
             snapshot.amount_summary(),
-            "total=$3.5 budget=$5 spent=$1.25 sub=$2 paygo=$1.5"
+            "plan=monthly total=$3.5 budget=$5 spent=$1.25 used=$7 today=$0.5 sub=$2 paygo=$1.5 req=42 tok=1234"
         );
     }
 

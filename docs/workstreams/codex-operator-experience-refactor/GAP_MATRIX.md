@@ -174,12 +174,17 @@ Observed from local files:
 - `repo-ref/aio-coding-hub`
   - does not appear to use a generic third-party balance script model
   - emphasizes request logs, provider limit windows, cost multipliers, and Basellm-backed model price sync
+- `repo-ref/all-api-hub`
+  - Sub2API account balance uses dashboard JWT `GET /api/v1/auth/me` and parses `data.balance`
+  - Sub2API model-key telemetry uses `GET /v1/usage` and parses `remaining`, plan metadata, today usage, total usage, and model stats
+  - New API account refresh uses `/api/user/self`, while usage-history sync can pull `/api/log/self` and `/api/log/self/stat`
+  - balance history is stored as daily snapshots with retention, separate from live refresh state
 
 Gap:
 
-- useful behavior now exists and is surfaced in TUI/GUI, but balance adapter coverage is still incomplete
+- useful behavior now exists and is surfaced in TUI/GUI, and adapter coverage now includes the all-api-hub Sub2API `/v1/usage` and `/api/v1/auth/me` patterns
 - sub2api and New API should be the primary relay adapters; official/provider-specific balances are secondary
-- balance/quota still needs clearer policy weighting and operator-facing diagnostics
+- balance/quota still needs richer plan/today-usage fields and clearer operator-facing diagnostics
 - stale/error/exhausted states need to keep feeding routing preview and station eligibility
 
 Recommended fix:

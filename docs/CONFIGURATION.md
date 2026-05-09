@@ -221,35 +221,51 @@ Balance and quota live in a separate local file:
 
 This file describes how codex-helper should fetch provider balance state. Keep it separate from the relay config so provider onboarding stays thin.
 
-For most relay users, start with one of these two adapters:
+For most relay users, start with one of these adapters:
 
-- `sub2api_balance_http_json`: OpenAI-compatible relay balance, usually `GET {{base_url}}/user/balance`.
+- `sub2api_usage`: Sub2API API-key telemetry, usually `GET {{base_url}}/v1/usage`.
+- `sub2api_auth_me`: Sub2API dashboard JWT account balance, usually `GET {{base_url}}/api/v1/auth/me`.
 - `new_api_user_self`: New API dashboard quota, usually `GET {{base_url}}/api/user/self`.
+- `openai_balance_http_json`: generic OpenAI-compatible relay balance, usually `GET {{base_url}}/user/balance`.
 
 `{{base_url}}` is the upstream URL normalized without a trailing `/v1`. Use `{{upstream_base_url}}` if a relay really exposes its balance endpoint under the same `/v1` prefix as chat/completions.
 
-Sub2API-style balance:
+Sub2API API-key telemetry, modeled after all-api-hub's `/v1/usage` probe. If the upstream already has a configured `auth_token_env`, `token_env` can be omitted and codex-helper will reuse the upstream key:
 
 ```json
 {
   "providers": [
     {
       "id": "input-monthly",
-      "kind": "sub2api_balance_http_json",
+      "kind": "sub2api_usage",
       "domains": ["ai.input.im"],
-      "endpoint": "{{base_url}}/user/balance",
-      "token_env": "INPUT_API_KEY",
       "poll_interval_secs": 60,
       "refresh_on_request": true,
-      "trust_exhaustion_for_routing": true,
-      "extract": {
-        "remaining_balance_paths": ["data.remaining_balance"],
-        "exhausted_paths": ["data.exhausted"]
-      }
+      "trust_exhaustion_for_routing": true
     }
   ]
 }
 ```
+
+Sub2API dashboard JWT balance:
+
+```json
+{
+  "providers": [
+    {
+      "id": "input-dashboard",
+      "kind": "sub2api_auth_me",
+      "domains": ["ai.input.im"],
+      "token_env": "INPUT_DASHBOARD_JWT",
+      "poll_interval_secs": 60,
+      "refresh_on_request": true,
+      "trust_exhaustion_for_routing": false
+    }
+  ]
+}
+```
+
+For Sub2API, `sub2api_usage` uses the model API key and can expose remaining quota plus aggregate usage when the relay implements `/v1/usage`. `sub2api_auth_me` uses the dashboard JWT, not the model API key, and is mainly useful when you already maintain that credential separately. Keep `trust_exhaustion_for_routing = false` if a dashboard endpoint reports misleading zero balances for active subscriptions.
 
 New API-style quota:
 
@@ -275,13 +291,15 @@ New API-style quota:
 
 For New API, the dashboard access token and `New-Api-User` value are often not the same as the model API key. Keep them in environment variables.
 
-The generated default file also includes fixed-domain official balance adapters modeled after CC Switch's built-ins: DeepSeek, StepFun, SiliconFlow, OpenRouter, and Novita AI. These are safe as defaults because their domains and account endpoints are unambiguous. For ordinary relays, prefer the explicit `sub2api_balance_http_json` or `new_api_user_self` examples above.
+The generated default file also includes fixed-domain official balance adapters modeled after CC Switch's built-ins: DeepSeek, StepFun, SiliconFlow, OpenRouter, and Novita AI. These are safe as defaults because their domains and account endpoints are unambiguous. For ordinary relays, prefer the explicit `sub2api_usage`, `sub2api_auth_me`, or `new_api_user_self` examples above.
 
 Supported adapter kinds include:
 
 - `openai_balance_http_json`
-- `sub2api_balance_http_json`
 - `relay_balance_http_json`
+- `sub2api_usage`
+- `sub2api_usage_http_json`
+- `sub2api_auth_me`
 - `new_api_user_self`
 - `yescode_profile`
 - `budget_http_json`

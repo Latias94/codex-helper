@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - `version = 3` routing-first 配置成为公开默认格式：用户只需要定义 `providers`，再用 `[codex.routing]` / `[claude.routing]` 描述顺序、pin、标签优先和耗尽处理。 `version = 3` routing-first config is now the public default: users define `providers` once and express order, pins, tag preference, and exhaustion behavior through `[codex.routing]` / `[claude.routing]`.
 - 新增 provider / routing 持久化控制面和 CLI 写入面，用于新增 provider、调整 `routing.order`、pin provider、按标签优先路由，而不再要求用户维护多份 Codex config。 Add provider / routing persisted control-plane and CLI write surfaces for adding providers, editing `routing.order`, pinning providers, and preferring tags without maintaining one Codex config per relay.
 - 新增余额适配与价格目录能力：支持常见 OpenAI-compatible / sub2api 风格余额响应、可配置刷新节流与 `trust_exhaustion_for_routing`，并基于可更新价格目录展示请求成本、cache token 和速度指标。 Add balance adapters and pricing catalog support: common OpenAI-compatible / sub2api-style balance responses, configurable refresh throttling and `trust_exhaustion_for_routing`, plus request cost, cache-token, and speed metrics from an updatable price catalog.
+- 新增参考 all-api-hub 的 Sub2API 余额/用量适配：`sub2api_usage` 默认查询 `/v1/usage`，可用模型 API key 读取 `remaining` 和累计用量；`sub2api_auth_me` 默认查询 `/api/v1/auth/me`，用于 dashboard JWT 账号余额。 Add all-api-hub-inspired Sub2API balance/usage adapters: `sub2api_usage` defaults to `/v1/usage` for model API-key `remaining` and aggregate usage, while `sub2api_auth_me` defaults to `/api/v1/auth/me` for dashboard-JWT account balance.
 
 ### 可复制 routing 示例 / Copyable Routing Recipes
 

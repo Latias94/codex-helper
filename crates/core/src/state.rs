@@ -2655,11 +2655,18 @@ mod tests {
                         status: BalanceSnapshotStatus::Unknown,
                         exhausted: Some(false),
                         exhaustion_affects_routing: true,
+                        plan_name: None,
                         total_balance_usd: Some("3.5".to_string()),
                         subscription_balance_usd: None,
                         paygo_balance_usd: None,
                         monthly_budget_usd: Some("5".to_string()),
                         monthly_spent_usd: Some("1.5".to_string()),
+                        total_used_usd: None,
+                        today_used_usd: None,
+                        total_requests: None,
+                        today_requests: None,
+                        total_tokens: None,
+                        today_tokens: None,
                         error: None,
                     },
                 )
@@ -2701,6 +2708,7 @@ mod tests {
                                 None
                             },
                             exhaustion_affects_routing: true,
+                            plan_name: None,
                             total_balance_usd: if status == BalanceSnapshotStatus::Ok {
                                 Some("3.5".to_string())
                             } else {
@@ -2710,6 +2718,12 @@ mod tests {
                             paygo_balance_usd: None,
                             monthly_budget_usd: None,
                             monthly_spent_usd: None,
+                            total_used_usd: None,
+                            today_used_usd: None,
+                            total_requests: None,
+                            today_requests: None,
+                            total_tokens: None,
+                            today_tokens: None,
                             error: if status == BalanceSnapshotStatus::Error {
                                 Some("decode failed".to_string())
                             } else {
@@ -2792,11 +2806,18 @@ mod tests {
                         status: BalanceSnapshotStatus::Ok,
                         exhausted: Some(false),
                         exhaustion_affects_routing: true,
+                        plan_name: None,
                         total_balance_usd: Some("3.5".to_string()),
                         subscription_balance_usd: None,
                         paygo_balance_usd: None,
                         monthly_budget_usd: None,
                         monthly_spent_usd: None,
+                        total_used_usd: None,
+                        today_used_usd: None,
+                        total_requests: None,
+                        today_requests: None,
+                        total_tokens: None,
+                        today_tokens: None,
                         error: None,
                     },
                 )

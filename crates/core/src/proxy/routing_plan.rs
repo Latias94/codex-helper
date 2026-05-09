@@ -413,11 +413,18 @@ mod tests {
                     _ => None,
                 },
                 exhaustion_affects_routing: true,
+                plan_name: None,
                 total_balance_usd: None,
                 subscription_balance_usd: None,
                 paygo_balance_usd: None,
                 monthly_budget_usd: None,
                 monthly_spent_usd: None,
+                total_used_usd: None,
+                today_used_usd: None,
+                total_requests: None,
+                today_requests: None,
+                total_tokens: None,
+                today_tokens: None,
                 error: None,
             })
             .collect()

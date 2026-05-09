@@ -243,17 +243,34 @@ pub(super) fn render_station_balance_section(
                     if let Some(total) = snapshot.total_balance_usd.as_deref() {
                         parts.push(format!("total=${total}"));
                     }
+                    if let Some(plan) = snapshot.plan_name.as_deref()
+                        && !plan.trim().is_empty()
+                    {
+                        parts.push(format!("plan={plan}"));
+                    }
                     if let Some(budget) = snapshot.monthly_budget_usd.as_deref() {
                         parts.push(format!("budget=${budget}"));
                     }
                     if let Some(spent) = snapshot.monthly_spent_usd.as_deref() {
                         parts.push(format!("spent=${spent}"));
                     }
+                    if let Some(used) = snapshot.total_used_usd.as_deref() {
+                        parts.push(format!("used=${used}"));
+                    }
+                    if let Some(today) = snapshot.today_used_usd.as_deref() {
+                        parts.push(format!("today=${today}"));
+                    }
                     if let Some(sub) = snapshot.subscription_balance_usd.as_deref() {
                         parts.push(format!("sub=${sub}"));
                     }
                     if let Some(paygo) = snapshot.paygo_balance_usd.as_deref() {
                         parts.push(format!("paygo=${paygo}"));
+                    }
+                    if let Some(requests) = snapshot.total_requests {
+                        parts.push(format!("req={requests}"));
+                    }
+                    if let Some(tokens) = snapshot.total_tokens {
+                        parts.push(format!("tok={tokens}"));
                     }
                     if snapshot.stale {
                         parts.push("stale".to_string());

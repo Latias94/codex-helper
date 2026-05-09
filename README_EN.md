@@ -623,9 +623,16 @@ Path: `~/.codex-helper/usage_providers.json`. If it does not exist, codex-helper
     },
     {
       "id": "my-sub2api",
-      "kind": "openai_balance_http_json",
+      "kind": "sub2api_usage",
       "domains": ["relay.example.com"],
-      "endpoint": "{{base_url}}/user/balance",
+      "poll_interval_secs": 60
+    },
+    {
+      "id": "my-sub2api-dashboard",
+      "kind": "sub2api_auth_me",
+      "domains": ["relay.example.com"],
+      "token_env": "SUB2API_DASHBOARD_JWT",
+      "trust_exhaustion_for_routing": false,
       "poll_interval_secs": 60
     },
     {
@@ -656,7 +663,9 @@ For `budget_http_json`:
 For the new generic adapters:
 
 - `endpoint` supports `{{base_url}}`, `{{upstream_base_url}}`, `{{token}}` / `{{apiKey}}` / `{{accessToken}}`, `{{env:NAME}}`, and `variables` templates; `{{base_url}}` is normalized to drop a trailing `/v1` when present;
-- `openai_balance_http_json` covers the cc-switch style generic template / common sub2api relays: it defaults to `{{base_url}}/user/balance` and reads fields such as `balance`, `remaining`, `credit`, `subscription_balance`, and `pay_as_you_go_balance`;
+- `sub2api_usage` covers the all-api-hub style Sub2API API-key telemetry probe: it defaults to `{{base_url}}/v1/usage`, reads `remaining` plus `usage.total.cost`, and can omit `token_env` when the upstream already has `auth_token_env`;
+- `sub2api_auth_me` covers Sub2API dashboard JWT balance: it defaults to `{{base_url}}/api/v1/auth/me` and reads `data.balance`; this usually is not the model API key;
+- `openai_balance_http_json` covers the cc-switch style generic template: it defaults to `{{base_url}}/user/balance` and reads fields such as `balance`, `remaining`, `credit`, `subscription_balance`, and `pay_as_you_go_balance`;
 - `new_api_user_self` covers New API style relays: it defaults to `{{base_url}}/api/user/self` and parses `data.quota` / `data.used_quota`, converting the quota units to USD with the cc-switch-style `500000` divisor by default;
 - custom/self-hosted providers can extend the parser with `extract.remaining_balance_paths`, `extract.monthly_spent_paths`, `extract.monthly_budget_paths`, `extract.exhausted_paths`, and divisor fields without touching Rust code;
 - `refresh_on_request` controls whether a request finish automatically triggers a balance poll for that provider; it defaults to `true`, and `false` disables the request-driven refresh path;
@@ -777,6 +786,7 @@ Note: retries may replay **non-idempotent POST requests** (potential double-bill
 - [cli_proxy](https://github.com/guojinpeng/cli_proxy): a multi-service daemon + Web UI with centralized monitoring.
 - [cc-switch](https://github.com/farion1231/cc-switch): a desktop GUI supplier/MCP manager focused on “manage configs in one place, apply to many clients”. codex-helper references its provider UX, balance/quota query templates, and request usage visibility ideas.
 - [aio-coding-hub](https://github.com/dyndynjyxa/aio-coding-hub): a broader multi-CLI gateway and desktop control console. codex-helper references its request-chain observability, cost tracking, provider limit, and dashboard direction.
+- [all-api-hub](https://github.com/qixing-jk/all-api-hub): a browser-extension account/token manager for relay hubs. codex-helper references its Sub2API, New API, balance-history, and usage-aggregation adapter experience.
 
 codex-helper takes inspiration from these projects, but stays deliberately focused:
 

@@ -24,10 +24,15 @@ enum ProviderKind {
     #[serde(
         rename = "openai_balance_http_json",
         alias = "open_ai_balance_http_json",
-        alias = "sub2api_balance_http_json",
         alias = "relay_balance_http_json"
     )]
     OpenAiBalanceHttpJson,
+    /// Sub2API API-key telemetry endpoint, defaulting to /v1/usage.
+    #[serde(rename = "sub2api_usage", alias = "sub2api_usage_http_json")]
+    Sub2ApiUsage,
+    /// Sub2API dashboard JWT account endpoint, defaulting to /api/v1/auth/me.
+    #[serde(rename = "sub2api_auth_me", alias = "sub2api_auth_me_http_json")]
+    Sub2ApiAuthMe,
     /// New API-style user quota endpoint, defaulting to /api/user/self.
     NewApiUserSelf,
 }
@@ -38,6 +43,8 @@ impl ProviderKind {
             ProviderKind::BudgetHttpJson => "usage_provider:budget_http_json",
             ProviderKind::YescodeProfile => "usage_provider:yescode_profile",
             ProviderKind::OpenAiBalanceHttpJson => "usage_provider:openai_balance_http_json",
+            ProviderKind::Sub2ApiUsage => "usage_provider:sub2api_usage",
+            ProviderKind::Sub2ApiAuthMe => "usage_provider:sub2api_auth_me",
             ProviderKind::NewApiUserSelf => "usage_provider:new_api_user_self",
         }
     }
@@ -45,6 +52,8 @@ impl ProviderKind {
     fn default_endpoint(&self) -> Option<&'static str> {
         match self {
             ProviderKind::OpenAiBalanceHttpJson => Some("{{base_url}}/user/balance"),
+            ProviderKind::Sub2ApiUsage => Some("{{base_url}}/v1/usage"),
+            ProviderKind::Sub2ApiAuthMe => Some("{{base_url}}/api/v1/auth/me"),
             ProviderKind::NewApiUserSelf => Some("{{base_url}}/api/user/self"),
             _ => None,
         }
@@ -656,6 +665,49 @@ fn first_bool_from_paths(
         .find_map(|path| json_value_at_path(value, path).and_then(bool_from_json))
 }
 
+fn string_from_json(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn first_string_from_paths(value: &serde_json::Value, default_paths: &[&str]) -> Option<String> {
+    default_paths
+        .iter()
+        .copied()
+        .find_map(|path| json_value_at_path(value, path).and_then(string_from_json))
+}
+
+fn u64_from_json(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                text.parse::<u64>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn first_u64_from_paths(value: &serde_json::Value, default_paths: &[&str]) -> Option<u64> {
+    default_paths
+        .iter()
+        .copied()
+        .find_map(|path| json_value_at_path(value, path).and_then(u64_from_json))
+}
+
 fn amount_to_string(amount: UsdAmount) -> String {
     amount.format_usd()
 }
@@ -908,6 +960,86 @@ fn balance_http_snapshot_from_json(
     snapshot
 }
 
+fn sub2api_usage_snapshot_from_json(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    value: &serde_json::Value,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    if json_value_at_path(value, "isValid").and_then(bool_from_json) == Some(false) {
+        return base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms)
+            .with_error("sub2api usage response reported invalid API key");
+    }
+
+    let mut snapshot =
+        balance_http_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms);
+    snapshot.plan_name = first_string_from_paths(value, &["planName", "data.planName"]);
+    snapshot.total_used_usd = first_amount_from_paths(
+        value,
+        &[],
+        &["usage.total.cost", "data.usage.total.cost"],
+        None,
+    )
+    .map(amount_to_string);
+    snapshot.today_used_usd = first_amount_from_paths(
+        value,
+        &[],
+        &["usage.today.cost", "data.usage.today.cost"],
+        None,
+    )
+    .map(amount_to_string);
+    snapshot.total_requests = first_u64_from_paths(
+        value,
+        &["usage.total.requests", "data.usage.total.requests"],
+    );
+    snapshot.today_requests = first_u64_from_paths(
+        value,
+        &["usage.today.requests", "data.usage.today.requests"],
+    );
+    snapshot.total_tokens = first_u64_from_paths(
+        value,
+        &[
+            "usage.total.total_tokens",
+            "usage.total.tokens",
+            "data.usage.total.total_tokens",
+            "data.usage.total.tokens",
+        ],
+    );
+    snapshot.today_tokens = first_u64_from_paths(
+        value,
+        &[
+            "usage.today.total_tokens",
+            "usage.today.tokens",
+            "data.usage.today.total_tokens",
+            "data.usage.today.tokens",
+        ],
+    );
+    snapshot.refresh_status(fetched_at_ms);
+    snapshot
+}
+
+fn sub2api_auth_me_snapshot_from_json(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    value: &serde_json::Value,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    if json_value_at_path(value, "code")
+        .and_then(|value| value.as_i64())
+        .is_some_and(|code| code != 0)
+    {
+        let message = json_value_at_path(value, "message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("sub2api auth/me response reported failure");
+        return base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms)
+            .with_error(message.to_string());
+    }
+
+    balance_http_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
+}
+
 fn new_api_snapshot_from_json(
     provider: &UsageProviderConfig,
     upstream: &UpstreamRef,
@@ -1052,6 +1184,20 @@ fn snapshot_from_provider_json(
             yescode_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
         }
         ProviderKind::OpenAiBalanceHttpJson => balance_http_snapshot_from_json(
+            provider,
+            upstream,
+            value,
+            fetched_at_ms,
+            stale_after_ms,
+        ),
+        ProviderKind::Sub2ApiUsage => sub2api_usage_snapshot_from_json(
+            provider,
+            upstream,
+            value,
+            fetched_at_ms,
+            stale_after_ms,
+        ),
+        ProviderKind::Sub2ApiAuthMe => sub2api_auth_me_snapshot_from_json(
             provider,
             upstream,
             value,
@@ -1391,6 +1537,28 @@ mod tests {
     }
 
     #[test]
+    fn sub2api_usage_endpoint_defaults_to_upstream_usage_under_v1() {
+        let mut provider = provider("sub2api", ProviderKind::Sub2ApiUsage);
+        provider.endpoint.clear();
+
+        let endpoint =
+            resolve_endpoint(&provider, "https://relay.example.com/v1", "token").expect("endpoint");
+
+        assert_eq!(endpoint, "https://relay.example.com/v1/usage");
+    }
+
+    #[test]
+    fn sub2api_auth_me_endpoint_defaults_to_dashboard_path_without_v1() {
+        let mut provider = provider("sub2api-auth", ProviderKind::Sub2ApiAuthMe);
+        provider.endpoint.clear();
+
+        let endpoint =
+            resolve_endpoint(&provider, "https://relay.example.com/v1", "token").expect("endpoint");
+
+        assert_eq!(endpoint, "https://relay.example.com/api/v1/auth/me");
+    }
+
+    #[test]
     fn provider_templates_support_variables_for_custom_headers_or_queries() {
         let mut provider = provider("newapi", ProviderKind::NewApiUserSelf);
         provider.endpoint = "{{base_url}}/api/user/self?user={{userId}}".to_string();
@@ -1541,6 +1709,104 @@ mod tests {
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
         assert_eq!(snapshot.total_balance_usd.as_deref(), Some("1.2345"));
+    }
+
+    #[test]
+    fn sub2api_usage_snapshot_reads_all_api_hub_usage_shape() {
+        let snapshot = sub2api_usage_snapshot_from_json(
+            &provider("sub2api", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": true,
+                "mode": "unrestricted",
+                "planName": "CodeX Air",
+                "remaining": 165.0877165,
+                "usage": {
+                    "today": {
+                        "cost": 0,
+                        "requests": 0,
+                        "total_tokens": 0
+                    },
+                    "total": {
+                        "cost": 354.194748,
+                        "requests": 2691,
+                        "total_tokens": 384084697
+                    }
+                }
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert_eq!(snapshot.plan_name.as_deref(), Some("CodeX Air"));
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("165.0877165"));
+        assert_eq!(snapshot.total_used_usd.as_deref(), Some("354.194748"));
+        assert_eq!(snapshot.today_used_usd.as_deref(), Some("0"));
+        assert_eq!(snapshot.total_requests, Some(2691));
+        assert_eq!(snapshot.today_requests, Some(0));
+        assert_eq!(snapshot.total_tokens, Some(384084697));
+        assert_eq!(snapshot.today_tokens, Some(0));
+    }
+
+    #[test]
+    fn sub2api_usage_snapshot_marks_invalid_key_as_error() {
+        let snapshot = sub2api_usage_snapshot_from_json(
+            &provider("sub2api", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": false
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("sub2api usage response reported invalid API key")
+        );
+    }
+
+    #[test]
+    fn sub2api_auth_me_snapshot_reads_dashboard_balance_envelope() {
+        let snapshot = sub2api_auth_me_snapshot_from_json(
+            &provider("sub2api-auth", ProviderKind::Sub2ApiAuthMe),
+            &upstream(),
+            &serde_json::json!({
+                "code": 0,
+                "message": "ok",
+                "data": {
+                    "id": 42,
+                    "username": "demo",
+                    "balance": "12.5"
+                }
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("12.5"));
+    }
+
+    #[test]
+    fn sub2api_auth_me_snapshot_marks_business_error() {
+        let snapshot = sub2api_auth_me_snapshot_from_json(
+            &provider("sub2api-auth", ProviderKind::Sub2ApiAuthMe),
+            &upstream(),
+            &serde_json::json!({
+                "code": 401,
+                "message": "login required"
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
+        assert_eq!(snapshot.error.as_deref(), Some("login required"));
     }
 
     #[test]
