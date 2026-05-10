@@ -25,10 +25,10 @@ It is probably unnecessary if you only use one official account and do not need 
 ## Main Features
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
-- **Safe Codex switch**: `switch on/off` only patches the local proxy section and does not overwrite unrelated Codex edits made during a run.
+- **Safe Codex patching**: only touches the local proxy fields in `~/.codex/config.toml`; unrelated Codex edits are preserved.
 - **Provider / routing config**: `version = 3` is the default schema. Define providers once, then choose the routing recipe.
 - **Failover**: route around failed, unavailable, or trusted-exhausted candidates according to policy.
-- **Balance and plan visibility**: auto-probes common Sub2API, New API, and generic `/user/balance` endpoints. Lookup failures show as `unknown`, not exhausted.
+- **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Request observability**: provider, model, tokens, cache tokens, TTFB, duration, output rate, retry chain, and estimated cost.
 - **TUI and GUI**: built-in TUI for terminal use; GUI for local or attached operation.
 
@@ -208,7 +208,7 @@ Codex-owned files remain owned by Codex:
 - `~/.codex/auth.json`
 - `~/.codex/config.toml`
 
-codex-helper only applies a small local proxy patch during `switch on/off` or the one-command startup path.
+codex-helper only touches the local proxy fields in `~/.codex/config.toml`.
 
 ## Design Boundaries
 

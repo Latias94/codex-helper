@@ -23,10 +23,10 @@ English: [README_EN.md](README_EN.md)
 ## 核心能力
 
 - **本地代理**：默认监听 `127.0.0.1:3211`，Codex 继续按原方式使用。
-- **安全 Codex 开关**：`switch on/off` 只 patch 本地代理相关配置，不会覆盖 Codex 运行期间写入的其他内容。
+- **安全 Codex 局部修改**：只改本地代理片段，不影响 Codex 运行中写入的其他配置。
 - **provider / routing 配置**：`version = 3` 默认格式，新增 provider 后用 routing 决定顺序、固定或标签优先。
 - **自动兜底**：请求失败、上游不可用或可信余额显示耗尽时，可按策略切换候选 provider/upstream。
-- **余额与套餐**：支持 Sub2API、New API、通用 `/user/balance` 等常见接口自动探测；查询失败显示为 `unknown`，不会被当作耗尽。
+- **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
 - **请求可观测**：记录 provider、model、token、cache token、TTFB、总耗时、输出速度、重试链和估算成本。
 - **TUI/GUI**：TUI 内置在命令行里；GUI 可作为本地控制台或 attached 控制台使用。
 
@@ -206,7 +206,7 @@ Codex 自己的文件仍由 Codex 维护：
 - `~/.codex/auth.json`
 - `~/.codex/config.toml`
 
-codex-helper 只在 `switch on/off` 或一键启动时对 Codex 配置做局部 patch。
+codex-helper 只会局部修改 `~/.codex/config.toml` 里的本地代理片段。
 
 ## 设计边界
 
