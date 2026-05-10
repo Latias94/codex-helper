@@ -4,6 +4,7 @@ use crate::config::RetryStrategy;
 use crate::lb::LoadBalancer;
 use crate::logging::log_retry_trace;
 
+use super::attempt_selection::station_upstreams_exhausted;
 use super::retry::{RetryLayerOptions, RetryPlan};
 
 pub(super) fn cross_station_failover_enabled(
@@ -43,7 +44,7 @@ pub(super) fn station_loop_action_after_attempt(
     upstream_total: usize,
     avoid_set: &HashSet<usize>,
 ) -> bool {
-    if upstream_total > 0 && avoid_set.len() >= upstream_total {
+    if station_upstreams_exhausted(upstream_total, avoid_set) {
         log_same_station_failover_trace(
             service_name,
             request_id,
@@ -189,6 +190,24 @@ mod tests {
     fn provider_attempt_limit_respects_cross_station_flag() {
         assert_eq!(provider_attempt_limit(false, 4), 1);
         assert_eq!(provider_attempt_limit(true, 4), 4);
+    }
+
+    #[test]
+    fn station_loop_action_ignores_out_of_range_avoids() {
+        assert!(!station_loop_action_after_attempt(
+            "codex",
+            1,
+            "alpha",
+            2,
+            &HashSet::from([0usize, 99usize])
+        ));
+        assert!(station_loop_action_after_attempt(
+            "codex",
+            1,
+            "alpha",
+            2,
+            &HashSet::from([0usize, 1usize, 99usize])
+        ));
     }
 
     #[test]

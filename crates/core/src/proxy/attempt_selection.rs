@@ -23,7 +23,12 @@ pub(super) fn station_upstreams_exhausted(
     upstream_total: usize,
     avoid_set: &HashSet<usize>,
 ) -> bool {
-    upstream_total > 0 && avoid_set.len() >= upstream_total
+    upstream_total > 0
+        && avoid_set
+            .iter()
+            .filter(|&&idx| idx < upstream_total)
+            .count()
+            >= upstream_total
 }
 
 pub(super) fn select_supported_upstream(
@@ -195,11 +200,22 @@ mod tests {
     }
 
     #[test]
-    fn station_upstreams_exhausted_checks_full_avoid_set() {
-        let avoid_set = HashSet::from([0usize, 2usize]);
-
-        assert!(station_upstreams_exhausted(2, &avoid_set));
-        assert!(!station_upstreams_exhausted(3, &avoid_set));
-        assert!(!station_upstreams_exhausted(0, &avoid_set));
+    fn station_upstreams_exhausted_counts_only_valid_upstream_indices() {
+        assert!(!station_upstreams_exhausted(
+            2,
+            &HashSet::from([0usize, 99usize])
+        ));
+        assert!(station_upstreams_exhausted(
+            2,
+            &HashSet::from([0usize, 1usize, 99usize])
+        ));
+        assert!(!station_upstreams_exhausted(
+            3,
+            &HashSet::from([0usize, 2usize])
+        ));
+        assert!(!station_upstreams_exhausted(
+            0,
+            &HashSet::from([0usize, 1usize])
+        ));
     }
 }

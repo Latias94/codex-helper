@@ -429,6 +429,31 @@ mod tests {
     }
 
     #[test]
+    fn lb_strict_mode_still_falls_back_when_all_usage_exhausted() {
+        let service = make_service(
+            "codex-main",
+            &["https://primary.example", "https://backup.example"],
+        );
+        let states = Arc::new(Mutex::new(HashMap::new()));
+        let lb = LoadBalancer::new(Arc::new(service), states.clone());
+
+        {
+            let mut guard = states.lock().unwrap();
+            let entry = guard
+                .entry("codex-main".to_string())
+                .or_insert_with(LbState::default);
+            entry.ensure_layout(&lb.service.upstreams);
+            entry.usage_exhausted[0] = true;
+            entry.usage_exhausted[1] = true;
+        }
+
+        let selected = lb
+            .select_upstream_avoiding_strict(&HashSet::new())
+            .expect("strict mode should still ignore usage exhaustion on fallback");
+        assert_eq!(selected.index, 0);
+    }
+
+    #[test]
     fn lb_resets_state_when_upstream_layout_changes() {
         let states = Arc::new(Mutex::new(HashMap::new()));
         let initial = LoadBalancer::new(
