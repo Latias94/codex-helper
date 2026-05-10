@@ -226,10 +226,14 @@ pub(super) fn render_station_balance_section(
     cfg: &StationOption,
     balances: Option<&[ProviderBalanceSnapshot]>,
 ) {
-    ui.label(pick(ctx.lang, "余额 / 额度", "Balance / quota"));
+    ui.label(pick(ctx.lang, "余额 / 花费", "Balance / spend"));
     if let Some(balances) = balances {
         if balances.is_empty() {
-            ui.label(pick(ctx.lang, "(无余额数据)", "(no balance data)"));
+            ui.label(pick(
+                ctx.lang,
+                "(无余额/花费数据)",
+                "(no balance/spend data)",
+            ));
             return;
         }
         ui.small(format_station_balance_summary(Some(balances)));
@@ -296,7 +300,11 @@ pub(super) fn render_station_balance_section(
                 }
             });
     } else {
-        ui.label(pick(ctx.lang, "(无余额数据)", "(no balance data)"));
+        ui.label(pick(
+            ctx.lang,
+            "(无余额/花费数据)",
+            "(no balance/spend data)",
+        ));
     }
 }
 

@@ -462,7 +462,7 @@ fn render_bucket_table_stateful(
 ) {
     let header = Row::new(vec![
         Cell::from(Span::styled("name", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("balance", Style::default().fg(p.muted))),
+        Cell::from(Span::styled("balance/spend", Style::default().fg(p.muted))),
         Cell::from(Span::styled("req", Style::default().fg(p.muted))),
         Cell::from(Span::styled("ok%", Style::default().fg(p.muted))),
         Cell::from(Span::styled("ttfb", Style::default().fg(p.muted))),

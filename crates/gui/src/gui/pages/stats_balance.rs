@@ -41,7 +41,7 @@ pub(super) fn render_balance_overview(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) 
         .map(|station| station.stale_rows)
         .sum::<usize>();
     ui.separator();
-    ui.label(pick(ctx.lang, "余额 / 额度", "Balance / quota"));
+    ui.label(pick(ctx.lang, "余额 / 花费", "Balance / spend"));
     let unknown_rows = stations
         .iter()
         .map(|station| station.unknown_rows + station.error_rows)
