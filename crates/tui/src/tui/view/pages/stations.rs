@@ -122,7 +122,7 @@ fn format_routing_order_hint(mode: StationRoutingMode) -> &'static str {
             "pinned target only; breaker_open / empty upstreams block."
         }
         StationRoutingMode::AutoLevelFallback => {
-            "known fully exhausted stations are demoted by default; provider-level exceptions only show balance/spend."
+            "known fully exhausted stations are demoted by default; provider-level exceptions only show balance/quota."
         }
         StationRoutingMode::AutoSingleLevelFallback => {
             "known fully exhausted stations are demoted by default unless a provider opts out of routing trust."
@@ -388,7 +388,7 @@ fn render_v3_routing_page(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["#", "Provider", "On", "Route", "Balance/Spend"])
+    let header = Row::new(["#", "Provider", "On", "Route", "Balance/Quota"])
         .style(Style::default().fg(p.muted))
         .height(1);
     let rows = order
@@ -539,7 +539,7 @@ fn render_v3_routing_page(
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Balance / spend",
+            "Balance / quota",
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
         let balances = routing_provider_balance_snapshots(snapshot, name);
@@ -655,7 +655,7 @@ pub(super) fn render_stations_page(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["Lvl", "Name", "On", "Up", "Balance/Spend", "Health"])
+    let header = Row::new(["Lvl", "Name", "On", "Up", "Balance/Quota", "Health"])
         .style(Style::default().fg(p.muted))
         .height(1);
 
@@ -988,7 +988,7 @@ pub(super) fn render_stations_page(
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Balance / spend",
+            "Balance / quota",
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
         if let Some(balances) = snapshot.provider_balances.get(cfg.name.as_str()) {

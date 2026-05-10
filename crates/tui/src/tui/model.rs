@@ -9,7 +9,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::config::ProxyConfig;
 use crate::dashboard_core::WindowStats;
 pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats;
-use crate::pricing::ModelPriceCatalogSnapshot;
+use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
 use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
     ProviderBalanceSnapshot, ProxyState, ResolvedRouteValue, SessionIdentityCard,
@@ -402,6 +402,14 @@ pub(in crate::tui) fn balance_status_style(p: Palette, status: BalanceSnapshotSt
 }
 
 pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
+    if snapshot.unlimited_quota == Some(true) {
+        return Some("unlimited".to_string());
+    }
+
+    if let Some(amount) = quota_amount_brief(snapshot) {
+        return Some(amount);
+    }
+
     if let Some(total) = snapshot
         .total_balance_usd
         .as_deref()
@@ -448,12 +456,29 @@ pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -
             .map(str::trim)
             .filter(|value| !value.is_empty()),
     ) {
-        (Some(spent), Some(budget)) => Some(format!(
-            "spent {} / budget {}",
-            usd_brief(spent),
-            usd_brief(budget)
-        )),
-        (Some(spent), None) => Some(format!("spent {}", usd_brief(spent))),
+        (Some(spent), Some(budget)) => {
+            if let Some(left) = left_brief_from_budget_and_spent(budget, spent) {
+                Some(format!("left {} / budget {}", left, usd_brief(budget)))
+            } else {
+                Some(format!(
+                    "budget {} / used {}",
+                    usd_brief(budget),
+                    usd_brief(spent)
+                ))
+            }
+        }
+        (Some(spent), None) => {
+            if snapshot.plan_name.is_none()
+                && snapshot.quota_period.is_none()
+                && snapshot.quota_remaining_usd.is_none()
+                && snapshot.quota_limit_usd.is_none()
+                && snapshot.quota_used_usd.is_none()
+            {
+                Some(format!("used {}", usd_brief(spent)))
+            } else {
+                None
+            }
+        }
         (None, Some(budget)) => Some(format!("budget {}", usd_brief(budget))),
         (None, None) => snapshot
             .total_used_usd
@@ -472,8 +497,64 @@ pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -
     }
 }
 
+fn quota_amount_brief(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
+    let period = snapshot
+        .quota_period
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let remaining = snapshot
+        .quota_remaining_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let limit = snapshot
+        .quota_limit_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let used = snapshot
+        .quota_used_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if remaining.is_none() && limit.is_none() && used.is_none() {
+        return None;
+    }
+
+    let quota_label = match period {
+        Some("quota") | None => "quota".to_string(),
+        Some(period) => period.to_string(),
+    };
+
+    let amount = match (remaining, limit, used) {
+        (Some(remaining), Some(limit), _) => {
+            format!("left {} / {}", usd_brief(remaining), usd_brief(limit))
+        }
+        (Some(remaining), None, Some(used)) => {
+            format!("left {} / used {}", usd_brief(remaining), usd_brief(used))
+        }
+        (Some(remaining), None, None) => format!("left {}", usd_brief(remaining)),
+        (None, Some(limit), Some(used)) => {
+            format!("used {} / {}", usd_brief(used), usd_brief(limit))
+        }
+        (None, Some(limit), None) => format!("limit {}", usd_brief(limit)),
+        (None, None, Some(used)) => format!("used {}", usd_brief(used)),
+        (None, None, None) => return None,
+    };
+
+    Some(format!("{quota_label} {amount}"))
+}
+
 fn usd_brief(raw: &str) -> String {
     format!("${}", decimal_brief(raw))
+}
+
+fn left_brief_from_budget_and_spent(budget: &str, spent: &str) -> Option<String> {
+    let budget = UsdAmount::from_decimal_str(budget)?;
+    let spent = UsdAmount::from_decimal_str(spent)?;
+    Some(format!("${}", budget.saturating_sub(spent).format_usd()))
 }
 
 fn decimal_brief(raw: &str) -> String {
@@ -1235,6 +1316,37 @@ mod tests {
         assert_eq!(
             provider_balance_compact(&snapshot, 80),
             "CodeX Air left $165.08"
+        );
+    }
+
+    #[test]
+    fn provider_balance_compact_prefers_unlimited_over_spend() {
+        let snapshot = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Ok,
+            plan_name: Some("cx".to_string()),
+            unlimited_quota: Some(true),
+            quota_used_usd: Some("106065.94".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+
+        assert_eq!(provider_balance_compact(&snapshot, 80), "cx unlimited");
+    }
+
+    #[test]
+    fn provider_balance_compact_shows_quota_window_instead_of_spend() {
+        let snapshot = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Exhausted,
+            plan_name: Some("CodeX Lite 年度".to_string()),
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("0".to_string()),
+            quota_limit_usd: Some("100".to_string()),
+            quota_used_usd: Some("100.468025".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+
+        assert_eq!(
+            provider_balance_compact(&snapshot, 120),
+            "exh CodeX Lite 年度 daily left $0 / $100.00"
         );
     }
 

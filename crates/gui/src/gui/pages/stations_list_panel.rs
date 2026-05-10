@@ -61,7 +61,7 @@ pub(super) fn render_station_list_panel(
                 let capability_hover =
                     runtime_config_capability_hover_text(ctx.lang, &cfg.capabilities);
                 let hover = format!(
-                    "health: {health_label}\nbalance/spend: {balance_label}\nbreaker: {breaker_label}\n{}\nsource: {}",
+                    "health: {health_label}\nbalance/quota: {balance_label}\nbreaker: {breaker_label}\n{}\nsource: {}",
                     capability_hover,
                     format_runtime_station_source(ctx.lang, cfg)
                 );

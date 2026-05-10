@@ -106,7 +106,7 @@ fn pricing_catalog_preview_lines(snapshot: &Snapshot, limit: usize) -> Vec<Strin
 fn balance_overview_lines(snapshot: &Snapshot, limit: usize) -> Vec<String> {
     let mut stations = summarize_station_balances(&snapshot.provider_balances);
     if stations.is_empty() {
-        return vec!["no balance/spend data".to_string()];
+        return vec!["no balance/quota data".to_string()];
     }
 
     stations.sort_by(|left, right| {
@@ -425,7 +425,7 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "余额 / 花费概览", "Balance / spend overview"),
+        crate::tui::i18n::pick(ui.language, "余额 / 配额概览", "Balance / quota overview"),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     for line in balance_overview_lines(snapshot, 6) {

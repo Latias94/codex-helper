@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -219,6 +220,7 @@ static LAST_USAGE_POLL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::ne
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 // Minimal poll interval per provider to avoid hammering usage APIs.
 const MIN_POLL_INTERVAL_SECS: u64 = 20;
+const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
 const AUTO_PROBE_KINDS: [ProviderKind; 4] = [
     ProviderKind::Sub2ApiUsage,
@@ -943,6 +945,14 @@ fn amount_to_string(amount: UsdAmount) -> String {
     amount.format_usd()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuotaWindowSnapshot {
+    period: &'static str,
+    remaining: UsdAmount,
+    used: UsdAmount,
+    limit: UsdAmount,
+}
+
 fn base_snapshot(
     provider: &UsageProviderConfig,
     upstream: &UpstreamRef,
@@ -1246,24 +1256,29 @@ fn populate_sub2api_usage_fields(
 
 fn sub2api_subscription_limit_snapshot(
     value: &serde_json::Value,
+    period: &'static str,
     limit_paths: &[&str],
     usage_paths: &[&str],
-) -> Option<(UsdAmount, UsdAmount, UsdAmount)> {
+) -> Option<QuotaWindowSnapshot> {
     let budget = first_amount_from_paths(value, &[], limit_paths, None)?;
     if budget.is_zero() {
         return None;
     }
     let spent = first_amount_from_paths(value, &[], usage_paths, None).unwrap_or(UsdAmount::ZERO);
     let remaining = budget.saturating_sub(spent);
-    Some((remaining, spent, budget))
+    Some(QuotaWindowSnapshot {
+        period,
+        remaining,
+        used: spent,
+        limit: budget,
+    })
 }
 
-fn sub2api_limiting_subscription_window(
-    value: &serde_json::Value,
-) -> Option<(UsdAmount, UsdAmount, UsdAmount)> {
+fn sub2api_limiting_subscription_window(value: &serde_json::Value) -> Option<QuotaWindowSnapshot> {
     let windows = [
         sub2api_subscription_limit_snapshot(
             value,
+            "daily",
             &[
                 "subscription.daily_limit_usd",
                 "data.subscription.daily_limit_usd",
@@ -1275,6 +1290,7 @@ fn sub2api_limiting_subscription_window(
         ),
         sub2api_subscription_limit_snapshot(
             value,
+            "weekly",
             &[
                 "subscription.weekly_limit_usd",
                 "data.subscription.weekly_limit_usd",
@@ -1286,6 +1302,7 @@ fn sub2api_limiting_subscription_window(
         ),
         sub2api_subscription_limit_snapshot(
             value,
+            "monthly",
             &[
                 "subscription.monthly_limit_usd",
                 "data.subscription.monthly_limit_usd",
@@ -1300,7 +1317,7 @@ fn sub2api_limiting_subscription_window(
     windows
         .into_iter()
         .flatten()
-        .min_by_key(|(remaining, _, _)| *remaining)
+        .min_by_key(|window| window.remaining)
 }
 
 fn sub2api_usage_snapshot_from_json(
@@ -1319,7 +1336,7 @@ fn sub2api_usage_snapshot_from_json(
     let has_subscription = has_any_json_path(value, &["subscription", "data.subscription"]);
 
     if mode.as_deref() == Some("quota_limited") {
-        let remaining_balance = first_amount_from_paths(
+        let quota_remaining = first_amount_from_paths(
             value,
             &provider.extract.remaining_balance_paths,
             &[
@@ -1330,13 +1347,13 @@ fn sub2api_usage_snapshot_from_json(
             ],
             provider.extract.remaining_divisor,
         );
-        let budget = first_amount_from_paths(
+        let quota_limit = first_amount_from_paths(
             value,
             &provider.extract.monthly_budget_paths,
             &["quota.limit", "data.quota.limit"],
             provider.extract.monthly_budget_divisor,
         );
-        let spent = first_amount_from_paths(
+        let quota_used = first_amount_from_paths(
             value,
             &provider.extract.monthly_spent_paths,
             &["quota.used", "data.quota.used"],
@@ -1352,12 +1369,15 @@ fn sub2api_usage_snapshot_from_json(
                 "data.quota_exhausted",
             ],
         )
-        .or_else(|| remaining_balance.map(UsdAmount::is_zero));
+        .or_else(|| quota_remaining.map(UsdAmount::is_zero));
 
         let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
-        snapshot.total_balance_usd = remaining_balance.map(amount_to_string);
-        snapshot.monthly_budget_usd = budget.map(amount_to_string);
-        snapshot.monthly_spent_usd = spent.map(amount_to_string);
+        snapshot.quota_period = Some("quota".to_string());
+        snapshot.quota_remaining_usd = quota_remaining.map(amount_to_string);
+        snapshot.quota_limit_usd = quota_limit.map(amount_to_string);
+        snapshot.quota_used_usd = quota_used.map(amount_to_string);
+        snapshot.monthly_budget_usd = quota_limit.map(amount_to_string);
+        snapshot.monthly_spent_usd = quota_used.map(amount_to_string);
         snapshot.exhausted = exhausted;
         populate_sub2api_usage_fields(&mut snapshot, value);
         snapshot.refresh_status(fetched_at_ms);
@@ -1376,13 +1396,17 @@ fn sub2api_usage_snapshot_from_json(
                 "data.quota_exhausted",
             ],
         )
-        .or_else(|| limiting_window.map(|(remaining, _, _)| remaining.is_zero()))
+        .or_else(|| limiting_window.map(|window| window.remaining.is_zero()))
         .or(Some(false));
 
         let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
-        if let Some((_, spent, budget)) = limiting_window {
-            snapshot.monthly_budget_usd = Some(amount_to_string(budget));
-            snapshot.monthly_spent_usd = Some(amount_to_string(spent));
+        if let Some(window) = limiting_window {
+            snapshot.quota_period = Some(window.period.to_string());
+            snapshot.quota_remaining_usd = Some(amount_to_string(window.remaining));
+            snapshot.quota_limit_usd = Some(amount_to_string(window.limit));
+            snapshot.quota_used_usd = Some(amount_to_string(window.used));
+            snapshot.monthly_budget_usd = Some(amount_to_string(window.limit));
+            snapshot.monthly_spent_usd = Some(amount_to_string(window.used));
         }
         snapshot.exhausted = exhausted;
         populate_sub2api_usage_fields(&mut snapshot, value);
@@ -1500,11 +1524,17 @@ fn new_api_token_usage_snapshot_from_json(
 
     let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
     snapshot.plan_name = first_string_from_paths(value, &["data.name", "name"]);
+    snapshot.unlimited_quota = Some(unlimited_quota);
     if !unlimited_quota {
-        snapshot.total_balance_usd = remaining_balance.map(amount_to_string);
+        snapshot.quota_period = Some("token".to_string());
+        snapshot.quota_remaining_usd = remaining_balance.map(amount_to_string);
+        snapshot.quota_limit_usd = monthly_budget.map(amount_to_string);
+        snapshot.quota_used_usd = monthly_spent.map(amount_to_string);
         snapshot.monthly_budget_usd = monthly_budget.map(amount_to_string);
+        snapshot.monthly_spent_usd = monthly_spent.map(amount_to_string);
+    } else {
+        snapshot.monthly_spent_usd = monthly_spent.map(amount_to_string);
     }
-    snapshot.monthly_spent_usd = monthly_spent.map(amount_to_string);
     snapshot.exhausted = exhausted;
     snapshot.refresh_status(fetched_at_ms);
     snapshot
@@ -1574,11 +1604,17 @@ fn new_api_snapshot_from_json(
     };
 
     let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
+    snapshot.unlimited_quota = Some(unlimited_quota);
     if !unlimited_quota {
-        snapshot.total_balance_usd = remaining_balance.map(amount_to_string);
+        snapshot.quota_period = Some("quota".to_string());
+        snapshot.quota_remaining_usd = remaining_balance.map(amount_to_string);
+        snapshot.quota_limit_usd = monthly_budget.map(amount_to_string);
+        snapshot.quota_used_usd = monthly_spent.map(amount_to_string);
         snapshot.monthly_budget_usd = monthly_budget.map(amount_to_string);
+        snapshot.monthly_spent_usd = monthly_spent.map(amount_to_string);
+    } else {
+        snapshot.monthly_spent_usd = monthly_spent.map(amount_to_string);
     }
-    snapshot.monthly_spent_usd = monthly_spent.map(amount_to_string);
     snapshot.exhausted = exhausted;
     snapshot.refresh_status(fetched_at_ms);
     snapshot
@@ -1842,6 +1878,138 @@ async fn refresh_provider_target(
     }
 }
 
+struct ConfiguredRefreshJob<'a> {
+    provider: &'a UsageProviderConfig,
+    target: UsageProviderTarget,
+    interval_secs: u64,
+}
+
+struct AutoRefreshJob {
+    target: UsageProviderTarget,
+}
+
+async fn run_configured_refresh_job<'a>(
+    client: &'a Client,
+    job: ConfiguredRefreshJob<'a>,
+    cfg: &'a ProxyConfig,
+    lb_states: &'a Arc<Mutex<HashMap<String, LbState>>>,
+    state: &'a Arc<ProxyState>,
+    service_name: &'a str,
+) -> (String, UsageProviderRefreshOutcome) {
+    let provider_id = job.provider.id.clone();
+    let outcome = refresh_provider_target(RefreshProviderTargetParams {
+        client,
+        provider: job.provider,
+        target: &job.target,
+        cfg,
+        lb_states,
+        state,
+        service_name,
+        interval_secs: job.interval_secs,
+    })
+    .await;
+    (provider_id, outcome)
+}
+
+async fn run_auto_refresh_job(
+    client: &Client,
+    job: AutoRefreshJob,
+    cfg: &ProxyConfig,
+    lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
+    state: &Arc<ProxyState>,
+    service_name: &str,
+) -> UsageProviderRefreshOutcome {
+    auto_probe_provider_target(client, &job.target, cfg, lb_states, state, service_name).await
+}
+
+async fn run_configured_refresh_jobs<'a>(
+    client: &'a Client,
+    jobs: Vec<ConfiguredRefreshJob<'a>>,
+    cfg: &'a ProxyConfig,
+    lb_states: &'a Arc<Mutex<HashMap<String, LbState>>>,
+    state: &'a Arc<ProxyState>,
+    service_name: &'a str,
+) -> Vec<(String, UsageProviderRefreshOutcome)> {
+    let mut pending = jobs.into_iter();
+    let mut running = FuturesUnordered::new();
+    let mut results = Vec::new();
+    let concurrency = BALANCE_REFRESH_CONCURRENCY.max(1);
+
+    for _ in 0..concurrency {
+        let Some(job) = pending.next() else {
+            break;
+        };
+        running.push(run_configured_refresh_job(
+            client,
+            job,
+            cfg,
+            lb_states,
+            state,
+            service_name,
+        ));
+    }
+
+    while let Some(result) = running.next().await {
+        results.push(result);
+        if let Some(job) = pending.next() {
+            running.push(run_configured_refresh_job(
+                client,
+                job,
+                cfg,
+                lb_states,
+                state,
+                service_name,
+            ));
+        }
+    }
+
+    results
+}
+
+async fn run_auto_refresh_jobs(
+    client: &Client,
+    jobs: Vec<AutoRefreshJob>,
+    cfg: &ProxyConfig,
+    lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
+    state: &Arc<ProxyState>,
+    service_name: &str,
+) -> Vec<UsageProviderRefreshOutcome> {
+    let mut pending = jobs.into_iter();
+    let mut running = FuturesUnordered::new();
+    let mut results = Vec::new();
+    let concurrency = BALANCE_REFRESH_CONCURRENCY.max(1);
+
+    for _ in 0..concurrency {
+        let Some(job) = pending.next() else {
+            break;
+        };
+        running.push(run_auto_refresh_job(
+            client,
+            job,
+            cfg,
+            lb_states,
+            state,
+            service_name,
+        ));
+    }
+
+    while let Some(result) = running.next().await {
+        results.push(result);
+        if let Some(job) = pending.next() {
+            running.push(run_auto_refresh_job(
+                client,
+                job,
+                cfg,
+                lb_states,
+                state,
+                service_name,
+            ));
+        }
+    }
+
+    results
+}
+
 fn auto_snapshot_is_usable(snapshot: &ProviderBalanceSnapshot) -> bool {
     snapshot.error.is_none()
         && matches!(
@@ -2037,53 +2205,58 @@ pub async fn refresh_balances_for_service(
     };
 
     let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut client: Option<Client> = None;
-    for provider in providers_file.providers {
+    let client = Client::new();
+    let mut configured_jobs = Vec::new();
+    for provider in &providers_file.providers {
         if provider_id_filter.is_some_and(|filter| filter != provider.id.as_str()) {
             continue;
         }
 
-        let targets = matching_provider_targets(&cfg, service_name, &provider, station_name_filter);
+        let targets = matching_provider_targets(&cfg, service_name, provider, station_name_filter);
         if targets.is_empty() {
             continue;
         }
 
         summary.providers_matched += 1;
         summary.upstreams_matched += targets.len();
-        warn_if_provider_spans_hosts(&cfg, service_name, &provider);
+        warn_if_provider_spans_hosts(&cfg, service_name, provider);
 
-        let interval_secs = snapshot_refresh_interval_secs(&provider);
-        let mut refreshed_any_target = false;
+        let interval_secs = snapshot_refresh_interval_secs(provider);
         for target in targets {
             summary.attempted += 1;
-            let c = client.get_or_insert_with(Client::new);
-            match refresh_provider_target(RefreshProviderTargetParams {
-                client: c,
-                provider: &provider,
-                target: &target,
-                cfg: &cfg,
-                lb_states: &lb_states,
-                state: &state,
-                service_name,
+            configured_jobs.push(ConfiguredRefreshJob {
+                provider,
+                target,
                 interval_secs,
-            })
-            .await
-            {
+            });
+        }
+    }
+
+    let mut refreshed_provider_ids = HashSet::new();
+    if !configured_jobs.is_empty() {
+        for (provider_id, outcome) in run_configured_refresh_jobs(
+            &client,
+            configured_jobs,
+            &cfg,
+            &lb_states,
+            &state,
+            service_name,
+        )
+        .await
+        {
+            match outcome {
                 UsageProviderRefreshOutcome::Refreshed => {
-                    refreshed_any_target = true;
                     summary.refreshed += 1;
+                    refreshed_provider_ids.insert(provider_id);
                 }
                 UsageProviderRefreshOutcome::Failed => summary.failed += 1,
                 UsageProviderRefreshOutcome::MissingToken => summary.missing_token += 1,
             }
         }
-
-        if refreshed_any_target && let Ok(mut map) = poll_map.lock() {
-            map.insert(provider.id.clone(), Instant::now());
-        }
     }
 
     if provider_id_filter.is_none() {
+        let mut auto_jobs = Vec::new();
         for target in usage_provider_targets(&cfg, service_name, station_name_filter) {
             if configured_keys.contains(&target_key(&target)) {
                 continue;
@@ -2091,22 +2264,37 @@ pub async fn refresh_balances_for_service(
 
             summary.attempted += 1;
             summary.auto_attempted += 1;
-            let c = client.get_or_insert_with(Client::new);
-            match auto_probe_provider_target(c, &target, &cfg, &lb_states, &state, service_name)
-                .await
+            auto_jobs.push(AutoRefreshJob { target });
+        }
+
+        if !auto_jobs.is_empty() {
+            for outcome in
+                run_auto_refresh_jobs(&client, auto_jobs, &cfg, &lb_states, &state, service_name)
+                    .await
             {
-                UsageProviderRefreshOutcome::Refreshed => {
-                    summary.refreshed += 1;
-                    summary.auto_refreshed += 1;
-                }
-                UsageProviderRefreshOutcome::Failed => {
-                    summary.failed += 1;
-                    summary.auto_failed += 1;
-                }
-                UsageProviderRefreshOutcome::MissingToken => {
-                    summary.missing_token += 1;
+                match outcome {
+                    UsageProviderRefreshOutcome::Refreshed => {
+                        summary.refreshed += 1;
+                        summary.auto_refreshed += 1;
+                    }
+                    UsageProviderRefreshOutcome::Failed => {
+                        summary.failed += 1;
+                        summary.auto_failed += 1;
+                    }
+                    UsageProviderRefreshOutcome::MissingToken => {
+                        summary.missing_token += 1;
+                    }
                 }
             }
+        }
+    }
+
+    if !refreshed_provider_ids.is_empty()
+        && let Ok(mut map) = poll_map.lock()
+    {
+        let now = Instant::now();
+        for provider_id in refreshed_provider_ids {
+            map.insert(provider_id, now);
         }
     }
 
@@ -2151,10 +2339,11 @@ pub async fn poll_for_codex_upstream(
 
     let now = Instant::now();
     let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut client: Option<Client> = None;
+    let client = Client::new();
     let mut matched_configured_provider = false;
+    let mut configured_jobs = Vec::new();
 
-    for provider in providers_file.providers {
+    for provider in &providers_file.providers {
         if !domain_matches(&current_target.base_url, &provider.domains) {
             continue;
         }
@@ -2177,18 +2366,23 @@ pub async fn poll_for_codex_upstream(
             map.insert(provider.id.clone(), now);
         }
 
-        warn_if_provider_spans_hosts(&cfg, service_name, &provider);
-        let c = client.get_or_insert_with(Client::new);
-        let _ = refresh_provider_target(RefreshProviderTargetParams {
-            client: c,
-            provider: &provider,
-            target: &current_target,
-            cfg: &cfg,
-            lb_states: &lb_states,
-            state: &state,
-            service_name,
+        warn_if_provider_spans_hosts(&cfg, service_name, provider);
+        configured_jobs.push(ConfiguredRefreshJob {
+            provider,
+            target: current_target.clone(),
             interval_secs,
-        })
+        });
+    }
+
+    if !configured_jobs.is_empty() {
+        let _ = run_configured_refresh_jobs(
+            &client,
+            configured_jobs,
+            &cfg,
+            &lb_states,
+            &state,
+            service_name,
+        )
         .await;
     }
 
@@ -2218,9 +2412,15 @@ pub async fn poll_for_codex_upstream(
         map.insert(auto_provider.id.clone(), now);
     }
 
-    let c = client.get_or_insert_with(Client::new);
-    let _ = auto_probe_provider_target(c, &current_target, &cfg, &lb_states, &state, service_name)
-        .await;
+    let _ = auto_probe_provider_target(
+        &client,
+        &current_target,
+        &cfg,
+        &lb_states,
+        &state,
+        service_name,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -2743,6 +2943,10 @@ mod tests {
         assert_eq!(snapshot.exhausted, Some(true));
         assert_eq!(snapshot.plan_name.as_deref(), Some("CodeX Lite 年度"));
         assert_eq!(snapshot.total_balance_usd, None);
+        assert_eq!(snapshot.quota_period.as_deref(), Some("daily"));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("0"));
+        assert_eq!(snapshot.quota_limit_usd.as_deref(), Some("100"));
+        assert_eq!(snapshot.quota_used_usd.as_deref(), Some("100.468025"));
         assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("100"));
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("100.468025"));
         assert_eq!(snapshot.total_used_usd.as_deref(), Some("702.492098"));
@@ -2771,7 +2975,11 @@ mod tests {
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
         assert_eq!(snapshot.exhausted, Some(true));
-        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("0"));
+        assert_eq!(snapshot.total_balance_usd, None);
+        assert_eq!(snapshot.quota_period.as_deref(), Some("quota"));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("0"));
+        assert_eq!(snapshot.quota_limit_usd.as_deref(), Some("10"));
+        assert_eq!(snapshot.quota_used_usd.as_deref(), Some("10"));
         assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("10"));
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("10"));
     }
@@ -2964,7 +3172,11 @@ mod tests {
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
         assert_eq!(snapshot.exhausted, Some(false));
-        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("1"));
+        assert_eq!(snapshot.total_balance_usd, None);
+        assert_eq!(snapshot.quota_period.as_deref(), Some("quota"));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("1"));
+        assert_eq!(snapshot.quota_limit_usd.as_deref(), Some("1.5"));
+        assert_eq!(snapshot.quota_used_usd.as_deref(), Some("0.5"));
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("0.5"));
         assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("1.5"));
     }
@@ -2991,6 +3203,7 @@ mod tests {
         assert_eq!(snapshot.total_balance_usd, None);
         assert_eq!(snapshot.monthly_budget_usd, None);
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("0.5"));
+        assert_eq!(snapshot.unlimited_quota, Some(true));
     }
 
     #[test]
@@ -3020,6 +3233,7 @@ mod tests {
         assert_eq!(snapshot.total_balance_usd, None);
         assert_eq!(snapshot.monthly_budget_usd, None);
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("0.5"));
+        assert_eq!(snapshot.unlimited_quota, Some(true));
     }
 
     #[test]

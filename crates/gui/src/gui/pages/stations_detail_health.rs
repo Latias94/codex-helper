@@ -226,13 +226,13 @@ pub(super) fn render_station_balance_section(
     cfg: &StationOption,
     balances: Option<&[ProviderBalanceSnapshot]>,
 ) {
-    ui.label(pick(ctx.lang, "余额 / 花费", "Balance / spend"));
+    ui.label(pick(ctx.lang, "余额 / 配额", "Balance / quota"));
     if let Some(balances) = balances {
         if balances.is_empty() {
             ui.label(pick(
                 ctx.lang,
-                "(无余额/花费数据)",
-                "(no balance/spend data)",
+                "(无余额/配额数据)",
+                "(no balance/quota data)",
             ));
             return;
         }
@@ -244,31 +244,63 @@ pub(super) fn render_station_balance_section(
             .show(ui, |ui| {
                 for snapshot in balances.iter().rev().take(12) {
                     let mut parts = vec![balance_status_label(snapshot.status).to_string()];
-                    if let Some(total) = snapshot.total_balance_usd.as_deref() {
-                        parts.push(format!("total=${total}"));
-                    }
                     if let Some(plan) = snapshot.plan_name.as_deref()
                         && !plan.trim().is_empty()
                     {
                         parts.push(format!("plan={plan}"));
                     }
-                    if let Some(budget) = snapshot.monthly_budget_usd.as_deref() {
-                        parts.push(format!("budget=${budget}"));
-                    }
-                    if let Some(spent) = snapshot.monthly_spent_usd.as_deref() {
-                        parts.push(format!("spent=${spent}"));
-                    }
-                    if let Some(used) = snapshot.total_used_usd.as_deref() {
-                        parts.push(format!("used=${used}"));
-                    }
-                    if let Some(today) = snapshot.today_used_usd.as_deref() {
-                        parts.push(format!("today=${today}"));
-                    }
-                    if let Some(sub) = snapshot.subscription_balance_usd.as_deref() {
-                        parts.push(format!("sub=${sub}"));
-                    }
-                    if let Some(paygo) = snapshot.paygo_balance_usd.as_deref() {
-                        parts.push(format!("paygo=${paygo}"));
+                    if snapshot.unlimited_quota == Some(true) {
+                        parts.push("unlimited".to_string());
+                    } else if snapshot.quota_period.is_some()
+                        || snapshot.quota_remaining_usd.is_some()
+                        || snapshot.quota_limit_usd.is_some()
+                        || snapshot.quota_used_usd.is_some()
+                    {
+                        let quota_label = snapshot
+                            .quota_period
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(|period| {
+                                if period == "quota" {
+                                    "quota".to_string()
+                                } else {
+                                    format!("{period} quota")
+                                }
+                            })
+                            .unwrap_or_else(|| "quota".to_string());
+                        parts.push(quota_label);
+                        if let Some(remaining) = snapshot.quota_remaining_usd.as_deref() {
+                            parts.push(format!("left=${remaining}"));
+                        }
+                        if let Some(limit) = snapshot.quota_limit_usd.as_deref() {
+                            parts.push(format!("limit=${limit}"));
+                        }
+                        if let Some(used) = snapshot.quota_used_usd.as_deref() {
+                            parts.push(format!("used=${used}"));
+                        }
+                    } else {
+                        if let Some(total) = snapshot.total_balance_usd.as_deref() {
+                            parts.push(format!("total=${total}"));
+                        }
+                        if let Some(budget) = snapshot.monthly_budget_usd.as_deref() {
+                            parts.push(format!("budget=${budget}"));
+                        }
+                        if let Some(spent) = snapshot.monthly_spent_usd.as_deref() {
+                            parts.push(format!("spent=${spent}"));
+                        }
+                        if let Some(used) = snapshot.total_used_usd.as_deref() {
+                            parts.push(format!("used=${used}"));
+                        }
+                        if let Some(today) = snapshot.today_used_usd.as_deref() {
+                            parts.push(format!("today=${today}"));
+                        }
+                        if let Some(sub) = snapshot.subscription_balance_usd.as_deref() {
+                            parts.push(format!("sub=${sub}"));
+                        }
+                        if let Some(paygo) = snapshot.paygo_balance_usd.as_deref() {
+                            parts.push(format!("paygo=${paygo}"));
+                        }
                     }
                     if let Some(requests) = snapshot.total_requests {
                         parts.push(format!("req={requests}"));
@@ -302,8 +334,8 @@ pub(super) fn render_station_balance_section(
     } else {
         ui.label(pick(
             ctx.lang,
-            "(无余额/花费数据)",
-            "(no balance/spend data)",
+            "(无余额/配额数据)",
+            "(no balance/quota data)",
         ));
     }
 }

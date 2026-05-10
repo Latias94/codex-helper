@@ -62,7 +62,7 @@ pub(super) fn render_station_identity_summary(
         format_runtime_station_health_status(health, health_status)
     ));
     ui.label(format!(
-        "balance/spend: {}",
+        "balance/quota: {}",
         super::stations_detail_health::format_station_balance_summary(balances)
     ));
     ui.label(format!("breaker: {}", format_runtime_lb_summary(lb)));

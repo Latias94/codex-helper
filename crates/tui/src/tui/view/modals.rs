@@ -1636,7 +1636,7 @@ pub(super) fn render_provider_modal(
             ListItem::new(Text::from(vec![
                 Line::from(Span::styled(label, style)),
                 Line::from(vec![
-                    Span::styled("balance/spend: ", Style::default().fg(p.muted)),
+                    Span::styled("balance/quota: ", Style::default().fg(p.muted)),
                     Span::styled(balance, balance_style),
                     Span::raw("  "),
                     Span::styled("tags: ", Style::default().fg(p.muted)),
@@ -1858,7 +1858,7 @@ pub(super) fn render_routing_modal(
                     },
                 ]),
                 Line::from(vec![
-                    Span::styled("     balance/spend: ", Style::default().fg(p.muted)),
+                    Span::styled("     balance/quota: ", Style::default().fg(p.muted)),
                     Span::styled(balance_text, balance_style),
                     Span::raw("  "),
                     Span::styled("tags: ", Style::default().fg(p.muted)),

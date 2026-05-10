@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::pricing::UsdAmount;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BalanceSnapshotStatus {
@@ -58,6 +60,16 @@ pub struct ProviderBalanceSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monthly_spent_usd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_period: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_remaining_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_limit_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_used_usd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlimited_quota: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_used_usd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub today_used_usd: Option<String>,
@@ -92,6 +104,11 @@ impl Default for ProviderBalanceSnapshot {
             paygo_balance_usd: None,
             monthly_budget_usd: None,
             monthly_spent_usd: None,
+            quota_period: None,
+            quota_remaining_usd: None,
+            quota_limit_usd: None,
+            quota_used_usd: None,
+            unlimited_quota: None,
             total_used_usd: None,
             today_used_usd: None,
             total_requests: None,
@@ -163,6 +180,11 @@ impl ProviderBalanceSnapshot {
             || self.paygo_balance_usd.is_some()
             || self.monthly_budget_usd.is_some()
             || self.monthly_spent_usd.is_some()
+            || self.quota_period.is_some()
+            || self.quota_remaining_usd.is_some()
+            || self.quota_limit_usd.is_some()
+            || self.quota_used_usd.is_some()
+            || self.unlimited_quota == Some(true)
             || self.total_used_usd.is_some()
             || self.today_used_usd.is_some()
     }
@@ -174,26 +196,41 @@ impl ProviderBalanceSnapshot {
         {
             parts.push(format!("plan={plan}"));
         }
-        if let Some(total) = self.total_balance_usd.as_deref() {
-            parts.push(format!("total=${total}"));
-        }
-        if let Some(budget) = self.monthly_budget_usd.as_deref() {
-            parts.push(format!("budget=${budget}"));
-        }
-        if let Some(spent) = self.monthly_spent_usd.as_deref() {
-            parts.push(format!("spent=${spent}"));
-        }
-        if let Some(used) = self.total_used_usd.as_deref() {
-            parts.push(format!("used=${used}"));
-        }
-        if let Some(today) = self.today_used_usd.as_deref() {
-            parts.push(format!("today=${today}"));
-        }
-        if let Some(sub) = self.subscription_balance_usd.as_deref() {
-            parts.push(format!("sub=${sub}"));
-        }
-        if let Some(paygo) = self.paygo_balance_usd.as_deref() {
-            parts.push(format!("paygo=${paygo}"));
+        if self.unlimited_quota == Some(true) {
+            parts.push("unlimited".to_string());
+        } else if let Some(quota) = self.quota_summary() {
+            parts.push(quota);
+        } else {
+            if let Some(total) = self.total_balance_usd.as_deref() {
+                parts.push(format!("total=${total}"));
+            }
+            match (
+                self.monthly_budget_usd.as_deref(),
+                self.monthly_spent_usd.as_deref(),
+            ) {
+                (Some(budget), Some(spent)) => {
+                    if let Some(left) = left_from_budget_and_spent(budget, spent) {
+                        parts.push(format!("left=${left} budget=${budget} spent=${spent}"));
+                    } else {
+                        parts.push(format!("budget=${budget} spent=${spent}"));
+                    }
+                }
+                (Some(budget), None) => parts.push(format!("budget=${budget}")),
+                (None, Some(spent)) => parts.push(format!("used=${spent}")),
+                (None, None) => {}
+            }
+            if let Some(used) = self.total_used_usd.as_deref() {
+                parts.push(format!("used=${used}"));
+            }
+            if let Some(today) = self.today_used_usd.as_deref() {
+                parts.push(format!("today=${today}"));
+            }
+            if let Some(sub) = self.subscription_balance_usd.as_deref() {
+                parts.push(format!("sub=${sub}"));
+            }
+            if let Some(paygo) = self.paygo_balance_usd.as_deref() {
+                parts.push(format!("paygo=${paygo}"));
+            }
         }
         if let Some(requests) = self.total_requests {
             parts.push(format!("req={requests}"));
@@ -207,6 +244,65 @@ impl ProviderBalanceSnapshot {
             parts.join(" ")
         }
     }
+
+    fn quota_summary(&self) -> Option<String> {
+        let period = self
+            .quota_period
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let remaining = self
+            .quota_remaining_usd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let limit = self
+            .quota_limit_usd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let used = self
+            .quota_used_usd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if remaining.is_none() && limit.is_none() && used.is_none() {
+            return None;
+        }
+
+        let mut parts = Vec::new();
+        let quota_label = match period {
+            Some("quota") | None => "quota".to_string(),
+            Some(period) => format!("{period} quota"),
+        };
+        parts.push(quota_label);
+
+        match (remaining, limit, used) {
+            (Some(remaining), Some(limit), Some(used)) => {
+                parts.push(format!("left=${remaining} limit=${limit} used=${used}"))
+            }
+            (Some(remaining), Some(limit), None) => {
+                parts.push(format!("left=${remaining} limit=${limit}"))
+            }
+            (Some(remaining), None, Some(used)) => {
+                parts.push(format!("left=${remaining} used=${used}"))
+            }
+            (Some(remaining), None, None) => parts.push(format!("left=${remaining}")),
+            (None, Some(limit), Some(used)) => parts.push(format!("used=${used} limit=${limit}")),
+            (None, Some(limit), None) => parts.push(format!("limit=${limit}")),
+            (None, None, Some(used)) => parts.push(format!("used=${used}")),
+            (None, None, None) => {}
+        }
+
+        Some(parts.join(" "))
+    }
+}
+
+fn left_from_budget_and_spent(budget: &str, spent: &str) -> Option<String> {
+    let budget = UsdAmount::from_decimal_str(budget)?;
+    let spent = UsdAmount::from_decimal_str(spent)?;
+    Some(budget.saturating_sub(spent).format_usd())
 }
 
 fn default_exhaustion_affects_routing() -> bool {
@@ -248,8 +344,20 @@ mod tests {
 
         assert_eq!(
             snapshot.amount_summary(),
-            "plan=monthly total=$3.5 budget=$5 spent=$1.25 used=$7 today=$0.5 sub=$2 paygo=$1.5 req=42 tok=1234"
+            "plan=monthly total=$3.5 left=$3.75 budget=$5 spent=$1.25 used=$7 today=$0.5 sub=$2 paygo=$1.5 req=42 tok=1234"
         );
+    }
+
+    #[test]
+    fn provider_balance_amount_summary_prioritizes_unlimited_quota() {
+        let snapshot = ProviderBalanceSnapshot {
+            plan_name: Some("cx".to_string()),
+            unlimited_quota: Some(true),
+            quota_used_usd: Some("106065.94".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(snapshot.amount_summary(), "plan=cx unlimited");
     }
 
     #[test]
