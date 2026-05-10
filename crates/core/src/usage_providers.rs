@@ -2349,7 +2349,7 @@ pub async fn poll_for_codex_upstream(
         }
         matched_configured_provider = true;
 
-        let Some(interval_secs) = effective_poll_interval_secs(&provider) else {
+        let Some(interval_secs) = effective_poll_interval_secs(provider) else {
             continue;
         };
 

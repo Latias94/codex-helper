@@ -166,15 +166,15 @@ impl ProviderBalanceSnapshot {
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         {
-            return BalanceSnapshotStatus::Error;
+            BalanceSnapshotStatus::Error
         } else if self.exhausted == Some(true) {
-            return BalanceSnapshotStatus::Exhausted;
+            BalanceSnapshotStatus::Exhausted
         } else if stale {
-            return BalanceSnapshotStatus::Stale;
+            BalanceSnapshotStatus::Stale
         } else if self.exhausted == Some(false) || self.has_amount_data() {
-            return BalanceSnapshotStatus::Ok;
+            BalanceSnapshotStatus::Ok
         } else {
-            return BalanceSnapshotStatus::Unknown;
+            BalanceSnapshotStatus::Unknown
         }
     }
 
