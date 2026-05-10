@@ -138,6 +138,41 @@ fn service_layout_signature(mgr: &ServiceConfigManager) -> ServiceLayoutSignatur
     entries
 }
 
+fn changed_service_layout_stations(
+    previous: &ServiceLayoutSignature,
+    current: &ServiceLayoutSignature,
+) -> HashSet<String> {
+    let previous_by_station = previous
+        .iter()
+        .map(|(station_name, upstreams)| (station_name.as_str(), upstreams.as_slice()))
+        .collect::<HashMap<_, _>>();
+    let current_by_station = current
+        .iter()
+        .map(|(station_name, upstreams)| (station_name.as_str(), upstreams.as_slice()))
+        .collect::<HashMap<_, _>>();
+    let mut changed = HashSet::new();
+
+    for (station_name, upstreams) in previous {
+        if current_by_station
+            .get(station_name.as_str())
+            .is_none_or(|current_upstreams| *current_upstreams != upstreams.as_slice())
+        {
+            changed.insert(station_name.clone());
+        }
+    }
+
+    for (station_name, upstreams) in current {
+        if previous_by_station
+            .get(station_name.as_str())
+            .is_none_or(|previous_upstreams| *previous_upstreams != upstreams.as_slice())
+        {
+            changed.insert(station_name.clone());
+        }
+    }
+
+    changed
+}
+
 /// Runtime-only state for the proxy process.
 ///
 /// This state is intentionally not persisted across restarts.
@@ -868,18 +903,48 @@ impl ProxyState {
         }
 
         let layout = service_layout_signature(mgr);
-        let layout_changed = {
+        let balance_prune_stations = {
             let mut signatures = self.service_layout_signatures.write().await;
-            let changed = signatures.get(service_name) != Some(&layout);
+            let changed = signatures.get(service_name).map_or_else(
+                || {
+                    if active_stations.len() == 1 && active_stations.contains("routing") {
+                        Some(HashSet::from(["routing".to_string()]))
+                    } else {
+                        None
+                    }
+                },
+                |previous| Some(changed_service_layout_stations(previous, &layout)),
+            );
             signatures.insert(service_name.to_string(), layout);
             changed
         };
 
-        if layout_changed {
-            let mut provider_balances = self.provider_balances.write().await;
-            provider_balances.remove(service_name);
-            let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
-            provider_balance_summaries.remove(service_name);
+        match balance_prune_stations {
+            Some(changed_layout_stations) if !changed_layout_stations.is_empty() => {
+                let mut provider_balances = self.provider_balances.write().await;
+                if let Some(per_service) = provider_balances.get_mut(service_name) {
+                    per_service
+                        .retain(|station_name, _| !changed_layout_stations.contains(station_name));
+                    if per_service.is_empty() {
+                        provider_balances.remove(service_name);
+                    }
+                }
+                let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
+                if let Some(per_service) = provider_balance_summaries.get_mut(service_name) {
+                    per_service
+                        .retain(|station_name, _| !changed_layout_stations.contains(station_name));
+                    if per_service.is_empty() {
+                        provider_balance_summaries.remove(service_name);
+                    }
+                }
+            }
+            None => {
+                let mut provider_balances = self.provider_balances.write().await;
+                provider_balances.remove(service_name);
+                let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
+                provider_balance_summaries.remove(service_name);
+            }
+            Some(_) => {}
         }
 
         {
@@ -3261,6 +3326,111 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["general", "newapi"]
             );
+        });
+    }
+
+    #[test]
+    fn prune_runtime_observability_keeps_catalog_provider_balances_on_routing_layout_change() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+
+            let mut initial_mgr = ServiceConfigManager::default();
+            initial_mgr.configs.insert(
+                "routing".to_string(),
+                ServiceConfig {
+                    name: "routing".to_string(),
+                    alias: None,
+                    enabled: true,
+                    level: 1,
+                    upstreams: vec![
+                        UpstreamConfig {
+                            base_url: "https://input.example/v1".to_string(),
+                            auth: UpstreamAuth::default(),
+                            tags: HashMap::from([("provider_id".to_string(), "input".to_string())]),
+                            supported_models: HashMap::new(),
+                            model_mapping: HashMap::new(),
+                        },
+                        UpstreamConfig {
+                            base_url: "https://backup.example/v1".to_string(),
+                            auth: UpstreamAuth::default(),
+                            tags: HashMap::from([(
+                                "provider_id".to_string(),
+                                "backup".to_string(),
+                            )]),
+                            supported_models: HashMap::new(),
+                            model_mapping: HashMap::new(),
+                        },
+                    ],
+                },
+            );
+            state
+                .prune_runtime_observability_for_service("codex", &initial_mgr)
+                .await;
+
+            state
+                .record_provider_balance_snapshot(
+                    "codex",
+                    ProviderBalanceSnapshot {
+                        provider_id: "input".to_string(),
+                        station_name: Some("input".to_string()),
+                        upstream_index: Some(0),
+                        source: "usage_provider:test".to_string(),
+                        fetched_at_ms: 10,
+                        stale_after_ms: None,
+                        stale: false,
+                        status: BalanceSnapshotStatus::Ok,
+                        exhausted: Some(false),
+                        exhaustion_affects_routing: true,
+                        total_balance_usd: Some("3.5".to_string()),
+                        ..ProviderBalanceSnapshot::default()
+                    },
+                )
+                .await;
+            state
+                .record_provider_balance_snapshot(
+                    "codex",
+                    ProviderBalanceSnapshot {
+                        provider_id: "input".to_string(),
+                        station_name: Some("routing".to_string()),
+                        upstream_index: Some(0),
+                        source: "usage_provider:test".to_string(),
+                        fetched_at_ms: 10,
+                        stale_after_ms: None,
+                        stale: false,
+                        status: BalanceSnapshotStatus::Ok,
+                        exhausted: Some(false),
+                        exhaustion_affects_routing: true,
+                        total_balance_usd: Some("3.5".to_string()),
+                        ..ProviderBalanceSnapshot::default()
+                    },
+                )
+                .await;
+
+            let mut pinned_mgr = ServiceConfigManager::default();
+            pinned_mgr.configs.insert(
+                "routing".to_string(),
+                ServiceConfig {
+                    name: "routing".to_string(),
+                    alias: None,
+                    enabled: true,
+                    level: 1,
+                    upstreams: vec![UpstreamConfig {
+                        base_url: "https://input.example/v1".to_string(),
+                        auth: UpstreamAuth::default(),
+                        tags: HashMap::from([("provider_id".to_string(), "input".to_string())]),
+                        supported_models: HashMap::new(),
+                        model_mapping: HashMap::new(),
+                    }],
+                },
+            );
+            state
+                .prune_runtime_observability_for_service("codex", &pinned_mgr)
+                .await;
+
+            let view = state.get_provider_balance_view("codex").await;
+            assert!(view.contains_key("input"));
+            assert!(!view.contains_key("routing"));
         });
     }
 

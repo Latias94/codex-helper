@@ -1408,6 +1408,7 @@ fn sub2api_usage_snapshot_from_json(
             snapshot.monthly_budget_usd = Some(amount_to_string(window.limit));
             snapshot.monthly_spent_usd = Some(amount_to_string(window.used));
         }
+        snapshot.exhaustion_affects_routing = false;
         snapshot.exhausted = exhausted;
         populate_sub2api_usage_fields(&mut snapshot, value);
         snapshot.refresh_status(fetched_at_ms);
@@ -2913,7 +2914,7 @@ mod tests {
     }
 
     #[test]
-    fn sub2api_subscription_zero_remaining_is_period_capacity_exhaustion() {
+    fn sub2api_subscription_zero_remaining_is_display_only_period_capacity_exhaustion() {
         let snapshot = sub2api_usage_snapshot_from_json(
             &provider("sub2api", ProviderKind::Sub2ApiUsage),
             &upstream(),
@@ -2951,7 +2952,10 @@ mod tests {
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("100.468025"));
         assert_eq!(snapshot.total_used_usd.as_deref(), Some("702.492098"));
         assert_eq!(snapshot.today_used_usd.as_deref(), Some("0"));
-        assert!(snapshot.routing_exhausted());
+        assert!(
+            !snapshot.routing_exhausted(),
+            "sub2api /v1/usage skips billing checks; subscription windows are reset lazily on real requests"
+        );
     }
 
     #[test]
@@ -2982,6 +2986,7 @@ mod tests {
         assert_eq!(snapshot.quota_used_usd.as_deref(), Some("10"));
         assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("10"));
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("10"));
+        assert!(snapshot.routing_exhausted());
     }
 
     #[test]

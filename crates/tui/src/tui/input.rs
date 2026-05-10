@@ -787,6 +787,7 @@ pub(in crate::tui) async fn refresh_routing_control_state(ui: &mut UiState) -> a
 enum BalanceRefreshMode {
     Auto,
     Force,
+    ControlChanged,
 }
 
 fn balance_auto_refresh_cooldown(
@@ -827,6 +828,7 @@ fn should_request_provider_balance_refresh(
 ) -> bool {
     let cooldown = match mode {
         BalanceRefreshMode::Force => Some(Duration::from_secs(2)),
+        BalanceRefreshMode::ControlChanged => Some(Duration::ZERO),
         BalanceRefreshMode::Auto => balance_auto_refresh_cooldown(provider_balances, now_ms),
     };
 
@@ -908,9 +910,24 @@ fn request_provider_balance_refresh(
     true
 }
 
+fn request_provider_balance_refresh_after_control_change(
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    balance_refresh_tx: &BalanceRefreshSender,
+) -> bool {
+    request_provider_balance_refresh(
+        ui,
+        snapshot,
+        BalanceRefreshMode::ControlChanged,
+        balance_refresh_tx,
+    )
+}
+
 async fn apply_persisted_routing(
     ui: &mut UiState,
+    snapshot: &Snapshot,
     mut routing: RoutingSpecView,
+    balance_refresh_tx: &BalanceRefreshSender,
 ) -> anyhow::Result<()> {
     routing.providers.clear();
     let response = reqwest::Client::new()
@@ -932,6 +949,7 @@ async fn apply_persisted_routing(
     ui.last_routing_control_refresh_at = Some(Instant::now());
     ui.needs_snapshot_refresh = true;
     ui.needs_config_refresh = true;
+    request_provider_balance_refresh_after_control_change(ui, snapshot, balance_refresh_tx);
     Ok(())
 }
 
@@ -3636,6 +3654,18 @@ mod tests {
     }
 
     #[test]
+    fn control_changed_balance_refresh_bypasses_recent_auto_request() {
+        let balances = balance_map(balance_snapshot(false, Some(2_000)));
+
+        assert!(should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::ControlChanged,
+            1_000,
+            Some(Duration::ZERO)
+        ));
+    }
+
+    #[test]
     fn default_profile_menu_idx_offsets_bound_profile_selection() {
         let profiles = vec![make_profile("balanced"), make_profile("fast")];
 
@@ -4149,7 +4179,7 @@ async fn handle_key_routing_menu(
                 order,
                 crate::config::RoutingPolicyV3::OrderedFailover,
             );
-            match apply_persisted_routing(ui, next).await {
+            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => ui.toast = Some(("routing: moved up".to_string(), Instant::now())),
                 Err(err) => {
                     ui.toast = Some((format!("routing: move failed: {err}"), Instant::now()))
@@ -4172,7 +4202,7 @@ async fn handle_key_routing_menu(
                 order,
                 crate::config::RoutingPolicyV3::OrderedFailover,
             );
-            match apply_persisted_routing(ui, next).await {
+            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => ui.toast = Some(("routing: moved down".to_string(), Instant::now())),
                 Err(err) => {
                     ui.toast = Some((format!("routing: move failed: {err}"), Instant::now()))
@@ -4192,7 +4222,7 @@ async fn handle_key_routing_menu(
             next.target = Some(target.clone());
             next.order = routing_provider_names(&spec);
             next.prefer_tags.clear();
-            match apply_persisted_routing(ui, next).await {
+            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((format!("routing: pinned {target}"), Instant::now()));
                 }
@@ -4212,7 +4242,7 @@ async fn handle_key_routing_menu(
                 order,
                 crate::config::RoutingPolicyV3::OrderedFailover,
             );
-            match apply_persisted_routing(ui, next).await {
+            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some(("routing: ordered-failover".to_string(), Instant::now()));
                 }
@@ -4234,7 +4264,7 @@ async fn handle_key_routing_menu(
                 "billing".to_string(),
                 "monthly".to_string(),
             )])];
-            match apply_persisted_routing(ui, next).await {
+            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((
                         "routing: prefer billing=monthly".to_string(),
@@ -4263,6 +4293,7 @@ async fn handle_key_routing_menu(
             match set_provider_enabled(ui, provider_name.as_str(), next_enabled).await {
                 Ok(()) => {
                     let mut suffix = String::new();
+                    let mut balance_refresh_requested = false;
                     if let Some(next_routing) = original_spec.as_ref().and_then(|spec| {
                         routing_spec_after_provider_enabled_change(
                             spec,
@@ -4270,12 +4301,29 @@ async fn handle_key_routing_menu(
                             next_enabled,
                         )
                     }) {
-                        match apply_persisted_routing(ui, next_routing).await {
-                            Ok(()) => suffix = "; routing=ordered-failover".to_string(),
+                        match apply_persisted_routing(
+                            ui,
+                            snapshot,
+                            next_routing,
+                            balance_refresh_tx,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                suffix = "; routing=ordered-failover".to_string();
+                                balance_refresh_requested = true;
+                            }
                             Err(err) => {
                                 suffix = format!("; routing update failed: {err}");
                             }
                         }
+                    }
+                    if !balance_refresh_requested {
+                        request_provider_balance_refresh_after_control_change(
+                            ui,
+                            snapshot,
+                            balance_refresh_tx,
+                        );
                     }
                     let label = if next_enabled { "enabled" } else { "disabled" };
                     ui.toast = Some((
@@ -4302,7 +4350,7 @@ async fn handle_key_routing_menu(
                     crate::config::RoutingExhaustedActionV3::Continue
                 }
             };
-            match apply_persisted_routing(ui, next).await {
+            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
                     let label = match ui.routing_spec.as_ref().map(|spec| spec.on_exhausted) {
                         Some(crate::config::RoutingExhaustedActionV3::Continue) => "continue",
@@ -4329,6 +4377,11 @@ async fn handle_key_routing_menu(
             };
             match set_provider_billing_tag(ui, provider_name.as_str(), value).await {
                 Ok(()) => {
+                    request_provider_balance_refresh_after_control_change(
+                        ui,
+                        snapshot,
+                        balance_refresh_tx,
+                    );
                     let label = value.unwrap_or("<clear>");
                     ui.toast = Some((
                         format!("provider {provider_name}: billing={label}"),
