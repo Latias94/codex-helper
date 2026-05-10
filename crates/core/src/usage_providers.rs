@@ -33,6 +33,12 @@ enum ProviderKind {
     /// Sub2API dashboard JWT account endpoint, defaulting to /api/v1/auth/me.
     #[serde(rename = "sub2api_auth_me", alias = "sub2api_auth_me_http_json")]
     Sub2ApiAuthMe,
+    /// New API-style model token quota endpoint, defaulting to /api/usage/token/.
+    #[serde(
+        rename = "new_api_token_usage",
+        alias = "new_api_token_usage_http_json"
+    )]
+    NewApiTokenUsage,
     /// New API-style user quota endpoint, defaulting to /api/user/self.
     NewApiUserSelf,
 }
@@ -45,6 +51,7 @@ impl ProviderKind {
             ProviderKind::OpenAiBalanceHttpJson => "usage_provider:openai_balance_http_json",
             ProviderKind::Sub2ApiUsage => "usage_provider:sub2api_usage",
             ProviderKind::Sub2ApiAuthMe => "usage_provider:sub2api_auth_me",
+            ProviderKind::NewApiTokenUsage => "usage_provider:new_api_token_usage",
             ProviderKind::NewApiUserSelf => "usage_provider:new_api_user_self",
         }
     }
@@ -54,6 +61,7 @@ impl ProviderKind {
             ProviderKind::OpenAiBalanceHttpJson => Some("{{base_url}}/user/balance"),
             ProviderKind::Sub2ApiUsage => Some("{{base_url}}/v1/usage"),
             ProviderKind::Sub2ApiAuthMe => Some("{{base_url}}/api/v1/auth/me"),
+            ProviderKind::NewApiTokenUsage => Some("{{base_url}}/api/usage/token/"),
             ProviderKind::NewApiUserSelf => Some("{{base_url}}/api/user/self"),
             _ => None,
         }
@@ -199,8 +207,9 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 // Minimal poll interval per provider to avoid hammering usage APIs.
 const MIN_POLL_INTERVAL_SECS: u64 = 20;
 const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
-const AUTO_PROBE_KINDS: [ProviderKind; 3] = [
+const AUTO_PROBE_KINDS: [ProviderKind; 4] = [
     ProviderKind::Sub2ApiUsage,
+    ProviderKind::NewApiTokenUsage,
     ProviderKind::NewApiUserSelf,
     ProviderKind::OpenAiBalanceHttpJson,
 ];
@@ -1111,20 +1120,16 @@ fn balance_http_snapshot_from_json(
     snapshot
 }
 
-fn sub2api_usage_snapshot_from_json(
-    provider: &UsageProviderConfig,
-    upstream: &UpstreamRef,
-    value: &serde_json::Value,
-    fetched_at_ms: u64,
-    stale_after_ms: Option<u64>,
-) -> ProviderBalanceSnapshot {
-    if json_value_at_path(value, "isValid").and_then(bool_from_json) == Some(false) {
-        return base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms)
-            .with_error("sub2api usage response reported invalid API key");
-    }
+fn has_any_json_path(value: &serde_json::Value, paths: &[&str]) -> bool {
+    paths
+        .iter()
+        .any(|path| json_value_at_path(value, path).is_some())
+}
 
-    let mut snapshot =
-        balance_http_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms);
+fn populate_sub2api_usage_fields(
+    snapshot: &mut ProviderBalanceSnapshot,
+    value: &serde_json::Value,
+) {
     snapshot.plan_name = first_string_from_paths(value, &["planName", "data.planName"]);
     snapshot.total_used_usd = first_amount_from_paths(
         value,
@@ -1166,6 +1171,157 @@ fn sub2api_usage_snapshot_from_json(
             "data.usage.today.tokens",
         ],
     );
+}
+
+fn sub2api_subscription_limit_snapshot(
+    value: &serde_json::Value,
+    limit_paths: &[&str],
+    usage_paths: &[&str],
+) -> Option<(UsdAmount, UsdAmount, UsdAmount)> {
+    let budget = first_amount_from_paths(value, &[], limit_paths, None)?;
+    if budget.is_zero() {
+        return None;
+    }
+    let spent = first_amount_from_paths(value, &[], usage_paths, None).unwrap_or(UsdAmount::ZERO);
+    let remaining = budget.saturating_sub(spent);
+    Some((remaining, spent, budget))
+}
+
+fn sub2api_limiting_subscription_window(
+    value: &serde_json::Value,
+) -> Option<(UsdAmount, UsdAmount, UsdAmount)> {
+    let windows = [
+        sub2api_subscription_limit_snapshot(
+            value,
+            &[
+                "subscription.daily_limit_usd",
+                "data.subscription.daily_limit_usd",
+            ],
+            &[
+                "subscription.daily_usage_usd",
+                "data.subscription.daily_usage_usd",
+            ],
+        ),
+        sub2api_subscription_limit_snapshot(
+            value,
+            &[
+                "subscription.weekly_limit_usd",
+                "data.subscription.weekly_limit_usd",
+            ],
+            &[
+                "subscription.weekly_usage_usd",
+                "data.subscription.weekly_usage_usd",
+            ],
+        ),
+        sub2api_subscription_limit_snapshot(
+            value,
+            &[
+                "subscription.monthly_limit_usd",
+                "data.subscription.monthly_limit_usd",
+            ],
+            &[
+                "subscription.monthly_usage_usd",
+                "data.subscription.monthly_usage_usd",
+            ],
+        ),
+    ];
+
+    windows
+        .into_iter()
+        .flatten()
+        .min_by_key(|(remaining, _, _)| *remaining)
+}
+
+fn sub2api_usage_snapshot_from_json(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    value: &serde_json::Value,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    if json_value_at_path(value, "isValid").and_then(bool_from_json) == Some(false) {
+        return base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms)
+            .with_error("sub2api usage response reported invalid API key");
+    }
+
+    let mode = first_string_from_paths(value, &["mode", "data.mode"]);
+    let has_subscription = has_any_json_path(value, &["subscription", "data.subscription"]);
+
+    if mode.as_deref() == Some("quota_limited") {
+        let remaining_balance = first_amount_from_paths(
+            value,
+            &provider.extract.remaining_balance_paths,
+            &[
+                "quota.remaining",
+                "data.quota.remaining",
+                "remaining",
+                "data.remaining",
+            ],
+            provider.extract.remaining_divisor,
+        );
+        let budget = first_amount_from_paths(
+            value,
+            &provider.extract.monthly_budget_paths,
+            &["quota.limit", "data.quota.limit"],
+            provider.extract.monthly_budget_divisor,
+        );
+        let spent = first_amount_from_paths(
+            value,
+            &provider.extract.monthly_spent_paths,
+            &["quota.used", "data.quota.used"],
+            provider.extract.monthly_spent_divisor,
+        );
+        let exhausted = first_bool_from_paths(
+            value,
+            &provider.extract.exhausted_paths,
+            &[
+                "exhausted",
+                "data.exhausted",
+                "quota_exhausted",
+                "data.quota_exhausted",
+            ],
+        )
+        .or_else(|| remaining_balance.map(UsdAmount::is_zero));
+
+        let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
+        snapshot.total_balance_usd = remaining_balance.map(amount_to_string);
+        snapshot.monthly_budget_usd = budget.map(amount_to_string);
+        snapshot.monthly_spent_usd = spent.map(amount_to_string);
+        snapshot.exhausted = exhausted;
+        populate_sub2api_usage_fields(&mut snapshot, value);
+        snapshot.refresh_status(fetched_at_ms);
+        return snapshot;
+    }
+
+    if mode.as_deref() == Some("unrestricted") && has_subscription {
+        let limiting_window = sub2api_limiting_subscription_window(value);
+        let exhausted = first_bool_from_paths(
+            value,
+            &provider.extract.exhausted_paths,
+            &[
+                "exhausted",
+                "data.exhausted",
+                "quota_exhausted",
+                "data.quota_exhausted",
+            ],
+        )
+        .or_else(|| limiting_window.map(|(remaining, _, _)| remaining.is_zero()))
+        .or(Some(false));
+
+        let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
+        if let Some((_, spent, budget)) = limiting_window {
+            snapshot.monthly_budget_usd = Some(amount_to_string(budget));
+            snapshot.monthly_spent_usd = Some(amount_to_string(spent));
+        }
+        snapshot.exhausted = exhausted;
+        populate_sub2api_usage_fields(&mut snapshot, value);
+        snapshot.refresh_status(fetched_at_ms);
+        return snapshot;
+    }
+
+    let mut snapshot =
+        balance_http_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms);
+    populate_sub2api_usage_fields(&mut snapshot, value);
     snapshot.refresh_status(fetched_at_ms);
     snapshot
 }
@@ -1189,6 +1345,98 @@ fn sub2api_auth_me_snapshot_from_json(
     }
 
     balance_http_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
+}
+
+fn new_api_token_usage_snapshot_from_json(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    value: &serde_json::Value,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    if json_value_at_path(value, "success").and_then(bool_from_json) == Some(false)
+        || json_value_at_path(value, "code").and_then(bool_from_json) == Some(false)
+    {
+        let message = json_value_at_path(value, "message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("new api token usage response reported failure");
+        return base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms)
+            .with_error(message.to_string());
+    }
+
+    let mut effective = provider.extract.clone();
+    if effective.remaining_balance_paths.is_empty() {
+        effective.remaining_balance_paths = vec![
+            "data.total_available".to_string(),
+            "data.remain_quota".to_string(),
+            "total_available".to_string(),
+            "remain_quota".to_string(),
+        ];
+    }
+    if effective.monthly_spent_paths.is_empty() {
+        effective.monthly_spent_paths = vec![
+            "data.total_used".to_string(),
+            "data.used_quota".to_string(),
+            "total_used".to_string(),
+            "used_quota".to_string(),
+        ];
+    }
+    if effective.monthly_budget_paths.is_empty() {
+        effective.monthly_budget_paths = vec![
+            "data.total_granted".to_string(),
+            "total_granted".to_string(),
+        ];
+    }
+    effective.remaining_divisor = effective.remaining_divisor.or(Some(500_000));
+    effective.monthly_spent_divisor = effective.monthly_spent_divisor.or(Some(500_000));
+    effective.monthly_budget_divisor = effective.monthly_budget_divisor.or(Some(500_000));
+
+    let unlimited_quota =
+        first_bool_from_paths(value, &[], &["data.unlimited_quota", "unlimited_quota"])
+            == Some(true);
+    let remaining_balance = first_amount_from_paths(
+        value,
+        &effective.remaining_balance_paths,
+        &[],
+        effective.remaining_divisor,
+    );
+    let monthly_spent = first_amount_from_paths(
+        value,
+        &effective.monthly_spent_paths,
+        &[],
+        effective.monthly_spent_divisor,
+    );
+    let monthly_budget = first_amount_from_paths(
+        value,
+        &effective.monthly_budget_paths,
+        &[],
+        effective.monthly_budget_divisor,
+    )
+    .or_else(|| match (remaining_balance, monthly_spent) {
+        (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
+        _ => None,
+    });
+    let exhausted = if unlimited_quota {
+        Some(false)
+    } else {
+        first_bool_from_paths(
+            value,
+            &effective.exhausted_paths,
+            &["data.exhausted", "exhausted"],
+        )
+        .or_else(|| remaining_balance.map(UsdAmount::is_zero))
+    };
+
+    let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
+    snapshot.plan_name = first_string_from_paths(value, &["data.name", "name"]);
+    if !unlimited_quota {
+        snapshot.total_balance_usd = remaining_balance.map(amount_to_string);
+        snapshot.monthly_budget_usd = monthly_budget.map(amount_to_string);
+    }
+    snapshot.monthly_spent_usd = monthly_spent.map(amount_to_string);
+    snapshot.exhausted = exhausted;
+    snapshot.refresh_status(fetched_at_ms);
+    snapshot
 }
 
 fn new_api_snapshot_from_json(
@@ -1240,16 +1488,25 @@ fn new_api_snapshot_from_json(
         (Some(remaining), Some(spent)) => Some(remaining.saturating_add(spent)),
         _ => None,
     });
-    let exhausted = first_bool_from_paths(
-        value,
-        &effective.exhausted_paths,
-        &["data.exhausted", "exhausted"],
-    )
-    .or_else(|| remaining_balance.map(UsdAmount::is_zero));
+    let unlimited_quota =
+        first_bool_from_paths(value, &[], &["data.unlimited_quota", "unlimited_quota"])
+            == Some(true);
+    let exhausted = if unlimited_quota {
+        Some(false)
+    } else {
+        first_bool_from_paths(
+            value,
+            &effective.exhausted_paths,
+            &["data.exhausted", "exhausted"],
+        )
+        .or_else(|| remaining_balance.map(UsdAmount::is_zero))
+    };
 
     let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
-    snapshot.total_balance_usd = remaining_balance.map(amount_to_string);
-    snapshot.monthly_budget_usd = monthly_budget.map(amount_to_string);
+    if !unlimited_quota {
+        snapshot.total_balance_usd = remaining_balance.map(amount_to_string);
+        snapshot.monthly_budget_usd = monthly_budget.map(amount_to_string);
+    }
     snapshot.monthly_spent_usd = monthly_spent.map(amount_to_string);
     snapshot.exhausted = exhausted;
     snapshot.refresh_status(fetched_at_ms);
@@ -1349,6 +1606,13 @@ fn snapshot_from_provider_json(
             stale_after_ms,
         ),
         ProviderKind::Sub2ApiAuthMe => sub2api_auth_me_snapshot_from_json(
+            provider,
+            upstream,
+            value,
+            fetched_at_ms,
+            stale_after_ms,
+        ),
+        ProviderKind::NewApiTokenUsage => new_api_token_usage_snapshot_from_json(
             provider,
             upstream,
             value,
@@ -1924,6 +2188,17 @@ mod tests {
     }
 
     #[test]
+    fn new_api_token_usage_endpoint_defaults_to_model_key_usage_path() {
+        let mut provider = provider("newapi-token", ProviderKind::NewApiTokenUsage);
+        provider.endpoint.clear();
+
+        let endpoint = resolve_endpoint(&provider, "https://newapi.example.com/v1", "token")
+            .expect("endpoint");
+
+        assert_eq!(endpoint, "https://newapi.example.com/api/usage/token/");
+    }
+
+    #[test]
     fn effective_poll_interval_respects_disable_flag_zero_and_minimum() {
         let mut provider = provider("sub2api", ProviderKind::OpenAiBalanceHttpJson);
 
@@ -1958,14 +2233,20 @@ mod tests {
         };
 
         let sub2api = auto_usage_provider(&target, ProviderKind::Sub2ApiUsage);
+        let newapi_token = auto_usage_provider(&target, ProviderKind::NewApiTokenUsage);
         let newapi = auto_usage_provider(&target, ProviderKind::NewApiUserSelf);
 
         assert_eq!(sub2api.id, "auto:balance:input-sub:2");
+        assert_eq!(sub2api.id, newapi_token.id);
         assert_eq!(sub2api.id, newapi.id);
         assert_eq!(sub2api.domains, vec!["ai.input.im".to_string()]);
         assert_eq!(
             resolve_endpoint(&sub2api, &target.base_url, "token").unwrap(),
             "https://ai.input.im/v1/usage"
+        );
+        assert_eq!(
+            resolve_endpoint(&newapi_token, &target.base_url, "token").unwrap(),
+            "https://ai.input.im/api/usage/token/"
         );
     }
 
@@ -2186,6 +2467,70 @@ mod tests {
     }
 
     #[test]
+    fn sub2api_subscription_zero_remaining_is_period_capacity_exhaustion() {
+        let snapshot = sub2api_usage_snapshot_from_json(
+            &provider("sub2api", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": true,
+                "mode": "unrestricted",
+                "planName": "CodeX Lite 年度",
+                "remaining": 0,
+                "subscription": {
+                    "daily_usage_usd": 100.468025,
+                    "daily_limit_usd": 100,
+                    "weekly_usage_usd": 401.441684,
+                    "weekly_limit_usd": 0,
+                    "monthly_usage_usd": 401.441684,
+                    "monthly_limit_usd": 0
+                },
+                "usage": {
+                    "today": { "cost": 0, "requests": 0, "total_tokens": 0 },
+                    "total": { "cost": 702.492098, "requests": 42, "total_tokens": 1234 }
+                }
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert_eq!(snapshot.exhausted, Some(true));
+        assert_eq!(snapshot.plan_name.as_deref(), Some("CodeX Lite 年度"));
+        assert_eq!(snapshot.total_balance_usd, None);
+        assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("100"));
+        assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("100.468025"));
+        assert_eq!(snapshot.total_used_usd.as_deref(), Some("702.492098"));
+        assert_eq!(snapshot.today_used_usd.as_deref(), Some("0"));
+        assert!(snapshot.routing_exhausted());
+    }
+
+    #[test]
+    fn sub2api_quota_limited_zero_remaining_still_marks_exhausted() {
+        let snapshot = sub2api_usage_snapshot_from_json(
+            &provider("sub2api", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": true,
+                "mode": "quota_limited",
+                "quota": {
+                    "limit": 10,
+                    "used": 10,
+                    "remaining": 0,
+                    "unit": "USD"
+                }
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert_eq!(snapshot.exhausted, Some(true));
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("0"));
+        assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("10"));
+        assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("10"));
+    }
+
+    #[test]
     fn sub2api_usage_snapshot_marks_invalid_key_as_error() {
         let snapshot = sub2api_usage_snapshot_from_json(
             &provider("sub2api", ProviderKind::Sub2ApiUsage),
@@ -2376,5 +2721,58 @@ mod tests {
         assert_eq!(snapshot.total_balance_usd.as_deref(), Some("1"));
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("0.5"));
         assert_eq!(snapshot.monthly_budget_usd.as_deref(), Some("1.5"));
+    }
+
+    #[test]
+    fn new_api_user_self_honors_unlimited_quota_flag() {
+        let snapshot = new_api_snapshot_from_json(
+            &provider("newapi", ProviderKind::NewApiUserSelf),
+            &upstream(),
+            &serde_json::json!({
+                "success": true,
+                "data": {
+                    "quota": 0,
+                    "used_quota": 250000,
+                    "unlimited_quota": true
+                }
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert_eq!(snapshot.total_balance_usd, None);
+        assert_eq!(snapshot.monthly_budget_usd, None);
+        assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("0.5"));
+    }
+
+    #[test]
+    fn new_api_token_usage_honors_unlimited_quota_flag() {
+        let snapshot = new_api_token_usage_snapshot_from_json(
+            &provider("newapi-token", ProviderKind::NewApiTokenUsage),
+            &upstream(),
+            &serde_json::json!({
+                "code": true,
+                "message": "ok",
+                "data": {
+                    "object": "token_usage",
+                    "name": "demo-token",
+                    "total_granted": 0,
+                    "total_used": 250000,
+                    "total_available": 0,
+                    "unlimited_quota": true
+                }
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert_eq!(snapshot.plan_name.as_deref(), Some("demo-token"));
+        assert_eq!(snapshot.total_balance_usd, None);
+        assert_eq!(snapshot.monthly_budget_usd, None);
+        assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("0.5"));
     }
 }

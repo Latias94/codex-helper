@@ -280,8 +280,9 @@ Legacy profile station bindings are migration-only. New v3 configs should use `[
 Most relay users do not need to write `usage_providers.json` just to see balances. If no explicit adapter matches an upstream, codex-helper tries common relay probes:
 
 1. `sub2api_usage`: `GET {{base_url}}/v1/usage` with the model API key.
-2. `new_api_user_self`: `GET {{base_url}}/api/user/self` with the model API key.
-3. `openai_balance_http_json`: `GET {{base_url}}/user/balance` with the model API key.
+2. `new_api_token_usage`: `GET {{base_url}}/api/usage/token/` with the model API key.
+3. `new_api_user_self`: `GET {{base_url}}/api/user/self` with dashboard-style auth.
+4. `openai_balance_http_json`: `GET {{base_url}}/user/balance` with the model API key.
 
 Explicit adapters are still useful when a relay needs dashboard credentials, custom headers, a custom endpoint, or safer exhaustion handling.
 
@@ -330,6 +331,8 @@ Important balance behavior:
 
 - Lookup failure is displayed as `unknown`, not `err`, and is not treated as exhausted.
 - Known exhausted snapshots can demote automatic routing only when `trust_exhaustion_for_routing = true`.
+- Sub2API subscription-mode `remaining` is a period-limit capacity signal, not a wallet balance. A zero `remaining` means at least one configured subscription window is currently exhausted and may demote routing; quota-limited keys and wallet balances also use zero remaining as exhausted.
+- New API quota values are quota units converted with `QuotaPerUnit = 500000`; token usage snapshots with `unlimited_quota = true` are never treated as exhausted.
 - If a provider reports misleading zero balances for active subscriptions, set `trust_exhaustion_for_routing = false`.
 - UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh`.
 
@@ -337,6 +340,7 @@ Common adapter kinds:
 
 - `sub2api_usage`
 - `sub2api_auth_me`
+- `new_api_token_usage`
 - `new_api_user_self`
 - `openai_balance_http_json`
 - `relay_balance_http_json`
