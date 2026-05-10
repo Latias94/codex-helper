@@ -9,18 +9,18 @@ All notable changes to this project will be documented in this file.
 
 ### 重点 / Highlights
 
-- `version = 3` 成为默认配置：先定义 provider，再用 routing 表达“按顺序兜底 / 手动固定 / 包月优先”等策略。旧配置会自动迁移到 `config.toml`，并保留 `.bak` 备份。
-  `version = 3` is now the default config model: define providers once, then use routing for ordered fallback, manual pinning, or monthly-first policies. Older configs migrate automatically with a `.bak` backup.
-- 新增更好懂的 provider 切换体验：包月中转可以打 `billing=monthly` 标签，已知耗尽后再按策略继续或停止。
+- `version = 3` 成为默认配置：provider 只定义一次，routing 负责顺序兜底、手动固定和标签优先。旧配置会自动迁移到 `config.toml`，并在覆盖前保留 `config.toml.bak` / `config.json.bak`。
+  `version = 3` is now the default config model: define providers once and let routing handle ordered fallback, manual pinning, and tag-based preference. Older configs migrate automatically to `config.toml`, with `config.toml.bak` / `config.json.bak` kept before overwrite.
+- 新增更直观的 provider 切换体验：包月中转可以打 `billing=monthly` 标签，已知耗尽后按策略继续或停止。
   Provider switching is clearer: monthly relays can be tagged with `billing=monthly`, then known exhaustion can either fall through or stop according to policy.
-- 余额和套餐更可见：Sub2API、New API 和常见 `/user/balance` 接口会自动探测；查询失败显示为 `unknown`，不会被当作耗尽。
-  Balance and plan visibility improved: Sub2API, New API, and common `/user/balance` endpoints are auto-probed. Lookup failures show as `unknown` and do not count as exhaustion.
-- TUI/GUI 更适合日常操作：routing 页面会显示 provider 顺序、余额/套餐、tags、启停状态和候选状态；请求视图会显示 token、cache token、耗时、速度、重试和估算成本。
+- 余额和套餐更可见：会优先尝试 Sub2API、New API 和常见 `/user/balance` 接口；查询失败显示为 `unknown`，不会被当作耗尽。
+  Balance and plan visibility improved: Sub2API, New API, and common `/user/balance` endpoints are probed first. Lookup failures show as `unknown` and do not count as exhaustion.
+- TUI/GUI 更适合日常操作：routing 页面显示 provider 顺序、余额/套餐、tags、启停状态和候选状态；请求视图显示 token、cache token、耗时、速度、重试和估算成本。
   TUI/GUI are more operator-friendly: routing pages show provider order, balances/plans, tags, enabled state, and candidates; request views show tokens, cache tokens, latency, speed, retries, and estimated cost.
-- Codex 配置 patch 更安全：`switch on/off` 只修改 codex-helper 的本地代理片段，不再用旧快照覆盖 Codex 运行期间写入的其它配置。
-  Codex config patching is safer: `switch on/off` only changes the codex-helper local proxy section and no longer restores an old whole-file snapshot over Codex edits.
+- Codex 配置 patch 更安全：`switch on/off` 只改本地代理相关片段，不会覆盖 Codex 运行期间写入的其他配置。
+  Codex config patching is safer: `switch on/off` only changes the local proxy section and does not overwrite other Codex edits made during a run.
 - 长时间运行更稳：上游连接增加连接超时、TCP keepalive、空闲连接回收；运行态日志和 TUI/GUI 刷新路径做了有界化处理。
-  Long-running proxy stability improved with connect timeouts, TCP keepalive, idle connection cleanup, rotated runtime logs, and bounded TUI/GUI refresh state.
+  Long-running proxy stability improved with connect timeouts, TCP keepalive, idle connection cleanup, and bounded TUI/GUI refresh state.
 
 ### 可复制 Routing 示例 / Copyable Routing Examples
 
@@ -118,6 +118,10 @@ More config recipes are available in `docs/CONFIGURATION.md`.
   Fixed old snapshot restore overwriting `~/.codex/config.toml`; Codex-written project trust and similar entries are preserved.
 - 修复 TUI provider 列表重复行、顶部状态栏和底部快捷键在窄终端下显示不稳的问题。
   Fixed TUI provider-list duplicate rows plus top-status/footer layout issues in narrow terminals.
+- 修复 GUI 手动切换、重载或探测后，旧的后台刷新结果可能短暂覆盖新状态的问题。
+  Fixed stale GUI background refresh results briefly overriding newer state after manual switching, reloads, or probes.
+- 修复 GUI 在持久化配置保存或运行态重载后，界面有时还会沿用旧配置快照的问题。
+  Fixed GUI cases where the UI could keep showing an old config snapshot after persisted saves or runtime reloads.
 - 修复 v3 provider/routing 保存后可能丢失 provider tags、endpoint tags、模型支持和 model mapping 的问题。
   Fixed v3 provider/routing saves potentially losing provider tags, endpoint tags, model support, and model mappings.
 - 修复余额查询失败残留旧耗尽状态的问题；HTTP 404 等失败现在显示为 `unknown`，不会影响 routing。

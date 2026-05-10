@@ -34,42 +34,7 @@ fn render_request_session_actions(
         .button(pick(ctx.lang, "在 History 查看", "Open in History"))
         .clicked()
     {
-        match ctx
-            .rt
-            .block_on(crate::sessions::find_codex_session_file_by_id(sid))
-        {
-            Ok(path) => {
-                if let Some(summary) =
-                    request_history_summary_from_request(request, path.clone(), ctx.lang)
-                {
-                    history::prepare_select_session_from_external(
-                        &mut ctx.view.history,
-                        summary,
-                        history::ExternalHistoryOrigin::Requests,
-                    );
-                    ctx.view.requested_page = Some(Page::History);
-                    *ctx.last_info = Some(
-                        if path.is_some() {
-                            pick(
-                                ctx.lang,
-                                "已切到 History（本地 transcript）",
-                                "Opened in History (local transcript)",
-                            )
-                        } else {
-                            pick(
-                                ctx.lang,
-                                "已切到 History（共享观测摘要）",
-                                "Opened in History (observed summary)",
-                            )
-                        }
-                        .to_string(),
-                    );
-                }
-            }
-            Err(error) => {
-                *ctx.last_error = Some(format!("find session file failed: {error}"));
-            }
-        }
+        start_open_request_in_history(ctx, request.clone());
     }
 }
 

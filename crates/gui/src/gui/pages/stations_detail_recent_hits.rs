@@ -185,7 +185,7 @@ fn route_attempt_brief(attempt: &crate::logging::RouteAttemptLog) -> String {
         parts.push(format!("st={status_code}"));
     }
     if let Some(duration_ms) = attempt.duration_ms {
-        parts.push(format!("dur={duration_ms}ms"));
+        parts.push(format!("dur={}", format_duration_ms(duration_ms)));
     }
     if let Some(cooldown_secs) = attempt.cooldown_secs {
         parts.push(format!("cd={cooldown_secs}s"));
@@ -277,10 +277,10 @@ pub(super) fn render_station_recent_hits_section(
                         ui.colored_label(
                             color,
                             format!(
-                                "{}  st={}  {}ms  att={}  {}",
+                                "{}  st={}  total={}  att={}  {}",
                                 format_age(now, Some(request.ended_at_ms)),
                                 request.status_code,
-                                request.duration_ms,
+                                format_duration_ms(request.duration_ms),
                                 attempts,
                                 outcome
                             ),

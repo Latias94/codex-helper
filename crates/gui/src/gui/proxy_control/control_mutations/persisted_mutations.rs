@@ -56,7 +56,7 @@ impl ProxyController {
             _ => {}
         }
 
-        refresh_now(self, rt);
+        refresh_now(self, rt)?;
         Ok(())
     }
 }

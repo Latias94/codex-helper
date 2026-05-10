@@ -25,7 +25,7 @@ It is probably unnecessary if you only use one official account and do not need 
 ## Main Features
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
-- **Safe Codex switch**: `switch on/off` only patches the local `codex_proxy` section and does not overwrite unrelated Codex config changes.
+- **Safe Codex switch**: `switch on/off` only patches the local proxy section and does not overwrite unrelated Codex edits made during a run.
 - **Provider / routing config**: `version = 3` is the default schema. Define providers once, then choose the routing recipe.
 - **Failover**: route around failed, unavailable, or trusted-exhausted candidates according to policy.
 - **Balance and plan visibility**: auto-probes common Sub2API, New API, and generic `/user/balance` endpoints. Lookup failures show as `unknown`, not exhausted.
@@ -60,7 +60,7 @@ ch
 By default this will:
 
 - start the local proxy;
-- initialize or migrate `~/.codex-helper/config.toml`;
+- initialize or migrate `~/.codex-helper/config.toml`, backing up the old file as `.bak` first;
 - patch Codex to use `model_providers.codex_proxy` when needed;
 - open the TUI in interactive terminals;
 - remove only the codex-helper proxy patch on exit.
@@ -176,7 +176,7 @@ codex-helper --version
 Useful pages:
 
 - `Overview`: proxy status, current sessions, and recent requests.
-- `Routing` / `Stations`: provider order, balance, tags, health, and routing preview.
+- `Routing` / `Stations`: provider order, balance/plan, tags, health, and routing preview.
 - `Sessions`: session identity, effective route, and per-session overrides.
 - `Stats` / `Requests`: tokens, cache tokens, latency, retries, cost, and request logs.
 

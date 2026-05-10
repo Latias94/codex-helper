@@ -32,6 +32,50 @@ pub(super) fn format_age(now_ms: u64, ts_ms: Option<u64>) -> String {
     }
 }
 
+pub(super) fn format_duration_ms(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        return format!("{duration_ms}ms");
+    }
+    if duration_ms < 60_000 {
+        return format!("{:.1}s", duration_ms as f64 / 1_000.0);
+    }
+    if duration_ms < 3_600_000 {
+        let total_secs = duration_ms / 1_000;
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        return if secs == 0 {
+            format!("{mins}m")
+        } else {
+            format!("{mins}m{secs}s")
+        };
+    }
+    if duration_ms < 86_400_000 {
+        let total_secs = duration_ms / 1_000;
+        let hours = total_secs / 3_600;
+        let mins = (total_secs % 3_600) / 60;
+        return if mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{mins}m")
+        };
+    }
+    let total_hours = duration_ms / 3_600_000;
+    let days = total_hours / 24;
+    let hours = total_hours % 24;
+    if hours == 0 {
+        format!("{days}d")
+    } else {
+        format!("{days}d{hours}h")
+    }
+}
+
+pub(super) fn format_duration_ms_opt(duration_ms: Option<u64>) -> String {
+    duration_ms
+        .filter(|value| *value > 0)
+        .map(format_duration_ms)
+        .unwrap_or_else(|| "-".to_string())
+}
+
 pub(super) fn basename(path: &str) -> &str {
     let trimmed = path.trim_end_matches(['/', '\\']);
     trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
@@ -120,4 +164,17 @@ pub(super) fn usage_line(usage: &UsageMetrics) -> String {
         ));
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_duration_ms_scales_units() {
+        assert_eq!(format_duration_ms(999), "999ms");
+        assert_eq!(format_duration_ms(1_500), "1.5s");
+        assert_eq!(format_duration_ms(90_000), "1m30s");
+        assert_eq!(format_duration_ms(3_600_000), "1h");
+    }
 }

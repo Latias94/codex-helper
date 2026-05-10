@@ -150,6 +150,8 @@ pub async fn run_dashboard(
     let mut snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
     let mut providers = providers;
     ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
+    let (balance_refresh_tx, mut balance_refresh_rx) =
+        tokio::sync::mpsc::unbounded_channel::<input::BalanceRefreshOutcome>();
 
     let mut render_invalidation = RenderInvalidation::FullClear;
     let mut last_drawn_page = ui.page;
@@ -245,6 +247,19 @@ pub async fn run_dashboard(
                 }
                 request_redraw(&mut render_invalidation);
             }
+            maybe_balance_refresh = balance_refresh_rx.recv() => {
+                if let Some(result) = maybe_balance_refresh {
+                    if let Err(err) = result {
+                        ui.toast = Some((format!("balance refresh failed: {err}"), Instant::now()));
+                    }
+                    let refresh = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days);
+                    if let Ok(new_snapshot) = tokio::time::timeout(io_timeout, refresh).await {
+                        snapshot = new_snapshot;
+                        ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
+                    }
+                    request_redraw(&mut render_invalidation);
+                }
+            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 ui.should_exit = true;
@@ -261,7 +276,16 @@ pub async fn run_dashboard(
                 match event {
                     Event::Key(key) if input::should_accept_key_event(&key) => {
                         let before_surface = RenderSurfaceKey::capture(&ui);
-                        if input::handle_key_event(state.clone(), &mut providers, &mut ui, &snapshot, key).await {
+                        if input::handle_key_event(
+                            state.clone(),
+                            &mut providers,
+                            &mut ui,
+                            &snapshot,
+                            balance_refresh_tx.clone(),
+                            key,
+                        )
+                        .await
+                        {
                             if ui.needs_config_refresh {
                                 match load_config().await {
                                     Ok(new_cfg) => {

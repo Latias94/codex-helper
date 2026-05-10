@@ -373,6 +373,7 @@ fn sort_discovered_proxies(found: &mut [DiscoveredProxy]) {
 
 impl ProxyController {
     pub fn request_attach_with_admin_base(&mut self, port: u16, admin_base_url: Option<String>) {
+        self.clear_background_refresh();
         let mut attached = AttachedStatus::new(port);
         if let Some(admin_base_url) = admin_base_url {
             attached.admin_base_url = admin_base_url.clone();

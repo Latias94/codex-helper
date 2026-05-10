@@ -171,8 +171,7 @@ use history_tools::*;
 use navigation::page_nav_groups;
 #[allow(unused_imports)]
 use proxy_settings_document::{
-    parse_proxy_settings_document, save_proxy_settings_document,
-    sync_codex_auth_into_settings_document,
+    parse_proxy_settings_document, sync_codex_auth_into_settings_document,
 };
 #[allow(unused_imports)]
 use remote_attach::*;
@@ -244,6 +243,15 @@ pub fn render(ui: &mut egui::Ui, page: Page, ctx: &mut PageCtx<'_>) {
         Page::History => history::render_history(ui, ctx),
         Page::Settings => settings::render(ui, ctx),
     }
+}
+
+pub fn poll_global_tasks(ctx: &mut PageCtx<'_>) {
+    requests_filters::poll_request_ledger_loader(ctx);
+    stats_control_trace_loader::poll_control_trace_loader(ctx);
+    stats_request_ledger::poll_request_ledger_summary_loader(ctx);
+    session_bridge::poll_history_open_loader(ctx);
+    setup_config_step::poll_setup_config_init(ctx);
+    proxy_settings_document::poll_proxy_settings_save(ctx);
 }
 
 #[cfg(test)]

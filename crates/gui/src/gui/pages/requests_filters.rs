@@ -1,4 +1,6 @@
+use super::view_state::RequestLedgerLoad;
 use super::*;
+use std::sync::mpsc::TryRecvError;
 
 pub(super) fn selected_requests_session_id(ctx: &PageCtx<'_>) -> Option<String> {
     ctx.view
@@ -35,7 +37,7 @@ pub(super) fn render_requests_filters(
                 )
                 .changed();
             if changed && ctx.view.requests.include_request_ledger {
-                refresh_request_ledger(ctx);
+                refresh_request_ledger(ctx, true);
             }
         });
         if ctx.view.requests.include_request_ledger {
@@ -50,14 +52,14 @@ pub(super) fn render_requests_filters(
                     ctx.view.requests.request_ledger_limit.clamp(20, 5000);
             }
             if ui.button(pick(ctx.lang, "载入日志", "Load log")).clicked() {
-                refresh_request_ledger(ctx);
+                refresh_request_ledger(ctx, true);
             }
         }
         if ui.button(pick(ctx.lang, "刷新", "Refresh")).clicked() {
             ctx.proxy
                 .refresh_current_if_due(ctx.rt, std::time::Duration::from_secs(0));
             if ctx.view.requests.include_request_ledger {
-                refresh_request_ledger(ctx);
+                refresh_request_ledger(ctx, true);
             }
         }
     });
@@ -141,44 +143,131 @@ pub(super) fn ensure_request_ledger_loaded(ctx: &mut PageCtx<'_>) {
         ctx.view.requests.include_request_ledger = false;
         return;
     }
-    let source_changed = ctx.view.requests.request_ledger_loaded_signature != source_signature;
-    let never_loaded = ctx.view.requests.request_ledger_loaded_at_ms.is_none()
-        && ctx.view.requests.request_ledger_last_error.is_none();
-    if never_loaded || source_changed {
-        refresh_request_ledger(ctx);
+    let current_limit = ctx.view.requests.request_ledger_limit.clamp(20, 5000);
+    ctx.view.requests.request_ledger_limit = current_limit;
+    if ctx.view.requests.request_ledger_load.is_none()
+        && (ctx.view.requests.request_ledger_requested_signature != source_signature
+            || ctx.view.requests.request_ledger_requested_limit != current_limit)
+    {
+        refresh_request_ledger(ctx, false);
     }
 }
 
-fn refresh_request_ledger(ctx: &mut PageCtx<'_>) {
-    let limit = ctx.view.requests.request_ledger_limit.clamp(20, 5000);
-    ctx.view.requests.request_ledger_limit = limit;
-    let source = ctx.proxy.request_ledger_source();
-    let source_signature = source.as_ref().map(|source| source.signature());
-    let source_detail = source.as_ref().map(|source| source.display_detail());
-    match ctx.proxy.read_request_ledger_records(ctx.rt, limit) {
-        Ok(result) => {
-            ctx.view.requests.request_ledger_loaded_signature = Some(result.source.signature());
-            ctx.view.requests.request_ledger_source_detail = Some(result.source.display_detail());
-            ctx.view.requests.request_ledger_records = result.records;
-            ctx.view.requests.request_ledger_loaded_limit = limit;
-            ctx.view.requests.request_ledger_loaded_at_ms = Some(now_ms());
-            ctx.view.requests.request_ledger_last_error = None;
-            ctx.view.requests.selected_idx = 0;
+pub(super) fn poll_request_ledger_loader(ctx: &mut PageCtx<'_>) {
+    let current_signature = ctx.proxy.request_ledger_source_signature();
+    let current_limit = ctx.view.requests.request_ledger_limit.clamp(20, 5000);
+    let Some(load) = ctx.view.requests.request_ledger_load.as_mut() else {
+        return;
+    };
+
+    match load.rx.try_recv() {
+        Ok((seq, result)) => {
+            if seq != load.seq
+                || load.source_signature != current_signature
+                || load.limit != current_limit
+            {
+                ctx.view.requests.request_ledger_load = None;
+                return;
+            }
+
+            let limit = load.limit;
+            ctx.view.requests.request_ledger_load = None;
+            match result {
+                Ok(result) => {
+                    ctx.view.requests.request_ledger_requested_signature =
+                        Some(result.source.signature());
+                    ctx.view.requests.request_ledger_requested_limit = limit;
+                    ctx.view.requests.request_ledger_loaded_signature =
+                        Some(result.source.signature());
+                    ctx.view.requests.request_ledger_source_detail =
+                        Some(result.source.display_detail());
+                    ctx.view.requests.request_ledger_records = result.records;
+                    ctx.view.requests.request_ledger_loaded_limit = limit;
+                    ctx.view.requests.request_ledger_loaded_at_ms = Some(now_ms());
+                    ctx.view.requests.request_ledger_last_error = None;
+                    ctx.view.requests.selected_idx = 0;
+                }
+                Err(err) => {
+                    ctx.view.requests.request_ledger_last_error = Some(err.to_string());
+                }
+            }
         }
-        Err(err) => {
-            ctx.view.requests.request_ledger_records.clear();
-            ctx.view.requests.request_ledger_loaded_limit = limit;
-            ctx.view.requests.request_ledger_loaded_signature = source_signature;
-            ctx.view.requests.request_ledger_source_detail = source_detail;
-            ctx.view.requests.request_ledger_loaded_at_ms = Some(now_ms());
-            ctx.view.requests.request_ledger_last_error = Some(err.to_string());
-            ctx.view.requests.selected_idx = 0;
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            ctx.view.requests.request_ledger_load = None;
         }
     }
+}
+
+fn cancel_request_ledger_load(state: &mut RequestsViewState) {
+    if let Some(load) = state.request_ledger_load.take() {
+        load.join.abort();
+    }
+}
+
+fn refresh_request_ledger(ctx: &mut PageCtx<'_>, force: bool) {
+    let source = ctx.proxy.request_ledger_source();
+    let Some(source) = source else {
+        ctx.view.requests.request_ledger_last_error =
+            Some("request ledger is unavailable for this proxy".to_string());
+        return;
+    };
+
+    let source_signature = Some(source.signature());
+    let source_detail = Some(source.display_detail());
+    let limit = ctx.view.requests.request_ledger_limit.clamp(20, 5000);
+    ctx.view.requests.request_ledger_limit = limit;
+
+    if !force
+        && ctx.view.requests.request_ledger_load.is_none()
+        && ctx.view.requests.request_ledger_requested_signature == source_signature
+        && ctx.view.requests.request_ledger_requested_limit == limit
+    {
+        return;
+    }
+
+    if force {
+        cancel_request_ledger_load(&mut ctx.view.requests);
+    } else if ctx.view.requests.request_ledger_load.is_some() {
+        return;
+    }
+
+    ctx.view.requests.request_ledger_requested_signature = source_signature.clone();
+    ctx.view.requests.request_ledger_requested_limit = limit;
+    ctx.view.requests.request_ledger_source_detail = source_detail;
+    ctx.view.requests.request_ledger_last_error = None;
+
+    let future = match ctx.proxy.read_request_ledger_records_task(limit) {
+        Ok(future) => future,
+        Err(err) => {
+            ctx.view.requests.request_ledger_last_error = Some(err.to_string());
+            return;
+        }
+    };
+
+    ctx.view.requests.request_ledger_load_seq =
+        ctx.view.requests.request_ledger_load_seq.saturating_add(1);
+    let seq = ctx.view.requests.request_ledger_load_seq;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let join = ctx.rt.spawn(async move {
+        let result = future.await;
+        let _ = tx.send((seq, result));
+    });
+    ctx.view.requests.request_ledger_load = Some(RequestLedgerLoad {
+        seq,
+        source_signature,
+        limit,
+        rx,
+        join,
+    });
 }
 
 fn render_request_ledger_status(ui: &mut egui::Ui, ctx: &PageCtx<'_>) {
     ui.horizontal_wrapped(|ui| {
+        if ctx.view.requests.request_ledger_load.is_some() {
+            ui.small(pick(ctx.lang, "正在载入日志...", "Loading request log..."));
+            return;
+        }
         if let Some(error) = ctx.view.requests.request_ledger_last_error.as_deref() {
             ui.colored_label(
                 egui::Color32::from_rgb(200, 120, 40),
@@ -187,6 +276,18 @@ fn render_request_ledger_status(ui: &mut egui::Ui, ctx: &PageCtx<'_>) {
                     pick(ctx.lang, "请求日志错误", "Request ledger error")
                 ),
             );
+            if ctx.view.requests.request_ledger_loaded_at_ms.is_some()
+                && (ctx.view.requests.request_ledger_loaded_signature
+                    != ctx.view.requests.request_ledger_requested_signature
+                    || ctx.view.requests.request_ledger_loaded_limit
+                        != ctx.view.requests.request_ledger_requested_limit)
+            {
+                ui.small(pick(
+                    ctx.lang,
+                    "显示的是上次成功结果；最新刷新失败。",
+                    "Showing the last successful result; the latest refresh failed.",
+                ));
+            }
             return;
         }
         ui.small(format!(

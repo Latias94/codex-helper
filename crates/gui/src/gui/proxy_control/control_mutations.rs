@@ -133,8 +133,13 @@ where
     }
 }
 
-fn refresh_now(controller: &mut ProxyController, rt: &tokio::runtime::Runtime) {
+fn refresh_now(
+    controller: &mut ProxyController,
+    rt: &tokio::runtime::Runtime,
+) -> anyhow::Result<()> {
+    controller.sync_running_config_from_disk(rt)?;
     controller.refresh_current_if_due(rt, Duration::from_secs(0));
+    Ok(())
 }
 
 impl ProxyController {

@@ -3,7 +3,7 @@ use eframe::egui;
 use super::components::history_sessions;
 use super::history::ResolvedHistoryLayout;
 use super::history_all_by_date_loader::{
-    ensure_selected_date_loaded, load_more_day_index, refresh_day_index,
+    ensure_selected_date_loaded, load_more_day_index, poll_all_by_date_loaders, refresh_day_index,
 };
 use super::history_all_by_date_transcript::render_all_by_date_transcript_panel;
 use super::*;
@@ -114,6 +114,7 @@ pub(super) fn render_history_all_by_date(
     layout: ResolvedHistoryLayout,
 ) {
     ui.add_space(6.0);
+    poll_all_by_date_loaders(ctx);
 
     ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "搜索", "Search"));
@@ -148,14 +149,31 @@ pub(super) fn render_history_all_by_date(
         ui.add_space(4.0);
         ui.colored_label(egui::Color32::from_rgb(200, 120, 40), error);
     }
+    if ctx.view.history.day_index_load.is_some() {
+        ui.add_space(4.0);
+        ui.label(pick(
+            ctx.lang,
+            "正在加载日期索引...",
+            "Loading date index...",
+        ));
+    } else if ctx.view.history.day_sessions_load.is_some() {
+        ui.add_space(4.0);
+        ui.label(pick(
+            ctx.lang,
+            "正在加载所选日期的会话...",
+            "Loading sessions for the selected date...",
+        ));
+    }
 
     if ctx.view.history.all_dates.is_empty() {
         ui.add_space(8.0);
-        ui.label(pick(
-            ctx.lang,
-            "暂无日期索引。点击“刷新”加载。",
-            "No date index loaded. Click Refresh.",
-        ));
+        if ctx.view.history.day_index_load.is_none() {
+            ui.label(pick(
+                ctx.lang,
+                "暂无日期索引。点击“刷新”加载。",
+                "No date index loaded. Click Refresh.",
+            ));
+        }
         return;
     }
 

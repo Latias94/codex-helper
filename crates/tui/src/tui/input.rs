@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Url;
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::{OnceCell, Semaphore, mpsc};
 
 use crate::config::{
     UpstreamConfig,
@@ -50,11 +50,15 @@ pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
     matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+pub(in crate::tui) type BalanceRefreshOutcome = Result<(), String>;
+pub(in crate::tui) type BalanceRefreshSender = mpsc::UnboundedSender<BalanceRefreshOutcome>;
+
 pub(in crate::tui) async fn handle_key_event(
     state: Arc<ProxyState>,
     providers: &mut Vec<ProviderOption>,
     ui: &mut UiState,
     snapshot: &Snapshot,
+    balance_refresh_tx: BalanceRefreshSender,
     key: KeyEvent,
 ) -> bool {
     if ui.overlay == Overlay::None && apply_page_shortcuts(ui, key.code) {
@@ -62,7 +66,9 @@ pub(in crate::tui) async fn handle_key_event(
     }
 
     match ui.overlay {
-        Overlay::None => handle_key_normal(&state, providers, ui, snapshot, key).await,
+        Overlay::None => {
+            handle_key_normal(&state, providers, ui, snapshot, &balance_refresh_tx, key).await
+        }
         Overlay::Help => match key.code {
             KeyCode::Esc | KeyCode::Char('?') => {
                 ui.overlay = Overlay::None;
@@ -210,7 +216,9 @@ pub(in crate::tui) async fn handle_key_event(
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             handle_key_provider_menu(&state, providers, ui, snapshot, key).await
         }
-        Overlay::RoutingMenu => handle_key_routing_menu(providers, ui, snapshot, key).await,
+        Overlay::RoutingMenu => {
+            handle_key_routing_menu(providers, ui, snapshot, &balance_refresh_tx, key).await
+        }
     }
 }
 
@@ -786,7 +794,7 @@ fn balance_auto_refresh_cooldown(
     now_ms: u64,
 ) -> Option<Duration> {
     let mut seen = false;
-    let mut all_expired = true;
+    let mut any_refresh_worthy = false;
 
     for snapshot in provider_balances.values().flatten() {
         seen = true;
@@ -794,12 +802,17 @@ fn balance_auto_refresh_cooldown(
             || snapshot
                 .stale_after_ms
                 .is_some_and(|stale_after_ms| now_ms > stale_after_ms);
-        all_expired &= expired;
+        let problematic = matches!(
+            snapshot.status,
+            crate::state::BalanceSnapshotStatus::Unknown
+                | crate::state::BalanceSnapshotStatus::Error
+        );
+        any_refresh_worthy |= expired || problematic;
     }
 
     if !seen {
         Some(Duration::from_secs(10))
-    } else if all_expired {
+    } else if any_refresh_worthy {
         Some(Duration::from_secs(60))
     } else {
         None
@@ -824,8 +837,18 @@ fn should_request_provider_balance_refresh(
     last_request_elapsed.is_none_or(|elapsed| elapsed >= cooldown)
 }
 
-async fn open_routing_editor(ui: &mut UiState, snapshot: &Snapshot, reason: &'static str) {
-    let balance_started = request_provider_balance_refresh(ui, snapshot, BalanceRefreshMode::Auto);
+async fn open_routing_editor(
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    reason: &'static str,
+    balance_refresh_tx: &BalanceRefreshSender,
+) {
+    let balance_started = request_provider_balance_refresh(
+        ui,
+        snapshot,
+        BalanceRefreshMode::Auto,
+        balance_refresh_tx,
+    );
     if ui.page == Page::Stations {
         ui.routing_menu_idx = ui.selected_station_idx;
     }
@@ -851,6 +874,7 @@ fn request_provider_balance_refresh(
     ui: &mut UiState,
     snapshot: &Snapshot,
     mode: BalanceRefreshMode,
+    balance_refresh_tx: &BalanceRefreshSender,
 ) -> bool {
     let now = Instant::now();
     let last_request_elapsed = ui
@@ -865,16 +889,21 @@ fn request_provider_balance_refresh(
         return false;
     }
     ui.last_balance_refresh_requested_at = Some(now);
-    ui.needs_snapshot_refresh = true;
     let admin_port = ui.admin_port;
+    let balance_refresh_tx = balance_refresh_tx.clone();
     tokio::spawn(async move {
-        let _ = reqwest::Client::new()
+        let result = reqwest::Client::new()
             .post(format!(
                 "http://127.0.0.1:{admin_port}/__codex_helper/api/v1/providers/balances/refresh"
             ))
             .timeout(Duration::from_secs(12))
             .send()
             .await;
+        let outcome = result
+            .and_then(|resp| resp.error_for_status())
+            .map(|_| ())
+            .map_err(|err| err.to_string());
+        let _ = balance_refresh_tx.send(outcome);
     });
     true
 }
@@ -1386,6 +1415,7 @@ async fn handle_key_normal(
     providers: &mut Vec<ProviderOption>,
     ui: &mut UiState,
     snapshot: &Snapshot,
+    balance_refresh_tx: &BalanceRefreshSender,
     key: KeyEvent,
 ) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
@@ -1527,7 +1557,13 @@ async fn handle_key_normal(
         }
         KeyCode::Char('i') if ui.page == Page::Stations => {
             if ui.uses_v3_routing() {
-                open_routing_editor(ui, snapshot, "routing: provider details/edit").await;
+                open_routing_editor(
+                    ui,
+                    snapshot,
+                    "routing: provider details/edit",
+                    balance_refresh_tx,
+                )
+                .await;
                 return true;
             }
             ui.overlay = Overlay::StationInfo;
@@ -1686,7 +1722,13 @@ async fn handle_key_normal(
         }
         KeyCode::Enter if ui.page == Page::Stations => {
             if ui.uses_v3_routing() {
-                open_routing_editor(ui, snapshot, "routing: edit provider policy/order/tags").await;
+                open_routing_editor(
+                    ui,
+                    snapshot,
+                    "routing: edit provider policy/order/tags",
+                    balance_refresh_tx,
+                )
+                .await;
                 return true;
             }
             let Some(name) = providers
@@ -1706,7 +1748,13 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('r') if ui.page == Page::Stations => {
-            open_routing_editor(ui, snapshot, "routing: edit persisted policy/order").await;
+            open_routing_editor(
+                ui,
+                snapshot,
+                "routing: edit persisted policy/order",
+                balance_refresh_tx,
+            )
+            .await;
             true
         }
         KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
@@ -1794,7 +1842,8 @@ async fn handle_key_normal(
                 return true;
             }
             ui.routing_menu_idx = ui.selected_station_idx;
-            let handled = handle_key_routing_menu(providers, ui, snapshot, key).await;
+            let handled =
+                handle_key_routing_menu(providers, ui, snapshot, balance_refresh_tx, key).await;
             ui.selected_station_idx = ui.routing_menu_idx;
             handled
         }
@@ -3147,6 +3196,7 @@ async fn handle_key_normal(
                     ui,
                     snapshot,
                     "v3 routing is global; editing persisted routing",
+                    balance_refresh_tx,
                 )
                 .await;
                 return true;
@@ -3168,8 +3218,12 @@ async fn handle_key_normal(
                 .position(|p| p.name == current)
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            let balance_started =
-                request_provider_balance_refresh(ui, snapshot, BalanceRefreshMode::Auto);
+            let balance_started = request_provider_balance_refresh(
+                ui,
+                snapshot,
+                BalanceRefreshMode::Auto,
+                balance_refresh_tx,
+            );
             ui.overlay = Overlay::ProviderMenuSession;
             if balance_started {
                 ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
@@ -3178,7 +3232,13 @@ async fn handle_key_normal(
         }
         KeyCode::Char('P') => {
             if ui.uses_v3_routing() {
-                open_routing_editor(ui, snapshot, "routing: edit provider policy/order/tags").await;
+                open_routing_editor(
+                    ui,
+                    snapshot,
+                    "routing: edit provider policy/order/tags",
+                    balance_refresh_tx,
+                )
+                .await;
                 return true;
             }
             let current = snapshot
@@ -3191,8 +3251,12 @@ async fn handle_key_normal(
                 .position(|p| p.name == current)
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            let balance_started =
-                request_provider_balance_refresh(ui, snapshot, BalanceRefreshMode::Auto);
+            let balance_started = request_provider_balance_refresh(
+                ui,
+                snapshot,
+                BalanceRefreshMode::Auto,
+                balance_refresh_tx,
+            );
             ui.overlay = Overlay::ProviderMenuGlobal;
             if balance_started {
                 ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
@@ -3392,7 +3456,7 @@ mod tests {
     };
     use crate::config::{RoutingExhaustedActionV3, RoutingPolicyV3};
     use crate::dashboard_core::ControlProfileOption;
-    use crate::state::ProviderBalanceSnapshot;
+    use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
     use crate::tui::model::{RoutingProviderRef, RoutingSpecView, routing_provider_names};
     use std::collections::{BTreeMap, HashMap};
     use std::time::Duration;
@@ -3419,7 +3483,20 @@ mod tests {
             fetched_at_ms: 100,
             stale_after_ms,
             stale,
+            exhausted: Some(false),
+            status: BalanceSnapshotStatus::Ok,
             ..ProviderBalanceSnapshot::default()
+        }
+    }
+
+    fn balance_snapshot_status(
+        status: BalanceSnapshotStatus,
+        stale: bool,
+        stale_after_ms: Option<u64>,
+    ) -> ProviderBalanceSnapshot {
+        ProviderBalanceSnapshot {
+            status,
+            ..balance_snapshot(stale, stale_after_ms)
         }
     }
 
@@ -3452,8 +3529,67 @@ mod tests {
     }
 
     #[test]
-    fn auto_balance_refresh_requests_when_all_cached_balances_are_stale() {
-        let balances = balance_map(balance_snapshot(true, Some(500)));
+    fn auto_balance_refresh_requests_when_any_cached_balance_is_stale() {
+        let balances = HashMap::from([
+            (
+                "input".to_string(),
+                vec![balance_snapshot(false, Some(2_000))],
+            ),
+            (
+                "backup".to_string(),
+                vec![ProviderBalanceSnapshot {
+                    provider_id: "backup".to_string(),
+                    station_name: Some("backup".to_string()),
+                    upstream_index: Some(0),
+                    source: "test".to_string(),
+                    fetched_at_ms: 100,
+                    stale_after_ms: Some(500),
+                    stale: true,
+                    ..ProviderBalanceSnapshot::default()
+                }],
+            ),
+        ]);
+
+        assert!(should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Auto,
+            1_000,
+            None
+        ));
+        assert!(!should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Auto,
+            1_000,
+            Some(Duration::from_secs(30))
+        ));
+        assert!(should_request_provider_balance_refresh(
+            &balances,
+            BalanceRefreshMode::Auto,
+            1_000,
+            Some(Duration::from_secs(61))
+        ));
+    }
+
+    #[test]
+    fn auto_balance_refresh_requests_for_unknown_or_error_balances() {
+        let balances = HashMap::from([
+            (
+                "input".to_string(),
+                vec![balance_snapshot_status(
+                    BalanceSnapshotStatus::Unknown,
+                    false,
+                    Some(2_000),
+                )],
+            ),
+            (
+                "backup".to_string(),
+                vec![balance_snapshot_status(
+                    BalanceSnapshotStatus::Error,
+                    false,
+                    Some(2_000),
+                )],
+            ),
+        ]);
 
         assert!(should_request_provider_balance_refresh(
             &balances,
@@ -3952,6 +4088,7 @@ async fn handle_key_routing_menu(
     _providers: &mut [ProviderOption],
     ui: &mut UiState,
     snapshot: &Snapshot,
+    balance_refresh_tx: &BalanceRefreshSender,
     key: KeyEvent,
 ) -> bool {
     match key.code {
@@ -3960,8 +4097,12 @@ async fn handle_key_routing_menu(
             true
         }
         KeyCode::Char('g') => {
-            let balance_started =
-                request_provider_balance_refresh(ui, snapshot, BalanceRefreshMode::Force);
+            let balance_started = request_provider_balance_refresh(
+                ui,
+                snapshot,
+                BalanceRefreshMode::Force,
+                balance_refresh_tx,
+            );
             match refresh_routing_control_state(ui).await {
                 Ok(()) => {
                     ui.toast = Some((

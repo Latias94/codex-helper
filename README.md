@@ -23,7 +23,7 @@ English: [README_EN.md](README_EN.md)
 ## 核心能力
 
 - **本地代理**：默认监听 `127.0.0.1:3211`，Codex 继续按原方式使用。
-- **安全 Codex 开关**：`switch on/off` 只 patch `codex_proxy` 相关配置，不覆盖 Codex 运行期间写入的其它配置。
+- **安全 Codex 开关**：`switch on/off` 只 patch 本地代理相关配置，不会覆盖 Codex 运行期间写入的其他内容。
 - **provider / routing 配置**：`version = 3` 默认格式，新增 provider 后用 routing 决定顺序、固定或标签优先。
 - **自动兜底**：请求失败、上游不可用或可信余额显示耗尽时，可按策略切换候选 provider/upstream。
 - **余额与套餐**：支持 Sub2API、New API、通用 `/user/balance` 等常见接口自动探测；查询失败显示为 `unknown`，不会被当作耗尽。
@@ -58,7 +58,7 @@ ch
 默认行为：
 
 - 启动本地代理；
-- 初始化或迁移 `~/.codex-helper/config.toml`；
+- 初始化或迁移 `~/.codex-helper/config.toml`，旧文件会自动备份为 `.bak`；
 - 必要时把 Codex 的 `model_provider` 局部 patch 到 `codex_proxy`；
 - 交互终端中打开 TUI；
 - 退出时撤销 codex-helper 的本地代理 patch。
@@ -174,7 +174,7 @@ codex-helper --version
 常用页面：
 
 - `Overview`：代理状态、当前会话和最近请求。
-- `Routing` / `Stations`：provider 顺序、余额、tags、健康状态和 routing 预览。
+- `Routing` / `Stations`：provider 顺序、余额/套餐、tags、健康状态和 routing 预览。
 - `Sessions`：session identity、effective route、单会话覆盖。
 - `Stats` / `Requests`：token、cache token、耗时、重试、成本和请求日志。
 

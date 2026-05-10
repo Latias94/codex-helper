@@ -1,3 +1,4 @@
+use super::proxy_settings_document::start_proxy_settings_save;
 use super::proxy_settings_v3_editors::{
     render_v3_provider_editor, render_v3_routing_editor, routing_policy_label,
 };
@@ -44,6 +45,9 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             ctx.view.proxy_settings.import_codex.preview = None;
         }
     });
+    if ctx.view.proxy_settings.save_load.is_some() {
+        ui.label(pick(ctx.lang, "正在保存设置...", "Saving settings..."));
+    }
 
     if needs_load {
         reload_working_document_from_disk(ctx);
@@ -92,28 +96,17 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                         Some(pick(ctx.lang, "已生成预览", "Preview ready").to_string());
 
                     if do_apply {
-                        match save_proxy_settings_document(ctx.rt, doc) {
-                            Ok(()) => {
-                                reload_working_document_from_disk(ctx);
-                                if matches!(
-                                    ctx.proxy.kind(),
-                                    ProxyModeKind::Running | ProxyModeKind::Attached
-                                ) && let Err(err) = ctx.proxy.reload_runtime_config(ctx.rt)
-                                {
-                                    *ctx.last_error = Some(format!("reload runtime failed: {err}"));
-                                }
-                                *ctx.last_info = Some(format!(
-                                    "{}: {}",
-                                    pick(ctx.lang, "已导入并保存", "Imported & saved"),
-                                    summary
-                                ));
-                            }
-                            Err(err) => {
-                                ctx.view.proxy_settings.import_codex.last_error =
-                                    Some(format!("save failed: {err}"));
-                                *ctx.last_error = Some(format!("save failed: {err}"));
-                            }
-                        }
+                        start_proxy_settings_save(
+                            ctx,
+                            doc.clone(),
+                            format!(
+                                "{}: {}",
+                                pick(ctx.lang, "已导入并保存", "Imported & saved"),
+                                summary
+                            ),
+                            true,
+                        );
+                        ctx.view.proxy_settings.import_codex.last_error = None;
                     }
                 }
                 Err(err) => {
@@ -198,50 +191,7 @@ fn persist_current_working_document(ctx: &mut PageCtx<'_>, message: String) {
         *ctx.last_error = Some("no loaded settings document to save".to_string());
         return;
     };
-
-    match save_proxy_settings_document(ctx.rt, doc) {
-        Ok(()) => {
-            let path = crate::config::config_file_path();
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    *ctx.proxy_settings_text = text.clone();
-                    match parse_proxy_settings_document(&text) {
-                        Ok(doc) => {
-                            ctx.view.proxy_settings.working = Some(doc);
-                            ctx.view.proxy_settings.load_error = None;
-                        }
-                        Err(err) => {
-                            ctx.view.proxy_settings.working = None;
-                            ctx.view.proxy_settings.load_error =
-                                Some(format!("parse failed: {err}"));
-                            *ctx.last_error = Some(format!("re-read parse failed: {err}"));
-                            return;
-                        }
-                    }
-                }
-                Err(err) => {
-                    *ctx.last_error = Some(format!("re-read settings failed: {err}"));
-                    return;
-                }
-            }
-
-            if matches!(
-                ctx.proxy.kind(),
-                ProxyModeKind::Running | ProxyModeKind::Attached
-            ) && let Err(err) = ctx.proxy.reload_runtime_config(ctx.rt)
-            {
-                *ctx.last_error = Some(format!("reload runtime failed: {err}"));
-                *ctx.last_info = Some(message);
-                return;
-            }
-
-            *ctx.last_info = Some(message);
-            *ctx.last_error = None;
-        }
-        Err(err) => {
-            *ctx.last_error = Some(format!("save failed: {err}"));
-        }
-    }
+    start_proxy_settings_save(ctx, doc.clone(), message, true);
 }
 
 fn render_import_modal(

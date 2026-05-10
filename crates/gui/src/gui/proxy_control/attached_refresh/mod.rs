@@ -1,34 +1,46 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 
-use crate::config::{
-    PersistedProviderSpec, PersistedStationProviderRef, PersistedStationSpec, ResolvedRetryConfig,
-    RetryConfig,
-};
+use crate::config::{ResolvedRetryConfig, RetryConfig};
 use crate::dashboard_core::{
     ApiV1Capabilities, ApiV1OperatorSummary, ApiV1Snapshot, ControlProfileOption,
-    HostLocalControlPlaneCapabilities, OperatorHealthSummary, OperatorRetrySummary,
-    OperatorRuntimeSummary, OperatorSummaryCounts, OperatorSummaryLinks, ProviderOption,
-    RemoteAdminAccessCapabilities, SharedControlPlaneCapabilities, StationOption, WindowStats,
+    OperatorSummaryLinks, ProviderOption, StationOption, WindowStats,
 };
 use crate::pricing::{ModelPriceCatalogSnapshot, bundled_model_price_catalog_snapshot};
 use crate::state::{
-    ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
-    SessionIdentityCard, SessionManualOverrides, SessionStats, StationHealth, UsageRollupView,
+    ActiveRequest, FinishedRequest, HealthCheckStatus, SessionManualOverrides, SessionStats,
+    StationHealth, UsageRollupView,
 };
 
 use super::attached_discovery::{attached_management_candidates, resolve_api_v1_surface};
+use super::types::AttachedRefreshResult;
 use super::{AttachedStatus, ProxyController, ProxyMode, send_admin_request};
 
 mod fetch;
 mod state_apply;
 
 use fetch::refresh_from_base;
-use state_apply::apply_refresh_result;
+pub(super) use state_apply::apply_refresh_result as apply_attached_refresh_result;
+
+pub(super) async fn fetch_attached_refresh(
+    client: Client,
+    base_candidates: Vec<String>,
+) -> anyhow::Result<AttachedRefreshResult> {
+    let req_timeout = Duration::from_millis(800);
+    let mut last_err: Option<anyhow::Error> = None;
+    for base in base_candidates {
+        match refresh_from_base(&client, &base, req_timeout).await {
+            Ok(result) => return Ok(result),
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("attach refresh failed")))
+}
 
 impl ProxyController {
     pub fn refresh_attached_if_due(
@@ -50,24 +62,13 @@ impl ProxyController {
             _ => return,
         };
 
-        let client = self.http_client.clone();
-        let fut = async move {
-            let req_timeout = Duration::from_millis(800);
-            let mut last_err: Option<anyhow::Error> = None;
-            for base in base_candidates {
-                match refresh_from_base(&client, &base, req_timeout).await {
-                    Ok(result) => return Ok::<_, anyhow::Error>(result),
-                    Err(err) => last_err = Some(err),
-                }
-            }
-
-            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("attach refresh failed")))
-        };
-
-        match rt.block_on(fut) {
+        match rt.block_on(fetch_attached_refresh(
+            self.http_client.clone(),
+            base_candidates,
+        )) {
             Ok(result) => {
                 if let ProxyMode::Attached(att) = &mut self.mode {
-                    apply_refresh_result(att, result);
+                    apply_attached_refresh_result(att, result);
                 }
             }
             Err(err) => {

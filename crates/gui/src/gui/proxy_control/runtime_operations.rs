@@ -1,11 +1,27 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::bail;
+
+use crate::config::load_config;
 
 use super::control_mutations::mode_control_url;
 use super::{ProxyController, ProxyMode, send_admin_request};
 
 impl ProxyController {
+    pub fn sync_running_config_from_disk(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+    ) -> anyhow::Result<bool> {
+        let ProxyMode::Running(r) = &mut self.mode else {
+            return Ok(false);
+        };
+
+        let cfg = rt.block_on(load_config())?;
+        r.cfg = Arc::new(cfg);
+        Ok(true)
+    }
+
     pub fn reload_runtime_config(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         let url = mode_control_url(
             &self.mode,
@@ -21,6 +37,7 @@ impl ProxyController {
             Ok::<(), anyhow::Error>(())
         };
         rt.block_on(fut)?;
+        self.sync_running_config_from_disk(rt)?;
         self.refresh_current_if_due(rt, Duration::from_secs(0));
         Ok(())
     }

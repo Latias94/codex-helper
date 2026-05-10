@@ -72,19 +72,19 @@ fn request_list_label(request: &FinishedRequest, now_ms: u64) -> String {
     let model = request.model.as_deref().unwrap_or("-");
     let station = request.station_name.as_deref().unwrap_or("-");
     let provider = request.provider_id.as_deref().unwrap_or("-");
-    let path = shorten_middle(&request.path, 44);
+    let request_line = shorten_middle(&format!("{} {}", request.method, request.path), 44);
     let metrics = request_list_metrics(request);
     format!(
-        "{age}  http={}  dur={}ms  ttfb={}  att={}  {}  stn={}  prv={}  {}  {}",
+        "{age}  http={}  total={}  ttfb={}  att={}  {}  stn={}  prv={}  {}  req={}",
         request.status_code,
-        request.duration_ms,
+        format_duration_ms(request.duration_ms),
         request_list_ttfb(request),
         request.attempt_count(),
         shorten(model, 18),
         shorten(station, 14),
         shorten(provider, 12),
         shorten(&metrics, 96),
-        path
+        request_line
     )
 }
 
@@ -148,11 +148,7 @@ fn request_list_metrics(request: &FinishedRequest) -> String {
 }
 
 fn request_list_ttfb(request: &FinishedRequest) -> String {
-    request
-        .ttfb_ms
-        .filter(|value| *value > 0)
-        .map(|value| format!("{value}ms"))
-        .unwrap_or_else(|| "-".to_string())
+    format_duration_ms_opt(request.ttfb_ms)
 }
 
 fn compact_count(value: i64) -> String {

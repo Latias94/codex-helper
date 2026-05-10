@@ -1,9 +1,12 @@
 use super::components::console_layout::console_note;
 use super::stats_control_trace_summary::control_trace_summary;
-use super::view_state::{ControlTraceRecordState, ControlTraceSourceKind, StatsViewState};
+use super::view_state::{
+    ControlTraceLoad, ControlTraceRecordState, ControlTraceSourceKind, StatsViewState,
+};
 use super::*;
-use crate::gui::proxy_control::{ControlTraceDataSource, ProxyController};
+use crate::gui::proxy_control::ControlTraceDataSource;
 use crate::logging::{ControlTraceDetail, ControlTraceLogEntry};
+use std::sync::mpsc::TryRecvError;
 
 pub(super) fn render_control_trace_source_summary(
     ui: &mut egui::Ui,
@@ -48,36 +51,105 @@ pub(super) fn render_control_trace_source_summary(
     }
 }
 
-pub(super) fn refresh_control_trace_state(
-    state: &mut StatsViewState,
-    lang: Language,
-    proxy: &ProxyController,
-    rt: &tokio::runtime::Runtime,
-) {
-    let source = proxy.control_trace_source();
-    apply_control_trace_source_state(state, source.as_ref());
-    state.control_trace_loaded_signature = source.as_ref().map(ControlTraceDataSource::signature);
+pub(super) fn poll_control_trace_loader(ctx: &mut PageCtx<'_>) {
+    let current_signature = ctx.proxy.control_trace_source_signature();
+    let current_limit = ctx.view.stats.control_trace_limit.clamp(20, 400);
+    let Some(load) = ctx.view.stats.control_trace_load.as_mut() else {
+        return;
+    };
 
-    match proxy.read_control_trace_entries(rt, state.control_trace_limit) {
-        Ok(result) => {
-            apply_control_trace_source_state(state, Some(&result.source));
-            state.control_trace_loaded_signature = Some(result.source.signature());
-            state.control_trace_entries = result
-                .entries
-                .iter()
-                .map(|entry| control_trace_record_from_entry(entry, lang))
-                .collect();
-            state.control_trace_loaded_limit = state.control_trace_limit;
-            state.control_trace_last_loaded_ms = Some(now_ms());
-            state.control_trace_last_error = None;
+    match load.rx.try_recv() {
+        Ok((seq, result)) => {
+            if seq != load.seq
+                || load.source_signature != current_signature
+                || load.limit != current_limit
+            {
+                ctx.view.stats.control_trace_load = None;
+                return;
+            }
+
+            let limit = load.limit;
+            ctx.view.stats.control_trace_load = None;
+            match result {
+                Ok(result) => {
+                    apply_control_trace_source_state(&mut ctx.view.stats, Some(&result.source));
+                    ctx.view.stats.control_trace_loaded_signature = Some(result.source.signature());
+                    ctx.view.stats.control_trace_loaded_limit = limit;
+                    ctx.view.stats.control_trace_entries = result
+                        .entries
+                        .iter()
+                        .map(|entry| control_trace_record_from_entry(entry, ctx.lang))
+                        .collect();
+                    ctx.view.stats.control_trace_last_loaded_ms = Some(now_ms());
+                    ctx.view.stats.control_trace_last_error = None;
+                }
+                Err(err) => {
+                    ctx.view.stats.control_trace_last_error = Some(err.to_string());
+                }
+            }
         }
-        Err(err) => {
-            state.control_trace_entries.clear();
-            state.control_trace_loaded_limit = state.control_trace_limit;
-            state.control_trace_last_loaded_ms = Some(now_ms());
-            state.control_trace_last_error = Some(err.to_string());
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            ctx.view.stats.control_trace_load = None;
         }
     }
+}
+
+fn cancel_control_trace_load(state: &mut StatsViewState) {
+    if let Some(load) = state.control_trace_load.take() {
+        load.join.abort();
+    }
+}
+
+pub(super) fn refresh_control_trace_state(ctx: &mut PageCtx<'_>, force: bool) {
+    let source = ctx.proxy.control_trace_source();
+    let requested_signature = source.as_ref().map(ControlTraceDataSource::signature);
+    apply_control_trace_source_state(&mut ctx.view.stats, source.as_ref());
+
+    let limit = ctx.view.stats.control_trace_limit.clamp(20, 400);
+    ctx.view.stats.control_trace_limit = limit;
+
+    if !force
+        && ctx.view.stats.control_trace_load.is_none()
+        && ctx.view.stats.control_trace_requested_signature == requested_signature
+        && ctx.view.stats.control_trace_requested_limit == limit
+    {
+        return;
+    }
+
+    if force {
+        cancel_control_trace_load(&mut ctx.view.stats);
+    } else if ctx.view.stats.control_trace_load.is_some() {
+        return;
+    }
+
+    ctx.view.stats.control_trace_requested_signature = requested_signature.clone();
+    ctx.view.stats.control_trace_requested_limit = limit;
+    ctx.view.stats.control_trace_last_error = None;
+
+    let future = match ctx.proxy.read_control_trace_entries_task(limit) {
+        Ok(future) => future,
+        Err(err) => {
+            ctx.view.stats.control_trace_last_error = Some(err.to_string());
+            return;
+        }
+    };
+
+    ctx.view.stats.control_trace_load_seq = ctx.view.stats.control_trace_load_seq.saturating_add(1);
+    let seq = ctx.view.stats.control_trace_load_seq;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let join = ctx.rt.spawn(async move {
+        let result = future.await;
+        let _ = tx.send((seq, result));
+    });
+
+    ctx.view.stats.control_trace_load = Some(ControlTraceLoad {
+        seq,
+        source_signature: requested_signature,
+        limit,
+        rx,
+        join,
+    });
 }
 
 fn apply_control_trace_source_state(

@@ -3,7 +3,8 @@ use eframe::egui;
 use super::super::i18n::pick;
 use super::history_all_by_date::render_history_all_by_date;
 use super::history_controller::{
-    apply_pending_metadata_filter, history_refresh_needed, stabilize_history_selection,
+    apply_pending_metadata_filter, history_refresh_needed, poll_history_refresh_loader,
+    poll_tail_transcript_search_loader, stabilize_history_selection,
 };
 use super::history_main_view::render_history_content;
 use super::history_state::{HistoryDataSource, HistoryScope};
@@ -61,6 +62,7 @@ fn render_observed_fallback_notice(ui: &mut egui::Ui, ctx: &PageCtx<'_>) {
 
 pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     poll_transcript_loader(ctx);
+    poll_tail_transcript_search_loader(ctx);
     let remote_attached = remote_attached_proxy_active(ctx.proxy);
     let (shared_observed_history_available, attached_host_local_history_advertised) = ctx
         .proxy
@@ -72,6 +74,7 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             )
         })
         .unwrap_or((false, false));
+    poll_history_refresh_loader(ctx);
 
     render_history_header(
         ui,
@@ -109,14 +112,31 @@ pub(super) fn render_history(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         ui.add_space(4.0);
         ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
     }
+    if ctx.view.history.refresh_load.is_some() {
+        ui.add_space(4.0);
+        ui.label(pick(
+            ctx.lang,
+            "正在刷新会话列表...",
+            "Refreshing sessions...",
+        ));
+    } else if ctx.view.history.tail_search_load.is_some() {
+        ui.add_space(4.0);
+        ui.label(pick(
+            ctx.lang,
+            "正在搜索对话尾部...",
+            "Searching transcript tails...",
+        ));
+    }
 
     if ctx.view.history.sessions.is_empty() {
         ui.add_space(8.0);
-        ui.label(pick(
-            ctx.lang,
-            "暂无会话。点击“刷新”加载。",
-            "No sessions loaded. Click Refresh.",
-        ));
+        if ctx.view.history.refresh_load.is_none() && ctx.view.history.tail_search_load.is_none() {
+            ui.label(pick(
+                ctx.lang,
+                "暂无会话。点击“刷新”加载。",
+                "No sessions loaded. Click Refresh.",
+            ));
+        }
         return;
     }
 

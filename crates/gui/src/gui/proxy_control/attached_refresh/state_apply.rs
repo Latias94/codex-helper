@@ -1,7 +1,10 @@
 use super::fetch::RefreshResult;
 use super::*;
 
-pub(super) fn apply_refresh_result(att: &mut AttachedStatus, result: RefreshResult) {
+pub(in crate::gui::proxy_control) fn apply_refresh_result(
+    att: &mut AttachedStatus,
+    result: RefreshResult,
+) {
     att.last_error = None;
     att.admin_base_url = result.management_base_url;
     att.api_version = result.api_version;

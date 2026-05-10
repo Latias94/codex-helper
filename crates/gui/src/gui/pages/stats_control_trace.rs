@@ -7,13 +7,6 @@ use super::*;
 
 pub(super) fn render_control_trace_panel(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let current_signature = ctx.proxy.control_trace_source_signature();
-    if ctx.view.stats.control_trace_last_loaded_ms.is_none()
-        || ctx.view.stats.control_trace_loaded_limit != ctx.view.stats.control_trace_limit
-        || ctx.view.stats.control_trace_loaded_signature != current_signature
-    {
-        refresh_control_trace_state(&mut ctx.view.stats, ctx.lang, ctx.proxy, ctx.rt);
-    }
-
     console_section(
         ui,
         pick(ctx.lang, "控制链事件", "Control trace"),
@@ -26,6 +19,24 @@ pub(super) fn render_control_trace_panel(ui: &mut egui::Ui, ctx: &mut PageCtx<'_
                     pick(ctx.lang, "最近加载", "Last loaded"),
                     format_age(now_ms(), Some(loaded_at))
                 ));
+            }
+            if ctx.view.stats.control_trace_load.is_some() {
+                ui.small(pick(ctx.lang, "正在加载...", "Loading..."));
+            } else if ctx.view.stats.control_trace_last_loaded_ms.is_some()
+                && ctx.view.stats.control_trace_last_error.is_some()
+                && (ctx.view.stats.control_trace_loaded_signature
+                    != ctx.view.stats.control_trace_requested_signature
+                    || ctx.view.stats.control_trace_loaded_limit
+                        != ctx.view.stats.control_trace_requested_limit)
+            {
+                console_note(
+                    ui,
+                    pick(
+                        ctx.lang,
+                        "当前显示的是上次成功结果；最新刷新失败。",
+                        "Showing the last successful result; the latest refresh failed.",
+                    ),
+                );
             }
 
             ui.add_space(6.0);
@@ -78,8 +89,14 @@ pub(super) fn render_control_trace_panel(ui: &mut egui::Ui, ctx: &mut PageCtx<'_
                         )),
                 );
 
+                let should_auto_refresh = ctx.view.stats.control_trace_load.is_none()
+                    && (ctx.view.stats.control_trace_requested_signature != current_signature
+                        || ctx.view.stats.control_trace_requested_limit
+                            != ctx.view.stats.control_trace_limit);
                 if refresh_clicked {
-                    refresh_control_trace_state(&mut ctx.view.stats, ctx.lang, ctx.proxy, ctx.rt);
+                    refresh_control_trace_state(ctx, true);
+                } else if should_auto_refresh {
+                    refresh_control_trace_state(ctx, false);
                 }
             });
 

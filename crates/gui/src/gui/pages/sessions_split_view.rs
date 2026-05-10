@@ -85,7 +85,7 @@ pub(super) fn render_sessions_split_view(
             cols[1].label(format!("status(last): {status}"));
         }
         if let Some(ms) = row.last_duration_ms {
-            cols[1].label(format!("duration(last): {ms} ms"));
+            cols[1].label(format!("duration(last): {}", format_duration_ms(ms)));
         }
         if let Some(usage) = row.last_usage.as_ref() {
             cols[1].label(format!("usage(last): {}", usage_line(usage)));

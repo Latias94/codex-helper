@@ -15,6 +15,7 @@ use reqwest::Client;
 
 mod attached_discovery;
 mod attached_refresh;
+mod background_refresh;
 mod control_mutations;
 mod running_refresh;
 mod runtime_lifecycle;
@@ -80,6 +81,7 @@ impl ProxyController {
             http_client: Client::new(),
             discovered: Vec::new(),
             last_discovery_scan: None,
+            background_refresh: None,
         }
     }
 
@@ -199,50 +201,58 @@ impl ProxyController {
             .map(|source| source.signature())
     }
 
+    #[allow(dead_code)]
     pub fn read_request_ledger_records(
         &self,
         rt: &tokio::runtime::Runtime,
         limit: usize,
     ) -> anyhow::Result<RequestLedgerReadResult> {
+        rt.block_on(self.read_request_ledger_records_task(limit)?)
+    }
+
+    pub fn read_request_ledger_records_task(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<
+        impl std::future::Future<Output = anyhow::Result<RequestLedgerReadResult>> + Send + 'static,
+    > {
         let limit = limit.clamp(20, 5000);
         let source = self
             .request_ledger_source()
             .ok_or_else(|| anyhow::anyhow!("request ledger is unavailable for this proxy"))?;
+        let request_ledger_path = self
+            .attached()
+            .and_then(|att| att.operator_summary_links.as_ref())
+            .map(|links| links.request_ledger_recent.as_str())
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or("/__codex_helper/api/v1/request-ledger/recent")
+            .to_string();
+        let client = self.http_client.clone();
 
-        let records = match &source {
-            RequestLedgerDataSource::LocalFile { path } => {
-                tail_finished_requests_from_log(path, limit)?
-            }
-            RequestLedgerDataSource::AttachedApi { admin_base_url } => {
-                let request_ledger_path = self
-                    .attached()
-                    .and_then(|att| att.operator_summary_links.as_ref())
-                    .map(|links| links.request_ledger_recent.as_str())
-                    .filter(|path| !path.trim().is_empty())
-                    .unwrap_or("/__codex_helper/api/v1/request-ledger/recent")
-                    .to_string();
-                let client = self.http_client.clone();
-                let admin_base_url = admin_base_url.clone();
-                rt.block_on(async move {
-                    let response = send_admin_request(
+        Ok(async move {
+            let records = match &source {
+                RequestLedgerDataSource::LocalFile { path } => {
+                    tail_finished_requests_from_log(path, limit)?
+                }
+                RequestLedgerDataSource::AttachedApi { admin_base_url } => {
+                    send_admin_request(
                         client
                             .get(format!(
                                 "{admin_base_url}{request_ledger_path}?limit={limit}"
                             ))
                             .timeout(Duration::from_millis(1200)),
                     )
-                    .await?;
-                    let records = response
-                        .json::<Vec<crate::state::FinishedRequest>>()
-                        .await?;
-                    Ok::<Vec<crate::state::FinishedRequest>, anyhow::Error>(records)
-                })?
-            }
-        };
+                    .await?
+                    .json::<Vec<crate::state::FinishedRequest>>()
+                    .await?
+                }
+            };
 
-        Ok(RequestLedgerReadResult { source, records })
+            Ok(RequestLedgerReadResult { source, records })
+        })
     }
 
+    #[allow(dead_code)]
     pub fn read_request_ledger_summary(
         &self,
         rt: &tokio::runtime::Runtime,
@@ -250,33 +260,45 @@ impl ProxyController {
         limit: usize,
         filters: &RequestLogFilters,
     ) -> anyhow::Result<RequestLedgerSummaryReadResult> {
+        rt.block_on(self.read_request_ledger_summary_task(group, limit, filters.clone())?)
+    }
+
+    pub fn read_request_ledger_summary_task(
+        &self,
+        group: RequestUsageSummaryGroup,
+        limit: usize,
+        filters: RequestLogFilters,
+    ) -> anyhow::Result<
+        impl std::future::Future<Output = anyhow::Result<RequestLedgerSummaryReadResult>>
+        + Send
+        + 'static,
+    > {
         let limit = limit.clamp(1, 100);
         let source = self.request_ledger_summary_source().ok_or_else(|| {
             anyhow::anyhow!("request ledger summary is unavailable for this proxy")
         })?;
+        let request_ledger_path = self
+            .attached()
+            .and_then(|att| att.operator_summary_links.as_ref())
+            .map(|links| links.request_ledger_summary.as_str())
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or("/__codex_helper/api/v1/request-ledger/summary")
+            .to_string();
+        let client = self.http_client.clone();
 
-        let rows = match &source {
-            RequestLedgerDataSource::LocalFile { path } => {
-                summarize_request_log(path, group, filters, limit)?
-            }
-            RequestLedgerDataSource::AttachedApi { admin_base_url } => {
-                let request_ledger_path = self
-                    .attached()
-                    .and_then(|att| att.operator_summary_links.as_ref())
-                    .map(|links| links.request_ledger_summary.as_str())
-                    .filter(|path| !path.trim().is_empty())
-                    .unwrap_or("/__codex_helper/api/v1/request-ledger/summary")
-                    .to_string();
-                let by = match group {
-                    RequestUsageSummaryGroup::Station => "station",
-                    RequestUsageSummaryGroup::Provider => "provider",
-                    RequestUsageSummaryGroup::Model => "model",
-                    RequestUsageSummaryGroup::Session => "session",
-                };
-                let client = self.http_client.clone();
-                let admin_base_url = admin_base_url.clone();
-                rt.block_on(async move {
-                    let query = request_ledger_summary_query_pairs(limit, by, filters);
+        Ok(async move {
+            let rows = match &source {
+                RequestLedgerDataSource::LocalFile { path } => {
+                    summarize_request_log(path, group, &filters, limit)?
+                }
+                RequestLedgerDataSource::AttachedApi { admin_base_url } => {
+                    let by = match group {
+                        RequestUsageSummaryGroup::Station => "station",
+                        RequestUsageSummaryGroup::Provider => "provider",
+                        RequestUsageSummaryGroup::Model => "model",
+                        RequestUsageSummaryGroup::Session => "session",
+                    };
+                    let query = request_ledger_summary_query_pairs(limit, by, &filters);
                     let mut url =
                         reqwest::Url::parse(&format!("{admin_base_url}{request_ledger_path}"))?;
                     {
@@ -285,60 +307,66 @@ impl ProxyController {
                             pairs.append_pair(&key, &value);
                         }
                     }
-                    let response =
-                        send_admin_request(client.get(url).timeout(Duration::from_millis(1200)))
-                            .await?;
-                    let rows = response
+                    send_admin_request(client.get(url).timeout(Duration::from_millis(1200)))
+                        .await?
                         .json::<Vec<crate::request_ledger::RequestUsageSummaryRow>>()
-                        .await?;
-                    Ok::<Vec<crate::request_ledger::RequestUsageSummaryRow>, anyhow::Error>(rows)
-                })?
-            }
-        };
+                        .await?
+                }
+            };
 
-        Ok(RequestLedgerSummaryReadResult { source, rows })
+            Ok(RequestLedgerSummaryReadResult { source, rows })
+        })
     }
 
+    #[allow(dead_code)]
     pub fn read_control_trace_entries(
         &self,
         rt: &tokio::runtime::Runtime,
         limit: usize,
     ) -> anyhow::Result<ControlTraceReadResult> {
+        rt.block_on(self.read_control_trace_entries_task(limit)?)
+    }
+
+    pub fn read_control_trace_entries_task(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<
+        impl std::future::Future<Output = anyhow::Result<ControlTraceReadResult>> + Send + 'static,
+    > {
         let limit = limit.clamp(20, 400);
         let source = self
             .control_trace_source()
             .ok_or_else(|| anyhow::anyhow!("proxy is not running/attached"))?;
+        let control_trace_path = self
+            .attached()
+            .and_then(|att| att.operator_summary_links.as_ref())
+            .map(|links| links.control_trace.as_str())
+            .unwrap_or("/__codex_helper/api/v1/control-trace")
+            .to_string();
+        let client = self.http_client.clone();
 
-        let entries = match &source {
-            ControlTraceDataSource::LocalFile { .. }
-            | ControlTraceDataSource::AttachedFallbackLocal { .. } => {
-                read_recent_control_trace_entries(limit)?
-            }
-            ControlTraceDataSource::AttachedApi { admin_base_url } => {
-                let control_trace_path = self
-                    .attached()
-                    .and_then(|att| att.operator_summary_links.as_ref())
-                    .map(|links| links.control_trace.as_str())
-                    .unwrap_or("/__codex_helper/api/v1/control-trace")
-                    .to_string();
-                let client = self.http_client.clone();
-                let admin_base_url = admin_base_url.clone();
-                rt.block_on(async move {
-                    let response = send_admin_request(
+        Ok(async move {
+            let entries = match &source {
+                ControlTraceDataSource::LocalFile { .. }
+                | ControlTraceDataSource::AttachedFallbackLocal { .. } => {
+                    read_recent_control_trace_entries(limit)?
+                }
+                ControlTraceDataSource::AttachedApi { admin_base_url } => {
+                    send_admin_request(
                         client
                             .get(format!(
                                 "{admin_base_url}{control_trace_path}?limit={limit}"
                             ))
                             .timeout(Duration::from_millis(800)),
                     )
-                    .await?;
-                    let entries = response.json::<Vec<ControlTraceLogEntry>>().await?;
-                    Ok::<Vec<ControlTraceLogEntry>, anyhow::Error>(entries)
-                })?
-            }
-        };
+                    .await?
+                    .json::<Vec<ControlTraceLogEntry>>()
+                    .await?
+                }
+            };
 
-        Ok(ControlTraceReadResult { source, entries })
+            Ok(ControlTraceReadResult { source, entries })
+        })
     }
 
     pub fn snapshot(&self) -> Option<GuiRuntimeSnapshot> {
@@ -430,11 +458,22 @@ impl ProxyController {
         rt: &tokio::runtime::Runtime,
         refresh_every: Duration,
     ) {
+        if refresh_every.is_zero() {
+            self.clear_background_refresh();
+        }
         match self.kind() {
             ProxyModeKind::Running => self.refresh_running_if_due(rt, refresh_every),
             ProxyModeKind::Attached => self.refresh_attached_if_due(rt, refresh_every),
             _ => {}
         }
+    }
+
+    pub fn refresh_current_background_if_due(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        refresh_every: Duration,
+    ) {
+        self.refresh_background_if_due(rt, refresh_every);
     }
 
     pub fn show_port_in_use_modal(&self) -> bool {
@@ -446,6 +485,7 @@ impl ProxyController {
     }
 
     pub fn stop(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+        self.clear_background_refresh();
         let ProxyMode::Running(mut running) = std::mem::replace(&mut self.mode, ProxyMode::Stopped)
         else {
             self.mode = ProxyMode::Stopped;
@@ -478,6 +518,7 @@ impl ProxyController {
     }
 
     pub fn detach(&mut self) {
+        self.clear_background_refresh();
         self.mode = ProxyMode::Stopped;
         self.last_start_error = None;
         self.port_in_use_modal = None;

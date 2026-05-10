@@ -78,10 +78,10 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
             ui.label(pick(ctx.lang, "窗口(5m)", "Window (5m)"));
             ui.label(format!(
-                "ok={}  p95={}ms  att={}  429={}  5xx={}  n={}",
+                "ok={}  p95={}  att={}  429={}  5xx={}  n={}",
                 fmt_pct(s5.ok_2xx, s5.total),
                 s5.p95_ms
-                    .map(|v| v.to_string())
+                    .map(format_duration_ms)
                     .unwrap_or_else(|| "-".to_string()),
                 s5.avg_attempts
                     .map(|v| format!("{v:.1}"))
@@ -94,10 +94,10 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
 
             ui.label(pick(ctx.lang, "窗口(1h)", "Window (1h)"));
             ui.label(format!(
-                "ok={}  p95={}ms  att={}  429={}  5xx={}  n={}",
+                "ok={}  p95={}  att={}  429={}  5xx={}  n={}",
                 fmt_pct(s1.ok_2xx, s1.total),
                 s1.p95_ms
-                    .map(|v| v.to_string())
+                    .map(format_duration_ms)
                     .unwrap_or_else(|| "-".to_string()),
                 s1.avg_attempts
                     .map(|v| format!("{v:.1}"))

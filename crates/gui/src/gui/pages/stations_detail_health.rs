@@ -201,7 +201,7 @@ pub(super) fn render_station_health_section(
                         .unwrap_or_else(|| "-".to_string());
                     let latency = upstream
                         .latency_ms
-                        .map(|value| format!("{value}ms"))
+                        .map(format_duration_ms)
                         .unwrap_or_else(|| "-".to_string());
                     let error = upstream
                         .error

@@ -1,3 +1,4 @@
+use super::proxy_settings_document::start_proxy_settings_save;
 use super::*;
 
 pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
@@ -48,56 +49,22 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             .clicked()
         {
             match parse_proxy_settings_document(ctx.proxy_settings_text) {
-                Ok(cfg) => match save_proxy_settings_document(ctx.rt, &cfg) {
-                    Ok(()) => {
-                        let new_path = crate::config::config_file_path();
-                        match std::fs::read_to_string(&new_path) {
-                            Ok(t) => {
-                                *ctx.proxy_settings_text = t.clone();
-                                match parse_proxy_settings_document(&t) {
-                                    Ok(doc) => {
-                                        ctx.view.proxy_settings.working = Some(doc);
-                                        ctx.view.proxy_settings.load_error = None;
-                                        *ctx.last_info =
-                                            Some(pick(ctx.lang, "已保存", "Saved").to_string());
-                                        *ctx.last_error = None;
-                                    }
-                                    Err(e) => {
-                                        ctx.view.proxy_settings.working = None;
-                                        ctx.view.proxy_settings.load_error =
-                                            Some(format!("parse failed: {e}"));
-                                        *ctx.last_info =
-                                            Some(pick(ctx.lang, "已保存", "Saved").to_string());
-                                        *ctx.last_error =
-                                            Some(format!("re-read parse failed: {e}"));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                *ctx.last_info =
-                                    Some(pick(ctx.lang, "已保存", "Saved").to_string());
-                                *ctx.last_error = Some(format!("re-read failed: {e}"));
-                            }
-                        }
-
-                        if matches!(
-                            ctx.proxy.kind(),
-                            ProxyModeKind::Running | ProxyModeKind::Attached
-                        ) && let Err(e) = ctx.proxy.reload_runtime_config(ctx.rt)
-                        {
-                            *ctx.last_error = Some(format!("reload runtime failed: {e}"));
-                        }
-                    }
-                    Err(e) => {
-                        *ctx.last_error = Some(format!("save failed: {e}"));
-                    }
-                },
+                Ok(cfg) => start_proxy_settings_save(
+                    ctx,
+                    cfg,
+                    pick(ctx.lang, "已保存", "Saved").to_string(),
+                    true,
+                ),
                 Err(e) => {
                     *ctx.last_error = Some(format!("parse failed: {e}"));
                 }
             }
         }
     });
+    if ctx.view.proxy_settings.save_load.is_some() {
+        ui.add_space(4.0);
+        ui.label(pick(ctx.lang, "正在保存设置...", "Saving settings..."));
+    }
 
     ui.separator();
     let editor = egui::TextEdit::multiline(ctx.proxy_settings_text)

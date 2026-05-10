@@ -33,7 +33,7 @@ impl ProxyController {
             Ok::<(), anyhow::Error>(())
         };
         rt.block_on(fut)?;
-        refresh_now(self, rt);
+        refresh_now(self, rt)?;
         Ok(())
     }
 
@@ -70,7 +70,7 @@ impl ProxyController {
             Ok::<(), anyhow::Error>(())
         };
         rt.block_on(fut)?;
-        refresh_now(self, rt);
+        refresh_now(self, rt)?;
         Ok(())
     }
 
@@ -100,7 +100,7 @@ impl ProxyController {
             Ok::<(), anyhow::Error>(())
         };
         rt.block_on(fut)?;
-        refresh_now(self, rt);
+        refresh_now(self, rt)?;
         Ok(())
     }
 }

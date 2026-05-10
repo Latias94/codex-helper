@@ -19,7 +19,7 @@ pub(super) fn control_trace_summary(entry: &ControlTraceLogEntry, lang: Language
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
             let duration = duration_ms
-                .map(|value| format!("{value}ms"))
+                .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
             let station = station_name.unwrap_or_else(|| "-".to_string());
             let provider = provider_id.unwrap_or_else(|| "-".to_string());

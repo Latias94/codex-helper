@@ -159,6 +159,7 @@ impl ProxyController {
         service: ServiceKind,
         port: u16,
     ) -> anyhow::Result<()> {
+        self.clear_background_refresh();
         self.mode = ProxyMode::Starting;
 
         let service_name: &'static str = match service {

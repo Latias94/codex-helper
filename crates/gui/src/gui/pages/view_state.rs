@@ -3,6 +3,8 @@ use super::*;
 #[derive(Debug, Default)]
 pub struct ViewState {
     pub requested_page: Option<Page>,
+    pub(super) history_open_seq: u64,
+    pub(super) history_open_load: Option<HistoryOpenLoad>,
     pub setup: SetupViewState,
     pub discovery: DiscoveryViewState,
     pub stations: StationsViewState,
@@ -12,6 +14,15 @@ pub struct ViewState {
     pub requests: RequestsViewState,
     pub proxy_settings: ProxySettingsViewState,
     pub history: HistoryViewState,
+}
+
+#[derive(Debug)]
+pub(in crate::gui::pages) struct HistoryOpenLoad {
+    pub(super) seq: u64,
+    pub(super) origin: super::history_external::ExternalHistoryOrigin,
+    pub(super) require_local: bool,
+    pub(super) rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<Option<SessionSummary>>)>,
+    pub(super) join: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Default)]
@@ -94,6 +105,15 @@ pub struct DoctorViewState {
     pub report: Option<crate::doctor::DoctorReport>,
     pub last_error: Option<String>,
     pub loaded_at_ms: Option<u64>,
+    pub(super) load_seq: u64,
+    pub(super) load: Option<DoctorLoad>,
+}
+
+#[derive(Debug)]
+pub(super) struct DoctorLoad {
+    pub(super) seq: u64,
+    pub(super) rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<crate::doctor::DoctorReport>)>,
+    pub(super) join: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -124,9 +144,39 @@ pub struct ControlTraceRecordState {
 }
 
 #[derive(Debug)]
+pub(super) struct ControlTraceLoad {
+    pub(super) seq: u64,
+    pub(super) source_signature: Option<String>,
+    pub(super) limit: usize,
+    pub(super) rx: std::sync::mpsc::Receiver<(
+        u64,
+        anyhow::Result<crate::gui::proxy_control::ControlTraceReadResult>,
+    )>,
+    pub(super) join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub(super) struct RequestLedgerSummaryLoad {
+    pub(super) seq: u64,
+    pub(super) source_signature: Option<String>,
+    pub(super) group: crate::request_ledger::RequestUsageSummaryGroup,
+    pub(super) limit: usize,
+    pub(super) filters: crate::request_ledger::RequestLogFilters,
+    pub(super) rx: std::sync::mpsc::Receiver<(
+        u64,
+        anyhow::Result<crate::gui::proxy_control::RequestLedgerSummaryReadResult>,
+    )>,
+    pub(super) join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
 pub struct StatsViewState {
     pub(super) pricing_editor: StatsPricingEditorState,
     pub control_trace_limit: usize,
+    pub(super) control_trace_requested_signature: Option<String>,
+    pub(super) control_trace_requested_limit: usize,
+    pub(super) control_trace_load_seq: u64,
+    pub(super) control_trace_load: Option<ControlTraceLoad>,
     pub control_trace_loaded_limit: usize,
     pub control_trace_loaded_signature: Option<String>,
     pub control_trace_source_kind: ControlTraceSourceKind,
@@ -139,6 +189,13 @@ pub struct StatsViewState {
     pub request_ledger_summary_filters: RequestLedgerSummaryFilterState,
     pub request_ledger_summary_group: crate::request_ledger::RequestUsageSummaryGroup,
     pub request_ledger_summary_limit: usize,
+    pub(super) request_ledger_summary_requested_signature: Option<String>,
+    pub(super) request_ledger_summary_requested_group:
+        crate::request_ledger::RequestUsageSummaryGroup,
+    pub(super) request_ledger_summary_requested_limit: usize,
+    pub(super) request_ledger_summary_requested_filters: crate::request_ledger::RequestLogFilters,
+    pub(super) request_ledger_summary_load_seq: u64,
+    pub(super) request_ledger_summary_load: Option<RequestLedgerSummaryLoad>,
     pub request_ledger_summary_loaded_signature: Option<String>,
     pub request_ledger_summary_loaded_group: crate::request_ledger::RequestUsageSummaryGroup,
     pub request_ledger_summary_loaded_limit: usize,
@@ -154,6 +211,10 @@ impl Default for StatsViewState {
         Self {
             pricing_editor: StatsPricingEditorState::default(),
             control_trace_limit: 80,
+            control_trace_requested_signature: None,
+            control_trace_requested_limit: 0,
+            control_trace_load_seq: 0,
+            control_trace_load: None,
             control_trace_loaded_limit: 0,
             control_trace_loaded_signature: None,
             control_trace_source_kind: ControlTraceSourceKind::LocalFile,
@@ -166,6 +227,14 @@ impl Default for StatsViewState {
             request_ledger_summary_filters: RequestLedgerSummaryFilterState::default(),
             request_ledger_summary_group: crate::request_ledger::RequestUsageSummaryGroup::Station,
             request_ledger_summary_limit: 30,
+            request_ledger_summary_requested_signature: None,
+            request_ledger_summary_requested_group:
+                crate::request_ledger::RequestUsageSummaryGroup::Station,
+            request_ledger_summary_requested_limit: 0,
+            request_ledger_summary_requested_filters:
+                crate::request_ledger::RequestLogFilters::default(),
+            request_ledger_summary_load_seq: 0,
+            request_ledger_summary_load: None,
             request_ledger_summary_loaded_signature: None,
             request_ledger_summary_loaded_group:
                 crate::request_ledger::RequestUsageSummaryGroup::Station,
@@ -232,14 +301,25 @@ impl Default for StatsPricingEditorState {
 #[derive(Debug)]
 pub struct SetupViewState {
     pub import_codex_on_init: bool,
+    pub(super) config_init_seq: u64,
+    pub(super) config_init_load: Option<SetupConfigInitLoad>,
 }
 
 impl Default for SetupViewState {
     fn default() -> Self {
         Self {
             import_codex_on_init: true,
+            config_init_seq: 0,
+            config_init_load: None,
         }
     }
+}
+
+#[derive(Debug)]
+pub(super) struct SetupConfigInitLoad {
+    pub(super) seq: u64,
+    pub(super) rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<(std::path::PathBuf, String)>)>,
+    pub(super) join: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -254,6 +334,8 @@ pub struct ProxySettingsViewState {
     pub(super) mode: ProxySettingsMode,
     pub(super) working: Option<ProxySettingsWorkingDocument>,
     pub(super) load_error: Option<String>,
+    pub(super) save_seq: u64,
+    pub(super) save_load: Option<ProxySettingsSaveLoad>,
     pub(super) import_codex: ImportCodexModalState,
     pub(super) provider_editor: ProxySettingsProviderEditorState,
     pub(super) routing_editor: ProxySettingsRoutingEditorState,
@@ -265,6 +347,8 @@ impl Default for ProxySettingsViewState {
             mode: ProxySettingsMode::Form,
             working: None,
             load_error: None,
+            save_seq: 0,
+            save_load: None,
             import_codex: ImportCodexModalState::default(),
             provider_editor: ProxySettingsProviderEditorState::default(),
             routing_editor: ProxySettingsRoutingEditorState::default(),
@@ -275,6 +359,15 @@ impl Default for ProxySettingsViewState {
 #[derive(Debug, Clone)]
 pub(super) enum ProxySettingsWorkingDocument {
     V3(crate::config::ProxyConfigV3),
+}
+
+#[derive(Debug)]
+pub(super) struct ProxySettingsSaveLoad {
+    pub(super) seq: u64,
+    pub(super) message: String,
+    pub(super) reload_runtime: bool,
+    pub(super) rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<String>)>,
+    pub(super) join: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -375,6 +468,18 @@ pub struct SessionsViewState {
 }
 
 #[derive(Debug)]
+pub(super) struct RequestLedgerLoad {
+    pub(super) seq: u64,
+    pub(super) source_signature: Option<String>,
+    pub(super) limit: usize,
+    pub(super) rx: std::sync::mpsc::Receiver<(
+        u64,
+        anyhow::Result<crate::gui::proxy_control::RequestLedgerReadResult>,
+    )>,
+    pub(super) join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
 pub struct RequestsViewState {
     pub errors_only: bool,
     pub scope_session: bool,
@@ -387,6 +492,10 @@ pub struct RequestsViewState {
     pub selected_idx: usize,
     pub include_request_ledger: bool,
     pub request_ledger_limit: usize,
+    pub(super) request_ledger_requested_signature: Option<String>,
+    pub(super) request_ledger_requested_limit: usize,
+    pub(super) request_ledger_load_seq: u64,
+    pub(super) request_ledger_load: Option<RequestLedgerLoad>,
     pub request_ledger_loaded_limit: usize,
     pub request_ledger_loaded_signature: Option<String>,
     pub request_ledger_loaded_at_ms: Option<u64>,
@@ -409,6 +518,10 @@ impl Default for RequestsViewState {
             selected_idx: 0,
             include_request_ledger: false,
             request_ledger_limit: 1000,
+            request_ledger_requested_signature: None,
+            request_ledger_requested_limit: 0,
+            request_ledger_load_seq: 0,
+            request_ledger_load: None,
             request_ledger_loaded_limit: 0,
             request_ledger_loaded_signature: None,
             request_ledger_loaded_at_ms: None,

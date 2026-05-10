@@ -1,10 +1,11 @@
 use super::components::console_layout::{ConsoleTone, console_note, console_section};
 use super::view_state::{
-    RequestLedgerSummaryFilterParseError, RequestLedgerSummaryFilterState, StatsViewState,
+    RequestLedgerSummaryFilterParseError, RequestLedgerSummaryFilterState,
+    RequestLedgerSummaryLoad, StatsViewState,
 };
 use super::*;
-use crate::gui::proxy_control::ProxyController;
 use crate::request_ledger::{RequestLogFilters, RequestUsageSummaryGroup, RequestUsageSummaryRow};
+use std::sync::mpsc::TryRecvError;
 
 pub(super) fn render_request_ledger_summary_panel(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let current_signature = ctx.proxy.request_ledger_summary_source_signature();
@@ -34,6 +35,9 @@ pub(super) fn render_request_ledger_summary_panel(ui: &mut egui::Ui, ctx: &mut P
                     format_age(now_ms(), Some(loaded_at))
                 ));
             }
+            if ctx.view.stats.request_ledger_summary_load.is_some() {
+                ui.small(pick(ctx.lang, "正在加载...", "Loading..."));
+            }
             render_active_filter_summary(
                 ui,
                 ctx.lang,
@@ -55,28 +59,36 @@ pub(super) fn render_request_ledger_summary_panel(ui: &mut egui::Ui, ctx: &mut P
                 }
             };
 
-            let should_auto_refresh = ctx.view.stats.request_ledger_summary_loaded_at_ms.is_none()
-                || ctx.view.stats.request_ledger_summary_loaded_signature != current_signature
-                || ctx.view.stats.request_ledger_summary_loaded_group
-                    != ctx.view.stats.request_ledger_summary_group
-                || ctx.view.stats.request_ledger_summary_loaded_limit
-                    != ctx.view.stats.request_ledger_summary_limit;
-            let mut refreshed = false;
-            if should_auto_refresh {
-                refresh_request_ledger_summary(
-                    &mut ctx.view.stats,
-                    ctx.proxy,
-                    ctx.rt,
-                    &current_filters,
-                );
-                refreshed = true;
+            let should_auto_refresh = ctx.view.stats.request_ledger_summary_load.is_none()
+                && (ctx.view.stats.request_ledger_summary_requested_signature != current_signature
+                    || ctx.view.stats.request_ledger_summary_requested_group
+                        != ctx.view.stats.request_ledger_summary_group
+                    || ctx.view.stats.request_ledger_summary_requested_limit
+                        != ctx.view.stats.request_ledger_summary_limit);
+            if refresh_clicked {
+                refresh_request_ledger_summary(ctx, true, current_filters.clone());
+            } else if should_auto_refresh {
+                refresh_request_ledger_summary(ctx, false, current_filters.clone());
             }
-            if refresh_clicked && !refreshed {
-                refresh_request_ledger_summary(
-                    &mut ctx.view.stats,
-                    ctx.proxy,
-                    ctx.rt,
-                    &current_filters,
+
+            if ctx.view.stats.request_ledger_summary_loaded_at_ms.is_some()
+                && ctx.view.stats.request_ledger_summary_last_error.is_some()
+                && ctx.view.stats.request_ledger_summary_load.is_none()
+                && (ctx.view.stats.request_ledger_summary_loaded_signature
+                    != ctx.view.stats.request_ledger_summary_requested_signature
+                    || ctx.view.stats.request_ledger_summary_loaded_group
+                        != ctx.view.stats.request_ledger_summary_requested_group
+                    || ctx.view.stats.request_ledger_summary_loaded_limit
+                        != ctx.view.stats.request_ledger_summary_requested_limit)
+            {
+                ui.add_space(6.0);
+                console_note(
+                    ui,
+                    pick(
+                        ctx.lang,
+                        "当前显示的是上次成功结果；最新刷新失败。",
+                        "Showing the last successful result; the latest refresh failed.",
+                    ),
                 );
             }
 
@@ -115,41 +127,139 @@ pub(super) fn render_request_ledger_summary_panel(ui: &mut egui::Ui, ctx: &mut P
     );
 }
 
-fn refresh_request_ledger_summary(
-    state: &mut StatsViewState,
-    proxy: &ProxyController,
-    rt: &tokio::runtime::Runtime,
-    filters: &RequestLogFilters,
-) {
-    let source = proxy.request_ledger_summary_source();
-    state.request_ledger_summary_loaded_signature =
-        source.as_ref().map(|source| source.signature());
-    state.request_ledger_summary_source_detail =
-        source.as_ref().map(|source| source.display_detail());
+pub(super) fn poll_request_ledger_summary_loader(ctx: &mut PageCtx<'_>) {
+    let current_signature = ctx.proxy.request_ledger_summary_source_signature();
+    let current_group = ctx.view.stats.request_ledger_summary_group;
+    let current_limit = ctx.view.stats.request_ledger_summary_limit.clamp(1, 100);
+    let Some(load) = ctx.view.stats.request_ledger_summary_load.as_mut() else {
+        return;
+    };
 
-    let limit = state.request_ledger_summary_limit.clamp(1, 100);
-    state.request_ledger_summary_limit = limit;
-    match proxy.read_request_ledger_summary(rt, state.request_ledger_summary_group, limit, filters)
-    {
-        Ok(result) => {
-            state.request_ledger_summary_loaded_signature = Some(result.source.signature());
-            state.request_ledger_summary_source_detail = Some(result.source.display_detail());
-            state.request_ledger_summary_loaded_group = state.request_ledger_summary_group;
-            state.request_ledger_summary_loaded_limit = limit;
-            state.request_ledger_summary_loaded_filters = filters.clone();
-            state.request_ledger_summary_rows = result.rows;
-            state.request_ledger_summary_loaded_at_ms = Some(now_ms());
-            state.request_ledger_summary_last_error = None;
+    match load.rx.try_recv() {
+        Ok((seq, result)) => {
+            if seq != load.seq
+                || load.source_signature != current_signature
+                || load.group != current_group
+                || load.limit != current_limit
+            {
+                ctx.view.stats.request_ledger_summary_load = None;
+                return;
+            }
+
+            let limit = load.limit;
+            let group = load.group;
+            let filters = load.filters.clone();
+            ctx.view.stats.request_ledger_summary_load = None;
+            match result {
+                Ok(result) => {
+                    apply_request_ledger_summary_source_state(&mut ctx.view.stats, &result.source);
+                    ctx.view.stats.request_ledger_summary_loaded_signature =
+                        Some(result.source.signature());
+                    ctx.view.stats.request_ledger_summary_loaded_group = group;
+                    ctx.view.stats.request_ledger_summary_loaded_limit = limit;
+                    ctx.view.stats.request_ledger_summary_loaded_filters = filters;
+                    ctx.view.stats.request_ledger_summary_rows = result.rows;
+                    ctx.view.stats.request_ledger_summary_loaded_at_ms = Some(now_ms());
+                    ctx.view.stats.request_ledger_summary_last_error = None;
+                }
+                Err(err) => {
+                    ctx.view.stats.request_ledger_summary_last_error = Some(err.to_string());
+                }
+            }
         }
-        Err(err) => {
-            state.request_ledger_summary_loaded_group = state.request_ledger_summary_group;
-            state.request_ledger_summary_loaded_limit = limit;
-            state.request_ledger_summary_loaded_filters = filters.clone();
-            state.request_ledger_summary_rows.clear();
-            state.request_ledger_summary_loaded_at_ms = Some(now_ms());
-            state.request_ledger_summary_last_error = Some(err.to_string());
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            ctx.view.stats.request_ledger_summary_load = None;
         }
     }
+}
+
+fn cancel_request_ledger_summary_load(state: &mut StatsViewState) {
+    if let Some(load) = state.request_ledger_summary_load.take() {
+        load.join.abort();
+    }
+}
+
+fn refresh_request_ledger_summary(ctx: &mut PageCtx<'_>, force: bool, filters: RequestLogFilters) {
+    let source = ctx.proxy.request_ledger_summary_source();
+    if source.is_none() {
+        ctx.view.stats.request_ledger_summary_last_error =
+            Some("request ledger summary source is unavailable for this proxy".to_string());
+        return;
+    }
+
+    let source_signature = source.as_ref().map(|source| source.signature());
+    let source_detail = source.as_ref().map(|source| source.display_detail());
+    let limit = ctx.view.stats.request_ledger_summary_limit.clamp(1, 100);
+    ctx.view.stats.request_ledger_summary_limit = limit;
+    let group = ctx.view.stats.request_ledger_summary_group;
+    apply_request_ledger_summary_source_state(&mut ctx.view.stats, source.as_ref().unwrap());
+
+    if !force
+        && ctx.view.stats.request_ledger_summary_load.is_none()
+        && ctx.view.stats.request_ledger_summary_requested_signature == source_signature
+        && ctx.view.stats.request_ledger_summary_requested_group == group
+        && ctx.view.stats.request_ledger_summary_requested_limit == limit
+    {
+        return;
+    }
+
+    if force {
+        cancel_request_ledger_summary_load(&mut ctx.view.stats);
+    } else if ctx.view.stats.request_ledger_summary_load.is_some() {
+        return;
+    }
+
+    ctx.view.stats.request_ledger_summary_requested_signature = source_signature.clone();
+    ctx.view.stats.request_ledger_summary_requested_group = group;
+    ctx.view.stats.request_ledger_summary_requested_limit = limit;
+    ctx.view.stats.request_ledger_summary_requested_filters = filters.clone();
+    ctx.view.stats.request_ledger_summary_source_detail = source_detail;
+    ctx.view.stats.request_ledger_summary_last_error = None;
+    let requested_filters = ctx
+        .view
+        .stats
+        .request_ledger_summary_requested_filters
+        .clone();
+
+    let future = match ctx
+        .proxy
+        .read_request_ledger_summary_task(group, limit, filters)
+    {
+        Ok(future) => future,
+        Err(err) => {
+            ctx.view.stats.request_ledger_summary_last_error = Some(err.to_string());
+            return;
+        }
+    };
+
+    ctx.view.stats.request_ledger_summary_load_seq = ctx
+        .view
+        .stats
+        .request_ledger_summary_load_seq
+        .saturating_add(1);
+    let seq = ctx.view.stats.request_ledger_summary_load_seq;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let join = ctx.rt.spawn(async move {
+        let result = future.await;
+        let _ = tx.send((seq, result));
+    });
+    ctx.view.stats.request_ledger_summary_load = Some(RequestLedgerSummaryLoad {
+        seq,
+        source_signature,
+        group,
+        limit,
+        filters: requested_filters,
+        rx,
+        join,
+    });
+}
+
+fn apply_request_ledger_summary_source_state(
+    state: &mut StatsViewState,
+    source: &crate::gui::proxy_control::RequestLedgerDataSource,
+) {
+    state.request_ledger_summary_source_detail = Some(source.display_detail());
 }
 
 fn render_summary_controls(ui: &mut egui::Ui, lang: Language, state: &mut StatsViewState) -> bool {
@@ -354,7 +464,7 @@ fn render_summary_rows(ui: &mut egui::Ui, lang: Language, rows: &[RequestUsageSu
                     ui.strong("output");
                     ui.strong("cache read");
                     ui.strong("cache create");
-                    ui.strong("avg ms");
+                    ui.strong("avg");
                     ui.end_row();
 
                     for row in rows {
@@ -365,7 +475,7 @@ fn render_summary_rows(ui: &mut egui::Ui, lang: Language, rows: &[RequestUsageSu
                         ui.small(compact_count(row.aggregate.output_tokens));
                         ui.small(compact_count(row.aggregate.cache_read_input_tokens));
                         ui.small(compact_count(row.aggregate.cache_creation_input_tokens));
-                        ui.small(row.aggregate.average_duration_ms().to_string());
+                        ui.small(format_duration_ms(row.aggregate.average_duration_ms()));
                         ui.end_row();
                     }
                 });

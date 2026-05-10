@@ -11,6 +11,8 @@ pub struct HistoryViewState {
     pub sessions: Vec<SessionSummary>,
     pub last_error: Option<String>,
     pub loaded_at_ms: Option<u64>,
+    pub(super) refresh_load_seq: u64,
+    pub(super) refresh_load: Option<HistoryRefreshLoad>,
     pub selected_idx: usize,
     pub selected_id: Option<String>,
     pub(super) applied_scope: HistoryScope,
@@ -34,9 +36,15 @@ pub struct HistoryViewState {
     pub all_day_limit: usize,
     pub all_day_sessions: Vec<SessionIndexItem>,
     pub(super) loaded_day_for: Option<String>,
+    pub(super) day_index_load_seq: u64,
+    pub(super) day_index_load: Option<HistoryAllByDateIndexLoad>,
+    pub(super) day_sessions_load_seq: u64,
+    pub(super) day_sessions_load: Option<HistoryAllByDateSessionsLoad>,
     pub search_transcript_tail: bool,
     pub search_transcript_tail_n: usize,
     pub(super) search_transcript_applied: Option<(HistoryScope, String, usize)>,
+    pub(super) tail_search_load_seq: u64,
+    pub(super) tail_search_load: Option<HistoryTailSearchLoad>,
     pub hide_tool_calls: bool,
     pub transcript_view: TranscriptViewMode,
     pub transcript_selected_msg_idx: usize,
@@ -92,6 +100,8 @@ impl Default for HistoryViewState {
             sessions: Vec::new(),
             last_error: None,
             loaded_at_ms: None,
+            refresh_load_seq: 0,
+            refresh_load: None,
             selected_idx: 0,
             selected_id: None,
             applied_scope: HistoryScope::CurrentProject,
@@ -115,9 +125,15 @@ impl Default for HistoryViewState {
             all_day_limit: 500,
             all_day_sessions: Vec::new(),
             loaded_day_for: None,
+            day_index_load_seq: 0,
+            day_index_load: None,
+            day_sessions_load_seq: 0,
+            day_sessions_load: None,
             search_transcript_tail: false,
             search_transcript_tail_n: 80,
             search_transcript_applied: None,
+            tail_search_load_seq: 0,
+            tail_search_load: None,
             hide_tool_calls: true,
             transcript_view: TranscriptViewMode::Messages,
             transcript_selected_msg_idx: 0,
@@ -153,5 +169,40 @@ pub(in crate::gui::pages) struct TranscriptLoad {
     pub(super) seq: u64,
     pub(super) key: (String, Option<usize>),
     pub(super) rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<Vec<SessionTranscriptMessage>>)>,
+    pub(super) join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub(in crate::gui::pages) struct HistoryAllByDateIndexLoad {
+    pub(super) seq: u64,
+    pub(super) reset_selection: bool,
+    pub(super) rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<Vec<SessionDayDir>>)>,
+    pub(super) join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub(in crate::gui::pages) struct HistoryAllByDateSessionsLoad {
+    pub(super) seq: u64,
+    pub(super) date: String,
+    pub(super) rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<Vec<SessionIndexItem>>)>,
+    pub(super) join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub(in crate::gui::pages) struct HistoryRefreshLoad {
+    pub(super) seq: u64,
+    pub(super) scope: HistoryScope,
+    pub(super) observed_fallback_supported: bool,
+    pub(super) rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<Vec<SessionSummary>>)>,
+    pub(super) join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub(in crate::gui::pages) struct HistoryTailSearchLoad {
+    pub(super) seq: u64,
+    pub(super) scope: HistoryScope,
+    pub(super) query: String,
+    pub(super) tail: usize,
+    pub(super) rx: std::sync::mpsc::Receiver<(u64, anyhow::Result<Vec<SessionSummary>>)>,
     pub(super) join: tokio::task::JoinHandle<()>,
 }

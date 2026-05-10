@@ -33,28 +33,30 @@ pub(super) fn observed_session_row_from_snapshot(
     .find(|row| row.session_id.as_deref() == Some(session_id))
 }
 
-pub(super) fn refresh_history_sessions_with_fallback(
-    ctx: &mut PageCtx<'_>,
+pub(super) async fn load_local_history_sessions(
     scope: HistoryScope,
-    observed_fallback_supported: bool,
-) -> anyhow::Result<(Vec<SessionSummary>, HistoryDataSource)> {
-    let recent_since_minutes = ctx.view.history.recent_since_minutes;
-    let recent_limit = ctx.view.history.recent_limit;
-    let local_result = ctx.rt.block_on(async move {
-        match scope {
-            HistoryScope::CurrentProject => {
-                crate::sessions::find_codex_sessions_for_current_dir(200).await
-            }
-            HistoryScope::GlobalRecent => {
-                let since = std::time::Duration::from_secs(
-                    (recent_since_minutes as u64).saturating_mul(60),
-                );
-                crate::sessions::find_recent_codex_session_summaries(since, recent_limit).await
-            }
-            HistoryScope::AllByDate => Ok(Vec::new()),
+    recent_since_minutes: u32,
+    recent_limit: usize,
+) -> anyhow::Result<Vec<SessionSummary>> {
+    match scope {
+        HistoryScope::CurrentProject => {
+            crate::sessions::find_codex_sessions_for_current_dir(200).await
         }
-    });
+        HistoryScope::GlobalRecent => {
+            let since =
+                std::time::Duration::from_secs((recent_since_minutes as u64).saturating_mul(60));
+            crate::sessions::find_recent_codex_session_summaries(since, recent_limit).await
+        }
+        HistoryScope::AllByDate => Ok(Vec::new()),
+    }
+}
 
+pub(super) fn resolve_history_sessions_with_fallback(
+    ctx: &mut PageCtx<'_>,
+    _scope: HistoryScope,
+    observed_fallback_supported: bool,
+    local_result: anyhow::Result<Vec<SessionSummary>>,
+) -> anyhow::Result<(Vec<SessionSummary>, HistoryDataSource)> {
     match local_result {
         Ok(mut list) => {
             if !list.is_empty() || !observed_fallback_supported {

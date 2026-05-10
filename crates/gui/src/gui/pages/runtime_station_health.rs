@@ -36,7 +36,11 @@ pub(super) fn format_runtime_station_health_status(
         .min();
     if ok > 0 {
         if let Some(latency_ms) = best_ms {
-            format!("{ok}/{} {latency_ms}ms", health.upstreams.len())
+            format!(
+                "{ok}/{} {}",
+                health.upstreams.len(),
+                format_duration_ms(latency_ms)
+            )
         } else {
             format!("{ok}/{} ok", health.upstreams.len())
         }

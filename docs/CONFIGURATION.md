@@ -11,7 +11,7 @@ The short version: define providers once, then choose one routing recipe. Most u
 - `profiles` are request defaults such as model and reasoning effort. They should not pick providers.
 - `retry` controls how hard the proxy retries before returning an error.
 
-Runtime and UI screens may still say `station` because the proxy engine routes through compiled station candidates. For hand-written config, think in `provider` plus `routing`.
+Some runtime internals still use the legacy `station` wording, but hand-written config should think in `provider` plus `routing`.
 
 ## File Locations
 

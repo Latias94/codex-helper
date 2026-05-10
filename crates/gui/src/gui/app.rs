@@ -508,9 +508,9 @@ impl eframe::App for GuiApp {
             }
         }
 
-        // Keep attach status fresh (read-only mode).
-        self.proxy.refresh_attached_if_due(&self.rt, refresh);
-        self.proxy.refresh_running_if_due(&self.rt, refresh);
+        // Keep proxy snapshots fresh without blocking the UI thread.
+        self.proxy
+            .refresh_current_background_if_due(&self.rt, refresh);
 
         egui::TopBottomPanel::top("top_nav").show(ctx, |ui| {
             super::pages::nav(ui, lang, &mut self.page, &self.proxy);
@@ -538,6 +538,7 @@ impl eframe::App for GuiApp {
                 rt: &self.rt,
                 proxy: &mut self.proxy,
             };
+            super::pages::poll_global_tasks(&mut page_ctx);
             super::pages::render(ui, self.page, &mut page_ctx);
         });
 
@@ -638,10 +639,10 @@ fn install_fonts(ctx: &egui::Context) {
             if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                 list.insert(0, name.clone());
             }
-            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                if !list.contains(&name) {
-                    list.push(name.clone());
-                }
+            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Monospace)
+                && !list.contains(&name)
+            {
+                list.push(name.clone());
             }
             installed_any = true;
             tracing::info!("gui fonts: installed system cjk font: {name}");

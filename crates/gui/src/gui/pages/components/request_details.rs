@@ -2,9 +2,9 @@ use eframe::egui;
 
 use super::super::super::i18n::{Language, pick};
 use super::super::{
-    EffectiveRouteField, effective_route_field_label, format_age, non_empty_trimmed, now_ms,
-    route_decision_field_value, route_value_source_label, session_binding_mode_label,
-    shorten_middle, usage_line,
+    EffectiveRouteField, effective_route_field_label, format_age, format_duration_ms,
+    format_duration_ms_opt, non_empty_trimmed, now_ms, route_decision_field_value,
+    route_value_source_label, session_binding_mode_label, shorten_middle, usage_line,
 };
 use super::console_layout::{ConsoleTone, console_kv_grid, console_note, console_section};
 use super::route_explanation::format_service_tier_display;
@@ -167,20 +167,15 @@ pub(in super::super) fn request_route_decision_reason(
 fn render_request_summary_card(ui: &mut egui::Ui, lang: Language, request: &FinishedRequest) {
     let request_rows = vec![
         ("service".to_string(), request.service.clone()),
-        ("method".to_string(), request.method.clone()),
-        ("path".to_string(), request.path.clone()),
-        ("status".to_string(), request.status_code.to_string()),
         (
-            "duration".to_string(),
-            format!("{} ms", request.duration_ms),
+            "request".to_string(),
+            format!("{} {}", request.method, request.path),
         ),
+        ("status".to_string(), request.status_code.to_string()),
+        ("total".to_string(), format_duration_ms(request.duration_ms)),
         (
-            "ttfb".to_string(),
-            request
-                .ttfb_ms
-                .filter(|value| *value > 0)
-                .map(|value| format!("{value} ms"))
-                .unwrap_or_else(|| "-".to_string()),
+            "first token".to_string(),
+            format_duration_ms_opt(request.ttfb_ms),
         ),
         (
             "session".to_string(),
@@ -576,10 +571,10 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
         parts.push(format!("model={model}"));
     }
     if let Some(ttfb_ms) = attempt.upstream_headers_ms {
-        parts.push(format!("ttfb={ttfb_ms}ms"));
+        parts.push(format!("ttfb={}", format_duration_ms(ttfb_ms)));
     }
     if let Some(duration_ms) = attempt.duration_ms {
-        parts.push(format!("dur={duration_ms}ms"));
+        parts.push(format!("dur={}", format_duration_ms(duration_ms)));
     }
     if let Some(cooldown_secs) = attempt.cooldown_secs {
         parts.push(format!("cooldown={cooldown_secs}s"));
@@ -627,24 +622,24 @@ fn request_speed_rows(request: &FinishedRequest) -> Vec<(String, String)> {
     let observability = request.observability_view();
     let mut rows = vec![
         (
-            "duration".to_string(),
+            "total".to_string(),
             observability
                 .duration_ms
-                .map(|value| format!("{value} ms"))
+                .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string()),
         ),
         (
-            "ttfb".to_string(),
+            "first token".to_string(),
             observability
                 .ttfb_ms
-                .map(|value| format!("{value} ms"))
+                .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string()),
         ),
         (
             "generation".to_string(),
             observability
                 .generation_ms
-                .map(|value| format!("{value} ms"))
+                .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string()),
         ),
         (
