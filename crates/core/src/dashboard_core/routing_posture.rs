@@ -2,66 +2,11 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::balance::StationRoutingBalanceSummary;
 use crate::config::{ResolvedRetryConfig, RetryStrategy};
-use crate::state::{
-    BalanceSnapshotStatus, LbConfigView, ProviderBalanceSnapshot, RuntimeConfigState,
-};
+use crate::state::{LbConfigView, ProviderBalanceSnapshot, RuntimeConfigState};
 
 use super::types::StationOption;
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct StationRoutingBalanceSummary {
-    pub snapshots: usize,
-    #[serde(default)]
-    pub ok: usize,
-    #[serde(default)]
-    pub exhausted: usize,
-    #[serde(default)]
-    pub stale: usize,
-    #[serde(default)]
-    pub error: usize,
-    #[serde(default)]
-    pub unknown: usize,
-    #[serde(default)]
-    pub routing_snapshots: usize,
-    #[serde(default)]
-    pub routing_exhausted: usize,
-    #[serde(default)]
-    pub routing_ignored_exhausted: usize,
-}
-
-impl StationRoutingBalanceSummary {
-    pub fn from_snapshots(snapshots: Option<&[ProviderBalanceSnapshot]>) -> Self {
-        let mut out = Self::default();
-        let Some(snapshots) = snapshots else {
-            return out;
-        };
-
-        out.snapshots = snapshots.len();
-        for snapshot in snapshots {
-            match snapshot.status {
-                BalanceSnapshotStatus::Ok => out.ok += 1,
-                BalanceSnapshotStatus::Exhausted => out.exhausted += 1,
-                BalanceSnapshotStatus::Stale => out.stale += 1,
-                BalanceSnapshotStatus::Error => out.error += 1,
-                BalanceSnapshotStatus::Unknown => out.unknown += 1,
-            }
-            if snapshot.exhaustion_affects_routing {
-                out.routing_snapshots += 1;
-                if snapshot.status == BalanceSnapshotStatus::Exhausted {
-                    out.routing_exhausted += 1;
-                }
-            } else if snapshot.status == BalanceSnapshotStatus::Exhausted {
-                out.routing_ignored_exhausted += 1;
-            }
-        }
-        out
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.snapshots == 0
-    }
-}
 
 fn balance_exhaustion_rank(balance: &StationRoutingBalanceSummary) -> u8 {
     if balance.routing_snapshots > 0 && balance.routing_exhausted == balance.routing_snapshots {
@@ -407,6 +352,7 @@ fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::BalanceSnapshotStatus;
 
     fn station(
         name: &str,

@@ -10,7 +10,9 @@ use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
-pub use crate::balance::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
+pub use crate::balance::{
+    BalanceSnapshotStatus, ProviderBalanceSnapshot, StationRoutingBalanceSummary,
+};
 use crate::config::ServiceConfigManager;
 use crate::lb::LbState;
 #[cfg(test)]
@@ -47,6 +49,7 @@ type PassiveStationHealthMap =
     HashMap<String, HashMap<String, HashMap<String, PassiveUpstreamHealth>>>;
 type ProviderBalanceMap =
     HashMap<String, HashMap<String, HashMap<usize, HashMap<String, ProviderBalanceSnapshot>>>>;
+type ProviderBalanceSummaryMap = HashMap<String, HashMap<String, StationRoutingBalanceSummary>>;
 type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
 
 #[derive(Debug, Clone)]
@@ -168,6 +171,7 @@ pub struct ProxyState {
     station_health: RwLock<HashMap<String, HashMap<String, StationHealth>>>,
     passive_station_health: RwLock<PassiveStationHealthMap>,
     provider_balances: RwLock<ProviderBalanceMap>,
+    provider_balance_summaries: RwLock<ProviderBalanceSummaryMap>,
     station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
     service_layout_signatures: RwLock<HashMap<String, ServiceLayoutSignature>>,
     lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
@@ -267,6 +271,7 @@ impl ProxyState {
             station_health: RwLock::new(HashMap::new()),
             passive_station_health: RwLock::new(HashMap::new()),
             provider_balances: RwLock::new(HashMap::new()),
+            provider_balance_summaries: RwLock::new(HashMap::new()),
             station_health_checks: RwLock::new(HashMap::new()),
             service_layout_signatures: RwLock::new(HashMap::new()),
             lb_states,
@@ -873,6 +878,8 @@ impl ProxyState {
         if layout_changed {
             let mut provider_balances = self.provider_balances.write().await;
             provider_balances.remove(service_name);
+            let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
+            provider_balance_summaries.remove(service_name);
         }
 
         {
@@ -1001,17 +1008,33 @@ impl ProxyState {
         else {
             return;
         };
-        snapshot.refresh_status(unix_now_ms());
+        let now_ms = unix_now_ms();
+        snapshot.refresh_status(now_ms);
 
-        let mut guard = self.provider_balances.write().await;
-        guard
+        let station_summary = {
+            let mut guard = self.provider_balances.write().await;
+            let station_balances = guard
+                .entry(service_name.to_string())
+                .or_default()
+                .entry(station_name.clone())
+                .or_default();
+            station_balances
+                .entry(upstream_index)
+                .or_default()
+                .insert(snapshot.provider_id.clone(), snapshot);
+            StationRoutingBalanceSummary::from_snapshot_iter_at(
+                station_balances
+                    .values()
+                    .flat_map(|providers| providers.values()),
+                now_ms,
+            )
+        };
+
+        let mut summaries = self.provider_balance_summaries.write().await;
+        summaries
             .entry(service_name.to_string())
             .or_default()
-            .entry(station_name)
-            .or_default()
-            .entry(upstream_index)
-            .or_default()
-            .insert(snapshot.provider_id.clone(), snapshot);
+            .insert(station_name, station_summary);
     }
 
     pub async fn get_provider_balance_view(
@@ -1042,6 +1065,18 @@ impl ProxyState {
                 (station_name.clone(), snapshots)
             })
             .collect()
+    }
+
+    pub async fn get_provider_balance_summary_view(
+        &self,
+        service_name: &str,
+    ) -> HashMap<String, StationRoutingBalanceSummary> {
+        let guard = self.provider_balance_summaries.read().await;
+        let Some(per_service) = guard.get(service_name) else {
+            return HashMap::new();
+        };
+
+        per_service.clone()
     }
 
     pub async fn record_passive_upstream_success(
@@ -3145,6 +3180,16 @@ mod tests {
             assert_eq!(balances[0].provider_id, "packycode");
             assert_eq!(balances[0].status, BalanceSnapshotStatus::Stale);
             assert_eq!(balances[0].exhausted, Some(false));
+
+            let summary = state
+                .get_provider_balance_summary_view("codex")
+                .await
+                .get("right")
+                .cloned()
+                .expect("station balance summary");
+            assert_eq!(summary.snapshots, 1);
+            assert_eq!(summary.stale, 1);
+            assert_eq!(summary.routing_snapshots, 1);
         });
     }
 

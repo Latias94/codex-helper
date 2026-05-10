@@ -150,24 +150,32 @@ impl ProviderBalanceSnapshot {
     }
 
     pub fn refresh_status(&mut self, now_ms: u64) {
-        self.stale = self
-            .stale_after_ms
-            .is_some_and(|stale_after_ms| now_ms > stale_after_ms);
-        self.status = if self
+        self.stale = self.stale_at(now_ms);
+        self.status = self.status_at(now_ms);
+    }
+
+    pub fn stale_at(&self, now_ms: u64) -> bool {
+        self.stale_after_ms
+            .is_some_and(|stale_after_ms| now_ms > stale_after_ms)
+    }
+
+    pub fn status_at(&self, now_ms: u64) -> BalanceSnapshotStatus {
+        let stale = self.stale_at(now_ms);
+        if self
             .error
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         {
-            BalanceSnapshotStatus::Error
+            return BalanceSnapshotStatus::Error;
         } else if self.exhausted == Some(true) {
-            BalanceSnapshotStatus::Exhausted
-        } else if self.stale {
-            BalanceSnapshotStatus::Stale
+            return BalanceSnapshotStatus::Exhausted;
+        } else if stale {
+            return BalanceSnapshotStatus::Stale;
         } else if self.exhausted == Some(false) || self.has_amount_data() {
-            BalanceSnapshotStatus::Ok
+            return BalanceSnapshotStatus::Ok;
         } else {
-            BalanceSnapshotStatus::Unknown
-        };
+            return BalanceSnapshotStatus::Unknown;
+        }
     }
 
     pub fn routing_exhausted(&self) -> bool {
@@ -303,6 +311,75 @@ fn left_from_budget_and_spent(budget: &str, spent: &str) -> Option<String> {
     let budget = UsdAmount::from_decimal_str(budget)?;
     let spent = UsdAmount::from_decimal_str(spent)?;
     Some(budget.saturating_sub(spent).format_usd())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StationRoutingBalanceSummary {
+    pub snapshots: usize,
+    #[serde(default)]
+    pub ok: usize,
+    #[serde(default)]
+    pub exhausted: usize,
+    #[serde(default)]
+    pub stale: usize,
+    #[serde(default)]
+    pub error: usize,
+    #[serde(default)]
+    pub unknown: usize,
+    #[serde(default)]
+    pub routing_snapshots: usize,
+    #[serde(default)]
+    pub routing_exhausted: usize,
+    #[serde(default)]
+    pub routing_ignored_exhausted: usize,
+}
+
+impl StationRoutingBalanceSummary {
+    pub fn from_snapshots(snapshots: Option<&[ProviderBalanceSnapshot]>) -> Self {
+        let mut out = Self::default();
+        let Some(snapshots) = snapshots else {
+            return out;
+        };
+
+        for snapshot in snapshots {
+            out.record(snapshot, snapshot.status);
+        }
+        out
+    }
+
+    pub fn from_snapshot_iter_at<'a>(
+        snapshots: impl IntoIterator<Item = &'a ProviderBalanceSnapshot>,
+        now_ms: u64,
+    ) -> Self {
+        let mut out = Self::default();
+        for snapshot in snapshots {
+            out.record(snapshot, snapshot.status_at(now_ms));
+        }
+        out
+    }
+
+    fn record(&mut self, snapshot: &ProviderBalanceSnapshot, status: BalanceSnapshotStatus) {
+        self.snapshots += 1;
+        match status {
+            BalanceSnapshotStatus::Ok => self.ok += 1,
+            BalanceSnapshotStatus::Exhausted => self.exhausted += 1,
+            BalanceSnapshotStatus::Stale => self.stale += 1,
+            BalanceSnapshotStatus::Error => self.error += 1,
+            BalanceSnapshotStatus::Unknown => self.unknown += 1,
+        }
+        if snapshot.exhaustion_affects_routing {
+            self.routing_snapshots += 1;
+            if status == BalanceSnapshotStatus::Exhausted {
+                self.routing_exhausted += 1;
+            }
+        } else if status == BalanceSnapshotStatus::Exhausted {
+            self.routing_ignored_exhausted += 1;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.snapshots == 0
+    }
 }
 
 fn default_exhaustion_affects_routing() -> bool {

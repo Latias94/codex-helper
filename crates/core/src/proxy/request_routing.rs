@@ -106,7 +106,7 @@ impl ProxyService {
             .await;
         let provider_balances = self
             .state
-            .get_provider_balance_view(self.service_name)
+            .get_provider_balance_summary_view(self.service_name)
             .await;
         if let Some((name, source)) = self.pinned_config(mgr, session_id).await {
             let pinned_runtime_state = state_overrides

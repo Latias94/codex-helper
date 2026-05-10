@@ -3,7 +3,6 @@ use std::collections::HashMap;
 
 use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamConfig};
 use crate::dashboard_core::StationRoutingBalanceSummary;
-use crate::state::ProviderBalanceSnapshot;
 use crate::state::RuntimeConfigState;
 
 #[derive(Debug, Clone)]
@@ -149,14 +148,13 @@ fn station_candidate(
 }
 
 fn station_balance_summary(
-    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    provider_balances: &HashMap<String, StationRoutingBalanceSummary>,
     station_name: &str,
 ) -> StationRoutingBalanceSummary {
-    StationRoutingBalanceSummary::from_snapshots(
-        provider_balances
-            .get(station_name)
-            .map(|balances| balances.as_slice()),
-    )
+    provider_balances
+        .get(station_name)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn balance_exhaustion_rank(balance: &StationRoutingBalanceSummary) -> u8 {
@@ -194,7 +192,7 @@ pub(super) fn build_station_routing_plan(
     meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
     state_overrides: &HashMap<String, RuntimeConfigState>,
     upstream_overrides: &HashMap<String, (Option<bool>, Option<RuntimeConfigState>)>,
-    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    provider_balances: &HashMap<String, StationRoutingBalanceSummary>,
 ) -> StationRoutingPlan {
     let mut eligible_stations = mgr
         .stations()
@@ -394,8 +392,8 @@ mod tests {
             .collect()
     }
 
-    fn balance(statuses: &[BalanceSnapshotStatus]) -> Vec<ProviderBalanceSnapshot> {
-        statuses
+    fn balance(statuses: &[BalanceSnapshotStatus]) -> StationRoutingBalanceSummary {
+        let snapshots = statuses
             .iter()
             .enumerate()
             .map(|(index, status)| ProviderBalanceSnapshot {
@@ -432,11 +430,12 @@ mod tests {
                 today_tokens: None,
                 error: None,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        StationRoutingBalanceSummary::from_snapshots(Some(&snapshots))
     }
 
-    fn ignored_exhausted_balance() -> Vec<ProviderBalanceSnapshot> {
-        vec![ProviderBalanceSnapshot {
+    fn ignored_exhausted_balance() -> StationRoutingBalanceSummary {
+        let snapshots = vec![ProviderBalanceSnapshot {
             provider_id: "provider-0".to_string(),
             station_name: Some("ignored".to_string()),
             upstream_index: Some(0),
@@ -446,11 +445,12 @@ mod tests {
             exhausted: Some(true),
             exhaustion_affects_routing: false,
             ..ProviderBalanceSnapshot::default()
-        }]
+        }];
+        StationRoutingBalanceSummary::from_snapshots(Some(&snapshots))
     }
 
-    fn error_balance() -> Vec<ProviderBalanceSnapshot> {
-        vec![ProviderBalanceSnapshot {
+    fn error_balance() -> StationRoutingBalanceSummary {
+        let snapshots = vec![ProviderBalanceSnapshot {
             provider_id: "provider-0".to_string(),
             station_name: Some("ignored".to_string()),
             upstream_index: Some(0),
@@ -460,7 +460,8 @@ mod tests {
             error: Some("usage provider poll failed: HTTP 404 Not Found".to_string()),
             exhaustion_affects_routing: true,
             ..ProviderBalanceSnapshot::default()
-        }]
+        }];
+        StationRoutingBalanceSummary::from_snapshots(Some(&snapshots))
     }
 
     #[test]
