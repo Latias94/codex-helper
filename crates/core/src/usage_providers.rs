@@ -13,7 +13,7 @@ use crate::lb::LbState;
 use crate::pricing::UsdAmount;
 use crate::state::ProxyState;
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ProviderKind {
     /// 简单预算接口，返回 total/used，判断是否用尽
@@ -41,6 +41,13 @@ enum ProviderKind {
     NewApiTokenUsage,
     /// New API-style user quota endpoint, defaulting to /api/user/self.
     NewApiUserSelf,
+    /// OpenAI official organization Costs API, defaulting to a rolling 30-day cost window.
+    #[serde(
+        rename = "openai_organization_costs",
+        alias = "openai_org_costs",
+        alias = "openai_costs"
+    )]
+    OpenAiOrganizationCosts,
 }
 
 impl ProviderKind {
@@ -53,6 +60,7 @@ impl ProviderKind {
             ProviderKind::Sub2ApiAuthMe => "usage_provider:sub2api_auth_me",
             ProviderKind::NewApiTokenUsage => "usage_provider:new_api_token_usage",
             ProviderKind::NewApiUserSelf => "usage_provider:new_api_user_self",
+            ProviderKind::OpenAiOrganizationCosts => "usage_provider:openai_organization_costs",
         }
     }
 
@@ -63,6 +71,9 @@ impl ProviderKind {
             ProviderKind::Sub2ApiAuthMe => Some("{{base_url}}/api/v1/auth/me"),
             ProviderKind::NewApiTokenUsage => Some("{{base_url}}/api/usage/token/"),
             ProviderKind::NewApiUserSelf => Some("{{base_url}}/api/user/self"),
+            ProviderKind::OpenAiOrganizationCosts => {
+                Some("{{base_url}}/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30")
+            }
             _ => None,
         }
     }
@@ -120,6 +131,8 @@ struct UsageProviderConfig {
     endpoint: String,
     #[serde(default)]
     token_env: Option<String>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    require_token_env: bool,
     #[serde(default)]
     poll_interval_secs: Option<u64>,
     #[serde(
@@ -241,6 +254,13 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn stale_after_ms(fetched_at_ms: u64, interval_secs: u64) -> Option<u64> {
     fetched_at_ms.checked_add(interval_secs.saturating_mul(3).saturating_mul(1_000))
 }
@@ -294,6 +314,7 @@ fn default_provider_config(
         domains: domains.into_iter().map(str::to_string).collect(),
         endpoint: endpoint.to_string(),
         token_env: None,
+        require_token_env: false,
         poll_interval_secs: Some(60),
         refresh_on_request: true,
         trust_exhaustion_for_routing: true,
@@ -307,6 +328,10 @@ fn host_from_base_url(base_url: &str) -> Option<String> {
     reqwest::Url::parse(base_url)
         .ok()
         .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+}
+
+fn is_official_openai_base_url(base_url: &str) -> bool {
+    host_from_base_url(base_url).as_deref() == Some("api.openai.com")
 }
 
 fn provider_id_component(value: &str) -> String {
@@ -355,6 +380,7 @@ fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> Usag
             .collect::<Vec<_>>(),
         endpoint: String::new(),
         token_env: None,
+        require_token_env: false,
         poll_interval_secs: Some(DEFAULT_POLL_INTERVAL_SECS),
         refresh_on_request: true,
         trust_exhaustion_for_routing: true,
@@ -362,6 +388,15 @@ fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> Usag
         variables: BTreeMap::new(),
         extract: UsageProviderExtractConfig::default(),
     }
+}
+
+fn auto_openai_official_provider(target: &UsageProviderTarget) -> UsageProviderConfig {
+    let mut provider = auto_usage_provider(target, ProviderKind::OpenAiOrganizationCosts);
+    provider.token_env = Some("OPENAI_ADMIN_KEY".to_string());
+    provider.require_token_env = true;
+    provider.refresh_on_request = false;
+    provider.trust_exhaustion_for_routing = false;
+    provider
 }
 
 fn default_providers() -> UsageProvidersFile {
@@ -377,6 +412,18 @@ fn default_providers() -> UsageProvidersFile {
         remaining_divisor: Some(10_000),
         ..Default::default()
     };
+
+    let mut openai_official = default_provider_config(
+        "openai-official-costs",
+        ProviderKind::OpenAiOrganizationCosts,
+        vec!["api.openai.com"],
+        "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30",
+        UsageProviderExtractConfig::default(),
+    );
+    openai_official.token_env = Some("OPENAI_ADMIN_KEY".to_string());
+    openai_official.require_token_env = true;
+    openai_official.refresh_on_request = false;
+    openai_official.trust_exhaustion_for_routing = false;
 
     UsageProvidersFile {
         providers: vec![
@@ -430,6 +477,7 @@ fn default_providers() -> UsageProvidersFile {
                 "https://api.novita.ai/v3/user/balance",
                 novita_extract,
             ),
+            openai_official,
         ],
     }
 }
@@ -571,6 +619,10 @@ fn resolve_token(
         return Some(v);
     }
 
+    if provider.require_token_env {
+        return None;
+    }
+
     // 否则: 使用绑定 upstream 的 auth_token（当前 Codex 正在使用的 token）
     for uref in upstreams {
         if let Some(service) = service_manager(cfg, service_name).station(&uref.station_name)
@@ -616,6 +668,25 @@ fn render_provider_template(
         .replace("{{apiKey}}", token)
         .replace("{{accessToken}}", token)
         .replace("{{token}}", token);
+
+    out = out
+        .replace("{{unix_now}}", &unix_now_secs().to_string())
+        .replace("{{unix_now_ms}}", &unix_now_ms().to_string());
+
+    while let Some(start) = out.find("{{unix_days_ago:") {
+        let Some(end_offset) = out[start..].find("}}") else {
+            break;
+        };
+        let end = start + end_offset + 2;
+        let days_str = out[start + "{{unix_days_ago:".len()..end - 2].trim();
+        let replacement = days_str
+            .parse::<u64>()
+            .ok()
+            .map(|days| unix_now_secs().saturating_sub(days.saturating_mul(24 * 60 * 60)))
+            .map(|secs| secs.to_string())
+            .unwrap_or_default();
+        out.replace_range(start..end, &replacement);
+    }
 
     while let Some(start) = out.find("{{env:") {
         let Some(end_offset) = out[start..].find("}}") else {
@@ -1513,6 +1584,59 @@ fn new_api_snapshot_from_json(
     snapshot
 }
 
+fn openai_cost_result_usd_amount(result: &serde_json::Value) -> Option<UsdAmount> {
+    let amount = json_value_at_path(result, "amount.value").and_then(amount_from_json)?;
+    let currency = json_value_at_path(result, "amount.currency").and_then(|value| value.as_str());
+    match currency {
+        Some(currency) if currency.eq_ignore_ascii_case("usd") => Some(amount),
+        None => Some(amount),
+        _ => None,
+    }
+}
+
+fn openai_organization_costs_total(value: &serde_json::Value) -> Option<UsdAmount> {
+    let buckets = json_value_at_path(value, "data")?.as_array()?;
+    let mut total = UsdAmount::ZERO;
+
+    for bucket in buckets {
+        let Some(results) =
+            json_value_at_path(bucket, "results").and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+        for result in results {
+            if let Some(amount) = openai_cost_result_usd_amount(result) {
+                total = total.saturating_add(amount);
+            }
+        }
+    }
+
+    Some(total)
+}
+
+fn openai_organization_costs_snapshot_from_json(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    value: &serde_json::Value,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    let spent = first_amount_from_paths(
+        value,
+        &provider.extract.monthly_spent_paths,
+        &[],
+        provider.extract.monthly_spent_divisor,
+    )
+    .or_else(|| openai_organization_costs_total(value));
+
+    let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
+    snapshot.monthly_spent_usd = spent.map(amount_to_string);
+    snapshot.exhausted = None;
+    snapshot.exhaustion_affects_routing = false;
+    snapshot.refresh_status(fetched_at_ms);
+    snapshot
+}
+
 fn update_usage_exhausted(
     lb_states: &Arc<Mutex<HashMap<String, LbState>>>,
     cfg: &ProxyConfig,
@@ -1622,6 +1746,13 @@ fn snapshot_from_provider_json(
         ProviderKind::NewApiUserSelf => {
             new_api_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
         }
+        ProviderKind::OpenAiOrganizationCosts => openai_organization_costs_snapshot_from_json(
+            provider,
+            upstream,
+            value,
+            fetched_at_ms,
+            stale_after_ms,
+        ),
     }
 }
 
@@ -1644,19 +1775,28 @@ async fn refresh_provider_target(
     let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
 
     let Some(token) = resolve_token(provider, &upstreams, cfg, service_name) else {
+        let snapshot = if provider.kind == ProviderKind::OpenAiOrganizationCosts {
+            base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+        } else {
+            base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+                .with_error("no usable token; checked provider token_env and upstream auth")
+        };
         state
-            .record_provider_balance_snapshot(
-                service_name,
-                base_snapshot(provider, &upstreams[0], fetched_at_ms, stale_after_ms)
-                    .with_error("no usable token; checked provider token_env and upstream auth"),
-            )
+            .record_provider_balance_snapshot(service_name, snapshot)
             .await;
         update_usage_exhausted(lb_states, cfg, service_name, &upstreams, false);
-        warn!(
-            "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
+        if provider.kind == ProviderKind::OpenAiOrganizationCosts {
+            warn!(
+                "usage provider '{}' is missing OPENAI_ADMIN_KEY; OpenAI official costs stay unknown",
+                provider.id
+            );
+        } else {
+            warn!(
+                "usage provider '{}' has no usable token (checked token_env and associated upstream auth_token); \
 跳过本次用量查询，请检查 usage_providers.json 和 ~/.codex-helper/config.json",
-            provider.id
-        );
+                provider.id
+            );
+        }
         return UsageProviderRefreshOutcome::MissingToken;
     };
 
@@ -1722,6 +1862,57 @@ async fn auto_probe_provider_target(
     let fetched_at_ms = unix_now_ms();
     let interval_secs = DEFAULT_POLL_INTERVAL_SECS;
     let stale_after_ms = stale_after_ms(fetched_at_ms, interval_secs);
+
+    if is_official_openai_base_url(&target.base_url) {
+        let provider = auto_openai_official_provider(target);
+        let Some(token) = resolve_token(&provider, &upstreams, cfg, service_name) else {
+            state
+                .record_provider_balance_snapshot(
+                    service_name,
+                    base_snapshot(&provider, &target.upstream, fetched_at_ms, stale_after_ms),
+                )
+                .await;
+            update_usage_exhausted(lb_states, cfg, service_name, &upstreams, false);
+            warn!(
+                "OpenAI organization costs require OPENAI_ADMIN_KEY; balance stays unknown for {}[{}]",
+                target.upstream.station_name, target.upstream.index
+            );
+            return UsageProviderRefreshOutcome::MissingToken;
+        };
+
+        return match poll_provider_http_json(client, &provider, &target.base_url, &token).await {
+            Ok(value) => {
+                let snapshot = snapshot_from_provider_json(
+                    &provider,
+                    &upstreams[0],
+                    &value,
+                    fetched_at_ms,
+                    stale_after_ms,
+                );
+                update_usage_exhausted(lb_states, cfg, service_name, &upstreams, false);
+                state
+                    .record_provider_balance_snapshot(service_name, snapshot)
+                    .await;
+                UsageProviderRefreshOutcome::Refreshed
+            }
+            Err(err) => {
+                state
+                    .record_provider_balance_snapshot(
+                        service_name,
+                        base_snapshot(&provider, &upstreams[0], fetched_at_ms, stale_after_ms)
+                            .with_error(err.to_string()),
+                    )
+                    .await;
+                update_usage_exhausted(lb_states, cfg, service_name, &upstreams, false);
+                warn!(
+                    "OpenAI organization costs poll failed for {}[{}]: {}",
+                    target.upstream.station_name, target.upstream.index, err
+                );
+                UsageProviderRefreshOutcome::Failed
+            }
+        };
+    }
+
     let first_provider = auto_usage_provider(target, AUTO_PROBE_KINDS[0]);
 
     let Some(token) = resolve_token(&first_provider, &upstreams, cfg, service_name) else {
@@ -2005,7 +2196,11 @@ pub async fn poll_for_codex_upstream(
         return;
     }
 
-    let auto_provider = auto_usage_provider(&current_target, AUTO_PROBE_KINDS[0]);
+    let auto_provider = if is_official_openai_base_url(&current_target.base_url) {
+        auto_openai_official_provider(&current_target)
+    } else {
+        auto_usage_provider(&current_target, AUTO_PROBE_KINDS[0])
+    };
     let Some(interval_secs) = effective_poll_interval_secs(&auto_provider) else {
         return;
     };
@@ -2042,6 +2237,7 @@ mod tests {
             domains: vec!["example.com".to_string()],
             endpoint: "https://example.com/usage".to_string(),
             token_env: None,
+            require_token_env: false,
             poll_interval_secs: Some(60),
             refresh_on_request: true,
             trust_exhaustion_for_routing: true,
@@ -2196,6 +2392,56 @@ mod tests {
             .expect("endpoint");
 
         assert_eq!(endpoint, "https://newapi.example.com/api/usage/token/");
+    }
+
+    #[test]
+    fn openai_organization_costs_endpoint_defaults_to_official_v1_costs_window() {
+        let mut provider = provider("openai", ProviderKind::OpenAiOrganizationCosts);
+        provider.endpoint.clear();
+
+        let endpoint =
+            resolve_endpoint(&provider, "https://api.openai.com/v1", "token").expect("endpoint");
+
+        assert!(endpoint.starts_with("https://api.openai.com/v1/organization/costs?start_time="));
+        assert!(endpoint.ends_with("&limit=30"));
+        let start_time = endpoint
+            .split("start_time=")
+            .nth(1)
+            .and_then(|value| value.split('&').next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("numeric start_time");
+        assert!(start_time > 0);
+    }
+
+    #[test]
+    fn require_token_env_prevents_upstream_model_key_fallback() {
+        let mut cfg = proxy_config(vec![service_config(
+            "right",
+            vec![upstream_config("https://api.openai.com/v1")],
+        )]);
+        cfg.codex
+            .configs
+            .get_mut("right")
+            .expect("station")
+            .upstreams[0]
+            .auth
+            .auth_token = Some("model-key".to_string());
+
+        let mut provider = provider("openai", ProviderKind::OpenAiOrganizationCosts);
+        provider.token_env = Some("__CODEX_HELPER_TEST_MISSING_TOKEN_ENV__".to_string());
+        provider.require_token_env = true;
+        let upstreams = [UpstreamRef {
+            station_name: "right".to_string(),
+            index: 0,
+        }];
+
+        assert_eq!(resolve_token(&provider, &upstreams, &cfg, "codex"), None);
+
+        provider.require_token_env = false;
+        assert_eq!(
+            resolve_token(&provider, &upstreams, &cfg, "codex").as_deref(),
+            Some("model-key")
+        );
     }
 
     #[test]
@@ -2774,5 +3020,56 @@ mod tests {
         assert_eq!(snapshot.total_balance_usd, None);
         assert_eq!(snapshot.monthly_budget_usd, None);
         assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("0.5"));
+    }
+
+    #[test]
+    fn openai_organization_costs_sums_official_cost_buckets_without_exhaustion() {
+        let snapshot = openai_organization_costs_snapshot_from_json(
+            &provider("openai", ProviderKind::OpenAiOrganizationCosts),
+            &upstream(),
+            &serde_json::json!({
+                "object": "page",
+                "data": [
+                    {
+                        "object": "bucket",
+                        "start_time": 1710000000,
+                        "end_time": 1710086400,
+                        "results": [
+                            {
+                                "object": "organization.costs.result",
+                                "amount": { "value": 1.25, "currency": "usd" }
+                            },
+                            {
+                                "object": "organization.costs.result",
+                                "amount": { "value": "2.5", "currency": "usd" }
+                            },
+                            {
+                                "object": "organization.costs.result",
+                                "amount": { "value": 99, "currency": "eur" }
+                            }
+                        ]
+                    },
+                    {
+                        "object": "bucket",
+                        "results": [
+                            {
+                                "object": "organization.costs.result",
+                                "amount": { "value": "0.25", "currency": "USD" }
+                            }
+                        ]
+                    }
+                ],
+                "has_more": false
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, None);
+        assert!(!snapshot.exhaustion_affects_routing);
+        assert!(!snapshot.routing_exhausted());
+        assert_eq!(snapshot.monthly_spent_usd.as_deref(), Some("4"));
+        assert_eq!(snapshot.total_balance_usd, None);
     }
 }

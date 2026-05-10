@@ -286,7 +286,31 @@ Most relay users do not need to write `usage_providers.json` just to see balance
 
 Explicit adapters are still useful when a relay needs dashboard credentials, custom headers, a custom endpoint, or safer exhaustion handling.
 
-In balance adapter templates, `{{base_url}}` is normalized without a trailing `/v1`. Use `{{upstream_base_url}}` only when a balance endpoint really lives under the same `/v1` prefix as model requests.
+For `api.openai.com`, codex-helper skips relay-style `/user/balance` probing. If `OPENAI_ADMIN_KEY` is set, it can auto-read `openai_organization_costs`; otherwise the official OpenAI provider remains unknown instead of being treated as exhausted.
+
+OpenAI's public platform surface is not a wallet-balance API. It exposes organization-level costs/usage views, which are suitable for showing current spend but not for routing off a wallet balance or subscription remainder. To connect the official OpenAI billing view, use:
+
+```json
+{
+  "providers": [
+    {
+      "id": "openai-official-costs",
+      "kind": "openai_organization_costs",
+      "domains": ["api.openai.com"],
+      "token_env": "OPENAI_ADMIN_KEY",
+      "require_token_env": true,
+      "endpoint": "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30",
+      "poll_interval_secs": 60,
+      "refresh_on_request": false,
+      "trust_exhaustion_for_routing": false
+    }
+  ]
+}
+```
+
+`OPENAI_ADMIN_KEY` must be an organization-level admin key; a normal model API key is not a stable substitute.
+
+In balance adapter templates, `{{base_url}}` is normalized without a trailing `/v1`. Use `{{upstream_base_url}}` only when a balance endpoint really lives under the same `/v1` prefix as model requests. Time helpers such as `{{unix_now}}`, `{{unix_now_ms}}`, and `{{unix_days_ago:30}}` are available for official usage/cost APIs that require query windows.
 
 Sub2API API-key telemetry:
 
@@ -342,6 +366,7 @@ Common adapter kinds:
 - `sub2api_auth_me`
 - `new_api_token_usage`
 - `new_api_user_self`
+- `openai_organization_costs`
 - `openai_balance_http_json`
 - `relay_balance_http_json`
 - `yescode_profile`
@@ -354,6 +379,7 @@ Useful adapter fields:
 | `domains` | Relay hosts this adapter applies to |
 | `endpoint` | Balance endpoint URL, with optional `{{base_url}}` templating |
 | `token_env` | Environment variable used for adapter auth |
+| `require_token_env` | Require `token_env` instead of falling back to the model API key |
 | `headers` / `variables` | Request templating |
 | `poll_interval_secs` | Refresh throttle / cache window |
 | `refresh_on_request` | Whether routed requests may trigger balance refresh |
