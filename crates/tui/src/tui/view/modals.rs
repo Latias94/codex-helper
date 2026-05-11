@@ -8,9 +8,9 @@ use crate::dashboard_core::ControlProfileOption;
 use crate::tui::Language;
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, balance_status_style, compute_window_stats, now_ms,
+    Palette, Snapshot, balance_snapshot_status_style, compute_window_stats, now_ms,
     provider_balance_compact, provider_tags_brief, shorten, shorten_middle, station_balance_brief,
-    station_balance_status,
+    station_primary_balance_snapshot,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{EffortChoice, Overlay, ServiceTierChoice};
@@ -1624,8 +1624,8 @@ pub(super) fn render_provider_modal(
         }
         let balance = station_balance_brief(&snapshot.provider_balances, pvd.name.as_str(), 42);
         let balance_style = if pvd.enabled {
-            station_balance_status(&snapshot.provider_balances, pvd.name.as_str())
-                .map(|status| balance_status_style(p, status))
+            station_primary_balance_snapshot(&snapshot.provider_balances, pvd.name.as_str())
+                .map(|snapshot| balance_snapshot_status_style(p, snapshot))
                 .unwrap_or_else(|| Style::default().fg(p.muted))
         } else {
             Style::default().fg(p.muted)
@@ -1835,7 +1835,7 @@ pub(super) fn render_routing_modal(
         };
         let (balance_style, balance_text) =
             if let Some((balance, text)) = routing_provider_balance_line(snapshot, name) {
-                (balance_status_style(p, balance.status), text)
+                (balance_snapshot_status_style(p, balance), text)
             } else {
                 (Style::default().fg(p.muted), "-".to_string())
             };

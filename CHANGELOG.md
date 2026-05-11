@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
+### 修复 / Fixed
+
+- TUI 对 Sub2API 订阅窗口懒刷新返回的零额度改为显示 `lazy reset`，避免把待实际请求触发刷新前的套餐窗口误判为确定耗尽。
+  TUI now labels Sub2API subscription-window zero balance from lazy refresh as `lazy reset`, avoiding a misleading hard-exhausted signal before a real request refreshes the plan window.
+
 ## [0.13.0] - 2026-05-09
 
 ### 重点 / Highlights

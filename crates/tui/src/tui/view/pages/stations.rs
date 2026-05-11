@@ -12,8 +12,8 @@ use crate::dashboard_core::{
 };
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, balance_status_label, balance_status_style, format_age, now_ms,
-    provider_balance_compact, routing_provider_names, shorten, shorten_middle,
+    Palette, Snapshot, balance_snapshot_status_label, balance_snapshot_status_style, format_age,
+    now_ms, provider_balance_compact, routing_provider_names, shorten, shorten_middle,
     station_balance_brief,
 };
 use crate::tui::state::UiState;
@@ -557,8 +557,8 @@ fn render_v3_routing_page(
                 lines.push(Line::from(vec![
                     Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
                     Span::styled(
-                        balance_status_label(balance.status),
-                        balance_status_style(p, balance.status),
+                        balance_snapshot_status_label(balance),
+                        balance_snapshot_status_style(p, balance),
                     ),
                     Span::raw("  "),
                     Span::styled(
@@ -1011,8 +1011,8 @@ pub(super) fn render_stations_page(
                         ),
                         Span::raw("  "),
                         Span::styled(
-                            balance_status_label(balance.status),
-                            balance_status_style(p, balance.status),
+                            balance_snapshot_status_label(balance),
+                            balance_snapshot_status_style(p, balance),
                         ),
                         Span::raw("  "),
                         Span::styled(

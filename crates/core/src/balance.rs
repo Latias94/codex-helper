@@ -182,6 +182,10 @@ impl ProviderBalanceSnapshot {
         self.exhaustion_affects_routing && self.status == BalanceSnapshotStatus::Exhausted
     }
 
+    pub fn routing_ignored_exhaustion(&self) -> bool {
+        self.status == BalanceSnapshotStatus::Exhausted && !self.exhaustion_affects_routing
+    }
+
     fn has_amount_data(&self) -> bool {
         self.total_balance_usd.is_some()
             || self.subscription_balance_usd.is_some()
@@ -448,5 +452,6 @@ mod tests {
 
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
         assert!(!snapshot.routing_exhausted());
+        assert!(snapshot.routing_ignored_exhaustion());
     }
 }

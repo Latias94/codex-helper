@@ -9,7 +9,9 @@ use crate::config::{ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryStrategy
 use crate::healthcheck::{
     HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
 };
-use crate::tui::model::{Palette, Snapshot, balance_status_label, now_ms, shorten, shorten_middle};
+use crate::tui::model::{
+    Palette, Snapshot, balance_snapshot_status_label, now_ms, shorten, shorten_middle,
+};
 use crate::tui::state::UiState;
 
 fn retry_strategy_name(strategy: RetryStrategy) -> &'static str {
@@ -123,6 +125,10 @@ fn balance_overview_lines(snapshot: &Snapshot, limit: usize) -> Vec<String> {
         .iter()
         .map(|station| station.exhausted_rows)
         .sum::<usize>();
+    let lazy_rows = stations
+        .iter()
+        .map(|station| station.lazy_rows)
+        .sum::<usize>();
     let stale_rows = stations
         .iter()
         .map(|station| station.stale_rows)
@@ -133,21 +139,23 @@ fn balance_overview_lines(snapshot: &Snapshot, limit: usize) -> Vec<String> {
         .sum::<usize>();
 
     let mut lines = vec![format!(
-        "stations={}  rows={}  exhausted={}  stale={}  unknown={}",
+        "stations={}  rows={}  exhausted={}  lazy={}  stale={}  unknown={}",
         stations.len(),
         total_rows,
         exhausted_rows,
+        lazy_rows,
         stale_rows,
         unknown_rows
     )];
     for station in stations.into_iter().take(limit) {
         lines.push(format!(
-            "{}  rows={} ok={} stale={} exhausted={} unknown={}  {}",
+            "{}  rows={} ok={} stale={} exhausted={} lazy={} unknown={}  {}",
             shorten_middle(&station.station_name, 20),
             station.total_rows,
             station.ok_rows,
             station.stale_rows,
             station.exhausted_rows,
+            station.lazy_rows,
             station.unknown_rows + station.error_rows,
             station
                 .primary
@@ -234,6 +242,7 @@ struct StationBalanceSummary {
     ok_rows: usize,
     stale_rows: usize,
     exhausted_rows: usize,
+    lazy_rows: usize,
     error_rows: usize,
     unknown_rows: usize,
     primary: Option<crate::state::ProviderBalanceSnapshot>,
@@ -257,7 +266,14 @@ fn summarize_station_balances(
                 .count(),
             exhausted_rows: balances
                 .iter()
-                .filter(|balance| balance.status == crate::state::BalanceSnapshotStatus::Exhausted)
+                .filter(|balance| {
+                    balance.status == crate::state::BalanceSnapshotStatus::Exhausted
+                        && !balance.routing_ignored_exhaustion()
+                })
+                .count(),
+            lazy_rows: balances
+                .iter()
+                .filter(|balance| balance.routing_ignored_exhaustion())
                 .count(),
             error_rows: balances
                 .iter()
@@ -276,17 +292,23 @@ fn balance_priority(
     left: &crate::state::ProviderBalanceSnapshot,
     right: &crate::state::ProviderBalanceSnapshot,
 ) -> std::cmp::Ordering {
-    balance_status_rank(left.status)
-        .cmp(&balance_status_rank(right.status))
+    balance_snapshot_rank(left)
+        .cmp(&balance_snapshot_rank(right))
         .then_with(|| left.upstream_index.cmp(&right.upstream_index))
         .then_with(|| left.provider_id.cmp(&right.provider_id))
         .then_with(|| left.fetched_at_ms.cmp(&right.fetched_at_ms))
 }
 
-fn balance_status_rank(status: crate::state::BalanceSnapshotStatus) -> u8 {
-    match status {
-        crate::state::BalanceSnapshotStatus::Exhausted => 0,
-        crate::state::BalanceSnapshotStatus::Stale => 1,
+fn balance_snapshot_rank(snapshot: &crate::state::ProviderBalanceSnapshot) -> u8 {
+    if snapshot.status == crate::state::BalanceSnapshotStatus::Exhausted
+        && !snapshot.routing_ignored_exhaustion()
+    {
+        return 0;
+    }
+
+    match snapshot.status {
+        crate::state::BalanceSnapshotStatus::Stale
+        | crate::state::BalanceSnapshotStatus::Exhausted => 1,
         crate::state::BalanceSnapshotStatus::Error
         | crate::state::BalanceSnapshotStatus::Unknown => 2,
         crate::state::BalanceSnapshotStatus::Ok => 3,
@@ -297,7 +319,7 @@ fn station_priority(summary: &StationBalanceSummary) -> u8 {
     summary
         .primary
         .as_ref()
-        .map(|snapshot| balance_status_rank(snapshot.status))
+        .map(balance_snapshot_rank)
         .unwrap_or(5)
 }
 
@@ -309,7 +331,7 @@ fn format_primary_balance(snapshot: &crate::state::ProviderBalanceSnapshot) -> S
             .upstream_index
             .map(|idx| idx.to_string())
             .unwrap_or_else(|| "-".to_string()),
-        balance_status_label(snapshot.status),
+        balance_snapshot_status_label(snapshot),
         snapshot.amount_summary()
     );
     if let Some(err) = snapshot.error.as_deref()

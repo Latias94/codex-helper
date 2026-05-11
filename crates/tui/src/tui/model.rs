@@ -401,6 +401,17 @@ pub(in crate::tui) fn balance_status_style(p: Palette, status: BalanceSnapshotSt
     }
 }
 
+pub(in crate::tui) fn balance_snapshot_status_style(
+    p: Palette,
+    snapshot: &ProviderBalanceSnapshot,
+) -> Style {
+    if snapshot.routing_ignored_exhaustion() {
+        Style::default().fg(p.warn)
+    } else {
+        balance_status_style(p, snapshot.status)
+    }
+}
+
 pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
     if snapshot.unlimited_quota == Some(true) {
         return Some("unlimited".to_string());
@@ -589,6 +600,14 @@ fn balance_status_brief(status: BalanceSnapshotStatus) -> &'static str {
     }
 }
 
+fn balance_snapshot_status_brief(snapshot: &ProviderBalanceSnapshot) -> &'static str {
+    if snapshot.routing_ignored_exhaustion() {
+        "lazy"
+    } else {
+        balance_status_brief(snapshot.status)
+    }
+}
+
 pub(in crate::tui) fn balance_status_label(status: BalanceSnapshotStatus) -> &'static str {
     match status {
         BalanceSnapshotStatus::Ok => "ok",
@@ -598,13 +617,23 @@ pub(in crate::tui) fn balance_status_label(status: BalanceSnapshotStatus) -> &'s
     }
 }
 
+pub(in crate::tui) fn balance_snapshot_status_label(
+    snapshot: &ProviderBalanceSnapshot,
+) -> &'static str {
+    if snapshot.routing_ignored_exhaustion() {
+        "lazy reset"
+    } else {
+        balance_status_label(snapshot.status)
+    }
+}
+
 pub(in crate::tui) fn provider_balance_compact(
     snapshot: &ProviderBalanceSnapshot,
     max_width: usize,
 ) -> String {
     let mut parts = Vec::new();
     if snapshot.status != BalanceSnapshotStatus::Ok {
-        parts.push(balance_status_brief(snapshot.status).to_string());
+        parts.push(balance_snapshot_status_brief(snapshot).to_string());
     }
     if let Some(plan) = snapshot
         .plan_name
@@ -618,16 +647,17 @@ pub(in crate::tui) fn provider_balance_compact(
         parts.push(amount);
     }
     if parts.is_empty() {
-        parts.push(balance_status_brief(snapshot.status).to_string());
+        parts.push(balance_snapshot_status_brief(snapshot).to_string());
     }
 
     shorten_middle(&parts.join(" "), max_width)
 }
 
-fn balance_status_rank(status: BalanceSnapshotStatus) -> u8 {
-    match status {
+fn balance_snapshot_rank(snapshot: &ProviderBalanceSnapshot) -> u8 {
+    match snapshot.status {
         BalanceSnapshotStatus::Ok => 0,
         BalanceSnapshotStatus::Stale => 1,
+        BalanceSnapshotStatus::Exhausted if snapshot.routing_ignored_exhaustion() => 1,
         BalanceSnapshotStatus::Unknown | BalanceSnapshotStatus::Error => 2,
         BalanceSnapshotStatus::Exhausted => 3,
     }
@@ -637,20 +667,21 @@ fn primary_balance_snapshot(
     balances: &[ProviderBalanceSnapshot],
 ) -> Option<&ProviderBalanceSnapshot> {
     balances.iter().min_by(|left, right| {
-        balance_status_rank(left.status)
-            .cmp(&balance_status_rank(right.status))
+        balance_snapshot_rank(left)
+            .cmp(&balance_snapshot_rank(right))
             .then_with(|| left.upstream_index.cmp(&right.upstream_index))
             .then_with(|| left.provider_id.cmp(&right.provider_id))
             .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
     })
 }
 
-pub(in crate::tui) fn station_balance_status(
-    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+pub(in crate::tui) fn station_primary_balance_snapshot<'a>(
+    provider_balances: &'a HashMap<String, Vec<ProviderBalanceSnapshot>>,
     station_name: &str,
-) -> Option<BalanceSnapshotStatus> {
-    let balances = provider_balances.get(station_name)?;
-    primary_balance_snapshot(balances).map(|snapshot| snapshot.status)
+) -> Option<&'a ProviderBalanceSnapshot> {
+    provider_balances
+        .get(station_name)
+        .and_then(|balances| primary_balance_snapshot(balances))
 }
 
 pub(in crate::tui) fn station_balance_brief(
@@ -680,7 +711,14 @@ pub(in crate::tui) fn station_balance_brief(
         .count();
     let exhausted = balances
         .iter()
-        .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Exhausted)
+        .filter(|snapshot| {
+            snapshot.status == BalanceSnapshotStatus::Exhausted
+                && !snapshot.routing_ignored_exhaustion()
+        })
+        .count();
+    let lazy_exhausted = balances
+        .iter()
+        .filter(|snapshot| snapshot.routing_ignored_exhaustion())
         .count();
     let error = balances
         .iter()
@@ -702,6 +740,8 @@ pub(in crate::tui) fn station_balance_brief(
             parts.push(format!("stale {stale}/{total}"));
         } else if displayed_unknown > 0 {
             parts.push(format!("unknown {displayed_unknown}/{total}"));
+        } else if lazy_exhausted > 0 {
+            parts.push(format!("lazy {lazy_exhausted}/{total}"));
         } else if exhausted > 0 {
             parts.push(format!("exh {exhausted}/{total}"));
         }
@@ -713,7 +753,10 @@ pub(in crate::tui) fn station_balance_brief(
     if exhausted > 0 && ok > 0 {
         parts.push(format!("exh {exhausted}"));
     }
-    if error > 0 && (ok > 0 || stale > 0 || unknown > 0 || exhausted > 0) {
+    if lazy_exhausted > 0 && ok > 0 {
+        parts.push(format!("lazy {lazy_exhausted}"));
+    }
+    if error > 0 && (ok > 0 || stale > 0 || unknown > 0 || exhausted > 0 || lazy_exhausted > 0) {
         parts.push(format!("unknown {error}"));
     }
 
@@ -755,8 +798,8 @@ fn balance_by_provider_id<'a>(
         return None;
     }
     matches.sort_by(|(_, left), (_, right)| {
-        balance_status_rank(left.status)
-            .cmp(&balance_status_rank(right.status))
+        balance_snapshot_rank(left)
+            .cmp(&balance_snapshot_rank(right))
             .then_with(|| left.upstream_index.cmp(&right.upstream_index))
             .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
     });
@@ -795,13 +838,13 @@ pub(in crate::tui) fn session_balance_brief(
         })
 }
 
-pub(in crate::tui) fn session_balance_status(
+pub(in crate::tui) fn session_primary_balance_snapshot<'a>(
     row: &SessionRow,
-    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
-) -> Option<BalanceSnapshotStatus> {
+    provider_balances: &'a HashMap<String, Vec<ProviderBalanceSnapshot>>,
+) -> Option<&'a ProviderBalanceSnapshot> {
     for station_name in row_station_candidates(row) {
-        if let Some(status) = station_balance_status(provider_balances, station_name) {
-            return Some(status);
+        if let Some(snapshot) = station_primary_balance_snapshot(provider_balances, station_name) {
+            return Some(snapshot);
         }
     }
 
@@ -810,7 +853,7 @@ pub(in crate::tui) fn session_balance_status(
         .map(str::trim)
         .filter(|provider_id| !provider_id.is_empty())
         .and_then(|provider_id| balance_by_provider_id(provider_balances, provider_id))
-        .map(|(_, snapshot)| snapshot.status)
+        .map(|(_, snapshot)| snapshot)
 }
 
 pub(in crate::tui) fn provider_tags_brief(
@@ -1351,6 +1394,26 @@ mod tests {
     }
 
     #[test]
+    fn provider_balance_compact_marks_ignored_exhaustion_as_lazy() {
+        let snapshot = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            exhaustion_affects_routing: false,
+            plan_name: Some("CodeX Lite 年度".to_string()),
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("0".to_string()),
+            quota_limit_usd: Some("100".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+
+        assert_eq!(
+            provider_balance_compact(&snapshot, 120),
+            "lazy CodeX Lite 年度 daily left $0 / $100.00"
+        );
+        assert_eq!(balance_snapshot_status_label(&snapshot), "lazy reset");
+    }
+
+    #[test]
     fn station_balance_brief_prefers_usable_snapshot_and_keeps_warnings() {
         let balances = HashMap::from([(
             "input".to_string(),
@@ -1372,8 +1435,29 @@ mod tests {
             "left $12.50 exh 1"
         );
         assert_eq!(
-            station_balance_status(&balances, "input"),
+            station_primary_balance_snapshot(&balances, "input").map(|snapshot| snapshot.status),
             Some(BalanceSnapshotStatus::Ok)
+        );
+    }
+
+    #[test]
+    fn station_balance_brief_marks_ignored_exhaustion_as_lazy() {
+        let balances = HashMap::from([(
+            "input".to_string(),
+            vec![ProviderBalanceSnapshot {
+                status: BalanceSnapshotStatus::Exhausted,
+                exhausted: Some(true),
+                exhaustion_affects_routing: false,
+                quota_period: Some("daily".to_string()),
+                quota_remaining_usd: Some("0".to_string()),
+                quota_limit_usd: Some("100".to_string()),
+                ..ProviderBalanceSnapshot::default()
+            }],
+        )]);
+
+        assert_eq!(
+            station_balance_brief(&balances, "input", 80),
+            "lazy daily left $0 / $100.00"
         );
     }
 

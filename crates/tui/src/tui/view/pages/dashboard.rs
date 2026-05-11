@@ -8,11 +8,11 @@ use ratatui::widgets::{
 
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, balance_status_style, basename, duration_short, format_age,
-    format_observed_client_identity, now_ms, session_balance_brief, session_balance_status,
-    session_control_posture, session_observation_scope_label, session_row_has_any_override,
-    session_transcript_host_status, short_sid, shorten, shorten_middle, status_style, tokens_short,
-    usage_line,
+    Palette, Snapshot, balance_snapshot_status_style, basename, duration_short, format_age,
+    format_observed_client_identity, now_ms, session_balance_brief, session_control_posture,
+    session_observation_scope_label, session_primary_balance_snapshot,
+    session_row_has_any_override, session_transcript_host_status, short_sid, shorten,
+    shorten_middle, status_style, tokens_short, usage_line,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -248,8 +248,8 @@ fn render_session_details(
         .and_then(|r| r.last_provider_id.as_deref())
         .unwrap_or("-");
     let balance = selected.and_then(|r| session_balance_brief(r, &snapshot.provider_balances, 56));
-    let balance_status =
-        selected.and_then(|r| session_balance_status(r, &snapshot.provider_balances));
+    let balance_snapshot =
+        selected.and_then(|r| session_primary_balance_snapshot(r, &snapshot.provider_balances));
     let provider_line = match balance.as_deref() {
         Some(balance) if provider != "-" => format!("{provider} | {balance}"),
         Some(balance) => balance.to_string(),
@@ -351,8 +351,8 @@ fn render_session_details(
             p,
             "provider",
             provider_line,
-            balance_status
-                .map(|status| balance_status_style(p, status))
+            balance_snapshot
+                .map(|snapshot| balance_snapshot_status_style(p, snapshot))
                 .unwrap_or_else(|| Style::default().fg(p.text)),
         ),
         kv_line(p, "station", cfg.to_string(), Style::default().fg(p.text)),
