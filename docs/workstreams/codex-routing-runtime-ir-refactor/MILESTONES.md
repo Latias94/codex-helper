@@ -40,6 +40,11 @@ Acceptance:
 - [x] Add a read-only `RoutePlanExecutor` that can iterate `RouteCandidate`
   values without driving production routing.
 - [x] Map each candidate to the existing `SelectedUpstream` compatibility shape.
+- [x] Add a read-only attempt-order selector that can shadow unsupported-model
+  skips and failed-attempt avoidance without sending requests.
+- [x] Compare shadow attempt order against the legacy `LoadBalancer` path for
+  failover avoidance, unsupported-model skip, all-unsupported exhaustion, and
+  same-candidate retry boundaries.
 - [ ] Preserve current retry, cooldown, unsupported-model skip, and failover
   semantics.
 - [ ] Keep legacy station/upstream log fields while adding route metadata

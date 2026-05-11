@@ -7,6 +7,7 @@ use crate::config::{
     ServiceViewV4, UpstreamAuth, UpstreamConfig, effective_v4_routing,
 };
 use crate::lb::SelectedUpstream;
+use crate::model_routing;
 
 const V4_COMPATIBILITY_STATION_NAME: &str = "routing";
 
@@ -79,6 +80,72 @@ pub struct SelectedRouteCandidate<'a> {
     pub selected_upstream: SelectedUpstream,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutePlanAttemptState {
+    avoid_upstream_indices: BTreeSet<usize>,
+    avoided_total: usize,
+}
+
+impl RoutePlanAttemptState {
+    pub fn avoid_upstream_index(&mut self, upstream_index: usize) -> bool {
+        if self.avoid_upstream_indices.insert(upstream_index) {
+            self.avoided_total = self.avoided_total.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    pub fn avoid_selected(&mut self, selected: &SelectedRouteCandidate<'_>) -> bool {
+        self.avoid_upstream_index(selected.selected_upstream.index)
+    }
+
+    pub fn avoids_upstream_index(&self, upstream_index: usize) -> bool {
+        self.avoid_upstream_indices.contains(&upstream_index)
+    }
+
+    pub fn avoid_for_station(&self) -> Vec<usize> {
+        self.avoid_upstream_indices.iter().copied().collect()
+    }
+
+    pub fn avoided_total(&self) -> usize {
+        self.avoided_total
+    }
+
+    pub fn station_exhausted(&self, upstream_total: usize) -> bool {
+        upstream_total > 0
+            && self
+                .avoid_upstream_indices
+                .iter()
+                .filter(|&&idx| idx < upstream_total)
+                .count()
+                >= upstream_total
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutePlanSkipReason {
+    UnsupportedModel { requested_model: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct SkippedRouteCandidate<'a> {
+    pub candidate: &'a RouteCandidate,
+    pub selected_upstream: SelectedUpstream,
+    pub reason: RoutePlanSkipReason,
+    pub avoid_for_station: Vec<usize>,
+    pub avoided_total: usize,
+    pub total_upstreams: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutePlanAttemptSelection<'a> {
+    pub selected: Option<SelectedRouteCandidate<'a>>,
+    pub skipped: Vec<SkippedRouteCandidate<'a>>,
+    pub avoid_for_station: Vec<usize>,
+    pub avoided_total: usize,
+    pub total_upstreams: usize,
+}
+
 pub struct RoutePlanExecutor<'a> {
     template: &'a RoutePlanTemplate,
 }
@@ -102,6 +169,66 @@ impl<'a> RoutePlanExecutor<'a> {
             })
     }
 
+    pub fn select_supported_candidate(
+        &self,
+        state: &mut RoutePlanAttemptState,
+        request_model: Option<&str>,
+    ) -> RoutePlanAttemptSelection<'_> {
+        let total_upstreams = self.template.candidates.len();
+        let mut skipped = Vec::new();
+
+        loop {
+            if state.station_exhausted(total_upstreams) {
+                return RoutePlanAttemptSelection {
+                    selected: None,
+                    skipped,
+                    avoid_for_station: state.avoid_for_station(),
+                    avoided_total: state.avoided_total(),
+                    total_upstreams,
+                };
+            }
+
+            let Some(candidate) = self.next_unavoided_candidate(state) else {
+                return RoutePlanAttemptSelection {
+                    selected: None,
+                    skipped,
+                    avoid_for_station: state.avoid_for_station(),
+                    avoided_total: state.avoided_total(),
+                    total_upstreams,
+                };
+            };
+            let selected_upstream = self.selected_upstream_for_candidate(candidate);
+
+            if let Some(requested_model) = request_model
+                && !candidate_supports_model(candidate, requested_model)
+            {
+                state.avoid_upstream_index(selected_upstream.index);
+                skipped.push(SkippedRouteCandidate {
+                    candidate,
+                    selected_upstream,
+                    reason: RoutePlanSkipReason::UnsupportedModel {
+                        requested_model: requested_model.to_string(),
+                    },
+                    avoid_for_station: state.avoid_for_station(),
+                    avoided_total: state.avoided_total(),
+                    total_upstreams,
+                });
+                continue;
+            }
+
+            return RoutePlanAttemptSelection {
+                selected: Some(SelectedRouteCandidate {
+                    candidate,
+                    selected_upstream,
+                }),
+                skipped,
+                avoid_for_station: state.avoid_for_station(),
+                avoided_total: state.avoided_total(),
+                total_upstreams,
+            };
+        }
+    }
+
     pub fn selected_upstream_for_candidate(&self, candidate: &RouteCandidate) -> SelectedUpstream {
         SelectedUpstream {
             station_name: candidate
@@ -114,6 +241,15 @@ impl<'a> RoutePlanExecutor<'a> {
                 .unwrap_or(candidate.stable_index),
             upstream: candidate.to_upstream_config(),
         }
+    }
+
+    fn next_unavoided_candidate(
+        &self,
+        state: &RoutePlanAttemptState,
+    ) -> Option<&'a RouteCandidate> {
+        self.template.candidates.iter().find(|candidate| {
+            !state.avoids_upstream_index(candidate_compatibility_upstream_index(candidate))
+        })
     }
 }
 
@@ -656,6 +792,20 @@ fn merge_bool_maps(
     merged
 }
 
+fn candidate_compatibility_upstream_index(candidate: &RouteCandidate) -> usize {
+    candidate
+        .compatibility_upstream_index
+        .unwrap_or(candidate.stable_index)
+}
+
+fn candidate_supports_model(candidate: &RouteCandidate, requested_model: &str) -> bool {
+    model_routing::is_model_supported(
+        &btree_bool_map_to_hash_map(&candidate.supported_models),
+        &btree_string_map_to_hash_map(&candidate.model_mapping),
+        requested_model,
+    )
+}
+
 fn btree_string_map_to_hash_map(values: &BTreeMap<String, String>) -> HashMap<String, String> {
     values
         .iter()
@@ -710,7 +860,7 @@ mod tests {
         assert_eq!(provider_ids(template), resolved);
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct UpstreamSignature {
         station_name: String,
         index: usize,
@@ -718,6 +868,16 @@ mod tests {
         tags: BTreeMap<String, String>,
         supported_models: BTreeMap<String, bool>,
         model_mapping: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AttemptOrderEvent {
+        decision: &'static str,
+        upstream: UpstreamSignature,
+        avoid_for_station: Vec<usize>,
+        avoided_total: usize,
+        total_upstreams: usize,
+        reason: Option<&'static str>,
     }
 
     fn hash_string_map_to_btree(values: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -745,6 +905,37 @@ mod tests {
         }
     }
 
+    fn provider_ids_from_attempt_events(events: &[AttemptOrderEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| {
+                event
+                    .upstream
+                    .tags
+                    .get("provider_id")
+                    .expect("provider_id tag")
+                    .clone()
+            })
+            .collect()
+    }
+
+    fn skip_reason(reason: &RoutePlanSkipReason) -> &'static str {
+        match reason {
+            RoutePlanSkipReason::UnsupportedModel { .. } => "unsupported_model",
+        }
+    }
+
+    fn sorted_hash_set(values: &HashSet<usize>) -> Vec<usize> {
+        let mut sorted = values.iter().copied().collect::<Vec<_>>();
+        sorted.sort_unstable();
+        sorted
+    }
+
+    fn station_exhausted(upstream_total: usize, avoid: &HashSet<usize>) -> bool {
+        upstream_total > 0
+            && avoid.iter().filter(|&&idx| idx < upstream_total).count() >= upstream_total
+    }
+
     fn executor_selected_upstream_signatures(
         template: &RoutePlanTemplate,
     ) -> Vec<UpstreamSignature> {
@@ -754,9 +945,7 @@ mod tests {
             .collect()
     }
 
-    fn legacy_load_balancer_selected_upstream_signatures(
-        view: ServiceViewV4,
-    ) -> Vec<UpstreamSignature> {
+    fn legacy_routing_load_balancer(view: ServiceViewV4) -> LoadBalancer {
         let runtime = compile_v4_to_runtime(&ProxyConfigV4 {
             codex: view,
             ..ProxyConfigV4::default()
@@ -767,11 +956,17 @@ mod tests {
             .station("routing")
             .expect("routing station")
             .clone();
-        let upstream_count = service.upstreams.len();
-        let lb = LoadBalancer::new(
+        LoadBalancer::new(
             Arc::new(service),
             Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
-        );
+        )
+    }
+
+    fn legacy_load_balancer_selected_upstream_signatures(
+        view: ServiceViewV4,
+    ) -> Vec<UpstreamSignature> {
+        let lb = legacy_routing_load_balancer(view);
+        let upstream_count = lb.service.upstreams.len();
         let mut avoid = HashSet::new();
         let mut selected = Vec::new();
         while selected.len() < upstream_count {
@@ -782,6 +977,102 @@ mod tests {
             selected.push(upstream_signature(&next));
         }
         selected
+    }
+
+    fn legacy_shadow_attempt_order_signatures(
+        view: ServiceViewV4,
+        request_model: Option<&str>,
+    ) -> Vec<AttemptOrderEvent> {
+        let lb = legacy_routing_load_balancer(view);
+        let total_upstreams = lb.service.upstreams.len();
+        let mut avoid = HashSet::new();
+        let mut avoided_total = 0usize;
+        let mut events = Vec::new();
+
+        while !station_exhausted(total_upstreams, &avoid) {
+            let Some(selected) = lb.select_upstream_avoiding_strict(&avoid) else {
+                break;
+            };
+
+            if let Some(requested_model) = request_model {
+                let supported = model_routing::is_model_supported(
+                    &selected.upstream.supported_models,
+                    &selected.upstream.model_mapping,
+                    requested_model,
+                );
+                if !supported {
+                    if avoid.insert(selected.index) {
+                        avoided_total = avoided_total.saturating_add(1);
+                    }
+                    events.push(AttemptOrderEvent {
+                        decision: "skipped_capability_mismatch",
+                        upstream: upstream_signature(&selected),
+                        avoid_for_station: sorted_hash_set(&avoid),
+                        avoided_total,
+                        total_upstreams,
+                        reason: Some("unsupported_model"),
+                    });
+                    continue;
+                }
+            }
+
+            events.push(AttemptOrderEvent {
+                decision: "selected",
+                upstream: upstream_signature(&selected),
+                avoid_for_station: sorted_hash_set(&avoid),
+                avoided_total,
+                total_upstreams,
+                reason: None,
+            });
+
+            if avoid.insert(selected.index) {
+                avoided_total = avoided_total.saturating_add(1);
+            }
+        }
+
+        events
+    }
+
+    fn executor_shadow_attempt_order_signatures(
+        view: &ServiceViewV4,
+        request_model: Option<&str>,
+    ) -> Vec<AttemptOrderEvent> {
+        let template = compile_v4_route_plan_template("codex", view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut state = RoutePlanAttemptState::default();
+        let mut events = Vec::new();
+
+        loop {
+            let selection = executor.select_supported_candidate(&mut state, request_model);
+            events.extend(
+                selection
+                    .skipped
+                    .into_iter()
+                    .map(|skipped| AttemptOrderEvent {
+                        decision: "skipped_capability_mismatch",
+                        upstream: upstream_signature(&skipped.selected_upstream),
+                        avoid_for_station: skipped.avoid_for_station,
+                        avoided_total: skipped.avoided_total,
+                        total_upstreams: skipped.total_upstreams,
+                        reason: Some(skip_reason(&skipped.reason)),
+                    }),
+            );
+
+            let Some(selected) = selection.selected else {
+                break;
+            };
+            events.push(AttemptOrderEvent {
+                decision: "selected",
+                upstream: upstream_signature(&selected.selected_upstream),
+                avoid_for_station: selection.avoid_for_station,
+                avoided_total: selection.avoided_total,
+                total_upstreams: selection.total_upstreams,
+                reason: None,
+            });
+            state.avoid_selected(&selected);
+        }
+
+        events
     }
 
     fn assert_executor_matches_legacy_load_balancer(view: ServiceViewV4) {
@@ -1167,5 +1458,178 @@ mod tests {
             )]),
             ..ServiceViewV4::default()
         });
+    }
+
+    #[test]
+    fn route_plan_executor_shadow_attempt_order_matches_legacy_failover_avoidance() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    provider("https://primary.example/v1"),
+                ),
+                ("backup".to_string(), provider("https://backup.example/v1")),
+                ("paygo".to_string(), provider("https://paygo.example/v1")),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "backup".to_string(),
+                "primary".to_string(),
+                "paygo".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+
+        let executor_events = executor_shadow_attempt_order_signatures(&view, None);
+        let legacy_events = legacy_shadow_attempt_order_signatures(view, None);
+
+        assert_eq!(executor_events, legacy_events);
+        assert_eq!(
+            provider_ids_from_attempt_events(&executor_events),
+            vec!["backup", "primary", "paygo"]
+        );
+        assert_eq!(executor_events[0].avoid_for_station, Vec::<usize>::new());
+        assert_eq!(executor_events[1].avoid_for_station, vec![0]);
+        assert_eq!(executor_events[2].avoid_for_station, vec![0, 1]);
+    }
+
+    #[test]
+    fn route_plan_executor_shadow_attempt_order_matches_legacy_unsupported_model_skip() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "legacy".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://legacy.example/v1".to_string()),
+                        supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "mapped".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://mapped.example/v1".to_string()),
+                        model_mapping: BTreeMap::from([(
+                            "gpt-5".to_string(),
+                            "provider-gpt-5".to_string(),
+                        )]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "fallback".to_string(),
+                    provider("https://fallback.example/v1"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "legacy".to_string(),
+                "mapped".to_string(),
+                "fallback".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+
+        let executor_events = executor_shadow_attempt_order_signatures(&view, Some("gpt-5"));
+        let legacy_events = legacy_shadow_attempt_order_signatures(view, Some("gpt-5"));
+
+        assert_eq!(executor_events, legacy_events);
+        assert_eq!(
+            executor_events
+                .iter()
+                .map(|event| event.decision)
+                .collect::<Vec<_>>(),
+            vec!["skipped_capability_mismatch", "selected", "selected"]
+        );
+        assert_eq!(
+            provider_ids_from_attempt_events(&executor_events),
+            vec!["legacy", "mapped", "fallback"]
+        );
+        assert_eq!(executor_events[0].reason, Some("unsupported_model"));
+        assert_eq!(executor_events[0].avoid_for_station, vec![0]);
+        assert_eq!(executor_events[1].avoid_for_station, vec![0]);
+        assert_eq!(executor_events[2].avoid_for_station, vec![0, 1]);
+    }
+
+    #[test]
+    fn route_plan_executor_shadow_attempt_order_matches_legacy_all_unsupported_exhaustion() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "old".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://old.example/v1".to_string()),
+                        supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "older".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://older.example/v1".to_string()),
+                        supported_models: BTreeMap::from([("gpt-4o".to_string(), true)]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "old".to_string(),
+                "older".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+
+        let executor_events = executor_shadow_attempt_order_signatures(&view, Some("gpt-5"));
+        let legacy_events = legacy_shadow_attempt_order_signatures(view.clone(), Some("gpt-5"));
+
+        assert_eq!(executor_events, legacy_events);
+        assert_eq!(
+            executor_events
+                .iter()
+                .map(|event| event.decision)
+                .collect::<Vec<_>>(),
+            vec!["skipped_capability_mismatch", "skipped_capability_mismatch"]
+        );
+
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut state = RoutePlanAttemptState::default();
+        let selection = executor.select_supported_candidate(&mut state, Some("gpt-5"));
+
+        assert!(selection.selected.is_none());
+        assert_eq!(selection.skipped.len(), 2);
+        assert_eq!(selection.avoid_for_station, vec![0, 1]);
+        assert!(state.station_exhausted(selection.total_upstreams));
+    }
+
+    #[test]
+    fn route_plan_executor_shadow_keeps_same_candidate_until_caller_marks_avoidance() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                ("first".to_string(), provider("https://first.example/v1")),
+                ("second".to_string(), provider("https://second.example/v1")),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "first".to_string(),
+                "second".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut state = RoutePlanAttemptState::default();
+
+        let first = executor.select_supported_candidate(&mut state, None);
+        let first_selected = first.selected.as_ref().expect("first selected");
+        assert_eq!(first_selected.selected_upstream.index, 0);
+
+        let same = executor.select_supported_candidate(&mut state, None);
+        let same_selected = same.selected.as_ref().expect("same selected");
+        assert_eq!(same_selected.selected_upstream.index, 0);
+
+        assert!(state.avoid_selected(same_selected));
+        let next = executor.select_supported_candidate(&mut state, None);
+        let next_selected = next.selected.as_ref().expect("next selected");
+
+        assert_eq!(next_selected.selected_upstream.index, 1);
+        assert_eq!(next.avoid_for_station, vec![0]);
     }
 }
