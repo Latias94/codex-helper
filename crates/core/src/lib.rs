@@ -14,6 +14,7 @@ pub mod notify;
 pub mod pricing;
 pub mod proxy;
 pub mod request_ledger;
+pub mod routing_ir;
 pub mod sessions;
 pub mod state;
 pub mod usage;
