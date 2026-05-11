@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
@@ -11,17 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-test:
-    name: build-test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-22.04
-          - macos-14
-          - windows-2022
-
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
 
@@ -29,6 +24,43 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libpango1.0-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --features gui -- -D warnings
+
+  test-build:
+    name: test-build (${{ matrix.os }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+          - windows-2025
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -47,14 +79,8 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --features gui -- -D warnings
-
       - name: Test (nextest)
-        run: cargo nextest run --workspace --features gui --no-fail-fast
+        run: cargo nextest run --locked --workspace --features gui --no-fail-fast
 
       - name: Build (release)
         run: cargo build --release --locked --workspace --features gui

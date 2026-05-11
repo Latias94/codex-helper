@@ -784,7 +784,7 @@ fn render_detail_panel(
         .data(&series);
     f.render_widget(sl, inner[1]);
 
-    render_recent_breakdown(f, p, ui, snapshot, kind, name, inner[2], lang);
+    render_recent_breakdown(f, p, ui, snapshot, kind, name, inner[2]);
 }
 
 fn render_recent_breakdown(
@@ -795,8 +795,8 @@ fn render_recent_breakdown(
     kind: &str,
     name: &str,
     area: Rect,
-    lang: Language,
 ) {
+    let lang = ui.language;
     let l = |text| i18n::label(lang, text);
     let tips = Text::from(vec![
         Line::from(vec![
