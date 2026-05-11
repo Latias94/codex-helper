@@ -7,12 +7,14 @@ use ratatui::widgets::{
 };
 
 use crate::tui::ProviderOption;
+use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, basename, duration_short, format_age,
-    format_observed_client_identity, now_ms, session_balance_brief, session_control_posture,
-    session_observation_scope_label, session_primary_balance_snapshot,
-    session_row_has_any_override, session_transcript_host_status, short_sid, shorten,
-    shorten_middle, status_style, tokens_short, usage_line,
+    format_observed_client_identity, now_ms, session_balance_brief_lang,
+    session_control_posture_lang, session_observation_scope_label_lang,
+    session_primary_balance_snapshot, session_row_has_any_override,
+    session_transcript_host_status_lang, short_sid, shorten, shorten_middle, status_style,
+    tokens_short, usage_line_lang,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -42,8 +44,10 @@ fn render_sessions_panel(
     snapshot: &Snapshot,
     area: Rect,
 ) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     let title = Span::styled(
-        "Sessions",
+        l("Sessions"),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     );
     let focused = ui.focus == Focus::Sessions && ui.overlay == Overlay::None;
@@ -56,12 +60,12 @@ fn render_sessions_panel(
     let now = now_ms();
 
     let header = Row::new(vec![
-        Cell::from(Span::styled("Session", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("CWD", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("A", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("Last", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("Age", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("ΣTok", Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("Session"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("CWD"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("A"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("Last"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("Age"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("ΣTok"), Style::default().fg(p.muted))),
     ])
     .height(1)
     .style(Style::default().bg(p.panel));
@@ -203,6 +207,8 @@ fn render_session_details(
     snapshot: &Snapshot,
     area: Rect,
 ) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     let selected = snapshot.rows.get(ui.selected_session_idx);
     let sid = selected
         .and_then(|r| r.session_id.as_deref())
@@ -212,10 +218,10 @@ fn render_session_details(
         .map(|s| shorten_middle(s, 64))
         .unwrap_or_else(|| "-".to_string());
     let identity = selected
-        .map(|r| session_observation_scope_label(r.observation_scope).to_string())
+        .map(|r| session_observation_scope_label_lang(r.observation_scope, lang).to_string())
         .unwrap_or_else(|| "-".to_string());
     let transcript = selected
-        .map(session_transcript_host_status)
+        .map(|row| session_transcript_host_status_lang(row, lang))
         .unwrap_or_else(|| "-".to_string());
     let client = selected
         .and_then(|r| {
@@ -247,7 +253,8 @@ fn render_session_details(
     let provider = selected
         .and_then(|r| r.last_provider_id.as_deref())
         .unwrap_or("-");
-    let balance = selected.and_then(|r| session_balance_brief(r, &snapshot.provider_balances, 56));
+    let balance =
+        selected.and_then(|r| session_balance_brief_lang(r, &snapshot.provider_balances, 56, lang));
     let balance_snapshot =
         selected.and_then(|r| session_primary_balance_snapshot(r, &snapshot.provider_balances));
     let provider_line = match balance.as_deref() {
@@ -292,28 +299,29 @@ fn render_session_details(
 
     let last_usage = selected
         .and_then(|r| r.last_usage.as_ref())
-        .map(usage_line)
-        .unwrap_or_else(|| "tok in/out/rsn/ttl: -".to_string());
+        .map(|usage| usage_line_lang(usage, lang))
+        .unwrap_or_else(|| format!("{}: -", l("tok in/out/rsn/ttl")));
 
     let total_usage = selected
         .and_then(|r| r.total_usage.as_ref())
         .filter(|u| u.total_tokens > 0)
-        .map(usage_line)
-        .unwrap_or_else(|| "tok in/out/rsn/ttl: -".to_string());
-    let posture = selected
-        .map(|row| session_control_posture(row, snapshot.global_station_override.as_deref()));
+        .map(|usage| usage_line_lang(usage, lang))
+        .unwrap_or_else(|| format!("{}: -", l("tok in/out/rsn/ttl")));
+    let posture = selected.map(|row| {
+        session_control_posture_lang(row, snapshot.global_station_override.as_deref(), lang)
+    });
 
     let lines = vec![
         kv_line(
             p,
-            "session",
+            l("session"),
             short_sid(sid, 24),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ),
-        kv_line(p, "identity", identity, Style::default().fg(p.text)),
+        kv_line(p, l("identity"), identity, Style::default().fg(p.text)),
         kv_line(
             p,
-            "transcript",
+            l("transcript"),
             transcript,
             Style::default().fg(
                 if selected
@@ -326,17 +334,17 @@ fn render_session_details(
                 },
             ),
         ),
-        kv_line(p, "client", client, Style::default().fg(p.text)),
-        kv_line(p, "cwd", cwd, Style::default().fg(p.text)),
+        kv_line(p, l("client"), client, Style::default().fg(p.text)),
+        kv_line(p, l("cwd"), cwd, Style::default().fg(p.text)),
         kv_line(
             p,
-            "binding",
+            l("binding"),
             binding.to_string(),
             Style::default().fg(if binding == "-" { p.muted } else { p.text }),
         ),
         kv_line(
             p,
-            "control",
+            l("control"),
             posture
                 .as_ref()
                 .map(|posture| posture.headline.clone())
@@ -346,19 +354,29 @@ fn render_session_details(
                 .map(|posture| posture.color)
                 .unwrap_or(p.muted)),
         ),
-        kv_line(p, "model", model.to_string(), Style::default().fg(p.text)),
         kv_line(
             p,
-            "provider",
+            l("model"),
+            model.to_string(),
+            Style::default().fg(p.text),
+        ),
+        kv_line(
+            p,
+            l("provider"),
             provider_line,
             balance_snapshot
                 .map(|snapshot| balance_snapshot_status_style(p, snapshot))
                 .unwrap_or_else(|| Style::default().fg(p.text)),
         ),
-        kv_line(p, "station", cfg.to_string(), Style::default().fg(p.text)),
         kv_line(
             p,
-            "effort",
+            l("station"),
+            cfg.to_string(),
+            Style::default().fg(p.text),
+        ),
+        kv_line(
+            p,
+            l("effort"),
             effort.to_string(),
             Style::default().fg(if override_effort != "-" {
                 p.accent
@@ -368,7 +386,7 @@ fn render_session_details(
         ),
         kv_line(
             p,
-            "service_tier",
+            l("service_tier"),
             service_tier.to_string(),
             Style::default().fg(if override_service_tier != "-" {
                 p.accent
@@ -378,7 +396,7 @@ fn render_session_details(
         ),
         kv_line(
             p,
-            "override",
+            l("override"),
             format!(
                 "model={override_model}, effort={override_effort}, station={override_cfg}, tier={override_service_tier}"
             ),
@@ -396,7 +414,7 @@ fn render_session_details(
         ),
         kv_line(
             p,
-            "activity",
+            l("activity"),
             format!(
                 "active_age={active_age}, last_age={last_age}, last_status={}, last_dur={last_dur}",
                 last_status
@@ -407,14 +425,14 @@ fn render_session_details(
         ),
         kv_line(
             p,
-            "usage",
+            l("usage"),
             format!("{last_usage} | sum {total_usage} | turns {turns_total}/{turns_with_usage}"),
             Style::default().fg(p.muted),
         ),
     ];
 
     let title = Span::styled(
-        "Details",
+        l("Details"),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
@@ -437,14 +455,16 @@ fn render_requests_panel(
     _providers: &[ProviderOption],
     area: Rect,
 ) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     let focused = ui.focus == Focus::Requests && ui.overlay == Overlay::None;
     let title = Span::styled(
         snapshot
             .rows
             .get(ui.selected_session_idx)
             .and_then(|r| r.session_id.as_deref())
-            .map(|sid| format!("Requests [{}]", short_sid(sid, 12)))
-            .unwrap_or_else(|| "Requests".to_string()),
+            .map(|sid| format!("{} [{}]", l("Requests"), short_sid(sid, 12)))
+            .unwrap_or_else(|| l("Requests").to_string()),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     );
     let block = Block::default()
@@ -471,15 +491,15 @@ fn render_requests_panel(
         .collect::<Vec<_>>();
 
     let header = Row::new(vec![
-        Cell::from(Span::styled("Age", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("St", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("TTFB", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("Total", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("In", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("Out", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("CRead", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("CNew", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("Tok", Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("Age"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("St"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("TTFB"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("Total"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("In"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("Out"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("CRead"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("CNew"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("Tok"), Style::default().fg(p.muted))),
     ]);
 
     let now = now_ms();

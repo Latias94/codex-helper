@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use super::Language;
+use super::i18n;
 use super::model::tokens_short;
 use super::state::UiState;
 use super::types::StatsFocus;
@@ -121,9 +123,10 @@ fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
     format!("{}ms", total_ms / n)
 }
 
-fn fmt_usage_line(u: &UsageMetrics) -> String {
+fn fmt_usage_line(u: &UsageMetrics, lang: Language) -> String {
     let mut line = format!(
-        "tokens in/out/rsn/ttl: {}/{}/{}/{}",
+        "{}: {}/{}/{}/{}",
+        i18n::label(lang, "tok in/out/rsn/ttl"),
         tokens_short(u.input_tokens),
         tokens_short(u.output_tokens),
         tokens_short(u.reasoning_output_tokens_total()),
@@ -131,7 +134,8 @@ fn fmt_usage_line(u: &UsageMetrics) -> String {
     );
     if u.has_cache_tokens() {
         line.push_str(&format!(
-            " cache cached/read/create: {}/{}/{}",
+            " {}: {}/{}/{}",
+            i18n::label(lang, "cache"),
             tokens_short(u.cached_input_tokens),
             tokens_short(u.cache_read_input_tokens),
             tokens_short(u.cache_creation_tokens_total())
@@ -184,53 +188,79 @@ pub(in crate::tui) fn build_stats_report(
     let recent = compute_recent_breakdown(ui, snapshot, &target);
 
     let (kind, name) = match &target {
-        StatsTarget::Station(n) => ("station", n.as_str()),
-        StatsTarget::Provider(n) => ("provider", n.as_str()),
+        StatsTarget::Station(n) => (i18n::label(ui.language, "station"), n.as_str()),
+        StatsTarget::Provider(n) => (i18n::label(ui.language, "provider"), n.as_str()),
     };
+    let l = |text| i18n::label(ui.language, text);
 
     let mut out = String::new();
-    out.push_str("codex-helper TUI Stats report\n");
+    out.push_str(match ui.language {
+        Language::Zh => "codex-helper TUI 统计报告\n",
+        Language::En => "codex-helper TUI Stats report\n",
+    });
     out.push_str(&format!("generated_at_ms: {now_ms}\n"));
     out.push_str(&format!("service: {}\n", ui.service_name));
-    out.push_str(&format!("target: {kind} {name}\n"));
+    out.push_str(&format!("{}: {kind} {name}\n", l("target")));
     let window_label = match ui.stats_days {
-        0 => "loaded".to_string(),
-        1 => "today".to_string(),
+        0 => l("loaded").to_string(),
+        1 => l("today").to_string(),
         n => format!("{n}d"),
     };
-    out.push_str(&format!("window: {window_label}\n"));
+    out.push_str(&format!("{}: {window_label}\n", l("window")));
     out.push_str(&format!(
-        "loaded_requests: {}  loaded_days_with_data: {}\n",
+        "{}: {}  {}: {}\n",
+        l("loaded total req"),
         snapshot.usage_rollup.coverage.loaded_requests,
+        l("loaded days with data"),
         snapshot.usage_rollup.coverage.loaded_days_with_data
     ));
     if snapshot.usage_rollup.coverage.window_exceeds_loaded_start {
-        out.push_str("coverage_warning: selected window starts before loaded log data\n");
+        out.push_str(&format!(
+            "{}: {}\n",
+            l("coverage warning"),
+            l("selected window starts before loaded log data")
+        ));
     }
     out.push_str(&format!(
-        "recent_filter: errors_only={}\n",
+        "{}: {}={}\n",
+        l("recent filter"),
+        l("errors_only"),
         ui.stats_errors_only
     ));
     out.push('\n');
 
-    out.push_str("[window rollup]\n");
+    out.push_str(match ui.language {
+        Language::Zh => "[窗口汇总]\n",
+        Language::En => "[window rollup]\n",
+    });
     out.push_str(&format!(
-        "requests: {} (errors {} / {})  avg {}\n",
+        "{}: {} ({} {} / {})  {} {}\n",
+        l("requests"),
         window_bucket.requests_total,
+        l("errors"),
         window_bucket.requests_error,
         fmt_pct(window_bucket.requests_error, window_bucket.requests_total),
+        l("avg"),
         fmt_avg_ms(
             window_bucket.duration_ms_total,
             window_bucket.requests_total
         ),
     ));
-    out.push_str(&format!("{}\n", fmt_usage_line(&window_bucket.usage)));
+    out.push_str(&format!(
+        "{}\n",
+        fmt_usage_line(&window_bucket.usage, ui.language)
+    ));
     out.push('\n');
 
-    out.push_str("[recent sample]\n");
+    out.push_str(match ui.language {
+        Language::Zh => "[最近样本]\n",
+        Language::En => "[recent sample]\n",
+    });
     out.push_str(&format!(
-        "requests: {}  errors: {}  2xx/3xx/4xx/5xx: {}/{}/{}/{}\n",
+        "{}: {}  {}: {}  2xx/3xx/4xx/5xx: {}/{}/{}/{}\n",
+        l("requests"),
         recent.total,
+        l("errors"),
         recent.err,
         recent.class_2xx,
         recent.class_3xx,
@@ -238,24 +268,32 @@ pub(in crate::tui) fn build_stats_report(
         recent.class_5xx
     ));
     if !recent.top_status.is_empty() {
-        out.push_str("top_status:\n");
+        out.push_str(&format!("{}:\n", l("top status")));
         for (s, c) in &recent.top_status {
             out.push_str(&format!("  - {s}: {c}\n"));
         }
     }
     if !recent.top_models_by_tokens.is_empty() {
-        out.push_str("top_models_by_tokens:\n");
+        out.push_str(&format!("{}:\n", l("top models by tokens")));
         for (m, (c, tok)) in &recent.top_models_by_tokens {
-            out.push_str(&format!("  - {}: {} req / {}\n", m, c, tokens_short(*tok)));
+            out.push_str(&format!(
+                "  - {}: {} {} / {}\n",
+                m,
+                c,
+                l("req"),
+                tokens_short(*tok)
+            ));
         }
     }
     if !recent.top_paths_by_tokens.is_empty() {
-        out.push_str("top_paths_by_tokens:\n");
+        out.push_str(&format!("{}:\n", l("top paths by tokens")));
         for (path, (c, e, tok)) in &recent.top_paths_by_tokens {
             out.push_str(&format!(
-                "  - {}: {} req (err {}) / {}\n",
+                "  - {}: {} {} ({} {}) / {}\n",
                 path,
                 c,
+                l("req"),
+                l("err"),
                 e,
                 tokens_short(*tok)
             ));

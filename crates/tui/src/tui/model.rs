@@ -14,6 +14,8 @@ use crate::state::{
     ProviderBalanceSnapshot, ProxyState, ResolvedRouteValue, SessionIdentityCard,
     SessionObservationScope, StationHealth, UsageRollupView,
 };
+use crate::tui::Language;
+use crate::tui::i18n;
 use crate::usage::UsageMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -542,12 +544,15 @@ pub(in crate::tui) fn balance_snapshot_status_style(
     }
 }
 
-pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
+pub(in crate::tui) fn balance_amount_brief_lang(
+    snapshot: &ProviderBalanceSnapshot,
+    lang: Language,
+) -> Option<String> {
     if snapshot.unlimited_quota == Some(true) {
-        return Some("unlimited".to_string());
+        return Some(i18n::label(lang, "unlimited").to_string());
     }
 
-    if let Some(amount) = quota_amount_brief(snapshot) {
+    if let Some(amount) = quota_amount_brief(snapshot, lang) {
         return Some(amount);
     }
 
@@ -557,7 +562,11 @@ pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Some(format!("left {}", usd_brief(total)));
+        return Some(format!(
+            "{} {}",
+            i18n::label(lang, "left"),
+            usd_brief(total)
+        ));
     }
 
     let subscription = snapshot
@@ -573,16 +582,29 @@ pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -
 
     if let (Some(sub), Some(paygo)) = (subscription, paygo) {
         return Some(format!(
-            "left sub {} + paygo {}",
+            "{} {} {} + {} {}",
+            i18n::label(lang, "left"),
+            i18n::label(lang, "subscription"),
             usd_brief(sub),
+            i18n::label(lang, "paygo"),
             usd_brief(paygo)
         ));
     }
     if let Some(sub) = subscription {
-        return Some(format!("sub left {}", usd_brief(sub)));
+        return Some(format!(
+            "{} {} {}",
+            i18n::label(lang, "subscription"),
+            i18n::label(lang, "left"),
+            usd_brief(sub)
+        ));
     }
     if let Some(paygo) = paygo {
-        return Some(format!("paygo left {}", usd_brief(paygo)));
+        return Some(format!(
+            "{} {} {}",
+            i18n::label(lang, "paygo"),
+            i18n::label(lang, "left"),
+            usd_brief(paygo)
+        ));
     }
 
     match (
@@ -599,11 +621,19 @@ pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -
     ) {
         (Some(spent), Some(budget)) => {
             if let Some(left) = left_brief_from_budget_and_spent(budget, spent) {
-                Some(format!("left {} / budget {}", left, usd_brief(budget)))
+                Some(format!(
+                    "{} {} / {} {}",
+                    i18n::label(lang, "left"),
+                    left,
+                    i18n::label(lang, "budget"),
+                    usd_brief(budget)
+                ))
             } else {
                 Some(format!(
-                    "budget {} / used {}",
+                    "{} {} / {} {}",
+                    i18n::label(lang, "budget"),
                     usd_brief(budget),
+                    i18n::label(lang, "used"),
                     usd_brief(spent)
                 ))
             }
@@ -615,30 +645,40 @@ pub(in crate::tui) fn balance_amount_brief(snapshot: &ProviderBalanceSnapshot) -
                 && snapshot.quota_limit_usd.is_none()
                 && snapshot.quota_used_usd.is_none()
             {
-                Some(format!("used {}", usd_brief(spent)))
+                Some(format!(
+                    "{} {}",
+                    i18n::label(lang, "used"),
+                    usd_brief(spent)
+                ))
             } else {
                 None
             }
         }
-        (None, Some(budget)) => Some(format!("budget {}", usd_brief(budget))),
+        (None, Some(budget)) => Some(format!(
+            "{} {}",
+            i18n::label(lang, "budget"),
+            usd_brief(budget)
+        )),
         (None, None) => snapshot
             .total_used_usd
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(|value| format!("used {}", usd_brief(value)))
+            .map(|value| format!("{} {}", i18n::label(lang, "used"), usd_brief(value)))
             .or_else(|| {
                 snapshot
                     .today_used_usd
                     .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
-                    .map(|value| format!("today used {}", usd_brief(value)))
+                    .map(|value| {
+                        format!("{} {}", i18n::label(lang, "today used"), usd_brief(value))
+                    })
             }),
     }
 }
 
-fn quota_amount_brief(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
+fn quota_amount_brief(snapshot: &ProviderBalanceSnapshot, lang: Language) -> Option<String> {
     let period = snapshot
         .quota_period
         .as_deref()
@@ -665,23 +705,45 @@ fn quota_amount_brief(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
     }
 
     let quota_label = match period {
-        Some("quota") | None => "quota".to_string(),
+        Some("quota") | None => i18n::label(lang, "quota").to_string(),
         Some(period) => period.to_string(),
     };
 
     let amount = match (remaining, limit, used) {
         (Some(remaining), Some(limit), _) => {
-            format!("left {} / {}", usd_brief(remaining), usd_brief(limit))
+            format!(
+                "{} {} / {}",
+                i18n::label(lang, "left"),
+                usd_brief(remaining),
+                usd_brief(limit)
+            )
         }
         (Some(remaining), None, Some(used)) => {
-            format!("left {} / used {}", usd_brief(remaining), usd_brief(used))
+            format!(
+                "{} {} / {} {}",
+                i18n::label(lang, "left"),
+                usd_brief(remaining),
+                i18n::label(lang, "used"),
+                usd_brief(used)
+            )
         }
-        (Some(remaining), None, None) => format!("left {}", usd_brief(remaining)),
+        (Some(remaining), None, None) => {
+            format!("{} {}", i18n::label(lang, "left"), usd_brief(remaining))
+        }
         (None, Some(limit), Some(used)) => {
-            format!("used {} / {}", usd_brief(used), usd_brief(limit))
+            format!(
+                "{} {} / {}",
+                i18n::label(lang, "used"),
+                usd_brief(used),
+                usd_brief(limit)
+            )
         }
-        (None, Some(limit), None) => format!("limit {}", usd_brief(limit)),
-        (None, None, Some(used)) => format!("used {}", usd_brief(used)),
+        (None, Some(limit), None) => {
+            format!("{} {}", i18n::label(lang, "limit"), usd_brief(limit))
+        }
+        (None, None, Some(used)) => {
+            format!("{} {}", i18n::label(lang, "used"), usd_brief(used))
+        }
         (None, None, None) => return None,
     };
 
@@ -721,49 +783,76 @@ fn decimal_brief(raw: &str) -> String {
     if out == "-0" { "0".to_string() } else { out }
 }
 
-fn balance_status_brief(status: BalanceSnapshotStatus) -> &'static str {
+fn balance_status_brief_lang(status: BalanceSnapshotStatus, lang: Language) -> &'static str {
     match status {
-        BalanceSnapshotStatus::Ok => "ok",
-        BalanceSnapshotStatus::Exhausted => "exh",
-        BalanceSnapshotStatus::Stale => "stale",
-        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => "unknown",
+        BalanceSnapshotStatus::Ok => i18n::label(lang, "ok"),
+        BalanceSnapshotStatus::Exhausted => i18n::label(lang, "exh"),
+        BalanceSnapshotStatus::Stale => i18n::label(lang, "stale"),
+        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => {
+            i18n::label(lang, "unknown")
+        }
     }
 }
 
-fn balance_snapshot_status_brief(snapshot: &ProviderBalanceSnapshot) -> &'static str {
+fn balance_snapshot_status_brief_lang(
+    snapshot: &ProviderBalanceSnapshot,
+    lang: Language,
+) -> &'static str {
     if snapshot.routing_ignored_exhaustion() {
-        "lazy"
+        i18n::label(lang, "lazy")
     } else {
-        balance_status_brief(snapshot.status)
+        balance_status_brief_lang(snapshot.status, lang)
     }
 }
 
-pub(in crate::tui) fn balance_status_label(status: BalanceSnapshotStatus) -> &'static str {
+pub(in crate::tui) fn balance_status_label_lang(
+    status: BalanceSnapshotStatus,
+    lang: Language,
+) -> &'static str {
     match status {
-        BalanceSnapshotStatus::Ok => "ok",
-        BalanceSnapshotStatus::Exhausted => "exhausted",
-        BalanceSnapshotStatus::Stale => "stale",
-        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => "unknown",
+        BalanceSnapshotStatus::Ok => i18n::label(lang, "ok"),
+        BalanceSnapshotStatus::Exhausted => i18n::label(lang, "exhausted"),
+        BalanceSnapshotStatus::Stale => i18n::label(lang, "stale"),
+        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => {
+            i18n::label(lang, "unknown")
+        }
     }
 }
 
+#[cfg(test)]
 pub(in crate::tui) fn balance_snapshot_status_label(
     snapshot: &ProviderBalanceSnapshot,
 ) -> &'static str {
+    balance_snapshot_status_label_lang(snapshot, Language::En)
+}
+
+pub(in crate::tui) fn balance_snapshot_status_label_lang(
+    snapshot: &ProviderBalanceSnapshot,
+    lang: Language,
+) -> &'static str {
     if snapshot.routing_ignored_exhaustion() {
-        "lazy reset"
+        i18n::label(lang, "lazy reset")
     } else {
-        balance_status_label(snapshot.status)
+        balance_status_label_lang(snapshot.status, lang)
     }
 }
 
+#[cfg(test)]
 pub(in crate::tui) fn provider_balance_compact(
     snapshot: &ProviderBalanceSnapshot,
     max_width: usize,
 ) -> String {
+    provider_balance_compact_lang(snapshot, max_width, Language::En)
+}
+
+pub(in crate::tui) fn provider_balance_compact_lang(
+    snapshot: &ProviderBalanceSnapshot,
+    max_width: usize,
+    lang: Language,
+) -> String {
     let mut parts = Vec::new();
     if snapshot.status != BalanceSnapshotStatus::Ok {
-        parts.push(balance_snapshot_status_brief(snapshot).to_string());
+        parts.push(balance_snapshot_status_brief_lang(snapshot, lang).to_string());
     }
     if let Some(plan) = snapshot
         .plan_name
@@ -773,11 +862,11 @@ pub(in crate::tui) fn provider_balance_compact(
     {
         parts.push(plan.to_string());
     }
-    if let Some(amount) = balance_amount_brief(snapshot) {
+    if let Some(amount) = balance_amount_brief_lang(snapshot, lang) {
         parts.push(amount);
     }
     if parts.is_empty() {
-        parts.push(balance_snapshot_status_brief(snapshot).to_string());
+        parts.push(balance_snapshot_status_brief_lang(snapshot, lang).to_string());
     }
 
     shorten_middle(&parts.join(" "), max_width)
@@ -814,10 +903,20 @@ pub(in crate::tui) fn station_primary_balance_snapshot<'a>(
         .and_then(|balances| primary_balance_snapshot(balances))
 }
 
+#[cfg(test)]
 pub(in crate::tui) fn station_balance_brief(
     provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
     station_name: &str,
     max_width: usize,
+) -> String {
+    station_balance_brief_lang(provider_balances, station_name, max_width, Language::En)
+}
+
+pub(in crate::tui) fn station_balance_brief_lang(
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    station_name: &str,
+    max_width: usize,
+    lang: Language,
 ) -> String {
     let Some(balances) = provider_balances.get(station_name) else {
         return "-".to_string();
@@ -827,7 +926,7 @@ pub(in crate::tui) fn station_balance_brief(
     }
 
     if balances.len() == 1 {
-        return provider_balance_compact(&balances[0], max_width);
+        return provider_balance_compact_lang(&balances[0], max_width, lang);
     }
 
     let total = balances.len();
@@ -860,20 +959,27 @@ pub(in crate::tui) fn station_balance_brief(
         .count();
     let displayed_unknown = unknown + error;
 
-    let primary_amount = primary_balance_snapshot(balances).and_then(balance_amount_brief);
+    let primary_amount = primary_balance_snapshot(balances)
+        .and_then(|snapshot| balance_amount_brief_lang(snapshot, lang));
 
     let mut parts = Vec::new();
     if primary_amount.is_none() || ok == 0 {
         if ok > 0 {
-            parts.push(format!("ok {ok}/{total}"));
+            parts.push(format!("{} {ok}/{total}", i18n::label(lang, "ok")));
         } else if stale > 0 {
-            parts.push(format!("stale {stale}/{total}"));
+            parts.push(format!("{} {stale}/{total}", i18n::label(lang, "stale")));
         } else if displayed_unknown > 0 {
-            parts.push(format!("unknown {displayed_unknown}/{total}"));
+            parts.push(format!(
+                "{} {displayed_unknown}/{total}",
+                i18n::label(lang, "unknown")
+            ));
         } else if lazy_exhausted > 0 {
-            parts.push(format!("lazy {lazy_exhausted}/{total}"));
+            parts.push(format!(
+                "{} {lazy_exhausted}/{total}",
+                i18n::label(lang, "lazy")
+            ));
         } else if exhausted > 0 {
-            parts.push(format!("exh {exhausted}/{total}"));
+            parts.push(format!("{} {exhausted}/{total}", i18n::label(lang, "exh")));
         }
     }
 
@@ -881,13 +987,13 @@ pub(in crate::tui) fn station_balance_brief(
         parts.push(amount);
     }
     if exhausted > 0 && ok > 0 {
-        parts.push(format!("exh {exhausted}"));
+        parts.push(format!("{} {exhausted}", i18n::label(lang, "exh")));
     }
     if lazy_exhausted > 0 && ok > 0 {
-        parts.push(format!("lazy {lazy_exhausted}"));
+        parts.push(format!("{} {lazy_exhausted}", i18n::label(lang, "lazy")));
     }
     if error > 0 && (ok > 0 || stale > 0 || unknown > 0 || exhausted > 0 || lazy_exhausted > 0) {
-        parts.push(format!("unknown {error}"));
+        parts.push(format!("{} {error}", i18n::label(lang, "unknown")));
     }
 
     if parts.is_empty() {
@@ -936,17 +1042,28 @@ fn balance_by_provider_id<'a>(
     matches.into_iter().next()
 }
 
+#[cfg(test)]
 pub(in crate::tui) fn session_balance_brief(
     row: &SessionRow,
     provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
     max_width: usize,
 ) -> Option<String> {
+    session_balance_brief_lang(row, provider_balances, max_width, Language::En)
+}
+
+pub(in crate::tui) fn session_balance_brief_lang(
+    row: &SessionRow,
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    max_width: usize,
+    lang: Language,
+) -> Option<String> {
     for station_name in row_station_candidates(row) {
         if provider_balances.contains_key(station_name) {
-            return Some(station_balance_brief(
+            return Some(station_balance_brief_lang(
                 provider_balances,
                 station_name,
                 max_width,
+                lang,
             ));
         }
     }
@@ -961,7 +1078,7 @@ pub(in crate::tui) fn session_balance_brief(
                 &format!(
                     "{} {}",
                     shorten_middle(station_name, 18),
-                    provider_balance_compact(snapshot, max_width)
+                    provider_balance_compact_lang(snapshot, max_width, lang)
                 ),
                 max_width,
             )
@@ -1086,9 +1203,10 @@ pub(in crate::tui) fn tokens_short(n: i64) -> String {
     }
 }
 
-pub(in crate::tui) fn usage_line(usage: &UsageMetrics) -> String {
+pub(in crate::tui) fn usage_line_lang(usage: &UsageMetrics, lang: Language) -> String {
     let mut line = format!(
-        "tok in/out/rsn/ttl: {}/{}/{}/{}",
+        "{}: {}/{}/{}/{}",
+        i18n::label(lang, "tok in/out/rsn/ttl"),
         tokens_short(usage.input_tokens),
         tokens_short(usage.output_tokens),
         tokens_short(usage.reasoning_output_tokens_total()),
@@ -1096,7 +1214,8 @@ pub(in crate::tui) fn usage_line(usage: &UsageMetrics) -> String {
     );
     if usage.has_cache_tokens() {
         line.push_str(&format!(
-            " cache cached/read/create: {}/{}/{}",
+            " {}: {}/{}/{}",
+            i18n::label(lang, "cache cached/read/create"),
             tokens_short(usage.cached_input_tokens),
             tokens_short(usage.cache_read_input_tokens),
             tokens_short(usage.cache_creation_tokens_total())
@@ -1184,20 +1303,24 @@ pub(in crate::tui) fn format_observed_client_identity(
     }
 }
 
-pub(in crate::tui) fn session_observation_scope_label(
+pub(in crate::tui) fn session_observation_scope_label_lang(
     scope: SessionObservationScope,
+    lang: Language,
 ) -> &'static str {
     match scope {
-        SessionObservationScope::ObservedOnly => "observed only",
-        SessionObservationScope::HostLocalEnriched => "host-local enriched",
+        SessionObservationScope::ObservedOnly => i18n::label(lang, "observed only"),
+        SessionObservationScope::HostLocalEnriched => i18n::label(lang, "host-local enriched"),
     }
 }
 
-pub(in crate::tui) fn session_transcript_host_status(row: &SessionRow) -> String {
+pub(in crate::tui) fn session_transcript_host_status_lang(
+    row: &SessionRow,
+    lang: Language,
+) -> String {
     if row.host_local_transcript_path.is_some() {
-        "linked under ~/.codex/sessions".to_string()
+        i18n::label(lang, "linked under ~/.codex/sessions").to_string()
     } else {
-        "no host-local transcript detected".to_string()
+        i18n::label(lang, "no host-local transcript detected").to_string()
     }
 }
 
@@ -1225,11 +1348,27 @@ pub(in crate::tui) fn session_override_fields(row: &SessionRow) -> Vec<&'static 
     fields
 }
 
+#[cfg(test)]
 pub(in crate::tui) fn session_control_posture(
     row: &SessionRow,
     global_station: Option<&str>,
 ) -> SessionControlPosture {
+    session_control_posture_lang(row, global_station, Language::En)
+}
+
+pub(in crate::tui) fn session_control_posture_lang(
+    row: &SessionRow,
+    global_station: Option<&str>,
+    lang: Language,
+) -> SessionControlPosture {
     let override_fields = session_override_fields(row);
+    let override_fields_label = || {
+        override_fields
+            .iter()
+            .map(|field| i18n::label(lang, field))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if let Some(profile_name) = row.binding_profile_name.as_deref() {
         if override_fields.is_empty() {
             let mode = row
@@ -1237,19 +1376,31 @@ pub(in crate::tui) fn session_control_posture(
                 .map(|mode| format!("{mode:?}").to_ascii_lowercase())
                 .unwrap_or_else(|| "default_profile".to_string());
             return SessionControlPosture {
-                headline: format!("bound to profile {profile_name} ({mode})"),
-                detail:
-                    "This session keeps its stored binding until another profile or override rewrites it."
-                        .to_string(),
+                headline: match lang {
+                    Language::Zh => format!("绑定到 profile {profile_name}（{mode}）"),
+                    Language::En => format!("bound to profile {profile_name} ({mode})"),
+                },
+                detail: i18n::label(
+                    lang,
+                    "This session keeps its stored binding until another profile or override rewrites it.",
+                )
+                .to_string(),
                 color: Color::Rgb(63, 185, 80),
             };
         }
 
         return SessionControlPosture {
-            headline: format!("profile {profile_name} with session overrides"),
+            headline: match lang {
+                Language::Zh => format!("profile {profile_name} 存在会话覆盖"),
+                Language::En => format!("profile {profile_name} with session overrides"),
+            },
             detail: format!(
-                "Session overrides on {} currently take priority over the bound profile.",
-                override_fields.join(", ")
+                "{} {}",
+                i18n::label(
+                    lang,
+                    "Session overrides currently take priority over the bound profile:",
+                ),
+                override_fields_label()
             ),
             color: Color::Rgb(88, 166, 255),
         };
@@ -1257,10 +1408,11 @@ pub(in crate::tui) fn session_control_posture(
 
     if !override_fields.is_empty() {
         return SessionControlPosture {
-            headline: "session-controlled route".to_string(),
+            headline: i18n::label(lang, "session-controlled route").to_string(),
             detail: format!(
-                "This session is currently pinned by overrides on {}.",
-                override_fields.join(", ")
+                "{} {}",
+                i18n::label(lang, "This session is currently pinned by overrides on:"),
+                override_fields_label()
             ),
             color: Color::Rgb(88, 166, 255),
         };
@@ -1268,21 +1420,28 @@ pub(in crate::tui) fn session_control_posture(
 
     if let Some(station) = global_station.filter(|station| !station.trim().is_empty()) {
         return SessionControlPosture {
-            headline: format!(
-                "no binding; global station {station} may still influence fallback"
-            ),
-            detail:
-                "Without a stored profile or session override, runtime/global routing explains the effective route."
-                    .to_string(),
+            headline: match lang {
+                Language::Zh => format!("无绑定；全局站点 {station} 仍可能影响回退"),
+                Language::En => {
+                    format!("no binding; global station {station} may still influence fallback")
+                }
+            },
+            detail: i18n::label(
+                lang,
+                "Without a stored profile or session override, runtime/global routing explains the effective route.",
+            )
+            .to_string(),
             color: Color::Rgb(210, 153, 34),
         };
     }
 
     SessionControlPosture {
-        headline: "no stored binding or session override".to_string(),
-        detail:
-            "Effective route comes from request payloads, station defaults, and runtime fallback."
-                .to_string(),
+        headline: i18n::label(lang, "no stored binding or session override").to_string(),
+        detail: i18n::label(
+            lang,
+            "Effective route comes from request payloads, station defaults, and runtime fallback.",
+        )
+        .to_string(),
         color: Color::Rgb(144, 154, 164),
     }
 }

@@ -4,16 +4,19 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
 use crate::sessions::SessionSummarySource;
+use crate::tui::i18n::{self, msg};
 use crate::tui::model::{Palette, basename, short_sid, shorten, shorten_middle};
 use crate::tui::state::{CodexHistoryExternalFocusOrigin, UiState};
 
 pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(area);
 
-    let title = crate::tui::i18n::pick(ui.language, "历史会话 (Codex)", "History sessions (Codex)");
+    let title = i18n::text(lang, msg::HISTORY_TITLE);
     let left_block = Block::default()
         .title(Span::styled(
             title,
@@ -23,9 +26,15 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["Updated", "Session", "CWD", "Rounds", "First user message"])
-        .style(Style::default().fg(p.muted))
-        .height(1);
+    let header = Row::new([
+        l("Updated"),
+        l("Session"),
+        l("CWD"),
+        l("Rounds"),
+        l("First user message"),
+    ])
+    .style(Style::default().fg(p.muted))
+    .height(1);
 
     ui.sync_codex_history_selection();
 
@@ -83,7 +92,7 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
 
     let right_block = Block::default()
         .title(Span::styled(
-            crate::tui::i18n::pick(ui.language, "详情", "Details"),
+            i18n::text(ui.language, msg::DETAILS_TITLE),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -93,7 +102,7 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
     let mut lines = Vec::new();
     if let Some(err) = ui.codex_history_error.as_deref() {
         lines.push(Line::from(Span::styled(
-            format!("error: {err}"),
+            format!("{}: {err}", l("error")),
             Style::default().fg(p.bad),
         )));
         lines.push(Line::from(""));
@@ -101,11 +110,7 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
 
     if ui.codex_history_sessions.is_empty() {
         lines.push(Line::from(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "未找到历史会话。按 r 刷新；或确认 ~/.codex/sessions 存在。",
-                "No history sessions found. Press r to refresh; or check ~/.codex/sessions.",
-            ),
+            i18n::text(ui.language, msg::HISTORY_EMPTY),
             Style::default().fg(p.muted),
         )));
     } else if let Some(s) = ui.codex_history_sessions.get(ui.selected_codex_history_idx) {
@@ -115,19 +120,23 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
             .filter(|focus| focus.summary.id == s.id)
         {
             lines.push(Line::from(vec![
-                Span::styled("context: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("context")), Style::default().fg(p.muted)),
                 Span::styled(
-                    format!("focused from {}", history_focus_origin_label(focus.origin)),
+                    format!(
+                        "{} {}",
+                        l("focused from"),
+                        history_focus_origin_label(focus.origin, lang)
+                    ),
                     Style::default().fg(p.accent),
                 ),
             ]));
         }
         lines.push(Line::from(vec![
-            Span::styled("sid: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("sid")), Style::default().fg(p.muted)),
             Span::styled(s.id.clone(), Style::default().fg(p.text)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("cwd: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("cwd")), Style::default().fg(p.muted)),
             Span::styled(
                 s.cwd
                     .as_deref()
@@ -137,7 +146,7 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("updated: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("updated")), Style::default().fg(p.muted)),
             Span::styled(
                 s.updated_at
                     .as_deref()
@@ -148,27 +157,35 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("turns: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("turns")), Style::default().fg(p.muted)),
             Span::styled(
                 format!(
-                    "user={} assistant={} rounds={}",
-                    s.user_turns, s.assistant_turns, s.rounds
+                    "{}={} {}={} {}={}",
+                    l("user"),
+                    s.user_turns,
+                    l("assistant"),
+                    s.assistant_turns,
+                    l("rounds"),
+                    s.rounds
                 ),
                 Style::default().fg(p.muted),
             ),
         ]));
         if let Some(ts) = s.last_response_at.as_deref() {
             lines.push(Line::from(vec![
-                Span::styled("last_response: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    format!("{}: ", l("last_response")),
+                    Style::default().fg(p.muted),
+                ),
                 Span::styled(shorten_middle(ts, 80), Style::default().fg(p.muted)),
             ]));
         }
         lines.push(Line::from(vec![
-            Span::styled("source: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("source")), Style::default().fg(p.muted)),
             Span::styled(
                 match s.source {
-                    SessionSummarySource::LocalFile => "local transcript",
-                    SessionSummarySource::ObservedOnly => "observed bridge",
+                    SessionSummarySource::LocalFile => l("local transcript"),
+                    SessionSummarySource::ObservedOnly => l("observed bridge"),
                 },
                 Style::default().fg(if s.source == SessionSummarySource::LocalFile {
                     p.text
@@ -180,7 +197,7 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            crate::tui::i18n::pick(ui.language, "首条用户消息", "First user message"),
+            i18n::text(ui.language, msg::FIRST_USER_MESSAGE),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )));
         if let Some(msg) = s.first_user_message.as_deref() {
@@ -189,26 +206,21 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
             }
         } else {
             lines.push(Line::from(Span::styled(
-                crate::tui::i18n::pick(ui.language, "  -", "  -"),
+                i18n::text(ui.language, msg::BULLET_DASH),
                 Style::default().fg(p.muted),
             )));
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            crate::tui::i18n::pick(ui.language, "按键", "Keys"),
+            i18n::text(ui.language, msg::KEYS_LABEL),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(crate::tui::i18n::pick(
-            ui.language,
-            "  ↑/↓ 选择  r 刷新  t/Enter 打开对话记录  s 打开到 Sessions  f 打开到 Requests",
-            "  ↑/↓ select  r refresh  t/Enter open transcript  s open in Sessions  f open in Requests",
-        )));
+        lines.push(Line::from(i18n::text(ui.language, msg::HISTORY_KEYS)));
         if s.source == SessionSummarySource::ObservedOnly {
-            lines.push(Line::from(crate::tui::i18n::pick(
+            lines.push(Line::from(i18n::text(
                 ui.language,
-                "  当前条目来自外部桥接，没有本地 transcript 文件。",
-                "  This entry comes from an external bridge and may not have a local transcript file.",
+                msg::HISTORY_EXTERNAL_NO_TRANSCRIPT,
             )));
         }
     }
@@ -220,10 +232,13 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
     f.render_widget(content, columns[1]);
 }
 
-fn history_focus_origin_label(origin: CodexHistoryExternalFocusOrigin) -> &'static str {
+fn history_focus_origin_label(
+    origin: CodexHistoryExternalFocusOrigin,
+    lang: crate::tui::Language,
+) -> &'static str {
     match origin {
-        CodexHistoryExternalFocusOrigin::Sessions => "Sessions",
-        CodexHistoryExternalFocusOrigin::Requests => "Requests",
-        CodexHistoryExternalFocusOrigin::Recent => "Recent",
+        CodexHistoryExternalFocusOrigin::Sessions => i18n::label(lang, "Sessions"),
+        CodexHistoryExternalFocusOrigin::Requests => i18n::label(lang, "Requests"),
+        CodexHistoryExternalFocusOrigin::Recent => i18n::label(lang, "Recent"),
     }
 }

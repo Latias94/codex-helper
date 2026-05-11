@@ -10,13 +10,14 @@ use crate::dashboard_core::{
     StationRoutingPostureInput, StationRoutingSkipReason, StationRoutingSource,
     build_station_routing_posture, summarize_recent_retry_observations,
 };
-use crate::tui::ProviderOption;
+use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
-    Palette, Snapshot, balance_snapshot_status_label, balance_snapshot_status_style, format_age,
-    now_ms, provider_balance_compact, routing_provider_names, shorten, shorten_middle,
-    station_balance_brief,
+    Palette, Snapshot, balance_amount_brief_lang, balance_snapshot_status_label_lang,
+    balance_snapshot_status_style, format_age, now_ms, provider_balance_compact_lang,
+    routing_provider_names, shorten, shorten_middle, station_balance_brief_lang,
 };
 use crate::tui::state::UiState;
+use crate::tui::{Language, ProviderOption};
 
 fn station_routing_posture(
     providers: &[ProviderOption],
@@ -97,85 +98,173 @@ fn effective_station_enabled_level(
     )
 }
 
-fn format_routing_source(source: &StationRoutingSource) -> String {
+fn format_routing_source_lang(source: &StationRoutingSource, lang: Language) -> String {
     match source {
-        StationRoutingSource::SessionPin(station) => format!("session pin={station}"),
-        StationRoutingSource::GlobalPin(station) => format!("global pin={station}"),
-        StationRoutingSource::ConfiguredActiveStation(station) => {
-            format!("configured active={station}")
-        }
-        StationRoutingSource::Auto => "auto".to_string(),
+        StationRoutingSource::SessionPin(station) => match lang {
+            Language::Zh => format!("会话 pin={station}"),
+            Language::En => format!("session pin={station}"),
+        },
+        StationRoutingSource::GlobalPin(station) => match lang {
+            Language::Zh => format!("全局 pin={station}"),
+            Language::En => format!("global pin={station}"),
+        },
+        StationRoutingSource::ConfiguredActiveStation(station) => match lang {
+            Language::Zh => format!("配置活跃站点={station}"),
+            Language::En => format!("configured active={station}"),
+        },
+        StationRoutingSource::Auto => i18n::label(lang, "auto").to_string(),
     }
 }
 
-fn format_routing_mode(mode: StationRoutingMode) -> &'static str {
+fn format_routing_mode_lang(mode: StationRoutingMode, lang: Language) -> &'static str {
     match mode {
-        StationRoutingMode::PinnedStation => "pinned",
-        StationRoutingMode::AutoLevelFallback => "auto(level fallback)",
-        StationRoutingMode::AutoSingleLevelFallback => "auto(single-level fallback)",
-    }
-}
-
-fn format_routing_order_hint(mode: StationRoutingMode) -> &'static str {
-    match mode {
-        StationRoutingMode::PinnedStation => {
-            "pinned target only; breaker_open / empty upstreams block."
-        }
-        StationRoutingMode::AutoLevelFallback => {
-            "known fully exhausted stations are demoted by default; provider-level exceptions only show balance/quota."
-        }
+        StationRoutingMode::PinnedStation => i18n::label(lang, "pinned"),
+        StationRoutingMode::AutoLevelFallback => i18n::label(lang, "auto(level fallback)"),
         StationRoutingMode::AutoSingleLevelFallback => {
-            "known fully exhausted stations are demoted by default unless a provider opts out of routing trust."
+            i18n::label(lang, "auto(single-level fallback)")
         }
     }
 }
 
-fn format_retry_boundary(boundary: StationRetryBoundary) -> String {
+#[cfg(test)]
+fn format_routing_order_hint(mode: StationRoutingMode) -> &'static str {
+    format_routing_order_hint_lang(mode, Language::En)
+}
+
+fn format_routing_order_hint_lang(mode: StationRoutingMode, lang: Language) -> &'static str {
+    match mode {
+        StationRoutingMode::PinnedStation => i18n::label(
+            lang,
+            "pinned target only; breaker_open / empty upstreams block.",
+        ),
+        StationRoutingMode::AutoLevelFallback => i18n::label(
+            lang,
+            "known fully exhausted stations are demoted by default; provider-level exceptions only show balance/quota.",
+        ),
+        StationRoutingMode::AutoSingleLevelFallback => i18n::label(
+            lang,
+            "known fully exhausted stations are demoted by default unless a provider opts out of routing trust.",
+        ),
+    }
+}
+
+fn format_retry_boundary_lang(boundary: StationRetryBoundary, lang: Language) -> String {
     match boundary {
-        StationRetryBoundary::Unknown => "resolved policy unavailable".to_string(),
+        StationRetryBoundary::Unknown => {
+            i18n::label(lang, "resolved policy unavailable").to_string()
+        }
         StationRetryBoundary::CrossStationBeforeFirstOutput {
             provider_max_attempts,
-        } => {
-            format!("provider failover x{provider_max_attempts}; cross-station before first output")
-        }
+        } => match lang {
+            Language::Zh => {
+                format!("provider failover x{provider_max_attempts}；首个输出前允许跨站点")
+            }
+            Language::En => format!(
+                "provider failover x{provider_max_attempts}; cross-station before first output"
+            ),
+        },
         StationRetryBoundary::CurrentStationFirst {
             provider_strategy,
             provider_max_attempts,
-        } => format!(
-            "provider {provider_strategy:?} x{provider_max_attempts}; selected station first"
-        )
-        .to_ascii_lowercase(),
-        StationRetryBoundary::NextRequestOnly => {
-            "provider x1; auto switch on next routed request".to_string()
-        }
+        } => match lang {
+            Language::Zh => {
+                format!("provider {provider_strategy:?} x{provider_max_attempts}；选中站点优先")
+                    .to_ascii_lowercase()
+            }
+            Language::En => format!(
+                "provider {provider_strategy:?} x{provider_max_attempts}; selected station first"
+            )
+            .to_ascii_lowercase(),
+        },
+        StationRetryBoundary::NextRequestOnly => match lang {
+            Language::Zh => "provider x1；下次路由请求自动切换".to_string(),
+            Language::En => "provider x1; auto switch on next routed request".to_string(),
+        },
     }
 }
 
+#[cfg(test)]
 fn format_routing_candidate(candidate: &StationRoutingCandidate) -> String {
+    format_routing_candidate_lang(candidate, Language::En)
+}
+
+fn format_routing_candidate_lang(candidate: &StationRoutingCandidate, lang: Language) -> String {
     let mut parts = vec![format!("L{}", candidate.level.clamp(1, 10))];
     if candidate.active {
-        parts.push("active".to_string());
+        parts.push(i18n::label(lang, "active").to_string());
     }
     match candidate.upstreams {
-        Some(upstreams) => parts.push(format!("upstreams={upstreams}")),
-        None => parts.push("upstreams=?".to_string()),
+        Some(upstreams) => parts.push(format!("{}={upstreams}", i18n::label(lang, "upstreams"))),
+        None => parts.push(format!("{}=?", i18n::label(lang, "upstreams"))),
     }
     if candidate.has_cooldown {
-        parts.push("cooldown".to_string());
+        parts.push(i18n::label(lang, "cooldown").to_string());
     }
     if candidate.all_usage_exhausted {
-        parts.push("quota=all_exhausted".to_string());
+        parts.push(format!(
+            "{}={}",
+            i18n::label(lang, "quota"),
+            i18n::label(lang, "all_exhausted")
+        ));
     } else if candidate.any_usage_exhausted {
-        parts.push("quota=partial_exhausted".to_string());
+        parts.push(format!(
+            "{}={}",
+            i18n::label(lang, "quota"),
+            i18n::label(lang, "partial_exhausted")
+        ));
     }
     if !candidate.balance.is_empty() {
-        parts.push(format_routing_balance(candidate));
+        parts.push(format_routing_balance_lang(candidate, lang));
     }
 
     format!("{} [{}]", candidate.name, parts.join(", "))
 }
 
-fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
+fn format_routing_balance_lang(candidate: &StationRoutingCandidate, lang: Language) -> String {
+    if lang == Language::En {
+        return format_routing_balance_en(candidate);
+    }
+
+    let balance = &candidate.balance;
+    let mut parts = Vec::new();
+    if balance.routing_snapshots == 0 {
+        if balance.exhausted > 0 {
+            parts.push("耗尽但不参与路由".to_string());
+        }
+    } else if balance.routing_exhausted == balance.routing_snapshots {
+        parts.push("路由可见全部耗尽".to_string());
+    } else if balance.routing_exhausted > 0 {
+        parts.push(format!(
+            "耗尽={}/{}",
+            balance.routing_exhausted, balance.routing_snapshots
+        ));
+    }
+    if balance.routing_ignored_exhausted > 0 {
+        parts.push(format!(
+            "路由忽略耗尽={}",
+            balance.routing_ignored_exhausted
+        ));
+    }
+    if balance.stale > 0 {
+        parts.push(format!("{}={}", i18n::label(lang, "stale"), balance.stale));
+    }
+    let unknown = balance.unknown + balance.error;
+    if unknown > 0 {
+        parts.push(format!("{}={unknown}", i18n::label(lang, "unknown")));
+    }
+    if parts.is_empty() {
+        format!(
+            "{}={}({})",
+            i18n::label(lang, "balance"),
+            i18n::label(lang, "ok"),
+            balance.snapshots
+        )
+    } else {
+        format!("{}={}", i18n::label(lang, "balance"), parts.join("/"))
+    }
+}
+
+fn format_routing_balance_en(candidate: &StationRoutingCandidate) -> String {
     let balance = &candidate.balance;
     let mut parts = Vec::new();
     if balance.routing_snapshots == 0 {
@@ -210,28 +299,38 @@ fn format_routing_balance(candidate: &StationRoutingCandidate) -> String {
     }
 }
 
-fn format_skipped_station(skipped: &crate::dashboard_core::StationRoutingSkipped) -> String {
+fn format_skipped_station_lang(
+    skipped: &crate::dashboard_core::StationRoutingSkipped,
+    lang: Language,
+) -> String {
     format!(
         "{}: {}",
         skipped.station_name,
         skipped
             .reasons
             .iter()
-            .map(format_skip_reason)
+            .map(|reason| format_skip_reason_lang(reason, lang))
             .collect::<Vec<_>>()
             .join(",")
     )
 }
 
-fn format_skip_reason(reason: &StationRoutingSkipReason) -> String {
+fn format_skip_reason_lang(reason: &StationRoutingSkipReason, lang: Language) -> String {
     match reason {
-        StationRoutingSkipReason::Disabled => "disabled".to_string(),
-        StationRoutingSkipReason::RuntimeState(state) => {
-            format!("state={state:?}").to_ascii_lowercase()
+        StationRoutingSkipReason::Disabled => i18n::label(lang, "disabled").to_string(),
+        StationRoutingSkipReason::RuntimeState(state) => match lang {
+            Language::Zh => format!("状态={state:?}").to_ascii_lowercase(),
+            Language::En => format!("state={state:?}").to_ascii_lowercase(),
+        },
+        StationRoutingSkipReason::NoRoutableUpstreams => {
+            i18n::label(lang, "no_upstreams").to_string()
         }
-        StationRoutingSkipReason::NoRoutableUpstreams => "no_upstreams".to_string(),
-        StationRoutingSkipReason::MissingPinnedTarget => "missing_pinned_station".to_string(),
-        StationRoutingSkipReason::BreakerOpenBlocksPinned => "breaker_open_blocks_pin".to_string(),
+        StationRoutingSkipReason::MissingPinnedTarget => {
+            i18n::label(lang, "missing_pinned_station").to_string()
+        }
+        StationRoutingSkipReason::BreakerOpenBlocksPinned => {
+            i18n::label(lang, "breaker_open_blocks_pin").to_string()
+        }
     }
 }
 
@@ -309,10 +408,14 @@ fn routing_provider_balance_snapshots<'a>(
     matches
 }
 
-fn routing_provider_balance_brief(snapshot: &Snapshot, provider_name: &str) -> String {
+fn routing_provider_balance_brief_lang(
+    snapshot: &Snapshot,
+    provider_name: &str,
+    lang: Language,
+) -> String {
     routing_provider_balance_snapshots(snapshot, provider_name)
         .first()
-        .map(|balance| provider_balance_compact(balance, 24))
+        .map(|balance| provider_balance_compact_lang(balance, 24, lang))
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -337,6 +440,8 @@ fn render_route_graph_routing_page(
     snapshot: &Snapshot,
     area: Rect,
 ) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -345,16 +450,22 @@ fn render_route_graph_routing_page(
     let Some(spec) = ui.routing_spec.clone() else {
         let block = Block::default()
             .title(Span::styled(
-                "Routing",
+                l("Routing"),
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(p.border))
             .style(Style::default().bg(p.panel));
         let text = Text::from(vec![
-            Line::from("loading routing providers..."),
+            Line::from(match lang {
+                crate::tui::Language::Zh => "正在加载 routing providers...",
+                crate::tui::Language::En => "loading routing providers...",
+            }),
             Line::from(Span::styled(
-                "press r to open the editor immediately",
+                match lang {
+                    crate::tui::Language::Zh => "按 r 可立即打开编辑器",
+                    crate::tui::Language::En => "press r to open the editor immediately",
+                },
                 Style::default().fg(p.muted),
             )),
         ]);
@@ -378,8 +489,12 @@ fn render_route_graph_routing_page(
     let left_block = Block::default()
         .title(Span::styled(
             format!(
-                "Routing providers  policy={}  exhausted={}",
+                "{} {}  {}={}  {}={}",
+                l("Routing"),
+                l("providers"),
+                l("policy"),
                 routing_policy_label(spec.policy),
+                l("exhausted"),
                 routing_exhausted_label(spec.on_exhausted)
             ),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
@@ -388,7 +503,7 @@ fn render_route_graph_routing_page(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["#", "Provider", "On", "Route", "Balance/Quota"])
+    let header = Row::new(["#", l("Provider"), l("On"), l("Route"), l("Balance/Quota")])
         .style(Style::default().fg(p.muted))
         .height(1);
     let rows = order
@@ -405,7 +520,7 @@ fn render_route_graph_routing_page(
             {
                 label = format!("{label} ({alias})");
             }
-            let balance = routing_provider_balance_brief(snapshot, name);
+            let balance = routing_provider_balance_brief_lang(snapshot, name, lang);
             let style = if !enabled {
                 Style::default().fg(p.muted)
             } else if spec.target.as_deref() == Some(name.as_str()) {
@@ -420,7 +535,7 @@ fn render_route_graph_routing_page(
             Row::new([
                 (idx + 1).to_string(),
                 shorten_middle(&label, 28),
-                if enabled { "on" } else { "off" }.to_string(),
+                if enabled { l("on") } else { l("off") }.to_string(),
                 marker.to_string(),
                 balance,
             ])
@@ -451,18 +566,18 @@ fn render_route_graph_routing_page(
     let selected_name = order.get(ui.selected_station_idx).map(String::as_str);
     let selected_provider = selected_name.and_then(|name| provider_by_name.get(name).copied());
     let right_title = selected_name
-        .map(|name| format!("Provider routing: {name}"))
-        .unwrap_or_else(|| "Provider routing".to_string());
+        .map(|name| format!("{}: {name}", l("Provider routing")))
+        .unwrap_or_else(|| l("Provider routing").to_string());
 
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("policy: ", Style::default().fg(p.muted)),
+        Span::styled(format!("{}: ", l("policy")), Style::default().fg(p.muted)),
         Span::styled(
             routing_policy_label(spec.policy),
             Style::default().fg(p.text),
         ),
         Span::raw("   "),
-        Span::styled("target: ", Style::default().fg(p.muted)),
+        Span::styled(format!("{}: ", l("target")), Style::default().fg(p.muted)),
         Span::styled(
             spec.target.as_deref().unwrap_or("-"),
             Style::default().fg(if spec.target.is_some() {
@@ -472,14 +587,20 @@ fn render_route_graph_routing_page(
             }),
         ),
         Span::raw("   "),
-        Span::styled("on_exhausted: ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{}: ", l("on_exhausted")),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(
             routing_exhausted_label(spec.on_exhausted),
             Style::default().fg(p.text),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("prefer_tags: ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{}: ", l("prefer_tags")),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(
             routing_prefer_tags_label(&spec.prefer_tags, 80),
             Style::default().fg(if spec.prefer_tags.is_empty() {
@@ -490,7 +611,7 @@ fn render_route_graph_routing_page(
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("order: ", Style::default().fg(p.muted)),
+        Span::styled(format!("{}: ", l("order")), Style::default().fg(p.muted)),
         Span::styled(
             shorten_middle(&order.join(" > "), 96),
             Style::default().fg(p.text),
@@ -506,25 +627,25 @@ fn render_route_graph_routing_page(
                 .filter(|alias| !alias.trim().is_empty())
             {
                 lines.push(Line::from(vec![
-                    Span::styled("alias: ", Style::default().fg(p.muted)),
+                    Span::styled(format!("{}: ", l("alias")), Style::default().fg(p.muted)),
                     Span::styled(alias.to_string(), Style::default().fg(p.text)),
                 ]));
             }
             lines.push(Line::from(vec![
-                Span::styled("enabled: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("enabled")), Style::default().fg(p.muted)),
                 Span::styled(
-                    if provider.enabled { "true" } else { "false" },
+                    if provider.enabled { l("yes") } else { l("no") },
                     Style::default().fg(if provider.enabled { p.good } else { p.warn }),
                 ),
                 Span::raw("   "),
-                Span::styled("route: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("Route")), Style::default().fg(p.muted)),
                 Span::styled(
                     routing_provider_marker(&spec, name, Some(provider)).to_string(),
                     Style::default().fg(p.accent),
                 ),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("tags: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("tags")), Style::default().fg(p.muted)),
                 Span::styled(
                     routing_tags_label(&provider.tags, 96),
                     Style::default().fg(p.text),
@@ -532,20 +653,20 @@ fn render_route_graph_routing_page(
             ]));
         } else {
             lines.push(Line::from(Span::styled(
-                "provider is referenced by the route graph but missing from catalog",
+                l("provider is referenced by the route graph but missing from catalog"),
                 Style::default().fg(p.warn),
             )));
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Balance / quota",
+            l("Balance / quota"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
         let balances = routing_provider_balance_snapshots(snapshot, name);
         if balances.is_empty() {
             lines.push(Line::from(Span::styled(
-                "(none)",
+                i18n::text(lang, msg::NONE_PARENS),
                 Style::default().fg(p.muted),
             )));
         } else {
@@ -557,12 +678,12 @@ fn render_route_graph_routing_page(
                 lines.push(Line::from(vec![
                     Span::styled(format!("{idx:>2}. "), Style::default().fg(p.muted)),
                     Span::styled(
-                        balance_snapshot_status_label(balance),
+                        balance_snapshot_status_label_lang(balance, lang),
                         balance_snapshot_status_style(p, balance),
                     ),
                     Span::raw("  "),
                     Span::styled(
-                        provider_balance_compact(balance, 72),
+                        provider_balance_compact_lang(balance, 72, lang),
                         Style::default().fg(p.text),
                     ),
                 ]));
@@ -574,7 +695,7 @@ fn render_route_graph_routing_page(
                     lines.push(Line::from(vec![
                         Span::raw("     "),
                         Span::styled(
-                            format!("balance lookup failed: {}", shorten(err, 56)),
+                            format!("{}: {}", l("balance lookup failed"), shorten(err, 56)),
                             Style::default().fg(p.muted),
                         ),
                     ]));
@@ -585,21 +706,27 @@ fn render_route_graph_routing_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "Actions",
+        l("Actions"),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
-    lines.push(Line::from("  Enter/r      open routing editor"));
-    lines.push(Line::from(
-        "  e            enable/disable selected provider",
-    ));
-    lines.push(Line::from("  f            prefer billing=monthly"));
-    lines.push(Line::from(
-        "  1/2/0        set monthly/paygo/clear billing tag",
-    ));
-    lines.push(Line::from(
-        "  s            toggle on_exhausted continue/stop",
-    ));
-    lines.push(Line::from("  [/]/u/d      reorder fallback order"));
+    lines.extend(match lang {
+        crate::tui::Language::Zh => vec![
+            Line::from("  Enter/r      打开 routing 编辑器"),
+            Line::from("  e            启用/禁用选中 provider"),
+            Line::from("  f            优先 billing=monthly"),
+            Line::from("  1/2/0        设置 monthly/paygo/清除 billing 标签"),
+            Line::from("  s            切换 on_exhausted continue/stop"),
+            Line::from("  [/]/u/d      调整 fallback 顺序"),
+        ],
+        crate::tui::Language::En => vec![
+            Line::from("  Enter/r      open routing editor"),
+            Line::from("  e            enable/disable selected provider"),
+            Line::from("  f            prefer billing=monthly"),
+            Line::from("  1/2/0        set monthly/paygo/clear billing tag"),
+            Line::from("  s            toggle on_exhausted continue/stop"),
+            Line::from("  [/]/u/d      reorder fallback order"),
+        ],
+    });
 
     let right_block = Block::default()
         .title(Span::styled(
@@ -628,6 +755,8 @@ pub(super) fn render_stations_page(
         render_route_graph_routing_page(f, p, ui, snapshot, area);
         return;
     }
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -648,16 +777,23 @@ pub(super) fn render_stations_page(
 
     let left_block = Block::default()
         .title(Span::styled(
-            format!("Stations  (session: {selected_session})"),
+            format!("{}  ({}: {selected_session})", l("Stations"), l("session")),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["Lvl", "Name", "On", "Up", "Balance/Quota", "Health"])
-        .style(Style::default().fg(p.muted))
-        .height(1);
+    let header = Row::new([
+        l("Lvl"),
+        l("Name"),
+        l("On"),
+        l("Up"),
+        l("Balance/Quota"),
+        l("Health"),
+    ])
+    .style(Style::default().fg(p.muted))
+    .height(1);
 
     let rows = providers
         .iter()
@@ -675,22 +811,27 @@ pub(super) fn render_stations_page(
                 name = format!("* {name}");
             }
 
-            let on = if enabled { "on" } else { "off" };
+            let on = if enabled { l("on") } else { l("off") };
             let up = cfg.upstreams.len().to_string();
-            let balance = station_balance_brief(&snapshot.provider_balances, cfg.name.as_str(), 18);
+            let balance = station_balance_brief_lang(
+                &snapshot.provider_balances,
+                cfg.name.as_str(),
+                18,
+                lang,
+            );
             let health = if let Some(st) = snapshot.health_checks.get(cfg.name.as_str())
                 && !st.done
             {
                 if st.cancel_requested {
-                    format!("cancel {}/{}", st.completed, st.total.max(1))
+                    format!("{} {}/{}", l("cancel"), st.completed, st.total.max(1))
                 } else {
-                    format!("run {}/{}", st.completed, st.total.max(1))
+                    format!("{} {}/{}", l("run"), st.completed, st.total.max(1))
                 }
             } else if let Some(st) = snapshot.health_checks.get(cfg.name.as_str())
                 && st.done
                 && st.canceled
             {
-                "canceled".to_string()
+                l("canceled").to_string()
             } else {
                 snapshot
                     .station_health
@@ -708,14 +849,14 @@ pub(super) fn render_stations_page(
                             if let Some(ms) = best_ms {
                                 format!("{ok}/{total} {ms}ms")
                             } else {
-                                format!("{ok}/{total} ok")
+                                format!("{ok}/{total} {}", l("ok"))
                             }
                         } else {
                             let status = h.upstreams.iter().filter_map(|u| u.status_code).next();
                             if let Some(code) = status {
-                                format!("err {code}")
+                                format!("{} {code}", l("err"))
                             } else {
-                                "err".to_string()
+                                l("err").to_string()
                             }
                         }
                     })
@@ -766,8 +907,15 @@ pub(super) fn render_stations_page(
 
     let selected = providers.get(ui.selected_station_idx);
     let right_title = selected
-        .map(|c| format!("Station details: {} (L{})", c.name, c.level.clamp(1, 10)))
-        .unwrap_or_else(|| "Station details".to_string());
+        .map(|c| {
+            format!(
+                "{}: {} (L{})",
+                l("Station details"),
+                c.name,
+                c.level.clamp(1, 10)
+            )
+        })
+        .unwrap_or_else(|| l("Station details").to_string());
 
     let mut lines = Vec::new();
     if let Some(cfg) = selected {
@@ -779,12 +927,18 @@ pub(super) fn render_stations_page(
         let enabled = enabled_ovr.unwrap_or(cfg.enabled);
         let level = level_ovr.unwrap_or(cfg.level).clamp(1, 10);
         let level_note = if level_ovr.is_some() {
-            " (override)"
+            match lang {
+                Language::Zh => "（覆盖）",
+                Language::En => " (override)",
+            }
         } else {
             ""
         };
         let enabled_note = if enabled_ovr.is_some() {
-            " (override)"
+            match lang {
+                Language::Zh => "（覆盖）",
+                Language::En => " (override)",
+            }
         } else {
             ""
         };
@@ -793,26 +947,26 @@ pub(super) fn render_stations_page(
             && !alias.trim().is_empty()
         {
             lines.push(Line::from(vec![
-                Span::styled("alias: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("alias")), Style::default().fg(p.muted)),
                 Span::styled(alias.to_string(), Style::default().fg(p.text)),
             ]));
         }
         lines.push(Line::from(vec![
-            Span::styled("enabled: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("enabled")), Style::default().fg(p.muted)),
             Span::styled(
-                format!("{}{enabled_note}", if enabled { "true" } else { "false" }),
+                format!("{}{enabled_note}", if enabled { l("yes") } else { l("no") }),
                 Style::default().fg(if enabled { p.good } else { p.warn }),
             ),
             Span::raw("   "),
-            Span::styled("level: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("Lvl")), Style::default().fg(p.muted)),
             Span::styled(
                 format!("L{level}{level_note}"),
                 Style::default().fg(p.muted),
             ),
             Span::raw("   "),
-            Span::styled("active: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("active")), Style::default().fg(p.muted)),
             Span::styled(
-                if cfg.active { "true" } else { "false" },
+                if cfg.active { l("yes") } else { l("no") },
                 Style::default().fg(if cfg.active { p.accent } else { p.muted }),
             ),
         ]));
@@ -827,33 +981,42 @@ pub(super) fn render_stations_page(
             ui.last_runtime_retry.as_ref(),
         );
         lines.push(Line::from(vec![
-            Span::styled("routing: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("routing")), Style::default().fg(p.muted)),
             Span::styled(
                 format!(
                     "{} · {}",
-                    format_routing_source(&routing.source),
-                    format_routing_mode(routing.mode)
+                    format_routing_source_lang(&routing.source, lang),
+                    format_routing_mode_lang(routing.mode, lang)
                 ),
                 Style::default().fg(p.muted),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("retry: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("retry")), Style::default().fg(p.muted)),
             Span::styled(
-                shorten_middle(&format_retry_boundary(routing.retry_boundary), 96),
+                shorten_middle(
+                    &format_retry_boundary_lang(routing.retry_boundary, lang),
+                    96,
+                ),
                 Style::default().fg(p.muted),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("order_rule: ", Style::default().fg(p.muted)),
             Span::styled(
-                shorten_middle(format_routing_order_hint(routing.mode), 96),
+                format!("{}: ", l("order_rule")),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled(
+                shorten_middle(format_routing_order_hint_lang(routing.mode, lang), 96),
                 Style::default().fg(p.muted),
             ),
         ]));
         let observations = summarize_recent_retry_observations(&snapshot.recent);
         lines.push(Line::from(vec![
-            Span::styled("recent: ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!("{}: ", l("Recent sample")),
+                Style::default().fg(p.muted),
+            ),
             Span::styled(
                 format!(
                     "retry={} same={} cross={} fast={}",
@@ -867,13 +1030,13 @@ pub(super) fn render_stations_page(
         ]));
         if !routing.eligible_candidates.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled("order: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("order")), Style::default().fg(p.muted)),
                 Span::styled(
                     shorten_middle(
                         &routing
                             .eligible_candidates
                             .iter()
-                            .map(format_routing_candidate)
+                            .map(|candidate| format_routing_candidate_lang(candidate, lang))
                             .collect::<Vec<_>>()
                             .join(" > "),
                         96,
@@ -884,13 +1047,13 @@ pub(super) fn render_stations_page(
         }
         if !routing.skipped.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled("skipped: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("skipped")), Style::default().fg(p.muted)),
                 Span::styled(
                     shorten_middle(
                         &routing
                             .skipped
                             .iter()
-                            .map(format_skipped_station)
+                            .map(|skipped| format_skipped_station_lang(skipped, lang))
                             .collect::<Vec<_>>()
                             .join(" | "),
                         96,
@@ -903,17 +1066,20 @@ pub(super) fn render_stations_page(
         if let Some(st) = snapshot.health_checks.get(cfg.name.as_str()) {
             let status = if !st.done {
                 if st.cancel_requested {
-                    format!("cancel {}/{}", st.completed, st.total.max(1))
+                    format!("{} {}/{}", l("cancel"), st.completed, st.total.max(1))
                 } else {
-                    format!("running {}/{}", st.completed, st.total.max(1))
+                    format!("{} {}/{}", l("running"), st.completed, st.total.max(1))
                 }
             } else if st.canceled {
-                "canceled".to_string()
+                l("canceled").to_string()
             } else {
-                "done".to_string()
+                l("done").to_string()
             };
             lines.push(Line::from(vec![
-                Span::styled("health_check: ", Style::default().fg(p.muted)),
+                Span::styled(
+                    format!("{}: ", l("health_check")),
+                    Style::default().fg(p.muted),
+                ),
                 Span::styled(
                     status,
                     Style::default().fg(if st.done && !st.canceled {
@@ -936,9 +1102,12 @@ pub(super) fn render_stations_page(
         if let Some(health) = snapshot.station_health.get(cfg.name.as_str()) {
             let age = format_age(now, Some(health.checked_at_ms));
             lines.push(Line::from(vec![
-                Span::styled("health: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("health")), Style::default().fg(p.muted)),
                 Span::styled(
-                    format!("checked {age} ago"),
+                    match lang {
+                        crate::tui::Language::Zh => format!("{age} 前检查"),
+                        crate::tui::Language::En => format!("checked {age} ago"),
+                    },
                     Style::default().fg(p.muted).add_modifier(Modifier::DIM),
                 ),
             ]));
@@ -956,7 +1125,7 @@ pub(super) fn render_stations_page(
                 lines.push(Line::from(vec![
                     Span::styled(head, Style::default().fg(p.muted)),
                     Span::styled(
-                        if ok { "ok" } else { "err" },
+                        if ok { l("ok") } else { l("err") },
                         Style::default().fg(if ok { p.good } else { p.warn }),
                     ),
                     Span::raw("  "),
@@ -978,9 +1147,9 @@ pub(super) fn render_stations_page(
             }
         } else {
             lines.push(Line::from(vec![
-                Span::styled("health: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("health")), Style::default().fg(p.muted)),
                 Span::styled(
-                    "not checked (press 'h')",
+                    i18n::text(lang, msg::NOT_CHECKED),
                     Style::default().fg(p.muted).add_modifier(Modifier::DIM),
                 ),
             ]));
@@ -988,13 +1157,13 @@ pub(super) fn render_stations_page(
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Balance / quota",
+            l("Balance / quota"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
         if let Some(balances) = snapshot.provider_balances.get(cfg.name.as_str()) {
             if balances.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    "(none)",
+                    i18n::text(lang, msg::NONE_PARENS),
                     Style::default().fg(p.muted),
                 )));
             } else {
@@ -1011,12 +1180,16 @@ pub(super) fn render_stations_page(
                         ),
                         Span::raw("  "),
                         Span::styled(
-                            balance_snapshot_status_label(balance),
+                            balance_snapshot_status_label_lang(balance, lang),
                             balance_snapshot_status_style(p, balance),
                         ),
                         Span::raw("  "),
                         Span::styled(
-                            shorten_middle(&balance.amount_summary(), 56),
+                            shorten_middle(
+                                &balance_amount_brief_lang(balance, lang)
+                                    .unwrap_or_else(|| balance.amount_summary()),
+                                56,
+                            ),
                             Style::default().fg(p.muted),
                         ),
                     ]));
@@ -1026,7 +1199,7 @@ pub(super) fn render_stations_page(
                         lines.push(Line::from(vec![
                             Span::raw("     "),
                             Span::styled(
-                                format!("balance lookup failed: {}", shorten(err, 56)),
+                                format!("{}: {}", l("balance lookup failed"), shorten(err, 56)),
                                 Style::default().fg(p.muted),
                             ),
                         ]));
@@ -1041,19 +1214,19 @@ pub(super) fn render_stations_page(
             }
         } else {
             lines.push(Line::from(Span::styled(
-                "(none)",
+                i18n::text(lang, msg::NONE_PARENS),
                 Style::default().fg(p.muted),
             )));
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Upstreams",
+            l("Upstreams"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
         if cfg.upstreams.is_empty() {
             lines.push(Line::from(Span::styled(
-                "(none)",
+                i18n::text(lang, msg::NONE_PARENS),
                 Style::default().fg(p.muted),
             )));
         } else {
@@ -1070,45 +1243,63 @@ pub(super) fn render_stations_page(
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Actions",
+            l("Actions"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
-        lines.push(Line::from(crate::tui::i18n::pick(
+        lines.push(Line::from(i18n::text(
             ui.language,
-            "  i            Provider 详情（可滚动）",
-            "  i            provider details (scrollable)",
+            msg::ROUTING_ACTION_PROVIDER_DETAILS,
         )));
         if ui.uses_route_graph_routing() {
-            lines.push(Line::from(
-                "  Enter/r      routing editor (policy/order/tags/enable)",
-            ));
-            lines.push(Line::from(
-                "  Backspace    clear legacy runtime station pin",
-            ));
-            lines.push(Line::from(
-                "  o            disabled: provider choice is v4 routing policy",
-            ));
-            lines.push(Line::from(
-                "  O            clear legacy session station override",
-            ));
+            lines.extend(match lang {
+                crate::tui::Language::Zh => vec![
+                    Line::from("  Enter/r      routing 编辑器（策略/顺序/标签/启停）"),
+                    Line::from("  Backspace    清除旧版运行时站点 pin"),
+                    Line::from("  o            禁用：provider 选择由 v4 routing 策略接管"),
+                    Line::from("  O            清除旧版会话站点覆盖"),
+                ],
+                crate::tui::Language::En => vec![
+                    Line::from("  Enter/r      routing editor (policy/order/tags/enable)"),
+                    Line::from("  Backspace    clear legacy runtime station pin"),
+                    Line::from("  o            disabled: provider choice is v4 routing policy"),
+                    Line::from("  O            clear legacy session station override"),
+                ],
+            });
         } else {
-            lines.push(Line::from("  Enter        set global pin"));
-            lines.push(Line::from("  Backspace    clear global pin (auto)"));
-            lines.push(Line::from(
-                "  r            routing editor (policy/order/tags)",
-            ));
-            lines.push(Line::from(
-                "  o            set session override to selected station",
-            ));
-            lines.push(Line::from("  O            clear session override"));
+            lines.extend(match lang {
+                crate::tui::Language::Zh => vec![
+                    Line::from("  Enter        设置全局 pin"),
+                    Line::from("  Backspace    清除全局 pin（auto）"),
+                    Line::from("  r            routing 编辑器（策略/顺序/标签）"),
+                    Line::from("  o            将会话覆盖设置为选中站点"),
+                    Line::from("  O            清除会话覆盖"),
+                ],
+                crate::tui::Language::En => vec![
+                    Line::from("  Enter        set global pin"),
+                    Line::from("  Backspace    clear global pin (auto)"),
+                    Line::from("  r            routing editor (policy/order/tags)"),
+                    Line::from("  o            set session override to selected station"),
+                    Line::from("  O            clear session override"),
+                ],
+            });
         }
-        lines.push(Line::from("  h            health check selected station"));
-        lines.push(Line::from("  H            health check all stations"));
-        lines.push(Line::from("  c            cancel health check (selected)"));
-        lines.push(Line::from("  C            cancel health check (all)"));
+        lines.extend(match lang {
+            crate::tui::Language::Zh => vec![
+                Line::from("  h            检查选中站点健康"),
+                Line::from("  H            检查全部站点健康"),
+                Line::from("  c            取消健康检查（选中）"),
+                Line::from("  C            取消健康检查（全部）"),
+            ],
+            crate::tui::Language::En => vec![
+                Line::from("  h            health check selected station"),
+                Line::from("  H            health check all stations"),
+                Line::from("  c            cancel health check (selected)"),
+                Line::from("  C            cancel health check (all)"),
+            ],
+        });
     } else {
         lines.push(Line::from(Span::styled(
-            "No stations available.",
+            l("No stations available."),
             Style::default().fg(p.muted),
         )));
     }
@@ -1134,6 +1325,7 @@ mod tests {
     use super::*;
     use crate::state::BalanceSnapshotStatus;
     use crate::tui::UpstreamSummary;
+    use crate::tui::model::station_balance_brief;
 
     fn provider(
         name: &str,

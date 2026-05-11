@@ -307,31 +307,16 @@ async fn run_server(
     };
 
     let tui_lang = {
-        let env_lang_raw = std::env::var("CODEX_HELPER_TUI_LANG").ok();
-        let env_lang = env_lang_raw.as_deref().and_then(|s| {
-            if s.trim().eq_ignore_ascii_case("auto") {
-                Some(tui::detect_system_language())
-            } else {
-                tui::parse_language(s)
-            }
-        });
-        if let Some(l) = env_lang {
-            l
+        if let Ok(s) = std::env::var("CODEX_HELPER_TUI_LANG") {
+            tui::resolve_language_preference(Some(&s))
         } else if let Some(s) = cfg.ui.language.as_deref() {
-            if s.trim().eq_ignore_ascii_case("auto") {
-                tui::detect_system_language()
-            } else {
-                tui::parse_language(s).unwrap_or_else(|| {
-                    tracing::warn!("Invalid ui.language '{}', falling back to system locale", s);
-                    tui::detect_system_language()
-                })
+            if !s.trim().eq_ignore_ascii_case("auto") && tui::parse_language(s).is_none() {
+                tracing::warn!("Invalid ui.language '{}', falling back to system locale", s);
             }
+            tui::resolve_language_preference(Some(s))
         } else {
             let detected = tui::detect_system_language();
-            cfg.ui.language = Some(match detected {
-                tui::Language::Zh => "zh".to_string(),
-                tui::Language::En => "en".to_string(),
-            });
+            cfg.ui.language = Some("auto".to_string());
             if let Err(err) = crate::config::save_config(&cfg).await {
                 tracing::warn!("Failed to persist ui.language to config: {}", err);
             }

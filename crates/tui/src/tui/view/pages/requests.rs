@@ -3,9 +3,11 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 
+use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, duration_short, format_age, now_ms, request_matches_page_filters,
-    request_page_focus_session_id, short_sid, shorten, shorten_middle, status_style, usage_line,
+    request_page_focus_session_id, short_sid, shorten, shorten_middle, status_style,
+    usage_line_lang,
 };
 use crate::tui::state::UiState;
 
@@ -16,6 +18,8 @@ pub(super) fn render_requests_page(
     snapshot: &Snapshot,
     area: Rect,
 ) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
@@ -53,17 +57,20 @@ pub(super) fn render_requests_page(
         focused_sid
             .as_deref()
             .map(|sid| format!("session {}", short_sid(sid, 16)))
-            .unwrap_or_else(|| "session".to_string())
+            .unwrap_or_else(|| l("session").to_string())
     } else {
-        "all".to_string()
+        l("all").to_string()
     };
     let left_title = format!(
-        "Requests  (scope: {}, errors_only: {})",
+        "{}  ({}: {}, {}: {})",
+        l("Requests"),
+        l("scope"),
         scope_label,
+        l("errors_only"),
         if ui.request_page_errors_only {
-            "on"
+            l("on")
         } else {
-            "off"
+            l("off")
         }
     );
     let left_block = Block::default()
@@ -75,9 +82,18 @@ pub(super) fn render_requests_page(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["Age", "St", "Dur", "Att", "Model", "Stn", "Pid", "Path"])
-        .style(Style::default().fg(p.muted))
-        .height(1);
+    let header = Row::new([
+        l("Age"),
+        "St",
+        l("Dur"),
+        "Att",
+        l("Model"),
+        "Stn",
+        "Pid",
+        l("Path"),
+    ])
+    .style(Style::default().fg(p.muted))
+    .height(1);
 
     let now = now_ms();
     let rows = filtered
@@ -138,12 +154,12 @@ pub(super) fn render_requests_page(
     if let Some(r) = selected {
         let observability = r.observability_view();
         let focus_mode = if ui.focused_request_session_id.is_some() {
-            "explicit session focus"
+            l("explicit session focus")
         } else {
-            "follow selected session"
+            l("follow selected session")
         };
         lines.push(Line::from(vec![
-            Span::styled("scope: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("scope")), Style::default().fg(p.muted)),
             Span::styled(
                 if ui.request_page_scope_session {
                     focused_sid
@@ -151,27 +167,27 @@ pub(super) fn render_requests_page(
                         .map(|sid| short_sid(sid, 20))
                         .unwrap_or_else(|| "-".to_string())
                 } else {
-                    "all requests".to_string()
+                    l("all requests").to_string()
                 },
                 Style::default().fg(p.text),
             ),
             Span::raw("  "),
-            Span::styled("mode: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("mode")), Style::default().fg(p.muted)),
             Span::styled(focus_mode, Style::default().fg(p.muted)),
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("status: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("status")), Style::default().fg(p.muted)),
             Span::styled(
                 r.status_code.to_string(),
                 status_style(p, Some(r.status_code)),
             ),
             Span::raw("  "),
-            Span::styled("dur: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("Dur")), Style::default().fg(p.muted)),
             Span::styled(duration_short(r.duration_ms), Style::default().fg(p.muted)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("trace: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("trace")), Style::default().fg(p.muted)),
             Span::styled(
                 r.trace_id
                     .as_deref()
@@ -181,42 +197,42 @@ pub(super) fn render_requests_page(
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("method: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("method")), Style::default().fg(p.muted)),
             Span::styled(r.method.clone(), Style::default().fg(p.text)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("path: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("path")), Style::default().fg(p.muted)),
             Span::styled(shorten_middle(&r.path, 80), Style::default().fg(p.text)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("model: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("model")), Style::default().fg(p.muted)),
             Span::styled(
                 r.model.as_deref().unwrap_or("-").to_string(),
                 Style::default().fg(p.text),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("effort: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("effort")), Style::default().fg(p.muted)),
             Span::styled(
                 r.reasoning_effort.as_deref().unwrap_or("-").to_string(),
                 Style::default().fg(p.text),
             ),
             Span::raw("  "),
-            Span::styled("tier: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("tier")), Style::default().fg(p.muted)),
             Span::styled(
                 request_service_tier_label(r.service_tier.as_deref()),
                 Style::default().fg(if r.is_fast_mode() { p.good } else { p.text }),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("station: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("station")), Style::default().fg(p.muted)),
             Span::styled(
                 r.station_name.as_deref().unwrap_or("-").to_string(),
                 Style::default().fg(p.accent),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("provider: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("provider")), Style::default().fg(p.muted)),
             Span::styled(
                 r.provider_id.as_deref().unwrap_or("-").to_string(),
                 Style::default().fg(p.text),
@@ -224,13 +240,13 @@ pub(super) fn render_requests_page(
         ]));
         if let Some(u) = r.upstream_base_url.as_deref() {
             lines.push(Line::from(vec![
-                Span::styled("upstream: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("upstream")), Style::default().fg(p.muted)),
                 Span::styled(shorten_middle(u, 80), Style::default().fg(p.text)),
             ]));
         }
 
         lines.push(Line::from(vec![
-            Span::styled("ttfb: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("ttfb")), Style::default().fg(p.muted)),
             Span::styled(
                 observability
                     .ttfb_ms
@@ -239,7 +255,10 @@ pub(super) fn render_requests_page(
                 Style::default().fg(p.text),
             ),
             Span::raw("  "),
-            Span::styled("generation: ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!("{}: ", l("generation")),
+                Style::default().fg(p.muted),
+            ),
             Span::styled(
                 observability
                     .generation_ms
@@ -248,20 +267,24 @@ pub(super) fn render_requests_page(
                 Style::default().fg(p.text),
             ),
             Span::raw("  "),
-            Span::styled("stream: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("stream")), Style::default().fg(p.muted)),
             Span::styled(
-                if observability.streaming { "yes" } else { "no" },
+                if observability.streaming {
+                    l("yes")
+                } else {
+                    l("no")
+                },
                 Style::default().fg(p.text),
             ),
         ]));
 
         if let Some(u) = r.usage.as_ref().filter(|u| u.total_tokens > 0) {
             lines.push(Line::from(vec![
-                Span::styled("usage: ", Style::default().fg(p.muted)),
-                Span::styled(usage_line(u), Style::default().fg(p.accent)),
+                Span::styled(format!("{}: ", l("usage")), Style::default().fg(p.muted)),
+                Span::styled(usage_line_lang(u, lang), Style::default().fg(p.accent)),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("cost: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("cost")), Style::default().fg(p.muted)),
                 Span::styled(
                     r.cost.display_total_with_confidence(),
                     Style::default().fg(p.text),
@@ -269,14 +292,20 @@ pub(super) fn render_requests_page(
             ]));
             if let Some(cost_parts) = request_cost_parts_line(r) {
                 lines.push(Line::from(vec![
-                    Span::styled("cost_parts: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        format!("{}: ", l("cost_parts")),
+                        Style::default().fg(p.muted),
+                    ),
                     Span::styled(cost_parts, Style::default().fg(p.muted)),
                 ]));
             }
 
             if let Some(rate) = observability.output_tokens_per_second {
                 lines.push(Line::from(vec![
-                    Span::styled("out_tok/s: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        format!("{}: ", l("out_tok/s")),
+                        Style::default().fg(p.muted),
+                    ),
                     Span::styled(format!("{rate:.1}"), Style::default().fg(p.text)),
                 ]));
             }
@@ -284,12 +313,12 @@ pub(super) fn render_requests_page(
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Retry / route chain",
+            l("Retry / route chain"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
         if let Some(retry) = r.retry.as_ref() {
             lines.push(Line::from(vec![
-                Span::styled("attempts: ", Style::default().fg(p.muted)),
+                Span::styled(format!("{}: ", l("attempts")), Style::default().fg(p.muted)),
                 Span::styled(r.attempt_count().to_string(), Style::default().fg(p.text)),
             ]));
             let max = 12usize;
@@ -326,31 +355,49 @@ pub(super) fn render_requests_page(
             }
         } else {
             lines.push(Line::from(Span::styled(
-                "(no retries)",
+                match ui.language {
+                    crate::tui::Language::Zh => "（无重试）",
+                    crate::tui::Language::En => "(no retries)",
+                },
                 Style::default().fg(p.muted),
             )));
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Keys",
+            l("Keys"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
-        lines.push(Line::from("  e toggle errors-only"));
-        lines.push(Line::from("  s toggle session scope"));
-        lines.push(Line::from("  x clear explicit session focus"));
-        lines.push(Line::from("  o open session in Sessions"));
-        lines.push(Line::from("  h open session in History"));
+        lines.push(Line::from(match ui.language {
+            crate::tui::Language::Zh => "  e 切换仅错误",
+            crate::tui::Language::En => "  e toggle errors-only",
+        }));
+        lines.push(Line::from(match ui.language {
+            crate::tui::Language::Zh => "  s 切换会话范围",
+            crate::tui::Language::En => "  s toggle session scope",
+        }));
+        lines.push(Line::from(match ui.language {
+            crate::tui::Language::Zh => "  x 清除显式会话聚焦",
+            crate::tui::Language::En => "  x clear explicit session focus",
+        }));
+        lines.push(Line::from(match ui.language {
+            crate::tui::Language::Zh => "  o 在 Sessions 中打开会话",
+            crate::tui::Language::En => "  o open session in Sessions",
+        }));
+        lines.push(Line::from(match ui.language {
+            crate::tui::Language::Zh => "  h 在 History 中打开会话",
+            crate::tui::Language::En => "  h open session in History",
+        }));
     } else {
         lines.push(Line::from(Span::styled(
-            "No requests match the current filters.",
+            l("No requests match the current filters."),
             Style::default().fg(p.muted),
         )));
     }
 
     let right_block = Block::default()
         .title(Span::styled(
-            "Details",
+            l("Details"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)

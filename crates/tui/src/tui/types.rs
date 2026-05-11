@@ -1,3 +1,6 @@
+use crate::tui::Language;
+use crate::tui::i18n::{self, msg};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tui) enum Focus {
     Sessions,
@@ -52,7 +55,7 @@ pub(in crate::tui) enum EffortChoice {
 }
 
 impl EffortChoice {
-    pub(in crate::tui) fn label(self) -> &'static str {
+    fn label_en(self) -> &'static str {
         match self {
             EffortChoice::Clear => "Clear (use request value)",
             EffortChoice::Low => "low",
@@ -60,6 +63,10 @@ impl EffortChoice {
             EffortChoice::High => "high",
             EffortChoice::XHigh => "xhigh",
         }
+    }
+
+    pub(in crate::tui) fn label(self, lang: Language) -> &'static str {
+        i18n::label(lang, self.label_en())
     }
 
     pub(in crate::tui) fn value(self) -> Option<&'static str> {
@@ -82,13 +89,17 @@ pub(in crate::tui) enum ServiceTierChoice {
 }
 
 impl ServiceTierChoice {
-    pub(in crate::tui) fn label(self) -> &'static str {
+    fn label_en(self) -> &'static str {
         match self {
             ServiceTierChoice::Clear => "Clear (use request/binding value)",
             ServiceTierChoice::Default => "default",
             ServiceTierChoice::Priority => "priority (fast)",
             ServiceTierChoice::Flex => "flex",
         }
+    }
+
+    pub(in crate::tui) fn label(self, lang: Language) -> &'static str {
+        i18n::label(lang, self.label_en())
     }
 
     pub(in crate::tui) fn value(self) -> Option<&'static str> {
@@ -106,18 +117,18 @@ pub(in crate::tui) fn page_titles(
     uses_route_graph_routing: bool,
 ) -> [&'static str; 8] {
     [
-        crate::tui::i18n::pick(lang, "1 总览", "1 Dashboard"),
+        i18n::text(lang, msg::PAGE_DASHBOARD),
         if uses_route_graph_routing {
-            crate::tui::i18n::pick(lang, "2 路由", "2 Routing")
+            i18n::text(lang, msg::PAGE_ROUTING)
         } else {
-            crate::tui::i18n::pick(lang, "2 站点", "2 Stations")
+            i18n::text(lang, msg::PAGE_STATIONS)
         },
-        crate::tui::i18n::pick(lang, "3 会话", "3 Sessions"),
-        crate::tui::i18n::pick(lang, "4 请求", "4 Requests"),
-        crate::tui::i18n::pick(lang, "5 统计", "5 Stats"),
-        crate::tui::i18n::pick(lang, "6 设置", "6 Settings"),
-        crate::tui::i18n::pick(lang, "7 历史", "7 History"),
-        crate::tui::i18n::pick(lang, "8 最近", "8 Recent"),
+        i18n::text(lang, msg::PAGE_SESSIONS),
+        i18n::text(lang, msg::PAGE_REQUESTS),
+        i18n::text(lang, msg::PAGE_STATS),
+        i18n::text(lang, msg::PAGE_SETTINGS),
+        i18n::text(lang, msg::PAGE_HISTORY),
+        i18n::text(lang, msg::PAGE_RECENT),
     ]
 }
 
@@ -133,4 +144,3 @@ pub(in crate::tui) fn page_index(page: Page) -> usize {
         Page::Recent => 7,
     }
 }
-use crate::tui::Language;

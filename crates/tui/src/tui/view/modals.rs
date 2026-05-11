@@ -7,10 +7,11 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use crate::dashboard_core::ControlProfileOption;
 use crate::tui::Language;
 use crate::tui::ProviderOption;
+use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, compute_window_stats, now_ms,
-    provider_balance_compact, provider_tags_brief, shorten, shorten_middle, station_balance_brief,
-    station_primary_balance_snapshot,
+    provider_balance_compact_lang, provider_tags_brief, shorten, shorten_middle,
+    station_balance_brief_lang, station_primary_balance_snapshot,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{EffortChoice, Overlay, ServiceTierChoice};
@@ -73,7 +74,7 @@ fn profile_declared_summary(profile: &ControlProfileOption, lang: Language) -> S
     ));
     format!(
         "{} {}",
-        crate::tui::i18n::pick(lang, "声明：", "declared:"),
+        i18n::text(lang, msg::DECLARED_LABEL),
         shorten_middle(parts.join("  ").as_str(), 72)
     )
 }
@@ -87,7 +88,7 @@ fn profile_resolved_summary(
         Ok(profile) => (
             format!(
                 "{} {}",
-                crate::tui::i18n::pick(lang, "生效：", "resolved:"),
+                i18n::text(lang, msg::RESOLVED_LABEL),
                 shorten_middle(format_profile_route_summary(&profile).as_str(), 72)
             ),
             false,
@@ -95,7 +96,7 @@ fn profile_resolved_summary(
         Err(err) => (
             format!(
                 "{} {}",
-                crate::tui::i18n::pick(lang, "解析失败：", "resolve failed:"),
+                i18n::text(lang, msg::RESOLVE_FAILED_LABEL),
                 shorten_middle(err.to_string().as_str(), 72)
             ),
             true,
@@ -129,12 +130,12 @@ pub(super) fn render_station_info_modal(
         let level = cfg.level.clamp(1, 10);
         format!(
             "{}: {} (L{})",
-            crate::tui::i18n::pick(ui.language, "站点详情", "Station details"),
+            i18n::text(ui.language, msg::OVERLAY_STATION_DETAILS),
             cfg.name,
             level
         )
     } else {
-        crate::tui::i18n::pick(ui.language, "站点详情", "Station details").to_string()
+        i18n::text(ui.language, msg::OVERLAY_STATION_DETAILS).to_string()
     };
 
     let block = Block::default()
@@ -149,13 +150,13 @@ pub(super) fn render_station_info_modal(
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "会话：", "session: "),
+            i18n::text(ui.language, msg::SESSION_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(selected_session.to_string(), Style::default().fg(p.text)),
         Span::raw("   "),
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "固定：", "pinned: "),
+            i18n::text(ui.language, msg::PINNED_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(
@@ -176,15 +177,11 @@ pub(super) fn render_station_info_modal(
         ),
         Span::raw("   "),
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "按键：", "keys: "),
+            i18n::text(ui.language, msg::KEYS_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言",
-                "↑/↓ scroll  PgUp/PgDn page  Esc close  L language",
-            ),
+            i18n::text(ui.language, msg::FOOTER_STATION_INFO),
             Style::default().fg(p.muted),
         ),
     ]));
@@ -233,7 +230,7 @@ pub(super) fn render_station_info_modal(
         {
             lines.push(Line::from(vec![
                 Span::styled(
-                    crate::tui::i18n::pick(ui.language, "别名：", "alias: "),
+                    i18n::text(ui.language, msg::ALIAS_LABEL),
                     Style::default().fg(p.muted),
                 ),
                 Span::styled(alias.to_string(), Style::default().fg(p.text)),
@@ -242,14 +239,17 @@ pub(super) fn render_station_info_modal(
 
         lines.push(Line::from(vec![
             Span::styled(
-                crate::tui::i18n::pick(ui.language, "状态：", "status: "),
+                i18n::text(ui.language, msg::STATUS_LABEL),
                 Style::default().fg(p.muted),
             ),
             Span::styled(
-                crate::tui::i18n::pick(
+                i18n::text(
                     ui.language,
-                    if enabled { "启用" } else { "禁用" },
-                    if enabled { "enabled" } else { "disabled" },
+                    if enabled {
+                        msg::ENABLED_LABEL
+                    } else {
+                        msg::DISABLED_LABEL
+                    },
                 ),
                 Style::default().fg(if enabled { p.good } else { p.warn }),
             ),
@@ -264,28 +264,20 @@ pub(super) fn render_station_info_modal(
             ),
             Span::raw("  "),
             Span::styled(
-                crate::tui::i18n::pick(
-                    ui.language,
-                    if cfg.active { "active" } else { "" },
-                    if cfg.active { "active" } else { "" },
-                ),
+                if cfg.active { "active" } else { "" },
                 Style::default().fg(if cfg.active { p.accent } else { p.muted }),
             ),
         ]));
         lines.push(Line::from(""));
 
         lines.push(Line::from(vec![Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "运行态（可用性/体验）",
-                "Runtime (availability/UX)",
-            ),
+            i18n::text(ui.language, msg::RUNTIME_HEALTH_TITLE),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
         lines.push(Line::from(vec![
             Span::styled("5m ", Style::default().fg(p.muted)),
             Span::styled(
-                crate::tui::i18n::pick(ui.language, "成功 ", "ok "),
+                i18n::text(ui.language, msg::OK_PREFIX),
                 Style::default().fg(p.muted),
             ),
             Span::styled(
@@ -342,7 +334,7 @@ pub(super) fn render_station_info_modal(
         lines.push(Line::from(vec![
             Span::styled("1h ", Style::default().fg(p.muted)),
             Span::styled(
-                crate::tui::i18n::pick(ui.language, "成功 ", "ok "),
+                i18n::text(ui.language, msg::OK_PREFIX),
                 Style::default().fg(p.muted),
             ),
             Span::styled(
@@ -400,7 +392,7 @@ pub(super) fn render_station_info_modal(
         lines.push(Line::from(""));
 
         lines.push(Line::from(vec![Span::styled(
-            crate::tui::i18n::pick(ui.language, "上游（Providers）", "Upstreams (providers)"),
+            i18n::text(ui.language, msg::UPSTREAMS_TITLE),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
 
@@ -466,7 +458,7 @@ pub(super) fn render_station_info_modal(
 
         if cfg.upstreams.is_empty() {
             lines.push(Line::from(Span::styled(
-                crate::tui::i18n::pick(ui.language, "（无）", "(none)"),
+                i18n::text(ui.language, msg::NONE_PARENS),
                 Style::default().fg(p.muted),
             )));
         } else {
@@ -499,7 +491,7 @@ pub(super) fn render_station_info_modal(
                         )
                     }
                 } else {
-                    crate::tui::i18n::pick(ui.language, "未检查", "not checked").to_string()
+                    i18n::text(ui.language, msg::NOT_CHECKED).to_string()
                 };
 
                 let lb_text = lb
@@ -527,16 +519,19 @@ pub(super) fn render_station_info_modal(
                     .unwrap_or_else(|| "-".to_string());
 
                 let models_text = if up.supported_models.is_empty() && up.model_mapping.is_empty() {
-                    crate::tui::i18n::pick(ui.language, "模型：全部", "models: all").to_string()
+                    i18n::text(ui.language, msg::MODELS_ALL).to_string()
                 } else {
                     let allow = up.supported_models.len();
                     let map = up.model_mapping.len();
-                    crate::tui::i18n::pick(
-                        ui.language,
-                        &format!("模型：allow {allow} / map {map}"),
-                        &format!("models: allow {allow} / map {map}"),
-                    )
-                    .to_string()
+                    match ui.language {
+                        Language::Zh => format!(
+                            "{}：{} {allow} / {} {map}",
+                            i18n::label(ui.language, "models"),
+                            i18n::label(ui.language, "allow"),
+                            i18n::label(ui.language, "map")
+                        ),
+                        Language::En => format!("models: allow {allow} / map {map}"),
+                    }
                 };
 
                 lines.push(Line::from(vec![
@@ -550,20 +545,29 @@ pub(super) fn render_station_info_modal(
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("     "),
-                    Span::styled("auth: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        format!("{}: ", i18n::label(ui.language, "auth")),
+                        Style::default().fg(p.muted),
+                    ),
                     Span::styled(auth.to_string(), Style::default().fg(p.text)),
                     Span::raw("   "),
                     Span::styled(models_text, Style::default().fg(p.muted)),
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("     "),
-                    Span::styled("health: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        format!("{}: ", i18n::label(ui.language, "health")),
+                        Style::default().fg(p.muted),
+                    ),
                     Span::styled(
                         health_text,
                         Style::default().fg(if ok == Some(true) { p.good } else { p.warn }),
                     ),
                     Span::raw("   "),
-                    Span::styled("lb: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        format!("{}: ", i18n::label(ui.language, "lb")),
+                        Style::default().fg(p.muted),
+                    ),
                     Span::styled(lb_text, Style::default().fg(p.muted)),
                 ]));
 
@@ -630,7 +634,10 @@ pub(super) fn render_station_info_modal(
                 };
                 lines.push(Line::from(vec![
                     Span::raw("     "),
-                    Span::styled("rt: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        format!("{}: ", i18n::label(ui.language, "rt")),
+                        Style::default().fg(p.muted),
+                    ),
                     Span::styled(runtime_line, Style::default().fg(p.muted)),
                 ]));
 
@@ -643,7 +650,10 @@ pub(super) fn render_station_info_modal(
                         .join(", ");
                     lines.push(Line::from(vec![
                         Span::raw("     "),
-                        Span::styled("tags: ", Style::default().fg(p.muted)),
+                        Span::styled(
+                            format!("{}: ", i18n::label(ui.language, "tags")),
+                            Style::default().fg(p.muted),
+                        ),
                         Span::styled(shorten(&tags, 120), Style::default().fg(p.muted)),
                     ]));
                 }
@@ -661,7 +671,10 @@ pub(super) fn render_station_info_modal(
                     }
                     lines.push(Line::from(vec![
                         Span::raw("     "),
-                        Span::styled("allow: ", Style::default().fg(p.muted)),
+                        Span::styled(
+                            format!("{}: ", i18n::label(ui.language, "allow")),
+                            Style::default().fg(p.muted),
+                        ),
                         Span::styled(s, Style::default().fg(p.muted)),
                     ]));
                 }
@@ -678,7 +691,10 @@ pub(super) fn render_station_info_modal(
                     }
                     lines.push(Line::from(vec![
                         Span::raw("     "),
-                        Span::styled("map: ", Style::default().fg(p.muted)),
+                        Span::styled(
+                            format!("{}: ", i18n::label(ui.language, "map")),
+                            Style::default().fg(p.muted),
+                        ),
                         Span::styled(s, Style::default().fg(p.muted)),
                     ]));
                 }
@@ -696,7 +712,7 @@ pub(super) fn render_station_info_modal(
         }
     } else {
         lines.push(Line::from(Span::styled(
-            crate::tui::i18n::pick(ui.language, "未选中任何站点。", "No station selected."),
+            i18n::text(ui.language, msg::NO_STATION_SELECTED),
             Style::default().fg(p.muted),
         )));
     }
@@ -722,7 +738,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(
-            crate::tui::i18n::pick(lang, "帮助", "Help"),
+            i18n::text(lang, msg::OVERLAY_HELP_TITLE),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -1043,6 +1059,8 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
 }
 
 pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     // Use a full-screen "page-like" overlay so users can mouse-select/copy without
     // accidentally including other panels in the selection rectangle.
     let area = f.area();
@@ -1050,12 +1068,12 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
 
     let sid = ui.session_transcript_sid.as_deref().unwrap_or("-");
     let mode = match ui.session_transcript_tail {
-        Some(n) => format!("tail {n}"),
-        None => "all".to_string(),
+        Some(n) => format!("{} {n}", l("tail")),
+        None => l("all").to_string(),
     };
     let title = format!(
         "{}: {}  [{mode}]",
-        crate::tui::i18n::pick(ui.language, "会话对话记录", "Session transcript"),
+        i18n::text(lang, msg::OVERLAY_SESSION_TRANSCRIPT),
         sid
     );
 
@@ -1070,32 +1088,28 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("sid: ", Style::default().fg(p.muted)),
+        Span::styled(format!("{}: ", l("sid")), Style::default().fg(p.muted)),
         Span::styled(sid.to_string(), Style::default().fg(p.text)),
         Span::raw("   "),
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "按键：", "keys: "),
+            i18n::text(lang, msg::KEYS_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  A 全量/尾部  y 复制  t/Esc 关闭  L 语言",
-                "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  A all/tail  y copy  t/Esc close  L language",
-            ),
+            i18n::text(lang, msg::FOOTER_SESSION_TRANSCRIPT),
             Style::default().fg(p.muted),
         ),
     ]));
 
     if let Some(meta) = ui.session_transcript_meta.as_ref() {
         lines.push(Line::from(vec![
-            Span::styled("meta: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("meta")), Style::default().fg(p.muted)),
             Span::styled(
                 shorten_middle(meta.id.as_str(), 44),
                 Style::default().fg(p.text),
             ),
             Span::raw("   "),
-            Span::styled("cwd: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("cwd")), Style::default().fg(p.muted)),
             Span::styled(
                 meta.cwd
                     .as_deref()
@@ -1108,7 +1122,7 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
 
     if let Some(file) = ui.session_transcript_file.as_deref() {
         lines.push(Line::from(vec![
-            Span::styled("file: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("file")), Style::default().fg(p.muted)),
             Span::styled(shorten_middle(file, 120), Style::default().fg(p.muted)),
         ]));
     }
@@ -1116,7 +1130,7 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
     if let Some(err) = ui.session_transcript_error.as_deref() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("error: {err}"),
+            format!("{}: {err}", l("error")),
             Style::default().fg(p.bad),
         )));
     }
@@ -1125,16 +1139,12 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
 
     if ui.session_transcript_messages.is_empty() {
         lines.push(Line::from(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "未找到可展示的对话消息（可能该会话不在 ~/.codex/sessions，或格式发生变化）。",
-                "No transcript messages found (session file missing or format changed).",
-            ),
+            i18n::text(lang, msg::NO_TRANSCRIPT_MESSAGES),
             Style::default().fg(p.muted),
         )));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("messages: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("messages")), Style::default().fg(p.muted)),
             Span::styled(
                 ui.session_transcript_messages.len().to_string(),
                 Style::default().fg(p.text),
@@ -1179,7 +1189,7 @@ pub(super) fn render_effort_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
     let focused = ui.overlay == Overlay::EffortMenu;
     let block = Block::default()
         .title(Span::styled(
-            "Set reasoning effort",
+            i18n::label(ui.language, "Set reasoning effort"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -1195,7 +1205,7 @@ pub(super) fn render_effort_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
     ];
     let items = choices
         .iter()
-        .map(|c| ListItem::new(Line::from(c.label())))
+        .map(|c| ListItem::new(Line::from(c.label(ui.language))))
         .collect::<Vec<_>>();
 
     ui.menu_list.select(Some(
@@ -1213,7 +1223,7 @@ pub(super) fn render_model_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(
-            crate::tui::i18n::pick(ui.language, "设置 Session Model", "Set session model"),
+            i18n::text(ui.language, msg::OVERLAY_SET_SESSION_MODEL),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -1222,17 +1232,9 @@ pub(super) fn render_model_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
 
     let mut items = Vec::with_capacity(ui.session_model_options.len().saturating_add(1));
     items.push(ListItem::new(Text::from(vec![
-        Line::from(crate::tui::i18n::pick(
-            ui.language,
-            "Clear (清除会话 model 覆盖)",
-            "Clear (remove session model override)",
-        )),
+        Line::from(i18n::text(ui.language, msg::CLEAR_MODEL_OVERRIDE)),
         Line::from(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "恢复为 request / binding / runtime 的默认路由",
-                "Use request / binding / runtime routing again",
-            ),
+            i18n::text(ui.language, msg::RESTORE_DEFAULT_ROUTING),
             Style::default().fg(p.muted),
         )),
     ])));
@@ -1240,27 +1242,15 @@ pub(super) fn render_model_modal(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
         ListItem::new(Text::from(vec![
             Line::from(shorten_middle(model, 56)),
             Line::from(Span::styled(
-                crate::tui::i18n::pick(
-                    ui.language,
-                    "应用为当前会话的 model override",
-                    "Apply as the session model override",
-                ),
+                i18n::text(ui.language, msg::APPLY_SESSION_MODEL_OVERRIDE),
                 Style::default().fg(p.muted),
             )),
         ]))
     }));
     items.push(ListItem::new(Text::from(vec![
-        Line::from(crate::tui::i18n::pick(
-            ui.language,
-            "Custom...（输入任意 model）",
-            "Custom... (enter any model)",
-        )),
+        Line::from(i18n::text(ui.language, msg::CUSTOM_MODEL)),
         Line::from(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "打开输入框，手动填写 model override",
-                "Open an input box for arbitrary model override",
-            ),
+            i18n::text(ui.language, msg::CUSTOM_MODEL_HELP),
             Style::default().fg(p.muted),
         )),
     ])));
@@ -1279,11 +1269,7 @@ pub(super) fn render_model_input_modal(f: &mut Frame<'_>, p: Palette, ui: &mut U
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "输入自定义 Session Model",
-                "Enter custom session model",
-            ),
+            i18n::text(ui.language, msg::OVERLAY_INPUT_SESSION_MODEL),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -1301,25 +1287,21 @@ pub(super) fn render_model_input_modal(f: &mut Frame<'_>, p: Palette, ui: &mut U
     let lines = vec![
         Line::from(vec![
             Span::styled(
-                crate::tui::i18n::pick(ui.language, "当前输入: ", "current: "),
+                i18n::text(ui.language, msg::CURRENT_INPUT_LABEL),
                 Style::default().fg(p.muted),
             ),
             Span::styled(current.to_string(), Style::default().fg(p.text)),
         ]),
         Line::from(vec![
             Span::styled(
-                crate::tui::i18n::pick(ui.language, "当前会话模型: ", "session hint: "),
+                i18n::text(ui.language, msg::SESSION_MODEL_HINT_LABEL),
                 Style::default().fg(p.muted),
             ),
             Span::styled(shorten_middle(hint, 56), Style::default().fg(p.accent)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "输入任意 model 名称。Enter 应用，Esc 返回菜单，Backspace 删除，Delete / Ctrl+U 清空。空值会清除会话 model 覆盖。",
-                "Type any model name. Enter applies, Esc returns to menu, Backspace deletes, Delete / Ctrl+U clears. Empty value clears the session model override.",
-            ),
+            i18n::text(ui.language, msg::MODEL_INPUT_HELP),
             Style::default().fg(p.muted),
         )),
     ];
@@ -1336,11 +1318,7 @@ pub(super) fn render_service_tier_modal(f: &mut Frame<'_>, p: Palette, ui: &mut 
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "设置 Fast / Service Tier",
-                "Set fast / service tier",
-            ),
+            i18n::text(ui.language, msg::OVERLAY_SET_SERVICE_TIER),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -1357,42 +1335,26 @@ pub(super) fn render_service_tier_modal(f: &mut Frame<'_>, p: Palette, ui: &mut 
         .iter()
         .map(|choice| {
             let detail = match choice {
-                ServiceTierChoice::Clear => crate::tui::i18n::pick(
-                    ui.language,
-                    "移除当前会话的 service tier 覆盖",
-                    "Remove the session service tier override",
-                ),
-                ServiceTierChoice::Default => crate::tui::i18n::pick(
-                    ui.language,
-                    "显式使用 default",
-                    "Explicitly use default",
-                ),
-                ServiceTierChoice::Priority => crate::tui::i18n::pick(
-                    ui.language,
-                    "通常可视为 fast mode",
-                    "Usually maps to fast mode",
-                ),
-                ServiceTierChoice::Flex => {
-                    crate::tui::i18n::pick(ui.language, "显式使用 flex", "Explicitly use flex")
+                ServiceTierChoice::Clear => {
+                    i18n::text(ui.language, msg::CLEAR_SERVICE_TIER_OVERRIDE)
                 }
+                ServiceTierChoice::Default => {
+                    i18n::text(ui.language, msg::USE_DEFAULT_SERVICE_TIER)
+                }
+                ServiceTierChoice::Priority => {
+                    i18n::text(ui.language, msg::USE_PRIORITY_SERVICE_TIER)
+                }
+                ServiceTierChoice::Flex => i18n::text(ui.language, msg::USE_FLEX_SERVICE_TIER),
             };
             ListItem::new(Text::from(vec![
-                Line::from(choice.label()),
+                Line::from(choice.label(ui.language)),
                 Line::from(Span::styled(detail, Style::default().fg(p.muted))),
             ]))
         })
         .chain(std::iter::once(ListItem::new(Text::from(vec![
-            Line::from(crate::tui::i18n::pick(
-                ui.language,
-                "Custom...（输入任意 service_tier）",
-                "Custom... (enter any service_tier)",
-            )),
+            Line::from(i18n::text(ui.language, msg::CUSTOM_SERVICE_TIER)),
             Line::from(Span::styled(
-                crate::tui::i18n::pick(
-                    ui.language,
-                    "打开输入框，手动填写 service_tier override",
-                    "Open an input box for arbitrary service_tier override",
-                ),
+                i18n::text(ui.language, msg::CUSTOM_SERVICE_TIER_HELP),
                 Style::default().fg(p.muted),
             )),
         ]))))
@@ -1412,11 +1374,7 @@ pub(super) fn render_service_tier_input_modal(f: &mut Frame<'_>, p: Palette, ui:
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "输入自定义 Service Tier",
-                "Enter custom service tier",
-            ),
+            i18n::text(ui.language, msg::OVERLAY_INPUT_SERVICE_TIER),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -1434,25 +1392,21 @@ pub(super) fn render_service_tier_input_modal(f: &mut Frame<'_>, p: Palette, ui:
     let lines = vec![
         Line::from(vec![
             Span::styled(
-                crate::tui::i18n::pick(ui.language, "当前输入: ", "current: "),
+                i18n::text(ui.language, msg::CURRENT_INPUT_LABEL),
                 Style::default().fg(p.muted),
             ),
             Span::styled(current.to_string(), Style::default().fg(p.text)),
         ]),
         Line::from(vec![
             Span::styled(
-                crate::tui::i18n::pick(ui.language, "当前会话 tier: ", "session hint: "),
+                i18n::text(ui.language, msg::SESSION_TIER_HINT_LABEL),
                 Style::default().fg(p.muted),
             ),
             Span::styled(shorten_middle(hint, 56), Style::default().fg(p.accent)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "输入任意 service_tier。Enter 应用，Esc 返回菜单，Backspace 删除，Delete / Ctrl+U 清空。空值会清除会话 service_tier 覆盖。",
-                "Type any service_tier. Enter applies, Esc returns to menu, Backspace deletes, Delete / Ctrl+U clears. Empty value clears the session service_tier override.",
-            ),
+            i18n::text(ui.language, msg::SERVICE_TIER_INPUT_HELP),
             Style::default().fg(p.muted),
         )),
     ];
@@ -1469,55 +1423,19 @@ pub(super) fn render_profile_modal_v2(f: &mut Frame<'_>, p: Palette, ui: &mut Ui
     f.render_widget(Clear, area);
     let (title, clear_title, clear_detail) = match ui.overlay {
         Overlay::ProfileMenuDefaultRuntime => (
-            crate::tui::i18n::pick(
-                ui.language,
-                "管理运行时默认 Profile",
-                "Manage runtime default profile",
-            ),
-            crate::tui::i18n::pick(
-                ui.language,
-                "Clear runtime override（回退到配置默认 profile）",
-                "Clear runtime override (fall back to configured default profile)",
-            ),
-            crate::tui::i18n::pick(
-                ui.language,
-                "只清理运行时 default_profile 覆盖；保留配置文件里的 default_profile",
-                "Only clears the runtime default_profile override; keep the configured default_profile from disk",
-            ),
+            i18n::text(ui.language, msg::OVERLAY_MANAGE_RUNTIME_PROFILE),
+            i18n::text(ui.language, msg::CLEAR_RUNTIME_PROFILE),
+            i18n::text(ui.language, msg::CLEAR_RUNTIME_PROFILE_HELP),
         ),
         Overlay::ProfileMenuDefaultPersisted => (
-            crate::tui::i18n::pick(
-                ui.language,
-                "管理配置默认 Profile",
-                "Manage configured default profile",
-            ),
-            crate::tui::i18n::pick(
-                ui.language,
-                "Clear configured default（移除配置默认 profile）",
-                "Clear configured default (remove configured default profile)",
-            ),
-            crate::tui::i18n::pick(
-                ui.language,
-                "会修改并重载代理配置；新的会话将不再继承配置级 default_profile",
-                "This updates and reloads proxy config; new sessions will no longer inherit a configured default_profile",
-            ),
+            i18n::text(ui.language, msg::OVERLAY_MANAGE_CONFIGURED_PROFILE),
+            i18n::text(ui.language, msg::CLEAR_CONFIGURED_PROFILE),
+            i18n::text(ui.language, msg::CLEAR_CONFIGURED_PROFILE_HELP),
         ),
         _ => (
-            crate::tui::i18n::pick(
-                ui.language,
-                "管理 Session Profile Binding",
-                "Manage session profile binding",
-            ),
-            crate::tui::i18n::pick(
-                ui.language,
-                "Clear binding（移除会话已存储的 profile 绑定）",
-                "Clear binding (remove stored session profile binding)",
-            ),
-            crate::tui::i18n::pick(
-                ui.language,
-                "只清理 profile binding；保留当前会话的 model / effort / provider / service_tier 覆盖",
-                "Only clears the profile binding; keep current session model / effort / provider / service_tier overrides",
-            ),
+            i18n::text(ui.language, msg::OVERLAY_MANAGE_SESSION_PROFILE),
+            i18n::text(ui.language, msg::CLEAR_SESSION_PROFILE_BINDING),
+            i18n::text(ui.language, msg::CLEAR_SESSION_PROFILE_BINDING_HELP),
         ),
     };
     let block = Block::default()
@@ -1595,6 +1513,8 @@ pub(super) fn render_provider_modal(
     providers: &[ProviderOption],
     title: &str,
 ) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     let area = centered_rect(60, 70, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -1607,7 +1527,10 @@ pub(super) fn render_provider_modal(
         .style(Style::default().bg(p.panel));
 
     let mut items = Vec::with_capacity(providers.len() + 1);
-    items.push(ListItem::new(Line::from("(Clear override)")));
+    items.push(ListItem::new(Line::from(format!(
+        "({})",
+        l("Clear override")
+    ))));
     for pvd in providers {
         let mut label = format!("L{} {}", pvd.level.clamp(1, 10), pvd.name);
         if pvd.active {
@@ -1622,7 +1545,8 @@ pub(super) fn render_provider_modal(
         {
             label.push_str(&format!(" ({alias})"));
         }
-        let balance = station_balance_brief(&snapshot.provider_balances, pvd.name.as_str(), 42);
+        let balance =
+            station_balance_brief_lang(&snapshot.provider_balances, pvd.name.as_str(), 42, lang);
         let balance_style = if pvd.enabled {
             station_primary_balance_snapshot(&snapshot.provider_balances, pvd.name.as_str())
                 .map(|snapshot| balance_snapshot_status_style(p, snapshot))
@@ -1636,10 +1560,13 @@ pub(super) fn render_provider_modal(
             ListItem::new(Text::from(vec![
                 Line::from(Span::styled(label, style)),
                 Line::from(vec![
-                    Span::styled("balance/quota: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        format!("{}: ", l("balance/quota")),
+                        Style::default().fg(p.muted),
+                    ),
                     Span::styled(balance, balance_style),
                     Span::raw("  "),
-                    Span::styled("tags: ", Style::default().fg(p.muted)),
+                    Span::styled(format!("{}: ", l("tags")), Style::default().fg(p.muted)),
                     Span::styled(tags, Style::default().fg(p.muted)),
                     Span::raw("  "),
                     Span::styled(
@@ -1701,6 +1628,7 @@ fn routing_prefer_tags_label(filters: &[BTreeMap<String, String>], max_width: us
 fn routing_provider_balance_line<'a>(
     snapshot: &'a Snapshot,
     provider_name: &str,
+    lang: Language,
 ) -> Option<(&'a crate::state::ProviderBalanceSnapshot, String)> {
     let mut matches = snapshot
         .provider_balances
@@ -1714,7 +1642,7 @@ fn routing_provider_balance_line<'a>(
             .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
     });
     let balance = matches.into_iter().next()?;
-    Some((balance, provider_balance_compact(balance, 38)))
+    Some((balance, provider_balance_compact_lang(balance, 38, lang)))
 }
 
 pub(super) fn render_routing_modal(
@@ -1723,11 +1651,13 @@ pub(super) fn render_routing_modal(
     ui: &mut UiState,
     snapshot: &Snapshot,
 ) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     let area = centered_rect(76, 78, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(Span::styled(
-            "Routing",
+            l("Routing"),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -1736,9 +1666,12 @@ pub(super) fn render_routing_modal(
 
     let Some(spec) = ui.routing_spec.as_ref() else {
         let text = Text::from(vec![
-            Line::from("routing spec not loaded"),
+            Line::from(l("routing spec not loaded")),
             Line::from(Span::styled(
-                "g refresh   Esc close",
+                match lang {
+                    Language::Zh => "g 刷新   Esc 关闭",
+                    Language::En => "g refresh   Esc close",
+                },
                 Style::default().fg(p.muted),
             )),
         ]);
@@ -1777,20 +1710,20 @@ pub(super) fn render_routing_modal(
     let mut items = Vec::new();
     items.push(ListItem::new(Text::from(vec![
         Line::from(vec![
-            Span::styled("policy: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("policy")), Style::default().fg(p.muted)),
             Span::styled(routing_policy_label(spec.policy), Style::default().fg(p.text)),
             Span::raw("  "),
-            Span::styled("target: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("target")), Style::default().fg(p.muted)),
             Span::styled(
                 spec.target.as_deref().unwrap_or("-"),
                 Style::default().fg(if spec.target.is_some() { p.accent } else { p.muted }),
             ),
             Span::raw("  "),
-            Span::styled("on_exhausted: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("on_exhausted")), Style::default().fg(p.muted)),
             Span::styled(routing_exhausted_label(spec.on_exhausted), Style::default().fg(p.text)),
         ]),
         Line::from(vec![
-            Span::styled("prefer_tags: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("prefer_tags")), Style::default().fg(p.muted)),
             Span::styled(
                 routing_prefer_tags_label(&spec.prefer_tags, 72),
                 Style::default().fg(if spec.prefer_tags.is_empty() {
@@ -1801,7 +1734,14 @@ pub(super) fn render_routing_modal(
             ),
         ]),
         Line::from(Span::styled(
-            "Enter pin  a ordered  f monthly-first  e enable/disable  s stop/continue  [/]/u/d reorder  1 monthly  2 paygo  0 clear billing  g refresh  Esc close",
+            match lang {
+                Language::Zh => {
+                    "Enter pin  a 顺序  f monthly 优先  e 启用/禁用  s stop/continue  [/]/u/d 排序  1 monthly  2 paygo  0 清除 billing  g 刷新  Esc 关闭"
+                }
+                Language::En => {
+                    "Enter pin  a ordered  f monthly-first  e enable/disable  s stop/continue  [/]/u/d reorder  1 monthly  2 paygo  0 clear billing  g refresh  Esc close"
+                }
+            },
             Style::default().fg(p.muted),
         )),
     ])));
@@ -1834,7 +1774,7 @@ pub(super) fn render_routing_modal(
             "    "
         };
         let (balance_style, balance_text) =
-            if let Some((balance, text)) = routing_provider_balance_line(snapshot, name) {
+            if let Some((balance, text)) = routing_provider_balance_line(snapshot, name, lang) {
                 (balance_snapshot_status_style(p, balance), text)
             } else {
                 (Style::default().fg(p.muted), "-".to_string())
@@ -1858,10 +1798,13 @@ pub(super) fn render_routing_modal(
                     },
                 ]),
                 Line::from(vec![
-                    Span::styled("     balance/quota: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        format!("     {}: ", l("balance/quota")),
+                        Style::default().fg(p.muted),
+                    ),
                     Span::styled(balance_text, balance_style),
                     Span::raw("  "),
-                    Span::styled("tags: ", Style::default().fg(p.muted)),
+                    Span::styled(format!("{}: ", l("tags")), Style::default().fg(p.muted)),
                     Span::styled(tags, Style::default().fg(p.muted)),
                 ]),
             ]))

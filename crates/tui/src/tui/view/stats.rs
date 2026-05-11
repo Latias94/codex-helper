@@ -8,19 +8,21 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, W
 use crate::dashboard_core::WindowStats;
 use crate::pricing::CostConfidence;
 use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot, UsageBucket};
+use crate::tui::Language;
 use crate::tui::ProviderOption;
+use crate::tui::i18n;
 use crate::tui::model::{
-    Palette, Snapshot, duration_short, provider_balance_compact, shorten, shorten_middle,
-    station_balance_brief, tokens_short,
+    Palette, Snapshot, duration_short, provider_balance_compact_lang, shorten, shorten_middle,
+    station_balance_brief_lang, tokens_short,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
 use crate::usage::UsageMetrics;
 
-fn stats_window_label(days: usize) -> String {
+fn stats_window_label(days: usize, lang: Language) -> String {
     match days {
-        0 => "loaded".to_string(),
-        1 => "today".to_string(),
+        0 => i18n::label(lang, "loaded").to_string(),
+        1 => i18n::label(lang, "today").to_string(),
         n => format!("{n}d"),
     }
 }
@@ -46,12 +48,12 @@ fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
     duration_short(total_ms / n)
 }
 
-fn cost_confidence_label(confidence: CostConfidence) -> &'static str {
+fn cost_confidence_label(confidence: CostConfidence, lang: Language) -> &'static str {
     match confidence {
-        CostConfidence::Unknown => "unknown",
-        CostConfidence::Partial => "partial",
-        CostConfidence::Estimated => "estimated",
-        CostConfidence::Exact => "exact",
+        CostConfidence::Unknown => i18n::label(lang, "unknown"),
+        CostConfidence::Partial => i18n::label(lang, "partial"),
+        CostConfidence::Estimated => i18n::label(lang, "estimated"),
+        CostConfidence::Exact => i18n::label(lang, "exact"),
     }
 }
 
@@ -105,7 +107,7 @@ fn fmt_cache_hit(usage: &UsageMetrics) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn cost_coverage_label(bucket: &UsageBucket) -> String {
+fn cost_coverage_label(bucket: &UsageBucket, lang: Language) -> String {
     if bucket.requests_with_usage == 0 {
         return "-".to_string();
     }
@@ -113,7 +115,7 @@ fn cost_coverage_label(bucket: &UsageBucket) -> String {
         "{}/{} {}",
         bucket.cost.priced_requests,
         bucket.requests_with_usage,
-        cost_confidence_label(bucket.cost.confidence)
+        cost_confidence_label(bucket.cost.confidence, lang)
     )
 }
 
@@ -139,26 +141,36 @@ fn day_range_label(first: Option<i32>, last: Option<i32>) -> String {
     }
 }
 
-fn stats_coverage_line(p: Palette, snapshot: &Snapshot, window_label: &str) -> Line<'static> {
+fn stats_coverage_line(
+    p: Palette,
+    snapshot: &Snapshot,
+    window_label: &str,
+    lang: Language,
+) -> Line<'static> {
     let c = &snapshot.usage_rollup.coverage;
     let loaded = day_range_label(c.loaded_first_day, c.loaded_last_day);
     let window = day_range_label(c.window_first_day, c.window_last_day);
     let warning = if c.window_exceeds_loaded_start {
-        "  partial: selected window starts before loaded log data"
+        match lang {
+            Language::Zh => "  部分覆盖：所选窗口早于已加载日志数据",
+            Language::En => "  partial: selected window starts before loaded log data",
+        }
     } else {
         ""
     };
 
     Line::from(vec![
         Span::styled(
-            format!("window {window_label} {window}"),
+            format!("{} {window_label} {window}", i18n::label(lang, "window")),
             Style::default().fg(p.text),
         ),
         Span::raw("  "),
         Span::styled(
             format!(
-                "loaded {loaded} days={} req={}",
-                c.loaded_days_with_data, c.loaded_requests
+                "{} {loaded} days={} req={}",
+                i18n::label(lang, "loaded"),
+                c.loaded_days_with_data,
+                c.loaded_requests
             ),
             Style::default().fg(p.muted),
         ),
@@ -166,12 +178,13 @@ fn stats_coverage_line(p: Palette, snapshot: &Snapshot, window_label: &str) -> L
     ])
 }
 
-fn live_health_line(stats: &WindowStats) -> String {
+fn live_health_line(stats: &WindowStats, lang: Language) -> String {
     if stats.total == 0 {
         return "-".to_string();
     }
     format!(
-        "ok {} p95 {} retry {} 429 {} 5xx {} n={}",
+        "{} {} p95 {} retry {} 429 {} 5xx {} n={}",
+        i18n::label(lang, "ok"),
         fmt_pct(stats.ok_2xx as u64, stats.total as u64),
         stats
             .p95_ms
@@ -214,16 +227,28 @@ fn provider_primary_balance<'a>(
     matches.into_iter().next()
 }
 
-fn provider_balance_brief(snapshot: &Snapshot, provider_id: &str, max_width: usize) -> String {
+fn provider_balance_brief(
+    snapshot: &Snapshot,
+    provider_id: &str,
+    max_width: usize,
+    lang: Language,
+) -> String {
     provider_primary_balance(&snapshot.provider_balances, provider_id)
-        .map(|balance| provider_balance_compact(balance, max_width))
+        .map(|balance| provider_balance_compact_lang(balance, max_width, lang))
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn table_balance_brief(snapshot: &Snapshot, focus: StatsFocus, name: &str) -> String {
+fn table_balance_brief(
+    snapshot: &Snapshot,
+    focus: StatsFocus,
+    name: &str,
+    lang: Language,
+) -> String {
     match focus {
-        StatsFocus::Stations => station_balance_brief(&snapshot.provider_balances, name, 18),
-        StatsFocus::Providers => provider_balance_brief(snapshot, name, 18),
+        StatsFocus::Stations => {
+            station_balance_brief_lang(&snapshot.provider_balances, name, 18, lang)
+        }
+        StatsFocus::Providers => provider_balance_brief(snapshot, name, 18, lang),
     }
 }
 
@@ -244,13 +269,22 @@ pub(super) fn render_stats_page(
         ])
         .split(area);
 
-    let window_label = stats_window_label(ui.stats_days);
-    render_kpis(f, p, snapshot, &window_label, rows[0]);
-    render_sparkline(f, p, snapshot, &window_label, rows[1]);
-    render_tables(f, p, ui, snapshot, &window_label, rows[2]);
+    let lang = ui.language;
+    let window_label = stats_window_label(ui.stats_days, lang);
+    render_kpis(f, p, snapshot, &window_label, rows[0], lang);
+    render_sparkline(f, p, snapshot, &window_label, rows[1], lang);
+    render_tables(f, p, ui, snapshot, &window_label, rows[2], lang);
 }
 
-fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, window_label: &str, area: Rect) {
+fn render_kpis(
+    f: &mut Frame<'_>,
+    p: Palette,
+    snapshot: &Snapshot,
+    window_label: &str,
+    area: Rect,
+    lang: Language,
+) {
+    let l = |text| i18n::label(lang, text);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -266,44 +300,44 @@ fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, window_label:
     let ok = s.requests_total.saturating_sub(s.requests_error);
 
     let req_block = Block::default()
-        .title(format!("Requests ({window_label})"))
+        .title(format!("{} ({window_label})", l("Requests")))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
     let req_text = Text::from(vec![
         Line::from(vec![
-            Span::styled("total ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("total")), Style::default().fg(p.muted)),
             Span::styled(s.requests_total.to_string(), Style::default().fg(p.text)),
             Span::raw("  "),
-            Span::styled("ok ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("ok")), Style::default().fg(p.muted)),
             Span::styled(ok.to_string(), Style::default().fg(p.good)),
         ]),
         Line::from(vec![
-            Span::styled("success ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("success")), Style::default().fg(p.muted)),
             Span::styled(fmt_success_pct(s), Style::default().fg(p.good)),
             Span::raw("  "),
-            Span::styled("err ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("err")), Style::default().fg(p.muted)),
             Span::styled(s.requests_error.to_string(), Style::default().fg(p.warn)),
         ]),
     ]);
     f.render_widget(Paragraph::new(req_text).block(req_block), cols[0]);
 
     let spend_block = Block::default()
-        .title("Spend & tokens")
+        .title(l("Spend & tokens"))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
     let spend_text = Text::from(vec![
         Line::from(vec![
-            Span::styled("cost ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("cost")), Style::default().fg(p.muted)),
             Span::styled(s.cost.display_total(), Style::default().fg(p.accent)),
             Span::raw("  "),
-            Span::styled("tok ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("tok")), Style::default().fg(p.muted)),
             Span::styled(
                 tokens_short(tokens.total_tokens),
                 Style::default().fg(p.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled("in/out ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("in/out")), Style::default().fg(p.muted)),
             Span::styled(
                 format!(
                     "{}/{}",
@@ -317,25 +351,25 @@ fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, window_label:
     f.render_widget(Paragraph::new(spend_text).block(spend_block), cols[1]);
 
     let perf_block = Block::default()
-        .title("Cache & speed")
+        .title(l("Cache & speed"))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
     let perf_text = Text::from(vec![
         Line::from(vec![
-            Span::styled("cache ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("cache")), Style::default().fg(p.muted)),
             Span::styled(fmt_cache_hit(tokens), Style::default().fg(p.text)),
             Span::raw("  "),
-            Span::styled("tok/s ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("tok/s")), Style::default().fg(p.muted)),
             Span::styled(
                 fmt_tok_s_0(calc_output_rate_tok_s(s)),
                 Style::default().fg(p.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled("ttfb ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("ttfb")), Style::default().fg(p.muted)),
             Span::styled(fmt_avg_ttfb_ms(s), Style::default().fg(p.text)),
             Span::raw("  "),
-            Span::styled("avg ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("avg")), Style::default().fg(p.muted)),
             Span::styled(
                 fmt_avg_ms(s.duration_ms_total, s.requests_total),
                 Style::default().fg(p.text),
@@ -345,21 +379,21 @@ fn render_kpis(f: &mut Frame<'_>, p: Palette, snapshot: &Snapshot, window_label:
     f.render_widget(Paragraph::new(perf_text).block(perf_block), cols[2]);
 
     let live_block = Block::default()
-        .title("Live health")
+        .title(l("Live health"))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
     let live_text = Text::from(vec![
         Line::from(vec![
             Span::styled("5m ", Style::default().fg(p.muted)),
             Span::styled(
-                live_health_line(&snapshot.stats_5m),
+                live_health_line(&snapshot.stats_5m, lang),
                 Style::default().fg(p.text),
             ),
         ]),
         Line::from(vec![
             Span::styled("1h ", Style::default().fg(p.muted)),
             Span::styled(
-                live_health_line(&snapshot.stats_1h),
+                live_health_line(&snapshot.stats_1h, lang),
                 Style::default().fg(p.muted),
             ),
         ]),
@@ -378,12 +412,13 @@ fn render_sparkline(
     snapshot: &Snapshot,
     window_label: &str,
     area: Rect,
+    lang: Language,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
-    let coverage = stats_coverage_line(p, snapshot, window_label);
+    let coverage = stats_coverage_line(p, snapshot, window_label, lang);
     f.render_widget(Paragraph::new(Text::from(coverage)), rows[0]);
 
     let values = snapshot
@@ -393,7 +428,7 @@ fn render_sparkline(
         .map(|(_, b)| b.usage.total_tokens.max(0) as u64)
         .collect::<Vec<_>>();
     let block = Block::default()
-        .title("Tokens / day (window, zero-filled)")
+        .title(i18n::label(lang, "Tokens / day (window, zero-filled)"))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
 
@@ -411,6 +446,7 @@ fn render_tables(
     snapshot: &Snapshot,
     window_label: &str,
     area: Rect,
+    lang: Language,
 ) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -426,26 +462,34 @@ fn render_tables(
         f,
         p,
         ui.stats_focus == StatsFocus::Stations,
-        &format!("Stations scorecard ({window_label})"),
+        &format!(
+            "{} scorecard ({window_label})",
+            i18n::label(lang, "Stations")
+        ),
         &snapshot.usage_rollup.by_config,
         snapshot,
         StatsFocus::Stations,
         left[0],
         &mut ui.stats_stations_table,
+        lang,
     );
     render_bucket_table_stateful(
         f,
         p,
         ui.stats_focus == StatsFocus::Providers,
-        &format!("Providers scorecard ({window_label})"),
+        &format!(
+            "{} scorecard ({window_label})",
+            i18n::label(lang, "Provider")
+        ),
         &snapshot.usage_rollup.by_provider,
         snapshot,
         StatsFocus::Providers,
         left[1],
         &mut ui.stats_providers_table,
+        lang,
     );
 
-    render_detail_panel(f, p, ui, snapshot, window_label, cols[1]);
+    render_detail_panel(f, p, ui, snapshot, window_label, cols[1], lang);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -459,16 +503,21 @@ fn render_bucket_table_stateful(
     focus: StatsFocus,
     area: Rect,
     state: &mut ratatui::widgets::TableState,
+    lang: Language,
 ) {
+    let l = |text| i18n::label(lang, text);
     let header = Row::new(vec![
-        Cell::from(Span::styled("name", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("balance/quota", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("req", Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("name"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(
+            l("balance/quota"),
+            Style::default().fg(p.muted),
+        )),
+        Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
         Cell::from(Span::styled("ok%", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("ttfb", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("tok/s", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("tok", Style::default().fg(p.muted))),
-        Cell::from(Span::styled("usd", Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("ttfb"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("tok/s"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("tok"), Style::default().fg(p.muted))),
+        Cell::from(Span::styled(l("usd"), Style::default().fg(p.muted))),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -483,7 +532,7 @@ fn render_bucket_table_stateful(
             let rate = fmt_tok_s_0(calc_output_rate_tok_s(b));
             Row::new(vec![
                 Cell::from(shorten_middle(name, 24)),
-                Cell::from(table_balance_brief(snapshot, focus, name)),
+                Cell::from(table_balance_brief(snapshot, focus, name, lang)),
                 Cell::from(b.requests_total.to_string()),
                 Cell::from(fmt_success_pct(b)),
                 Cell::from(fmt_avg_ttfb_ms(b)),
@@ -527,7 +576,9 @@ fn render_detail_panel(
     snapshot: &Snapshot,
     window_label: &str,
     area: Rect,
+    lang: Language,
 ) {
+    let l = |text| i18n::label(lang, text);
     let selected = match ui.stats_focus {
         StatsFocus::Stations => snapshot
             .usage_rollup
@@ -543,7 +594,7 @@ fn render_detail_panel(
 
     let block = Block::default()
         .title(Span::styled(
-            format!("Detail  window: {window_label}"),
+            format!("{}  {}: {window_label}", l("Details"), l("window")),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -552,7 +603,7 @@ fn render_detail_panel(
     let Some((kind, name, bucket)) = selected else {
         f.render_widget(
             Paragraph::new(Text::from(Line::from(Span::styled(
-                "No data in this window.",
+                l("No data in this window."),
                 Style::default().fg(p.muted),
             ))))
             .block(block)
@@ -597,62 +648,74 @@ fn render_detail_panel(
     let cost = bucket.cost.display_total();
     let lines = vec![
         Line::from(vec![
-            Span::styled(format!("{kind}: "), Style::default().fg(p.muted)),
+            Span::styled(
+                format!("{}: ", i18n::label(lang, kind)),
+                Style::default().fg(p.muted),
+            ),
             Span::styled(name.to_string(), Style::default().fg(p.text)),
         ]),
         Line::from(vec![
-            Span::styled("requests ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("requests")), Style::default().fg(p.muted)),
             Span::styled(
                 bucket.requests_total.to_string(),
                 Style::default().fg(p.text),
             ),
             Span::raw("  "),
-            Span::styled("success ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("success")), Style::default().fg(p.muted)),
             Span::styled(fmt_success_pct(bucket), Style::default().fg(p.good)),
             Span::raw("  "),
-            Span::styled("errors ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("errors")), Style::default().fg(p.muted)),
             Span::styled(
                 bucket.requests_error.to_string(),
                 Style::default().fg(p.warn),
             ),
         ]),
         Line::from(vec![
-            Span::styled("tokens ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("tokens")), Style::default().fg(p.muted)),
             Span::styled(
                 tokens_short(bucket.usage.total_tokens),
                 Style::default().fg(p.accent),
             ),
             Span::raw("  "),
-            Span::styled("cost ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("cost")), Style::default().fg(p.muted)),
             Span::styled(cost, Style::default().fg(p.text)),
             Span::raw("  "),
-            Span::styled("coverage ", Style::default().fg(p.muted)),
-            Span::styled(cost_coverage_label(bucket), Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("coverage")), Style::default().fg(p.muted)),
+            Span::styled(
+                cost_coverage_label(bucket, lang),
+                Style::default().fg(p.muted),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("ttfb ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("ttfb")), Style::default().fg(p.muted)),
             Span::styled(fmt_avg_ttfb_ms(bucket), Style::default().fg(p.text)),
             Span::raw("  "),
-            Span::styled("avg ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("avg")), Style::default().fg(p.muted)),
             Span::styled(
                 fmt_avg_ms(bucket.duration_ms_total, bucket.requests_total),
                 Style::default().fg(p.text),
             ),
             Span::raw("  "),
-            Span::styled("gen ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!("{} ", l("generation")),
+                Style::default().fg(p.muted),
+            ),
             Span::styled(fmt_avg_generation_ms(bucket), Style::default().fg(p.text)),
             Span::raw("  "),
-            Span::styled("tok/s ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("tok/s")), Style::default().fg(p.muted)),
             Span::styled(
                 fmt_tok_s_0(calc_output_rate_tok_s(bucket)),
                 Style::default().fg(p.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled("cache hit ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("cache hit")), Style::default().fg(p.muted)),
             Span::styled(fmt_cache_hit(&bucket.usage), Style::default().fg(p.text)),
             Span::raw("  "),
-            Span::styled("read/create ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!("{} ", l("read/create")),
+                Style::default().fg(p.muted),
+            ),
             Span::styled(
                 format!(
                     "{}/{}",
@@ -663,7 +726,10 @@ fn render_detail_panel(
             ),
         ]),
         Line::from(vec![
-            Span::styled("tok in/out/rsn ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!("{} ", l("tok in/out/rsn")),
+                Style::default().fg(p.muted),
+            ),
             Span::styled(
                 format!(
                     "{}/{}/{}",
@@ -675,7 +741,10 @@ fn render_detail_panel(
             ),
         ]),
         Line::from(vec![
-            Span::styled("loaded total req ", Style::default().fg(p.muted)),
+            Span::styled(
+                format!("{} ", l("loaded total req")),
+                Style::default().fg(p.muted),
+            ),
             Span::styled(
                 snapshot.usage_rollup.loaded.requests_total.to_string(),
                 Style::default().fg(p.muted),
@@ -683,7 +752,10 @@ fn render_detail_panel(
             Span::raw("  "),
             Span::styled(
                 if snapshot.usage_rollup.coverage.window_exceeds_loaded_start {
-                    "selected window has partial loaded coverage"
+                    match lang {
+                        Language::Zh => "所选窗口只加载了部分覆盖数据",
+                        Language::En => "selected window has partial loaded coverage",
+                    }
                 } else {
                     ""
                 },
@@ -701,7 +773,7 @@ fn render_detail_panel(
 
     let sl_block = Block::default()
         .title(Span::styled(
-            "Tokens / day",
+            l("Tokens / day"),
             Style::default().fg(p.muted).add_modifier(Modifier::DIM),
         ))
         .borders(Borders::ALL)
@@ -712,7 +784,7 @@ fn render_detail_panel(
         .data(&series);
     f.render_widget(sl, inner[1]);
 
-    render_recent_breakdown(f, p, ui, snapshot, kind, name, inner[2]);
+    render_recent_breakdown(f, p, ui, snapshot, kind, name, inner[2], lang);
 }
 
 fn render_recent_breakdown(
@@ -723,21 +795,38 @@ fn render_recent_breakdown(
     kind: &str,
     name: &str,
     area: Rect,
+    lang: Language,
 ) {
+    let l = |text| i18n::label(lang, text);
     let tips = Text::from(vec![
         Line::from(vec![
             Span::styled("Tab", Style::default().fg(p.text)),
-            Span::styled(" focus  ", Style::default().fg(p.muted)),
+            Span::styled(format!(" {}  ", l("focus")), Style::default().fg(p.muted)),
             Span::styled("d", Style::default().fg(p.text)),
-            Span::styled(" window  ", Style::default().fg(p.muted)),
+            Span::styled(format!(" {}  ", l("window")), Style::default().fg(p.muted)),
             Span::styled("e", Style::default().fg(p.text)),
-            Span::styled(" errors_only(recent)", Style::default().fg(p.muted)),
+            Span::styled(
+                format!(" {}(recent)", l("errors_only")),
+                Style::default().fg(p.muted),
+            ),
         ]),
         Line::from(vec![
             Span::styled("↑/↓", Style::default().fg(p.text)),
-            Span::styled(" select  ", Style::default().fg(p.muted)),
+            Span::styled(
+                match lang {
+                    Language::Zh => " 选择  ",
+                    Language::En => " select  ",
+                },
+                Style::default().fg(p.muted),
+            ),
             Span::styled("y", Style::default().fg(p.text)),
-            Span::styled(" export report", Style::default().fg(p.muted)),
+            Span::styled(
+                match lang {
+                    Language::Zh => " 导出报告",
+                    Language::En => " export report",
+                },
+                Style::default().fg(p.muted),
+            ),
         ]),
     ]);
 
@@ -788,23 +877,29 @@ fn render_recent_breakdown(
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
-            "Recent sample ",
+            format!("{} ", l("Recent sample")),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             if errors_only {
-                "(errors only)"
+                match lang {
+                    Language::Zh => "（仅错误）",
+                    Language::En => "(errors only)",
+                }
             } else {
-                "(all)"
+                match lang {
+                    Language::Zh => "（全部）",
+                    Language::En => "(all)",
+                }
             },
             Style::default().fg(p.muted).add_modifier(Modifier::DIM),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("req ", Style::default().fg(p.muted)),
+        Span::styled(format!("{} ", l("req")), Style::default().fg(p.muted)),
         Span::styled(recent_total.to_string(), Style::default().fg(p.text)),
         Span::raw("  "),
-        Span::styled("err ", Style::default().fg(p.muted)),
+        Span::styled(format!("{} ", l("err")), Style::default().fg(p.muted)),
         Span::styled(recent_err.to_string(), Style::default().fg(p.warn)),
         Span::raw("  "),
         Span::styled("2xx/3xx/4xx/5xx ", Style::default().fg(p.muted)),
@@ -824,7 +919,7 @@ fn render_recent_breakdown(
         .join("  ");
     if !top_status.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("status ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("status")), Style::default().fg(p.muted)),
             Span::styled(shorten(&top_status, 56), Style::default().fg(p.muted)),
         ]));
     }
@@ -839,7 +934,7 @@ fn render_recent_breakdown(
         .join("  ");
     if !top_models.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("models ", Style::default().fg(p.muted)),
+            Span::styled(format!("{} ", l("models")), Style::default().fg(p.muted)),
             Span::styled(shorten(&top_models, 56), Style::default().fg(p.muted)),
         ]));
     }
@@ -854,7 +949,11 @@ fn render_recent_breakdown(
             .block(
                 Block::default()
                     .title(Span::styled(
-                        format!("Recent sample (loaded <= {}) + Tips", snapshot.recent.len()),
+                        format!(
+                            "{} (loaded <= {}) + Tips",
+                            l("Recent sample"),
+                            snapshot.recent.len()
+                        ),
                         Style::default().fg(p.muted).add_modifier(Modifier::DIM),
                     ))
                     .borders(Borders::ALL)

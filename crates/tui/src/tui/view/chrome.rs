@@ -6,6 +6,7 @@ use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::tui::i18n::{self, msg};
 use crate::tui::model::{Palette, Snapshot, shorten_middle};
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay, Page, page_index, page_titles};
@@ -245,12 +246,12 @@ pub(super) fn render_header(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
     let focus = match ui.focus {
-        Focus::Sessions => crate::tui::i18n::pick(ui.language, "会话", "Sessions"),
-        Focus::Requests => crate::tui::i18n::pick(ui.language, "请求", "Requests"),
+        Focus::Sessions => i18n::text(ui.language, msg::FOCUS_SESSIONS),
+        Focus::Requests => i18n::text(ui.language, msg::FOCUS_REQUESTS),
         Focus::Stations if ui.uses_route_graph_routing() => {
-            crate::tui::i18n::pick(ui.language, "路由", "Routing")
+            i18n::text(ui.language, msg::FOCUS_ROUTING)
         }
-        Focus::Stations => crate::tui::i18n::pick(ui.language, "站点", "Stations"),
+        Focus::Stations => i18n::text(ui.language, msg::FOCUS_STATIONS),
     };
     let title = if inner.width >= 72 {
         Line::from(vec![
@@ -265,10 +266,7 @@ pub(super) fn render_header(
             ),
             Span::raw("  "),
             Span::styled(
-                format!(
-                    "{}{focus}",
-                    crate::tui::i18n::pick(ui.language, "焦点：", "focus: ")
-                ),
+                format!("{}{focus}", i18n::text(ui.language, msg::FOCUS_LABEL)),
                 Style::default().fg(p.muted),
             ),
         ])
@@ -352,7 +350,7 @@ pub(super) fn render_header(
     if inner.width >= 150 {
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "活跃 ", "active "),
+            i18n::text(ui.language, msg::STATUS_ACTIVE_SHORT),
             active_total.to_string(),
             Style::default().fg(p.muted),
             Style::default().fg(p.good),
@@ -360,7 +358,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, false);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "错误(80) ", "errors(80) "),
+            i18n::text(ui.language, msg::STATUS_ERRORS_SHORT),
             recent_err.to_string(),
             Style::default().fg(p.muted),
             Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
@@ -436,7 +434,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, false);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "当前 ", "cur "),
+            i18n::text(ui.language, msg::STATUS_CURRENT_SHORT),
             route_full,
             Style::default().fg(p.muted),
             Style::default().fg(p.accent),
@@ -444,7 +442,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, false);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "健康检查 ", "hc "),
+            i18n::text(ui.language, msg::STATUS_HEALTH_CHECK_SHORT),
             hc_text,
             Style::default().fg(p.muted),
             Style::default().fg(if hc_running > 0 { p.accent } else { p.muted }),
@@ -452,7 +450,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, false);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "覆盖(M/E/C/T) ", "overrides(M/E/C/T) "),
+            i18n::text(ui.language, msg::STATUS_OVERRIDES_SHORT),
             format!("{overrides_model}/{overrides_effort}/{overrides_station}/{overrides_tier}"),
             Style::default().fg(p.muted),
             Style::default().fg(p.muted),
@@ -460,7 +458,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, false);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "覆盖(全局站点) ", "override(global station) "),
+            i18n::text(ui.language, msg::STATUS_GLOBAL_STATION_OVERRIDE_SHORT),
             global_station.to_string(),
             Style::default().fg(p.muted),
             Style::default().fg(p.accent),
@@ -468,7 +466,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, false);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "刷新 ", "updated "),
+            i18n::text(ui.language, msg::STATUS_UPDATED_SHORT),
             format!("{updated}ms"),
             Style::default().fg(p.muted),
             Style::default().fg(p.muted),
@@ -476,7 +474,7 @@ pub(super) fn render_header(
     } else if inner.width >= 96 {
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "活 ", "act "),
+            i18n::text(ui.language, msg::STATUS_ACTIVE_TINY),
             active_total.to_string(),
             Style::default().fg(p.muted),
             Style::default().fg(p.good),
@@ -484,7 +482,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, true);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "错 ", "err "),
+            i18n::text(ui.language, msg::STATUS_ERRORS_TINY),
             recent_err.to_string(),
             Style::default().fg(p.muted),
             Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
@@ -500,7 +498,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, true);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "当前 ", "cur "),
+            i18n::text(ui.language, msg::STATUS_CURRENT_SHORT),
             route_medium,
             Style::default().fg(p.muted),
             Style::default().fg(p.accent),
@@ -538,7 +536,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, true);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "刷 ", "upd "),
+            i18n::text(ui.language, msg::STATUS_UPDATED_TINY),
             format!("{updated}ms"),
             Style::default().fg(p.muted),
             Style::default().fg(p.muted),
@@ -546,7 +544,7 @@ pub(super) fn render_header(
     } else {
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "活 ", "act "),
+            i18n::text(ui.language, msg::STATUS_ACTIVE_TINY),
             active_total.to_string(),
             Style::default().fg(p.muted),
             Style::default().fg(p.good),
@@ -554,7 +552,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, true);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "错 ", "err "),
+            i18n::text(ui.language, msg::STATUS_ERRORS_TINY),
             recent_err.to_string(),
             Style::default().fg(p.muted),
             Style::default().fg(if recent_err > 0 { p.warn } else { p.muted }),
@@ -570,7 +568,7 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, true);
         push_header_metric(
             &mut subtitle_spans,
-            crate::tui::i18n::pick(ui.language, "当前 ", "cur "),
+            i18n::text(ui.language, msg::STATUS_CURRENT_SHORT),
             route_compact,
             Style::default().fg(p.muted),
             Style::default().fg(p.accent),
@@ -579,7 +577,7 @@ pub(super) fn render_header(
             push_header_sep(&mut subtitle_spans, true);
             push_header_metric(
                 &mut subtitle_spans,
-                crate::tui::i18n::pick(ui.language, "刷 ", "upd "),
+                i18n::text(ui.language, msg::STATUS_UPDATED_TINY),
                 format!("{updated}ms"),
                 Style::default().fg(p.muted),
                 Style::default().fg(p.muted),
@@ -611,125 +609,38 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
 
     let left = match ui.overlay {
         Overlay::None => match ui.page {
-            Page::Dashboard => crate::tui::i18n::pick(
-                ui.language,
-                "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话站点  P 全局 pin  O/H(会话) o/h(请求) 跳转  ? 帮助",
-                "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session station  P global pin  O/H(session) o/h(request) jump  ? help",
-            ),
-            Page::Stations if ui.uses_route_graph_routing() => crate::tui::i18n::pick(
-                ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ provider  r/Enter routing编辑  e 启停  f 包月优先  1/2/0 billing  s 耗尽策略  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ provider  r/Enter routing editor  e enable  f monthly-first  1/2/0 billing  s exhausted action  ? help",
-            ),
-            Page::Stations => crate::tui::i18n::pick(
-                ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r routing  i 详情  Enter 全局 pin  Backspace 清除  o 会话站点 override  O 清除  h/H 检查  c/C 取消  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  r routing  i details  Enter global pin  Backspace clear  o session station override  O clear  h/H check  c/C cancel  ? help",
-            ),
-            Page::Requests => crate::tui::i18n::pick(
-                ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  x 清除聚焦  o 打开到 Sessions  h 打开到 History  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  x clear focus  o open Sessions  h open History  ? help",
-            ),
-            Page::Sessions => crate::tui::i18n::pick(
-                ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  b profile绑定  M model  f fast/tier  R 重置覆盖  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  o 打开到 Requests  H 打开到 History  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  b profile binding  M model  f fast/tier  R reset overrides  a active_only  e errors_only  v overrides_only  r reset  t transcript  o open Requests  H open History  ? help",
-            ),
-            Page::Stats => crate::tui::i18n::pick(
-                ui.language,
-                "1-8 页面  q 退出  L 语言  Tab 焦点(station/provider)  ↑/↓ 选择  d 窗口(today/7d/30d/loaded)  e 仅看错误(recent)  y 复制+导出报告  ? 帮助",
-                "1-8 pages  q quit  L language  Tab focus(station/provider)  ↑/↓ select  d window(today/7d/30d/loaded)  e errors_only(recent)  y copy+export report  ? help",
-            ),
-            Page::Settings => crate::tui::i18n::pick(
-                ui.language,
-                if ui.service_name == "codex" {
-                    "1-8 页面  q 退出  L 语言  p 配置默认profile  P 运行时默认profile  R 重载配置  O 覆盖导入(~/.codex，二次确认)  ? 帮助"
-                } else {
-                    "1-8 页面  q 退出  L 语言  p 配置默认profile  P 运行时默认profile  R 重载配置  ? 帮助"
-                },
-                if ui.service_name == "codex" {
-                    "1-8 pages  q quit  L language  p configured-default-profile  P runtime-default-profile  R reload  O overwrite(~/.codex, confirm)  ? help"
-                } else {
-                    "1-8 pages  q quit  L language  p configured-default-profile  P runtime-default-profile  R reload  ? help"
-                },
-            ),
-            Page::History => crate::tui::i18n::pick(
-                ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r 刷新  t/Enter 对话记录  s 打开到 Sessions  f 打开到 Requests  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  r refresh  t/Enter transcript  s open Sessions  f open Requests  ? help",
-            ),
-            Page::Recent => crate::tui::i18n::pick(
-                ui.language,
-                "1-8 页面  q 退出  L 语言  ↑/↓ 选择  [] 切换时间  r 刷新  Enter 复制选中  y 复制全部(可见)  t transcript  s/f/h 跳转  ? 帮助",
-                "1-8 pages  q quit  L language  ↑/↓ select  [] window  r refresh  Enter copy selected  y copy all(visible)  t transcript  s/f/h navigate  ? help",
-            ),
+            Page::Dashboard => i18n::text(ui.language, msg::FOOTER_DASHBOARD),
+            Page::Stations if ui.uses_route_graph_routing() => {
+                i18n::text(ui.language, msg::FOOTER_ROUTING)
+            }
+            Page::Stations => i18n::text(ui.language, msg::FOOTER_STATIONS),
+            Page::Requests => i18n::text(ui.language, msg::FOOTER_REQUESTS),
+            Page::Sessions => i18n::text(ui.language, msg::FOOTER_SESSIONS),
+            Page::Stats => i18n::text(ui.language, msg::FOOTER_STATS),
+            Page::Settings if ui.service_name == "codex" => {
+                i18n::text(ui.language, msg::FOOTER_SETTINGS_CODEX)
+            }
+            Page::Settings => i18n::text(ui.language, msg::FOOTER_SETTINGS_OTHER),
+            Page::History => i18n::text(ui.language, msg::FOOTER_HISTORY),
+            Page::Recent => i18n::text(ui.language, msg::FOOTER_RECENT),
         },
-        Overlay::Help => crate::tui::i18n::pick(
-            ui.language,
-            "Esc 关闭帮助  L 语言",
-            "Esc close help  L language",
-        ),
-        Overlay::EffortMenu => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 选择  Enter 应用  Esc 取消",
-            "↑/↓ select  Enter apply  Esc cancel",
-        ),
-        Overlay::ModelMenuSession => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 选择 model  Enter 应用  Esc 取消",
-            "↑/↓ select model  Enter apply  Esc cancel",
-        ),
-        Overlay::ModelInputSession => crate::tui::i18n::pick(
-            ui.language,
-            "输入 model  Enter 应用  Esc 返回菜单  Backspace 删除  Delete/Ctrl+U 清空",
-            "type model  Enter apply  Esc back to menu  Backspace delete  Delete/Ctrl+U clear",
-        ),
-        Overlay::ServiceTierMenuSession => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 选择 service tier  Enter 应用  Esc 取消",
-            "↑/↓ select service tier  Enter apply  Esc cancel",
-        ),
-        Overlay::ServiceTierInputSession => crate::tui::i18n::pick(
-            ui.language,
-            "输入 service_tier  Enter 应用  Esc 返回菜单  Backspace 删除  Delete/Ctrl+U 清空",
-            "type service_tier  Enter apply  Esc back to menu  Backspace delete  Delete/Ctrl+U clear",
-        ),
-        Overlay::ProfileMenuSession => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 选择 profile 操作  Enter 应用/清除绑定  Esc 取消",
-            "↑/↓ select profile action  Enter apply/clear binding  Esc cancel",
-        ),
-        Overlay::ProfileMenuDefaultRuntime => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 选择运行时默认 profile  Enter 应用/清除覆盖  Esc 取消",
-            "↑/↓ select runtime default profile  Enter apply/clear override  Esc cancel",
-        ),
-        Overlay::ProfileMenuDefaultPersisted => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 选择配置默认 profile  Enter 应用/清除默认值  Esc 取消",
-            "↑/↓ select configured default profile  Enter apply/clear default  Esc cancel",
-        ),
-        Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 选择  Enter 应用  Esc 取消",
-            "↑/↓ select  Enter apply  Esc cancel",
-        ),
-        Overlay::RoutingMenu => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 选择  Enter pin  a 顺序  f 包月优先  e 启停  s 耗尽策略  []/u/d 重排  1/2/0 billing tag  g 刷新  Esc 关闭",
-            "↑/↓ select  Enter pin  a ordered  f monthly-first  e enable  s exhausted action  []/u/d reorder  1/2/0 billing tag  g refresh  Esc close",
-        ),
-        Overlay::StationInfo => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言",
-            "↑/↓ scroll  PgUp/PgDn page  Esc close  L language",
-        ),
-        Overlay::SessionTranscript => crate::tui::i18n::pick(
-            ui.language,
-            "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  A 全量/尾部  y 复制  t/Esc 关闭  L 语言",
-            "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  A all/tail  y copy  t/Esc close  L language",
-        ),
+        Overlay::Help => i18n::text(ui.language, msg::FOOTER_HELP),
+        Overlay::EffortMenu => i18n::text(ui.language, msg::FOOTER_SELECT_APPLY),
+        Overlay::ModelMenuSession => i18n::text(ui.language, msg::FOOTER_MODEL_MENU),
+        Overlay::ModelInputSession => i18n::text(ui.language, msg::FOOTER_MODEL_INPUT),
+        Overlay::ServiceTierMenuSession => i18n::text(ui.language, msg::FOOTER_SERVICE_TIER_MENU),
+        Overlay::ServiceTierInputSession => i18n::text(ui.language, msg::FOOTER_SERVICE_TIER_INPUT),
+        Overlay::ProfileMenuSession => i18n::text(ui.language, msg::FOOTER_PROFILE_SESSION),
+        Overlay::ProfileMenuDefaultRuntime => i18n::text(ui.language, msg::FOOTER_PROFILE_RUNTIME),
+        Overlay::ProfileMenuDefaultPersisted => {
+            i18n::text(ui.language, msg::FOOTER_PROFILE_CONFIGURED)
+        }
+        Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
+            i18n::text(ui.language, msg::FOOTER_SELECT_APPLY)
+        }
+        Overlay::RoutingMenu => i18n::text(ui.language, msg::FOOTER_ROUTING_MENU),
+        Overlay::StationInfo => i18n::text(ui.language, msg::FOOTER_STATION_INFO),
+        Overlay::SessionTranscript => i18n::text(ui.language, msg::FOOTER_SESSION_TRANSCRIPT),
     };
     let right = ui.toast.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
 

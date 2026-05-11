@@ -8,7 +8,7 @@ mod types;
 mod view;
 
 pub use i18n::Language;
-pub use i18n::{detect_system_language, parse_language};
+pub use i18n::{detect_system_language, parse_language, resolve_language_preference};
 #[allow(unused_imports)]
 pub use model::{ProviderOption, UpstreamSummary, build_provider_options};
 
@@ -324,11 +324,11 @@ pub async fn run_dashboard(
                                         }
                                         ui.codex_history_loaded_at_ms = Some(now_ms());
                                         ui.sync_codex_history_selection();
-                                        let count = ui.codex_history_sessions.len();
-                                        let zh = format!("history: 已加载 {count} 个会话");
-                                        let en = format!("history: loaded {count} sessions");
                                         ui.toast = Some((
-                                            crate::tui::i18n::pick(ui.language, &zh, &en).to_string(),
+                                            i18n::format_history_loaded(
+                                                ui.language,
+                                                ui.codex_history_sessions.len(),
+                                            ),
                                             Instant::now(),
                                         ));
                                     }
@@ -340,10 +340,8 @@ pub async fn run_dashboard(
                                         ui.codex_history_loaded_at_ms = Some(now_ms());
                                         ui.codex_history_error = Some(e.to_string());
                                         ui.sync_codex_history_selection();
-                                        let zh = format!("history: 加载失败：{e}");
-                                        let en = format!("history: load failed: {e}");
                                         ui.toast = Some((
-                                            crate::tui::i18n::pick(ui.language, &zh, &en).to_string(),
+                                            i18n::format_history_load_failed(ui.language, &e),
                                             Instant::now(),
                                         ));
                                     }
@@ -397,12 +395,11 @@ pub async fn run_dashboard(
                                         } else {
                                             Some(0)
                                         });
-                                        let count = ui.codex_recent_rows.len();
-                                        let zh = format!("recent: 已加载 {count} 个会话");
-                                        let en = format!("recent: loaded {count} sessions");
                                         ui.toast = Some((
-                                            crate::tui::i18n::pick(ui.language, &zh, &en)
-                                                .to_string(),
+                                            i18n::format_recent_loaded(
+                                                ui.language,
+                                                ui.codex_recent_rows.len(),
+                                            ),
                                             Instant::now(),
                                         ));
                                     }
@@ -410,11 +407,8 @@ pub async fn run_dashboard(
                                         ui.codex_recent_rows.clear();
                                         ui.codex_recent_loaded_at_ms = Some(now_ms());
                                         ui.codex_recent_error = Some(e.to_string());
-                                        let zh = format!("recent: 加载失败：{e}");
-                                        let en = format!("recent: load failed: {e}");
                                         ui.toast = Some((
-                                            crate::tui::i18n::pick(ui.language, &zh, &en)
-                                                .to_string(),
+                                            i18n::format_recent_load_failed(ui.language, &e),
                                             Instant::now(),
                                         ));
                                     }

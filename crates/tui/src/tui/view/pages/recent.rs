@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Tabs, Wrap};
 
+use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     CODEX_RECENT_WINDOWS, Palette, codex_recent_window_label, codex_recent_window_threshold_ms,
     format_age, now_ms, shorten_middle,
@@ -10,6 +11,8 @@ use crate::tui::model::{
 use crate::tui::state::UiState;
 
 pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
+    let lang = ui.language;
+    let l = |text| i18n::label(lang, text);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
@@ -42,10 +45,16 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
     }
 
     let title = format!(
-        "{}  (window: {}, raw_cwd: {})",
-        crate::tui::i18n::pick(ui.language, "最近会话 (Codex)", "Recent sessions (Codex)"),
+        "{}  ({}: {}, {}: {})",
+        i18n::text(lang, msg::RECENT_TITLE),
+        l("window"),
         codex_recent_window_label(ui.codex_recent_window_idx),
-        if ui.codex_recent_raw_cwd { "on" } else { "off" }
+        l("raw_cwd"),
+        if ui.codex_recent_raw_cwd {
+            l("on")
+        } else {
+            l("off")
+        }
     );
     let left_block = Block::default()
         .title(Span::styled(
@@ -116,7 +125,7 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
 
     let right_block = Block::default()
         .title(Span::styled(
-            crate::tui::i18n::pick(ui.language, "详情", "Details"),
+            i18n::text(ui.language, msg::DETAILS_TITLE),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -126,7 +135,7 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
     let mut lines = Vec::new();
     if let Some(err) = ui.codex_recent_error.as_deref() {
         lines.push(Line::from(Span::styled(
-            format!("error: {err}"),
+            format!("{}: {err}", l("error")),
             Style::default().fg(p.bad),
         )));
         lines.push(Line::from(""));
@@ -134,36 +143,32 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
 
     if ui.codex_recent_rows.is_empty() {
         lines.push(Line::from(Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "未加载最近会话。按 r 刷新；或确认 ~/.codex/sessions 存在。",
-                "No recent sessions loaded. Press r to refresh; or check ~/.codex/sessions.",
-            ),
+            i18n::text(ui.language, msg::RECENT_EMPTY),
             Style::default().fg(p.muted),
         )));
     } else if let Some(r) = visible.get(ui.codex_recent_selected_idx) {
         let branch = r.branch.as_deref().unwrap_or("-");
         lines.push(Line::from(vec![
-            Span::styled("root: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("root")), Style::default().fg(p.muted)),
             Span::styled(r.root.clone(), Style::default().fg(p.text)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("branch: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("branch")), Style::default().fg(p.muted)),
             Span::styled(branch.to_string(), Style::default().fg(p.text)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("sid: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("sid")), Style::default().fg(p.muted)),
             Span::styled(r.session_id.clone(), Style::default().fg(p.text)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("mtime: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("mtime")), Style::default().fg(p.muted)),
             Span::styled(
                 format_age(now, Some(r.mtime_ms)),
                 Style::default().fg(p.muted),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("cwd: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("cwd")), Style::default().fg(p.muted)),
             Span::styled(
                 r.cwd
                     .as_deref()
@@ -174,7 +179,7 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("copy: ", Style::default().fg(p.muted)),
+            Span::styled(format!("{}: ", l("copy")), Style::default().fg(p.muted)),
             Span::styled(
                 format!("{} {}", r.root, r.session_id),
                 Style::default().fg(p.accent),
@@ -182,22 +187,17 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            crate::tui::i18n::pick(ui.language, "按键", "Keys"),
+            i18n::text(ui.language, msg::KEYS_LABEL),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
-        lines.push(Line::from(crate::tui::i18n::pick(
+        lines.push(Line::from(i18n::text(
             ui.language,
-            "  Enter 复制条目  y 复制可见列表  t 打开 transcript",
-            "  Enter copy selected  y copy visible list  t open transcript",
+            msg::RECENT_KEYS_PRIMARY,
         )));
-        lines.push(Line::from(crate::tui::i18n::pick(
-            ui.language,
-            "  s 打开到 Sessions  f 打开到 Requests  h 打开到 History",
-            "  s open in Sessions  f open in Requests  h open in History",
-        )));
+        lines.push(Line::from(i18n::text(ui.language, msg::RECENT_KEYS_NAV)));
     } else {
         lines.push(Line::from(Span::styled(
-            crate::tui::i18n::pick(ui.language, "未选中任何条目。", "No selection."),
+            i18n::text(ui.language, msg::NO_SELECTION),
             Style::default().fg(p.muted),
         )));
     }

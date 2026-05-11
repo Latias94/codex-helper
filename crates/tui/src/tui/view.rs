@@ -4,6 +4,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use super::model::{Palette, ProviderOption, Snapshot};
 use super::state::UiState;
 use super::types::Overlay;
+use crate::tui::i18n::{self, msg};
 
 mod chrome;
 mod modals;
@@ -50,13 +51,11 @@ pub(in crate::tui) fn render_app(
         Overlay::SessionTranscript => modals::render_session_transcript_modal(f, p, ui),
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             let title = match ui.overlay {
-                Overlay::ProviderMenuSession => crate::tui::i18n::pick(
-                    ui.language,
-                    "会话 Provider 覆盖",
-                    "Session provider override",
-                ),
+                Overlay::ProviderMenuSession => {
+                    i18n::text(ui.language, msg::OVERLAY_SESSION_PROVIDER_OVERRIDE)
+                }
                 Overlay::ProviderMenuGlobal => {
-                    crate::tui::i18n::pick(ui.language, "全局站点 pin", "Global station pin")
+                    i18n::text(ui.language, msg::OVERLAY_GLOBAL_STATION_PIN)
                 }
                 _ => unreachable!(),
             };

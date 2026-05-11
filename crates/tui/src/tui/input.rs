@@ -27,6 +27,7 @@ use crate::state::{
 };
 
 use super::Language;
+use super::i18n::{self, msg};
 use super::model::{
     CODEX_RECENT_WINDOWS, ProviderOption, RoutingSpecUpsertView, RoutingSpecView, SessionRow,
     Snapshot, codex_recent_window_label, codex_recent_window_threshold_ms,
@@ -88,7 +89,10 @@ pub(in crate::tui) async fn handle_key_event(
             }
             KeyCode::Char('A') | KeyCode::Char('a') => {
                 let Some(file) = ui.session_transcript_file.as_deref() else {
-                    ui.toast = Some(("no transcript file loaded".to_string(), Instant::now()));
+                    ui.toast = Some((
+                        i18n::label(ui.language, "no transcript file loaded").to_string(),
+                        Instant::now(),
+                    ));
                     return true;
                 };
 
@@ -106,16 +110,26 @@ pub(in crate::tui) async fn handle_key_event(
                         ui.session_transcript_messages = msgs;
                         ui.toast = Some((
                             match ui.session_transcript_tail {
-                                Some(n) => format!("transcript: loaded tail {n}"),
-                                None => "transcript: loaded all".to_string(),
+                                Some(n) => format!(
+                                    "{} {n}",
+                                    i18n::label(ui.language, "transcript: loaded tail")
+                                ),
+                                None => {
+                                    i18n::label(ui.language, "transcript: loaded all").to_string()
+                                }
                             },
                             Instant::now(),
                         ));
                     }
                     Err(e) => {
                         ui.session_transcript_error = Some(e.to_string());
-                        ui.toast =
-                            Some((format!("transcript: reload failed: {e}"), Instant::now()));
+                        ui.toast = Some((
+                            format!(
+                                "{}: {e}",
+                                i18n::label(ui.language, "transcript: reload failed")
+                            ),
+                            Instant::now(),
+                        ));
                     }
                 }
                 true
@@ -125,12 +139,18 @@ pub(in crate::tui) async fn handle_key_event(
                 match try_copy_to_clipboard(&text) {
                     Ok(()) => {
                         ui.toast = Some((
-                            "transcript: copied to clipboard".to_string(),
+                            i18n::label(ui.language, "transcript: copied to clipboard").to_string(),
                             Instant::now(),
                         ))
                     }
                     Err(e) => {
-                        ui.toast = Some((format!("transcript: copy failed: {e}"), Instant::now()))
+                        ui.toast = Some((
+                            format!(
+                                "{}: {e}",
+                                i18n::label(ui.language, "transcript: copy failed")
+                            ),
+                            Instant::now(),
+                        ))
                     }
                 }
                 true
@@ -843,7 +863,7 @@ fn should_request_provider_balance_refresh(
 async fn open_routing_editor(
     ui: &mut UiState,
     snapshot: &Snapshot,
-    reason: &'static str,
+    reason: &str,
     balance_refresh_tx: &BalanceRefreshSender,
 ) {
     let balance_started = request_provider_balance_refresh(
@@ -860,7 +880,10 @@ async fn open_routing_editor(
             ui.overlay = Overlay::RoutingMenu;
             ui.toast = Some((
                 if balance_started {
-                    format!("{reason}; balance refresh started")
+                    format!(
+                        "{reason}; {}",
+                        i18n::label(ui.language, "balance refresh started")
+                    )
                 } else {
                     reason.to_string()
                 },
@@ -868,7 +891,13 @@ async fn open_routing_editor(
             ));
         }
         Err(err) => {
-            ui.toast = Some((format!("routing: load failed: {err}"), Instant::now()));
+            ui.toast = Some((
+                format!(
+                    "{}: {err}",
+                    i18n::label(ui.language, "routing: load failed")
+                ),
+                Instant::now(),
+            ));
         }
     }
 }
@@ -1082,52 +1111,24 @@ struct ProviderSpecPayload {
 
 async fn persist_ui_language(language: Language) -> anyhow::Result<()> {
     let mut cfg = load_config().await?;
-    cfg.ui.language = Some(match language {
-        Language::Zh => "zh".to_string(),
-        Language::En => "en".to_string(),
-    });
+    cfg.ui.language = Some(i18n::storage_code(language).to_string());
     save_config(&cfg).await?;
     Ok(())
 }
 
-fn language_name(language: Language) -> &'static str {
-    match language {
-        Language::Zh => "中文",
-        Language::En => "English",
-    }
-}
-
 async fn toggle_language(ui: &mut UiState) {
-    let next = if ui.language == Language::En {
-        Language::Zh
-    } else {
-        Language::En
-    };
+    let next = i18n::next_language(ui.language);
     ui.language = next;
     match persist_ui_language(next).await {
         Ok(()) => {
             ui.toast = Some((
-                format!(
-                    "{}{}{}",
-                    crate::tui::i18n::pick(ui.language, "语言：", "language: "),
-                    language_name(next),
-                    crate::tui::i18n::pick(ui.language, "（已保存）", " (saved)")
-                ),
+                i18n::format_language_saved(ui.language, next),
                 Instant::now(),
             ));
         }
         Err(err) => {
-            let suffix = match ui.language {
-                Language::Zh => format!("（保存失败：{err}）"),
-                Language::En => format!(" (save failed: {err})"),
-            };
             ui.toast = Some((
-                format!(
-                    "{}{}{}",
-                    crate::tui::i18n::pick(ui.language, "语言：", "language: "),
-                    language_name(next),
-                    suffix
-                ),
+                i18n::format_language_save_failed(ui.language, next, &err),
                 Instant::now(),
             ));
         }
@@ -1460,7 +1461,11 @@ async fn handle_key_normal(
         KeyCode::Char('O') if ui.page == Page::Settings => {
             if ui.service_name != "codex" {
                 ui.toast = Some((
-                    "overwrite-from-codex is only supported for Codex service".to_string(),
+                    i18n::label(
+                        ui.language,
+                        "overwrite-from-codex is only supported for Codex service",
+                    )
+                    .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -1474,12 +1479,7 @@ async fn handle_key_normal(
             } else {
                 ui.pending_overwrite_from_codex_confirm_at = Some(now);
                 ui.toast = Some((
-                    crate::tui::i18n::pick(
-                        ui.language,
-                        "再次按 O 确认覆盖导入（3s 内）",
-                        "Press O again to confirm overwrite (within 3s)",
-                    )
-                    .to_string(),
+                    i18n::text(ui.language, msg::CONFIRM_OVERWRITE).to_string(),
                     now,
                 ));
                 return true;
@@ -1489,13 +1489,22 @@ async fn handle_key_normal(
                 Ok(mut cfg) => {
                     if let Err(err) = overwrite_codex_config_from_codex_cli_in_place(&mut cfg) {
                         ui.toast = Some((
-                            format!("overwrite-from-codex failed: {err}"),
+                            match ui.language {
+                                Language::Zh => format!("overwrite-from-codex 失败：{err}"),
+                                Language::En => format!("overwrite-from-codex failed: {err}"),
+                            },
                             Instant::now(),
                         ));
                         return true;
                     }
                     if let Err(err) = save_config(&cfg).await {
-                        ui.toast = Some((format!("save failed: {err}"), Instant::now()));
+                        ui.toast = Some((
+                            match ui.language {
+                                Language::Zh => format!("保存失败：{err}"),
+                                Language::En => format!("save failed: {err}"),
+                            },
+                            Instant::now(),
+                        ));
                         return true;
                     }
 
@@ -1503,13 +1512,26 @@ async fn handle_key_normal(
                     ui.clamp_selection(snapshot, providers.len());
                     let _ = refresh_profile_control_state(ui).await;
                     ui.toast = Some((
-                        format!("overwrote stations from ~/.codex (n={})", providers.len()),
+                        match ui.language {
+                            Language::Zh => {
+                                format!("已从 ~/.codex 覆盖导入站点（n={}）", providers.len())
+                            }
+                            Language::En => {
+                                format!("overwrote stations from ~/.codex (n={})", providers.len())
+                            }
+                        },
                         Instant::now(),
                     ));
                     true
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("load config failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("加载配置失败：{err}"),
+                            Language::En => format!("load config failed: {err}"),
+                        },
+                        Instant::now(),
+                    ));
                     true
                 }
             }
@@ -1547,31 +1569,17 @@ async fn handle_key_normal(
                     let _ = refresh_profile_control_state(ui).await;
 
                     let changed = v.get("reloaded").and_then(|x| x.as_bool()).unwrap_or(false);
-                    ui.toast = Some((
-                        crate::tui::i18n::pick(
-                            ui.language,
-                            format!(
-                                "已重载配置（{}）",
-                                if changed {
-                                    "检测到变更"
-                                } else {
-                                    "无变更"
-                                }
-                            )
-                            .as_str(),
-                            format!(
-                                "Config reloaded ({})",
-                                if changed { "changed" } else { "no change" }
-                            )
-                            .as_str(),
-                        )
-                        .to_string(),
-                        now,
-                    ));
+                    ui.toast = Some((i18n::format_config_reloaded(ui.language, changed), now));
                     true
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("reload failed: {err}"), now));
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("重载失败：{err}"),
+                            Language::En => format!("reload failed: {err}"),
+                        },
+                        now,
+                    ));
                     true
                 }
             }
@@ -1581,7 +1589,7 @@ async fn handle_key_normal(
                 open_routing_editor(
                     ui,
                     snapshot,
-                    "routing: provider details/edit",
+                    i18n::label(ui.language, "routing: provider details/edit"),
                     balance_refresh_tx,
                 )
                 .await;
@@ -1607,10 +1615,11 @@ async fn handle_key_normal(
                 };
                 ui.toast = Some((
                     format!(
-                        "stats focus: {}",
+                        "{}: {}",
+                        i18n::label(ui.language, "focus"),
                         match ui.stats_focus {
-                            StatsFocus::Stations => "stations",
-                            StatsFocus::Providers => "providers",
+                            StatsFocus::Stations => i18n::label(ui.language, "station"),
+                            StatsFocus::Providers => i18n::label(ui.language, "provider"),
                         }
                     ),
                     Instant::now(),
@@ -1684,19 +1693,27 @@ async fn handle_key_normal(
             ui.stats_days = next;
             ui.needs_snapshot_refresh = true;
             let label = if next == 0 {
-                "loaded".to_string()
+                i18n::label(ui.language, "loaded").to_string()
             } else if next == 1 {
-                "today".to_string()
+                i18n::label(ui.language, "today").to_string()
             } else {
                 format!("{next}d")
             };
-            ui.toast = Some((format!("stats window: {label}"), Instant::now()));
+            ui.toast = Some((
+                format!("{}: {label}", i18n::label(ui.language, "window")),
+                Instant::now(),
+            ));
             true
         }
         KeyCode::Char('e') if ui.page == Page::Stats => {
             ui.stats_errors_only = !ui.stats_errors_only;
             ui.toast = Some((
-                format!("stats: errors_only={}", ui.stats_errors_only),
+                format!(
+                    "{}: {}={}",
+                    i18n::label(ui.language, "Stats page"),
+                    i18n::label(ui.language, "errors_only"),
+                    ui.stats_errors_only
+                ),
                 Instant::now(),
             ));
             true
@@ -1704,7 +1721,14 @@ async fn handle_key_normal(
         KeyCode::Char('y') if ui.page == Page::Stats => {
             let now = now_ms();
             let Some(report) = build_stats_report(ui, snapshot, now) else {
-                ui.toast = Some(("stats report: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "stats report: 未选择条目",
+                        Language::En => "stats report: no selection",
+                    }
+                    .to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let saved = write_report(&report, now);
@@ -1713,28 +1737,55 @@ async fn handle_key_normal(
             match (saved, copied) {
                 (Ok(path), Ok(())) => {
                     ui.toast = Some((
-                        format!("stats report: copied + saved {}", path.display()),
+                        match ui.language {
+                            Language::Zh => {
+                                format!("stats report: 已复制并保存 {}", path.display())
+                            }
+                            Language::En => {
+                                format!("stats report: copied + saved {}", path.display())
+                            }
+                        },
                         Instant::now(),
                     ));
                 }
                 (Ok(path), Err(err)) => {
                     ui.toast = Some((
-                        format!(
-                            "stats report: saved {} (copy failed: {err})",
-                            path.display()
-                        ),
+                        match ui.language {
+                            Language::Zh => {
+                                format!(
+                                    "stats report: 已保存 {}（复制失败：{err}）",
+                                    path.display()
+                                )
+                            }
+                            Language::En => {
+                                format!(
+                                    "stats report: saved {} (copy failed: {err})",
+                                    path.display()
+                                )
+                            }
+                        },
                         Instant::now(),
                     ));
                 }
                 (Err(err), Ok(())) => {
                     ui.toast = Some((
-                        format!("stats report: copied (save failed: {err})"),
+                        match ui.language {
+                            Language::Zh => format!("stats report: 已复制（保存失败：{err}）"),
+                            Language::En => format!("stats report: copied (save failed: {err})"),
+                        },
                         Instant::now(),
                     ));
                 }
                 (Err(err1), Err(err2)) => {
                     ui.toast = Some((
-                        format!("stats report: copy failed: {err2} (save failed: {err1})"),
+                        match ui.language {
+                            Language::Zh => {
+                                format!("stats report: 复制失败：{err2}（保存失败：{err1}）")
+                            }
+                            Language::En => {
+                                format!("stats report: copy failed: {err2} (save failed: {err1})")
+                            }
+                        },
                         Instant::now(),
                     ));
                 }
@@ -1746,7 +1797,7 @@ async fn handle_key_normal(
                 open_routing_editor(
                     ui,
                     snapshot,
-                    "routing: edit provider policy/order/tags",
+                    i18n::label(ui.language, "routing: edit provider policy/order/tags"),
                     balance_refresh_tx,
                 )
                 .await;
@@ -1760,10 +1811,22 @@ async fn handle_key_normal(
             };
             match apply_global_station_pin(state, providers, Some(name.clone())).await {
                 Ok(()) => {
-                    ui.toast = Some((format!("global station pin: {name}"), Instant::now()));
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("全局站点 pin：{name}"),
+                            Language::En => format!("global station pin: {name}"),
+                        },
+                        Instant::now(),
+                    ));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("set global pin failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("设置全局 pin 失败：{err}"),
+                            Language::En => format!("set global pin failed: {err}"),
+                        },
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -1772,7 +1835,7 @@ async fn handle_key_normal(
             open_routing_editor(
                 ui,
                 snapshot,
-                "routing: edit persisted policy/order",
+                i18n::label(ui.language, "routing: edit persisted policy/order"),
                 balance_refresh_tx,
             )
             .await;
@@ -1782,14 +1845,30 @@ async fn handle_key_normal(
             match apply_global_station_pin(state, providers, None).await {
                 Ok(()) => {
                     let message = if ui.uses_route_graph_routing() {
-                        "runtime station pin cleared; v4 provider choice uses routing policy"
+                        match ui.language {
+                            Language::Zh => {
+                                "运行时站点 pin 已清除；v4 provider 选择使用 routing 策略"
+                            }
+                            Language::En => {
+                                "runtime station pin cleared; v4 provider choice uses routing policy"
+                            }
+                        }
                     } else {
-                        "global station pin: <auto>"
+                        match ui.language {
+                            Language::Zh => "全局站点 pin：<auto>",
+                            Language::En => "global station pin: <auto>",
+                        }
                     };
                     ui.toast = Some((message.to_string(), Instant::now()));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("set global pin failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("设置全局 pin 失败：{err}"),
+                            Language::En => format!("set global pin failed: {err}"),
+                        },
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -1797,7 +1876,11 @@ async fn handle_key_normal(
         KeyCode::Char('o') if ui.page == Page::Stations => {
             if ui.uses_route_graph_routing() {
                 ui.toast = Some((
-                    "v4 routing owns provider choice; press r to edit routing".to_string(),
+                    i18n::label(
+                        ui.language,
+                        "v4 routing owns provider choice; press r to edit routing",
+                    )
+                    .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -1811,14 +1894,18 @@ async fn handle_key_normal(
                 .and_then(|r| r.session_id.clone())
             else {
                 ui.toast = Some((
-                    "session station override: <no session>".to_string(),
+                    i18n::label(ui.language, "session station override: <no session>").to_string(),
                     Instant::now(),
                 ));
                 return true;
             };
             apply_session_provider_override(state, sid, Some(pvd.name.clone())).await;
             ui.toast = Some((
-                format!("session station override: {}", pvd.name),
+                format!(
+                    "{}: {}",
+                    i18n::label(ui.language, "session station override"),
+                    pvd.name
+                ),
                 Instant::now(),
             ));
             true
@@ -1830,16 +1917,19 @@ async fn handle_key_normal(
                 .and_then(|r| r.session_id.clone())
             else {
                 ui.toast = Some((
-                    "session station override: <no session>".to_string(),
+                    i18n::label(ui.language, "session station override: <no session>").to_string(),
                     Instant::now(),
                 ));
                 return true;
             };
             apply_session_provider_override(state, sid, None).await;
             let message = if ui.uses_route_graph_routing() {
-                "legacy session station override cleared"
+                match ui.language {
+                    Language::Zh => "旧版会话站点覆盖已清除",
+                    Language::En => "legacy session station override cleared",
+                }
             } else {
-                "session station override: <clear>"
+                i18n::label(ui.language, "session station override: <clear>")
             };
             ui.toast = Some((message.to_string(), Instant::now()));
             true
@@ -1859,7 +1949,13 @@ async fn handle_key_normal(
             if ui.routing_spec.is_none()
                 && let Err(err) = refresh_routing_control_state(ui).await
             {
-                ui.toast = Some((format!("routing: load failed: {err}"), Instant::now()));
+                ui.toast = Some((
+                    format!(
+                        "{}: {err}",
+                        i18n::label(ui.language, "routing: load failed")
+                    ),
+                    Instant::now(),
+                ));
                 return true;
             }
             ui.routing_menu_idx = ui.selected_station_idx;
@@ -1878,7 +1974,13 @@ async fn handle_key_normal(
             let upstreams = match load_upstreams_for_station(service_name, &station_name).await {
                 Ok(v) => v,
                 Err(err) => {
-                    ui.toast = Some((format!("health check load failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        format!(
+                            "{}: {err}",
+                            i18n::label(ui.language, "health check load failed")
+                        ),
+                        Instant::now(),
+                    ));
                     return true;
                 }
             };
@@ -1889,7 +1991,10 @@ async fn handle_key_normal(
                 .await
             {
                 ui.toast = Some((
-                    format!("health check already running: {station_name}"),
+                    format!(
+                        "{}: {station_name}",
+                        i18n::label(ui.language, "health check already running")
+                    ),
                     Instant::now(),
                 ));
                 return true;
@@ -1908,7 +2013,10 @@ async fn handle_key_normal(
 
             let state = Arc::clone(state);
             ui.toast = Some((
-                format!("health check queued: {station_name}"),
+                format!(
+                    "{}: {station_name}",
+                    i18n::label(ui.language, "health check queued")
+                ),
                 Instant::now(),
             ));
             let upstreams_for_task = upstreams;
@@ -1929,7 +2037,10 @@ async fn handle_key_normal(
             let stations = providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
             let state = Arc::clone(state);
             ui.toast = Some((
-                format!("health check queued: {} stations", stations.len()),
+                match ui.language {
+                    Language::Zh => format!("健康检查已排队：{} 个站点", stations.len()),
+                    Language::En => format!("health check queued: {} stations", stations.len()),
+                },
                 Instant::now(),
             ));
             tokio::spawn(async move {
@@ -2032,12 +2143,20 @@ async fn handle_key_normal(
                 .await
             {
                 ui.toast = Some((
-                    format!("health check cancel requested: {}", pvd.name),
+                    format!(
+                        "{}: {}",
+                        i18n::label(ui.language, "health check cancel requested"),
+                        pvd.name
+                    ),
                     Instant::now(),
                 ));
             } else {
                 ui.toast = Some((
-                    format!("health check not running: {}", pvd.name),
+                    format!(
+                        "{}: {}",
+                        i18n::label(ui.language, "health check not running"),
+                        pvd.name
+                    ),
                     Instant::now(),
                 ));
             }
@@ -2055,7 +2174,10 @@ async fn handle_key_normal(
                 }
             }
             ui.toast = Some((
-                format!("health check cancel requested: {count} stations"),
+                match ui.language {
+                    Language::Zh => format!("已请求取消健康检查：{count} 个站点"),
+                    Language::En => format!("health check cancel requested: {count} stations"),
+                },
                 Instant::now(),
             ));
             true
@@ -2065,7 +2187,9 @@ async fn handle_key_normal(
             ui.selected_sessions_page_idx = 0;
             ui.toast = Some((
                 format!(
-                    "sessions filter: active_only={}",
+                    "{}: {}={}",
+                    i18n::label(ui.language, "sessions filter"),
+                    i18n::label(ui.language, "active_only"),
                     ui.sessions_page_active_only
                 ),
                 Instant::now(),
@@ -2077,7 +2201,9 @@ async fn handle_key_normal(
             ui.selected_sessions_page_idx = 0;
             ui.toast = Some((
                 format!(
-                    "sessions filter: errors_only={}",
+                    "{}: {}={}",
+                    i18n::label(ui.language, "sessions filter"),
+                    i18n::label(ui.language, "errors_only"),
                     ui.sessions_page_errors_only
                 ),
                 Instant::now(),
@@ -2089,7 +2215,9 @@ async fn handle_key_normal(
             ui.selected_sessions_page_idx = 0;
             ui.toast = Some((
                 format!(
-                    "sessions filter: overrides_only={}",
+                    "{}: {}={}",
+                    i18n::label(ui.language, "sessions filter"),
+                    i18n::label(ui.language, "overrides_only"),
                     ui.sessions_page_overrides_only
                 ),
                 Instant::now(),
@@ -2101,14 +2229,16 @@ async fn handle_key_normal(
             ui.sessions_page_errors_only = false;
             ui.sessions_page_overrides_only = false;
             ui.selected_sessions_page_idx = 0;
-            ui.toast = Some(("sessions filter: reset".to_string(), Instant::now()));
+            ui.toast = Some((
+                i18n::label(ui.language, "sessions filter: reset").to_string(),
+                Instant::now(),
+            ));
             true
         }
         KeyCode::Char('r') if ui.page == Page::History => {
             ui.needs_codex_history_refresh = true;
             ui.toast = Some((
-                crate::tui::i18n::pick(ui.language, "history: 刷新中…", "history: refreshing…")
-                    .to_string(),
+                i18n::text(ui.language, msg::HISTORY_REFRESHING).to_string(),
                 Instant::now(),
             ));
             true
@@ -2116,8 +2246,7 @@ async fn handle_key_normal(
         KeyCode::Char('r') if ui.page == Page::Recent => {
             ui.needs_codex_recent_refresh = true;
             ui.toast = Some((
-                crate::tui::i18n::pick(ui.language, "recent: 刷新中…", "recent: refreshing…")
-                    .to_string(),
+                i18n::text(ui.language, msg::RECENT_REFRESHING).to_string(),
                 Instant::now(),
             ));
             true
@@ -2131,19 +2260,17 @@ async fn handle_key_normal(
                 .get(ui.selected_session_idx)
                 .and_then(|row| row.session_id.as_deref())
             else {
-                ui.toast = Some(("no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
 
             match refresh_profile_control_state(ui).await {
                 Ok(()) if ui.profile_options.is_empty() => {
                     ui.toast = Some((
-                        crate::tui::i18n::pick(
-                            ui.language,
-                            "profile: 当前服务没有可用 profile",
-                            "profile: no profiles configured for this service",
-                        )
-                        .to_string(),
+                        i18n::text(ui.language, msg::PROFILE_NO_OPTIONS).to_string(),
                         Instant::now(),
                     ));
                 }
@@ -2156,12 +2283,25 @@ async fn handle_key_normal(
                         default_profile_menu_idx(&ui.profile_options, selected_profile);
                     ui.overlay = Overlay::ProfileMenuSession;
                     ui.toast = Some((
-                        format!("profile: manage binding for {}", short_sid(sid, 18)),
+                        match ui.language {
+                            Language::Zh => {
+                                format!("profile: 管理 {} 的绑定", short_sid(sid, 18))
+                            }
+                            Language::En => {
+                                format!("profile: manage binding for {}", short_sid(sid, 18))
+                            }
+                        },
                         Instant::now(),
                     ));
                 }
                 Err(e) => {
-                    ui.toast = Some((format!("profile: load failed: {e}"), Instant::now()));
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("profile: 加载失败：{e}"),
+                            Language::En => format!("profile: load failed: {e}"),
+                        },
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -2170,12 +2310,7 @@ async fn handle_key_normal(
             match refresh_profile_control_state(ui).await {
                 Ok(()) if ui.profile_options.is_empty() => {
                     ui.toast = Some((
-                        crate::tui::i18n::pick(
-                            ui.language,
-                            "default profile: 当前服务没有可用 profile",
-                            "default profile: no profiles configured for this service",
-                        )
-                        .to_string(),
+                        i18n::text(ui.language, msg::DEFAULT_PROFILE_NO_OPTIONS).to_string(),
                         Instant::now(),
                     ));
                 }
@@ -2186,18 +2321,16 @@ async fn handle_key_normal(
                     );
                     ui.overlay = Overlay::ProfileMenuDefaultPersisted;
                     ui.toast = Some((
-                        crate::tui::i18n::pick(
-                            ui.language,
-                            "default profile: 管理配置默认值",
-                            "default profile: manage configured default",
-                        )
-                        .to_string(),
+                        i18n::text(ui.language, msg::DEFAULT_PROFILE_MANAGE_CONFIGURED).to_string(),
                         Instant::now(),
                     ));
                 }
                 Err(err) => {
                     ui.toast = Some((
-                        format!("default profile load failed: {err}"),
+                        match ui.language {
+                            Language::Zh => format!("default profile 加载失败：{err}"),
+                            Language::En => format!("default profile load failed: {err}"),
+                        },
                         Instant::now(),
                     ));
                 }
@@ -2208,12 +2341,8 @@ async fn handle_key_normal(
             match refresh_profile_control_state(ui).await {
                 Ok(()) if ui.profile_options.is_empty() => {
                     ui.toast = Some((
-                        crate::tui::i18n::pick(
-                            ui.language,
-                            "runtime default profile: 当前服务没有可用 profile",
-                            "runtime default profile: no profiles configured for this service",
-                        )
-                        .to_string(),
+                        i18n::text(ui.language, msg::RUNTIME_DEFAULT_PROFILE_NO_OPTIONS)
+                            .to_string(),
                         Instant::now(),
                     ));
                 }
@@ -2224,18 +2353,20 @@ async fn handle_key_normal(
                     );
                     ui.overlay = Overlay::ProfileMenuDefaultRuntime;
                     ui.toast = Some((
-                        crate::tui::i18n::pick(
-                            ui.language,
-                            "runtime default profile: 管理运行时默认值",
-                            "runtime default profile: manage runtime default",
-                        )
-                        .to_string(),
+                        i18n::text(ui.language, msg::RUNTIME_DEFAULT_PROFILE_MANAGE).to_string(),
                         Instant::now(),
                     ));
                 }
                 Err(err) => {
                     ui.toast = Some((
-                        format!("runtime default profile load failed: {err}"),
+                        match ui.language {
+                            Language::Zh => {
+                                format!("runtime default profile 加载失败：{err}")
+                            }
+                            Language::En => {
+                                format!("runtime default profile load failed: {err}")
+                            }
+                        },
                         Instant::now(),
                     ));
                 }
@@ -2251,7 +2382,10 @@ async fn handle_key_normal(
                 .get(ui.selected_session_idx)
                 .and_then(|row| row.session_id.as_deref())
             else {
-                ui.toast = Some(("no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
 
@@ -2261,12 +2395,7 @@ async fn handle_key_normal(
                     add_model_option_if_missing(&mut models, current.as_deref());
                     if models.is_empty() {
                         ui.toast = Some((
-                            crate::tui::i18n::pick(
-                                ui.language,
-                                "model: 当前服务没有可用模型目录",
-                                "model: no model catalog available for this service",
-                            )
-                            .to_string(),
+                            i18n::text(ui.language, msg::MODEL_NO_CATALOG).to_string(),
                             Instant::now(),
                         ));
                         return true;
@@ -2288,12 +2417,23 @@ async fn handle_key_normal(
                     ui.session_model_input_hint = selected_session_model_hint(snapshot, ui);
                     ui.overlay = Overlay::ModelMenuSession;
                     ui.toast = Some((
-                        format!("model: select target for {}", short_sid(sid, 18)),
+                        match ui.language {
+                            Language::Zh => format!("model: 为 {} 选择目标", short_sid(sid, 18)),
+                            Language::En => {
+                                format!("model: select target for {}", short_sid(sid, 18))
+                            }
+                        },
                         Instant::now(),
                     ));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("model: load failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("model: 加载失败：{err}"),
+                            Language::En => format!("model: load failed: {err}"),
+                        },
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -2307,7 +2447,10 @@ async fn handle_key_normal(
                 .get(ui.selected_session_idx)
                 .and_then(|row| row.session_id.as_deref())
             else {
-                ui.toast = Some(("no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
 
@@ -2327,7 +2470,14 @@ async fn handle_key_normal(
             ui.session_service_tier_input_hint = selected_session_service_tier_hint(snapshot, ui);
             ui.overlay = Overlay::ServiceTierMenuSession;
             ui.toast = Some((
-                format!("service_tier: select target for {}", short_sid(sid, 18)),
+                match ui.language {
+                    Language::Zh => {
+                        format!("service_tier: 为 {} 选择目标", short_sid(sid, 18))
+                    }
+                    Language::En => {
+                        format!("service_tier: select target for {}", short_sid(sid, 18))
+                    }
+                },
                 Instant::now(),
             ));
             true
@@ -2337,16 +2487,22 @@ async fn handle_key_normal(
                 && matches!(ui.page, Page::Dashboard | Page::Sessions) =>
         {
             let Some(row) = snapshot.rows.get(ui.selected_session_idx) else {
-                ui.toast = Some(("no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let Some(sid) = row.session_id.clone() else {
-                ui.toast = Some(("no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             if !session_row_has_any_override(row) {
                 ui.toast = Some((
-                    "session overrides already clear".to_string(),
+                    i18n::label(ui.language, "session overrides already clear").to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -2354,7 +2510,10 @@ async fn handle_key_normal(
 
             clear_session_manual_overrides(state, sid).await;
             ui.needs_snapshot_refresh = true;
-            ui.toast = Some(("session manual overrides reset".to_string(), Instant::now()));
+            ui.toast = Some((
+                i18n::label(ui.language, "session manual overrides reset").to_string(),
+                Instant::now(),
+            ));
             true
         }
         KeyCode::Char('[') if ui.page == Page::Recent => {
@@ -2368,7 +2527,8 @@ async fn handle_key_normal(
             ui.codex_recent_table.select(None);
             ui.toast = Some((
                 format!(
-                    "recent window: {}",
+                    "{}: {}",
+                    i18n::label(ui.language, "recent window"),
                     codex_recent_window_label(ui.codex_recent_window_idx)
                 ),
                 Instant::now(),
@@ -2383,7 +2543,8 @@ async fn handle_key_normal(
             ui.codex_recent_table.select(None);
             ui.toast = Some((
                 format!(
-                    "recent window: {}",
+                    "{}: {}",
+                    i18n::label(ui.language, "recent window"),
                     codex_recent_window_label(ui.codex_recent_window_idx)
                 ),
                 Instant::now(),
@@ -2392,25 +2553,35 @@ async fn handle_key_normal(
         }
         KeyCode::Char('o') if ui.page == Page::Sessions => {
             let Some(sid) = ui.selected_session_id.clone() else {
-                ui.toast = Some(("sessions: no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "sessions: no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let sid_label = short_sid(&sid, 18);
             prepare_select_requests_for_session(ui, sid);
             ui.toast = Some((
-                format!("requests: focused session {sid_label}"),
+                format!(
+                    "{} {sid_label}",
+                    i18n::label(ui.language, "requests: focused session")
+                ),
                 Instant::now(),
             ));
             true
         }
         KeyCode::Char('H') if ui.page == Page::Sessions => {
             let Some(row) = snapshot.rows.get(ui.selected_session_idx) else {
-                ui.toast = Some(("sessions: no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "sessions: no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let Some(sid) = row.session_id.as_deref() else {
                 ui.toast = Some((
-                    "sessions: selected row has no session id".to_string(),
+                    i18n::label(ui.language, "sessions: selected row has no session id")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -2422,7 +2593,10 @@ async fn handle_key_normal(
                     Ok(path) => path,
                     Err(e) => {
                         ui.toast = Some((
-                            format!("history: resolve session file failed: {e}"),
+                            format!(
+                                "{}: {e}",
+                                i18n::label(ui.language, "history: resolve session file failed")
+                            ),
                             Instant::now(),
                         ));
                         return true;
@@ -2431,7 +2605,8 @@ async fn handle_key_normal(
             };
             let Some(summary) = session_history_summary_from_row(row, path) else {
                 ui.toast = Some((
-                    "history: failed to prepare session focus".to_string(),
+                    i18n::label(ui.language, "history: failed to prepare session focus")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -2443,32 +2618,45 @@ async fn handle_key_normal(
                 CodexHistoryExternalFocusOrigin::Sessions,
             );
             ui.toast = Some((
-                format!("history: focused session {sid_label}"),
+                format!(
+                    "{} {sid_label}",
+                    i18n::label(ui.language, "history: focused session")
+                ),
                 Instant::now(),
             ));
             true
         }
         KeyCode::Char('O') if ui.page == Page::Dashboard && ui.focus == Focus::Sessions => {
             let Some(sid) = ui.selected_session_id.clone() else {
-                ui.toast = Some(("dashboard: no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "dashboard: no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let sid_label = short_sid(&sid, 18);
             prepare_select_requests_for_session(ui, sid);
             ui.toast = Some((
-                format!("requests: focused session {sid_label}"),
+                format!(
+                    "{} {sid_label}",
+                    i18n::label(ui.language, "requests: focused session")
+                ),
                 Instant::now(),
             ));
             true
         }
         KeyCode::Char('H') if ui.page == Page::Dashboard && ui.focus == Focus::Sessions => {
             let Some(row) = snapshot.rows.get(ui.selected_session_idx) else {
-                ui.toast = Some(("dashboard: no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "dashboard: no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let Some(sid) = row.session_id.as_deref() else {
                 ui.toast = Some((
-                    "dashboard: selected row has no session id".to_string(),
+                    i18n::label(ui.language, "dashboard: selected row has no session id")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -2480,7 +2668,10 @@ async fn handle_key_normal(
                     Ok(path) => path,
                     Err(e) => {
                         ui.toast = Some((
-                            format!("history: resolve session file failed: {e}"),
+                            format!(
+                                "{}: {e}",
+                                i18n::label(ui.language, "history: resolve session file failed")
+                            ),
                             Instant::now(),
                         ));
                         return true;
@@ -2489,7 +2680,8 @@ async fn handle_key_normal(
             };
             let Some(summary) = session_history_summary_from_row(row, path) else {
                 ui.toast = Some((
-                    "history: failed to prepare session focus".to_string(),
+                    i18n::label(ui.language, "history: failed to prepare session focus")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -2501,14 +2693,20 @@ async fn handle_key_normal(
                 CodexHistoryExternalFocusOrigin::Sessions,
             );
             ui.toast = Some((
-                format!("history: focused session {sid_label}"),
+                format!(
+                    "{} {sid_label}",
+                    i18n::label(ui.language, "history: focused session")
+                ),
                 Instant::now(),
             ));
             true
         }
         KeyCode::Char('t') if ui.page == Page::Sessions => {
             let Some(sid) = ui.selected_session_id.clone() else {
-                ui.toast = Some(("no session selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "no session selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             ui.session_transcript_sid = Some(sid.clone());
@@ -2526,43 +2724,57 @@ async fn handle_key_normal(
                 }
                 Ok(None) => {
                     ui.toast = Some((
-                        "no Codex session file found for this session id".to_string(),
-                        Instant::now(),
-                    ));
-                }
-                Err(e) => {
-                    ui.toast = Some((format!("failed to load transcript: {e}"), Instant::now()));
-                }
-            }
-            true
-        }
-        KeyCode::Enter if ui.page == Page::Recent => {
-            let Some(r) = selected_recent_row(ui) else {
-                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
-                return true;
-            };
-            let line = format!("{} {}", r.root, r.session_id);
-            match try_copy_to_clipboard(&line) {
-                Ok(()) => {
-                    ui.toast = Some((
-                        crate::tui::i18n::pick(
+                        i18n::label(
                             ui.language,
-                            "recent: 已复制选中条目",
-                            "recent: copied selected",
+                            "no Codex session file found for this session id",
                         )
                         .to_string(),
                         Instant::now(),
                     ));
                 }
                 Err(e) => {
-                    ui.toast = Some((format!("clipboard failed: {e}"), Instant::now()));
+                    ui.toast = Some((
+                        format!(
+                            "{}: {e}",
+                            i18n::label(ui.language, "failed to load transcript")
+                        ),
+                        Instant::now(),
+                    ));
+                }
+            }
+            true
+        }
+        KeyCode::Enter if ui.page == Page::Recent => {
+            let Some(r) = selected_recent_row(ui) else {
+                ui.toast = Some((
+                    i18n::label(ui.language, "recent: no selection").to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            };
+            let line = format!("{} {}", r.root, r.session_id);
+            match try_copy_to_clipboard(&line) {
+                Ok(()) => {
+                    ui.toast = Some((
+                        i18n::text(ui.language, msg::RECENT_COPIED_SELECTED).to_string(),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    ui.toast = Some((
+                        format!("{}: {e}", i18n::label(ui.language, "clipboard failed")),
+                        Instant::now(),
+                    ));
                 }
             }
             true
         }
         KeyCode::Char('t') if ui.page == Page::Recent => {
             let Some(r) = selected_recent_row(ui) else {
-                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "recent: no selection").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let sid = r.session_id.clone();
@@ -2572,13 +2784,20 @@ async fn handle_key_normal(
                 }
                 Ok(None) => {
                     ui.toast = Some((
-                        "recent: no local transcript file found for this session".to_string(),
+                        i18n::label(
+                            ui.language,
+                            "recent: no local transcript file found for this session",
+                        )
+                        .to_string(),
                         Instant::now(),
                     ));
                 }
                 Err(e) => {
                     ui.toast = Some((
-                        format!("recent: resolve session file failed: {e}"),
+                        format!(
+                            "{}: {e}",
+                            i18n::label(ui.language, "recent: resolve session file failed")
+                        ),
                         Instant::now(),
                     ));
                 }
@@ -2587,22 +2806,24 @@ async fn handle_key_normal(
         }
         KeyCode::Char('s') if ui.page == Page::Recent => {
             let Some(r) = selected_recent_row(ui) else {
-                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "recent: no selection").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             if focus_session_in_sessions(ui, snapshot, r.session_id.as_str()) {
                 ui.toast = Some((
-                    format!("sessions: focused {}", short_sid(r.session_id.as_str(), 18)),
+                    format!(
+                        "{} {}",
+                        i18n::label(ui.language, "sessions: focused"),
+                        short_sid(r.session_id.as_str(), 18)
+                    ),
                     Instant::now(),
                 ));
             } else {
                 ui.toast = Some((
-                    crate::tui::i18n::pick(
-                        ui.language,
-                        "sessions: 当前 runtime 未观测到这个 recent session",
-                        "sessions: this recent session is not currently observed in runtime",
-                    )
-                    .to_string(),
+                    i18n::text(ui.language, msg::RECENT_SESSION_NOT_OBSERVED).to_string(),
                     Instant::now(),
                 ));
             }
@@ -2610,27 +2831,39 @@ async fn handle_key_normal(
         }
         KeyCode::Char('f') if ui.page == Page::Recent => {
             let Some(r) = selected_recent_row(ui) else {
-                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "recent: no selection").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let sid_label = short_sid(r.session_id.as_str(), 18);
             prepare_select_requests_for_session(ui, r.session_id);
             ui.toast = Some((
-                format!("requests: focused session {sid_label}"),
+                format!(
+                    "{} {sid_label}",
+                    i18n::label(ui.language, "requests: focused session")
+                ),
                 Instant::now(),
             ));
             true
         }
         KeyCode::Char('h') if ui.page == Page::Recent => {
             let Some(r) = selected_recent_row(ui) else {
-                ui.toast = Some(("recent: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "recent: no selection").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let path = match find_codex_session_file_by_id(r.session_id.as_str()).await {
                 Ok(path) => path,
                 Err(e) => {
                     ui.toast = Some((
-                        format!("history: resolve session file failed: {e}"),
+                        format!(
+                            "{}: {e}",
+                            i18n::label(ui.language, "history: resolve session file failed")
+                        ),
                         Instant::now(),
                     ));
                     return true;
@@ -2644,7 +2877,10 @@ async fn handle_key_normal(
                 CodexHistoryExternalFocusOrigin::Recent,
             );
             ui.toast = Some((
-                format!("history: focused session {sid_label}"),
+                format!(
+                    "{} {sid_label}",
+                    i18n::label(ui.language, "history: focused session")
+                ),
                 Instant::now(),
             ));
             true
@@ -2668,52 +2904,56 @@ async fn handle_key_normal(
                 out.push('\n');
             }
             if out.trim().is_empty() {
-                ui.toast = Some(("recent: nothing to copy".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "recent: nothing to copy").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             }
             match try_copy_to_clipboard(&out) {
                 Ok(()) => {
                     ui.toast = Some((
-                        crate::tui::i18n::pick(
-                            ui.language,
-                            "recent: 已复制可见列表",
-                            "recent: copied visible list",
-                        )
-                        .to_string(),
+                        i18n::text(ui.language, msg::RECENT_COPIED_VISIBLE).to_string(),
                         Instant::now(),
                     ));
                 }
                 Err(e) => {
-                    ui.toast = Some((format!("clipboard failed: {e}"), Instant::now()));
+                    ui.toast = Some((
+                        format!("{}: {e}", i18n::label(ui.language, "clipboard failed")),
+                        Instant::now(),
+                    ));
                 }
             }
             true
         }
         KeyCode::Char('o') if ui.page == Page::Dashboard && ui.focus == Focus::Requests => {
             let Some(request) = selected_dashboard_request(snapshot, ui) else {
-                ui.toast = Some(("dashboard: no request selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "dashboard: no request selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let Some(sid) = request.session_id.as_deref() else {
                 ui.toast = Some((
-                    "dashboard: selected request has no session id".to_string(),
+                    i18n::label(ui.language, "dashboard: selected request has no session id")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
             };
             if focus_session_in_sessions(ui, snapshot, sid) {
                 ui.toast = Some((
-                    format!("sessions: focused {}", short_sid(sid, 18)),
+                    format!(
+                        "{} {}",
+                        i18n::label(ui.language, "sessions: focused"),
+                        short_sid(sid, 18)
+                    ),
                     Instant::now(),
                 ));
             } else {
                 ui.toast = Some((
-                    crate::tui::i18n::pick(
-                        ui.language,
-                        "sessions: 当前 runtime 未观测到这个 session",
-                        "sessions: this session is not currently observed in runtime",
-                    )
-                    .to_string(),
+                    i18n::text(ui.language, msg::SESSION_NOT_OBSERVED).to_string(),
                     Instant::now(),
                 ));
             }
@@ -2721,12 +2961,16 @@ async fn handle_key_normal(
         }
         KeyCode::Char('h') if ui.page == Page::Dashboard && ui.focus == Focus::Requests => {
             let Some(request) = selected_dashboard_request(snapshot, ui).cloned() else {
-                ui.toast = Some(("dashboard: no request selected".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "dashboard: no request selected").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let Some(sid) = request.session_id.as_deref() else {
                 ui.toast = Some((
-                    "dashboard: selected request has no session id".to_string(),
+                    i18n::label(ui.language, "dashboard: selected request has no session id")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -2735,7 +2979,10 @@ async fn handle_key_normal(
                 Ok(path) => path,
                 Err(e) => {
                     ui.toast = Some((
-                        format!("history: resolve session file failed: {e}"),
+                        format!(
+                            "{}: {e}",
+                            i18n::label(ui.language, "history: resolve session file failed")
+                        ),
                         Instant::now(),
                     ));
                     return true;
@@ -2743,7 +2990,8 @@ async fn handle_key_normal(
             };
             let Some(summary) = request_history_summary_from_request(&request, path) else {
                 ui.toast = Some((
-                    "history: failed to prepare request focus".to_string(),
+                    i18n::label(ui.language, "history: failed to prepare request focus")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -2755,7 +3003,10 @@ async fn handle_key_normal(
                 CodexHistoryExternalFocusOrigin::Requests,
             );
             ui.toast = Some((
-                format!("history: focused session {sid_label}"),
+                format!(
+                    "{} {sid_label}",
+                    i18n::label(ui.language, "history: focused session")
+                ),
                 Instant::now(),
             ));
             true
@@ -2766,17 +3017,15 @@ async fn handle_key_normal(
                 .get(ui.selected_codex_history_idx)
                 .cloned()
             else {
-                ui.toast = Some(("history: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "history: no selection").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             if summary.path.as_os_str().is_empty() {
                 ui.toast = Some((
-                    crate::tui::i18n::pick(
-                        ui.language,
-                        "history: 当前选中项没有本地 transcript 文件",
-                        "history: selected entry has no local transcript file",
-                    )
-                    .to_string(),
+                    i18n::text(ui.language, msg::HISTORY_NO_TRANSCRIPT_FILE).to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -2790,22 +3039,24 @@ async fn handle_key_normal(
                 .get(ui.selected_codex_history_idx)
                 .map(|summary| summary.id.clone())
             else {
-                ui.toast = Some(("history: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "history: no selection").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             if focus_session_in_sessions(ui, snapshot, sid.as_str()) {
                 ui.toast = Some((
-                    format!("sessions: focused {}", short_sid(sid.as_str(), 18)),
+                    format!(
+                        "{} {}",
+                        i18n::label(ui.language, "sessions: focused"),
+                        short_sid(sid.as_str(), 18)
+                    ),
                     Instant::now(),
                 ));
             } else {
                 ui.toast = Some((
-                    crate::tui::i18n::pick(
-                        ui.language,
-                        "sessions: 当前 runtime 未观测到这个 session",
-                        "sessions: this session is not currently observed in runtime",
-                    )
-                    .to_string(),
+                    i18n::text(ui.language, msg::SESSION_NOT_OBSERVED).to_string(),
                     Instant::now(),
                 ));
             }
@@ -2817,13 +3068,19 @@ async fn handle_key_normal(
                 .get(ui.selected_codex_history_idx)
                 .cloned()
             else {
-                ui.toast = Some(("history: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "history: no selection").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let sid_label = short_sid(summary.id.as_str(), 18);
             prepare_select_requests_for_session(ui, summary.id);
             ui.toast = Some((
-                format!("requests: focused session {sid_label}"),
+                format!(
+                    "{} {sid_label}",
+                    i18n::label(ui.language, "requests: focused session")
+                ),
                 Instant::now(),
             ));
             true
@@ -2959,7 +3216,9 @@ async fn handle_key_normal(
             ui.selected_request_page_idx = 0;
             ui.toast = Some((
                 format!(
-                    "requests filter: errors_only={}",
+                    "{}: {}={}",
+                    i18n::label(ui.language, "requests filter"),
+                    i18n::label(ui.language, "errors_only"),
                     ui.request_page_errors_only
                 ),
                 Instant::now(),
@@ -2977,11 +3236,12 @@ async fn handle_key_normal(
             ui.selected_request_page_idx = 0;
             ui.toast = Some((
                 format!(
-                    "requests scope: {}",
+                    "{}: {}",
+                    i18n::label(ui.language, "requests scope"),
                     if ui.request_page_scope_session {
-                        "selected session"
+                        i18n::label(ui.language, "selected session")
                     } else {
-                        "all"
+                        i18n::label(ui.language, "all")
                     }
                 ),
                 Instant::now(),
@@ -2991,36 +3251,39 @@ async fn handle_key_normal(
         KeyCode::Char('x') if ui.page == Page::Requests => {
             clear_request_page_focus(ui);
             ui.toast = Some((
-                "requests: cleared explicit session focus".to_string(),
+                i18n::label(ui.language, "requests: cleared explicit session focus").to_string(),
                 Instant::now(),
             ));
             true
         }
         KeyCode::Char('o') if ui.page == Page::Requests => {
             let Some(request) = selected_request_page_request(snapshot, ui) else {
-                ui.toast = Some(("requests: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "requests: no selection").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let Some(sid) = request.session_id.as_deref() else {
                 ui.toast = Some((
-                    "requests: selected request has no session id".to_string(),
+                    i18n::label(ui.language, "requests: selected request has no session id")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
             };
             if focus_session_in_sessions(ui, snapshot, sid) {
                 ui.toast = Some((
-                    format!("sessions: focused {}", short_sid(sid, 18)),
+                    format!(
+                        "{} {}",
+                        i18n::label(ui.language, "sessions: focused"),
+                        short_sid(sid, 18)
+                    ),
                     Instant::now(),
                 ));
             } else {
                 ui.toast = Some((
-                    crate::tui::i18n::pick(
-                        ui.language,
-                        "sessions: 当前 runtime 未观测到这个 session",
-                        "sessions: this session is not currently observed in runtime",
-                    )
-                    .to_string(),
+                    i18n::text(ui.language, msg::SESSION_NOT_OBSERVED).to_string(),
                     Instant::now(),
                 ));
             }
@@ -3028,12 +3291,16 @@ async fn handle_key_normal(
         }
         KeyCode::Char('h') if ui.page == Page::Requests => {
             let Some(request) = selected_request_page_request(snapshot, ui).cloned() else {
-                ui.toast = Some(("requests: no selection".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "requests: no selection").to_string(),
+                    Instant::now(),
+                ));
                 return true;
             };
             let Some(sid) = request.session_id.as_deref() else {
                 ui.toast = Some((
-                    "requests: selected request has no session id".to_string(),
+                    i18n::label(ui.language, "requests: selected request has no session id")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -3042,7 +3309,10 @@ async fn handle_key_normal(
                 Ok(path) => path,
                 Err(e) => {
                     ui.toast = Some((
-                        format!("history: resolve session file failed: {e}"),
+                        format!(
+                            "{}: {e}",
+                            i18n::label(ui.language, "history: resolve session file failed")
+                        ),
                         Instant::now(),
                     ));
                     return true;
@@ -3050,7 +3320,8 @@ async fn handle_key_normal(
             };
             let Some(summary) = request_history_summary_from_request(&request, path) else {
                 ui.toast = Some((
-                    "history: failed to prepare request focus".to_string(),
+                    i18n::label(ui.language, "history: failed to prepare request focus")
+                        .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -3062,7 +3333,10 @@ async fn handle_key_normal(
                 CodexHistoryExternalFocusOrigin::Requests,
             );
             ui.toast = Some((
-                format!("history: focused session {sid_label}"),
+                format!(
+                    "{} {sid_label}",
+                    i18n::label(ui.language, "history: focused session")
+                ),
                 Instant::now(),
             ));
             true
@@ -3188,7 +3462,12 @@ async fn handle_key_normal(
             .map(|s| s.to_string());
             apply_effort_override(state, sid, eff.clone()).await;
             ui.toast = Some((
-                format!("effort override: {}", eff.as_deref().unwrap_or("<clear>")),
+                format!(
+                    "{}: {}",
+                    i18n::label(ui.language, "effort override"),
+                    eff.as_deref()
+                        .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
+                ),
                 Instant::now(),
             ));
             true
@@ -3205,7 +3484,10 @@ async fn handle_key_normal(
                 return false;
             };
             apply_effort_override(state, sid, None).await;
-            ui.toast = Some(("effort override cleared".to_string(), Instant::now()));
+            ui.toast = Some((
+                i18n::label(ui.language, "effort override cleared").to_string(),
+                Instant::now(),
+            ));
             true
         }
         KeyCode::Char('p') => {
@@ -3216,7 +3498,10 @@ async fn handle_key_normal(
                 open_routing_editor(
                     ui,
                     snapshot,
-                    "v4 routing is global; editing persisted routing",
+                    i18n::label(
+                        ui.language,
+                        "v4 routing is global; editing persisted routing",
+                    ),
                     balance_refresh_tx,
                 )
                 .await;
@@ -3247,7 +3532,10 @@ async fn handle_key_normal(
             );
             ui.overlay = Overlay::ProviderMenuSession;
             if balance_started {
-                ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "balance refresh started").to_string(),
+                    Instant::now(),
+                ));
             }
             true
         }
@@ -3256,7 +3544,7 @@ async fn handle_key_normal(
                 open_routing_editor(
                     ui,
                     snapshot,
-                    "routing: edit provider policy/order/tags",
+                    i18n::label(ui.language, "routing: edit provider policy/order/tags"),
                     balance_refresh_tx,
                 )
                 .await;
@@ -3280,7 +3568,10 @@ async fn handle_key_normal(
             );
             ui.overlay = Overlay::ProviderMenuGlobal;
             if balance_started {
-                ui.toast = Some(("balance refresh started".to_string(), Instant::now()));
+                ui.toast = Some((
+                    i18n::label(ui.language, "balance refresh started").to_string(),
+                    Instant::now(),
+                ));
             }
             true
         }
@@ -3325,7 +3616,14 @@ async fn handle_key_effort_menu(
             };
             apply_effort_override(state, sid, choice.value().map(|s| s.to_string())).await;
             ui.overlay = Overlay::None;
-            ui.toast = Some((format!("effort set: {}", choice.label()), Instant::now()));
+            ui.toast = Some((
+                format!(
+                    "{}: {}",
+                    i18n::label(ui.language, "effort set"),
+                    choice.label(ui.language)
+                ),
+                Instant::now(),
+            ));
             true
         }
         _ => false,
@@ -3384,19 +3682,30 @@ async fn handle_key_profile_menu(
                             Ok(()) => {
                                 ui.needs_snapshot_refresh = true;
                                 ui.toast = Some((
-                                    format!("profile applied: {profile_name}"),
+                                    format!(
+                                        "{}: {profile_name}",
+                                        i18n::label(ui.language, "profile applied")
+                                    ),
                                     Instant::now(),
                                 ));
                             }
                             Err(err) => {
-                                ui.toast =
-                                    Some((format!("profile apply failed: {err}"), Instant::now()));
+                                ui.toast = Some((
+                                    format!(
+                                        "{}: {err}",
+                                        i18n::label(ui.language, "profile apply failed")
+                                    ),
+                                    Instant::now(),
+                                ));
                             }
                         }
                     } else {
                         state.clear_session_binding(&sid).await;
                         ui.needs_snapshot_refresh = true;
-                        ui.toast = Some(("profile binding cleared".to_string(), Instant::now()));
+                        ui.toast = Some((
+                            i18n::label(ui.language, "profile binding cleared").to_string(),
+                            Instant::now(),
+                        ));
                     }
                 }
                 Overlay::ProfileMenuDefaultRuntime => {
@@ -3405,10 +3714,11 @@ async fn handle_key_profile_menu(
                             Ok(()) => {
                                 ui.toast = Some((
                                     format!(
-                                        "runtime default profile: {}",
+                                        "{}: {}",
+                                        i18n::label(ui.language, "runtime default profile"),
                                         default_profile_label(
                                             ui.runtime_default_profile_override.as_deref(),
-                                            "<configured fallback>",
+                                            i18n::label(ui.language, "<configured fallback>"),
                                         )
                                     ),
                                     Instant::now(),
@@ -3416,14 +3726,26 @@ async fn handle_key_profile_menu(
                             }
                             Err(err) => {
                                 ui.toast = Some((
-                                    format!("runtime default profile refresh failed: {err}"),
+                                    format!(
+                                        "{}: {err}",
+                                        i18n::label(
+                                            ui.language,
+                                            "runtime default profile refresh failed"
+                                        )
+                                    ),
                                     Instant::now(),
                                 ));
                             }
                         },
                         Err(err) => {
                             ui.toast = Some((
-                                format!("runtime default profile apply failed: {err}"),
+                                format!(
+                                    "{}: {err}",
+                                    i18n::label(
+                                        ui.language,
+                                        "runtime default profile apply failed"
+                                    )
+                                ),
                                 Instant::now(),
                             ));
                         }
@@ -3435,10 +3757,11 @@ async fn handle_key_profile_menu(
                             Ok(()) => {
                                 ui.toast = Some((
                                     format!(
-                                        "configured default profile: {}",
+                                        "{}: {}",
+                                        i18n::label(ui.language, "configured default profile"),
                                         default_profile_label(
                                             ui.configured_default_profile.as_deref(),
-                                            "<none>",
+                                            i18n::label(ui.language, "<none>"),
                                         )
                                     ),
                                     Instant::now(),
@@ -3446,14 +3769,26 @@ async fn handle_key_profile_menu(
                             }
                             Err(err) => {
                                 ui.toast = Some((
-                                    format!("configured default profile refresh failed: {err}"),
+                                    format!(
+                                        "{}: {err}",
+                                        i18n::label(
+                                            ui.language,
+                                            "configured default profile refresh failed"
+                                        )
+                                    ),
                                     Instant::now(),
                                 ));
                             }
                         },
                         Err(err) => {
                             ui.toast = Some((
-                                format!("configured default profile apply failed: {err}"),
+                                format!(
+                                    "{}: {err}",
+                                    i18n::label(
+                                        ui.language,
+                                        "configured default profile apply failed"
+                                    )
+                                ),
                                 Instant::now(),
                             ));
                         }
@@ -3948,7 +4283,11 @@ async fn handle_key_service_tier_menu(
             apply_service_tier_override(state, sid, choice.value().map(|s| s.to_string())).await;
             ui.overlay = Overlay::None;
             ui.toast = Some((
-                format!("service_tier set: {}", choice.label()),
+                format!(
+                    "{}: {}",
+                    i18n::label(ui.language, "service_tier set"),
+                    choice.label(ui.language)
+                ),
                 Instant::now(),
             ));
             true
@@ -3982,7 +4321,12 @@ async fn handle_key_service_tier_input(
             apply_service_tier_override(state, sid, tier.clone()).await;
             ui.overlay = Overlay::None;
             ui.toast = Some((
-                format!("service_tier set: {}", tier.as_deref().unwrap_or("<clear>")),
+                format!(
+                    "{}: {}",
+                    i18n::label(ui.language, "service_tier set"),
+                    tier.as_deref()
+                        .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
+                ),
                 Instant::now(),
             ));
             true
@@ -4054,7 +4398,13 @@ async fn handle_key_model_menu(
             apply_model_override(state, sid, model.clone()).await;
             ui.overlay = Overlay::None;
             ui.toast = Some((
-                format!("model override: {}", model.as_deref().unwrap_or("<clear>")),
+                format!(
+                    "{}: {}",
+                    i18n::label(ui.language, "model override"),
+                    model
+                        .as_deref()
+                        .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
+                ),
                 Instant::now(),
             ));
             true
@@ -4088,7 +4438,13 @@ async fn handle_key_model_input(
             apply_model_override(state, sid, model.clone()).await;
             ui.overlay = Overlay::None;
             ui.toast = Some((
-                format!("model override: {}", model.as_deref().unwrap_or("<clear>")),
+                format!(
+                    "{}: {}",
+                    i18n::label(ui.language, "model override"),
+                    model
+                        .as_deref()
+                        .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
+                ),
                 Instant::now(),
             ));
             true
@@ -4151,15 +4507,23 @@ async fn handle_key_provider_menu(
                         Ok(()) => {
                             ui.toast = Some((
                                 format!(
-                                    "global station pin: {}",
-                                    chosen.as_deref().unwrap_or("<auto>")
+                                    "{}: {}",
+                                    i18n::label(ui.language, "global station pin"),
+                                    chosen
+                                        .as_deref()
+                                        .unwrap_or_else(|| i18n::label(ui.language, "<auto>"))
                                 ),
                                 Instant::now(),
                             ));
                         }
                         Err(err) => {
-                            ui.toast =
-                                Some((format!("set global pin failed: {err}"), Instant::now()));
+                            ui.toast = Some((
+                                format!(
+                                    "{}: {err}",
+                                    i18n::label(ui.language, "set global pin failed")
+                                ),
+                                Instant::now(),
+                            ));
                         }
                     }
                 }
@@ -4175,8 +4539,11 @@ async fn handle_key_provider_menu(
                     apply_session_provider_override(state, sid, chosen.clone()).await;
                     ui.toast = Some((
                         format!(
-                            "session station override: {}",
-                            chosen.as_deref().unwrap_or("<clear>")
+                            "{}: {}",
+                            i18n::label(ui.language, "session station override"),
+                            chosen
+                                .as_deref()
+                                .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
                         ),
                         Instant::now(),
                     ));
@@ -4292,16 +4659,25 @@ async fn handle_key_routing_menu(
                 Ok(()) => {
                     ui.toast = Some((
                         if balance_started {
-                            "routing: refreshed; balance refresh started"
+                            match ui.language {
+                                Language::Zh => "routing: 已刷新；余额刷新已开始",
+                                Language::En => "routing: refreshed; balance refresh started",
+                            }
                         } else {
-                            "routing: refreshed"
+                            i18n::label(ui.language, "routing: refreshed")
                         }
                         .to_string(),
                         Instant::now(),
                     ));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("routing: refresh failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        format!(
+                            "{}: {err}",
+                            i18n::label(ui.language, "routing: refresh failed")
+                        ),
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -4325,7 +4701,11 @@ async fn handle_key_routing_menu(
             };
             if !routing_entry_is_flat_provider_list(&spec) {
                 ui.toast = Some((
-                    "nested route graph: edit route nodes in TOML for grouped reorder".to_string(),
+                    i18n::label(
+                        ui.language,
+                        "nested route graph: edit route nodes in TOML for grouped reorder",
+                    )
+                    .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -4342,9 +4722,20 @@ async fn handle_key_routing_menu(
                 crate::config::RoutingPolicyV4::OrderedFailover,
             );
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
-                Ok(()) => ui.toast = Some(("routing: moved up".to_string(), Instant::now())),
+                Ok(()) => {
+                    ui.toast = Some((
+                        i18n::label(ui.language, "routing: moved up").to_string(),
+                        Instant::now(),
+                    ))
+                }
                 Err(err) => {
-                    ui.toast = Some((format!("routing: move failed: {err}"), Instant::now()))
+                    ui.toast = Some((
+                        format!(
+                            "{}: {err}",
+                            i18n::label(ui.language, "routing: move failed")
+                        ),
+                        Instant::now(),
+                    ))
                 }
             }
             true
@@ -4355,7 +4746,11 @@ async fn handle_key_routing_menu(
             };
             if !routing_entry_is_flat_provider_list(&spec) {
                 ui.toast = Some((
-                    "nested route graph: edit route nodes in TOML for grouped reorder".to_string(),
+                    i18n::label(
+                        ui.language,
+                        "nested route graph: edit route nodes in TOML for grouped reorder",
+                    )
+                    .to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -4372,9 +4767,20 @@ async fn handle_key_routing_menu(
                 crate::config::RoutingPolicyV4::OrderedFailover,
             );
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
-                Ok(()) => ui.toast = Some(("routing: moved down".to_string(), Instant::now())),
+                Ok(()) => {
+                    ui.toast = Some((
+                        i18n::label(ui.language, "routing: moved down").to_string(),
+                        Instant::now(),
+                    ))
+                }
                 Err(err) => {
-                    ui.toast = Some((format!("routing: move failed: {err}"), Instant::now()))
+                    ui.toast = Some((
+                        format!(
+                            "{}: {err}",
+                            i18n::label(ui.language, "routing: move failed")
+                        ),
+                        Instant::now(),
+                    ))
                 }
             }
             true
@@ -4401,10 +4807,16 @@ async fn handle_key_routing_menu(
             next.sync_entry_compat_from_graph();
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
-                    ui.toast = Some((format!("routing: pinned {target}"), Instant::now()));
+                    ui.toast = Some((
+                        format!("{} {target}", i18n::label(ui.language, "routing: pinned")),
+                        Instant::now(),
+                    ));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("routing: pin failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        format!("{}: {err}", i18n::label(ui.language, "routing: pin failed")),
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -4421,10 +4833,19 @@ async fn handle_key_routing_menu(
             );
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
-                    ui.toast = Some(("routing: ordered-failover".to_string(), Instant::now()));
+                    ui.toast = Some((
+                        i18n::label(ui.language, "routing: ordered-failover").to_string(),
+                        Instant::now(),
+                    ));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("routing: apply failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        format!(
+                            "{}: {err}",
+                            i18n::label(ui.language, "routing: apply failed")
+                        ),
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -4449,12 +4870,18 @@ async fn handle_key_routing_menu(
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((
-                        "routing: prefer billing=monthly".to_string(),
+                        i18n::label(ui.language, "routing: prefer billing=monthly").to_string(),
                         Instant::now(),
                     ));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("routing: apply failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        format!(
+                            "{}: {err}",
+                            i18n::label(ui.language, "routing: apply failed")
+                        ),
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -4465,7 +4892,11 @@ async fn handle_key_routing_menu(
             };
             let Some(enabled) = selected_routing_provider_enabled(ui) else {
                 ui.toast = Some((
-                    format!("provider {provider_name}: not in catalog"),
+                    format!(
+                        "{} {provider_name}: {}",
+                        i18n::label(ui.language, "provider"),
+                        i18n::label(ui.language, "not in catalog")
+                    ),
                     Instant::now(),
                 ));
                 return true;
@@ -4496,7 +4927,10 @@ async fn handle_key_routing_menu(
                                 balance_refresh_requested = true;
                             }
                             Err(err) => {
-                                suffix = format!("; routing update failed: {err}");
+                                suffix = format!(
+                                    "; {}: {err}",
+                                    i18n::label(ui.language, "routing update failed")
+                                );
                             }
                         }
                     }
@@ -4507,14 +4941,27 @@ async fn handle_key_routing_menu(
                             balance_refresh_tx,
                         );
                     }
-                    let label = if next_enabled { "enabled" } else { "disabled" };
+                    let label = if next_enabled {
+                        i18n::label(ui.language, "enabled")
+                    } else {
+                        i18n::label(ui.language, "disabled")
+                    };
                     ui.toast = Some((
-                        format!("provider {provider_name}: {label}{suffix}"),
+                        format!(
+                            "{} {provider_name}: {label}{suffix}",
+                            i18n::label(ui.language, "provider")
+                        ),
                         Instant::now(),
                     ));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("provider enable failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        format!(
+                            "{}: {err}",
+                            i18n::label(ui.language, "provider enable failed")
+                        ),
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -4541,10 +4988,22 @@ async fn handle_key_routing_menu(
                         Some(crate::config::RoutingExhaustedActionV4::Stop) => "stop",
                         None => "-",
                     };
-                    ui.toast = Some((format!("routing: on_exhausted={label}"), Instant::now()));
+                    ui.toast = Some((
+                        format!(
+                            "routing: {}={label}",
+                            i18n::label(ui.language, "on_exhausted")
+                        ),
+                        Instant::now(),
+                    ));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("routing: apply failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        format!(
+                            "{}: {err}",
+                            i18n::label(ui.language, "routing: apply failed")
+                        ),
+                        Instant::now(),
+                    ));
                 }
             }
             true
@@ -4566,14 +5025,20 @@ async fn handle_key_routing_menu(
                         snapshot,
                         balance_refresh_tx,
                     );
-                    let label = value.unwrap_or("<clear>");
+                    let label = value.unwrap_or_else(|| i18n::label(ui.language, "<clear>"));
                     ui.toast = Some((
-                        format!("provider {provider_name}: billing={label}"),
+                        format!(
+                            "{} {provider_name}: billing={label}",
+                            i18n::label(ui.language, "provider")
+                        ),
                         Instant::now(),
                     ));
                 }
                 Err(err) => {
-                    ui.toast = Some((format!("provider tag failed: {err}"), Instant::now()));
+                    ui.toast = Some((
+                        format!("{}: {err}", i18n::label(ui.language, "provider tag failed")),
+                        Instant::now(),
+                    ));
                 }
             }
             true

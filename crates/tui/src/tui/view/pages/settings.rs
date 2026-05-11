@@ -9,8 +9,11 @@ use crate::config::{ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryStrategy
 use crate::healthcheck::{
     HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
 };
+use crate::tui::Language;
+use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
-    Palette, Snapshot, balance_snapshot_status_label, now_ms, shorten, shorten_middle,
+    Palette, Snapshot, balance_amount_brief_lang, balance_snapshot_status_label_lang, now_ms,
+    shorten, shorten_middle,
 };
 use crate::tui::state::UiState;
 
@@ -35,10 +38,16 @@ fn retry_trigger_summary(layer: &ResolvedRetryLayerConfig) -> String {
     format!("status=[{statuses}] class=[{classes}]")
 }
 
-fn retry_layer_preview(label: &str, layer: &ResolvedRetryLayerConfig) -> String {
+fn retry_layer_preview_lang(
+    label: &str,
+    layer: &ResolvedRetryLayerConfig,
+    lang: Language,
+) -> String {
     format!(
-        "{label}: strategy={} attempts={} backoff={}..{}ms jitter={}ms retry_on={}",
+        "{label}: {}={} {}={} backoff={}..{}ms jitter={}ms retry_on={}",
+        i18n::label(lang, "strategy"),
         retry_strategy_name(layer.strategy),
+        i18n::label(lang, "attempts"),
         layer.max_attempts,
         layer.backoff_ms,
         layer.backoff_max_ms,
@@ -47,15 +56,25 @@ fn retry_layer_preview(label: &str, layer: &ResolvedRetryLayerConfig) -> String 
     )
 }
 
+#[cfg(test)]
 fn retry_policy_preview_lines(retry: &ResolvedRetryConfig) -> Vec<String> {
+    retry_policy_preview_lines_lang(retry, Language::En)
+}
+
+fn retry_policy_preview_lines_lang(retry: &ResolvedRetryConfig, lang: Language) -> Vec<String> {
     let mut lines = vec![
-        retry_layer_preview("upstream", &retry.upstream),
-        retry_layer_preview("route", &retry.route),
+        retry_layer_preview_lang("upstream", &retry.upstream, lang),
+        retry_layer_preview_lang("route", &retry.route, lang),
     ];
-    let boundary = if retry.allow_cross_station_before_first_output {
-        "boundary: cross-station failover allowed before first output; after output stays on committed route"
-    } else {
-        "boundary: cross-station failover blocked before first output; same-station/upstream policy only"
+    let boundary = match (lang, retry.allow_cross_station_before_first_output) {
+        (Language::Zh, true) => "边界：首个输出前允许跨站点 failover；输出后保持已提交路由",
+        (Language::Zh, false) => "边界：首个输出前禁止跨站点 failover；仅执行同站点/上游策略",
+        (Language::En, true) => {
+            "boundary: cross-station failover allowed before first output; after output stays on committed route"
+        }
+        (Language::En, false) => {
+            "boundary: cross-station failover blocked before first output; same-station/upstream policy only"
+        }
     };
     lines.push(boundary.to_string());
     let never_class = if retry.never_on_class.is_empty() {
@@ -63,29 +82,49 @@ fn retry_policy_preview_lines(retry: &ResolvedRetryConfig) -> Vec<String> {
     } else {
         retry.never_on_class.join(",")
     };
-    lines.push(format!(
-        "guardrails: never_status=[{}] never_class=[{}]",
-        retry.never_on_status, never_class
-    ));
-    lines.push(format!(
-        "cooldown: transport={}s cf_challenge={}s cf_timeout={}s backoff_factor={} max={}s",
-        retry.transport_cooldown_secs,
-        retry.cloudflare_challenge_cooldown_secs,
-        retry.cloudflare_timeout_cooldown_secs,
-        retry.cooldown_backoff_factor,
-        retry.cooldown_backoff_max_secs
-    ));
+    lines.push(match lang {
+        Language::Zh => format!(
+            "护栏：never_status=[{}] never_class=[{}]",
+            retry.never_on_status, never_class
+        ),
+        Language::En => format!(
+            "guardrails: never_status=[{}] never_class=[{}]",
+            retry.never_on_status, never_class
+        ),
+    });
+    lines.push(match lang {
+        Language::Zh => format!(
+            "冷却：transport={}s cf_challenge={}s cf_timeout={}s backoff_factor={} max={}s",
+            retry.transport_cooldown_secs,
+            retry.cloudflare_challenge_cooldown_secs,
+            retry.cloudflare_timeout_cooldown_secs,
+            retry.cooldown_backoff_factor,
+            retry.cooldown_backoff_max_secs
+        ),
+        Language::En => format!(
+            "cooldown: transport={}s cf_challenge={}s cf_timeout={}s backoff_factor={} max={}s",
+            retry.transport_cooldown_secs,
+            retry.cloudflare_challenge_cooldown_secs,
+            retry.cloudflare_timeout_cooldown_secs,
+            retry.cooldown_backoff_factor,
+            retry.cooldown_backoff_max_secs
+        ),
+    });
     lines
 }
 
-fn pricing_catalog_preview_lines(snapshot: &Snapshot, limit: usize) -> Vec<String> {
+fn pricing_catalog_preview_lines_lang(
+    snapshot: &Snapshot,
+    limit: usize,
+    lang: Language,
+) -> Vec<String> {
     let catalog = &snapshot.pricing_catalog;
     let mut lines = vec![format!(
         "source={}  models={}",
         catalog.source, catalog.model_count
     )];
     if catalog.models.is_empty() {
-        lines.push("no price rows".to_string());
+        lines.push(i18n::label(lang, "no price rows").to_string());
         return lines;
     }
 
@@ -97,7 +136,7 @@ fn pricing_catalog_preview_lines(snapshot: &Snapshot, limit: usize) -> Vec<Strin
             format_price(&row.output_per_1m_usd),
             format_optional_price(row.cache_read_input_per_1m_usd.as_deref()),
             format_optional_price(row.cache_creation_input_per_1m_usd.as_deref()),
-            confidence_label(row.confidence),
+            confidence_label_lang(row.confidence, lang),
             row.source
         ));
     }
@@ -105,10 +144,10 @@ fn pricing_catalog_preview_lines(snapshot: &Snapshot, limit: usize) -> Vec<Strin
     lines
 }
 
-fn balance_overview_lines(snapshot: &Snapshot, limit: usize) -> Vec<String> {
+fn balance_overview_lines_lang(snapshot: &Snapshot, limit: usize, lang: Language) -> Vec<String> {
     let mut stations = summarize_station_balances(&snapshot.provider_balances);
     if stations.is_empty() {
-        return vec!["no balance/quota data".to_string()];
+        return vec![i18n::label(lang, "no balance/quota data").to_string()];
     }
 
     stations.sort_by(|left, right| {
@@ -139,28 +178,38 @@ fn balance_overview_lines(snapshot: &Snapshot, limit: usize) -> Vec<String> {
         .sum::<usize>();
 
     let mut lines = vec![format!(
-        "stations={}  rows={}  exhausted={}  lazy={}  stale={}  unknown={}",
+        "{}={}  rows={}  {}={}  {}={}  {}={}  {}={}",
+        i18n::label(lang, "stations"),
         stations.len(),
         total_rows,
+        i18n::label(lang, "exhausted"),
         exhausted_rows,
+        i18n::label(lang, "lazy"),
         lazy_rows,
+        i18n::label(lang, "stale"),
         stale_rows,
+        i18n::label(lang, "unknown"),
         unknown_rows
     )];
     for station in stations.into_iter().take(limit) {
         lines.push(format!(
-            "{}  rows={} ok={} stale={} exhausted={} lazy={} unknown={}  {}",
+            "{}  rows={} {}={} {}={} {}={} {}={} {}={}  {}",
             shorten_middle(&station.station_name, 20),
             station.total_rows,
+            i18n::label(lang, "ok"),
             station.ok_rows,
+            i18n::label(lang, "stale"),
             station.stale_rows,
+            i18n::label(lang, "exhausted"),
             station.exhausted_rows,
+            i18n::label(lang, "lazy"),
             station.lazy_rows,
+            i18n::label(lang, "unknown"),
             station.unknown_rows + station.error_rows,
             station
                 .primary
                 .as_ref()
-                .map(format_primary_balance)
+                .map(|snapshot| format_primary_balance_lang(snapshot, lang))
                 .unwrap_or_else(|| "-".to_string())
         ));
     }
@@ -226,12 +275,15 @@ fn format_optional_price(value: Option<&str>) -> String {
     value.map(format_price).unwrap_or_else(|| "-".to_string())
 }
 
-fn confidence_label(confidence: crate::pricing::CostConfidence) -> &'static str {
+fn confidence_label_lang(
+    confidence: crate::pricing::CostConfidence,
+    lang: Language,
+) -> &'static str {
     match confidence {
-        crate::pricing::CostConfidence::Unknown => "unknown",
-        crate::pricing::CostConfidence::Partial => "partial",
-        crate::pricing::CostConfidence::Estimated => "estimated",
-        crate::pricing::CostConfidence::Exact => "exact",
+        crate::pricing::CostConfidence::Unknown => i18n::label(lang, "unknown"),
+        crate::pricing::CostConfidence::Partial => i18n::label(lang, "partial"),
+        crate::pricing::CostConfidence::Estimated => i18n::label(lang, "estimated"),
+        crate::pricing::CostConfidence::Exact => i18n::label(lang, "exact"),
     }
 }
 
@@ -323,7 +375,10 @@ fn station_priority(summary: &StationBalanceSummary) -> u8 {
         .unwrap_or(5)
 }
 
-fn format_primary_balance(snapshot: &crate::state::ProviderBalanceSnapshot) -> String {
+fn format_primary_balance_lang(
+    snapshot: &crate::state::ProviderBalanceSnapshot,
+    lang: Language,
+) -> String {
     let mut line = format!(
         "{}  #{}  {}  {}",
         shorten_middle(&snapshot.provider_id, 20),
@@ -331,13 +386,17 @@ fn format_primary_balance(snapshot: &crate::state::ProviderBalanceSnapshot) -> S
             .upstream_index
             .map(|idx| idx.to_string())
             .unwrap_or_else(|| "-".to_string()),
-        balance_snapshot_status_label(snapshot),
-        snapshot.amount_summary()
+        balance_snapshot_status_label_lang(snapshot, lang),
+        balance_amount_brief_lang(snapshot, lang).unwrap_or_else(|| snapshot.amount_summary())
     );
     if let Some(err) = snapshot.error.as_deref()
         && !err.trim().is_empty()
     {
-        line.push_str(&format!("  lookup_failed={}", shorten(err, 48)));
+        line.push_str(&format!(
+            "  {}={}",
+            i18n::label(lang, "lookup_failed"),
+            shorten(err, 48)
+        ));
     }
     line
 }
@@ -352,7 +411,7 @@ pub(super) fn render_settings_page(
     let now_epoch_ms = now_ms();
     let block = Block::default()
         .title(Span::styled(
-            crate::tui::i18n::pick(ui.language, "设置", "Settings"),
+            i18n::text(ui.language, msg::SETTINGS_TITLE),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -361,10 +420,7 @@ pub(super) fn render_settings_page(
 
     let mut lines = Vec::new();
 
-    let lang_name = match ui.language {
-        crate::tui::Language::Zh => "中文",
-        crate::tui::Language::En => "English",
-    };
+    let lang_name = i18n::language_name(ui.language);
     let refresh_env = std::env::var("CODEX_HELPER_TUI_REFRESH_MS").ok();
     let recent_max_env = std::env::var("CODEX_HELPER_RECENT_FINISHED_MAX").ok();
     let health_timeout_env = std::env::var(HEALTHCHECK_TIMEOUT_MS_ENV).ok();
@@ -389,7 +445,7 @@ pub(super) fn render_settings_page(
     };
 
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "运行态概览", "Runtime overview"),
+        i18n::text(ui.language, msg::RUNTIME_OVERVIEW_TITLE),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![
@@ -447,10 +503,10 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "余额 / 配额概览", "Balance / quota overview"),
+        i18n::text(ui.language, msg::BALANCE_OVERVIEW_TITLE),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
-    for line in balance_overview_lines(snapshot, 6) {
+    for line in balance_overview_lines_lang(snapshot, 6, ui.language) {
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default().fg(p.muted)),
             Span::styled(shorten_middle(&line, 110), Style::default().fg(p.muted)),
@@ -459,10 +515,10 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "价格目录", "Pricing catalog"),
+        i18n::text(ui.language, msg::PRICING_CATALOG_TITLE),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
-    for line in pricing_catalog_preview_lines(snapshot, 6) {
+    for line in pricing_catalog_preview_lines_lang(snapshot, 6, ui.language) {
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default().fg(p.muted)),
             Span::styled(line, Style::default().fg(p.muted)),
@@ -471,27 +527,23 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "TUI 选项", "TUI options"),
+        i18n::text(ui.language, msg::TUI_OPTIONS_TITLE),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "语言：", "language: "),
+            i18n::text(ui.language, msg::LANGUAGE_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(lang_name, Style::default().fg(p.text)),
         Span::styled(
-            crate::tui::i18n::pick(
-                ui.language,
-                "  (按 L 切换，并落盘到 ui.language)",
-                "  (press L to toggle and persist to ui.language)",
-            ),
+            i18n::text(ui.language, msg::LANGUAGE_TOGGLE_HINT),
             Style::default().fg(p.muted),
         ),
     ]));
     lines.push(Line::from(vec![
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "刷新间隔：", "refresh: "),
+            i18n::text(ui.language, msg::REFRESH_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(format!("{}ms", ui.refresh_ms), Style::default().fg(p.text)),
@@ -505,7 +557,7 @@ pub(super) fn render_settings_page(
     ]));
     lines.push(Line::from(vec![
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "窗口采样：", "window samples: "),
+            i18n::text(ui.language, msg::WINDOW_SAMPLES_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(
@@ -523,12 +575,12 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "Profile 控制", "Profile control"),
+        i18n::text(ui.language, msg::PROFILE_CONTROL_TITLE),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "配置默认：", "configured default: "),
+            i18n::text(ui.language, msg::CONFIGURED_DEFAULT_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(
@@ -536,13 +588,13 @@ pub(super) fn render_settings_page(
             Style::default().fg(p.text),
         ),
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "  (按 p 管理)", "  (press p to manage)"),
+            i18n::text(ui.language, msg::PRESS_P_MANAGE),
             Style::default().fg(p.muted),
         ),
     ]));
     lines.push(Line::from(vec![
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "运行时覆盖：", "runtime override: "),
+            i18n::text(ui.language, msg::RUNTIME_OVERRIDE_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(
@@ -552,13 +604,13 @@ pub(super) fn render_settings_page(
             Style::default().fg(p.text),
         ),
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "  (按 P 管理)", "  (press P to manage)"),
+            i18n::text(ui.language, msg::PRESS_CAPITAL_P_MANAGE),
             Style::default().fg(p.muted),
         ),
     ]));
     lines.push(Line::from(vec![
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "当前生效：", "effective default: "),
+            i18n::text(ui.language, msg::EFFECTIVE_DEFAULT_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(
@@ -567,7 +619,7 @@ pub(super) fn render_settings_page(
         ),
     ]));
     let profile_list = if ui.profile_options.is_empty() {
-        crate::tui::i18n::pick(ui.language, "<no profiles>", "<no profiles>").to_string()
+        i18n::text(ui.language, msg::NO_PROFILES).to_string()
     } else {
         shorten_middle(
             ui.profile_options
@@ -581,7 +633,7 @@ pub(super) fn render_settings_page(
     };
     lines.push(Line::from(vec![
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "可用 profile：", "available profiles: "),
+            i18n::text(ui.language, msg::AVAILABLE_PROFILES_LABEL),
             Style::default().fg(p.muted),
         ),
         Span::styled(profile_list, Style::default().fg(p.text)),
@@ -589,7 +641,7 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "Health Check", "Health Check"),
+        i18n::text(ui.language, msg::HEALTH_CHECK_TITLE),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![Span::styled(
@@ -604,11 +656,14 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "路径", "Paths"),
+        i18n::text(ui.language, msg::PATHS_TITLE),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![
-        Span::styled("config file: ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{}: ", i18n::label(ui.language, "config file")),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(
             crate::config::config_file_path().display().to_string(),
             Style::default().fg(p.text),
@@ -616,18 +671,27 @@ pub(super) fn render_settings_page(
     ]));
     let home = crate::config::proxy_home_dir();
     lines.push(Line::from(vec![
-        Span::styled("home:   ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{:<7}", format!("{}:", i18n::label(ui.language, "home"))),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(home.display().to_string(), Style::default().fg(p.text)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("logs:   ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{:<7}", format!("{}:", i18n::label(ui.language, "logs"))),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(
             home.join("logs").display().to_string(),
             Style::default().fg(p.text),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("reports:", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{:<7}", format!("{}:", i18n::label(ui.language, "reports"))),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(
             home.join("reports").display().to_string(),
             Style::default().fg(p.text),
@@ -636,7 +700,7 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "运行态配置", "Runtime config"),
+        i18n::text(ui.language, msg::RUNTIME_CONFIG_TITLE),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
     let loaded = ui
@@ -653,16 +717,16 @@ pub(super) fn render_settings_page(
         Span::styled("  mtime_ms: ", Style::default().fg(p.muted)),
         Span::styled(mtime, Style::default().fg(p.text)),
         Span::styled(
-            crate::tui::i18n::pick(ui.language, "  (按 R 立即重载)", "  (press R to reload)"),
+            i18n::text(ui.language, msg::PRESS_R_RELOAD),
             Style::default().fg(p.muted),
         ),
     ]));
     if let Some(retry) = ui.last_runtime_retry.as_ref() {
         lines.push(Line::from(vec![Span::styled(
-            "retry policy:",
+            i18n::label(ui.language, "retry policy"),
             Style::default().fg(p.text),
         )]));
-        for line in retry_policy_preview_lines(retry) {
+        for line in retry_policy_preview_lines_lang(retry, ui.language) {
             lines.push(Line::from(vec![
                 Span::styled("  - ", Style::default().fg(p.muted)),
                 Span::styled(line, Style::default().fg(p.muted)),
@@ -672,30 +736,31 @@ pub(super) fn render_settings_page(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        crate::tui::i18n::pick(ui.language, "常用快捷键", "Common keys"),
+        i18n::text(ui.language, msg::COMMON_KEYS_TITLE),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
-    lines.push(Line::from(crate::tui::i18n::pick(
+    lines.push(Line::from(i18n::text(
         ui.language,
         if ui.service_name == "codex" {
-            "  1-8 切页  ? 帮助  q 退出  L 语言  (Stations: i 详情  Stats: y 导出/复制  Settings: R 重载配置  O 覆盖导入(二次确认))"
+            msg::COMMON_KEYS_CODEX
         } else {
-            "  1-8 切页  ? 帮助  q 退出  L 语言  (Stations: i 详情  Stats: y 导出/复制)"
-        },
-        if ui.service_name == "codex" {
-            "  1-8 pages  ? help  q quit  L language  (Stations: i details  Stats: y export/copy  Settings: R reload  O overwrite(confirm))"
-        } else {
-            "  1-8 pages  ? help  q quit  L language  (Stations: i details  Stats: y export/copy)"
+            msg::COMMON_KEYS_OTHER
         },
     )));
 
     lines.push(Line::from(""));
     let updated_ms = snapshot.refreshed_at.elapsed().as_millis();
     lines.push(Line::from(vec![
-        Span::styled("updated: ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{}: ", i18n::label(ui.language, "updated")),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(format!("{updated_ms}ms"), Style::default().fg(p.muted)),
         Span::raw("  "),
-        Span::styled("now: ", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("{}: ", i18n::label(ui.language, "now")),
+            Style::default().fg(p.muted),
+        ),
         Span::styled(now_epoch_ms.to_string(), Style::default().fg(p.muted)),
     ]));
 
