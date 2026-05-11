@@ -45,6 +45,9 @@ Acceptance:
 - [x] Compare shadow attempt order against the legacy `LoadBalancer` path for
   failover avoidance, unsupported-model skip, all-unsupported exhaustion, and
   same-candidate retry boundaries.
+- [x] Add an opt-in request-path shadow diff hook that compares the legacy
+  `LoadBalancer` dry-run order with the route executor order without changing
+  selected upstreams.
 - [ ] Preserve current retry, cooldown, unsupported-model skip, and failover
   semantics.
 - [ ] Keep legacy station/upstream log fields while adding route metadata

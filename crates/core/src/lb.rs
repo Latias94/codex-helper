@@ -39,7 +39,7 @@ impl CooldownBackoff {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LbState {
     pub failure_counts: Vec<u32>,
     pub cooldown_until: Vec<Option<std::time::Instant>>,

@@ -221,6 +221,13 @@ pub(super) async fn prepare_proxy_request(
         max_secs: plan.cooldown_backoff_max_secs,
     };
 
+    super::route_executor_shadow::maybe_log_route_executor_shadow_diff(
+        proxy.service_name,
+        request_id,
+        &lbs,
+        request_model.as_deref(),
+    );
+
     Ok(PreparedProxyRequest {
         method,
         uri,

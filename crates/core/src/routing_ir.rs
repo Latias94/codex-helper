@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{
     ProviderConfigV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4,
-    ServiceViewV4, UpstreamAuth, UpstreamConfig, effective_v4_routing,
+    ServiceConfig, ServiceViewV4, UpstreamAuth, UpstreamConfig, effective_v4_routing,
 };
 use crate::lb::SelectedUpstream;
 use crate::model_routing;
@@ -82,13 +82,22 @@ pub struct SelectedRouteCandidate<'a> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoutePlanAttemptState {
-    avoid_upstream_indices: BTreeSet<usize>,
+    avoid_by_station: BTreeMap<String, BTreeSet<usize>>,
     avoided_total: usize,
 }
 
 impl RoutePlanAttemptState {
     pub fn avoid_upstream_index(&mut self, upstream_index: usize) -> bool {
-        if self.avoid_upstream_indices.insert(upstream_index) {
+        self.avoid_upstream(V4_COMPATIBILITY_STATION_NAME, upstream_index)
+    }
+
+    pub fn avoid_upstream(&mut self, station_name: &str, upstream_index: usize) -> bool {
+        if self
+            .avoid_by_station
+            .entry(station_name.to_string())
+            .or_default()
+            .insert(upstream_index)
+        {
             self.avoided_total = self.avoided_total.saturating_add(1);
             return true;
         }
@@ -96,15 +105,32 @@ impl RoutePlanAttemptState {
     }
 
     pub fn avoid_selected(&mut self, selected: &SelectedRouteCandidate<'_>) -> bool {
-        self.avoid_upstream_index(selected.selected_upstream.index)
+        self.avoid_selected_upstream(&selected.selected_upstream)
+    }
+
+    pub fn avoid_selected_upstream(&mut self, selected: &SelectedUpstream) -> bool {
+        self.avoid_upstream(selected.station_name.as_str(), selected.index)
     }
 
     pub fn avoids_upstream_index(&self, upstream_index: usize) -> bool {
-        self.avoid_upstream_indices.contains(&upstream_index)
+        self.avoids_upstream(V4_COMPATIBILITY_STATION_NAME, upstream_index)
+    }
+
+    pub fn avoids_upstream(&self, station_name: &str, upstream_index: usize) -> bool {
+        self.avoid_by_station
+            .get(station_name)
+            .is_some_and(|indices| indices.contains(&upstream_index))
     }
 
     pub fn avoid_for_station(&self) -> Vec<usize> {
-        self.avoid_upstream_indices.iter().copied().collect()
+        self.avoid_for_station_name(V4_COMPATIBILITY_STATION_NAME)
+    }
+
+    pub fn avoid_for_station_name(&self, station_name: &str) -> Vec<usize> {
+        self.avoid_by_station
+            .get(station_name)
+            .map(|indices| indices.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     pub fn avoided_total(&self) -> usize {
@@ -112,12 +138,16 @@ impl RoutePlanAttemptState {
     }
 
     pub fn station_exhausted(&self, upstream_total: usize) -> bool {
+        self.station_exhausted_for(V4_COMPATIBILITY_STATION_NAME, upstream_total)
+    }
+
+    pub fn station_exhausted_for(&self, station_name: &str, upstream_total: usize) -> bool {
         upstream_total > 0
             && self
-                .avoid_upstream_indices
-                .iter()
-                .filter(|&&idx| idx < upstream_total)
-                .count()
+                .avoid_by_station
+                .get(station_name)
+                .map(|indices| indices.iter().filter(|&&idx| idx < upstream_total).count())
+                .unwrap_or_default()
                 >= upstream_total
     }
 }
@@ -178,7 +208,7 @@ impl<'a> RoutePlanExecutor<'a> {
         let mut skipped = Vec::new();
 
         loop {
-            if state.station_exhausted(total_upstreams) {
+            if self.candidates_exhausted(state) {
                 return RoutePlanAttemptSelection {
                     selected: None,
                     skipped,
@@ -202,27 +232,31 @@ impl<'a> RoutePlanExecutor<'a> {
             if let Some(requested_model) = request_model
                 && !candidate_supports_model(candidate, requested_model)
             {
-                state.avoid_upstream_index(selected_upstream.index);
+                state.avoid_selected_upstream(&selected_upstream);
+                let avoid_for_station =
+                    state.avoid_for_station_name(selected_upstream.station_name.as_str());
                 skipped.push(SkippedRouteCandidate {
                     candidate,
                     selected_upstream,
                     reason: RoutePlanSkipReason::UnsupportedModel {
                         requested_model: requested_model.to_string(),
                     },
-                    avoid_for_station: state.avoid_for_station(),
+                    avoid_for_station,
                     avoided_total: state.avoided_total(),
                     total_upstreams,
                 });
                 continue;
             }
 
+            let avoid_for_station =
+                state.avoid_for_station_name(selected_upstream.station_name.as_str());
             return RoutePlanAttemptSelection {
                 selected: Some(SelectedRouteCandidate {
                     candidate,
                     selected_upstream,
                 }),
                 skipped,
-                avoid_for_station: state.avoid_for_station(),
+                avoid_for_station,
                 avoided_total: state.avoided_total(),
                 total_upstreams,
             };
@@ -248,8 +282,31 @@ impl<'a> RoutePlanExecutor<'a> {
         state: &RoutePlanAttemptState,
     ) -> Option<&'a RouteCandidate> {
         self.template.candidates.iter().find(|candidate| {
-            !state.avoids_upstream_index(candidate_compatibility_upstream_index(candidate))
+            let station_name = self.candidate_compatibility_station_name(candidate);
+            !state.avoids_upstream(
+                station_name.as_str(),
+                candidate_compatibility_upstream_index(candidate),
+            )
         })
+    }
+
+    fn candidates_exhausted(&self, state: &RoutePlanAttemptState) -> bool {
+        !self.template.candidates.is_empty()
+            && self.template.candidates.iter().all(|candidate| {
+                let station_name = self.candidate_compatibility_station_name(candidate);
+                state.avoids_upstream(
+                    station_name.as_str(),
+                    candidate_compatibility_upstream_index(candidate),
+                )
+            })
+    }
+
+    fn candidate_compatibility_station_name(&self, candidate: &RouteCandidate) -> String {
+        candidate
+            .compatibility_station_name
+            .clone()
+            .or_else(|| self.template.compatibility_station_name.clone())
+            .unwrap_or_else(|| self.template.service_name.clone())
     }
 }
 
@@ -317,6 +374,63 @@ pub fn compile_v4_route_plan_template(
             .then(|| V4_COMPATIBILITY_STATION_NAME.to_string()),
         candidates,
     })
+}
+
+pub fn compile_legacy_route_plan_template<'a>(
+    service_name: &str,
+    services: impl IntoIterator<Item = &'a ServiceConfig>,
+) -> RoutePlanTemplate {
+    let entry = "legacy".to_string();
+    let mut candidates = Vec::new();
+    let mut station_names = BTreeSet::new();
+
+    for service in services {
+        station_names.insert(service.name.clone());
+        for (upstream_index, upstream) in service.upstreams.iter().enumerate() {
+            let provider_id = upstream
+                .tags
+                .get("provider_id")
+                .cloned()
+                .unwrap_or_else(|| format!("{}#{upstream_index}", service.name));
+            let endpoint_id = upstream
+                .tags
+                .get("endpoint_id")
+                .cloned()
+                .unwrap_or_else(|| upstream_index.to_string());
+            let stable_index = candidates.len();
+            let route_path = vec![entry.clone(), service.name.clone(), provider_id.clone()];
+            candidates.push(RouteCandidate {
+                provider_id,
+                provider_alias: service.alias.clone(),
+                endpoint_id,
+                base_url: upstream.base_url.clone(),
+                auth: upstream.auth.clone(),
+                tags: hash_string_map_to_btree(&upstream.tags),
+                supported_models: hash_bool_map_to_btree(&upstream.supported_models),
+                model_mapping: hash_string_map_to_btree(&upstream.model_mapping),
+                route_path,
+                stable_index,
+                compatibility_station_name: Some(service.name.clone()),
+                compatibility_upstream_index: Some(upstream_index),
+            });
+        }
+    }
+
+    RoutePlanTemplate {
+        service_name: service_name.to_string(),
+        entry,
+        nodes: BTreeMap::new(),
+        expanded_provider_order: candidates
+            .iter()
+            .map(|candidate| candidate.provider_id.clone())
+            .collect(),
+        candidates,
+        compatibility_station_name: if station_names.len() == 1 {
+            station_names.into_iter().next()
+        } else {
+            None
+        },
+    }
 }
 
 fn validate_route_provider_name_conflicts(
@@ -804,6 +918,20 @@ fn candidate_supports_model(candidate: &RouteCandidate, requested_model: &str) -
         &btree_string_map_to_hash_map(&candidate.model_mapping),
         requested_model,
     )
+}
+
+fn hash_string_map_to_btree(values: &HashMap<String, String>) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn hash_bool_map_to_btree(values: &HashMap<String, bool>) -> BTreeMap<String, bool> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), *value))
+        .collect()
 }
 
 fn btree_string_map_to_hash_map(values: &BTreeMap<String, String>) -> HashMap<String, String> {
