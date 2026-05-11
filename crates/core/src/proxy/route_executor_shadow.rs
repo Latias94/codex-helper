@@ -7,7 +7,8 @@ use crate::lb::{LoadBalancer, SelectedUpstream};
 use crate::logging::log_retry_trace;
 use crate::model_routing;
 use crate::routing_ir::{
-    RoutePlanAttemptState, RoutePlanExecutor, RoutePlanSkipReason,
+    RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState, RoutePlanSkipReason,
+    RoutePlanStationRuntimeState, RoutePlanUpstreamRuntimeState,
     compile_legacy_route_plan_template,
 };
 
@@ -91,10 +92,15 @@ fn executor_shadow_attempts(
         compile_legacy_route_plan_template(service_name, lbs.iter().map(|lb| lb.service.as_ref()));
     let executor = RoutePlanExecutor::new(&template);
     let mut state = RoutePlanAttemptState::default();
+    let runtime = route_plan_runtime_state_from_lbs(lbs);
     let mut attempts = Vec::new();
 
     loop {
-        let selection = executor.select_supported_candidate(&mut state, request_model);
+        let selection = executor.select_supported_candidate_with_runtime_state(
+            &mut state,
+            &runtime,
+            request_model,
+        );
         attempts.extend(selection.skipped.into_iter().map(|skipped| {
             shadow_attempt(
                 "skipped_capability_mismatch",
@@ -121,6 +127,51 @@ fn executor_shadow_attempts(
     }
 
     attempts
+}
+
+fn route_plan_runtime_state_from_lbs(lbs: &[LoadBalancer]) -> RoutePlanRuntimeState {
+    let mut runtime = RoutePlanRuntimeState::default();
+    let now = std::time::Instant::now();
+
+    for lb in lbs {
+        let mut state = match lb.states.lock() {
+            Ok(states) => states
+                .get(lb.service.name.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) => error
+                .into_inner()
+                .get(lb.service.name.as_str())
+                .cloned()
+                .unwrap_or_default(),
+        };
+        state.ensure_layout(&lb.service.upstreams);
+
+        let mut station = RoutePlanStationRuntimeState {
+            last_good_index: state.last_good_index,
+            ..RoutePlanStationRuntimeState::default()
+        };
+        for idx in 0..lb.service.upstreams.len() {
+            let cooldown_until = state.cooldown_until.get(idx).and_then(|until| *until);
+            let cooldown_active = cooldown_until.is_some_and(|until| now < until);
+            let failure_count = if cooldown_until.is_some_and(|until| now >= until) {
+                0
+            } else {
+                state.failure_counts.get(idx).copied().unwrap_or_default()
+            };
+            station.set_upstream(
+                idx,
+                RoutePlanUpstreamRuntimeState {
+                    failure_count,
+                    cooldown_active,
+                    usage_exhausted: state.usage_exhausted.get(idx).copied().unwrap_or(false),
+                },
+            );
+        }
+        runtime.set_station(lb.service.name.clone(), station);
+    }
+
+    runtime
 }
 
 fn legacy_shadow_attempts(
@@ -318,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_report_detects_live_lb_state_mismatch_without_mutating_real_state() {
+    fn shadow_report_matches_last_good_state_without_mutating_real_state() {
         let lb = load_balancer(
             "routing",
             vec![
@@ -343,13 +394,146 @@ mod tests {
 
         let report = route_executor_shadow_report("codex", std::slice::from_ref(&lb), None);
 
-        assert!(!report.matches);
+        assert!(report.matches);
         assert_eq!(report.legacy_attempts[0].upstream_index, 1);
-        assert_eq!(report.executor_attempts[0].upstream_index, 0);
+        assert_eq!(report.executor_attempts[0].upstream_index, 1);
 
         let after = lb
             .select_upstream_avoiding_strict(&HashSet::new())
             .expect("selected after shadow");
         assert_eq!(after.index, 1);
+    }
+
+    #[test]
+    fn shadow_report_matches_cooldown_state_without_mutating_real_state() {
+        let lb = load_balancer(
+            "routing",
+            vec![
+                upstream("https://cooldown.example/v1", "cooldown", &[]),
+                upstream("https://ready.example/v1", "ready", &[]),
+            ],
+        );
+        lb.penalize_with_backoff(
+            0,
+            60,
+            "test",
+            CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        );
+
+        let report = route_executor_shadow_report("codex", std::slice::from_ref(&lb), None);
+
+        assert!(report.matches);
+        assert_eq!(
+            report
+                .executor_attempts
+                .iter()
+                .map(|attempt| attempt.upstream_index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let selected = lb
+            .select_upstream_avoiding_strict(&HashSet::new())
+            .expect("selected after shadow");
+        assert_eq!(selected.index, 1);
+    }
+
+    #[test]
+    fn shadow_report_skips_exhausted_station_and_continues_to_next_station() {
+        let alpha = load_balancer(
+            "alpha",
+            vec![upstream("https://alpha.example/v1", "alpha", &[])],
+        );
+        alpha.penalize_with_backoff(
+            0,
+            60,
+            "test",
+            CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        );
+        let beta = load_balancer(
+            "beta",
+            vec![upstream("https://beta.example/v1", "beta", &[])],
+        );
+
+        let report = route_executor_shadow_report("codex", &[alpha, beta], None);
+
+        assert!(report.matches);
+        assert_eq!(
+            report
+                .executor_attempts
+                .iter()
+                .map(|attempt| (attempt.station_name.as_str(), attempt.upstream_index))
+                .collect::<Vec<_>>(),
+            vec![("beta", 0)]
+        );
+    }
+
+    #[test]
+    fn shadow_report_matches_usage_exhaustion_fallback_state() {
+        let lb = load_balancer(
+            "routing",
+            vec![
+                upstream("https://limited.example/v1", "limited", &[]),
+                upstream("https://available.example/v1", "available", &[]),
+            ],
+        );
+        {
+            let mut guard = lb.states.lock().expect("lb state lock");
+            let entry = guard
+                .entry("routing".to_string())
+                .or_insert_with(LbState::default);
+            entry.ensure_layout(&lb.service.upstreams);
+            entry.usage_exhausted[0] = true;
+        }
+
+        let report = route_executor_shadow_report("codex", std::slice::from_ref(&lb), None);
+
+        assert!(report.matches);
+        assert_eq!(
+            report
+                .executor_attempts
+                .iter()
+                .map(|attempt| attempt.upstream_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn shadow_report_matches_all_usage_exhausted_second_round_fallback() {
+        let lb = load_balancer(
+            "routing",
+            vec![
+                upstream("https://limited-one.example/v1", "limited-one", &[]),
+                upstream("https://limited-two.example/v1", "limited-two", &[]),
+            ],
+        );
+        {
+            let mut guard = lb.states.lock().expect("lb state lock");
+            let entry = guard
+                .entry("routing".to_string())
+                .or_insert_with(LbState::default);
+            entry.ensure_layout(&lb.service.upstreams);
+            entry.usage_exhausted[0] = true;
+            entry.usage_exhausted[1] = true;
+        }
+
+        let report = route_executor_shadow_report("codex", std::slice::from_ref(&lb), None);
+
+        assert!(report.matches);
+        assert_eq!(
+            report
+                .executor_attempts
+                .iter()
+                .map(|attempt| attempt.upstream_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 }

@@ -178,6 +178,12 @@ ServiceViewV4
 Legacy v2 configs can continue to compile into a compatibility `RoutePlan`
 template where each station is treated as a route candidate group.
 
+The shadow executor can consume a read-only `RoutePlanRuntimeState` derived from
+legacy `LbState`. This preserves current dry-run selection semantics for
+`last_good_index`, cooldown/failure threshold, usage exhaustion fallback,
+unsupported-model skips, and multi-station failover without mutating the live
+load-balancer state or changing production request execution.
+
 ## First Phase No-Behavior-Change Contract
 
 Phase 1 must not change:

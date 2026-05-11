@@ -6,7 +6,7 @@ use crate::config::{
     ProviderConfigV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4,
     ServiceConfig, ServiceViewV4, UpstreamAuth, UpstreamConfig, effective_v4_routing,
 };
-use crate::lb::SelectedUpstream;
+use crate::lb::{FAILURE_THRESHOLD, SelectedUpstream};
 use crate::model_routing;
 use crate::runtime_identity::{LegacyUpstreamKey, ProviderEndpointKey, RuntimeUpstreamIdentity};
 
@@ -178,6 +178,54 @@ impl RoutePlanAttemptState {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutePlanRuntimeState {
+    stations: BTreeMap<String, RoutePlanStationRuntimeState>,
+}
+
+impl RoutePlanRuntimeState {
+    pub fn set_station(
+        &mut self,
+        station_name: impl Into<String>,
+        state: RoutePlanStationRuntimeState,
+    ) {
+        self.stations.insert(station_name.into(), state);
+    }
+
+    pub fn station(&self, station_name: &str) -> Option<&RoutePlanStationRuntimeState> {
+        self.stations.get(station_name)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutePlanStationRuntimeState {
+    pub last_good_index: Option<usize>,
+    pub upstreams: BTreeMap<usize, RoutePlanUpstreamRuntimeState>,
+}
+
+impl RoutePlanStationRuntimeState {
+    pub fn set_upstream(&mut self, index: usize, state: RoutePlanUpstreamRuntimeState) {
+        self.upstreams.insert(index, state);
+    }
+
+    fn upstream(&self, index: usize) -> RoutePlanUpstreamRuntimeState {
+        self.upstreams.get(&index).copied().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoutePlanUpstreamRuntimeState {
+    pub failure_count: u32,
+    pub cooldown_active: bool,
+    pub usage_exhausted: bool,
+}
+
+impl RoutePlanUpstreamRuntimeState {
+    fn breaker_open(self) -> bool {
+        self.cooldown_active || self.failure_count >= FAILURE_THRESHOLD
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutePlanSkipReason {
     UnsupportedModel { requested_model: String },
@@ -230,6 +278,19 @@ impl<'a> RoutePlanExecutor<'a> {
         state: &mut RoutePlanAttemptState,
         request_model: Option<&str>,
     ) -> RoutePlanAttemptSelection<'_> {
+        self.select_supported_candidate_with_runtime_state(
+            state,
+            &RoutePlanRuntimeState::default(),
+            request_model,
+        )
+    }
+
+    pub fn select_supported_candidate_with_runtime_state(
+        &self,
+        state: &mut RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
+        request_model: Option<&str>,
+    ) -> RoutePlanAttemptSelection<'_> {
         let total_upstreams = self.template.candidates.len();
         let mut skipped = Vec::new();
 
@@ -244,7 +305,7 @@ impl<'a> RoutePlanExecutor<'a> {
                 };
             }
 
-            let Some(candidate) = self.next_unavoided_candidate(state) else {
+            let Some(candidate) = self.next_unavoided_candidate(state, runtime) else {
                 return RoutePlanAttemptSelection {
                     selected: None,
                     skipped,
@@ -300,14 +361,29 @@ impl<'a> RoutePlanExecutor<'a> {
     fn next_unavoided_candidate(
         &self,
         state: &RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
     ) -> Option<&'a RouteCandidate> {
-        self.template.candidates.iter().find(|candidate| {
+        let mut seen_stations = BTreeSet::new();
+        for station_name in self.template.candidates.iter().filter_map(|candidate| {
             let station_name = candidate_compatibility_station_name(self.template, candidate);
-            !state.avoids_upstream(
+            seen_stations
+                .insert(station_name.clone())
+                .then_some(station_name)
+        }) {
+            if state.station_exhausted_for(
                 station_name.as_str(),
-                candidate_compatibility_upstream_index(candidate),
-            )
-        })
+                self.station_candidate_count(station_name.as_str()),
+            ) {
+                continue;
+            }
+            if let Some(candidate) =
+                self.next_unavoided_station_candidate(state, runtime, station_name.as_str())
+            {
+                return Some(candidate);
+            }
+        }
+
+        None
     }
 
     fn candidates_exhausted(&self, state: &RoutePlanAttemptState) -> bool {
@@ -319,6 +395,68 @@ impl<'a> RoutePlanExecutor<'a> {
                     candidate_compatibility_upstream_index(candidate),
                 )
             })
+    }
+
+    fn station_candidate_count(&self, station_name: &str) -> usize {
+        self.template
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate_compatibility_station_name(self.template, candidate) == station_name
+            })
+            .count()
+    }
+
+    fn next_unavoided_station_candidate(
+        &self,
+        state: &RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
+        station_name: &str,
+    ) -> Option<&'a RouteCandidate> {
+        let station_runtime = runtime.station(station_name);
+        let station_candidates = self
+            .template
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate_compatibility_station_name(self.template, candidate) == station_name
+            })
+            .filter(|candidate| {
+                !state.avoids_upstream(
+                    station_name,
+                    candidate_compatibility_upstream_index(candidate),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(last_good_index) = station_runtime.and_then(|station| station.last_good_index)
+            && let Some(candidate) = station_candidates.iter().copied().find(|candidate| {
+                candidate_compatibility_upstream_index(candidate) == last_good_index
+                    && station_runtime
+                        .map(|station| station.upstream(last_good_index))
+                        .is_none_or(|upstream| {
+                            !upstream.breaker_open() && !upstream.usage_exhausted
+                        })
+            })
+        {
+            return Some(candidate);
+        }
+
+        if let Some(candidate) = station_candidates.iter().copied().find(|candidate| {
+            let index = candidate_compatibility_upstream_index(candidate);
+            station_runtime
+                .map(|station| station.upstream(index))
+                .is_none_or(|upstream| !upstream.breaker_open() && !upstream.usage_exhausted)
+        }) {
+            return Some(candidate);
+        }
+
+        station_candidates.iter().copied().find(|candidate| {
+            let index = candidate_compatibility_upstream_index(candidate);
+            station_runtime
+                .map(|station| station.upstream(index))
+                .is_none_or(|upstream| !upstream.breaker_open())
+        })
     }
 }
 
