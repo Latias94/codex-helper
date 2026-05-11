@@ -10,6 +10,19 @@ English: [README_EN.md](README_EN.md)
 
 ![内置 TUI 面板](https://raw.githubusercontent.com/Latias94/codex-helper/main/screenshots/main.png)
 
+## 支持项目开发
+
+如果 codex-helper 对你有帮助，可以通过我当前自用的 Codex 包月服务支持项目持续开发：
+
+- AI.INPUT.IM 官网：https://ai.input.im
+- AI.INPUT.IM 充值商城：https://shop.input.im
+- 我的推广链接：https://shop.input.im/?code=4394517f
+
+可用折扣码：
+
+- Air 套餐八折：`NEWAIR`
+- Max 套餐七折：`HELLOMAX`
+
 ## 适合谁
 
 - 你有多个 Codex/OpenAI 兼容中转站，不想反复手改 `~/.codex/config.toml`。
