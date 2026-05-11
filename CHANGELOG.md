@@ -18,9 +18,6 @@ All notable changes to this project will be documented in this file.
 
 - 控制面、CLI、TUI 和 GUI 写回 v4 route graph 时会保留 `entry/routes` 结构，provider CRUD 不再把嵌套路由压平成单一 order。
   Control-plane, CLI, TUI, and GUI writes preserve v4 `entry/routes` structure; provider CRUD no longer collapses nested routes into one flat order.
-- TUI 总览页改为 `Sessions + Session Summary + Recent Health + Requests` 信息架构，减少 Sessions/Requests 表格挤压截断，并在总览中展示最近错误、重试、failover、token 与成本摘要。
-  The TUI dashboard now uses a `Sessions + Session Summary + Recent Health + Requests` information layout, reducing cramped Sessions/Requests truncation while surfacing recent errors, retries, failovers, tokens, and cost.
-
 ### 文档 / Documentation
 
 - 补充月包 provider 池与 paygo 兜底的配置说明，明确 `unknown` 余额不等于耗尽，临时故障应通过 cooldown 和后续回探恢复。
