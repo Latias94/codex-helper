@@ -4,7 +4,7 @@ Codex CLI 的本地中转代理与控制台。
 
 它把 Codex 请求先送到本机代理，再按你配置的 provider / routing 转发到 OpenAI 官方或各类中转站。这样你可以在不中断 Codex 使用体验的情况下集中管理多个中转、多个 key、余额/套餐、请求日志、成本估算和 fallback 策略。
 
-当前版本：`v0.13.0`
+当前开发版本：`v0.14.0` route graph 重构中
 
 English: [README_EN.md](README_EN.md)
 
@@ -24,7 +24,7 @@ English: [README_EN.md](README_EN.md)
 
 - **本地代理**：默认监听 `127.0.0.1:3211`，Codex 继续按原方式使用。
 - **安全 Codex 局部修改**：只改本地代理片段，不影响 Codex 运行中写入的其他配置。
-- **provider / routing 配置**：`version = 3` 默认格式，新增 provider 后用 routing 决定顺序、固定或标签优先。
+- **provider / routing 配置**：`version = 4` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
 - **自动兜底**：请求失败、上游不可用或可信余额显示耗尽时，可按策略切换候选 provider/upstream。
 - **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
 - **请求可观测**：记录 provider、model、token、cache token、TTFB、总耗时、输出速度、重试链和估算成本。
@@ -101,7 +101,7 @@ codex-helper config set-retry-profile balanced
 对应的 `~/.codex-helper/config.toml` 很薄：
 
 ```toml
-version = 3
+version = 4
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
@@ -114,9 +114,11 @@ auth_token_env = "OPENAI_API_KEY"
 tags = { billing = "paygo" }
 
 [codex.routing]
-policy = "ordered-failover"
-order = ["input", "openai"]
-on_exhausted = "continue"
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["input", "openai"]
 
 [retry]
 profile = "balanced"
@@ -130,6 +132,7 @@ profile = "balanced"
 | 按顺序兜底 | `codex-helper routing order input openai` | 最直观，适合大多数用户 |
 | 包月优先 | `codex-helper routing prefer-tag --tag billing=monthly --order input,openai --on-exhausted continue` | 包月都已知耗尽后继续兜底 |
 | 包月止损 | 同上但 `--on-exhausted stop` | 不自动切到按量 provider |
+| 月包池 + paygo 兜底 | 在 TOML 中用嵌套 route nodes | `monthly_pool -> paygo` 保留清晰分组 |
 
 完整配置、迁移、余额适配、价格覆盖和 GUI/TUI 编辑说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
 

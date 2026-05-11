@@ -1,17 +1,17 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn render_v3_provider_editor(
+pub(super) fn render_v4_provider_editor(
     ui: &mut egui::Ui,
     lang: Language,
-    cfg: &mut crate::config::ProxyConfigV3,
+    cfg: &mut crate::config::ProxyConfigV4,
     editor: &mut ProxySettingsProviderEditorState,
 ) -> Option<Result<String, String>> {
     ui.heading(pick(lang, "Provider 编辑", "Provider editor"));
     ui.small(pick(
         lang,
-        "这是常用单 endpoint provider 的快速表单。新增 provider 会自动加入 routing.order。",
-        "This is a quick editor for common single-endpoint providers. New providers are appended to routing.order.",
+        "这是常用单 endpoint provider 的快速表单。新增 provider 会自动加入入口 route。",
+        "This is a quick editor for common single-endpoint providers. New providers are appended to the entry route.",
     ));
     ui.add_space(6.0);
 
@@ -177,11 +177,16 @@ pub(super) fn render_v3_provider_editor(
     let order_preview = service
         .routing
         .as_ref()
-        .map(|routing| {
-            if routing.order.is_empty() {
+        .map(|_| {
+            let routing = crate::config::effective_v4_routing(service);
+            let order = routing
+                .entry_node()
+                .map(|node| node.children.as_slice())
+                .unwrap_or(&[]);
+            if order.is_empty() {
                 "<provider key order>".to_string()
             } else {
-                routing.order.join(" -> ")
+                order.join(" -> ")
             }
         })
         .unwrap_or_else(|| "<implicit ordered-failover>".to_string());
@@ -194,10 +199,10 @@ pub(super) fn render_v3_provider_editor(
     action
 }
 
-pub(super) fn render_v3_routing_editor(
+pub(super) fn render_v4_routing_editor(
     ui: &mut egui::Ui,
     lang: Language,
-    cfg: &mut crate::config::ProxyConfigV3,
+    cfg: &mut crate::config::ProxyConfigV4,
     service_kind: ProxySettingsProviderEditorService,
     editor: &mut ProxySettingsRoutingEditorState,
 ) -> Option<Result<String, String>> {
@@ -226,17 +231,17 @@ pub(super) fn render_v3_routing_editor(
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
                         &mut editor.policy,
-                        crate::config::RoutingPolicyV3::OrderedFailover,
+                        crate::config::RoutingPolicyV4::OrderedFailover,
                         "ordered-failover",
                     );
                     ui.selectable_value(
                         &mut editor.policy,
-                        crate::config::RoutingPolicyV3::ManualSticky,
+                        crate::config::RoutingPolicyV4::ManualSticky,
                         "manual-sticky",
                     );
                     ui.selectable_value(
                         &mut editor.policy,
-                        crate::config::RoutingPolicyV3::TagPreferred,
+                        crate::config::RoutingPolicyV4::TagPreferred,
                         "tag-preferred",
                     );
                 });
@@ -247,12 +252,12 @@ pub(super) fn render_v3_routing_editor(
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
                         &mut editor.on_exhausted,
-                        crate::config::RoutingExhaustedActionV3::Continue,
+                        crate::config::RoutingExhaustedActionV4::Continue,
                         "continue",
                     );
                     ui.selectable_value(
                         &mut editor.on_exhausted,
-                        crate::config::RoutingExhaustedActionV3::Stop,
+                        crate::config::RoutingExhaustedActionV4::Stop,
                         "stop",
                     );
                 });
@@ -294,7 +299,7 @@ pub(super) fn render_v3_routing_editor(
         ui.horizontal(|ui| {
             ui.label("prefer_tags");
             ui.add_enabled(
-                matches!(editor.policy, crate::config::RoutingPolicyV3::TagPreferred),
+                matches!(editor.policy, crate::config::RoutingPolicyV4::TagPreferred),
                 egui::TextEdit::singleline(&mut editor.prefer_tags)
                     .desired_width(360.0)
                     .hint_text("billing=monthly"),
@@ -334,33 +339,48 @@ pub(super) fn render_v3_routing_editor(
     action
 }
 
-pub(super) fn routing_policy_label(policy: crate::config::RoutingPolicyV3) -> &'static str {
+pub(super) fn routing_policy_label(policy: crate::config::RoutingPolicyV4) -> &'static str {
     match policy {
-        crate::config::RoutingPolicyV3::ManualSticky => "manual-sticky",
-        crate::config::RoutingPolicyV3::OrderedFailover => "ordered-failover",
-        crate::config::RoutingPolicyV3::TagPreferred => "tag-preferred",
+        crate::config::RoutingPolicyV4::ManualSticky => "manual-sticky",
+        crate::config::RoutingPolicyV4::OrderedFailover => "ordered-failover",
+        crate::config::RoutingPolicyV4::TagPreferred => "tag-preferred",
     }
 }
 
-fn routing_exhausted_label(action: crate::config::RoutingExhaustedActionV3) -> &'static str {
+fn routing_exhausted_label(action: crate::config::RoutingExhaustedActionV4) -> &'static str {
     match action {
-        crate::config::RoutingExhaustedActionV3::Continue => "continue",
-        crate::config::RoutingExhaustedActionV3::Stop => "stop",
+        crate::config::RoutingExhaustedActionV4::Continue => "continue",
+        crate::config::RoutingExhaustedActionV4::Stop => "stop",
     }
 }
 
-fn routing_editor_source_signature(service: &crate::config::ServiceViewV3) -> String {
+fn routing_editor_source_signature(service: &crate::config::ServiceViewV4) -> String {
     let routing = service
         .routing
         .as_ref()
         .map(|routing| {
+            let routes = routing
+                .routes
+                .iter()
+                .map(|(name, node)| {
+                    format!(
+                        "{name}:{:?}:{}:{}:{}",
+                        node.strategy,
+                        node.children.join(","),
+                        node.target.as_deref().unwrap_or_default(),
+                        format_routing_prefer_tag_sets(&node.prefer_tags)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|");
             format!(
-                "{:?}|{}|{}|{}|{}",
-                routing.policy,
-                routing.order.join(","),
-                routing.target.as_deref().unwrap_or_default(),
-                format_routing_prefer_tag_sets(&routing.prefer_tags),
-                routing_exhausted_label(routing.on_exhausted)
+                "{}|{}|{}",
+                routing.entry,
+                routes,
+                routing
+                    .entry_node()
+                    .map(|node| routing_exhausted_label(node.on_exhausted))
+                    .unwrap_or("continue")
             )
         })
         .unwrap_or_else(|| "<implicit>".to_string());
@@ -382,36 +402,41 @@ fn routing_editor_source_signature(service: &crate::config::ServiceViewV3) -> St
 
 fn load_routing_editor_from_service(
     editor: &mut ProxySettingsRoutingEditorState,
-    service: &crate::config::ServiceViewV3,
+    service: &crate::config::ServiceViewV4,
     signature: String,
 ) {
-    let routing = service.routing.as_ref();
-    editor.policy = routing
-        .map(|routing| routing.policy)
-        .unwrap_or(crate::config::RoutingPolicyV3::OrderedFailover);
-    editor.target = routing
-        .and_then(|routing| routing.target.clone())
+    let routing = service
+        .routing
+        .as_ref()
+        .map(|_| crate::config::effective_v4_routing(service));
+    let entry_node = routing.as_ref().and_then(|routing| routing.entry_node());
+    editor.policy = entry_node
+        .map(|node| node.strategy)
+        .unwrap_or(crate::config::RoutingPolicyV4::OrderedFailover);
+    editor.target = entry_node
+        .and_then(|node| node.target.clone())
         .unwrap_or_default();
-    editor.order = routing
-        .map(|routing| {
-            if routing.order.is_empty() {
+    editor.order = entry_node
+        .map(|node| {
+            if node.children.is_empty() {
                 ordered_provider_names_for_editor(service).join(", ")
             } else {
-                routing.order.join(", ")
+                node.children.join(", ")
             }
         })
         .unwrap_or_else(|| ordered_provider_names_for_editor(service).join(", "));
-    editor.prefer_tags = routing
-        .map(|routing| format_routing_prefer_tag_sets(&routing.prefer_tags))
+    editor.prefer_tags = entry_node
+        .map(|node| format_routing_prefer_tag_sets(&node.prefer_tags))
         .unwrap_or_default();
-    editor.on_exhausted = routing
-        .map(|routing| routing.on_exhausted)
-        .unwrap_or(crate::config::RoutingExhaustedActionV3::Continue);
+    editor.original_routing = routing.clone();
+    editor.on_exhausted = entry_node
+        .map(|node| node.on_exhausted)
+        .unwrap_or(crate::config::RoutingExhaustedActionV4::Continue);
     editor.source_signature = Some(signature);
 }
 
 fn save_routing_from_editor(
-    cfg: &mut crate::config::ProxyConfigV3,
+    cfg: &mut crate::config::ProxyConfigV4,
     editor: &mut ProxySettingsRoutingEditorState,
     service_kind: ProxySettingsProviderEditorService,
     lang: Language,
@@ -429,12 +454,12 @@ fn save_routing_from_editor(
 
 fn build_routing_from_editor(
     editor: &ProxySettingsRoutingEditorState,
-    service: &crate::config::ServiceViewV3,
-) -> Result<crate::config::RoutingConfigV3, String> {
+    service: &crate::config::ServiceViewV4,
+) -> Result<crate::config::RoutingConfigV4, String> {
     let order = normalize_routing_editor_order(&editor.order, service)?;
     let on_exhausted = editor.on_exhausted;
     match editor.policy {
-        crate::config::RoutingPolicyV3::ManualSticky => {
+        crate::config::RoutingPolicyV4::ManualSticky => {
             let target = editor.target.trim();
             if target.is_empty() {
                 return Err("manual-sticky routing requires a target provider".to_string());
@@ -442,27 +467,20 @@ fn build_routing_from_editor(
             if !service.providers.contains_key(target) {
                 return Err(format!("target provider '{target}' does not exist"));
             }
-            Ok(crate::config::RoutingConfigV3 {
-                policy: crate::config::RoutingPolicyV3::ManualSticky,
+            Ok(crate::config::RoutingConfigV4::manual_sticky(
+                target.to_string(),
                 order,
-                target: Some(target.to_string()),
-                prefer_tags: Vec::new(),
-                on_exhausted,
-            })
+            ))
         }
-        crate::config::RoutingPolicyV3::OrderedFailover => Ok(crate::config::RoutingConfigV3 {
-            policy: crate::config::RoutingPolicyV3::OrderedFailover,
-            order,
-            target: None,
-            prefer_tags: Vec::new(),
-            on_exhausted,
-        }),
-        crate::config::RoutingPolicyV3::TagPreferred => {
+        crate::config::RoutingPolicyV4::OrderedFailover => {
+            Ok(crate::config::RoutingConfigV4::ordered_failover(order))
+        }
+        crate::config::RoutingPolicyV4::TagPreferred => {
             let prefer_tags = parse_routing_prefer_tag_sets(&editor.prefer_tags)?;
             if prefer_tags.is_empty() {
                 return Err("tag-preferred routing requires prefer_tags".to_string());
             }
-            if matches!(on_exhausted, crate::config::RoutingExhaustedActionV3::Stop)
+            if matches!(on_exhausted, crate::config::RoutingExhaustedActionV4::Stop)
                 && !order.iter().any(|name| {
                     service.providers.get(name).is_some_and(|provider| {
                         provider_matches_any_tag_set(provider, &prefer_tags)
@@ -473,20 +491,18 @@ fn build_routing_from_editor(
                     "tag-preferred routing with on_exhausted=stop matches no providers".to_string(),
                 );
             }
-            Ok(crate::config::RoutingConfigV3 {
-                policy: crate::config::RoutingPolicyV3::TagPreferred,
+            Ok(crate::config::RoutingConfigV4::tag_preferred(
                 order,
-                target: None,
                 prefer_tags,
                 on_exhausted,
-            })
+            ))
         }
     }
 }
 
 fn normalize_routing_editor_order(
     raw: &str,
-    service: &crate::config::ServiceViewV3,
+    service: &crate::config::ServiceViewV4,
 ) -> Result<Vec<String>, String> {
     let mut order = parse_routing_provider_list(raw);
     if order.is_empty() {
@@ -495,10 +511,10 @@ fn normalize_routing_editor_order(
     let mut seen = BTreeSet::new();
     for name in &order {
         if !service.providers.contains_key(name) {
-            return Err(format!("provider '{name}' in routing.order does not exist"));
+            return Err(format!("provider '{name}' in routing entry does not exist"));
         }
         if !seen.insert(name.clone()) {
-            return Err(format!("duplicate provider '{name}' in routing.order"));
+            return Err(format!("duplicate provider '{name}' in routing entry"));
         }
     }
     for name in ordered_provider_names_for_editor(service) {
@@ -553,9 +569,9 @@ struct RoutingPreviewRow {
 fn render_routing_editor_preview(
     ui: &mut egui::Ui,
     lang: Language,
-    cfg: &crate::config::ProxyConfigV3,
+    cfg: &crate::config::ProxyConfigV4,
     service_kind: ProxySettingsProviderEditorService,
-    draft: Result<&crate::config::RoutingConfigV3, &String>,
+    draft: Result<&crate::config::RoutingConfigV4, &String>,
 ) {
     ui.group(|ui| {
         ui.label(pick(lang, "Routing 预览", "Routing preview"));
@@ -590,35 +606,53 @@ fn render_routing_editor_preview(
 }
 
 fn routing_preview_rows(
-    service: &crate::config::ServiceViewV3,
-    routing: &crate::config::RoutingConfigV3,
+    service: &crate::config::ServiceViewV4,
+    routing: &crate::config::RoutingConfigV4,
 ) -> Vec<RoutingPreviewRow> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
-    match routing.policy {
-        crate::config::RoutingPolicyV3::ManualSticky => {
-            if let Some(target) = routing.target.as_deref() {
+    let effective = {
+        let mut service = service.clone();
+        service.routing = Some(routing.clone());
+        crate::config::effective_v4_routing(&service)
+    };
+    let node = effective.entry_node();
+    match node
+        .map(|node| node.strategy)
+        .unwrap_or(crate::config::RoutingPolicyV4::OrderedFailover)
+    {
+        crate::config::RoutingPolicyV4::ManualSticky => {
+            if let Some(target) = node.and_then(|node| node.target.as_deref()) {
                 push_routing_preview_row(&mut rows, &mut seen, service, target, "target");
             }
         }
-        crate::config::RoutingPolicyV3::OrderedFailover => {
-            for name in &routing.order {
+        crate::config::RoutingPolicyV4::OrderedFailover => {
+            let order = crate::config::resolved_v4_provider_order("gui-routing-preview", &{
+                let mut service = service.clone();
+                service.routing = Some(effective.clone());
+                service
+            })
+            .unwrap_or_else(|_| ordered_provider_names_for_editor(service));
+            for name in &order {
                 push_routing_preview_row(&mut rows, &mut seen, service, name, "fallback");
             }
         }
-        crate::config::RoutingPolicyV3::TagPreferred => {
-            for name in &routing.order {
+        crate::config::RoutingPolicyV4::TagPreferred => {
+            let children = node.map(|node| node.children.as_slice()).unwrap_or(&[]);
+            let prefer_tags = node.map(|node| node.prefer_tags.as_slice()).unwrap_or(&[]);
+            for name in children {
                 if let Some(provider) = service.providers.get(name)
-                    && provider_matches_any_tag_set(provider, &routing.prefer_tags)
+                    && provider_matches_any_tag_set(provider, prefer_tags)
                 {
                     push_routing_preview_row(&mut rows, &mut seen, service, name, "preferred");
                 }
             }
             if matches!(
-                routing.on_exhausted,
-                crate::config::RoutingExhaustedActionV3::Continue
+                node.map(|node| node.on_exhausted)
+                    .unwrap_or(crate::config::RoutingExhaustedActionV4::Continue),
+                crate::config::RoutingExhaustedActionV4::Continue
             ) {
-                for name in &routing.order {
+                for name in children {
                     push_routing_preview_row(&mut rows, &mut seen, service, name, "fallback");
                 }
             }
@@ -630,7 +664,7 @@ fn routing_preview_rows(
 fn push_routing_preview_row(
     rows: &mut Vec<RoutingPreviewRow>,
     seen: &mut BTreeSet<String>,
-    service: &crate::config::ServiceViewV3,
+    service: &crate::config::ServiceViewV4,
     provider_name: &str,
     role: &'static str,
 ) {
@@ -658,7 +692,7 @@ fn push_routing_preview_row(
 }
 
 fn provider_matches_any_tag_set(
-    provider: &crate::config::ProviderConfigV3,
+    provider: &crate::config::ProviderConfigV4,
     tag_sets: &[BTreeMap<String, String>],
 ) -> bool {
     tag_sets.iter().any(|tag_set| {
@@ -679,9 +713,9 @@ fn provider_editor_service_label(
 }
 
 fn select_provider_editor_service(
-    cfg: &crate::config::ProxyConfigV3,
+    cfg: &crate::config::ProxyConfigV4,
     service: ProxySettingsProviderEditorService,
-) -> &crate::config::ServiceViewV3 {
+) -> &crate::config::ServiceViewV4 {
     match service {
         ProxySettingsProviderEditorService::Codex => &cfg.codex,
         ProxySettingsProviderEditorService::Claude => &cfg.claude,
@@ -689,27 +723,18 @@ fn select_provider_editor_service(
 }
 
 fn select_provider_editor_service_mut(
-    cfg: &mut crate::config::ProxyConfigV3,
+    cfg: &mut crate::config::ProxyConfigV4,
     service: ProxySettingsProviderEditorService,
-) -> &mut crate::config::ServiceViewV3 {
+) -> &mut crate::config::ServiceViewV4 {
     match service {
         ProxySettingsProviderEditorService::Codex => &mut cfg.codex,
         ProxySettingsProviderEditorService::Claude => &mut cfg.claude,
     }
 }
 
-fn ordered_provider_names_for_editor(view: &crate::config::ServiceViewV3) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(routing) = view.routing.as_ref() {
-        if matches!(routing.policy, crate::config::RoutingPolicyV3::ManualSticky)
-            && let Some(target) = routing.target.as_deref()
-        {
-            push_provider_name_once(&mut names, view, target);
-        }
-        for name in &routing.order {
-            push_provider_name_once(&mut names, view, name);
-        }
-    }
+fn ordered_provider_names_for_editor(view: &crate::config::ServiceViewV4) -> Vec<String> {
+    let mut names =
+        crate::config::resolved_v4_provider_order("gui-provider-editor", view).unwrap_or_default();
     for name in view.providers.keys() {
         push_provider_name_once(&mut names, view, name);
     }
@@ -718,7 +743,7 @@ fn ordered_provider_names_for_editor(view: &crate::config::ServiceViewV3) -> Vec
 
 fn push_provider_name_once(
     names: &mut Vec<String>,
-    view: &crate::config::ServiceViewV3,
+    view: &crate::config::ServiceViewV4,
     name: &str,
 ) {
     if view.providers.contains_key(name) && !names.iter().any(|existing| existing == name) {
@@ -738,7 +763,7 @@ fn reset_provider_editor_draft(editor: &mut ProxySettingsProviderEditorState) {
 }
 
 fn load_provider_editor_draft(
-    cfg: &crate::config::ProxyConfigV3,
+    cfg: &crate::config::ProxyConfigV4,
     editor: &mut ProxySettingsProviderEditorState,
     selection: Option<String>,
 ) {
@@ -775,7 +800,7 @@ fn load_provider_editor_draft(
     editor.enabled = provider.enabled;
 }
 
-fn provider_is_advanced_for_form(provider: &crate::config::ProviderConfigV3) -> bool {
+fn provider_is_advanced_for_form(provider: &crate::config::ProviderConfigV4) -> bool {
     !provider.endpoints.is_empty()
         || provider.inline_auth.auth_token.is_some()
         || provider.inline_auth.api_key.is_some()
@@ -784,7 +809,7 @@ fn provider_is_advanced_for_form(provider: &crate::config::ProviderConfigV3) -> 
 }
 
 fn save_provider_from_editor(
-    cfg: &mut crate::config::ProxyConfigV3,
+    cfg: &mut crate::config::ProxyConfigV4,
     editor: &mut ProxySettingsProviderEditorState,
     lang: Language,
 ) -> Result<String, String> {
@@ -844,7 +869,7 @@ fn save_provider_from_editor(
 }
 
 fn remove_provider_from_editor(
-    cfg: &mut crate::config::ProxyConfigV3,
+    cfg: &mut crate::config::ProxyConfigV4,
     editor: &mut ProxySettingsProviderEditorState,
     provider_name: &str,
     lang: Language,
@@ -854,13 +879,7 @@ fn remove_provider_from_editor(
         return Err(format!("provider '{provider_name}' no longer exists"));
     }
     if let Some(routing) = service.routing.as_mut() {
-        routing.order.retain(|name| name != provider_name);
-        if routing.target.as_deref() == Some(provider_name) {
-            routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
-            routing.target = None;
-            routing.prefer_tags.clear();
-            routing.on_exhausted = crate::config::RoutingExhaustedActionV3::Continue;
-        }
+        remove_provider_from_route_nodes(routing, provider_name);
     }
     reset_provider_editor_draft(editor);
     Ok(format!(
@@ -872,30 +891,52 @@ fn remove_provider_from_editor(
 }
 
 fn ensure_provider_editor_routing_order_contains(
-    service: &mut crate::config::ServiceViewV3,
+    service: &mut crate::config::ServiceViewV4,
     provider_name: &str,
 ) {
     let routing = service
         .routing
-        .get_or_insert_with(crate::config::RoutingConfigV3::default);
-    if !routing.order.iter().any(|name| name == provider_name) {
-        routing.order.push(provider_name.to_string());
+        .get_or_insert_with(crate::config::RoutingConfigV4::default);
+    let entry = routing.entry.clone();
+    let node = routing.routes.entry(entry).or_default();
+    if !node.children.iter().any(|name| name == provider_name) {
+        node.children.push(provider_name.to_string());
     }
+    routing.sync_compat_from_graph();
 }
 
 fn clear_provider_editor_manual_target(
-    service: &mut crate::config::ServiceViewV3,
+    service: &mut crate::config::ServiceViewV4,
     provider_name: &str,
 ) {
     let Some(routing) = service.routing.as_mut() else {
         return;
     };
-    if routing.target.as_deref() == Some(provider_name) {
-        routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
-        routing.target = None;
-        routing.prefer_tags.clear();
-        routing.on_exhausted = crate::config::RoutingExhaustedActionV3::Continue;
+    if routing.entry_node().and_then(|node| node.target.as_deref()) == Some(provider_name) {
+        let entry = routing.entry.clone();
+        let node = routing.routes.entry(entry).or_default();
+        node.strategy = crate::config::RoutingPolicyV4::OrderedFailover;
+        node.target = None;
+        node.prefer_tags.clear();
+        node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
+        routing.sync_compat_from_graph();
     }
+}
+
+fn remove_provider_from_route_nodes(
+    routing: &mut crate::config::RoutingConfigV4,
+    provider_name: &str,
+) {
+    for node in routing.routes.values_mut() {
+        node.children.retain(|name| name != provider_name);
+        if node.target.as_deref() == Some(provider_name) {
+            node.target = None;
+            if matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky) {
+                node.strategy = crate::config::RoutingPolicyV4::OrderedFailover;
+            }
+        }
+    }
+    routing.sync_compat_from_graph();
 }
 
 fn normalize_provider_editor_name(raw: &str) -> Result<String, String> {
@@ -984,7 +1025,7 @@ mod tests {
 
     #[test]
     fn provider_editor_save_adds_inline_provider_and_routing_order() {
-        let mut cfg = crate::config::ProxyConfigV3::default();
+        let mut cfg = crate::config::ProxyConfigV4::default();
         let mut editor = ProxySettingsProviderEditorState {
             draft_name: "input".to_string(),
             base_url: "https://ai.input.im/v1".to_string(),
@@ -1010,27 +1051,26 @@ mod tests {
             cfg.codex
                 .routing
                 .as_ref()
-                .map(|routing| routing.order.as_slice()),
+                .and_then(|routing| routing.entry_node())
+                .map(|node| node.children.as_slice()),
             Some(&["input".to_string()][..])
         );
     }
 
     #[test]
     fn provider_editor_disable_clears_manual_target() {
-        let mut cfg = crate::config::ProxyConfigV3::default();
+        let mut cfg = crate::config::ProxyConfigV4::default();
         cfg.codex.providers.insert(
             "input".to_string(),
-            crate::config::ProviderConfigV3 {
+            crate::config::ProviderConfigV4 {
                 base_url: Some("https://ai.input.im/v1".to_string()),
-                ..crate::config::ProviderConfigV3::default()
+                ..crate::config::ProviderConfigV4::default()
             },
         );
-        cfg.codex.routing = Some(crate::config::RoutingConfigV3 {
-            policy: crate::config::RoutingPolicyV3::ManualSticky,
-            target: Some("input".to_string()),
-            order: vec!["input".to_string()],
-            ..crate::config::RoutingConfigV3::default()
-        });
+        cfg.codex.routing = Some(crate::config::RoutingConfigV4::manual_sticky(
+            "input".to_string(),
+            vec!["input".to_string()],
+        ));
         let mut editor = ProxySettingsProviderEditorState {
             selected_provider: Some("input".to_string()),
             draft_name: "input".to_string(),
@@ -1043,29 +1083,31 @@ mod tests {
             .expect("provider should save");
 
         let routing = cfg.codex.routing.as_ref().expect("routing exists");
+        let entry = routing.entry_node().expect("entry exists");
         assert_eq!(
-            routing.policy,
-            crate::config::RoutingPolicyV3::OrderedFailover
+            entry.strategy,
+            crate::config::RoutingPolicyV4::OrderedFailover
         );
-        assert_eq!(routing.target, None);
+        assert_eq!(entry.target, None);
     }
 
     #[test]
     fn routing_editor_order_keeps_unlisted_providers_as_tail_fallbacks() {
-        let mut service = crate::config::ServiceViewV3::default();
+        let mut service = crate::config::ServiceViewV4::default();
         service
             .providers
-            .insert("a".to_string(), crate::config::ProviderConfigV3::default());
+            .insert("a".to_string(), crate::config::ProviderConfigV4::default());
         service
             .providers
-            .insert("b".to_string(), crate::config::ProviderConfigV3::default());
+            .insert("b".to_string(), crate::config::ProviderConfigV4::default());
         service
             .providers
-            .insert("c".to_string(), crate::config::ProviderConfigV3::default());
-        service.routing = Some(crate::config::RoutingConfigV3 {
-            order: vec!["c".to_string(), "a".to_string(), "b".to_string()],
-            ..crate::config::RoutingConfigV3::default()
-        });
+            .insert("c".to_string(), crate::config::ProviderConfigV4::default());
+        service.routing = Some(crate::config::RoutingConfigV4::ordered_failover(vec![
+            "c".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+        ]));
         let editor = ProxySettingsRoutingEditorState {
             order: "b".to_string(),
             ..ProxySettingsRoutingEditorState::default()
@@ -1073,31 +1115,34 @@ mod tests {
 
         let routing = build_routing_from_editor(&editor, &service).expect("routing should build");
 
-        assert_eq!(routing.order, ["b", "c", "a"]);
+        assert_eq!(
+            routing.entry_node().map(|node| node.children.as_slice()),
+            Some(&["b".to_string(), "c".to_string(), "a".to_string()][..])
+        );
     }
 
     #[test]
     fn routing_editor_tag_preferred_continue_previews_preferred_then_fallbacks() {
-        let mut service = crate::config::ServiceViewV3::default();
+        let mut service = crate::config::ServiceViewV4::default();
         service.providers.insert(
             "monthly".to_string(),
-            crate::config::ProviderConfigV3 {
+            crate::config::ProviderConfigV4 {
                 tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
-                ..crate::config::ProviderConfigV3::default()
+                ..crate::config::ProviderConfigV4::default()
             },
         );
         service.providers.insert(
             "paygo".to_string(),
-            crate::config::ProviderConfigV3 {
+            crate::config::ProviderConfigV4 {
                 tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
-                ..crate::config::ProviderConfigV3::default()
+                ..crate::config::ProviderConfigV4::default()
             },
         );
         let editor = ProxySettingsRoutingEditorState {
-            policy: crate::config::RoutingPolicyV3::TagPreferred,
+            policy: crate::config::RoutingPolicyV4::TagPreferred,
             order: "paygo, monthly".to_string(),
             prefer_tags: "billing=monthly".to_string(),
-            on_exhausted: crate::config::RoutingExhaustedActionV3::Continue,
+            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
             ..ProxySettingsRoutingEditorState::default()
         };
 
@@ -1114,26 +1159,26 @@ mod tests {
 
     #[test]
     fn routing_editor_tag_preferred_stop_excludes_non_matching_fallbacks() {
-        let mut service = crate::config::ServiceViewV3::default();
+        let mut service = crate::config::ServiceViewV4::default();
         service.providers.insert(
             "monthly".to_string(),
-            crate::config::ProviderConfigV3 {
+            crate::config::ProviderConfigV4 {
                 tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
-                ..crate::config::ProviderConfigV3::default()
+                ..crate::config::ProviderConfigV4::default()
             },
         );
         service.providers.insert(
             "paygo".to_string(),
-            crate::config::ProviderConfigV3 {
+            crate::config::ProviderConfigV4 {
                 tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
-                ..crate::config::ProviderConfigV3::default()
+                ..crate::config::ProviderConfigV4::default()
             },
         );
         let editor = ProxySettingsRoutingEditorState {
-            policy: crate::config::RoutingPolicyV3::TagPreferred,
+            policy: crate::config::RoutingPolicyV4::TagPreferred,
             order: "monthly, paygo".to_string(),
             prefer_tags: "billing=monthly".to_string(),
-            on_exhausted: crate::config::RoutingExhaustedActionV3::Stop,
+            on_exhausted: crate::config::RoutingExhaustedActionV4::Stop,
             ..ProxySettingsRoutingEditorState::default()
         };
 
@@ -1150,19 +1195,19 @@ mod tests {
 
     #[test]
     fn routing_editor_tag_preferred_stop_rejects_empty_match_set() {
-        let mut service = crate::config::ServiceViewV3::default();
+        let mut service = crate::config::ServiceViewV4::default();
         service.providers.insert(
             "paygo".to_string(),
-            crate::config::ProviderConfigV3 {
+            crate::config::ProviderConfigV4 {
                 tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
-                ..crate::config::ProviderConfigV3::default()
+                ..crate::config::ProviderConfigV4::default()
             },
         );
         let editor = ProxySettingsRoutingEditorState {
-            policy: crate::config::RoutingPolicyV3::TagPreferred,
+            policy: crate::config::RoutingPolicyV4::TagPreferred,
             order: "paygo".to_string(),
             prefer_tags: "billing=monthly".to_string(),
-            on_exhausted: crate::config::RoutingExhaustedActionV3::Stop,
+            on_exhausted: crate::config::RoutingExhaustedActionV4::Stop,
             ..ProxySettingsRoutingEditorState::default()
         };
 

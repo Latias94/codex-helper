@@ -224,7 +224,7 @@ pub async fn run_dashboard(
                     }
                     ui.last_runtime_config_refresh_at = Some(Instant::now());
                 }
-                if ui.uses_v3_routing()
+                if ui.uses_route_graph_routing()
                     && ui.page == crate::tui::types::Page::Stations
                     && ui
                         .last_routing_control_refresh_at

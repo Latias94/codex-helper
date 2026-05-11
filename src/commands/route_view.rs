@@ -1,10 +1,10 @@
 use super::config_doc::{
-    ConfigDocument, load_config_document, ordered_v3_provider_names, print_v3_provider_list,
+    ConfigDocument, load_config_document, ordered_v4_provider_names, print_v4_provider_list,
     resolve_service, routing_exhausted_label, routing_policy_label, select_service_manager,
-    select_v3_service_view,
+    select_v4_service_view,
 };
 use crate::config::{
-    ServiceConfigManager, ServiceRoutingExplanation, ServiceViewV3, explain_service_routing,
+    ServiceConfigManager, ServiceRoutingExplanation, ServiceViewV4, explain_service_routing,
     storage::config_file_path,
 };
 use crate::{CliError, CliResult, RoutingCommand};
@@ -30,68 +30,84 @@ struct ConfigExplainPayload {
 }
 
 #[derive(Debug, Serialize, Clone)]
-struct ConfigExplainV3ProviderEndpoint {
+struct ConfigExplainV4ProviderEndpoint {
     name: String,
     base_url: String,
     enabled: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
-struct ConfigExplainV3Provider {
+struct ConfigExplainV4Provider {
     name: String,
     alias: Option<String>,
     enabled: bool,
     routing_index: Option<usize>,
     target: bool,
     tags: BTreeMap<String, String>,
-    endpoints: Vec<ConfigExplainV3ProviderEndpoint>,
+    endpoints: Vec<ConfigExplainV4ProviderEndpoint>,
 }
 
 #[derive(Debug, Serialize)]
-struct ConfigExplainV3Routing {
+struct ConfigExplainV4Routing {
+    entry: String,
     policy: &'static str,
     target: Option<String>,
     order: Vec<String>,
+    expanded_order: Vec<String>,
     prefer_tags: Vec<BTreeMap<String, String>>,
     on_exhausted: &'static str,
 }
 
 #[derive(Debug, Serialize)]
-struct ConfigExplainV3Payload {
+struct ConfigExplainV4Payload {
     schema_version: u32,
     service: String,
-    routing: ConfigExplainV3Routing,
-    providers: Vec<ConfigExplainV3Provider>,
-    provider: Option<ConfigExplainV3Provider>,
+    routing: ConfigExplainV4Routing,
+    providers: Vec<ConfigExplainV4Provider>,
+    provider: Option<ConfigExplainV4Provider>,
 }
 
-fn explain_v3_routing(view: &ServiceViewV3) -> ConfigExplainV3Routing {
-    let routing = view.routing.clone().unwrap_or_default();
-    ConfigExplainV3Routing {
-        policy: routing_policy_label(routing.policy),
-        target: routing.target,
-        order: routing.order,
-        prefer_tags: routing.prefer_tags,
-        on_exhausted: routing_exhausted_label(routing.on_exhausted),
+fn explain_v4_routing(view: &ServiceViewV4) -> ConfigExplainV4Routing {
+    let routing = crate::config::effective_v4_routing(view);
+    let entry_node = routing.entry_node();
+    ConfigExplainV4Routing {
+        entry: routing.entry.clone(),
+        policy: routing_policy_label(
+            entry_node
+                .map(|node| node.strategy)
+                .unwrap_or(crate::config::RoutingPolicyV4::OrderedFailover),
+        ),
+        target: entry_node.and_then(|node| node.target.clone()),
+        order: entry_node
+            .map(|node| node.children.clone())
+            .unwrap_or_default(),
+        expanded_order: crate::config::resolved_v4_provider_order("route-view", view)
+            .unwrap_or_else(|_| view.providers.keys().cloned().collect()),
+        prefer_tags: entry_node
+            .map(|node| node.prefer_tags.clone())
+            .unwrap_or_default(),
+        on_exhausted: routing_exhausted_label(
+            entry_node
+                .map(|node| node.on_exhausted)
+                .unwrap_or(crate::config::RoutingExhaustedActionV4::Continue),
+        ),
     }
 }
 
-fn explain_v3_provider(
-    view: &ServiceViewV3,
+fn explain_v4_provider(
+    view: &ServiceViewV4,
     provider_name: &str,
-) -> Option<ConfigExplainV3Provider> {
+) -> Option<ConfigExplainV4Provider> {
     let provider = view.providers.get(provider_name)?;
-    let routing = view.routing.as_ref();
-    let routing_index = routing
-        .and_then(|routing| {
-            routing
-                .order
-                .iter()
-                .position(|candidate| candidate == provider_name)
-        })
+    let route_order = crate::config::resolved_v4_provider_order("route-view", view)
+        .unwrap_or_else(|_| ordered_v4_provider_names(view));
+    let routing_index = route_order
+        .iter()
+        .position(|candidate| candidate == provider_name)
         .map(|idx| idx + 1);
-    let target = routing
-        .and_then(|routing| routing.target.as_deref())
+    let target = crate::config::effective_v4_routing(view)
+        .entry_node()
+        .and_then(|node| node.target.as_deref())
         .is_some_and(|target| target == provider_name);
 
     let mut endpoints = Vec::new();
@@ -101,21 +117,21 @@ fn explain_v3_provider(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        endpoints.push(ConfigExplainV3ProviderEndpoint {
+        endpoints.push(ConfigExplainV4ProviderEndpoint {
             name: "default".to_string(),
             base_url: base_url.to_string(),
             enabled: provider.enabled,
         });
     }
     endpoints.extend(provider.endpoints.iter().map(|(endpoint_name, endpoint)| {
-        ConfigExplainV3ProviderEndpoint {
+        ConfigExplainV4ProviderEndpoint {
             name: endpoint_name.clone(),
             base_url: endpoint.base_url.clone(),
             enabled: endpoint.enabled,
         }
     }));
 
-    Some(ConfigExplainV3Provider {
+    Some(ConfigExplainV4Provider {
         name: provider_name.to_string(),
         alias: provider.alias.clone(),
         enabled: provider.enabled,
@@ -126,21 +142,22 @@ fn explain_v3_provider(
     })
 }
 
-fn explain_v3_providers(view: &ServiceViewV3) -> Vec<ConfigExplainV3Provider> {
-    ordered_v3_provider_names(view)
+fn explain_v4_providers(view: &ServiceViewV4) -> Vec<ConfigExplainV4Provider> {
+    ordered_v4_provider_names(view)
         .into_iter()
-        .filter_map(|provider_name| explain_v3_provider(view, provider_name.as_str()))
+        .filter_map(|provider_name| explain_v4_provider(view, provider_name.as_str()))
         .collect()
 }
 
-fn print_v3_explain_text(
+fn print_v4_explain_text(
     label: &str,
-    view: &ServiceViewV3,
+    view: &ServiceViewV4,
     provider_name: Option<&str>,
 ) -> anyhow::Result<()> {
-    let routing = explain_v3_routing(view);
-    println!("Schema version: v3");
+    let routing = explain_v4_routing(view);
+    println!("Schema version: v4");
     println!("Service: {label}");
+    println!("Routing entry: {}", routing.entry);
     println!("Routing policy: {}", routing.policy);
     println!(
         "Routing target: {}",
@@ -152,9 +169,12 @@ fn print_v3_explain_text(
         routing.order.join(", ")
     };
     println!("Routing order: [{order}]");
+    if !routing.expanded_order.is_empty() && routing.expanded_order != routing.order {
+        println!("Expanded order: [{}]", routing.expanded_order.join(", "));
+    }
     println!("On exhausted: {}", routing.on_exhausted);
 
-    let providers = explain_v3_providers(view);
+    let providers = explain_v4_providers(view);
     if providers.is_empty() {
         println!("Providers: <empty>");
     } else {
@@ -188,7 +208,7 @@ fn print_v3_explain_text(
     }
 
     if let Some(provider_name) = provider_name {
-        let provider = explain_v3_provider(view, provider_name)
+        let provider = explain_v4_provider(view, provider_name)
             .ok_or_else(|| anyhow::anyhow!("provider '{}' not found", provider_name))?;
         println!("Provider '{}': enabled={}", provider.name, provider.enabled);
         if provider.endpoints.is_empty() {
@@ -307,9 +327,9 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
 
-            if let ConfigDocument::V3(cfg) = &document {
-                let (view, label) = select_v3_service_view(cfg, service);
-                print_v3_provider_list(label, view);
+            if let ConfigDocument::V4(cfg) = &document {
+                let (view, label) = select_v4_service_view(cfg, service);
+                print_v4_provider_list(label, view);
                 return Ok(());
             }
 
@@ -384,28 +404,28 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
 
-            if let ConfigDocument::V3(cfg) = &document {
-                let (view, label) = select_v3_service_view(cfg, service);
+            if let ConfigDocument::V4(cfg) = &document {
+                let (view, label) = select_v4_service_view(cfg, service);
                 if json {
                     let provider = if let Some(provider_name) = provider.as_deref() {
-                        Some(explain_v3_provider(view, provider_name).ok_or_else(|| {
+                        Some(explain_v4_provider(view, provider_name).ok_or_else(|| {
                             CliError::ProxyConfig(format!("provider '{}' not found", provider_name))
                         })?)
                     } else {
                         None
                     };
-                    let payload = ConfigExplainV3Payload {
+                    let payload = ConfigExplainV4Payload {
                         schema_version: document.schema_version(),
                         service: service.to_string(),
-                        routing: explain_v3_routing(view),
-                        providers: explain_v3_providers(view),
+                        routing: explain_v4_routing(view),
+                        providers: explain_v4_providers(view),
                         provider,
                     };
                     let text = serde_json::to_string_pretty(&payload)
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                     println!("{text}");
                 } else {
-                    print_v3_explain_text(label, view, provider.as_deref())
+                    print_v4_explain_text(label, view, provider.as_deref())
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 }
                 return Ok(());

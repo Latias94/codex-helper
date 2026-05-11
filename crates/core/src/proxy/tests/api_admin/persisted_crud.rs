@@ -246,7 +246,8 @@ async fn proxy_api_v1_station_settings_rejects_persisted_writes_after_v2_auto_mi
     assert_eq!(update_station.status(), StatusCode::BAD_REQUEST);
     let update_station_body = update_station.text().await.expect("update station body");
     assert!(
-        update_station_body.contains("v3 routing configs do not support station settings writes"),
+        update_station_body
+            .contains("v4 route graph configs do not support station settings writes"),
         "{update_station_body}"
     );
 
@@ -264,20 +265,20 @@ async fn proxy_api_v1_station_settings_rejects_persisted_writes_after_v2_auto_mi
     assert_eq!(set_active.status(), StatusCode::BAD_REQUEST);
     let set_active_body = set_active.text().await.expect("set active body");
     assert!(
-        set_active_body.contains("v3 routing configs do not support station active writes"),
+        set_active_body.contains("v4 route graph configs do not support station active writes"),
         "{set_active_body}"
     );
 
     let config_text =
         std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
-    assert!(config_text.contains("version = 3"));
+    assert!(config_text.contains("version = 4"));
     assert!(!config_text.contains("[codex.stations."));
 
     proxy_handle.abort();
 }
 
 #[tokio::test]
-async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
+async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
     let _env_lock = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -285,10 +286,10 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
     }
 
-    let mut cfg = crate::config::ProxyConfigV3::default();
+    let mut cfg = crate::config::ProxyConfigV4::default();
     cfg.codex.providers.insert(
         "input".to_string(),
-        crate::config::ProviderConfigV3 {
+        crate::config::ProviderConfigV4 {
             alias: Some("Input".to_string()),
             enabled: false,
             base_url: Some("https://input.example.com/v1".to_string()),
@@ -306,7 +307,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
     );
     cfg.codex.providers.insert(
         "backup".to_string(),
-        crate::config::ProviderConfigV3 {
+        crate::config::ProviderConfigV4 {
             enabled: true,
             base_url: Some("https://backup.example.com/v1".to_string()),
             inline_auth: UpstreamAuth {
@@ -321,17 +322,31 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
             ..Default::default()
         },
     );
-    cfg.codex.routing = Some(crate::config::RoutingConfigV3 {
-        policy: crate::config::RoutingPolicyV3::OrderedFailover,
-        order: vec!["input".to_string(), "backup".to_string()],
-        target: None,
-        prefer_tags: Vec::new(),
-        on_exhausted: crate::config::RoutingExhaustedActionV3::Continue,
-    });
+    cfg.codex.providers.insert(
+        "paygo".to_string(),
+        crate::config::ProviderConfigV4 {
+            enabled: true,
+            base_url: Some("https://paygo.example.com/v1".to_string()),
+            inline_auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: Some("PAYGO_KEY".to_string()),
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: [("billing".to_string(), "paygo".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+    );
+    cfg.codex.routing = Some(crate::config::RoutingConfigV4::ordered_failover(vec![
+        "input".to_string(),
+        "backup".to_string(),
+    ]));
 
-    crate::config::save_config_v3(&cfg)
+    crate::config::save_config_v4(&cfg)
         .await
-        .expect("write initial v3 config");
+        .expect("write initial v4 config");
     let loaded = crate::config::load_config()
         .await
         .expect("load initial runtime config");
@@ -353,7 +368,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         ))
         .send()
         .await
-        .expect("get v3 station specs send");
+        .expect("get v4 station specs send");
     assert_eq!(station_specs_rejected.status(), StatusCode::BAD_REQUEST);
 
     let provider_specs = client
@@ -363,17 +378,17 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         ))
         .send()
         .await
-        .expect("get v3 provider specs send")
+        .expect("get v4 provider specs send")
         .error_for_status()
-        .expect("get v3 provider specs status")
+        .expect("get v4 provider specs status")
         .json::<serde_json::Value>()
         .await
-        .expect("get v3 provider specs json");
+        .expect("get v4 provider specs json");
     assert_eq!(
         provider_specs["providers"]
             .as_array()
             .map(|providers| providers.len()),
-        Some(2)
+        Some(3)
     );
     let input_spec = provider_specs["providers"]
         .as_array()
@@ -392,12 +407,12 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         ))
         .send()
         .await
-        .expect("get v3 capabilities send")
+        .expect("get v4 capabilities send")
         .error_for_status()
-        .expect("get v3 capabilities status")
+        .expect("get v4 capabilities status")
         .json::<serde_json::Value>()
         .await
-        .expect("get v3 capabilities json");
+        .expect("get v4 capabilities json");
     assert_eq!(
         capabilities["surface_capabilities"]["routing"].as_bool(),
         Some(true)
@@ -405,6 +420,10 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
     assert_eq!(
         capabilities["surface_capabilities"]["station_specs"].as_bool(),
         Some(false)
+    );
+    assert_eq!(
+        capabilities["surface_capabilities"]["provider_specs"].as_bool(),
+        Some(true)
     );
     assert_eq!(
         capabilities["surface_capabilities"]["station_persisted_settings"].as_bool(),
@@ -418,12 +437,12 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         ))
         .send()
         .await
-        .expect("get v3 routing spec send")
+        .expect("get v4 routing spec send")
         .error_for_status()
-        .expect("get v3 routing spec status")
+        .expect("get v4 routing spec status")
         .json::<serde_json::Value>()
         .await
-        .expect("get v3 routing spec json");
+        .expect("get v4 routing spec json");
     assert_eq!(
         routing_spec["order"].as_array().map(|order| order.len()),
         Some(2)
@@ -442,7 +461,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         }))
         .send()
         .await
-        .expect("set disabled v3 routing target send");
+        .expect("set disabled v4 routing target send");
     assert_eq!(rejected_disabled_target.status(), StatusCode::BAD_REQUEST);
 
     let enable_provider = client
@@ -464,7 +483,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         }))
         .send()
         .await
-        .expect("enable v3 provider spec send");
+        .expect("enable v4 provider spec send");
     assert_eq!(enable_provider.status(), StatusCode::NO_CONTENT);
     let after_enable_provider_specs = client
         .get(format!(
@@ -473,12 +492,12 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         ))
         .send()
         .await
-        .expect("get v3 provider specs after enable send")
+        .expect("get v4 provider specs after enable send")
         .error_for_status()
-        .expect("get v3 provider specs after enable status")
+        .expect("get v4 provider specs after enable status")
         .json::<serde_json::Value>()
         .await
-        .expect("get v3 provider specs after enable json");
+        .expect("get v4 provider specs after enable json");
     let input_after_enable = after_enable_provider_specs["providers"]
         .as_array()
         .and_then(|providers| {
@@ -505,14 +524,60 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         }))
         .send()
         .await
-        .expect("set v3 routing target send")
+        .expect("set v4 routing target send")
         .error_for_status()
-        .expect("set v3 routing target status")
+        .expect("set v4 routing target status")
         .json::<serde_json::Value>()
         .await
-        .expect("set v3 routing target json");
+        .expect("set v4 routing target json");
     assert_eq!(set_routing_target["policy"].as_str(), Some("manual-sticky"));
     assert_eq!(set_routing_target["target"].as_str(), Some("input"));
+
+    let set_nested_graph = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/routing",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "entry": "monthly_first",
+            "routes": {
+                "monthly_pool": {
+                    "strategy": "ordered-failover",
+                    "children": ["input", "backup"]
+                },
+                "monthly_first": {
+                    "strategy": "ordered-failover",
+                    "children": ["monthly_pool", "paygo"]
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("set v4 routing graph send")
+        .error_for_status()
+        .expect("set v4 routing graph status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("set v4 routing graph json");
+    assert_eq!(set_nested_graph["entry"].as_str(), Some("monthly_first"));
+    assert_eq!(
+        set_nested_graph["expanded_order"]
+            .as_array()
+            .map(|order| order
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()),
+        Some(vec!["input", "backup", "paygo"])
+    );
+    assert_eq!(
+        set_nested_graph["routes"]["monthly_first"]["children"]
+            .as_array()
+            .map(|children| children
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()),
+        Some(vec!["monthly_pool", "paygo"])
+    );
 
     let station_active_rejected = client
         .post(format!(
@@ -522,7 +587,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         .json(&serde_json::json!({ "station_name": "input" }))
         .send()
         .await
-        .expect("set v3 active station send");
+        .expect("set v4 active station send");
     assert_eq!(station_active_rejected.status(), StatusCode::BAD_REQUEST);
 
     let station_update_rejected = client
@@ -533,7 +598,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         .json(&serde_json::json!({ "enabled": false }))
         .send()
         .await
-        .expect("update v3 station send");
+        .expect("update v4 station send");
     assert_eq!(station_update_rejected.status(), StatusCode::BAD_REQUEST);
 
     let upsert_provider = client
@@ -556,7 +621,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         }))
         .send()
         .await
-        .expect("upsert v3 provider spec send");
+        .expect("upsert v4 provider spec send");
     assert_eq!(upsert_provider.status(), StatusCode::NO_CONTENT);
 
     let upsert_new_provider = client
@@ -578,7 +643,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         }))
         .send()
         .await
-        .expect("upsert new v3 provider spec send");
+        .expect("upsert new v4 provider spec send");
     assert_eq!(upsert_new_provider.status(), StatusCode::NO_CONTENT);
 
     let station_bound_profile = client
@@ -592,14 +657,15 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         }))
         .send()
         .await
-        .expect("upsert v3 station-bound profile send");
+        .expect("upsert v4 station-bound profile send");
     assert_eq!(station_bound_profile.status(), StatusCode::BAD_REQUEST);
     let station_bound_profile_body = station_bound_profile
         .text()
         .await
         .expect("station-bound profile error body");
     assert!(
-        station_bound_profile_body.contains("v3 profiles do not support station bindings"),
+        station_bound_profile_body
+            .contains("v4 route graph profiles do not support station bindings"),
         "{station_bound_profile_body}"
     );
 
@@ -614,7 +680,7 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         }))
         .send()
         .await
-        .expect("upsert v3 profile send");
+        .expect("upsert v4 profile send");
     assert_eq!(upsert_profile.status(), StatusCode::OK);
 
     let set_default_profile = client
@@ -625,25 +691,41 @@ async fn proxy_api_v1_v3_persisted_control_plane_edits_v3_document() {
         .json(&serde_json::json!({ "profile_name": "daily" }))
         .send()
         .await
-        .expect("set v3 default profile send");
+        .expect("set v4 default profile send");
     assert_eq!(set_default_profile.status(), StatusCode::OK);
 
     let config_text =
-        std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted v3 config");
-    assert!(config_text.contains("version = 3"));
+        std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted v4 config");
+    assert!(config_text.contains("version = 4"));
     assert!(!config_text.contains("[codex.stations."));
-    let persisted_cfg: crate::config::ProxyConfigV3 =
-        toml::from_str(&config_text).expect("parse persisted v3 config");
+    let persisted_cfg: crate::config::ProxyConfigV4 =
+        toml::from_str(&config_text).expect("parse persisted v4 config");
     let routing = persisted_cfg
         .codex
         .routing
-        .expect("v3 routing should remain");
+        .expect("v4 routing should remain");
+    let entry = routing.entry_node().expect("entry route should remain");
     assert_eq!(
-        routing.policy,
-        crate::config::RoutingPolicyV3::OrderedFailover
+        entry.strategy,
+        crate::config::RoutingPolicyV4::OrderedFailover
     );
-    assert_eq!(routing.target.as_deref(), None);
-    assert_eq!(routing.order, vec!["input", "backup", "utility"]);
+    assert_eq!(entry.target.as_deref(), None);
+    assert_eq!(routing.entry, "monthly_first");
+    assert_eq!(
+        entry.children,
+        vec![
+            "monthly_pool".to_string(),
+            "paygo".to_string(),
+            "utility".to_string()
+        ]
+    );
+    assert_eq!(
+        routing
+            .routes
+            .get("monthly_pool")
+            .map(|node| node.children.clone()),
+        Some(vec!["input".to_string(), "backup".to_string()])
+    );
     assert_eq!(
         persisted_cfg.codex.default_profile.as_deref(),
         Some("daily")
@@ -913,7 +995,7 @@ async fn proxy_api_v1_station_specs_rejects_crud_after_v2_auto_migration() {
     assert_eq!(initial.status(), StatusCode::BAD_REQUEST);
     let initial_body = initial.text().await.expect("get station specs body");
     assert!(
-        initial_body.contains("v3 routing configs do not expose station specs"),
+        initial_body.contains("v4 route graph configs do not expose station specs"),
         "{initial_body}"
     );
 
@@ -1163,8 +1245,8 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
 
     let persisted_text =
         std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
-    let persisted_cfg: crate::config::ProxyConfigV3 =
-        toml::from_str(&persisted_text).expect("parse persisted provider v3 config");
+    let persisted_cfg: crate::config::ProxyConfigV4 =
+        toml::from_str(&persisted_text).expect("parse persisted provider v4 config");
     let alpha = persisted_cfg
         .codex
         .providers
@@ -1217,7 +1299,12 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
         .codex
         .routing
         .expect("routing should remain after provider CRUD");
-    assert!(!routing.order.iter().any(|provider| provider == "beta"));
+    assert!(
+        routing
+            .routes
+            .values()
+            .all(|node| !node.children.iter().any(|provider| provider == "beta"))
+    );
     let reloaded_cfg = crate::config::load_config()
         .await
         .expect("reload config from disk after provider spec CRUD");

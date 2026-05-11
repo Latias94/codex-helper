@@ -7,8 +7,8 @@ use axum::http::StatusCode;
 
 use crate::balance::ProviderBalanceSnapshot;
 use crate::config::{
-    ProxyConfig, ProxyConfigV2, ProxyConfigV3, ServiceConfig, ServiceConfigManager, ServiceViewV2,
-    ServiceViewV3, UpstreamAuth, UpstreamConfig,
+    ProxyConfig, ProxyConfigV2, ProxyConfigV4, ServiceConfig, ServiceConfigManager, ServiceViewV2,
+    ServiceViewV4, UpstreamAuth, UpstreamConfig,
 };
 use crate::dashboard_core::{ProviderOption, build_provider_options_from_view};
 use crate::logging::{log_retry_trace, now_ms};
@@ -18,7 +18,7 @@ use crate::usage_providers::{UsageProviderRefreshSummary, refresh_balances_for_s
 use super::ProxyService;
 use super::control_plane_service::{
     PersistedProxySettingsDocument, load_persisted_proxy_settings_document,
-    load_persisted_proxy_settings_v2, service_view_v2, service_view_v3,
+    load_persisted_proxy_settings_v2, service_view_v2, service_view_v4,
 };
 
 #[derive(serde::Deserialize)]
@@ -94,7 +94,7 @@ fn merge_refresh_summary(
     summary.auto_failed += extra.auto_failed;
 }
 
-fn merge_auth_v3(block: &UpstreamAuth, inline: &UpstreamAuth) -> UpstreamAuth {
+fn merge_auth_v4(block: &UpstreamAuth, inline: &UpstreamAuth) -> UpstreamAuth {
     UpstreamAuth {
         auth_token: inline
             .auth_token
@@ -150,14 +150,14 @@ fn provider_tags_for_balance(
     tags
 }
 
-fn service_manager_from_v3_provider_catalog(view: &ServiceViewV3) -> ServiceConfigManager {
+fn service_manager_from_v4_provider_catalog(view: &ServiceViewV4) -> ServiceConfigManager {
     let mut configs = HashMap::new();
     for (provider_name, provider) in &view.providers {
         if !provider.enabled {
             continue;
         }
 
-        let auth = merge_auth_v3(&provider.auth, &provider.inline_auth);
+        let auth = merge_auth_v4(&provider.auth, &provider.inline_auth);
         let mut upstreams = Vec::new();
         if let Some(base_url) = provider
             .base_url
@@ -222,10 +222,15 @@ fn service_manager_from_v3_provider_catalog(view: &ServiceViewV3) -> ServiceConf
     ServiceConfigManager {
         active: view.routing.as_ref().and_then(|routing| {
             routing
-                .target
-                .as_deref()
+                .entry_node()
+                .and_then(|node| node.target.as_deref())
                 .filter(|target| configs.contains_key(*target))
                 .map(ToOwned::to_owned)
+                .or_else(|| {
+                    crate::config::resolved_v4_provider_order("providers_api", view)
+                        .ok()
+                        .and_then(|order| order.into_iter().find(|name| configs.contains_key(name)))
+                })
         }),
         default_profile: view.default_profile.clone(),
         profiles: view.profiles.clone(),
@@ -285,16 +290,16 @@ fn service_manager_from_v2_provider_catalog(view: &ServiceViewV2) -> ServiceConf
     }
 }
 
-fn provider_catalog_runtime_from_v3(cfg: &ProxyConfigV3, service_name: &str) -> ProxyConfig {
+fn provider_catalog_runtime_from_v4(cfg: &ProxyConfigV4, service_name: &str) -> ProxyConfig {
     let mut runtime = ProxyConfig {
-        version: Some(3),
+        version: Some(4),
         retry: cfg.retry.clone(),
         notify: cfg.notify.clone(),
         default_service: cfg.default_service,
         ui: cfg.ui.clone(),
         ..ProxyConfig::default()
     };
-    let mgr = service_manager_from_v3_provider_catalog(service_view_v3(cfg, service_name));
+    let mgr = service_manager_from_v4_provider_catalog(service_view_v4(cfg, service_name));
     match service_name {
         "claude" => runtime.claude = mgr,
         _ => runtime.codex = mgr,
@@ -324,8 +329,8 @@ async fn load_provider_catalog_runtime(
 ) -> Result<Option<ProxyConfig>, (StatusCode, String)> {
     let document = load_persisted_proxy_settings_document().await?;
     let cfg = match document {
-        PersistedProxySettingsDocument::V3(cfg) => {
-            provider_catalog_runtime_from_v3(&cfg, service_name)
+        PersistedProxySettingsDocument::V4(cfg) => {
+            provider_catalog_runtime_from_v4(&cfg, service_name)
         }
         PersistedProxySettingsDocument::V2(cfg) => {
             provider_catalog_runtime_from_v2(&cfg, service_name)

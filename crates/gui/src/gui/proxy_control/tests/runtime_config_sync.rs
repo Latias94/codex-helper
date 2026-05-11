@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::{
-    ProviderConfigV3, ProxyConfig, ProxyConfigV3, RoutingConfigV3, RoutingExhaustedActionV3,
-    RoutingPolicyV3, ServiceKind, ServiceViewV3, UpstreamAuth, compile_v3_to_runtime,
+    ProviderConfigV4, ProxyConfig, ProxyConfigV4, RoutingConfigV4, ServiceKind, ServiceViewV4,
+    UpstreamAuth, compile_v4_to_runtime,
 };
 use crate::state::ProxyState;
 use tokio::sync::watch;
@@ -19,15 +19,15 @@ fn write_file(path: &Path, content: &str) {
     std::fs::write(path, content).expect("write test file");
 }
 
-fn v3_config(base_url: &str) -> ProxyConfig {
-    compile_v3_to_runtime(&ProxyConfigV3 {
-        version: 3,
-        codex: ServiceViewV3 {
+fn v4_config(base_url: &str) -> ProxyConfig {
+    compile_v4_to_runtime(&ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
             default_profile: None,
             profiles: BTreeMap::new(),
             providers: BTreeMap::from([(
                 "monthly".to_string(),
-                ProviderConfigV3 {
+                ProviderConfigV4 {
                     base_url: Some(base_url.to_string()),
                     auth: UpstreamAuth::default(),
                     inline_auth: UpstreamAuth::default(),
@@ -39,17 +39,13 @@ fn v3_config(base_url: &str) -> ProxyConfig {
                     enabled: true,
                 },
             )]),
-            routing: Some(RoutingConfigV3 {
-                policy: RoutingPolicyV3::OrderedFailover,
-                order: vec!["monthly".to_string()],
-                target: None,
-                prefer_tags: Vec::new(),
-                on_exhausted: RoutingExhaustedActionV3::Continue,
-            }),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "monthly".to_string(),
+            ])),
         },
-        ..ProxyConfigV3::default()
+        ..ProxyConfigV4::default()
     })
-    .expect("compile v3 config")
+    .expect("compile v4 config")
 }
 
 fn running_controller(cfg: ProxyConfig) -> ProxyController {
@@ -126,31 +122,37 @@ fn running_config_sync_from_disk_reloads_local_cfg_snapshot() {
     write_file(
         &config_path,
         r#"
-version = 3
+version = 4
 
 [codex.providers.monthly]
 base_url = "https://old.example.com/v1"
 
 [codex.routing]
-policy = "ordered-failover"
-order = ["monthly"]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["monthly"]
 "#,
     );
 
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let mut controller = running_controller(v3_config("https://old.example.com/v1"));
+    let mut controller = running_controller(v4_config("https://old.example.com/v1"));
 
     write_file(
         &config_path,
         r#"
-version = 3
+version = 4
 
 [codex.providers.monthly]
 base_url = "https://new.example.com/v1"
 
 [codex.routing]
-policy = "ordered-failover"
-order = ["monthly"]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["monthly"]
 "#,
     );
 

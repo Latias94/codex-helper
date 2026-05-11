@@ -717,7 +717,7 @@ pub(super) fn render_station_info_modal(
 
 pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
     let lang = ui.language;
-    let is_v3 = ui.uses_v3_routing();
+    let is_route_graph = ui.uses_route_graph_routing();
     let area = centered_rect(70, 70, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -779,12 +779,12 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
                 "Provider 覆盖",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from(if is_v3 {
-                "  p/P        打开 v3 routing 编辑器（provider 选择由 routing policy 管理）"
+            Line::from(if is_route_graph {
+                "  p/P        打开 v4 routing 编辑器（provider 选择由 routing policy 管理）"
             } else {
                 "  p          会话级 provider 覆盖（固定）"
             }),
-            Line::from(if is_v3 {
+            Line::from(if is_route_graph {
                 "  r          在 Stations 页打开 routing 编辑器"
             } else {
                 "  P          全局站点 pin（运行时）"
@@ -793,29 +793,29 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  Clear binding  清除当前会话已存储的 profile 绑定（保留其他会话覆盖）"),
             Line::from(""),
             Line::from(vec![Span::styled(
-                if is_v3 {
+                if is_route_graph {
                     "路由页（Routing）"
                 } else {
                     "站点页（Stations）"
                 },
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from(if is_v3 {
+            Line::from(if is_route_graph {
                 "  Enter/r    打开 routing 编辑器（策略/顺序/tags/启停）"
             } else {
                 "  Enter      设置为全局 pin"
             }),
-            Line::from(if is_v3 {
+            Line::from(if is_route_graph {
                 "  Backspace  清除遗留运行时 station pin"
             } else {
                 "  Backspace  清除全局 pin（自动）"
             }),
-            Line::from(if is_v3 {
-                "  o          v3 下不设置会话 station override"
+            Line::from(if is_route_graph {
+                "  o          v4 路由图下不设置会话 station override"
             } else {
                 "  o          设置会话 override 为当前站点"
             }),
-            Line::from(if is_v3 {
+            Line::from(if is_route_graph {
                 "  O          清除遗留会话 station override"
             } else {
                 "  O          清除会话 override"
@@ -930,12 +930,12 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
                 "Provider override",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from(if is_v3 {
-                "  p/P        open v3 routing editor (provider choice is routing policy)"
+            Line::from(if is_route_graph {
+                "  p/P        open v4 routing editor (provider choice is routing policy)"
             } else {
                 "  p          session provider override (pinned)"
             }),
-            Line::from(if is_v3 {
+            Line::from(if is_route_graph {
                 "  r          open routing editor on the Stations page"
             } else {
                 "  P          global station pin (runtime)"
@@ -946,29 +946,29 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             ),
             Line::from(""),
             Line::from(vec![Span::styled(
-                if is_v3 {
+                if is_route_graph {
                     "Routing page"
                 } else {
                     "Stations page"
                 },
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
-            Line::from(if is_v3 {
+            Line::from(if is_route_graph {
                 "  Enter/r    open routing editor (policy/order/tags/enable)"
             } else {
                 "  Enter      set global pin"
             }),
-            Line::from(if is_v3 {
+            Line::from(if is_route_graph {
                 "  Backspace  clear legacy runtime station pin"
             } else {
                 "  Backspace  clear global pin (auto)"
             }),
-            Line::from(if is_v3 {
-                "  o          session station override is disabled under v3 routing"
+            Line::from(if is_route_graph {
+                "  o          session station override is disabled under v4 routing"
             } else {
                 "  o          set session override to selected station"
             }),
-            Line::from(if is_v3 {
+            Line::from(if is_route_graph {
                 "  O          clear legacy session station override"
             } else {
                 "  O          clear session override"
@@ -1661,18 +1661,18 @@ pub(super) fn render_provider_modal(
     f.render_stateful_widget(list, area, &mut ui.menu_list);
 }
 
-fn routing_policy_label(policy: crate::config::RoutingPolicyV3) -> &'static str {
+fn routing_policy_label(policy: crate::config::RoutingPolicyV4) -> &'static str {
     match policy {
-        crate::config::RoutingPolicyV3::ManualSticky => "manual-sticky",
-        crate::config::RoutingPolicyV3::OrderedFailover => "ordered-failover",
-        crate::config::RoutingPolicyV3::TagPreferred => "tag-preferred",
+        crate::config::RoutingPolicyV4::ManualSticky => "manual-sticky",
+        crate::config::RoutingPolicyV4::OrderedFailover => "ordered-failover",
+        crate::config::RoutingPolicyV4::TagPreferred => "tag-preferred",
     }
 }
 
-fn routing_exhausted_label(action: crate::config::RoutingExhaustedActionV3) -> &'static str {
+fn routing_exhausted_label(action: crate::config::RoutingExhaustedActionV4) -> &'static str {
     match action {
-        crate::config::RoutingExhaustedActionV3::Continue => "continue",
-        crate::config::RoutingExhaustedActionV3::Stop => "stop",
+        crate::config::RoutingExhaustedActionV4::Continue => "continue",
+        crate::config::RoutingExhaustedActionV4::Stop => "stop",
     }
 }
 
@@ -1819,7 +1819,7 @@ pub(super) fn render_routing_modal(
             .unwrap_or_default();
         let marker = if spec.target.as_deref() == Some(name.as_str()) {
             "PIN"
-        } else if matches!(spec.policy, crate::config::RoutingPolicyV3::TagPreferred)
+        } else if matches!(spec.policy, crate::config::RoutingPolicyV4::TagPreferred)
             && provider.is_some_and(|provider| {
                 spec.prefer_tags.iter().any(|filter| {
                     !filter.is_empty()

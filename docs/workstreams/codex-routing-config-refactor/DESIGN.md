@@ -1,5 +1,9 @@
 # Design: Routing Config Surface
 
+> Historical note: this v3 routing-first design is superseded by
+> `docs/workstreams/codex-routing-graph-refactor/`. Use the v4 route graph docs
+> for current authoring and implementation decisions.
+
 ## Problem Statement
 
 The current public config shape is still too close to runtime internals.
@@ -127,7 +131,49 @@ Evaluation:
 - depends on correct user tagging;
 - much better than trying to infer “monthly” from balance APIs.
 
-### 4. Tag Preferred, Hard Stop
+### 4. Pool Fallback
+
+```toml
+[codex.providers.input]
+base_url = "https://ai.input.im/v1"
+auth_token_env = "INPUT_API_KEY"
+tags = { billing = "monthly", pool = "input" }
+
+[codex.providers.input1]
+base_url = "https://ai.input1.im/v1"
+auth_token_env = "INPUT1_API_KEY"
+tags = { billing = "monthly", pool = "input" }
+
+[codex.providers.input2]
+base_url = "https://ai.input2.im/v1"
+auth_token_env = "INPUT2_API_KEY"
+tags = { billing = "monthly", pool = "input" }
+
+[codex.providers.codex-for]
+base_url = "https://codex-for.example/v1"
+auth_token_env = "CODEX_FOR_API_KEY"
+tags = { billing = "paygo" }
+
+[codex.routing]
+policy = "pool-fallback"
+chain = ["input", "paygo"]
+on_exhausted = "continue"
+
+[codex.routing.pools.input]
+providers = ["input", "input1", "input2"]
+
+[codex.routing.pools.paygo]
+providers = ["codex-for"]
+```
+
+Evaluation:
+
+- best when several monthly providers belong to one real pool;
+- keeps the monthly pool boundary explicit instead of flattening everything into tags;
+- lets paygo stay as a true last-resort fallback;
+- gives runtime cooldown and later reprobe a clean place to bring the pool back.
+
+### 5. Tag Preferred, Hard Stop
 
 ```toml
 [codex.routing]
@@ -152,7 +198,7 @@ This design follows the same broad separation used by mature routing systems:
 - [OpenRouter provider routing](https://openrouter.ai/docs/features/provider-routing): expose provider order and fallback behavior as user-authored policy.
 - [Envoy outlier detection](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier): treat passive health, temporary ejection, cooldown, and later recovery as runtime state rather than permanent route rewrites.
 
-The local implication is that `routing.order`, `prefer_tags`, balance exhaustion, cooldown, and reprobe should remain separate concepts even when the common user story is simply “use monthly first, then paygo”.
+The local implication is that `routing.order`, `prefer_tags`, `pool-fallback`, balance exhaustion, cooldown, and reprobe should remain separate concepts even when the common user story is simply “use monthly first, then paygo”.
 
 ## Pool, Health, And Reprobe
 
@@ -163,7 +209,7 @@ The current `routing` block can already express a simple ordered fallback chain 
 - become usable again later without a config rewrite;
 - need a paygo fallback only after the monthly pool is truly unavailable.
 
-For that class of setups, the next semantic layer should treat the preferred monthly providers as a pool or workstream, not as a permanently demoted entry in a flat list. The important distinctions are:
+For that class of setups, the public shape should now treat the preferred monthly providers as a first-class pool, not as a permanently demoted entry in a flat list. The important distinctions are:
 
 - `unknown` is not exhausted;
 - confirmed exhaustion can demote routing;
@@ -171,7 +217,7 @@ For that class of setups, the next semantic layer should treat the preferred mon
 - cooldown must not be permanent;
 - reprobe should eventually let the provider back into the preferred pool.
 
-This is a runtime behavior model first and a syntax question second. If we later introduce a first-class `workstreams` or `pools` authoring shape, it should compile into the same runtime routing model, but keep these state transitions explicit instead of hiding them inside `order`.
+This is a runtime behavior model first and a syntax question second. The current `pool-fallback` syntax should compile into the same runtime routing model, while keeping these state transitions explicit instead of hiding them inside `order`.
 
 ## Self-Evaluation
 
@@ -180,13 +226,15 @@ This is a runtime behavior model first and a syntax question second. If we later
 | `manual-sticky` | high | high | low | high for continuity, low for availability | keep |
 | `ordered-failover` | high | high | low | high | default |
 | `tag-preferred` | medium-high | medium | medium | high if tags are correct | add |
+| `pool-fallback` | high for grouped pools | medium | medium | high if pool membership is correct | add |
 | `tag-preferred + stop` | medium | medium | medium | strict but explicit | advanced |
 | `balanced` | low right now | low | high | not trustworthy without measured latency/cost signals | defer |
 
 Conclusion:
 
 - `ordered-failover` should be the default public policy.
-- `tag-preferred` is the right way to express “monthly first”.
+- `tag-preferred` is the right way to express “monthly first” when the provider list is still flat.
+- `pool-fallback` is the right way to express “monthly pool first, paygo last” when the monthly providers form a real group.
 - `balanced` should stay out of the first public config surface until the runtime has real speed and cost signals.
 
 ## Migration Strategy
@@ -204,9 +252,9 @@ The migration should be deterministic and boring.
 
 ### Versioning
 
-- The public authoring model should use a new version number if the schema is materially different from the current one.
+- The public authoring model should stay on `version = 3` for additive routing extensions such as `pool-fallback`.
 - The runtime can still compile old and new inputs to the same internal routing model.
-- Old files should load, migrate, and re-save into the new shape.
+- Old files should load, migrate, and re-save into the same v3 shape without a forced major-version bump.
 
 ## UI / UX Implications
 

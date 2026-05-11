@@ -1,6 +1,6 @@
 [package]
 name = "codex-helper"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
@@ -33,9 +33,9 @@ path = "src/bin/codex-helper-gui.rs"
 required-features = ["gui"]
 
 [dependencies]
-codex-helper-core = { path = "crates/core", version = "0.13.0" }
-codex-helper-tui = { path = "crates/tui", version = "0.13.0" }
-codex-helper-gui = { path = "crates/gui", version = "0.13.0", optional = true }
+codex-helper-core = { path = "crates/core", version = "0.14.0" }
+codex-helper-tui = { path = "crates/tui", version = "0.14.0" }
+codex-helper-gui = { path = "crates/gui", version = "0.14.0", optional = true }
 anyhow = "1.0.102"
 base64 = "0.22.1"
 serde = { version = "1.0.228", features = ["derive"] }

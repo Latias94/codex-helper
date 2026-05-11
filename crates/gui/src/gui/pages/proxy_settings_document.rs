@@ -11,23 +11,42 @@ pub(super) fn parse_proxy_settings_document(
             .and_then(|v| v.as_integer())
             .map(|v| v as u32)
             .or_else(|| {
-                let has_routing = ["codex", "claude"].iter().any(|service| {
+                let has_v4_routing = ["codex", "claude"].iter().any(|service| {
                     value
                         .get(*service)
                         .and_then(|service| service.get("routing"))
+                        .and_then(|routing| routing.get("entry").or_else(|| routing.get("routes")))
                         .is_some()
                 });
-                if has_routing { Some(3) } else { None }
+                if has_v4_routing {
+                    Some(4)
+                } else {
+                    let has_legacy_routing = ["codex", "claude"].iter().any(|service| {
+                        value
+                            .get(*service)
+                            .and_then(|service| service.get("routing"))
+                            .is_some()
+                    });
+                    if has_legacy_routing { Some(3) } else { None }
+                }
             });
-        if version == Some(3) {
-            let cfg = toml::from_str::<crate::config::ProxyConfigV3>(text)?;
-            crate::config::compile_v3_to_runtime(&cfg)?;
-            return Ok(ProxySettingsWorkingDocument::V3(cfg));
+        if version == Some(4) {
+            let mut cfg = toml::from_str::<crate::config::ProxyConfigV4>(text)?;
+            cfg.sync_routing_compat_from_graph();
+            crate::config::compile_v4_to_runtime(&cfg)?;
+            return Ok(ProxySettingsWorkingDocument::V4(cfg));
+        } else if version == Some(3) {
+            let legacy = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(text)?;
+            let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&legacy)?;
+            let mut cfg = migrated.config;
+            cfg.sync_routing_compat_from_graph();
+            crate::config::compile_v4_to_runtime(&cfg)?;
+            return Ok(ProxySettingsWorkingDocument::V4(cfg));
         }
     }
 
     anyhow::bail!(
-        "GUI settings editor only supports v3 routing-first TOML config; run `codex-helper config migrate --write --yes` first"
+        "GUI settings editor only supports v4 route graph TOML config; run `codex-helper config migrate --write --yes` first"
     );
 }
 
@@ -35,7 +54,7 @@ async fn save_proxy_settings_document_async(
     doc: ProxySettingsWorkingDocument,
 ) -> anyhow::Result<String> {
     let _saved_path = match doc {
-        ProxySettingsWorkingDocument::V3(cfg) => crate::config::save_config_v3(&cfg).await?,
+        ProxySettingsWorkingDocument::V4(cfg) => crate::config::save_config_v4(&cfg).await?,
     };
     let path = crate::config::config_file_path();
     Ok(tokio::fs::read_to_string(path).await?)
@@ -130,10 +149,10 @@ pub(super) fn sync_codex_auth_into_settings_document(
     options: crate::config::SyncCodexAuthFromCodexOptions,
 ) -> anyhow::Result<crate::config::SyncCodexAuthFromCodexReport> {
     match doc {
-        ProxySettingsWorkingDocument::V3(cfg) => {
-            let mut runtime = crate::config::compile_v3_to_runtime(cfg)?;
+        ProxySettingsWorkingDocument::V4(cfg) => {
+            let mut runtime = crate::config::compile_v4_to_runtime(cfg)?;
             let report = crate::config::sync_codex_auth_from_codex_cli(&mut runtime, options)?;
-            *cfg = crate::config::migrate_legacy_to_v3(&runtime)?;
+            *cfg = crate::config::migrate_legacy_to_v4(&runtime)?;
             Ok(report)
         }
     }

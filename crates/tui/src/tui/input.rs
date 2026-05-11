@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,10 +28,11 @@ use crate::state::{
 
 use super::Language;
 use super::model::{
-    CODEX_RECENT_WINDOWS, ProviderOption, RoutingSpecView, SessionRow, Snapshot,
-    codex_recent_window_label, codex_recent_window_threshold_ms, filtered_request_page_len,
-    filtered_requests_len, find_session_idx, format_age, now_ms, request_matches_page_filters,
-    request_page_focus_session_id, routing_provider_names, session_row_has_any_override, short_sid,
+    CODEX_RECENT_WINDOWS, ProviderOption, RoutingSpecUpsertView, RoutingSpecView, SessionRow,
+    Snapshot, codex_recent_window_label, codex_recent_window_threshold_ms,
+    filtered_request_page_len, filtered_requests_len, find_session_idx, format_age, now_ms,
+    request_matches_page_filters, request_page_focus_session_id, routing_leaf_provider_names,
+    routing_provider_names, session_row_has_any_override, short_sid,
 };
 use super::report::build_stats_report;
 use super::state::{
@@ -930,13 +931,15 @@ async fn apply_persisted_routing(
     balance_refresh_tx: &BalanceRefreshSender,
 ) -> anyhow::Result<()> {
     routing.providers.clear();
+    routing.sync_entry_compat_from_graph();
+    let payload = RoutingSpecUpsertView::from(&routing);
     let response = reqwest::Client::new()
         .put(format!(
             "http://127.0.0.1:{}/__codex_helper/api/v1/routing",
             ui.admin_port
         ))
         .timeout(Duration::from_millis(1500))
-        .json(&routing)
+        .json(&payload)
         .send()
         .await?
         .error_for_status()?
@@ -1574,7 +1577,7 @@ async fn handle_key_normal(
             }
         }
         KeyCode::Char('i') if ui.page == Page::Stations => {
-            if ui.uses_v3_routing() {
+            if ui.uses_route_graph_routing() {
                 open_routing_editor(
                     ui,
                     snapshot,
@@ -1739,7 +1742,7 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Enter if ui.page == Page::Stations => {
-            if ui.uses_v3_routing() {
+            if ui.uses_route_graph_routing() {
                 open_routing_editor(
                     ui,
                     snapshot,
@@ -1778,8 +1781,8 @@ async fn handle_key_normal(
         KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
             match apply_global_station_pin(state, providers, None).await {
                 Ok(()) => {
-                    let message = if ui.uses_v3_routing() {
-                        "runtime station pin cleared; v3 provider choice uses routing policy"
+                    let message = if ui.uses_route_graph_routing() {
+                        "runtime station pin cleared; v4 provider choice uses routing policy"
                     } else {
                         "global station pin: <auto>"
                     };
@@ -1792,9 +1795,9 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('o') if ui.page == Page::Stations => {
-            if ui.uses_v3_routing() {
+            if ui.uses_route_graph_routing() {
                 ui.toast = Some((
-                    "v3 routing owns provider choice; press r to edit routing".to_string(),
+                    "v4 routing owns provider choice; press r to edit routing".to_string(),
                     Instant::now(),
                 ));
                 return true;
@@ -1833,7 +1836,7 @@ async fn handle_key_normal(
                 return true;
             };
             apply_session_provider_override(state, sid, None).await;
-            let message = if ui.uses_v3_routing() {
+            let message = if ui.uses_route_graph_routing() {
                 "legacy session station override cleared"
             } else {
                 "session station override: <clear>"
@@ -1851,7 +1854,7 @@ async fn handle_key_normal(
         | KeyCode::Char(']')
         | KeyCode::Char('u')
         | KeyCode::Char('d')
-            if ui.page == Page::Stations && ui.uses_v3_routing() =>
+            if ui.page == Page::Stations && ui.uses_route_graph_routing() =>
         {
             if ui.routing_spec.is_none()
                 && let Err(err) = refresh_routing_control_state(ui).await
@@ -3209,11 +3212,11 @@ async fn handle_key_normal(
             if ui.focus != Focus::Sessions {
                 return false;
             }
-            if ui.uses_v3_routing() {
+            if ui.uses_route_graph_routing() {
                 open_routing_editor(
                     ui,
                     snapshot,
-                    "v3 routing is global; editing persisted routing",
+                    "v4 routing is global; editing persisted routing",
                     balance_refresh_tx,
                 )
                 .await;
@@ -3249,7 +3252,7 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('P') => {
-            if ui.uses_v3_routing() {
+            if ui.uses_route_graph_routing() {
                 open_routing_editor(
                     ui,
                     snapshot,
@@ -3469,10 +3472,11 @@ async fn handle_key_profile_menu(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        BalanceRefreshMode, default_profile_menu_idx, routing_spec_after_provider_enabled_change,
+        BalanceRefreshMode, default_profile_menu_idx, routing_entry_children,
+        routing_entry_is_flat_provider_list, routing_spec_after_provider_enabled_change,
         routing_spec_with_order, should_request_provider_balance_refresh,
     };
-    use crate::config::{RoutingExhaustedActionV3, RoutingPolicyV3};
+    use crate::config::{RoutingExhaustedActionV4, RoutingPolicyV4};
     use crate::dashboard_core::ControlProfileOption;
     use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
     use crate::tui::model::{RoutingProviderRef, RoutingSpecView, routing_provider_names};
@@ -3690,11 +3694,18 @@ mod tests {
     #[test]
     fn routing_provider_names_appends_missing_catalog_entries() {
         let spec = RoutingSpecView {
-            policy: RoutingPolicyV3::OrderedFailover,
+            entry: "main".to_string(),
+            routes: BTreeMap::new(),
+            policy: RoutingPolicyV4::OrderedFailover,
             order: vec!["backup".to_string()],
             target: None,
             prefer_tags: Vec::new(),
-            on_exhausted: RoutingExhaustedActionV3::Continue,
+            chain: Vec::new(),
+            pools: BTreeMap::new(),
+            on_exhausted: RoutingExhaustedActionV4::Continue,
+            entry_strategy: RoutingPolicyV4::OrderedFailover,
+            expanded_order: Vec::new(),
+            entry_target: None,
             providers: vec![
                 RoutingProviderRef {
                     name: "input".to_string(),
@@ -3717,44 +3728,83 @@ mod tests {
     #[test]
     fn routing_spec_with_order_clears_target_for_ordered_policy() {
         let spec = RoutingSpecView {
-            policy: RoutingPolicyV3::ManualSticky,
+            entry: "main".to_string(),
+            routes: BTreeMap::from([(
+                "main".to_string(),
+                crate::config::RoutingNodeV4 {
+                    strategy: RoutingPolicyV4::ManualSticky,
+                    children: vec!["input".to_string()],
+                    target: Some("input".to_string()),
+                    prefer_tags: vec![BTreeMap::from([(
+                        "billing".to_string(),
+                        "monthly".to_string(),
+                    )])],
+                    on_exhausted: RoutingExhaustedActionV4::Stop,
+                    ..crate::config::RoutingNodeV4::default()
+                },
+            )]),
+            policy: RoutingPolicyV4::ManualSticky,
             order: vec!["input".to_string()],
             target: Some("input".to_string()),
             prefer_tags: vec![BTreeMap::from([(
                 "billing".to_string(),
                 "monthly".to_string(),
             )])],
-            on_exhausted: RoutingExhaustedActionV3::Stop,
+            chain: Vec::new(),
+            pools: BTreeMap::new(),
+            on_exhausted: RoutingExhaustedActionV4::Stop,
+            entry_strategy: RoutingPolicyV4::ManualSticky,
+            expanded_order: Vec::new(),
+            entry_target: Some("input".to_string()),
             providers: Vec::new(),
         };
 
         let next = routing_spec_with_order(
             &spec,
             vec!["backup".to_string(), "input".to_string()],
-            RoutingPolicyV3::OrderedFailover,
+            RoutingPolicyV4::OrderedFailover,
         );
 
-        assert_eq!(next.policy, RoutingPolicyV3::OrderedFailover);
+        assert_eq!(next.policy, RoutingPolicyV4::OrderedFailover);
         assert_eq!(next.target, None);
         assert!(next.prefer_tags.is_empty());
         assert_eq!(next.order, vec!["backup", "input"]);
+        assert_eq!(
+            next.entry_node().map(|node| node.children.as_slice()),
+            Some(&["backup".to_string(), "input".to_string()][..])
+        );
     }
 
     #[test]
     fn disabling_manual_sticky_target_downgrades_to_ordered_failover() {
         let spec = RoutingSpecView {
-            policy: RoutingPolicyV3::ManualSticky,
+            entry: "main".to_string(),
+            routes: BTreeMap::from([(
+                "main".to_string(),
+                crate::config::RoutingNodeV4 {
+                    strategy: RoutingPolicyV4::ManualSticky,
+                    children: vec!["input".to_string(), "backup".to_string()],
+                    target: Some("input".to_string()),
+                    ..crate::config::RoutingNodeV4::default()
+                },
+            )]),
+            policy: RoutingPolicyV4::ManualSticky,
             order: vec!["input".to_string(), "backup".to_string()],
             target: Some("input".to_string()),
             prefer_tags: Vec::new(),
-            on_exhausted: RoutingExhaustedActionV3::Continue,
+            chain: Vec::new(),
+            pools: BTreeMap::new(),
+            on_exhausted: RoutingExhaustedActionV4::Continue,
+            entry_strategy: RoutingPolicyV4::ManualSticky,
+            expanded_order: Vec::new(),
+            entry_target: Some("input".to_string()),
             providers: Vec::new(),
         };
 
         let next = routing_spec_after_provider_enabled_change(&spec, "input", false)
             .expect("manual target disable should rewrite routing");
 
-        assert_eq!(next.policy, RoutingPolicyV3::OrderedFailover);
+        assert_eq!(next.policy, RoutingPolicyV4::OrderedFailover);
         assert_eq!(next.target, None);
         assert_eq!(next.order, vec!["input", "backup"]);
     }
@@ -3762,15 +3812,93 @@ mod tests {
     #[test]
     fn enabling_provider_keeps_existing_routing_policy() {
         let spec = RoutingSpecView {
-            policy: RoutingPolicyV3::ManualSticky,
+            entry: "main".to_string(),
+            routes: BTreeMap::from([(
+                "main".to_string(),
+                crate::config::RoutingNodeV4 {
+                    strategy: RoutingPolicyV4::ManualSticky,
+                    children: vec!["input".to_string()],
+                    target: Some("input".to_string()),
+                    ..crate::config::RoutingNodeV4::default()
+                },
+            )]),
+            policy: RoutingPolicyV4::ManualSticky,
             order: vec!["input".to_string()],
             target: Some("input".to_string()),
             prefer_tags: Vec::new(),
-            on_exhausted: RoutingExhaustedActionV3::Continue,
+            chain: Vec::new(),
+            pools: BTreeMap::new(),
+            on_exhausted: RoutingExhaustedActionV4::Continue,
+            entry_strategy: RoutingPolicyV4::ManualSticky,
+            expanded_order: Vec::new(),
+            entry_target: Some("input".to_string()),
             providers: Vec::new(),
         };
 
         assert!(routing_spec_after_provider_enabled_change(&spec, "input", true).is_none());
+    }
+
+    #[test]
+    fn nested_route_graph_entry_reorder_is_not_flat_provider_list() {
+        let spec = RoutingSpecView {
+            entry: "monthly_first".to_string(),
+            routes: BTreeMap::from([
+                (
+                    "monthly_pool".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        children: vec!["input".to_string(), "input1".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+                (
+                    "monthly_first".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        children: vec!["monthly_pool".to_string(), "paygo".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+            ]),
+            policy: RoutingPolicyV4::OrderedFailover,
+            order: vec!["monthly_pool".to_string(), "paygo".to_string()],
+            target: None,
+            prefer_tags: Vec::new(),
+            chain: Vec::new(),
+            pools: BTreeMap::new(),
+            on_exhausted: RoutingExhaustedActionV4::Continue,
+            entry_strategy: RoutingPolicyV4::OrderedFailover,
+            expanded_order: vec![
+                "input".to_string(),
+                "input1".to_string(),
+                "paygo".to_string(),
+            ],
+            entry_target: None,
+            providers: vec![
+                RoutingProviderRef {
+                    name: "input".to_string(),
+                    alias: None,
+                    enabled: true,
+                    tags: BTreeMap::new(),
+                },
+                RoutingProviderRef {
+                    name: "input1".to_string(),
+                    alias: None,
+                    enabled: true,
+                    tags: BTreeMap::new(),
+                },
+                RoutingProviderRef {
+                    name: "paygo".to_string(),
+                    alias: None,
+                    enabled: true,
+                    tags: BTreeMap::new(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            routing_entry_children(&spec),
+            vec!["monthly_pool".to_string(), "paygo".to_string()]
+        );
+        assert!(!routing_entry_is_flat_provider_list(&spec));
     }
 }
 
@@ -4081,18 +4209,45 @@ fn selected_routing_provider_enabled(ui: &UiState) -> Option<bool> {
 fn routing_spec_with_order(
     spec: &RoutingSpecView,
     order: Vec<String>,
-    policy: crate::config::RoutingPolicyV3,
+    policy: crate::config::RoutingPolicyV4,
 ) -> RoutingSpecView {
     let mut next = spec.clone();
-    next.policy = policy;
-    next.order = order;
-    if !matches!(policy, crate::config::RoutingPolicyV3::ManualSticky) {
-        next.target = None;
+    {
+        let node = next.entry_node_mut();
+        node.strategy = policy;
+        node.children = order;
+        if !matches!(policy, crate::config::RoutingPolicyV4::ManualSticky) {
+            node.target = None;
+        }
+        if !matches!(policy, crate::config::RoutingPolicyV4::TagPreferred) {
+            node.prefer_tags.clear();
+        }
     }
-    if !matches!(policy, crate::config::RoutingPolicyV3::TagPreferred) {
-        next.prefer_tags.clear();
-    }
+    next.sync_entry_compat_from_graph();
     next
+}
+
+fn routing_entry_children(spec: &RoutingSpecView) -> Vec<String> {
+    let children = spec
+        .entry_node()
+        .map(|node| node.children.clone())
+        .unwrap_or_default();
+    if children.is_empty() {
+        routing_leaf_provider_names(spec)
+    } else {
+        children
+    }
+}
+
+fn routing_entry_is_flat_provider_list(spec: &RoutingSpecView) -> bool {
+    let provider_names = spec
+        .providers
+        .iter()
+        .map(|provider| provider.name.as_str())
+        .collect::<BTreeSet<_>>();
+    routing_entry_children(spec)
+        .iter()
+        .all(|name| provider_names.contains(name.as_str()))
 }
 
 fn routing_spec_after_provider_enabled_change(
@@ -4101,7 +4256,7 @@ fn routing_spec_after_provider_enabled_change(
     enabled: bool,
 ) -> Option<RoutingSpecView> {
     if enabled
-        || !matches!(spec.policy, crate::config::RoutingPolicyV3::ManualSticky)
+        || !matches!(spec.policy, crate::config::RoutingPolicyV4::ManualSticky)
         || spec.target.as_deref() != Some(provider_name)
     {
         return None;
@@ -4109,8 +4264,8 @@ fn routing_spec_after_provider_enabled_change(
 
     Some(routing_spec_with_order(
         spec,
-        routing_provider_names(spec),
-        crate::config::RoutingPolicyV3::OrderedFailover,
+        routing_entry_children(spec),
+        crate::config::RoutingPolicyV4::OrderedFailover,
     ))
 }
 
@@ -4168,6 +4323,13 @@ async fn handle_key_routing_menu(
             let Some(spec) = ui.routing_spec.clone() else {
                 return true;
             };
+            if !routing_entry_is_flat_provider_list(&spec) {
+                ui.toast = Some((
+                    "nested route graph: edit route nodes in TOML for grouped reorder".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            }
             let mut order = routing_provider_names(&spec);
             if ui.routing_menu_idx == 0 || ui.routing_menu_idx >= order.len() {
                 return true;
@@ -4177,7 +4339,7 @@ async fn handle_key_routing_menu(
             let next = routing_spec_with_order(
                 &spec,
                 order,
-                crate::config::RoutingPolicyV3::OrderedFailover,
+                crate::config::RoutingPolicyV4::OrderedFailover,
             );
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => ui.toast = Some(("routing: moved up".to_string(), Instant::now())),
@@ -4191,6 +4353,13 @@ async fn handle_key_routing_menu(
             let Some(spec) = ui.routing_spec.clone() else {
                 return true;
             };
+            if !routing_entry_is_flat_provider_list(&spec) {
+                ui.toast = Some((
+                    "nested route graph: edit route nodes in TOML for grouped reorder".to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            }
             let mut order = routing_provider_names(&spec);
             if ui.routing_menu_idx + 1 >= order.len() {
                 return true;
@@ -4200,7 +4369,7 @@ async fn handle_key_routing_menu(
             let next = routing_spec_with_order(
                 &spec,
                 order,
-                crate::config::RoutingPolicyV3::OrderedFailover,
+                crate::config::RoutingPolicyV4::OrderedFailover,
             );
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => ui.toast = Some(("routing: moved down".to_string(), Instant::now())),
@@ -4218,10 +4387,18 @@ async fn handle_key_routing_menu(
                 return true;
             };
             let mut next = spec.clone();
-            next.policy = crate::config::RoutingPolicyV3::ManualSticky;
-            next.target = Some(target.clone());
-            next.order = routing_provider_names(&spec);
-            next.prefer_tags.clear();
+            {
+                let node = next.entry_node_mut();
+                node.strategy = crate::config::RoutingPolicyV4::ManualSticky;
+                node.target = Some(target.clone());
+                node.children = routing_entry_children(&spec);
+                if !node.children.iter().any(|name| name == &target) {
+                    node.children.insert(0, target.clone());
+                }
+                node.prefer_tags.clear();
+                node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
+            }
+            next.sync_entry_compat_from_graph();
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((format!("routing: pinned {target}"), Instant::now()));
@@ -4236,11 +4413,11 @@ async fn handle_key_routing_menu(
             let Some(spec) = ui.routing_spec.clone() else {
                 return true;
             };
-            let order = routing_provider_names(&spec);
+            let order = routing_entry_children(&spec);
             let next = routing_spec_with_order(
                 &spec,
                 order,
-                crate::config::RoutingPolicyV3::OrderedFailover,
+                crate::config::RoutingPolicyV4::OrderedFailover,
             );
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
@@ -4257,13 +4434,18 @@ async fn handle_key_routing_menu(
                 return true;
             };
             let mut next = spec.clone();
-            next.policy = crate::config::RoutingPolicyV3::TagPreferred;
-            next.order = routing_provider_names(&spec);
-            next.target = None;
-            next.prefer_tags = vec![BTreeMap::from([(
-                "billing".to_string(),
-                "monthly".to_string(),
-            )])];
+            {
+                let node = next.entry_node_mut();
+                node.strategy = crate::config::RoutingPolicyV4::TagPreferred;
+                node.children = routing_entry_children(&spec);
+                node.target = None;
+                node.prefer_tags = vec![BTreeMap::from([(
+                    "billing".to_string(),
+                    "monthly".to_string(),
+                )])];
+                node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
+            }
+            next.sync_entry_compat_from_graph();
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((
@@ -4342,19 +4524,21 @@ async fn handle_key_routing_menu(
                 return true;
             };
             let mut next = spec.clone();
-            next.on_exhausted = match spec.on_exhausted {
-                crate::config::RoutingExhaustedActionV3::Continue => {
-                    crate::config::RoutingExhaustedActionV3::Stop
+            let on_exhausted = match spec.on_exhausted {
+                crate::config::RoutingExhaustedActionV4::Continue => {
+                    crate::config::RoutingExhaustedActionV4::Stop
                 }
-                crate::config::RoutingExhaustedActionV3::Stop => {
-                    crate::config::RoutingExhaustedActionV3::Continue
+                crate::config::RoutingExhaustedActionV4::Stop => {
+                    crate::config::RoutingExhaustedActionV4::Continue
                 }
             };
+            next.entry_node_mut().on_exhausted = on_exhausted;
+            next.sync_entry_compat_from_graph();
             match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
                 Ok(()) => {
                     let label = match ui.routing_spec.as_ref().map(|spec| spec.on_exhausted) {
-                        Some(crate::config::RoutingExhaustedActionV3::Continue) => "continue",
-                        Some(crate::config::RoutingExhaustedActionV3::Stop) => "stop",
+                        Some(crate::config::RoutingExhaustedActionV4::Continue) => "continue",
+                        Some(crate::config::RoutingExhaustedActionV4::Stop) => "stop",
                         None => "-",
                     };
                     ui.toast = Some((format!("routing: on_exhausted={label}"), Instant::now()));

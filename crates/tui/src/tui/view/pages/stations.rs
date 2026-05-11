@@ -235,18 +235,18 @@ fn format_skip_reason(reason: &StationRoutingSkipReason) -> String {
     }
 }
 
-fn routing_policy_label(policy: crate::config::RoutingPolicyV3) -> &'static str {
+fn routing_policy_label(policy: crate::config::RoutingPolicyV4) -> &'static str {
     match policy {
-        crate::config::RoutingPolicyV3::ManualSticky => "manual-sticky",
-        crate::config::RoutingPolicyV3::OrderedFailover => "ordered-failover",
-        crate::config::RoutingPolicyV3::TagPreferred => "tag-preferred",
+        crate::config::RoutingPolicyV4::ManualSticky => "manual-sticky",
+        crate::config::RoutingPolicyV4::OrderedFailover => "ordered-failover",
+        crate::config::RoutingPolicyV4::TagPreferred => "tag-preferred",
     }
 }
 
-fn routing_exhausted_label(action: crate::config::RoutingExhaustedActionV3) -> &'static str {
+fn routing_exhausted_label(action: crate::config::RoutingExhaustedActionV4) -> &'static str {
     match action {
-        crate::config::RoutingExhaustedActionV3::Continue => "continue",
-        crate::config::RoutingExhaustedActionV3::Stop => "stop",
+        crate::config::RoutingExhaustedActionV4::Continue => "continue",
+        crate::config::RoutingExhaustedActionV4::Stop => "stop",
     }
 }
 
@@ -282,7 +282,7 @@ fn routing_provider_matches_preference(
     spec: &crate::tui::model::RoutingSpecView,
     provider: &crate::tui::model::RoutingProviderRef,
 ) -> bool {
-    matches!(spec.policy, crate::config::RoutingPolicyV3::TagPreferred)
+    matches!(spec.policy, crate::config::RoutingPolicyV4::TagPreferred)
         && spec.prefer_tags.iter().any(|filter| {
             !filter.is_empty()
                 && filter
@@ -330,7 +330,7 @@ fn routing_provider_marker(
     }
 }
 
-fn render_v3_routing_page(
+fn render_route_graph_routing_page(
     f: &mut Frame<'_>,
     p: Palette,
     ui: &mut UiState,
@@ -532,7 +532,7 @@ fn render_v3_routing_page(
             ]));
         } else {
             lines.push(Line::from(Span::styled(
-                "provider is referenced by routing.order but missing from catalog",
+                "provider is referenced by the route graph but missing from catalog",
                 Style::default().fg(p.warn),
             )));
         }
@@ -624,8 +624,8 @@ pub(super) fn render_stations_page(
     providers: &[ProviderOption],
     area: Rect,
 ) {
-    if ui.uses_v3_routing() {
-        render_v3_routing_page(f, p, ui, snapshot, area);
+    if ui.uses_route_graph_routing() {
+        render_route_graph_routing_page(f, p, ui, snapshot, area);
         return;
     }
 
@@ -1078,7 +1078,7 @@ pub(super) fn render_stations_page(
             "  i            Provider 详情（可滚动）",
             "  i            provider details (scrollable)",
         )));
-        if ui.uses_v3_routing() {
+        if ui.uses_route_graph_routing() {
             lines.push(Line::from(
                 "  Enter/r      routing editor (policy/order/tags/enable)",
             ));
@@ -1086,7 +1086,7 @@ pub(super) fn render_stations_page(
                 "  Backspace    clear legacy runtime station pin",
             ));
             lines.push(Line::from(
-                "  o            disabled: provider choice is v3 routing policy",
+                "  o            disabled: provider choice is v4 routing policy",
             ));
             lines.push(Line::from(
                 "  O            clear legacy session station override",

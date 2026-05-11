@@ -9,7 +9,7 @@ use super::control_plane_service::{
     load_persisted_proxy_settings_v2, runtime_service_manager_mut,
     save_persisted_proxy_settings_document_and_reload, save_persisted_proxy_settings_v2_and_reload,
     save_runtime_profile_settings_and_reload, save_runtime_proxy_settings_and_reload,
-    service_view_v2, service_view_v2_mut, service_view_v3, service_view_v3_mut,
+    service_view_v2, service_view_v2_mut, service_view_v4, service_view_v4_mut,
 };
 
 fn default_persisted_station_enabled() -> bool {
@@ -20,12 +20,8 @@ fn default_persisted_station_level() -> u8 {
     1
 }
 
-fn default_persisted_routing_policy() -> crate::config::RoutingPolicyV3 {
-    crate::config::RoutingPolicyV3::OrderedFailover
-}
-
-fn default_persisted_routing_on_exhausted() -> crate::config::RoutingExhaustedActionV3 {
-    crate::config::RoutingExhaustedActionV3::Continue
+fn default_persisted_routing_on_exhausted() -> crate::config::RoutingExhaustedActionV4 {
+    crate::config::RoutingExhaustedActionV4::Continue
 }
 
 #[derive(serde::Deserialize)]
@@ -119,16 +115,24 @@ pub(super) struct PersistedDefaultProfileRequest {
 
 #[derive(serde::Deserialize)]
 pub(super) struct PersistedRoutingUpsertRequest {
-    #[serde(default = "default_persisted_routing_policy")]
-    policy: crate::config::RoutingPolicyV3,
+    #[serde(default)]
+    entry: Option<String>,
+    #[serde(default)]
+    routes: Option<std::collections::BTreeMap<String, crate::config::RoutingNodeV4>>,
+    #[serde(default)]
+    policy: Option<crate::config::RoutingPolicyV4>,
     #[serde(default)]
     order: Vec<String>,
     #[serde(default)]
     target: Option<String>,
     #[serde(default)]
-    prefer_tags: Vec<std::collections::BTreeMap<String, String>>,
+    prefer_tags: Option<Vec<std::collections::BTreeMap<String, String>>>,
+    #[serde(default)]
+    chain: Vec<String>,
+    #[serde(default)]
+    pools: std::collections::BTreeMap<String, crate::config::RoutingPoolV4>,
     #[serde(default = "default_persisted_routing_on_exhausted")]
-    on_exhausted: crate::config::RoutingExhaustedActionV3,
+    on_exhausted: crate::config::RoutingExhaustedActionV4,
 }
 
 fn sanitize_profile_name(profile_name: &str) -> Result<String, (StatusCode, String)> {
@@ -389,9 +393,9 @@ fn merge_persisted_provider_spec(
     }
 }
 
-fn persisted_provider_spec_from_v3(
+fn persisted_provider_spec_from_v4(
     name: &str,
-    provider: &crate::config::ProviderConfigV3,
+    provider: &crate::config::ProviderConfigV4,
 ) -> crate::config::PersistedProviderSpec {
     let mut endpoints = Vec::new();
     if let Some(base_url) = provider
@@ -429,16 +433,32 @@ fn persisted_provider_spec_from_v3(
     }
 }
 
-fn persisted_routing_spec_from_v3(
-    view: &crate::config::ServiceViewV3,
+fn persisted_routing_spec_from_v4(
+    view: &crate::config::ServiceViewV4,
 ) -> crate::config::PersistedRoutingSpec {
-    let routing = view.routing.clone().unwrap_or_default();
+    let routing = crate::config::effective_v4_routing(view);
+    let order = crate::config::resolved_v4_provider_order("persisted-routing", view)
+        .unwrap_or_else(|_| view.providers.keys().cloned().collect::<Vec<_>>());
+    let entry_node = routing.entry_node();
     crate::config::PersistedRoutingSpec {
-        policy: routing.policy,
-        order: routing.order,
-        target: routing.target,
-        prefer_tags: routing.prefer_tags,
-        on_exhausted: routing.on_exhausted,
+        entry: routing.entry.clone(),
+        routes: routing.routes.clone(),
+        policy: entry_node
+            .map(|node| node.strategy)
+            .unwrap_or(crate::config::RoutingPolicyV4::OrderedFailover),
+        order: order.clone(),
+        target: entry_node.and_then(|node| node.target.clone()),
+        prefer_tags: entry_node
+            .map(|node| node.prefer_tags.clone())
+            .unwrap_or_default(),
+        on_exhausted: entry_node
+            .map(|node| node.on_exhausted)
+            .unwrap_or(crate::config::RoutingExhaustedActionV4::Continue),
+        entry_strategy: entry_node
+            .map(|node| node.strategy)
+            .unwrap_or(crate::config::RoutingPolicyV4::OrderedFailover),
+        expanded_order: order,
+        entry_target: entry_node.and_then(|node| node.target.clone()),
         providers: view
             .providers
             .iter()
@@ -455,36 +475,168 @@ fn persisted_routing_spec_from_v3(
 }
 
 fn sanitize_routing_spec_request(
+    view: &crate::config::ServiceViewV4,
     payload: PersistedRoutingUpsertRequest,
-) -> Result<crate::config::RoutingConfigV3, (StatusCode, String)> {
-    let mut order = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for provider_name in payload.order {
-        let provider_name = provider_name.trim();
-        if provider_name.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "routing order provider name is required".to_string(),
-            ));
-        }
-        if !seen.insert(provider_name.to_string()) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("duplicate routing provider '{}'", provider_name),
-            ));
-        }
-        order.push(provider_name.to_string());
+) -> Result<crate::config::RoutingConfigV4, (StatusCode, String)> {
+    if !payload.chain.is_empty() || !payload.pools.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "pool routing is no longer part of the v4 authoring model; use nested routes instead"
+                .to_string(),
+        ));
     }
 
-    let target = payload
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+    let has_graph_update = payload.entry.is_some() || payload.routes.is_some();
+    let has_entry_update = payload.policy.is_some()
+        || !payload.order.is_empty()
+        || payload.target.is_some()
+        || payload.prefer_tags.is_some()
+        || payload.on_exhausted != crate::config::RoutingExhaustedActionV4::Continue;
 
-    let mut prefer_tags = Vec::new();
-    for filter in payload.prefer_tags {
+    let mut routing = crate::config::effective_v4_routing(view);
+    if let Some(entry) = payload.entry {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "routing entry is required".to_string(),
+            ));
+        }
+        routing.entry = entry.to_string();
+    }
+    if let Some(routes) = payload.routes {
+        routing.routes = sanitize_route_nodes(routes)?;
+    }
+
+    if has_entry_update || !has_graph_update {
+        let entry_name = routing.entry.clone();
+        if !routing.routes.contains_key(entry_name.as_str()) {
+            routing.routes.insert(
+                entry_name.clone(),
+                crate::config::RoutingNodeV4 {
+                    strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                    children: Vec::new(),
+                    target: None,
+                    prefer_tags: Vec::new(),
+                    on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
+                    metadata: std::collections::BTreeMap::new(),
+                },
+            );
+        }
+        let node = routing
+            .routes
+            .get_mut(entry_name.as_str())
+            .expect("entry route inserted above");
+
+        if let Some(policy) = payload.policy {
+            node.strategy = policy;
+        }
+
+        let order = sanitize_route_children(payload.order)?;
+        if !order.is_empty() {
+            node.children = order;
+        }
+
+        if let Some(raw_target) = payload.target {
+            let target = raw_target.trim();
+            if target.is_empty() {
+                node.target = None;
+            } else {
+                node.strategy = crate::config::RoutingPolicyV4::ManualSticky;
+                node.target = Some(target.to_string());
+                if node.children.is_empty() {
+                    node.children = vec![target.to_string()];
+                }
+            }
+        }
+
+        if let Some(prefer_tags) = payload.prefer_tags {
+            node.prefer_tags = sanitize_routing_prefer_tags(prefer_tags)?;
+            if !node.prefer_tags.is_empty() {
+                node.strategy = crate::config::RoutingPolicyV4::TagPreferred;
+            }
+        }
+
+        node.on_exhausted = payload.on_exhausted;
+        if !matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky) {
+            node.target = None;
+        }
+        if !matches!(node.strategy, crate::config::RoutingPolicyV4::TagPreferred) {
+            node.prefer_tags.clear();
+        }
+        if node.children.is_empty() {
+            node.children = view.providers.keys().cloned().collect();
+        }
+    }
+
+    routing.sync_compat_from_graph();
+    Ok(routing)
+}
+
+fn sanitize_route_nodes(
+    routes: std::collections::BTreeMap<String, crate::config::RoutingNodeV4>,
+) -> Result<std::collections::BTreeMap<String, crate::config::RoutingNodeV4>, (StatusCode, String)>
+{
+    let mut out = std::collections::BTreeMap::new();
+    for (name, mut node) in routes {
+        let route_name = name.trim();
+        if route_name.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "routing route name is required".to_string(),
+            ));
+        }
+        node.children = sanitize_route_children(node.children)?;
+        if let Some(target) = node.target.take() {
+            let target = target.trim();
+            if !target.is_empty() {
+                node.target = Some(target.to_string());
+            }
+        }
+        node.prefer_tags = sanitize_routing_prefer_tags(node.prefer_tags)?;
+        if !matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky) {
+            node.target = None;
+        }
+        if !matches!(node.strategy, crate::config::RoutingPolicyV4::TagPreferred) {
+            node.prefer_tags.clear();
+        }
+        if out.insert(route_name.to_string(), node).is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("duplicate routing route '{}'", route_name),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn sanitize_route_children(children: Vec<String>) -> Result<Vec<String>, (StatusCode, String)> {
+    let mut order = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for child_name in children {
+        let child_name = child_name.trim();
+        if child_name.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "routing child name is required".to_string(),
+            ));
+        }
+        if !seen.insert(child_name.to_string()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("duplicate routing child '{}'", child_name),
+            ));
+        }
+        order.push(child_name.to_string());
+    }
+    Ok(order)
+}
+
+fn sanitize_routing_prefer_tags(
+    prefer_tags: Vec<std::collections::BTreeMap<String, String>>,
+) -> Result<Vec<std::collections::BTreeMap<String, String>>, (StatusCode, String)> {
+    let mut out = Vec::new();
+    for filter in prefer_tags {
         let normalized = filter
             .into_iter()
             .filter_map(|(key, value)| {
@@ -499,53 +651,24 @@ fn sanitize_routing_spec_request(
                 "routing prefer_tags entries must contain at least one key/value pair".to_string(),
             ));
         }
-        prefer_tags.push(normalized);
+        out.push(normalized);
     }
-
-    Ok(crate::config::RoutingConfigV3 {
-        policy: payload.policy,
-        order,
-        target,
-        prefer_tags,
-        on_exhausted: payload.on_exhausted,
-    })
+    Ok(out)
 }
 
-fn validate_v3_routing_spec_for_view(
+fn validate_v4_routing_spec_for_view(
     service_name: &str,
-    view: &crate::config::ServiceViewV3,
-    routing: &crate::config::RoutingConfigV3,
+    view: &crate::config::ServiceViewV4,
+    routing: &crate::config::RoutingConfigV4,
 ) -> Result<(), (StatusCode, String)> {
-    for provider_name in &routing.order {
-        if !view.providers.contains_key(provider_name) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("[{service_name}] routing references missing provider '{provider_name}'"),
-            ));
-        }
-    }
-
-    if let Some(target) = routing.target.as_deref() {
-        let Some(provider) = view.providers.get(target) else {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("[{service_name}] routing target references missing provider '{target}'"),
-            ));
-        };
-        if !provider.enabled {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "[{service_name}] routing target provider '{target}' is disabled; enable the provider before pinning it"
-                ),
-            ));
-        }
-    }
-
-    Ok(())
+    let mut next_view = view.clone();
+    next_view.routing = Some(routing.clone());
+    crate::config::resolved_v4_provider_order(service_name, &next_view)
+        .map(|_| ())
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))
 }
 
-fn v3_default_endpoint_can_be_inlined(existing: Option<&crate::config::ProviderConfigV3>) -> bool {
+fn v4_default_endpoint_can_be_inlined(existing: Option<&crate::config::ProviderConfigV4>) -> bool {
     existing
         .and_then(|provider| provider.endpoints.get("default"))
         .map(|endpoint| {
@@ -556,12 +679,12 @@ fn v3_default_endpoint_can_be_inlined(existing: Option<&crate::config::ProviderC
         .unwrap_or(true)
 }
 
-fn merge_persisted_provider_spec_v3(
-    existing: Option<&crate::config::ProviderConfigV3>,
+fn merge_persisted_provider_spec_v4(
+    existing: Option<&crate::config::ProviderConfigV4>,
     provider: &SanitizedPersistedProviderSpec,
-) -> crate::config::ProviderConfigV3 {
+) -> crate::config::ProviderConfigV4 {
     let spec = &provider.spec;
-    let mut out = crate::config::ProviderConfigV3 {
+    let mut out = crate::config::ProviderConfigV4 {
         alias: spec.alias.clone(),
         enabled: spec.enabled,
         base_url: None,
@@ -594,7 +717,7 @@ fn merge_persisted_provider_spec_v3(
         && spec.endpoints[0].name == "default"
         && spec.endpoints[0].priority == 0
         && spec.endpoints[0].tags.is_empty()
-        && v3_default_endpoint_can_be_inlined(existing)
+        && v4_default_endpoint_can_be_inlined(existing)
     {
         out.base_url = Some(spec.endpoints[0].base_url.clone());
     } else {
@@ -606,7 +729,7 @@ fn merge_persisted_provider_spec_v3(
                     existing.and_then(|provider| provider.endpoints.get(endpoint.name.as_str()));
                 (
                     endpoint.name.clone(),
-                    crate::config::ProviderEndpointV3 {
+                    crate::config::ProviderEndpointV4 {
                         base_url: endpoint.base_url.clone(),
                         enabled: endpoint.enabled,
                         priority: endpoint.priority,
@@ -648,17 +771,33 @@ fn runtime_service_manager_for_document<'a>(
     }
 }
 
-fn append_new_provider_to_explicit_v3_order(
-    view: &mut crate::config::ServiceViewV3,
+fn ensure_v4_entry_route_mut(
+    view: &mut crate::config::ServiceViewV4,
+) -> &mut crate::config::RoutingNodeV4 {
+    let routing = view
+        .routing
+        .get_or_insert_with(|| crate::config::RoutingConfigV4::default());
+    if !routing.routes.contains_key(routing.entry.as_str()) {
+        routing.routes.insert(
+            routing.entry.clone(),
+            crate::config::RoutingNodeV4::default(),
+        );
+    }
+    routing
+        .routes
+        .get_mut(routing.entry.as_str())
+        .expect("entry route inserted above")
+}
+
+fn append_new_provider_to_explicit_v4_order(
+    view: &mut crate::config::ServiceViewV4,
     provider_name: &str,
 ) {
-    let Some(routing) = view.routing.as_mut() else {
-        return;
-    };
-    if routing.order.is_empty() || routing.order.iter().any(|name| name == provider_name) {
+    let routing = ensure_v4_entry_route_mut(view);
+    if routing.children.iter().any(|name| name == provider_name) {
         return;
     }
-    routing.order.push(provider_name.to_string());
+    routing.children.push(provider_name.to_string());
 }
 
 fn validate_station_members_for_view(
@@ -705,9 +844,9 @@ pub(super) async fn list_persisted_station_specs(
                 service_view_v2(&cfg, proxy.service_name),
             )))
         }
-        PersistedProxySettingsDocument::V3(_) => Err((
+        PersistedProxySettingsDocument::V4(_) => Err((
             StatusCode::BAD_REQUEST,
-            "v3 routing configs do not expose station specs; use the routing and provider specs APIs"
+            "v4 route graph configs do not expose station specs; use the routing and provider specs APIs"
                 .to_string(),
         )),
     }
@@ -722,12 +861,12 @@ pub(super) async fn list_persisted_provider_specs(
                 service_view_v2(&cfg, proxy.service_name),
             )))
         }
-        PersistedProxySettingsDocument::V3(cfg) => {
+        PersistedProxySettingsDocument::V4(cfg) => {
             Ok(Json(crate::config::PersistedProvidersCatalog {
-                providers: service_view_v3(&cfg, proxy.service_name)
+                providers: service_view_v4(&cfg, proxy.service_name)
                     .providers
                     .iter()
-                    .map(|(name, provider)| persisted_provider_spec_from_v3(name, provider))
+                    .map(|(name, provider)| persisted_provider_spec_from_v4(name, provider))
                     .collect(),
             }))
         }
@@ -738,12 +877,12 @@ pub(super) async fn list_persisted_routing_spec(
     proxy: ProxyService,
 ) -> Result<Json<crate::config::PersistedRoutingSpec>, (StatusCode, String)> {
     match load_persisted_proxy_settings_document().await? {
-        PersistedProxySettingsDocument::V3(cfg) => Ok(Json(persisted_routing_spec_from_v3(
-            service_view_v3(&cfg, proxy.service_name),
+        PersistedProxySettingsDocument::V4(cfg) => Ok(Json(persisted_routing_spec_from_v4(
+            service_view_v4(&cfg, proxy.service_name),
         ))),
         PersistedProxySettingsDocument::V2(_) => Err((
             StatusCode::BAD_REQUEST,
-            "routing API requires a version = 3 config".to_string(),
+            "routing API requires a version = 4 route graph config".to_string(),
         )),
     }
 }
@@ -753,37 +892,37 @@ pub(super) async fn upsert_persisted_routing_spec(
     Json(payload): Json<PersistedRoutingUpsertRequest>,
 ) -> Result<Json<crate::config::PersistedRoutingSpec>, (StatusCode, String)> {
     let mut document = match load_persisted_proxy_settings_document().await? {
-        PersistedProxySettingsDocument::V3(document) => document,
+        PersistedProxySettingsDocument::V4(document) => document,
         PersistedProxySettingsDocument::V2(_) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "routing API requires a version = 3 config".to_string(),
+                "routing API requires a version = 4 route graph config".to_string(),
             ));
         }
     };
 
-    let routing = sanitize_routing_spec_request(payload)?;
-    let view = service_view_v3_mut(&mut document, proxy.service_name);
-    validate_v3_routing_spec_for_view(proxy.service_name, view, &routing)?;
+    let view = service_view_v4_mut(&mut document, proxy.service_name);
+    let routing = sanitize_routing_spec_request(view, payload)?;
+    validate_v4_routing_spec_for_view(proxy.service_name, view, &routing)?;
     view.routing = Some(routing);
-    crate::config::compile_v3_to_runtime(&document)
+    crate::config::compile_v4_to_runtime(&document)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     save_persisted_proxy_settings_document_and_reload(
         &proxy,
-        PersistedProxySettingsDocument::V3(document),
+        PersistedProxySettingsDocument::V4(document),
     )
     .await?;
 
-    if let PersistedProxySettingsDocument::V3(cfg) =
+    if let PersistedProxySettingsDocument::V4(cfg) =
         load_persisted_proxy_settings_document().await?
     {
-        return Ok(Json(persisted_routing_spec_from_v3(service_view_v3(
+        return Ok(Json(persisted_routing_spec_from_v4(service_view_v4(
             &cfg,
             proxy.service_name,
         ))));
     }
 
-    unreachable!("saved routing document should reload as v3");
+    unreachable!("saved routing document should reload as v4");
 }
 
 pub(super) async fn upsert_persisted_profile(
@@ -794,19 +933,20 @@ pub(super) async fn upsert_persisted_profile(
     let profile_name = sanitize_profile_name(profile_name.as_str())?;
     let has_station_binding = profile_request_has_station_binding(&payload);
 
-    if let PersistedProxySettingsDocument::V3(mut document) =
+    if let PersistedProxySettingsDocument::V4(mut document) =
         load_persisted_proxy_settings_document().await?
     {
         if has_station_binding {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "v3 profiles do not support station bindings; edit routing instead".to_string(),
+                "v4 route graph profiles do not support station bindings; edit routing instead"
+                    .to_string(),
             ));
         }
         let profile = sanitize_profile_request(payload);
-        let view = service_view_v3_mut(&mut document, proxy.service_name);
+        let view = service_view_v4_mut(&mut document, proxy.service_name);
         view.profiles.insert(profile_name.clone(), profile);
-        let runtime = crate::config::compile_v3_to_runtime(&document)
+        let runtime = crate::config::compile_v4_to_runtime(&document)
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         let mgr = runtime_service_manager_for_document(&runtime, proxy.service_name);
         let resolved = crate::config::resolve_service_profile(mgr, profile_name.as_str())
@@ -820,7 +960,7 @@ pub(super) async fn upsert_persisted_profile(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         save_persisted_proxy_settings_document_and_reload(
             &proxy,
-            PersistedProxySettingsDocument::V3(document),
+            PersistedProxySettingsDocument::V4(document),
         )
         .await?;
         return Ok(Json(make_profiles_response(&proxy).await));
@@ -853,10 +993,10 @@ pub(super) async fn delete_persisted_profile(
 ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
     let profile_name = sanitize_profile_name(profile_name.as_str())?;
 
-    if let PersistedProxySettingsDocument::V3(mut document) =
+    if let PersistedProxySettingsDocument::V4(mut document) =
         load_persisted_proxy_settings_document().await?
     {
-        let view = service_view_v3_mut(&mut document, proxy.service_name);
+        let view = service_view_v4_mut(&mut document, proxy.service_name);
         let referencing_profiles = view
             .profiles
             .iter()
@@ -885,7 +1025,7 @@ pub(super) async fn delete_persisted_profile(
         }
         save_persisted_proxy_settings_document_and_reload(
             &proxy,
-            PersistedProxySettingsDocument::V3(document),
+            PersistedProxySettingsDocument::V4(document),
         )
         .await?;
         if proxy
@@ -967,11 +1107,11 @@ pub(super) async fn update_persisted_station(
 
     if matches!(
         load_persisted_proxy_settings_document().await?,
-        PersistedProxySettingsDocument::V3(_)
+        PersistedProxySettingsDocument::V4(_)
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "v3 routing configs do not support station settings writes; edit providers and routing instead"
+            "v4 route graph configs do not support station settings writes; edit providers and routing instead"
                 .to_string(),
         ));
     }
@@ -1004,11 +1144,11 @@ pub(super) async fn set_persisted_active_station(
 
     if matches!(
         load_persisted_proxy_settings_document().await?,
-        PersistedProxySettingsDocument::V3(_)
+        PersistedProxySettingsDocument::V4(_)
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "v3 routing configs do not support station active writes; edit routing instead"
+            "v4 route graph configs do not support station active writes; edit routing instead"
                 .to_string(),
         ));
     }
@@ -1041,11 +1181,11 @@ pub(super) async fn upsert_persisted_station_spec(
 
     if matches!(
         load_persisted_proxy_settings_document().await?,
-        PersistedProxySettingsDocument::V3(_)
+        PersistedProxySettingsDocument::V4(_)
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "v3 routing configs do not support station spec editing; edit providers and routing instead"
+            "v4 route graph configs do not support station spec editing; edit providers and routing instead"
                 .to_string(),
         ));
     }
@@ -1081,11 +1221,11 @@ pub(super) async fn delete_persisted_station_spec(
     let station_name = sanitize_station_name(station_name.as_str())?;
     if matches!(
         load_persisted_proxy_settings_document().await?,
-        PersistedProxySettingsDocument::V3(_)
+        PersistedProxySettingsDocument::V4(_)
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "v3 routing configs do not support station spec editing; edit providers and routing instead"
+            "v4 route graph configs do not support station spec editing; edit providers and routing instead"
                 .to_string(),
         ));
     }
@@ -1136,31 +1276,31 @@ pub(super) async fn upsert_persisted_provider_spec(
     let mut provider = sanitize_provider_spec_request(payload)?;
     provider.spec.name = provider_name.clone();
 
-    if let PersistedProxySettingsDocument::V3(mut document) =
+    if let PersistedProxySettingsDocument::V4(mut document) =
         load_persisted_proxy_settings_document().await?
     {
-        let view = service_view_v3_mut(&mut document, proxy.service_name);
+        let view = service_view_v4_mut(&mut document, proxy.service_name);
         let existing_provider = view.providers.get(provider_name.as_str()).cloned();
         let is_new_provider = existing_provider.is_none();
         view.providers.insert(
             provider_name.clone(),
-            merge_persisted_provider_spec_v3(existing_provider.as_ref(), &provider),
+            merge_persisted_provider_spec_v4(existing_provider.as_ref(), &provider),
         );
         if is_new_provider {
-            append_new_provider_to_explicit_v3_order(view, provider_name.as_str());
+            append_new_provider_to_explicit_v4_order(view, provider_name.as_str());
         }
-        if !provider.spec.enabled
-            && let Some(routing) = view.routing.as_mut()
-            && routing.target.as_deref() == Some(provider_name.as_str())
-        {
-            routing.policy = crate::config::RoutingPolicyV3::OrderedFailover;
-            routing.target = None;
+        if !provider.spec.enabled {
+            let entry = ensure_v4_entry_route_mut(view);
+            if entry.target.as_deref() == Some(provider_name.as_str()) {
+                entry.strategy = crate::config::RoutingPolicyV4::OrderedFailover;
+                entry.target = None;
+            }
         }
-        crate::config::compile_v3_to_runtime(&document)
+        crate::config::compile_v4_to_runtime(&document)
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         save_persisted_proxy_settings_document_and_reload(
             &proxy,
-            PersistedProxySettingsDocument::V3(document),
+            PersistedProxySettingsDocument::V4(document),
         )
         .await?;
         return Ok(StatusCode::NO_CONTENT);
@@ -1186,10 +1326,10 @@ pub(super) async fn delete_persisted_provider_spec(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let provider_name = sanitize_provider_name(provider_name.as_str())?;
 
-    if let PersistedProxySettingsDocument::V3(mut document) =
+    if let PersistedProxySettingsDocument::V4(mut document) =
         load_persisted_proxy_settings_document().await?
     {
-        let view = service_view_v3_mut(&mut document, proxy.service_name);
+        let view = service_view_v4_mut(&mut document, proxy.service_name);
         let Some(_) = view.providers.remove(provider_name.as_str()) else {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -1197,14 +1337,19 @@ pub(super) async fn delete_persisted_provider_spec(
             ));
         };
         if let Some(routing) = view.routing.as_mut() {
-            routing.order.retain(|name| name != &provider_name);
-            if routing.target.as_deref() == Some(provider_name.as_str()) {
-                routing.target = None;
+            for node in routing.routes.values_mut() {
+                node.children.retain(|name| name != &provider_name);
+                if node.target.as_deref() == Some(provider_name.as_str()) {
+                    node.target = None;
+                    if matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky) {
+                        node.strategy = crate::config::RoutingPolicyV4::OrderedFailover;
+                    }
+                }
             }
         }
         save_persisted_proxy_settings_document_and_reload(
             &proxy,
-            PersistedProxySettingsDocument::V3(document),
+            PersistedProxySettingsDocument::V4(document),
         )
         .await?;
         return Ok(StatusCode::NO_CONTENT);
@@ -1259,18 +1404,18 @@ pub(super) async fn set_persisted_default_profile(
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
 
-    if let PersistedProxySettingsDocument::V3(mut document) =
+    if let PersistedProxySettingsDocument::V4(mut document) =
         load_persisted_proxy_settings_document().await?
     {
         if let Some(profile_name) = profile_name.as_deref() {
-            let view = service_view_v3(&document, proxy.service_name);
+            let view = service_view_v4(&document, proxy.service_name);
             if !view.profiles.contains_key(profile_name) {
                 return Err((
                     StatusCode::NOT_FOUND,
                     format!("profile '{}' not found", profile_name),
                 ));
             }
-            let runtime = crate::config::compile_v3_to_runtime(&document)
+            let runtime = crate::config::compile_v4_to_runtime(&document)
                 .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
             let mgr = runtime_service_manager_for_document(&runtime, proxy.service_name);
             let resolved = crate::config::resolve_service_profile(mgr, profile_name)
@@ -1283,11 +1428,11 @@ pub(super) async fn set_persisted_default_profile(
             )
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         }
-        let view = service_view_v3_mut(&mut document, proxy.service_name);
+        let view = service_view_v4_mut(&mut document, proxy.service_name);
         view.default_profile = profile_name;
         save_persisted_proxy_settings_document_and_reload(
             &proxy,
-            PersistedProxySettingsDocument::V3(document),
+            PersistedProxySettingsDocument::V4(document),
         )
         .await?;
         return Ok(Json(make_profiles_response(&proxy).await));

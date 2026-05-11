@@ -4,7 +4,7 @@ use super::*;
 pub struct ServiceControlProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extends: Option<String>,
-    /// Retained for legacy/v2 profiles. Routing-first v3 configs should express provider
+    /// Retained for legacy/v2 profiles. V4 route graph configs should express provider
     /// selection in the service routing block instead of profile-level station bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub station: Option<String>,

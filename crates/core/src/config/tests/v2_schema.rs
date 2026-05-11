@@ -453,7 +453,7 @@ preferred = true
         );
 
         let cfg = super::load_config().await.expect("load v2 config");
-        assert_eq!(cfg.version, Some(3));
+        assert_eq!(cfg.version, Some(4));
         assert_eq!(cfg.codex.active.as_deref(), Some("primary"));
         assert_eq!(cfg.codex.default_profile.as_deref(), Some("daily"));
         assert_eq!(
@@ -482,7 +482,7 @@ preferred = true
         );
 
         let saved = std::fs::read_to_string(&toml_path).expect("read migrated config.toml");
-        assert!(saved.contains("version = 3"));
+        assert!(saved.contains("version = 4"));
         assert!(saved.contains("[codex.routing]"));
 
         let backup = std::fs::read_to_string(dir.join("config.toml.bak"))
@@ -579,7 +579,7 @@ extends = "alpha"
 }
 
 #[test]
-fn save_config_after_loading_v2_upgrades_to_v3_schema_and_backup() {
+fn save_config_after_loading_v2_upgrades_to_v4_schema_and_backup() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -618,11 +618,11 @@ endpoint_names = ["default"]
         );
 
         let cfg = super::load_config().await.expect("load v2 config");
-        assert_eq!(cfg.version, Some(3));
+        assert_eq!(cfg.version, Some(4));
 
         super::save_config(&cfg).await.expect("save v2 config");
         let saved = std::fs::read_to_string(&toml_path).expect("read saved config.toml");
-        assert!(saved.contains("version = 3"));
+        assert!(saved.contains("version = 4"));
         assert!(saved.contains("[codex.routing]"));
         assert!(saved.contains("[codex.providers.openai]"));
         assert!(saved.contains("default_profile = \"daily\""));
@@ -668,7 +668,7 @@ provider = "openai"
         let cfg = super::load_config()
             .await
             .expect("load legacy-named v2 config");
-        assert_eq!(cfg.version, Some(3));
+        assert_eq!(cfg.version, Some(4));
         assert_eq!(cfg.codex.active.as_deref(), Some("legacy"));
         assert!(cfg.codex.configs.contains_key("legacy"));
     });
@@ -832,7 +832,7 @@ supported_models = { "gpt-5.4" = true }
 }
 
 #[test]
-fn save_config_after_loading_legacy_keeps_v3_schema_and_backup() {
+fn save_config_after_loading_legacy_upgrades_to_v4_schema_and_backup() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -861,19 +861,19 @@ base_url = "https://legacy.example.com/v1"
         );
 
         let cfg = super::load_config().await.expect("load legacy config");
-        assert_eq!(cfg.version, Some(3));
+        assert_eq!(cfg.version, Some(4));
 
         super::save_config(&cfg)
             .await
             .expect("save_config should succeed");
-        let saved = std::fs::read_to_string(&toml_path).expect("read v3 config.toml");
-        assert!(saved.contains("version = 3"));
+        let saved = std::fs::read_to_string(&toml_path).expect("read v4 config.toml");
+        assert!(saved.contains("version = 4"));
         assert!(saved.contains("[codex.routing]"));
         assert!(saved.contains("[codex.providers.example]"));
         assert!(saved.contains("base_url = \"https://legacy.example.com/v1\""));
 
         let backup = std::fs::read_to_string(&backup_path).expect("read config.toml.bak");
-        assert!(backup.contains("version = 3"));
+        assert!(backup.contains("version = 4"));
         assert!(backup.contains("[codex.routing]"));
     });
 }

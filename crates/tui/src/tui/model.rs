@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,18 +47,137 @@ pub(in crate::tui) struct RoutingProviderRef {
     pub(in crate::tui) tags: BTreeMap<String, String>,
 }
 
-fn default_tui_routing_policy() -> crate::config::RoutingPolicyV3 {
-    crate::config::RoutingPolicyV3::OrderedFailover
+fn default_tui_routing_policy() -> crate::config::RoutingPolicyV4 {
+    crate::config::RoutingPolicyV4::OrderedFailover
 }
 
-fn default_tui_routing_on_exhausted() -> crate::config::RoutingExhaustedActionV3 {
-    crate::config::RoutingExhaustedActionV3::Continue
+fn default_tui_routing_on_exhausted() -> crate::config::RoutingExhaustedActionV4 {
+    crate::config::RoutingExhaustedActionV4::Continue
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub(in crate::tui) struct RoutingSpecView {
+    #[serde(default = "default_tui_routing_entry")]
+    pub(in crate::tui) entry: String,
+    #[serde(default)]
+    pub(in crate::tui) routes: BTreeMap<String, crate::config::RoutingNodeV4>,
     #[serde(default = "default_tui_routing_policy")]
-    pub(in crate::tui) policy: crate::config::RoutingPolicyV3,
+    pub(in crate::tui) policy: crate::config::RoutingPolicyV4,
+    #[serde(default)]
+    pub(in crate::tui) order: Vec<String>,
+    #[serde(default)]
+    pub(in crate::tui) target: Option<String>,
+    #[serde(default)]
+    pub(in crate::tui) prefer_tags: Vec<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(in crate::tui) chain: Vec<String>,
+    #[serde(default)]
+    pub(in crate::tui) pools: BTreeMap<String, crate::config::RoutingPoolV4>,
+    #[serde(default = "default_tui_routing_on_exhausted")]
+    pub(in crate::tui) on_exhausted: crate::config::RoutingExhaustedActionV4,
+    #[serde(default = "default_tui_routing_policy")]
+    pub(in crate::tui) entry_strategy: crate::config::RoutingPolicyV4,
+    #[serde(default)]
+    pub(in crate::tui) expanded_order: Vec<String>,
+    #[serde(default)]
+    pub(in crate::tui) entry_target: Option<String>,
+    #[serde(default)]
+    pub(in crate::tui) providers: Vec<RoutingProviderRef>,
+}
+
+fn default_tui_routing_entry() -> String {
+    "main".to_string()
+}
+
+pub(in crate::tui) fn routing_provider_names(spec: &RoutingSpecView) -> Vec<String> {
+    let mut names = if spec.expanded_order.is_empty() {
+        spec.graph_provider_names()
+    } else {
+        spec.expanded_order.clone()
+    };
+    for provider in &spec.providers {
+        if !names.iter().any(|name| name == &provider.name) {
+            names.push(provider.name.clone());
+        }
+    }
+    names
+}
+
+impl RoutingSpecView {
+    pub(in crate::tui) fn entry_node(&self) -> Option<&crate::config::RoutingNodeV4> {
+        self.routes.get(self.entry.as_str())
+    }
+
+    pub(in crate::tui) fn entry_node_mut(&mut self) -> &mut crate::config::RoutingNodeV4 {
+        self.routes.entry(self.entry.clone()).or_default()
+    }
+
+    pub(in crate::tui) fn sync_entry_compat_from_graph(&mut self) {
+        if let Some(node) = self.entry_node().cloned() {
+            self.policy = node.strategy;
+            self.order = node.children;
+            self.target = node.target;
+            self.prefer_tags = node.prefer_tags;
+            self.on_exhausted = node.on_exhausted;
+        }
+    }
+
+    pub(in crate::tui) fn graph_provider_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut seen = BTreeSet::new();
+        self.push_route_leaves(self.entry.as_str(), &mut seen, &mut names);
+        if names.is_empty() {
+            names = routing_leaf_provider_names(self);
+        }
+        names
+    }
+
+    fn push_route_leaves(
+        &self,
+        route_or_provider: &str,
+        seen_routes: &mut BTreeSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if self
+            .providers
+            .iter()
+            .any(|provider| provider.name == route_or_provider)
+        {
+            if !out.iter().any(|name| name == route_or_provider) {
+                out.push(route_or_provider.to_string());
+            }
+            return;
+        }
+        let Some(node) = self.routes.get(route_or_provider) else {
+            return;
+        };
+        if !seen_routes.insert(route_or_provider.to_string()) {
+            return;
+        }
+        if matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky) {
+            if let Some(target) = node
+                .target
+                .as_deref()
+                .or_else(|| node.children.first().map(String::as_str))
+            {
+                self.push_route_leaves(target, seen_routes, out);
+            }
+        } else {
+            for child in &node.children {
+                self.push_route_leaves(child, seen_routes, out);
+            }
+        }
+        seen_routes.remove(route_or_provider);
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub(in crate::tui) struct RoutingSpecUpsertView {
+    pub(in crate::tui) entry: String,
+    #[serde(default)]
+    pub(in crate::tui) routes: BTreeMap<String, crate::config::RoutingNodeV4>,
+    #[serde(default = "default_tui_routing_policy")]
+    pub(in crate::tui) policy: crate::config::RoutingPolicyV4,
     #[serde(default)]
     pub(in crate::tui) order: Vec<String>,
     #[serde(default)]
@@ -67,12 +185,24 @@ pub(in crate::tui) struct RoutingSpecView {
     #[serde(default)]
     pub(in crate::tui) prefer_tags: Vec<BTreeMap<String, String>>,
     #[serde(default = "default_tui_routing_on_exhausted")]
-    pub(in crate::tui) on_exhausted: crate::config::RoutingExhaustedActionV3,
-    #[serde(default)]
-    pub(in crate::tui) providers: Vec<RoutingProviderRef>,
+    pub(in crate::tui) on_exhausted: crate::config::RoutingExhaustedActionV4,
 }
 
-pub(in crate::tui) fn routing_provider_names(spec: &RoutingSpecView) -> Vec<String> {
+impl From<&RoutingSpecView> for RoutingSpecUpsertView {
+    fn from(spec: &RoutingSpecView) -> Self {
+        Self {
+            entry: spec.entry.clone(),
+            routes: spec.routes.clone(),
+            policy: spec.policy,
+            order: spec.order.clone(),
+            target: spec.target.clone(),
+            prefer_tags: spec.prefer_tags.clone(),
+            on_exhausted: spec.on_exhausted,
+        }
+    }
+}
+
+pub(in crate::tui) fn routing_leaf_provider_names(spec: &RoutingSpecView) -> Vec<String> {
     let mut names = if spec.order.is_empty() {
         spec.providers
             .iter()

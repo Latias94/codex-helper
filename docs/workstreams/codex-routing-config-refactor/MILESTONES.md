@@ -1,10 +1,15 @@
 # Milestones: Routing Config Surface
 
+> Historical note: these v3 routing-first milestones are superseded by
+> `docs/workstreams/codex-routing-graph-refactor/`. Use the v4 route graph docs
+> for current authoring and implementation decisions.
+
 ## P0 - Public Shape and Compiler
 
 - [x] Add the new public routing config schema.
 - [x] Support inline single-endpoint providers.
 - [x] Support explicit routing policy and order.
+- [x] Support explicit pool-fallback routing with named pools and a pool chain.
 - [x] Compile the new shape into the existing runtime routing model.
 - [x] Make `config init` emit a routing-first v3 template.
 - [x] Keep legacy config loading working during the transition.
@@ -14,6 +19,7 @@ Acceptance:
 - one provider with one endpoint is a short, readable block;
 - ordered failover is deterministic;
 - tag-preferred routing is deterministic;
+- pool-fallback routing compiles to a deterministic provider order while preserving the public pool boundary;
 - no user-visible active-provider clone remains in the new authoring model.
 
 ## P1 - Migration

@@ -1,6 +1,6 @@
 # Fearless Refactor Workstream: Routing Config Surface
 
-> 中文速览：这个 workstream 负责把“用户手写的配置面”从“运行时展开模型”里剥离出来。目标不是再堆一个 `active provider` 字段，而是把“谁是当前激活对象”重定义为 `active routing`：默认路由、顺序、标签优先和兜底规则都收敛到一个更薄、更直观的 `routing` 配置块里。
+> 中文速览：这个 workstream 记录的是 v3 路由配置表面的演进。它已经完成了从站点/分组模型到 routing-first 的过渡，但它不是最终终局。新的终局 workstream 是 `docs/workstreams/codex-routing-graph-refactor/`，会把路由语义重构成 v4 路由图。
 
 ## Purpose
 
@@ -61,7 +61,7 @@ The public config should feel like this:
 - define providers once;
 - mark them with tags;
 - declare one routing recipe per service;
-- choose a policy such as `manual-sticky`, `ordered-failover`, or `tag-preferred`;
+- choose a policy such as `manual-sticky`, `ordered-failover`, `tag-preferred`, or `pool-fallback`;
 - migrate the old `active provider` / `active station` concept into `active routing`;
 - let the compiler expand that recipe into the existing runtime routing model.
 

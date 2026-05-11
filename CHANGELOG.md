@@ -5,10 +5,22 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
+### 破坏性变更 / Breaking
+
+- `version = 4` 成为新的公共配置格式：routing 从 v3 扁平 `policy/order/target` 重构为 route graph，`routing.entry` 指向入口节点，`routing.routes.*` 可组合 provider 和其他 route node。
+  `version = 4` is the new public config format: routing moves from flat v3 `policy/order/target` fields to a route graph where `routing.entry` points to a route node and `routing.routes.*` can compose providers and other route nodes.
+- 移除新增公共 `pool-fallback` 语法的方向，月包池和 paygo 兜底改用嵌套 route nodes 表达；旧 v3 `pool-fallback` 仅作为迁移输入读取。
+  Public `pool-fallback` authoring is superseded by nested route nodes for monthly pools and paygo fallback; legacy v3 `pool-fallback` is accepted only as migration input.
+
+### 新增 / Added
+
+- 控制面、CLI、TUI 和 GUI 写回 v4 route graph 时会保留 `entry/routes` 结构，provider CRUD 不再把嵌套路由压平成单一 order。
+  Control-plane, CLI, TUI, and GUI writes preserve v4 `entry/routes` structure; provider CRUD no longer collapses nested routes into one flat order.
+
 ### 文档 / Documentation
 
-- 补充月包 provider 池与 paygo 兜底的路由配置说明，明确 `unknown` 余额不等于耗尽，临时故障应通过 cooldown 和后续回探恢复。
-  Added routing guidance for monthly provider pools with paygo fallback, clarifying that `unknown` balance is not exhaustion and temporary failures should recover through cooldown and later reprobe.
+- 补充月包 provider 池与 paygo 兜底的配置说明，明确 `unknown` 余额不等于耗尽，临时故障应通过 cooldown 和后续回探恢复。
+  Added monthly provider pool / paygo fallback guidance, clarifying that `unknown` balance is not exhaustion and temporary failures should recover through cooldown and later reprobe.
 
 ### 修复 / Fixed
 
@@ -38,7 +50,7 @@ All notable changes to this project will be documented in this file.
 Define providers once, then copy one `[codex.routing]` policy. For Claude, replace `codex` with `claude`.
 
 ```toml
-version = 3
+version = 4
 
 [codex.providers.monthly_a]
 base_url = "https://monthly-a.example.com/v1"
@@ -54,37 +66,27 @@ tags = { billing = "monthly" }
 base_url = "https://api.openai.com/v1"
 auth_token_env = "OPENAI_API_KEY"
 tags = { billing = "paygo" }
-```
 
-顺序兜底：最直观的优先级链。
-Ordered fallback: the clearest priority chain.
-
-```toml
 [codex.routing]
-policy = "ordered-failover"
-order = ["monthly_a", "monthly_b", "paygo"]
-on_exhausted = "continue"
-```
+entry = "monthly_first"
 
-手动固定：临时强制使用一个 provider。
-Manual sticky: force one provider temporarily.
+[codex.routing.routes.monthly_pool]
+strategy = "ordered-failover"
+children = ["monthly_a", "monthly_b"]
 
-```toml
-[codex.routing]
-policy = "manual-sticky"
-target = "monthly_a"
-order = ["monthly_a", "monthly_b", "paygo"]
-on_exhausted = "continue"
+[codex.routing.routes.monthly_first]
+strategy = "ordered-failover"
+children = ["monthly_pool", "paygo"]
 ```
 
 包月优先并保持可用：先用 `billing=monthly`，已知耗尽后继续兜底。
 Monthly first with fallback: prefer `billing=monthly`, then fall back after known exhaustion.
 
 ```toml
-[codex.routing]
-policy = "tag-preferred"
+[codex.routing.routes.monthly_first]
+strategy = "tag-preferred"
 prefer_tags = [{ billing = "monthly" }]
-order = ["monthly_a", "monthly_b", "paygo"]
+children = ["monthly_a", "monthly_b", "paygo"]
 on_exhausted = "continue"
 ```
 
@@ -92,10 +94,10 @@ on_exhausted = "continue"
 Strict monthly budget: stop instead of falling back to pay-as-you-go.
 
 ```toml
-[codex.routing]
-policy = "tag-preferred"
+[codex.routing.routes.monthly_first]
+strategy = "tag-preferred"
 prefer_tags = [{ billing = "monthly" }]
-order = ["monthly_a", "monthly_b", "paygo"]
+children = ["monthly_a", "monthly_b", "paygo"]
 on_exhausted = "stop"
 ```
 

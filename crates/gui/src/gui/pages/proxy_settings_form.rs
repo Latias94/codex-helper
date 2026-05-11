@@ -1,14 +1,14 @@
 use super::proxy_settings_document::start_proxy_settings_save;
-use super::proxy_settings_v3_editors::{
-    render_v3_provider_editor, render_v3_routing_editor, routing_policy_label,
+use super::proxy_settings_v4_editors::{
+    render_v4_provider_editor, render_v4_routing_editor, routing_policy_label,
 };
 use super::*;
 
 pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     ui.label(pick(
         ctx.lang,
-        "表单视图可编辑常用 v3 provider；复杂 routing、endpoint、模型映射仍可在“原始”视图中精确编辑。",
-        "Form view edits common v3 providers; use Raw for advanced routing, endpoints, and model mappings.",
+        "表单视图可编辑常用 v4 provider；复杂 routing、endpoint、模型映射仍可在“原始”视图中精确编辑。",
+        "Form view edits common v4 providers; use Raw for advanced routing, endpoints, and model mappings.",
     ));
 
     let mut needs_load = ctx.view.proxy_settings.working.is_none();
@@ -123,10 +123,10 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let lang = ctx.lang;
     let mut editor_action = None;
     match ctx.view.proxy_settings.working.as_mut() {
-        Some(ProxySettingsWorkingDocument::V3(cfg)) => {
-            render_v3_summary(ui, lang, cfg);
+        Some(ProxySettingsWorkingDocument::V4(cfg)) => {
+            render_v4_summary(ui, lang, cfg);
             ui.separator();
-            editor_action = render_v3_provider_editor(
+            editor_action = render_v4_provider_editor(
                 ui,
                 lang,
                 cfg,
@@ -135,7 +135,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             if editor_action.is_none() {
                 ui.separator();
                 let routing_service = ctx.view.proxy_settings.provider_editor.service;
-                editor_action = render_v3_routing_editor(
+                editor_action = render_v4_routing_editor(
                     ui,
                     lang,
                     cfg,
@@ -294,11 +294,11 @@ fn render_import_modal(
     ctx.view.proxy_settings.import_codex.open = open;
 }
 
-fn render_v3_summary(ui: &mut egui::Ui, lang: Language, cfg: &crate::config::ProxyConfigV3) {
+fn render_v4_summary(ui: &mut egui::Ui, lang: Language, cfg: &crate::config::ProxyConfigV4) {
     ui.label(pick(
         lang,
-        "当前文件是 v3 routing-first 配置。",
-        "The current file uses the v3 routing-first schema.",
+        "当前文件是 v4 route graph 配置。",
+        "The current file uses the v4 route graph schema.",
     ));
     ui.small(pick(
         lang,
@@ -316,7 +316,7 @@ fn render_service_summary(
     ui: &mut egui::Ui,
     lang: Language,
     service_name: &str,
-    service: &crate::config::ServiceViewV3,
+    service: &crate::config::ServiceViewV4,
 ) {
     let provider_count = service.providers.len();
     let endpoint_count = service
@@ -325,11 +325,17 @@ fn render_service_summary(
         .map(|provider| provider.endpoints.len())
         .sum::<usize>();
     let profile_count = service.profiles.len();
-    let routing = service.routing.as_ref();
-    let routing_policy = routing
-        .map(|routing| routing_policy_label(routing.policy))
+    let routing = service
+        .routing
+        .as_ref()
+        .map(|_| crate::config::effective_v4_routing(service));
+    let entry_node = routing.as_ref().and_then(|routing| routing.entry_node());
+    let routing_policy = entry_node
+        .map(|node| routing_policy_label(node.strategy))
         .unwrap_or("<none>");
-    let routing_order = routing.map(|routing| routing.order.len()).unwrap_or(0);
+    let routing_order = crate::config::resolved_v4_provider_order("gui-settings-summary", service)
+        .map(|order| order.len())
+        .unwrap_or(0);
     let default_profile = service.default_profile.as_deref().unwrap_or("<auto>");
 
     ui.group(|ui| {
@@ -361,13 +367,20 @@ fn render_service_summary(
             routing_order
         ));
         if let Some(routing) = routing {
-            if let Some(target) = routing.target.as_deref() {
+            if let Some(target) = routing.entry_node().and_then(|node| node.target.as_deref()) {
                 ui.small(format!("{}: {target}", pick(lang, "target", "target")));
             }
             ui.small(format!(
                 "{}: {}",
                 pick(lang, "on_exhausted", "on_exhausted"),
-                format!("{:?}", routing.on_exhausted).to_ascii_lowercase()
+                format!(
+                    "{:?}",
+                    routing
+                        .entry_node()
+                        .map(|node| node.on_exhausted)
+                        .unwrap_or(crate::config::RoutingExhaustedActionV4::Continue)
+                )
+                .to_ascii_lowercase()
             ));
         }
     });

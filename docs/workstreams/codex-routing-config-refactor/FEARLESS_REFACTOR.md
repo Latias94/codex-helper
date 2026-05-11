@@ -1,5 +1,9 @@
 # Fearless Refactor Notes
 
+> Historical note: this v3 routing-first refactor plan is superseded by
+> `docs/workstreams/codex-routing-graph-refactor/`. Use the v4 route graph docs
+> for current authoring and implementation decisions.
+
 ## What Should Go Away
 
 The public config surface should stop asking users to reason about:
@@ -15,6 +19,7 @@ The public config surface should stop asking users to reason about:
 - provider auth references;
 - provider endpoint inventory;
 - provider tags;
+- named pool boundaries and explicit pool chains for grouped monthly providers;
 - deterministic route order;
 - explicit route policy;
 - explicit fallback behavior;

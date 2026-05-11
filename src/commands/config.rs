@@ -4,7 +4,7 @@ use crate::config::{
     bootstrap::{
         import_codex_config_from_codex_cli, overwrite_codex_config_from_codex_cli_in_place,
     },
-    storage::{init_config_toml, load_config, save_config, save_config_v3},
+    storage::{init_config_toml, load_config, save_config, save_config_v4},
 };
 use crate::{CliError, CliResult, ConfigCommand, RetryProfile};
 
@@ -123,7 +123,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let report = document
-                .v3_migration_report()
+                .v4_migration_report()
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             print_migration_warnings(&report.warnings);
 
@@ -132,7 +132,7 @@ pub async fn handle_config_cmd(cmd: ConfigCommand) -> CliResult<()> {
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 println!("{text}");
             } else {
-                let path = save_config_v3(&report.config)
+                let path = save_config_v4(&report.config)
                     .await
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 println!("Migrated config written to {:?}", path);

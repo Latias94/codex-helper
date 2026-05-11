@@ -358,7 +358,7 @@ impl Default for ProxySettingsViewState {
 
 #[derive(Debug, Clone)]
 pub(super) enum ProxySettingsWorkingDocument {
-    V3(crate::config::ProxyConfigV3),
+    V4(crate::config::ProxyConfigV4),
 }
 
 #[derive(Debug)]
@@ -432,22 +432,24 @@ impl Default for ProxySettingsProviderEditorState {
 #[derive(Debug)]
 pub(super) struct ProxySettingsRoutingEditorState {
     pub(super) source_signature: Option<String>,
-    pub(super) policy: crate::config::RoutingPolicyV3,
+    pub(super) original_routing: Option<crate::config::RoutingConfigV4>,
+    pub(super) policy: crate::config::RoutingPolicyV4,
     pub(super) target: String,
     pub(super) order: String,
     pub(super) prefer_tags: String,
-    pub(super) on_exhausted: crate::config::RoutingExhaustedActionV3,
+    pub(super) on_exhausted: crate::config::RoutingExhaustedActionV4,
 }
 
 impl Default for ProxySettingsRoutingEditorState {
     fn default() -> Self {
         Self {
             source_signature: None,
-            policy: crate::config::RoutingPolicyV3::OrderedFailover,
+            original_routing: None,
+            policy: crate::config::RoutingPolicyV4::OrderedFailover,
             target: String::new(),
             order: String::new(),
             prefer_tags: String::new(),
-            on_exhausted: crate::config::RoutingExhaustedActionV3::Continue,
+            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
         }
     }
 }

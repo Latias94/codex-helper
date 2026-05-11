@@ -48,7 +48,7 @@ pub fn config_file_path() -> PathBuf {
     }
 }
 
-const CONFIG_VERSION: u32 = 3;
+const CONFIG_VERSION: u32 = 4;
 
 fn ensure_config_version(cfg: &mut ProxyConfig) {
     if cfg.version.is_none() {
@@ -85,7 +85,7 @@ const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 # - 生成/覆盖本模板：`codex-helper config init [--force]`
 # - 新安装时：首次写入配置默认会写 TOML。
 
-version = 3
+version = 4
 
 # 省略 --codex/--claude 时默认使用哪个服务。
 # default_service = "codex"
@@ -99,14 +99,15 @@ version = 3
 # 如果你只想生成纯模板（不导入），请使用：
 #   codex-helper config init --no-import
 
-# --- 推荐：provider / routing 配置（v3） ---
+# --- 推荐：provider / routing 配置（v4 route graph） ---
 #
 # 大部分用户只需要改这一段。
 #
 # 说明：
 # - 优先使用环境变量方式保存密钥（`*_env`），避免写入磁盘。
 # - `providers` 负责账号、认证、endpoint 和标签。
-# - `routing` 负责顺序、策略和兜底行为。
+# - `routing.entry` 指向入口 route node。
+# - `routing.routes.*` 负责顺序、策略、分组和兜底行为。
 # - 单 endpoint provider 尽量直接写 `base_url`，不要再包一层 `endpoints.default`。
 #
 # [codex.providers.openai]
@@ -120,9 +121,11 @@ version = 3
 # tags = { vendor = "backup", region = "hk" }
 #
 # [codex.routing]
-# policy = "ordered-failover"
-# order = ["openai", "backup"]
-# on_exhausted = "continue"
+# entry = "main"
+#
+# [codex.routing.routes.main]
+# strategy = "ordered-failover"
+# children = ["openai", "backup"]
 #
 # --- 会话控制模板（profiles，可选） ---
 #
@@ -253,7 +256,7 @@ profile = "balanced"
 "#;
 
 fn insert_after_version_block(template: &str, insert: &str) -> String {
-    let needle = "version = 3\n\n";
+    let needle = "version = 4\n\n";
     if let Some(idx) = template.find(needle) {
         let insert_pos = idx + needle.len();
         let mut out = String::with_capacity(template.len() + insert.len() + 2);
@@ -276,19 +279,30 @@ fn toml_schema_version_or_shape(text: &str) -> Option<u32> {
         return Some(version);
     }
 
-    let has_routing = ["codex", "claude"].iter().any(|service| {
+    let has_v4_routing = ["codex", "claude"].iter().any(|service| {
         value
             .get(*service)
             .and_then(|service| service.get("routing"))
+            .and_then(|routing| routing.get("entry").or_else(|| routing.get("routes")))
             .is_some()
     });
-    if has_routing { Some(3) } else { None }
+    if has_v4_routing {
+        Some(4)
+    } else {
+        let has_legacy_routing = ["codex", "claude"].iter().any(|service| {
+            value
+                .get(*service)
+                .and_then(|service| service.get("routing"))
+                .is_some()
+        });
+        if has_legacy_routing { Some(3) } else { None }
+    }
 }
 
 fn codex_bootstrap_snippet() -> Result<Option<String>> {
     #[derive(Serialize)]
     struct CodexOnly<'a> {
-        codex: &'a ServiceViewV3,
+        codex: &'a ServiceViewV4,
     }
 
     let mut cfg = ProxyConfig::default();
@@ -300,7 +314,7 @@ fn codex_bootstrap_snippet() -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let migrated = migrate_legacy_to_v3(&cfg)?;
+    let migrated = migrate_legacy_to_v4(&cfg)?;
     let body = toml::to_string_pretty(&CodexOnly {
         codex: &migrated.codex,
     })?;
@@ -342,11 +356,17 @@ pub async fn load_config() -> Result<ProxyConfig> {
         let text = fs::read_to_string(&toml_path).await?;
         let version = toml_schema_version_or_shape(&text);
 
-        let mut loaded_v3 = None;
-        let mut cfg = if version == Some(3) {
-            let cfg_v3 = toml::from_str::<ProxyConfigV3>(&text)?;
-            let runtime = compile_v3_to_runtime(&cfg_v3)?;
-            loaded_v3 = Some(cfg_v3);
+        let mut loaded_v4 = None;
+        let mut cfg = if version == Some(4) {
+            let cfg_v4 = toml::from_str::<ProxyConfigV4>(&text)?;
+            let runtime = compile_v4_to_runtime(&cfg_v4)?;
+            loaded_v4 = Some(cfg_v4);
+            runtime
+        } else if version == Some(3) {
+            let cfg_legacy = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(&text)?;
+            let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&cfg_legacy)?;
+            let runtime = compile_v4_to_runtime(&migrated.config)?;
+            loaded_v4 = Some(migrated.config);
             runtime
         } else if version == Some(2) {
             let cfg_v2 = toml::from_str::<ProxyConfigV2>(&text)?;
@@ -358,10 +378,14 @@ pub async fn load_config() -> Result<ProxyConfig> {
         };
         normalize_proxy_config(&mut cfg);
         validate_proxy_config(&cfg)?;
-        if version != Some(3) {
-            auto_migrate_loaded_config(&mut cfg, "config.toml", version).await;
-        } else if let Some(cfg_v3) = loaded_v3.as_ref() {
-            auto_compact_loaded_v3_config(cfg_v3, "config.toml").await;
+        if version != Some(4) {
+            if let Some(cfg_v4) = loaded_v4.as_ref() {
+                auto_migrate_loaded_v4_config(cfg_v4, "config.toml", version).await;
+            } else {
+                auto_migrate_loaded_config(&mut cfg, "config.toml", version).await;
+            }
+        } else if let Some(cfg_v4) = loaded_v4.as_ref() {
+            auto_compact_loaded_v4_config(cfg_v4, "config.toml").await;
         }
         return Ok(cfg);
     }
@@ -392,15 +416,36 @@ async fn auto_migrate_loaded_config(
 ) {
     match save_config(cfg).await {
         Ok(()) => {
-            cfg.version = Some(3);
+            cfg.version = Some(4);
             info!(
-                "auto-migrated {} from version {:?} to version 3",
+                "auto-migrated {} from version {:?} to version 4",
                 source, source_version
             );
         }
         Err(err) => {
             warn!(
-                "failed to auto-migrate {} from version {:?} to version 3: {}",
+                "failed to auto-migrate {} from version {:?} to version 4: {}",
+                source, source_version, err
+            );
+        }
+    }
+}
+
+async fn auto_migrate_loaded_v4_config(
+    cfg: &ProxyConfigV4,
+    source: &str,
+    source_version: Option<u32>,
+) {
+    match save_config_v4(cfg).await {
+        Ok(_) => {
+            info!(
+                "auto-migrated {} from version {:?} to version 4",
+                source, source_version
+            );
+        }
+        Err(err) => {
+            warn!(
+                "failed to auto-migrate {} from version {:?} to version 4: {}",
                 source, source_version, err
             );
         }
@@ -411,7 +456,7 @@ fn runtime_service_manager_value(mgr: &ServiceConfigManager) -> Result<JsonValue
     serde_json::to_value(mgr).context("serialize runtime service manager")
 }
 
-fn v3_service_has_import_metadata(view: &ServiceViewV3) -> bool {
+fn v4_service_has_import_metadata(view: &ServiceViewV4) -> bool {
     view.providers.values().any(|provider| {
         provider.tags.contains_key("provider_id")
             || provider.tags.contains_key("requires_openai_auth")
@@ -430,28 +475,28 @@ fn v3_service_has_import_metadata(view: &ServiceViewV3) -> bool {
     })
 }
 
-async fn auto_compact_loaded_v3_config(cfg: &ProxyConfigV3, source: &str) {
-    if !v3_service_has_import_metadata(&cfg.codex) && !v3_service_has_import_metadata(&cfg.claude) {
+async fn auto_compact_loaded_v4_config(cfg: &ProxyConfigV4, source: &str) {
+    if !v4_service_has_import_metadata(&cfg.codex) && !v4_service_has_import_metadata(&cfg.claude) {
         return;
     }
 
-    match save_config_v3(cfg).await {
+    match save_config_v4(cfg).await {
         Ok(_) => {
             info!(
-                "auto-compacted {} v3 provider config metadata for authoring format",
+                "auto-compacted {} v4 provider config metadata for authoring format",
                 source
             );
         }
         Err(err) => {
             warn!(
-                "failed to auto-compact {} v3 provider config metadata: {}",
+                "failed to auto-compact {} v4 provider config metadata: {}",
                 source, err
             );
         }
     }
 }
 
-async fn save_existing_v3_if_only_runtime_metadata_changed(
+async fn save_existing_v4_if_only_runtime_metadata_changed(
     cfg: &ProxyConfig,
 ) -> Result<Option<PathBuf>> {
     let path = config_toml_path();
@@ -460,7 +505,7 @@ async fn save_existing_v3_if_only_runtime_metadata_changed(
     }
 
     let text = fs::read_to_string(&path).await?;
-    if toml_schema_version_or_shape(&text) != Some(3) {
+    if toml_schema_version_or_shape(&text) != Some(4) {
         return Ok(None);
     }
 
@@ -468,8 +513,8 @@ async fn save_existing_v3_if_only_runtime_metadata_changed(
     normalize_proxy_config(&mut requested);
     validate_proxy_config(&requested)?;
 
-    let mut existing = toml::from_str::<ProxyConfigV3>(&text)?;
-    let mut existing_runtime = compile_v3_to_runtime(&existing)?;
+    let mut existing = toml::from_str::<ProxyConfigV4>(&text)?;
+    let mut existing_runtime = compile_v4_to_runtime(&existing)?;
     normalize_proxy_config(&mut existing_runtime);
 
     if runtime_service_manager_value(&existing_runtime.codex)?
@@ -484,24 +529,24 @@ async fn save_existing_v3_if_only_runtime_metadata_changed(
     existing.notify = requested.notify;
     existing.default_service = requested.default_service;
     existing.ui = requested.ui;
-    save_config_v3(&existing).await.map(Some)
+    save_config_v4(&existing).await.map(Some)
 }
 
 pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
-    if cfg.version == Some(3) {
-        if save_existing_v3_if_only_runtime_metadata_changed(cfg)
+    if cfg.version == Some(4) {
+        if save_existing_v4_if_only_runtime_metadata_changed(cfg)
             .await?
             .is_some()
         {
             return Ok(());
         }
-        let migrated = migrate_legacy_to_v3(cfg)?;
-        save_config_v3(&migrated).await?;
+        let migrated = migrate_legacy_to_v4(cfg)?;
+        save_config_v4(&migrated).await?;
         return Ok(());
     }
 
-    let migrated = migrate_legacy_to_v3(cfg)?;
-    save_config_v3(&migrated).await?;
+    let migrated = migrate_legacy_to_v4(cfg)?;
+    save_config_v4(&migrated).await?;
     Ok(())
 }
 
@@ -536,11 +581,11 @@ pub async fn save_config_v2(cfg: &ProxyConfigV2) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub async fn save_config_v3(cfg: &ProxyConfigV3) -> Result<PathBuf> {
+pub async fn save_config_v4(cfg: &ProxyConfigV4) -> Result<PathBuf> {
     let mut normalized = cfg.clone();
-    normalized.version = 3;
-    compact_v3_config_for_write(&mut normalized);
-    let mut runtime = compile_v3_to_runtime(&normalized)?;
+    normalized.version = 4;
+    compact_v4_config_for_write(&mut normalized);
+    let mut runtime = compile_v4_to_runtime(&normalized)?;
     normalize_proxy_config(&mut runtime);
     validate_proxy_config(&runtime)?;
 

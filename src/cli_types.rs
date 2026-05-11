@@ -80,7 +80,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: RoutingCommand,
     },
-    /// Manage routing-first provider catalog for v3 configs
+    /// Manage route graph provider catalog for v4 configs
     Provider {
         #[command(subcommand)]
         cmd: ProviderCommand,
@@ -217,7 +217,7 @@ pub enum ConfigCommand {
         yes: bool,
     },
 
-    /// Preview or write migration output for the routing-first v3 schema
+    /// Preview or write migration output for the v4 route graph schema
     Migrate {
         /// Preview only; print migrated TOML to stdout
         #[arg(long, conflicts_with = "write")]
@@ -233,7 +233,7 @@ pub enum ConfigCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum RoutingCommand {
-    /// Show the v3 routing recipe for Codex or Claude
+    /// Show the v4 route graph recipe for Codex or Claude
     Show {
         /// Target Codex routing (default if neither flag is set)
         #[arg(long)]
@@ -360,7 +360,7 @@ pub enum RoutingCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum ProviderCommand {
-    /// Show providers in the v3 catalog
+    /// Show providers in the v4 catalog
     List {
         /// Target Codex provider catalog (default if neither flag is set)
         #[arg(long)]
@@ -450,7 +450,7 @@ pub enum RoutingPolicy {
     TagPreferred,
 }
 
-impl From<RoutingPolicy> for codex_helper_core::config::RoutingPolicyV3 {
+impl From<RoutingPolicy> for codex_helper_core::config::RoutingPolicyV4 {
     fn from(value: RoutingPolicy) -> Self {
         match value {
             RoutingPolicy::ManualSticky => Self::ManualSticky,
@@ -467,7 +467,7 @@ pub enum RoutingExhaustedAction {
     Stop,
 }
 
-impl From<RoutingExhaustedAction> for codex_helper_core::config::RoutingExhaustedActionV3 {
+impl From<RoutingExhaustedAction> for codex_helper_core::config::RoutingExhaustedActionV4 {
     fn from(value: RoutingExhaustedAction) -> Self {
         match value {
             RoutingExhaustedAction::Continue => Self::Continue,

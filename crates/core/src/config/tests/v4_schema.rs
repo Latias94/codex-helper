@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn load_config_supports_v3_routing_first_schema() {
+fn load_config_supports_v4_route_graph_schema() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -14,7 +14,7 @@ fn load_config_supports_v3_routing_first_schema() {
         write_file(
             &toml_path,
             r#"
-version = 3
+version = 4
 
 [codex.providers.monthly]
 base_url = "https://monthly.example.com/v1"
@@ -27,15 +27,18 @@ auth_token_env = "PAYGO_API_KEY"
 tags = { billing = "paygo", region = "us" }
 
 [codex.routing]
-policy = "tag-preferred"
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "tag-preferred"
 prefer_tags = [{ billing = "monthly" }]
-order = ["paygo", "monthly"]
+children = ["paygo", "monthly"]
 on_exhausted = "continue"
 "#,
         );
 
-        let cfg = super::load_config().await.expect("load v3 config");
-        assert_eq!(cfg.version, Some(3));
+        let cfg = super::load_config().await.expect("load v4 config");
+        assert_eq!(cfg.version, Some(4));
         assert_eq!(cfg.codex.active.as_deref(), Some("routing"));
 
         let routing = cfg
@@ -59,53 +62,51 @@ on_exhausted = "continue"
 }
 
 #[test]
-fn v3_tag_preferred_stop_excludes_non_matching_fallbacks() {
-    let v3 = ProxyConfigV3 {
-        version: 3,
-        codex: ServiceViewV3 {
+fn v4_tag_preferred_stop_excludes_non_matching_fallbacks() {
+    let v4 = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
             default_profile: None,
             profiles: BTreeMap::new(),
             providers: BTreeMap::from([
                 (
                     "monthly".to_string(),
-                    ProviderConfigV3 {
+                    ProviderConfigV4 {
                         base_url: Some("https://monthly.example.com/v1".to_string()),
                         inline_auth: UpstreamAuth {
                             auth_token_env: Some("MONTHLY_API_KEY".to_string()),
                             ..UpstreamAuth::default()
                         },
                         tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
-                        ..ProviderConfigV3::default()
+                        ..ProviderConfigV4::default()
                     },
                 ),
                 (
                     "paygo".to_string(),
-                    ProviderConfigV3 {
+                    ProviderConfigV4 {
                         base_url: Some("https://paygo.example.com/v1".to_string()),
                         tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
-                        ..ProviderConfigV3::default()
+                        ..ProviderConfigV4::default()
                     },
                 ),
             ]),
-            routing: Some(RoutingConfigV3 {
-                policy: RoutingPolicyV3::TagPreferred,
-                order: vec!["monthly".to_string(), "paygo".to_string()],
-                target: None,
-                prefer_tags: vec![BTreeMap::from([(
+            routing: Some(RoutingConfigV4::tag_preferred(
+                vec!["monthly".to_string(), "paygo".to_string()],
+                vec![BTreeMap::from([(
                     "billing".to_string(),
                     "monthly".to_string(),
                 )])],
-                on_exhausted: RoutingExhaustedActionV3::Stop,
-            }),
+                RoutingExhaustedActionV4::Stop,
+            )),
         },
-        claude: ServiceViewV3::default(),
+        claude: ServiceViewV4::default(),
         retry: RetryConfig::default(),
         notify: NotifyConfig::default(),
         default_service: Some(ServiceKind::Codex),
         ui: UiConfig::default(),
     };
 
-    let runtime = compile_v3_to_runtime(&v3).expect("compile v3");
+    let runtime = compile_v4_to_runtime(&v4).expect("compile v4");
     let routing = runtime
         .codex
         .station("routing")
@@ -118,7 +119,269 @@ fn v3_tag_preferred_stop_excludes_non_matching_fallbacks() {
 }
 
 #[test]
-fn migrate_v2_to_v3_emits_routing_order_and_inline_simple_providers() {
+fn v4_nested_route_graph_expands_monthly_pool_before_paygo() {
+    let v4 = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
+            default_profile: None,
+            profiles: BTreeMap::new(),
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://input.example.com/v1".to_string()),
+                        tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "input1".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://input1.example.com/v1".to_string()),
+                        tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "input2".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://input2.example.com/v1".to_string()),
+                        tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "codex-for".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://codex-for.example.com/v1".to_string()),
+                        tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "monthly_first".to_string(),
+                routes: BTreeMap::from([
+                    (
+                        "monthly_pool".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::OrderedFailover,
+                            children: vec![
+                                "input".to_string(),
+                                "input1".to_string(),
+                                "input2".to_string(),
+                            ],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                    (
+                        "monthly_first".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::OrderedFailover,
+                            children: vec!["monthly_pool".to_string(), "codex-for".to_string()],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                ]),
+                ..RoutingConfigV4::default()
+            }),
+        },
+        claude: ServiceViewV4::default(),
+        retry: RetryConfig::default(),
+        notify: NotifyConfig::default(),
+        default_service: Some(ServiceKind::Codex),
+        ui: UiConfig::default(),
+    };
+
+    let runtime = compile_v4_to_runtime(&v4).expect("compile v4");
+    let routing = runtime
+        .codex
+        .station("routing")
+        .expect("routing station should exist");
+    let base_urls = routing
+        .upstreams
+        .iter()
+        .map(|upstream| upstream.base_url.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        base_urls,
+        vec![
+            "https://input.example.com/v1",
+            "https://input1.example.com/v1",
+            "https://input2.example.com/v1",
+            "https://codex-for.example.com/v1",
+        ]
+    );
+}
+
+#[test]
+fn v4_route_graph_rejects_cycles() {
+    let v4 = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("https://input.example.com/v1".to_string()),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4 {
+                entry: "a".to_string(),
+                routes: BTreeMap::from([
+                    (
+                        "a".to_string(),
+                        RoutingNodeV4 {
+                            children: vec!["b".to_string()],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                    (
+                        "b".to_string(),
+                        RoutingNodeV4 {
+                            children: vec!["a".to_string()],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                ]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+
+    let err = compile_v4_to_runtime(&v4).expect_err("cycle should fail");
+    assert!(err.to_string().contains("routing graph has a cycle"));
+}
+
+#[test]
+fn v4_route_graph_rejects_missing_reference() {
+    let v4 = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("https://input.example.com/v1".to_string()),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4 {
+                entry: "main".to_string(),
+                routes: BTreeMap::from([(
+                    "main".to_string(),
+                    RoutingNodeV4 {
+                        children: vec!["missing".to_string()],
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+
+    let err = compile_v4_to_runtime(&v4).expect_err("missing reference should fail");
+    assert!(
+        err.to_string()
+            .contains("routing entry references missing route node 'missing'")
+    );
+}
+
+#[test]
+fn legacy_v3_pool_fallback_migrates_to_nested_v4_route_nodes() {
+    let legacy = crate::config::legacy::ProxyConfigV3Legacy {
+        version: 3,
+        codex: crate::config::legacy::ServiceViewV3Legacy {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://input.example.com/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "input1".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://input1.example.com/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "codex-for".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://codex-for.example.com/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(crate::config::legacy::RoutingConfigV3Legacy {
+                policy: crate::config::legacy::RoutingPolicyV3Legacy::PoolFallback,
+                chain: vec!["input".to_string(), "paygo".to_string()],
+                pools: BTreeMap::from([
+                    (
+                        "input".to_string(),
+                        crate::config::RoutingPoolV4 {
+                            providers: vec!["input".to_string(), "input1".to_string()],
+                        },
+                    ),
+                    (
+                        "paygo".to_string(),
+                        crate::config::RoutingPoolV4 {
+                            providers: vec!["codex-for".to_string()],
+                        },
+                    ),
+                ]),
+                ..crate::config::legacy::RoutingConfigV3Legacy::default()
+            }),
+            ..crate::config::legacy::ServiceViewV3Legacy::default()
+        },
+        claude: crate::config::legacy::ServiceViewV3Legacy::default(),
+        retry: RetryConfig::default(),
+        notify: NotifyConfig::default(),
+        default_service: Some(ServiceKind::Codex),
+        ui: UiConfig::default(),
+    };
+
+    let report = crate::config::legacy::migrate_v3_legacy_to_v4(&legacy)
+        .expect("legacy v3 should migrate to v4");
+    assert_eq!(report.config.version, 4);
+    let routing = report
+        .config
+        .codex
+        .routing
+        .as_ref()
+        .expect("routing should migrate");
+    assert_eq!(routing.entry, "main");
+    assert_eq!(
+        routing.entry_node().map(|node| node.children.clone()),
+        Some(vec!["input_pool".to_string(), "paygo".to_string()])
+    );
+
+    let runtime = compile_v4_to_runtime(&report.config).expect("compile migrated v4");
+    let routing_station = runtime
+        .codex
+        .station("routing")
+        .expect("routing station should exist");
+    assert_eq!(
+        routing_station
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.base_url.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "https://input.example.com/v1",
+            "https://input1.example.com/v1",
+            "https://codex-for.example.com/v1",
+        ]
+    );
+}
+
+#[test]
+fn migrate_v2_to_v4_emits_route_graph_and_inline_simple_providers() {
     let v2 = ProxyConfigV2 {
         version: 2,
         codex: ServiceViewV2 {
@@ -200,7 +463,7 @@ fn migrate_v2_to_v3_emits_routing_order_and_inline_simple_providers() {
         ui: UiConfig::default(),
     };
 
-    let migrated = migrate_v2_to_v3(&v2).expect("migrate v2 to v3");
+    let migrated = migrate_v2_to_v4(&v2).expect("migrate v2 to v4");
     let codex = migrated.codex;
     assert_eq!(
         codex
@@ -217,8 +480,12 @@ fn migrate_v2_to_v3_emits_routing_order_and_inline_simple_providers() {
         Some("PRIMARY_API_KEY")
     );
     let routing = codex.routing.expect("routing should be emitted");
-    assert_eq!(routing.policy, RoutingPolicyV3::OrderedFailover);
+    assert_eq!(routing.policy, RoutingPolicyV4::OrderedFailover);
     assert_eq!(routing.order, vec!["primary", "backup"]);
+    assert_eq!(
+        routing.entry_node().map(|node| node.children.clone()),
+        Some(vec!["primary".to_string(), "backup".to_string()])
+    );
     assert_eq!(
         codex
             .profiles
@@ -229,7 +496,7 @@ fn migrate_v2_to_v3_emits_routing_order_and_inline_simple_providers() {
 }
 
 #[test]
-fn migrate_v2_to_v3_report_warns_when_flattening_endpoint_scoped_groups() {
+fn migrate_v2_to_v4_report_warns_when_flattening_endpoint_scoped_groups() {
     let v2 = ProxyConfigV2 {
         version: 2,
         codex: ServiceViewV2 {
@@ -327,7 +594,7 @@ fn migrate_v2_to_v3_report_warns_when_flattening_endpoint_scoped_groups() {
         ui: UiConfig::default(),
     };
 
-    let report = migrate_v2_to_v3_with_report(&v2).expect("migrate v2 to v3");
+    let report = migrate_v2_to_v4_with_report(&v2).expect("migrate v2 to v4");
     let warnings = report.warnings.join("\n");
     assert!(warnings.contains("flattens the effective route"));
     assert!(warnings.contains("scopes provider 'relay'"));
@@ -339,10 +606,14 @@ fn migrate_v2_to_v3_report_warns_when_flattening_endpoint_scoped_groups() {
         .routing
         .expect("routing should be emitted");
     assert_eq!(routing.order, vec!["relay", "backup"]);
+    assert_eq!(
+        routing.entry_node().map(|node| node.children.clone()),
+        Some(vec!["relay".to_string(), "backup".to_string()])
+    );
 }
 
 #[test]
-fn migrate_v2_to_v3_omits_disabled_inactive_groups_from_routing_order() {
+fn migrate_v2_to_v4_omits_disabled_inactive_groups_from_route_graph() {
     let v2 = ProxyConfigV2 {
         version: 2,
         codex: ServiceViewV2 {
@@ -420,13 +691,17 @@ fn migrate_v2_to_v3_omits_disabled_inactive_groups_from_routing_order() {
         ui: UiConfig::default(),
     };
 
-    let report = migrate_v2_to_v3_with_report(&v2).expect("migrate v2 to v3");
+    let report = migrate_v2_to_v4_with_report(&v2).expect("migrate v2 to v4");
     let routing = report
         .config
         .codex
         .routing
         .expect("routing should be emitted");
     assert_eq!(routing.order, vec!["primary"]);
+    assert_eq!(
+        routing.entry_node().map(|node| node.children.clone()),
+        Some(vec!["primary".to_string()])
+    );
     assert!(
         report
             .warnings
@@ -436,7 +711,7 @@ fn migrate_v2_to_v3_omits_disabled_inactive_groups_from_routing_order() {
 }
 
 #[test]
-fn save_config_v3_writes_routing_first_schema() {
+fn save_config_v4_writes_v4_route_graph_schema() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -444,12 +719,12 @@ fn save_config_v3_writes_routing_first_schema() {
         .expect("build tokio runtime");
 
     rt.block_on(async move {
-        let cfg = ProxyConfigV3 {
-            version: 3,
-            codex: ServiceViewV3 {
+        let cfg = ProxyConfigV4 {
+            version: 4,
+            codex: ServiceViewV4 {
                 providers: BTreeMap::from([(
                     "main".to_string(),
-                    ProviderConfigV3 {
+                    ProviderConfigV4 {
                         base_url: Some("https://api.example.com/v1".to_string()),
                         inline_auth: UpstreamAuth {
                             auth_token_env: Some("MAIN_API_KEY".to_string()),
@@ -460,24 +735,26 @@ fn save_config_v3_writes_routing_first_schema() {
                             ("requires_openai_auth".to_string(), "false".to_string()),
                             ("source".to_string(), "codex-config".to_string()),
                         ]),
-                        ..ProviderConfigV3::default()
+                        ..ProviderConfigV4::default()
                     },
                 )]),
-                routing: Some(RoutingConfigV3 {
-                    policy: RoutingPolicyV3::ManualSticky,
-                    target: Some("main".to_string()),
-                    ..RoutingConfigV3::default()
-                }),
-                ..ServiceViewV3::default()
+                routing: Some(RoutingConfigV4::manual_sticky(
+                    "main".to_string(),
+                    vec!["main".to_string()],
+                )),
+                ..ServiceViewV4::default()
             },
-            ..ProxyConfigV3::default()
+            ..ProxyConfigV4::default()
         };
 
-        let path = super::save_config_v3(&cfg).await.expect("save v3");
-        let saved = std::fs::read_to_string(path).expect("read saved v3 config");
-        assert!(saved.contains("version = 3"));
+        let path = super::save_config_v4(&cfg).await.expect("save v4");
+        let saved = std::fs::read_to_string(path).expect("read saved v4 config");
+        assert!(saved.contains("version = 4"));
         assert!(saved.contains("[codex.routing]"));
-        assert!(saved.contains("policy = \"manual-sticky\""));
+        assert!(saved.contains("entry = \"main_route\""));
+        assert!(saved.contains("[codex.routing.routes.main_route]"));
+        assert!(saved.contains("strategy = \"manual-sticky\""));
+        assert!(saved.contains("target = \"main\""));
         assert!(saved.contains("auth_token_env = \"MAIN_API_KEY\""));
         assert!(!saved.contains("enabled = true"));
         assert!(!saved.contains("[codex.providers.main.tags]"));
@@ -489,7 +766,7 @@ fn save_config_v3_writes_routing_first_schema() {
 }
 
 #[test]
-fn load_config_auto_compacts_v3_import_metadata() {
+fn load_config_auto_compacts_legacy_v3_import_metadata_to_v4() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -520,9 +797,12 @@ target = "input"
 "#,
         );
 
-        let cfg = super::load_config().await.expect("load v3 config");
-        assert_eq!(cfg.version, Some(3));
+        let cfg = super::load_config().await.expect("load legacy v3 config");
+        assert_eq!(cfg.version, Some(4));
         let saved = std::fs::read_to_string(&toml_path).expect("read compacted config");
+        assert!(saved.contains("version = 4"));
+        assert!(saved.contains("[codex.routing.routes.main]"));
+        assert!(saved.contains("strategy = \"manual-sticky\""));
         assert!(saved.contains("[codex.providers.input]"));
         assert!(saved.contains("auth_token_env = \"INPUT_API_KEY\""));
         assert!(!saved.contains("enabled = true"));
@@ -534,7 +814,7 @@ target = "input"
 }
 
 #[test]
-fn save_config_preserves_v3_routing_when_only_runtime_metadata_changes() {
+fn save_config_preserves_v4_route_graph_when_only_runtime_metadata_changes() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -542,43 +822,41 @@ fn save_config_preserves_v3_routing_when_only_runtime_metadata_changes() {
         .expect("build tokio runtime");
 
     rt.block_on(async move {
-        let cfg = ProxyConfigV3 {
-            version: 3,
-            codex: ServiceViewV3 {
+        let cfg = ProxyConfigV4 {
+            version: 4,
+            codex: ServiceViewV4 {
                 providers: BTreeMap::from([
                     (
                         "monthly".to_string(),
-                        ProviderConfigV3 {
+                        ProviderConfigV4 {
                             base_url: Some("https://monthly.example.com/v1".to_string()),
                             tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
-                            ..ProviderConfigV3::default()
+                            ..ProviderConfigV4::default()
                         },
                     ),
                     (
                         "paygo".to_string(),
-                        ProviderConfigV3 {
+                        ProviderConfigV4 {
                             base_url: Some("https://paygo.example.com/v1".to_string()),
                             tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
-                            ..ProviderConfigV3::default()
+                            ..ProviderConfigV4::default()
                         },
                     ),
                 ]),
-                routing: Some(RoutingConfigV3 {
-                    policy: RoutingPolicyV3::TagPreferred,
-                    prefer_tags: vec![BTreeMap::from([(
+                routing: Some(RoutingConfigV4::tag_preferred(
+                    vec!["monthly".to_string(), "paygo".to_string()],
+                    vec![BTreeMap::from([(
                         "billing".to_string(),
                         "monthly".to_string(),
                     )])],
-                    order: vec!["monthly".to_string(), "paygo".to_string()],
-                    on_exhausted: RoutingExhaustedActionV3::Stop,
-                    ..RoutingConfigV3::default()
-                }),
-                ..ServiceViewV3::default()
+                    RoutingExhaustedActionV4::Stop,
+                )),
+                ..ServiceViewV4::default()
             },
-            ..ProxyConfigV3::default()
+            ..ProxyConfigV4::default()
         };
 
-        let path = super::save_config_v3(&cfg).await.expect("save v3");
+        let path = super::save_config_v4(&cfg).await.expect("save v4");
         let mut runtime = super::load_config().await.expect("load runtime");
         runtime.ui.language = Some("zh".to_string());
         super::save_config(&runtime)
@@ -586,11 +864,13 @@ fn save_config_preserves_v3_routing_when_only_runtime_metadata_changes() {
             .expect("save runtime metadata");
 
         let saved = std::fs::read_to_string(path).expect("read saved config");
-        let reparsed = toml::from_str::<ProxyConfigV3>(&saved).expect("parse v3");
+        let reparsed = toml::from_str::<ProxyConfigV4>(&saved).expect("parse v4");
+        assert_eq!(reparsed.version, 4);
         let routing = reparsed.codex.routing.expect("routing should remain");
-        assert_eq!(routing.policy, RoutingPolicyV3::TagPreferred);
-        assert_eq!(routing.on_exhausted, RoutingExhaustedActionV3::Stop);
-        assert_eq!(routing.order, vec!["monthly", "paygo"]);
+        let entry = routing.entry_node().expect("entry node should remain");
+        assert_eq!(entry.strategy, RoutingPolicyV4::TagPreferred);
+        assert_eq!(entry.on_exhausted, RoutingExhaustedActionV4::Stop);
+        assert_eq!(entry.children, vec!["monthly", "paygo"]);
         assert_eq!(reparsed.ui.language.as_deref(), Some("zh"));
     });
 }

@@ -1,12 +1,13 @@
 use super::config_doc::{
-    load_v3_config, ordered_v3_provider_names, parse_cli_tags, routing_exhausted_label,
-    routing_policy_label, select_v3_service_view, select_v3_service_view_mut,
+    ensure_v4_routing, load_v4_config, ordered_v4_provider_names, parse_cli_tags,
+    routing_exhausted_label, routing_policy_label, select_v4_service_view,
+    select_v4_service_view_mut,
 };
 use super::route_view;
 use crate::cli_types::{RoutingCommand, RoutingPolicy};
 use crate::config::{
-    PersistedRoutingProviderRef, PersistedRoutingSpec, RoutingExhaustedActionV3, RoutingPolicyV3,
-    ServiceViewV3, storage::save_config_v3,
+    PersistedRoutingProviderRef, PersistedRoutingSpec, RoutingExhaustedActionV4, RoutingPolicyV4,
+    ServiceViewV4, storage::save_config_v4,
 };
 use crate::{CliError, CliResult};
 use serde::Serialize;
@@ -26,14 +27,14 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             claude,
             json,
         } => {
-            let (cfg, service, label) = load_v3_config(codex, claude, "routing")
+            let (cfg, service, label) = load_v4_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let (view, _) = select_v3_service_view(&cfg, service);
+            let (view, _) = select_v4_service_view(&cfg, service);
             let routing = persisted_routing_spec_from_view(view);
             if json {
                 let payload = RoutingShowPayload {
-                    schema_version: 3,
+                    schema_version: 4,
                     service: service.to_string(),
                     routing,
                 };
@@ -58,11 +59,11 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+            let (mut cfg, service, label) = load_v4_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
-                let (view, _) = select_v3_service_view_mut(&mut cfg, service);
+                let (view, _) = select_v4_service_view_mut(&mut cfg, service);
                 if let Some(policy) = policy {
                     if matches!(policy, RoutingPolicy::ManualSticky) && !prefer_tags.is_empty() {
                         return Err(CliError::ProxyConfig(
@@ -74,19 +75,9 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                             "routing target only makes sense with manual-sticky policy".to_string(),
                         ));
                     }
-                    if matches!(policy, RoutingPolicy::OrderedFailover) && !prefer_tags.is_empty() {
-                        return Err(CliError::ProxyConfig(
-                            "ordered-failover does not use prefer-tags".to_string(),
-                        ));
-                    }
                 } else if target.is_some() && !prefer_tags.is_empty() {
                     return Err(CliError::ProxyConfig(
                         "routing target and prefer-tags should not be set together without an explicit policy".to_string(),
-                    ));
-                }
-                if clear_target && matches!(policy, Some(RoutingPolicy::TagPreferred)) {
-                    return Err(CliError::ProxyConfig(
-                        "clear-target is only meaningful for manual-sticky or ordered-failover routing".to_string(),
                     ));
                 }
                 if clear_target && matches!(policy, Some(RoutingPolicy::ManualSticky)) {
@@ -96,44 +87,35 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                 }
 
                 let mut changed = false;
-                let mut next_policy = view
-                    .routing
-                    .as_ref()
-                    .map(|routing| routing.policy)
-                    .unwrap_or(RoutingPolicyV3::OrderedFailover);
-                let mut next_target = view
-                    .routing
-                    .as_ref()
-                    .and_then(|routing| routing.target.clone());
-                let mut next_order = view
-                    .routing
-                    .as_ref()
-                    .map(|routing| routing.order.clone())
+                let current_routing = crate::config::effective_v4_routing(view);
+                let current_entry = current_routing.entry_node();
+                let mut next_policy = current_entry
+                    .map(|node| node.strategy)
+                    .unwrap_or(RoutingPolicyV4::OrderedFailover);
+                let mut next_target = current_entry.and_then(|node| node.target.clone());
+                let mut next_order = current_entry
+                    .map(|node| node.children.clone())
                     .unwrap_or_default();
-                let mut next_prefer_tags = view
-                    .routing
-                    .as_ref()
-                    .map(|routing| routing.prefer_tags.clone())
+                let mut next_prefer_tags = current_entry
+                    .map(|node| node.prefer_tags.clone())
                     .unwrap_or_default();
-                let mut next_on_exhausted = view
-                    .routing
-                    .as_ref()
-                    .map(|routing| routing.on_exhausted)
-                    .unwrap_or(RoutingExhaustedActionV3::Continue);
+                let mut next_on_exhausted = current_entry
+                    .map(|node| node.on_exhausted)
+                    .unwrap_or(RoutingExhaustedActionV4::Continue);
 
                 if let Some(policy) = policy {
                     next_policy = policy.into();
                     changed = true;
                 }
                 if let Some(value) = target {
-                    next_policy = RoutingPolicyV3::ManualSticky;
+                    next_policy = RoutingPolicyV4::ManualSticky;
                     next_target = Some(value);
                     changed = true;
                 }
                 if clear_target {
                     next_target = None;
-                    if matches!(next_policy, RoutingPolicyV3::ManualSticky) {
-                        next_policy = RoutingPolicyV3::OrderedFailover;
+                    if matches!(next_policy, RoutingPolicyV4::ManualSticky) {
+                        next_policy = RoutingPolicyV4::OrderedFailover;
                     }
                     changed = true;
                 }
@@ -147,7 +129,7 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                         parse_cli_tags(&prefer_tags)
                             .map_err(|e| CliError::ProxyConfig(e.to_string()))?,
                     ];
-                    next_policy = RoutingPolicyV3::TagPreferred;
+                    next_policy = RoutingPolicyV4::TagPreferred;
                     changed = true;
                 }
                 if clear_prefer_tags {
@@ -164,14 +146,14 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                     ));
                 }
 
-                if !matches!(next_policy, RoutingPolicyV3::ManualSticky) {
+                if !matches!(next_policy, RoutingPolicyV4::ManualSticky) {
                     next_target = None;
                 }
-                if !matches!(next_policy, RoutingPolicyV3::TagPreferred) {
+                if !matches!(next_policy, RoutingPolicyV4::TagPreferred) {
                     next_prefer_tags.clear();
                 }
-                if !matches!(next_policy, RoutingPolicyV3::TagPreferred) && on_exhausted.is_none() {
-                    next_on_exhausted = RoutingExhaustedActionV3::Continue;
+                if !matches!(next_policy, RoutingPolicyV4::TagPreferred) && on_exhausted.is_none() {
+                    next_on_exhausted = RoutingExhaustedActionV4::Continue;
                 }
                 next_order = normalize_complete_order(view, next_order, next_target.as_deref())
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -185,16 +167,17 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                 )
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
 
-                view.routing = Some(crate::config::RoutingConfigV3 {
-                    policy: next_policy,
-                    order: next_order,
-                    target: next_target,
-                    prefer_tags: next_prefer_tags,
-                    on_exhausted: next_on_exhausted,
-                });
+                set_v4_entry_routing(
+                    view,
+                    next_policy,
+                    next_target,
+                    next_order,
+                    next_prefer_tags,
+                    next_on_exhausted,
+                );
             }
 
-            save_config_v3(&cfg)
+            save_config_v4(&cfg)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!("{label} routing updated");
@@ -204,26 +187,27 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+            let (mut cfg, service, label) = load_v4_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
-                let (view, _) = select_v3_service_view_mut(&mut cfg, service);
+                let (view, _) = select_v4_service_view_mut(&mut cfg, service);
                 ensure_provider_exists(view, provider.as_str())?;
 
                 let order =
                     normalize_complete_order(view, vec![provider.clone()], Some(provider.as_str()))
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                view.routing = Some(crate::config::RoutingConfigV3 {
-                    policy: RoutingPolicyV3::ManualSticky,
+                set_v4_entry_routing(
+                    view,
+                    RoutingPolicyV4::ManualSticky,
+                    Some(provider.clone()),
                     order,
-                    target: Some(provider.clone()),
-                    prefer_tags: Vec::new(),
-                    on_exhausted: RoutingExhaustedActionV3::Continue,
-                });
+                    Vec::new(),
+                    RoutingExhaustedActionV4::Continue,
+                );
             }
 
-            save_config_v3(&cfg)
+            save_config_v4(&cfg)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!("{label} routing pinned to provider '{}'", provider);
@@ -233,23 +217,24 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+            let (mut cfg, service, label) = load_v4_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
-                let (view, _) = select_v3_service_view_mut(&mut cfg, service);
+                let (view, _) = select_v4_service_view_mut(&mut cfg, service);
                 let order = normalize_complete_order(view, providers, None)
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-                view.routing = Some(crate::config::RoutingConfigV3 {
-                    policy: RoutingPolicyV3::OrderedFailover,
+                set_v4_entry_routing(
+                    view,
+                    RoutingPolicyV4::OrderedFailover,
+                    None,
                     order,
-                    target: None,
-                    prefer_tags: Vec::new(),
-                    on_exhausted: RoutingExhaustedActionV3::Continue,
-                });
+                    Vec::new(),
+                    RoutingExhaustedActionV4::Continue,
+                );
             }
 
-            save_config_v3(&cfg)
+            save_config_v4(&cfg)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!("{label} routing order updated");
@@ -261,11 +246,11 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+            let (mut cfg, service, label) = load_v4_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
-                let (view, _) = select_v3_service_view_mut(&mut cfg, service);
+                let (view, _) = select_v4_service_view_mut(&mut cfg, service);
                 let prefer_tag =
                     parse_cli_tags(&tags).map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 let order = if order.is_empty() {
@@ -277,48 +262,52 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                 };
                 let next_on_exhausted = on_exhausted
                     .map(Into::into)
-                    .unwrap_or(RoutingExhaustedActionV3::Continue);
-                view.routing = Some(crate::config::RoutingConfigV3 {
-                    policy: RoutingPolicyV3::TagPreferred,
+                    .unwrap_or(RoutingExhaustedActionV4::Continue);
+                set_v4_entry_routing(
+                    view,
+                    RoutingPolicyV4::TagPreferred,
+                    None,
                     order,
-                    target: None,
-                    prefer_tags: vec![prefer_tag],
-                    on_exhausted: next_on_exhausted,
-                });
+                    vec![prefer_tag],
+                    next_on_exhausted,
+                );
             }
 
-            save_config_v3(&cfg)
+            save_config_v4(&cfg)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!("{label} tag-preferred routing updated");
         }
         RoutingCommand::ClearTarget { codex, claude } => {
-            let (mut cfg, service, label) = load_v3_config(codex, claude, "routing")
+            let (mut cfg, service, label) = load_v4_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
-                let (view, _) = select_v3_service_view_mut(&mut cfg, service);
-                let Some(current_order) =
-                    view.routing.as_ref().map(|routing| routing.order.clone())
-                else {
+                let (view, _) = select_v4_service_view_mut(&mut cfg, service);
+                let current_routing = crate::config::effective_v4_routing(view);
+                let Some(current_entry) = current_routing.entry_node() else {
                     return Err(CliError::ProxyConfig(
-                        "routing clear-target requires an existing v3 routing block".to_string(),
+                        "routing clear-target requires an existing v4 routing block".to_string(),
                     ));
                 };
-                let next_order = normalize_complete_order(view, current_order, None)
-                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                let next_order =
+                    normalize_complete_order(view, current_entry.children.clone(), None)
+                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 let routing = view
                     .routing
                     .as_mut()
                     .expect("routing existence was checked above");
-                routing.policy = RoutingPolicyV3::OrderedFailover;
-                routing.target = None;
-                routing.order = next_order;
-                routing.prefer_tags.clear();
-                routing.on_exhausted = RoutingExhaustedActionV3::Continue;
+                let entry_name = routing.entry.clone();
+                let node = routing.routes.entry(entry_name).or_default();
+                node.strategy = RoutingPolicyV4::OrderedFailover;
+                node.target = None;
+                node.children = next_order;
+                node.prefer_tags.clear();
+                node.on_exhausted = RoutingExhaustedActionV4::Continue;
+                routing.sync_compat_from_graph();
             }
 
-            save_config_v3(&cfg)
+            save_config_v4(&cfg)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             println!("{label} routing target cleared");
@@ -328,9 +317,11 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
     Ok(())
 }
 
-fn persisted_routing_spec_from_view(view: &ServiceViewV3) -> PersistedRoutingSpec {
-    let routing = view.routing.clone().unwrap_or_default();
-    let providers = ordered_v3_provider_names(view)
+fn persisted_routing_spec_from_view(view: &ServiceViewV4) -> PersistedRoutingSpec {
+    let routing = crate::config::effective_v4_routing(view);
+    let entry_node = routing.entry_node();
+    let expanded_order = ordered_v4_provider_names(view);
+    let providers = ordered_v4_provider_names(view)
         .into_iter()
         .filter_map(|name| {
             view.providers
@@ -344,16 +335,29 @@ fn persisted_routing_spec_from_view(view: &ServiceViewV3) -> PersistedRoutingSpe
         })
         .collect();
     PersistedRoutingSpec {
+        entry: routing.entry.clone(),
+        routes: routing.routes.clone(),
         policy: routing.policy,
-        order: routing.order,
-        target: routing.target,
-        prefer_tags: routing.prefer_tags,
-        on_exhausted: routing.on_exhausted,
+        order: entry_node
+            .map(|node| node.children.clone())
+            .unwrap_or_default(),
+        target: entry_node.and_then(|node| node.target.clone()),
+        prefer_tags: entry_node
+            .map(|node| node.prefer_tags.clone())
+            .unwrap_or_default(),
+        on_exhausted: entry_node
+            .map(|node| node.on_exhausted)
+            .unwrap_or(RoutingExhaustedActionV4::Continue),
+        entry_strategy: entry_node
+            .map(|node| node.strategy)
+            .unwrap_or(RoutingPolicyV4::OrderedFailover),
+        expanded_order,
+        entry_target: entry_node.and_then(|node| node.target.clone()),
         providers,
     }
 }
 
-fn print_routing_text(label: &str, view: &ServiceViewV3) {
+fn print_routing_text(label: &str, view: &ServiceViewV4) {
     let routing = persisted_routing_spec_from_view(view);
     let policy = routing.policy;
     let order = routing.order;
@@ -361,7 +365,7 @@ fn print_routing_text(label: &str, view: &ServiceViewV3) {
     let prefer_tags = routing.prefer_tags;
     let on_exhausted = routing.on_exhausted;
     let providers = routing.providers;
-    println!("Schema version: v3");
+    println!("Schema version: v4");
     println!("Service: {label}");
     println!("Routing policy: {}", routing_policy_label(policy));
     println!("Routing target: {}", target.as_deref().unwrap_or("<none>"));
@@ -437,19 +441,19 @@ fn matches_prefer_tags(
     })
 }
 
-fn ensure_provider_exists(view: &ServiceViewV3, provider: &str) -> CliResult<()> {
+fn ensure_provider_exists(view: &ServiceViewV4, provider: &str) -> CliResult<()> {
     if view.providers.contains_key(provider) {
         Ok(())
     } else {
         Err(CliError::ProxyConfig(format!(
-            "provider '{}' not found in v3 routing config",
+            "provider '{}' not found in v4 routing config",
             provider
         )))
     }
 }
 
 fn normalize_complete_order(
-    view: &ServiceViewV3,
+    view: &ServiceViewV4,
     raw_order: Vec<String>,
     target: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
@@ -476,7 +480,7 @@ fn normalize_complete_order(
     for name in raw_order {
         push_name(name.as_str())?;
     }
-    for name in ordered_v3_provider_names(view) {
+    for name in ordered_v4_provider_names(view) {
         push_name(name.as_str())?;
     }
 
@@ -484,19 +488,19 @@ fn normalize_complete_order(
 }
 
 fn validate_routing_fields(
-    view: &ServiceViewV3,
-    policy: RoutingPolicyV3,
+    view: &ServiceViewV4,
+    policy: RoutingPolicyV4,
     target: Option<&str>,
     order: &[String],
     prefer_tags: &[BTreeMap<String, String>],
 ) -> anyhow::Result<()> {
-    if matches!(policy, RoutingPolicyV3::ManualSticky) && target.is_none() {
+    if matches!(policy, RoutingPolicyV4::ManualSticky) && target.is_none() {
         anyhow::bail!("manual-sticky routing requires a target provider");
     }
-    if !matches!(policy, RoutingPolicyV3::ManualSticky) && target.is_some() {
+    if !matches!(policy, RoutingPolicyV4::ManualSticky) && target.is_some() {
         anyhow::bail!("routing target only makes sense with manual-sticky policy");
     }
-    if matches!(policy, RoutingPolicyV3::TagPreferred) && prefer_tags.is_empty() {
+    if matches!(policy, RoutingPolicyV4::TagPreferred) && prefer_tags.is_empty() {
         anyhow::bail!("tag-preferred routing requires at least one prefer-tag filter");
     }
     for provider_name in order {
@@ -521,4 +525,29 @@ fn validate_routing_fields(
         }
     }
     Ok(())
+}
+
+fn set_v4_entry_routing(
+    view: &mut ServiceViewV4,
+    policy: RoutingPolicyV4,
+    target: Option<String>,
+    order: Vec<String>,
+    prefer_tags: Vec<BTreeMap<String, String>>,
+    on_exhausted: RoutingExhaustedActionV4,
+) {
+    let routing = ensure_v4_routing(view);
+    let entry_name = routing.entry.clone();
+    let node = routing.routes.entry(entry_name).or_default();
+    node.strategy = policy;
+    node.children = order;
+    node.target = target;
+    node.prefer_tags = prefer_tags;
+    node.on_exhausted = on_exhausted;
+    if !matches!(node.strategy, RoutingPolicyV4::ManualSticky) {
+        node.target = None;
+    }
+    if !matches!(node.strategy, RoutingPolicyV4::TagPreferred) {
+        node.prefer_tags.clear();
+    }
+    routing.sync_compat_from_graph();
 }

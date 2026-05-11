@@ -1,5 +1,9 @@
 # Routing-First Configuration Guide
 
+> Historical note: this v3 routing-first workstream is superseded by
+> `docs/workstreams/codex-routing-graph-refactor/`. Use the v4 route graph docs
+> for current authoring and implementation decisions.
+
 > This document describes the target authoring model for the routing refactor.
 > The current branch can load and write `version = 3` routing-first config, `config init` emits a v3 template, and legacy station-first config remains readable for migration.
 > The goal is simple: keep providers thin, make routing explicit, and let most users configure the system without learning internal station/group mechanics.
@@ -131,10 +135,15 @@ auth_token_env = "CODEX_FOR_API_KEY"
 tags = { billing = "paygo" }
 
 [codex.routing]
-policy = "tag-preferred"
-prefer_tags = [{ billing = "monthly", pool = "input" }]
-order = ["input", "input1", "input2", "codex-for"]
+policy = "pool-fallback"
+chain = ["input", "paygo"]
 on_exhausted = "continue"
+
+[codex.routing.pools.input]
+providers = ["input", "input1", "input2"]
+
+[codex.routing.pools.paygo]
+providers = ["codex-for"]
 ```
 
 The important part is not the flat order alone. The runtime must treat `unknown` balance as unknown, confirmed exhaustion as demotable, and temporary 502/429-style failures as recoverable through cooldown and later reprobe.
@@ -168,10 +177,12 @@ Recommended usage:
 
 | Field | Meaning | Notes |
 | --- | --- | --- |
-| `policy` | Routing policy | Required. Choose `manual-sticky`, `ordered-failover`, or `tag-preferred`. |
-| `order` | Deterministic fallback order | Use explicit provider keys. |
+| `policy` | Routing policy | Required. Choose `manual-sticky`, `ordered-failover`, `tag-preferred`, or `pool-fallback`. |
+| `order` | Deterministic fallback order | Use explicit provider keys. For `pool-fallback`, this is the flattened provider projection, not the primary grouping key. |
 | `target` | Pinned provider target | Used by `manual-sticky`. |
 | `prefer_tags` | Preferred tag filters | Used by `tag-preferred`. |
+| `chain` | Pool fallback chain | Used by `pool-fallback` to define the pool order explicitly. |
+| `pools` | Pool definitions | Used by `pool-fallback` to group providers into named pools. |
 | `on_exhausted` | Exhaustion behavior | Use `continue` or `stop`. |
 
 ## Common Recipes
@@ -318,8 +329,10 @@ The form intentionally treats providers with extra `endpoints` or inline secrets
 
 The same GUI form also exposes a v3 routing editor for the currently selected service.
 
-- `policy`: `ordered-failover`, `manual-sticky`, or `tag-preferred`;
-- `order`: comma- or newline-separated provider names; unlisted providers remain as tail fallbacks;
+- `policy`: `ordered-failover`, `manual-sticky`, `tag-preferred`, or `pool-fallback`;
+- `order`: comma- or newline-separated provider names; unlisted providers remain as tail fallbacks in flat policies;
+- `chain`: comma- or newline-separated pool names, used when the policy is `pool-fallback`;
+- `pools`: named pool definitions for grouped providers, used when the policy is `pool-fallback`;
 - `target`: required only for `manual-sticky`;
 - `prefer_tags`: `key=value` pairs, with multiple groups separated by semicolons;
 - `on_exhausted`: `continue` keeps non-matching fallbacks after preferred tags are exhausted, while `stop` limits routing to preferred matches.
@@ -332,9 +345,9 @@ Local GUI, remote attach clients, and TUI-backed admin flows should edit the sam
 
 - provider spec writes update `[codex.providers.<name>]` directly;
 - provider spec reads/writes preserve and can update provider-level and endpoint-level `tags`;
-- new providers are appended to an existing explicit `codex.routing.order`;
+- new providers are appended to an existing explicit `codex.routing.order` or preserved inside a `pool-fallback` pool when that policy is already present;
 - `GET /__codex_helper/api/v1/routing` reads the v3 routing block plus provider references;
-- `PUT /__codex_helper/api/v1/routing` is the canonical structured write path for `policy`, `order`, `target`, `prefer_tags`, and `on_exhausted`;
+- `PUT /__codex_helper/api/v1/routing` is the canonical structured write path for `policy`, `order`, `target`, `prefer_tags`, `chain`, `pools`, and `on_exhausted`;
 - station quick-switch and station settings APIs are v2-only for persisted station schema and are rejected on v3 files;
 - profile CRUD writes `[codex.profiles]` and `default_profile` directly;
 - station spec reads/writes are rejected on v3 files; use routing and provider specs instead.

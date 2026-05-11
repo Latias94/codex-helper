@@ -1,8 +1,8 @@
 use crate::config::{
-    ConfigV3MigrationReport, ProviderConfigV3, ProxyConfig, ProxyConfigV2, ProxyConfigV3,
-    RoutingConfigV3, RoutingExhaustedActionV3, RoutingPolicyV3, ServiceConfigManager, ServiceKind,
-    ServiceViewV3, compile_v2_to_runtime, compile_v3_to_runtime, migrate_legacy_to_v3_with_report,
-    migrate_v2_to_v3_with_report,
+    ConfigV4MigrationReport, ProviderConfigV4, ProxyConfig, ProxyConfigV2, ProxyConfigV4,
+    RoutingConfigV4, RoutingExhaustedActionV4, RoutingPolicyV4, ServiceConfigManager, ServiceKind,
+    ServiceViewV4, compile_v2_to_runtime, compile_v4_to_runtime, migrate_legacy_to_v4_with_report,
+    migrate_v2_to_v4_with_report,
     storage::{config_file_path, load_config},
 };
 use std::collections::BTreeMap;
@@ -12,7 +12,7 @@ use tokio::fs;
 pub(super) enum ConfigDocument {
     Legacy(ProxyConfig),
     V2(ProxyConfigV2),
-    V3(ProxyConfigV3),
+    V4(ProxyConfigV4),
 }
 
 impl ConfigDocument {
@@ -20,7 +20,7 @@ impl ConfigDocument {
         match self {
             Self::Legacy(cfg) => cfg.version.unwrap_or(1),
             Self::V2(cfg) => cfg.version,
-            Self::V3(cfg) => cfg.version,
+            Self::V4(cfg) => cfg.version,
         }
     }
 
@@ -28,15 +28,15 @@ impl ConfigDocument {
         match self {
             Self::Legacy(cfg) => Ok(cfg.clone()),
             Self::V2(cfg) => compile_v2_to_runtime(cfg),
-            Self::V3(cfg) => compile_v3_to_runtime(cfg),
+            Self::V4(cfg) => compile_v4_to_runtime(cfg),
         }
     }
 
-    pub(super) fn v3_migration_report(&self) -> anyhow::Result<ConfigV3MigrationReport> {
+    pub(super) fn v4_migration_report(&self) -> anyhow::Result<ConfigV4MigrationReport> {
         match self {
-            Self::Legacy(cfg) => migrate_legacy_to_v3_with_report(cfg),
-            Self::V2(cfg) => migrate_v2_to_v3_with_report(cfg),
-            Self::V3(cfg) => Ok(ConfigV3MigrationReport {
+            Self::Legacy(cfg) => migrate_legacy_to_v4_with_report(cfg),
+            Self::V2(cfg) => migrate_v2_to_v4_with_report(cfg),
+            Self::V4(cfg) => Ok(ConfigV4MigrationReport {
                 config: cfg.clone(),
                 warnings: Vec::new(),
             }),
@@ -86,20 +86,40 @@ pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
         .and_then(|value| value.get("version").and_then(|v| v.as_integer()))
         .map(|value| value as u32)
         .or_else(|| {
-            let has_routing = ["codex", "claude"].iter().any(|service| {
+            let has_v4_routing = ["codex", "claude"].iter().any(|service| {
                 value
                     .as_ref()
                     .and_then(|value| value.get(*service))
                     .and_then(|service| service.get("routing"))
+                    .and_then(|routing| routing.get("entry").or_else(|| routing.get("routes")))
                     .is_some()
             });
-            if has_routing { Some(3) } else { None }
+            if has_v4_routing {
+                Some(4)
+            } else {
+                let has_legacy_routing = ["codex", "claude"].iter().any(|service| {
+                    value
+                        .as_ref()
+                        .and_then(|value| value.get(*service))
+                        .and_then(|service| service.get("routing"))
+                        .is_some()
+                });
+                if has_legacy_routing { Some(3) } else { None }
+            }
         });
 
-    if version == Some(3) {
-        let cfg = toml::from_str::<ProxyConfigV3>(&text)?;
-        compile_v3_to_runtime(&cfg)?;
-        Ok(ConfigDocument::V3(cfg))
+    if version == Some(4) {
+        let mut cfg = toml::from_str::<ProxyConfigV4>(&text)?;
+        cfg.sync_routing_compat_from_graph();
+        compile_v4_to_runtime(&cfg)?;
+        Ok(ConfigDocument::V4(cfg))
+    } else if version == Some(3) {
+        let legacy = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(&text)?;
+        let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&legacy)?;
+        let mut cfg = migrated.config;
+        cfg.sync_routing_compat_from_graph();
+        compile_v4_to_runtime(&cfg)?;
+        Ok(ConfigDocument::V4(cfg))
     } else if version == Some(2) {
         let cfg = toml::from_str::<ProxyConfigV2>(&text)?;
         compile_v2_to_runtime(&cfg)?;
@@ -109,16 +129,16 @@ pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
     }
 }
 
-pub(super) async fn load_v3_config(
+pub(super) async fn load_v4_config(
     codex: bool,
     claude: bool,
     command_group: &str,
-) -> anyhow::Result<(ProxyConfigV3, &'static str, &'static str)> {
+) -> anyhow::Result<(ProxyConfigV4, &'static str, &'static str)> {
     let service = resolve_service(codex, claude).await?;
     let document = load_config_document().await?;
-    let ConfigDocument::V3(cfg) = document else {
+    let ConfigDocument::V4(cfg) = document else {
         anyhow::bail!(
-            "{} commands require a version = 3 config; run `codex-helper config migrate --write --yes` first",
+            "{} commands require a version = 4 route graph config; run `codex-helper config migrate --write --yes` first",
             command_group
         );
     };
@@ -141,10 +161,10 @@ pub(super) fn select_service_manager<'a>(
     }
 }
 
-pub(super) fn select_v3_service_view_mut<'a>(
-    cfg: &'a mut ProxyConfigV3,
+pub(super) fn select_v4_service_view_mut<'a>(
+    cfg: &'a mut ProxyConfigV4,
     service: &str,
-) -> (&'a mut ServiceViewV3, &'static str) {
+) -> (&'a mut ServiceViewV4, &'static str) {
     if service == "claude" {
         (&mut cfg.claude, "Claude")
     } else {
@@ -152,10 +172,10 @@ pub(super) fn select_v3_service_view_mut<'a>(
     }
 }
 
-pub(super) fn select_v3_service_view<'a>(
-    cfg: &'a ProxyConfigV3,
+pub(super) fn select_v4_service_view<'a>(
+    cfg: &'a ProxyConfigV4,
     service: &str,
-) -> (&'a ServiceViewV3, &'static str) {
+) -> (&'a ServiceViewV4, &'static str) {
     if service == "claude" {
         (&cfg.claude, "Claude")
     } else {
@@ -163,19 +183,30 @@ pub(super) fn select_v3_service_view<'a>(
     }
 }
 
-pub(super) fn ensure_v3_routing(view: &mut ServiceViewV3) -> &mut RoutingConfigV3 {
-    view.routing.get_or_insert_with(RoutingConfigV3::default)
+pub(super) fn ensure_v4_routing(view: &mut ServiceViewV4) -> &mut RoutingConfigV4 {
+    view.routing.get_or_insert_with(RoutingConfigV4::default)
 }
 
-pub(super) fn ensure_v3_routing_order_contains(view: &mut ServiceViewV3, provider_name: &str) {
-    let routing = ensure_v3_routing(view);
-    if !routing
-        .order
+pub(super) fn ensure_v4_routing_order_contains(view: &mut ServiceViewV4, provider_name: &str) {
+    let routing = ensure_v4_routing(view);
+    let entry_name = routing.entry.clone();
+    if !routing.routes.contains_key(entry_name.as_str()) {
+        routing
+            .routes
+            .insert(entry_name.clone(), crate::config::RoutingNodeV4::default());
+    }
+    let node = routing
+        .routes
+        .get_mut(entry_name.as_str())
+        .expect("entry route");
+    if !node
+        .children
         .iter()
         .any(|candidate| candidate == provider_name)
     {
-        routing.order.push(provider_name.to_string());
+        node.children.push(provider_name.to_string());
     }
+    routing.sync_compat_from_graph();
 }
 
 pub(super) fn parse_cli_tags(raw_tags: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
@@ -199,22 +230,22 @@ pub(super) fn parse_cli_tags(raw_tags: &[String]) -> anyhow::Result<BTreeMap<Str
     Ok(tags)
 }
 
-pub(super) fn routing_policy_label(policy: RoutingPolicyV3) -> &'static str {
+pub(super) fn routing_policy_label(policy: RoutingPolicyV4) -> &'static str {
     match policy {
-        RoutingPolicyV3::ManualSticky => "manual-sticky",
-        RoutingPolicyV3::OrderedFailover => "ordered-failover",
-        RoutingPolicyV3::TagPreferred => "tag-preferred",
+        RoutingPolicyV4::ManualSticky => "manual-sticky",
+        RoutingPolicyV4::OrderedFailover => "ordered-failover",
+        RoutingPolicyV4::TagPreferred => "tag-preferred",
     }
 }
 
-pub(super) fn routing_exhausted_label(action: RoutingExhaustedActionV3) -> &'static str {
+pub(super) fn routing_exhausted_label(action: RoutingExhaustedActionV4) -> &'static str {
     match action {
-        RoutingExhaustedActionV3::Continue => "continue",
-        RoutingExhaustedActionV3::Stop => "stop",
+        RoutingExhaustedActionV4::Continue => "continue",
+        RoutingExhaustedActionV4::Stop => "stop",
     }
 }
 
-pub(super) fn v3_provider_endpoint_count(provider: &ProviderConfigV3) -> usize {
+pub(super) fn v4_provider_endpoint_count(provider: &ProviderConfigV4) -> usize {
     let inline = provider
         .base_url
         .as_deref()
@@ -223,78 +254,84 @@ pub(super) fn v3_provider_endpoint_count(provider: &ProviderConfigV3) -> usize {
     inline + provider.endpoints.len()
 }
 
-fn push_v3_provider_name_once(names: &mut Vec<String>, view: &ServiceViewV3, name: &str) {
+fn push_v4_provider_name_once(names: &mut Vec<String>, view: &ServiceViewV4, name: &str) {
     if view.providers.contains_key(name) && !names.iter().any(|existing| existing == name) {
         names.push(name.to_string());
     }
 }
 
-pub(super) fn ordered_v3_provider_names(view: &ServiceViewV3) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(routing) = view.routing.as_ref() {
-        if matches!(routing.policy, RoutingPolicyV3::ManualSticky)
-            && let Some(target) = routing.target.as_deref()
-        {
-            push_v3_provider_name_once(&mut names, view, target);
-        }
-        for provider_name in &routing.order {
-            push_v3_provider_name_once(&mut names, view, provider_name);
-        }
-    }
+pub(super) fn ordered_v4_provider_names(view: &ServiceViewV4) -> Vec<String> {
+    let mut names =
+        crate::config::resolved_v4_provider_order("config_doc", view).unwrap_or_default();
     for provider_name in view.providers.keys() {
-        push_v3_provider_name_once(&mut names, view, provider_name);
+        push_v4_provider_name_once(&mut names, view, provider_name);
     }
     names
 }
 
-pub(super) fn print_v3_provider_list(label: &str, view: &ServiceViewV3) {
-    let provider_names = ordered_v3_provider_names(view);
+pub(super) fn print_v4_provider_list(label: &str, view: &ServiceViewV4) {
+    let provider_names = ordered_v4_provider_names(view);
     if view.providers.is_empty() {
-        println!("No {label} providers in v3 config.");
+        println!("No {label} providers in v4 route graph config.");
         return;
     }
 
-    if let Some(routing) = view.routing.as_ref() {
-        let target = routing.target.as_deref().unwrap_or("<none>");
-        let order = if routing.order.is_empty() {
+    if view.routing.is_some() {
+        let routing = crate::config::effective_v4_routing(view);
+        let entry = routing.entry_node();
+        let target = entry
+            .and_then(|node| node.target.as_deref())
+            .unwrap_or("<none>");
+        let order = if entry.is_none_or(|node| node.children.is_empty()) {
             "<provider key order>".to_string()
         } else {
-            routing.order.join(", ")
+            entry
+                .map(|node| node.children.join(", "))
+                .unwrap_or_default()
         };
         println!(
-            "{label} providers (v3): policy={} target={} order=[{}] on_exhausted={}",
-            routing_policy_label(routing.policy),
+            "{label} providers (v4): entry={} policy={} target={} order=[{}] on_exhausted={}",
+            routing.entry,
+            routing_policy_label(
+                entry
+                    .map(|node| node.strategy)
+                    .unwrap_or(RoutingPolicyV4::OrderedFailover)
+            ),
             target,
             order,
-            routing_exhausted_label(routing.on_exhausted)
+            routing_exhausted_label(
+                entry
+                    .map(|node| node.on_exhausted)
+                    .unwrap_or(RoutingExhaustedActionV4::Continue)
+            )
         );
     } else {
-        println!("{label} providers (v3): routing=<implicit ordered-failover>");
+        println!("{label} providers (v4): routing=<implicit ordered-failover>");
     }
 
-    let target = view.routing.as_ref().and_then(|routing| {
-        matches!(routing.policy, RoutingPolicyV3::ManualSticky)
-            .then(|| routing.target.as_deref())
+    let effective = crate::config::effective_v4_routing(view);
+    let target = effective.entry_node().and_then(|node| {
+        matches!(node.strategy, RoutingPolicyV4::ManualSticky)
+            .then(|| node.target.as_deref())
             .flatten()
     });
-    let first_ordered = view
-        .routing
-        .as_ref()
-        .and_then(|routing| routing.order.first().map(String::as_str));
+    let first_ordered = crate::config::resolved_v4_provider_order("config_doc", view)
+        .ok()
+        .and_then(|order| order.first().cloned());
 
     for provider_name in provider_names {
         let Some(provider) = view.providers.get(provider_name.as_str()) else {
             continue;
         };
         let marker = if target == Some(provider_name.as_str())
-            || (target.is_none() && first_ordered == Some(provider_name.as_str()))
+            || (target.is_none() && first_ordered.as_deref() == Some(provider_name.as_str()))
         {
             "*"
         } else {
             " "
         };
         let enabled = if provider.enabled { "on" } else { "off" };
-        let endpoints = v3_provider_endpoint_count(provider);
+        let endpoints = v4_provider_endpoint_count(provider);
         let tags = if provider.tags.is_empty() {
             "-".to_string()
         } else {

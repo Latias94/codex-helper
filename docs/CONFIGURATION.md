@@ -1,17 +1,18 @@
 # Configuration Guide
 
-This guide documents the public `version = 3` config format.
+This guide documents the public `version = 4` route graph config format.
 
-The short version: define providers once, then choose one routing recipe. Most users only need `[codex.providers.*]`, `[codex.routing]`, and `[retry]`.
+The short version: define providers once, then point `routing.entry` at a named route node under `routing.routes`. Most users only need `[codex.providers.*]`, `[codex.routing]`, `[codex.routing.routes.*]`, and `[retry]`.
 
 ## Mental Model
 
 - `providers` are your upstream catalog: base URL, auth, optional tags, optional endpoints.
-- `routing` is the active provider-selection recipe: ordered fallback, manual pin, or tag preference.
+- `routing.entry` is the root route node for a service.
+- `routing.routes.*` are named route nodes. A route node can reference providers or other route nodes.
 - `profiles` are request defaults such as model and reasoning effort. They should not pick providers.
 - `retry` controls how hard the proxy retries before returning an error.
 
-Some runtime internals still use the legacy `station` wording, but hand-written config should think in `provider` plus `routing`.
+Some runtime internals still use the legacy `station` wording, but hand-written config should think in `provider` plus `route graph`.
 
 ## File Locations
 
@@ -51,7 +52,7 @@ codex-helper config set-retry-profile balanced
 This creates the same thin TOML shape you would write by hand:
 
 ```toml
-version = 3
+version = 4
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
@@ -64,13 +65,40 @@ auth_token_env = "OPENAI_API_KEY"
 tags = { billing = "paygo" }
 
 [codex.routing]
-policy = "ordered-failover"
-order = ["input", "openai"]
-on_exhausted = "continue"
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["input", "openai"]
 
 [retry]
 profile = "balanced"
 ```
+
+## Route Graph Shape
+
+Every service can have its own route graph:
+
+```toml
+[codex.routing]
+entry = "monthly_first"
+
+[codex.routing.routes.monthly_pool]
+strategy = "ordered-failover"
+children = ["input", "input1", "input2"]
+
+[codex.routing.routes.monthly_first]
+strategy = "ordered-failover"
+children = ["monthly_pool", "codex_for"]
+```
+
+Rules:
+
+- A route node name must not be the same as a provider name.
+- `children` can reference providers or route nodes.
+- Cycles are rejected.
+- Duplicate provider leaves are rejected because they make fallback behavior ambiguous.
+- Runtime health, cooldown, balance exhaustion, and reprobe state are not stored in static config.
 
 ## Recipes
 
@@ -81,16 +109,18 @@ Pick one recipe first. You can refine fields later.
 Use this when you only want codex-helper as a local proxy and dashboard.
 
 ```toml
-version = 3
+version = 4
 
 [codex.providers.main]
 base_url = "https://api.example.com/v1"
 auth_token_env = "MAIN_API_KEY"
 
 [codex.routing]
-policy = "manual-sticky"
+entry = "main_route"
+
+[codex.routing.routes.main_route]
+strategy = "manual-sticky"
 target = "main"
-order = ["main"]
 
 [retry]
 profile = "balanced"
@@ -101,7 +131,7 @@ profile = "balanced"
 Use this as the default for multiple relays: first working provider wins, then fallback in order.
 
 ```toml
-version = 3
+version = 4
 
 [codex.providers.monthly]
 base_url = "https://monthly.example/v1"
@@ -119,19 +149,62 @@ auth_token_env = "OPENAI_API_KEY"
 tags = { billing = "official" }
 
 [codex.routing]
-policy = "ordered-failover"
-order = ["monthly", "backup", "openai"]
-on_exhausted = "continue"
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["monthly", "backup", "openai"]
 ```
 
 This is the most direct replacement for old priority or level-based setups.
 
-### Monthly First
+### Monthly Pool With Paygo Fallback
 
-Use this when the business intent matters: prefer every provider tagged `billing=monthly`, then continue to the rest.
+Use this when several monthly providers form one preferred group and a paygo provider is only the fallback of last resort.
 
 ```toml
-version = 3
+version = 4
+
+[codex.providers.input]
+base_url = "https://ai.input.im/v1"
+auth_token_env = "INPUT_API_KEY"
+tags = { billing = "monthly", pool = "input" }
+
+[codex.providers.input1]
+base_url = "https://ai.input1.im/v1"
+auth_token_env = "INPUT1_API_KEY"
+tags = { billing = "monthly", pool = "input" }
+
+[codex.providers.input2]
+base_url = "https://ai.input2.im/v1"
+auth_token_env = "INPUT2_API_KEY"
+tags = { billing = "monthly", pool = "input" }
+
+[codex.providers.codex_for]
+base_url = "https://codex-for.example/v1"
+auth_token_env = "CODEX_FOR_API_KEY"
+tags = { billing = "paygo" }
+
+[codex.routing]
+entry = "monthly_first"
+
+[codex.routing.routes.monthly_pool]
+strategy = "ordered-failover"
+children = ["input", "input1", "input2"]
+
+[codex.routing.routes.monthly_first]
+strategy = "ordered-failover"
+children = ["monthly_pool", "codex_for"]
+```
+
+This keeps the monthly pool as a first-class route node. Temporary 502/429-style failures recover through cooldown and later reprobe. `unknown` balance is not treated as exhausted. Confirmed exhaustion is the only balance signal that can demote a monthly candidate.
+
+### Monthly First By Tag
+
+Use this when the business intent is metadata: prefer every provider tagged `billing=monthly`, then continue to the rest.
+
+```toml
+version = 4
 
 [codex.providers.monthly_a]
 base_url = "https://monthly-a.example/v1"
@@ -149,59 +222,26 @@ auth_token_env = "PAYGO_API_KEY"
 tags = { billing = "paygo" }
 
 [codex.routing]
-policy = "tag-preferred"
+entry = "monthly_first"
+
+[codex.routing.routes.monthly_first]
+strategy = "tag-preferred"
 prefer_tags = [{ billing = "monthly" }]
-order = ["monthly_a", "monthly_b", "paygo"]
+children = ["monthly_a", "monthly_b", "paygo"]
 on_exhausted = "continue"
 ```
 
 Only known fully exhausted monthly candidates are demoted. A balance lookup failure is shown as `unknown` and does not mean exhausted.
-
-### Monthly Pool With Reprobe
-
-Use this when several monthly providers form one preferred pool and a paygo provider is only the fallback of last resort.
-
-```toml
-version = 3
-
-[codex.providers.input]
-base_url = "https://ai.input.im/v1"
-auth_token_env = "INPUT_API_KEY"
-tags = { billing = "monthly", pool = "input" }
-
-[codex.providers.input1]
-base_url = "https://ai.input1.im/v1"
-auth_token_env = "INPUT1_API_KEY"
-tags = { billing = "monthly", pool = "input" }
-
-[codex.providers.input2]
-base_url = "https://ai.input2.im/v1"
-auth_token_env = "INPUT2_API_KEY"
-tags = { billing = "monthly", pool = "input" }
-
-[codex.providers.codex-for]
-base_url = "https://codex-for.example/v1"
-auth_token_env = "CODEX_FOR_API_KEY"
-tags = { billing = "paygo" }
-
-[codex.routing]
-policy = "tag-preferred"
-prefer_tags = [{ billing = "monthly", pool = "input" }]
-order = ["input", "input1", "input2", "codex-for"]
-on_exhausted = "continue"
-```
-
-This keeps the monthly pool first, falls through within the pool when a provider is exhausted or temporarily unhealthy, and still allows the runtime to probe the monthly pool again later. `unknown` balance is not treated as exhausted, and only confirmed exhausted snapshots may demote routing.
 
 ### Monthly Only
 
 Use this when you would rather fail than spill into a paid fallback.
 
 ```toml
-[codex.routing]
-policy = "tag-preferred"
+[codex.routing.routes.monthly_first]
+strategy = "tag-preferred"
 prefer_tags = [{ billing = "monthly" }]
-order = ["monthly_a", "monthly_b", "paygo"]
+children = ["monthly_a", "monthly_b", "paygo"]
 on_exhausted = "stop"
 ```
 
@@ -213,12 +253,15 @@ Use this for debugging, strict vendor selection, or temporary steering.
 
 ```toml
 [codex.routing]
-policy = "manual-sticky"
+entry = "debug_pin"
+
+[codex.routing.routes.debug_pin]
+strategy = "manual-sticky"
 target = "input"
-order = ["input", "openai"]
+children = ["input", "openai"]
 ```
 
-A pinned target is explicit. If it fails, codex-helper does not silently pretend a different provider was selected.
+A pinned target is explicit. If it is disabled, codex-helper rejects the route instead of silently selecting a different provider.
 
 ### Multiple Endpoints For One Provider
 
@@ -243,15 +286,15 @@ tags = { region = "us" }
 
 Do not use endpoints just to model unrelated providers. Put unrelated accounts under separate provider names.
 
-## Routing Policies
+## Route Strategies
 
-| Policy | Best For | UI Mental Model |
+| Strategy | Best For | UI Mental Model |
 | --- | --- | --- |
-| `ordered-failover` | Simple fallback chains | Reorder a provider list |
-| `tag-preferred` | Monthly-first, region-first, vendor-class-first setups | Choose a preferred tag, then order fallback |
-| `manual-sticky` | Debugging or strict manual selection | Pick one active provider |
+| `ordered-failover` | Simple fallback chains and named pools | Reorder child routes/providers |
+| `tag-preferred` | Monthly-first, region-first, vendor-class-first setups | Choose preferred tags, then fallback |
+| `manual-sticky` | Debugging or strict manual selection | Pick one target |
 
-`on_exhausted` controls what happens after the preferred set is known to be depleted:
+`on_exhausted` is currently used by `tag-preferred`:
 
 | Value | Behavior |
 | --- | --- |
@@ -309,7 +352,7 @@ extends = "daily"
 reasoning_effort = "high"
 ```
 
-Legacy profile station bindings are migration-only. New v3 configs should use `[codex.routing]`.
+Legacy profile station bindings are migration-only. New v4 configs should use `[codex.routing]`.
 
 ## Balance Adapters
 
@@ -389,9 +432,10 @@ New API dashboard-style quota:
 
 Important balance behavior:
 
-- Lookup failure is displayed as `unknown`, not `err`, and is not treated as exhausted.
+- Lookup failure is displayed as `unknown`, not exhausted, and does not change route graph config.
 - Known exhausted snapshots can demote automatic routing only when `trust_exhaustion_for_routing = true`.
-- Sub2API subscription-mode `remaining` is a period-limit capacity signal, not a wallet balance. A zero `remaining` means at least one configured subscription window is currently exhausted and may demote routing; quota-limited keys and wallet balances also use zero remaining as exhausted.
+- Sub2API lazy subscription-window zeros are displayed as lazy reset state before a real request refreshes the period; they should not be confused with a durable package design choice.
+- Sub2API subscription-mode `remaining` is a period-limit capacity signal, not a wallet balance. A zero `remaining` means at least one configured subscription window is currently exhausted and may demote routing once trusted.
 - New API quota values are quota units converted with `QuotaPerUnit = 500000`; token usage snapshots with `unlimited_quota = true` are never treated as exhausted.
 - If a provider reports misleading zero balances for active subscriptions, set `trust_exhaustion_for_routing = false`.
 - UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh`.
@@ -458,7 +502,7 @@ codex-helper provider disable input
 codex-helper provider enable input
 ```
 
-Manage routing:
+Manage the entry route from CLI:
 
 ```bash
 codex-helper routing order input openai
@@ -470,6 +514,8 @@ codex-helper routing show
 codex-helper routing explain
 ```
 
+The CLI preserves existing v4 graph structure when it only edits the entry node. Advanced nested graph authoring is still best done in TOML until dedicated route-node commands are added.
+
 Use `--claude` on provider/routing commands when editing the Claude service instead of Codex.
 
 `routing show` reads persisted config. `routing list` and `routing explain` read the compiled runtime candidate view.
@@ -478,27 +524,27 @@ Use `--claude` on provider/routing commands when editing the Claude service inst
 
 TUI and GUI should keep the same mental model as the config file:
 
-- Provider list: names, aliases, enabled state, tags, balance, and fallback order.
-- Routing editor: policy, target, order, preferred tags, and exhaustion behavior.
+- Provider list: names, aliases, enabled state, tags, balance, and expanded fallback order.
+- Routing editor: entry strategy, target, children/order, preferred tags, and exhaustion behavior.
 - Runtime steering: useful for temporary choices, but durable provider intent belongs in `[service.providers]` and `[service.routing]`.
 
 TUI routing editor shortcuts:
 
 - `Enter`: pin selected provider with `manual-sticky`.
-- `a`: switch to `ordered-failover` using the visible order.
-- `[` / `]` or `u` / `d`: move selected provider in `routing.order`.
+- `a`: switch the entry route to `ordered-failover` using the visible order.
+- `[` / `]` or `u` / `d`: move selected provider in the entry route's expanded order.
 - `f`: enable monthly-first tag preference with `prefer_tags = [{ billing = "monthly" }]`.
 - `e`: enable or disable the selected provider.
 - `s`: toggle `on_exhausted` between `continue` and `stop`.
 - `1` / `2` / `0`: set `billing=monthly`, set `billing=paygo`, or clear `billing`.
 
-Advanced multi-endpoint providers, model mappings, and custom balance extraction rules are still best edited with CLI or raw TOML/JSON.
+Advanced multi-endpoint providers, model mappings, custom balance extraction rules, and deeply nested graphs are still best edited with CLI or raw TOML/JSON.
 
 ## Migration
 
-`v0.13.0` treats `version = 3` as the public persisted schema.
+`v0.14.0` treats `version = 4` as the public persisted schema.
 
-On load, legacy `version = 2`, unversioned TOML, and legacy `config.json` are migrated to `config.toml` with `version = 3`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
+On load, legacy `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json` are migrated to `config.toml` with `version = 4`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
 
 Preview migration before starting the proxy:
 
@@ -509,14 +555,16 @@ codex-helper config migrate --write --yes
 
 Migration rules:
 
-- old `active_station` becomes part of the initial routing order;
+- old `active_station` becomes part of the initial route entry;
 - old `level` becomes ordering input only;
-- old station/group members flatten into provider entries and `routing.order`;
+- old station/group members flatten into provider entries and an entry route's `children`;
+- legacy v3 `policy/order/target/prefer_tags` becomes a v4 entry route node;
+- legacy v3 `pool-fallback` becomes nested route nodes;
 - existing provider tags are preserved;
 - business tags such as `billing=monthly` are never guessed;
-- endpoint-scoped station groups may warn because v3 routing is provider-level by default.
+- endpoint-scoped station groups may warn because v4 provider routing is provider-level by default.
 
-After migration, treat provider and routing as the public write surface.
+After migration, treat provider and routing graph as the public write surface.
 
 ## Design Boundaries
 
@@ -527,4 +575,5 @@ codex-helper intentionally avoids:
 - pretending speed-first or cost-first routing is reliable before real measurements exist;
 - keeping `level` as the main user-facing priority control;
 - treating balance lookup failure as provider exhaustion;
-- silently writing legacy station schema from GUI or TUI.
+- silently writing legacy station schema from GUI or TUI;
+- using a special `pool-fallback` syntax when nested route nodes express the same intent more cleanly.

@@ -1,6 +1,6 @@
 # Config V2 Migration Guide (Historical)
 
-> Historical status: this document explains the older v2 station/provider split. The current public CLI no longer targets v2. `codex-helper config migrate` always migrates to the routing-first `version = 3` schema.
+> Historical status: this document explains the older v2 station/provider split. The current public CLI no longer targets v2. `codex-helper config migrate` now migrates through routing-first v3 into the `version = 4` route graph schema.
 
 This guide explains how to move an existing `~/.codex-helper/config.toml` from the legacy `configs` layout to the station/provider-oriented `v2` layout.
 
@@ -47,7 +47,7 @@ codex-helper config init --force
 
 Historical notes:
 
-- `config init` now writes a `version = 3` TOML template.
+- `config init` now writes a `version = 4` TOML route graph template.
 - Existing `version = 2` files can still load and migrate to v3.
 - Existing `v2` files that still use `active_group` / `groups` are accepted on load for migration.
 - Legacy boolean-like values such as `active = "true"` / `active = "false"` are normalized during load when they do not point to a real station name.

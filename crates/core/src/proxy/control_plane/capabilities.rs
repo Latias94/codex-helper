@@ -21,7 +21,7 @@ async fn api_v1_surface_capabilities_for_proxy(
 ) -> crate::dashboard_core::ControlPlaneSurfaceCapabilities {
     let mut surface = api_v1_surface_capabilities();
     let cfg = proxy.config.snapshot().await;
-    if cfg.version == Some(3) {
+    if matches!(cfg.version, Some(3 | 4)) {
         surface.station_persisted_settings = false;
         surface.station_specs = false;
     }

@@ -80,7 +80,7 @@ auth_token_env = "RIGHTCODE_API_KEY"
 }
 
 #[test]
-fn load_config_auto_migrates_unversioned_legacy_toml_to_v3() {
+fn load_config_auto_migrates_unversioned_legacy_toml_to_v4() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -107,14 +107,14 @@ auth_token_env = "RIGHTCODE_API_KEY"
         let cfg = super::load_config()
             .await
             .expect("load unversioned legacy config");
-        assert_eq!(cfg.version, Some(3));
+        assert_eq!(cfg.version, Some(4));
         assert_eq!(
             cfg.codex.active_station().map(|svc| svc.name.as_str()),
             Some("right")
         );
 
         let saved = std::fs::read_to_string(&toml_path).expect("read migrated config.toml");
-        assert!(saved.contains("version = 3"));
+        assert!(saved.contains("version = 4"));
         assert!(saved.contains("[codex.providers.rightcode]"));
         assert!(saved.contains("[codex.routing]"));
         assert!(!saved.contains("[codex.configs.right]"));
@@ -190,7 +190,7 @@ env_key = "RIGHTCODE_API_KEY"
             .await
             .expect("init_config_toml");
         let text = std::fs::read_to_string(&path).expect("read config.toml");
-        assert!(text.contains("version = 3"), "expected v3 template");
+        assert!(text.contains("version = 4"), "expected v4 template");
         assert!(
             text.contains("[codex.providers.right]"),
             "expected imported provider block to be present"
@@ -200,8 +200,8 @@ env_key = "RIGHTCODE_API_KEY"
             "expected imported routing block to be present"
         );
         assert!(
-            text.contains("order = [\"right\"]"),
-            "expected imported routing order to be present"
+            text.contains("children = [\"right\"]"),
+            "expected imported routing children to be present"
         );
         assert!(
             text.contains("\n[retry]\n") && text.contains("profile = \"balanced\""),
@@ -241,7 +241,7 @@ env_key = "RIGHTCODE_API_KEY"
             .await
             .expect("init_config_toml");
         let text = std::fs::read_to_string(&path).expect("read config.toml");
-        assert!(text.contains("version = 3"), "expected v3 template");
+        assert!(text.contains("version = 4"), "expected v4 template");
         assert!(
             !text.contains("\n[codex]\n"),
             "expected no_import to skip inserting a real [codex] block"
@@ -411,10 +411,10 @@ env_key = "RIGHTCODE_API_KEY"
             .filter(|l| !l.trim_start().starts_with('#'))
             .collect::<Vec<_>>()
             .join("\n");
-        let loaded: ProxyConfigV3 =
-            toml::from_str(&text).expect("config.toml should be valid ProxyConfigV3");
-        assert_eq!(loaded.version, 3);
-        let runtime = super::compile_v3_to_runtime(&loaded).expect("compile v3 runtime");
+        let loaded: ProxyConfigV4 =
+            toml::from_str(&text).expect("config.toml should be valid ProxyConfigV4");
+        assert_eq!(loaded.version, 4);
+        let runtime = super::compile_v4_to_runtime(&loaded).expect("compile v4 runtime");
         let svc2 = runtime
             .codex
             .active_station()

@@ -4,7 +4,7 @@ A local relay proxy and operator console for Codex CLI.
 
 codex-helper puts a local proxy between Codex and your upstream providers. It lets you manage multiple relays, keys, balances, request logs, cost estimates, and fallback policies without interrupting the normal Codex workflow.
 
-Current version: `v0.13.0`
+Current development version: `v0.14.0` route graph refactor
 
 中文说明: [README.md](README.md)
 
@@ -26,7 +26,7 @@ It is probably unnecessary if you only use one official account and do not need 
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
 - **Safe Codex patching**: only touches the local proxy fields in `~/.codex/config.toml`; unrelated Codex edits are preserved.
-- **Provider / routing config**: `version = 3` is the default schema. Define providers once, then choose the routing recipe.
+- **Provider / routing config**: `version = 4` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
 - **Failover**: route around failed, unavailable, or trusted-exhausted candidates according to policy.
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Request observability**: provider, model, tokens, cache tokens, TTFB, duration, output rate, retry chain, and estimated cost.
@@ -103,7 +103,7 @@ codex-helper config set-retry-profile balanced
 The resulting `~/.codex-helper/config.toml` stays small:
 
 ```toml
-version = 3
+version = 4
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
@@ -116,9 +116,11 @@ auth_token_env = "OPENAI_API_KEY"
 tags = { billing = "paygo" }
 
 [codex.routing]
-policy = "ordered-failover"
-order = ["input", "openai"]
-on_exhausted = "continue"
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["input", "openai"]
 
 [retry]
 profile = "balanced"
@@ -132,6 +134,7 @@ Common routing policies:
 | Ordered fallback | `codex-helper routing order input openai` | Best default for most users |
 | Monthly first | `codex-helper routing prefer-tag --tag billing=monthly --order input,openai --on-exhausted continue` | Falls back after known exhaustion |
 | Monthly stop-loss | Same command with `--on-exhausted stop` | Avoids silent pay-as-you-go spillover |
+| Monthly pool + paygo fallback | Use nested route nodes in TOML | Keeps `monthly_pool -> paygo` explicit |
 
 For complete config, migration, balance adapters, pricing, and GUI/TUI editing notes, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
@@ -180,7 +183,7 @@ Useful pages:
 - `Sessions`: session identity, effective route, and per-session overrides.
 - `Stats` / `Requests`: tokens, cache tokens, latency, retries, cost, and request logs.
 
-Shortcut hints are shown at the bottom. Under v3 config, durable provider/routing edits should go through the routing page, provider/routing CLI commands, or raw TOML. Press `R` after manual config edits to reload runtime config.
+Shortcut hints are shown at the bottom. Under v4 config, durable provider/routing edits should go through the routing page, provider/routing CLI commands, or raw TOML. Press `R` after manual config edits to reload runtime config.
 
 ### GUI
 

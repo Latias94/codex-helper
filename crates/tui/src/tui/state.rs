@@ -218,12 +218,12 @@ impl Default for UiState {
 }
 
 impl UiState {
-    pub(in crate::tui) fn uses_v3_routing(&self) -> bool {
-        self.config_version == Some(3)
+    pub(in crate::tui) fn uses_route_graph_routing(&self) -> bool {
+        matches!(self.config_version, Some(3 | 4))
     }
 
     pub(in crate::tui) fn station_page_rows_len(&self, legacy_len: usize) -> usize {
-        if self.uses_v3_routing() {
+        if self.uses_route_graph_routing() {
             return self
                 .routing_spec
                 .as_ref()
