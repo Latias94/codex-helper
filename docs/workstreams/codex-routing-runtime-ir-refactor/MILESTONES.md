@@ -68,7 +68,7 @@ Acceptance:
 - [x] Introduce provider endpoint keys alongside station/upstream compatibility
   keys.
 - [x] Associate passive health, cooldown, and balance summaries with candidates.
-- [ ] Keep compatibility reads for v2 and legacy station APIs.
+- [x] Keep compatibility reads for v2 and legacy station APIs.
 - [ ] Define migration behavior for existing in-memory state on config reload.
 
 Acceptance:

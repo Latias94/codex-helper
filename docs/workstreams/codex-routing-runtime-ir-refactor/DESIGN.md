@@ -264,6 +264,11 @@ load-balancer cooldown/usage state, and provider balance summaries through the
 legacy compatibility key. It does not re-key storage or alter request routing
 behavior yet.
 
+For v2 and legacy configs, the synthesized route plan keeps the original station
+name and upstream index as the compatibility key. Existing station-keyed APIs can
+therefore continue to provide runtime state while newer route-aware surfaces read
+the same facts from candidate views.
+
 ## Explainability
 
 The eventual `routing explain` and admin APIs should be able to return:

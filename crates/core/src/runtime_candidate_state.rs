@@ -121,8 +121,11 @@ fn balance_snapshot_matches_candidate(
 mod tests {
     use super::*;
     use crate::balance::BalanceSnapshotStatus;
-    use crate::config::{ProviderConfigV4, ProviderEndpointV4, ServiceViewV4, UpstreamAuth};
-    use crate::routing_ir::compile_v4_route_plan_template;
+    use crate::config::{
+        ProviderConfigV4, ProviderEndpointV4, ServiceConfig, ServiceViewV4, UpstreamAuth,
+        UpstreamConfig,
+    };
+    use crate::routing_ir::{compile_legacy_route_plan_template, compile_v4_route_plan_template};
     use crate::state::{PassiveHealthState, UpstreamHealth};
     use std::collections::BTreeMap;
 
@@ -146,12 +149,13 @@ mod tests {
 
     fn balance_snapshot(
         provider_id: &str,
+        station_name: &str,
         upstream_index: usize,
         exhausted: bool,
     ) -> ProviderBalanceSnapshot {
         ProviderBalanceSnapshot {
             provider_id: provider_id.to_string(),
-            station_name: Some("routing".to_string()),
+            station_name: Some(station_name.to_string()),
             upstream_index: Some(upstream_index),
             source: "test".to_string(),
             fetched_at_ms: 100,
@@ -201,7 +205,7 @@ mod tests {
         )]);
         let provider_balances = HashMap::from([(
             "routing".to_string(),
-            vec![balance_snapshot("input", 0, true)],
+            vec![balance_snapshot("input", "routing", 0, true)],
         )]);
         let inputs = RouteRuntimeSignalInputs {
             station_health: Some(&station_health),
@@ -276,8 +280,8 @@ mod tests {
         let provider_balances = HashMap::from([(
             "routing".to_string(),
             vec![
-                balance_snapshot("input", 0, false),
-                balance_snapshot("input", 1, true),
+                balance_snapshot("input", "routing", 0, false),
+                balance_snapshot("input", "routing", 1, true),
             ],
         )]);
         let load_balancers = HashMap::from([(
@@ -327,5 +331,84 @@ mod tests {
                 .cooldown_remaining_secs,
             Some(30)
         );
+    }
+
+    #[test]
+    fn route_candidate_runtime_signals_keep_legacy_station_compatibility_reads() {
+        let service = ServiceConfig {
+            name: "primary".to_string(),
+            alias: Some("Primary".to_string()),
+            enabled: true,
+            level: 1,
+            upstreams: vec![UpstreamConfig {
+                base_url: "https://legacy.example/v1".to_string(),
+                auth: UpstreamAuth::default(),
+                tags: HashMap::from([
+                    ("provider_id".to_string(), "legacy-provider".to_string()),
+                    ("endpoint_id".to_string(), "legacy-endpoint".to_string()),
+                ]),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        };
+        let template = compile_legacy_route_plan_template("codex", [&service]);
+
+        let station_health = HashMap::from([(
+            "primary".to_string(),
+            StationHealth {
+                checked_at_ms: 100,
+                upstreams: vec![UpstreamHealth {
+                    base_url: "https://legacy.example/v1".to_string(),
+                    passive: Some(passive_health(PassiveHealthState::Degraded, 60)),
+                    ..UpstreamHealth::default()
+                }],
+            },
+        )]);
+        let load_balancers = HashMap::from([(
+            "primary".to_string(),
+            LbConfigView {
+                last_good_index: Some(0),
+                upstreams: vec![LbUpstreamView {
+                    failure_count: 1,
+                    cooldown_remaining_secs: None,
+                    usage_exhausted: false,
+                }],
+            },
+        )]);
+        let provider_balances = HashMap::from([(
+            "primary".to_string(),
+            vec![balance_snapshot("legacy-provider", "primary", 0, false)],
+        )]);
+        let inputs = RouteRuntimeSignalInputs {
+            station_health: Some(&station_health),
+            load_balancers: Some(&load_balancers),
+            provider_balances: Some(&provider_balances),
+            now_ms: 150,
+        };
+
+        let signals = template.candidate_runtime_signal_view(&inputs);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(
+            signals[0].identity.provider_endpoint.stable_key(),
+            "codex/legacy-provider/legacy-endpoint"
+        );
+        assert_eq!(signals[0].identity.legacy.stable_key(), "codex/primary/0");
+        assert_eq!(
+            signals[0]
+                .passive_health
+                .as_ref()
+                .map(|health| health.state),
+            Some(PassiveHealthState::Degraded)
+        );
+        assert_eq!(
+            signals[0]
+                .load_balancer
+                .as_ref()
+                .map(|view| view.failure_count),
+            Some(1)
+        );
+        assert_eq!(signals[0].balance.ok, 1);
+        assert_eq!(signals[0].balance.routing_snapshots, 1);
     }
 }
