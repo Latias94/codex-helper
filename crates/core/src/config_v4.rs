@@ -879,10 +879,12 @@ pub mod legacy {
         let mut routes = BTreeMap::new();
         let entry = "main".to_string();
 
-        let mut root = RoutingNodeV4::default();
-        root.on_exhausted = match routing.on_exhausted {
-            RoutingExhaustedActionV3Legacy::Continue => RoutingExhaustedActionV4::Continue,
-            RoutingExhaustedActionV3Legacy::Stop => RoutingExhaustedActionV4::Stop,
+        let mut root = RoutingNodeV4 {
+            on_exhausted: match routing.on_exhausted {
+                RoutingExhaustedActionV3Legacy::Continue => RoutingExhaustedActionV4::Continue,
+                RoutingExhaustedActionV3Legacy::Stop => RoutingExhaustedActionV4::Stop,
+            },
+            ..RoutingNodeV4::default()
         };
 
         match routing.policy {

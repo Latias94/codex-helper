@@ -10,9 +10,9 @@ use tokio::fs;
 
 #[derive(Debug, Clone)]
 pub(super) enum ConfigDocument {
-    Legacy(ProxyConfig),
-    V2(ProxyConfigV2),
-    V4(ProxyConfigV4),
+    Legacy(Box<ProxyConfig>),
+    V2(Box<ProxyConfigV2>),
+    V4(Box<ProxyConfigV4>),
 }
 
 impl ConfigDocument {
@@ -26,7 +26,7 @@ impl ConfigDocument {
 
     pub(super) fn runtime(&self) -> anyhow::Result<ProxyConfig> {
         match self {
-            Self::Legacy(cfg) => Ok(cfg.clone()),
+            Self::Legacy(cfg) => Ok((**cfg).clone()),
             Self::V2(cfg) => compile_v2_to_runtime(cfg),
             Self::V4(cfg) => compile_v4_to_runtime(cfg),
         }
@@ -37,7 +37,7 @@ impl ConfigDocument {
             Self::Legacy(cfg) => migrate_legacy_to_v4_with_report(cfg),
             Self::V2(cfg) => migrate_v2_to_v4_with_report(cfg),
             Self::V4(cfg) => Ok(ConfigV4MigrationReport {
-                config: cfg.clone(),
+                config: (**cfg).clone(),
                 warnings: Vec::new(),
             }),
         }
@@ -68,7 +68,7 @@ pub(super) async fn resolve_service(codex: bool, claude: bool) -> anyhow::Result
 pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
     let path = config_file_path();
     if !path.exists() {
-        return Ok(ConfigDocument::Legacy(load_config().await?));
+        return Ok(ConfigDocument::Legacy(Box::new(load_config().await?)));
     }
 
     let is_toml = path
@@ -76,7 +76,7 @@ pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
     if !is_toml {
-        return Ok(ConfigDocument::Legacy(load_config().await?));
+        return Ok(ConfigDocument::Legacy(Box::new(load_config().await?)));
     }
 
     let text = fs::read_to_string(&path).await?;
@@ -112,20 +112,20 @@ pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
         let mut cfg = toml::from_str::<ProxyConfigV4>(&text)?;
         cfg.sync_routing_compat_from_graph();
         compile_v4_to_runtime(&cfg)?;
-        Ok(ConfigDocument::V4(cfg))
+        Ok(ConfigDocument::V4(Box::new(cfg)))
     } else if version == Some(3) {
         let legacy = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(&text)?;
         let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&legacy)?;
         let mut cfg = migrated.config;
         cfg.sync_routing_compat_from_graph();
         compile_v4_to_runtime(&cfg)?;
-        Ok(ConfigDocument::V4(cfg))
+        Ok(ConfigDocument::V4(Box::new(cfg)))
     } else if version == Some(2) {
         let cfg = toml::from_str::<ProxyConfigV2>(&text)?;
         compile_v2_to_runtime(&cfg)?;
-        Ok(ConfigDocument::V2(cfg))
+        Ok(ConfigDocument::V2(Box::new(cfg)))
     } else {
-        Ok(ConfigDocument::Legacy(load_config().await?))
+        Ok(ConfigDocument::Legacy(Box::new(load_config().await?)))
     }
 }
 
@@ -147,7 +147,7 @@ pub(super) async fn load_v4_config(
     } else {
         "Codex"
     };
-    Ok((cfg, service, label))
+    Ok((*cfg, service, label))
 }
 
 pub(super) fn select_service_manager<'a>(

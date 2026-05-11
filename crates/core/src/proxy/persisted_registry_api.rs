@@ -776,7 +776,7 @@ fn ensure_v4_entry_route_mut(
 ) -> &mut crate::config::RoutingNodeV4 {
     let routing = view
         .routing
-        .get_or_insert_with(|| crate::config::RoutingConfigV4::default());
+        .get_or_insert_with(crate::config::RoutingConfigV4::default);
     if !routing.routes.contains_key(routing.entry.as_str()) {
         routing.routes.insert(
             routing.entry.clone(),

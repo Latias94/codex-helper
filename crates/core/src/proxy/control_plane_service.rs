@@ -52,8 +52,8 @@ pub(super) fn service_view_v4_mut<'a>(
 }
 
 pub(super) enum PersistedProxySettingsDocument {
-    V2(ProxyConfigV2),
-    V4(ProxyConfigV4),
+    V2(Box<ProxyConfigV2>),
+    V4(Box<ProxyConfigV4>),
 }
 
 pub(super) async fn prune_runtime_observability_after_reload(proxy: &ProxyService) {
@@ -140,7 +140,7 @@ pub(super) async fn load_persisted_proxy_settings_document()
                 cfg.sync_routing_compat_from_graph();
                 crate::config::compile_v4_to_runtime(&cfg)
                     .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-                return Ok(PersistedProxySettingsDocument::V4(cfg));
+                return Ok(PersistedProxySettingsDocument::V4(Box::new(cfg)));
             }
             Some(3) => {
                 let legacy = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(&text)
@@ -151,14 +151,14 @@ pub(super) async fn load_persisted_proxy_settings_document()
                 cfg.sync_routing_compat_from_graph();
                 crate::config::compile_v4_to_runtime(&cfg)
                     .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-                return Ok(PersistedProxySettingsDocument::V4(cfg));
+                return Ok(PersistedProxySettingsDocument::V4(Box::new(cfg)));
             }
             Some(2) => {
                 let cfg = toml::from_str::<ProxyConfigV2>(&text)
                     .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
                 crate::config::compile_v2_to_runtime(&cfg)
                     .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-                return Ok(PersistedProxySettingsDocument::V2(cfg));
+                return Ok(PersistedProxySettingsDocument::V2(Box::new(cfg)));
             }
             _ => {}
         }
@@ -169,13 +169,13 @@ pub(super) async fn load_persisted_proxy_settings_document()
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     let cfg = crate::config::compact_v2_config(&crate::config::migrate_legacy_to_v2(&runtime))
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    Ok(PersistedProxySettingsDocument::V2(cfg))
+    Ok(PersistedProxySettingsDocument::V2(Box::new(cfg)))
 }
 
 pub(super) async fn load_persisted_proxy_settings_v2() -> Result<ProxyConfigV2, (StatusCode, String)>
 {
     match load_persisted_proxy_settings_document().await? {
-        PersistedProxySettingsDocument::V2(cfg) => Ok(cfg),
+        PersistedProxySettingsDocument::V2(cfg) => Ok(*cfg),
         PersistedProxySettingsDocument::V4(cfg) => {
             let v2 = crate::config::compile_v4_to_v2(&cfg)
                 .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
