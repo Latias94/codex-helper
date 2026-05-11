@@ -269,6 +269,13 @@ name and upstream index as the compatibility key. Existing station-keyed APIs ca
 therefore continue to provide runtime state while newer route-aware surfaces read
 the same facts from candidate views.
 
+Config reload migration is defined over provider endpoint identity plus
+`base_url`. Runtime state may be retained when `service / provider_id /
+endpoint_id` and `base_url` are unchanged, even if the compatibility
+station/upstream index changed. If the provider endpoint disappears or keeps the
+same key but changes `base_url`, its runtime state must be dropped and rebuilt
+from fresh observations.
+
 ## Explainability
 
 The eventual `routing explain` and admin APIs should be able to return:
