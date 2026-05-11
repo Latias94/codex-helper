@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
+### 文档 / Documentation
+
+- 补充月包 provider 池与 paygo 兜底的路由配置说明，明确 `unknown` 余额不等于耗尽，临时故障应通过 cooldown 和后续回探恢复。
+  Added routing guidance for monthly provider pools with paygo fallback, clarifying that `unknown` balance is not exhaustion and temporary failures should recover through cooldown and later reprobe.
+
 ### 修复 / Fixed
 
 - TUI 对 Sub2API 订阅窗口懒刷新返回的零额度改为显示 `lazy reset`，避免把待实际请求触发刷新前的套餐窗口误判为确定耗尽。

@@ -143,6 +143,36 @@ Evaluation:
 - very clear failure mode;
 - should be an advanced option, not the default.
 
+## Reference Model Takeaways
+
+This design follows the same broad separation used by mature routing systems:
+
+- [LiteLLM routing](https://docs.litellm.ai/docs/routing): keep deployment groups and fallback order explicit instead of hiding provider selection inside one API key.
+- [Portkey conditional routing](https://portkey.ai/docs/product/ai-gateway/conditional-routing): make route conditions and fallback chains visible to operators.
+- [OpenRouter provider routing](https://openrouter.ai/docs/features/provider-routing): expose provider order and fallback behavior as user-authored policy.
+- [Envoy outlier detection](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier): treat passive health, temporary ejection, cooldown, and later recovery as runtime state rather than permanent route rewrites.
+
+The local implication is that `routing.order`, `prefer_tags`, balance exhaustion, cooldown, and reprobe should remain separate concepts even when the common user story is simply “use monthly first, then paygo”.
+
+## Pool, Health, And Reprobe
+
+The current `routing` block can already express a simple ordered fallback chain or a tag-first preference. That is enough for many users, but it is not yet the full mental model for monthly quota providers that may:
+
+- report `unknown` before balance metadata is refreshed;
+- return temporary transport failures such as `502` or `429`;
+- become usable again later without a config rewrite;
+- need a paygo fallback only after the monthly pool is truly unavailable.
+
+For that class of setups, the next semantic layer should treat the preferred monthly providers as a pool or workstream, not as a permanently demoted entry in a flat list. The important distinctions are:
+
+- `unknown` is not exhausted;
+- confirmed exhaustion can demote routing;
+- temporary failure can trigger cooldown or ejection;
+- cooldown must not be permanent;
+- reprobe should eventually let the provider back into the preferred pool.
+
+This is a runtime behavior model first and a syntax question second. If we later introduce a first-class `workstreams` or `pools` authoring shape, it should compile into the same runtime routing model, but keep these state transitions explicit instead of hiding them inside `order`.
+
 ## Self-Evaluation
 
 | Policy | Readability | UI Ease | Migration Cost | Safety | Recommendation |

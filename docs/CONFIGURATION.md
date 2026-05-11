@@ -157,6 +157,42 @@ on_exhausted = "continue"
 
 Only known fully exhausted monthly candidates are demoted. A balance lookup failure is shown as `unknown` and does not mean exhausted.
 
+### Monthly Pool With Reprobe
+
+Use this when several monthly providers form one preferred pool and a paygo provider is only the fallback of last resort.
+
+```toml
+version = 3
+
+[codex.providers.input]
+base_url = "https://ai.input.im/v1"
+auth_token_env = "INPUT_API_KEY"
+tags = { billing = "monthly", pool = "input" }
+
+[codex.providers.input1]
+base_url = "https://ai.input1.im/v1"
+auth_token_env = "INPUT1_API_KEY"
+tags = { billing = "monthly", pool = "input" }
+
+[codex.providers.input2]
+base_url = "https://ai.input2.im/v1"
+auth_token_env = "INPUT2_API_KEY"
+tags = { billing = "monthly", pool = "input" }
+
+[codex.providers.codex-for]
+base_url = "https://codex-for.example/v1"
+auth_token_env = "CODEX_FOR_API_KEY"
+tags = { billing = "paygo" }
+
+[codex.routing]
+policy = "tag-preferred"
+prefer_tags = [{ billing = "monthly", pool = "input" }]
+order = ["input", "input1", "input2", "codex-for"]
+on_exhausted = "continue"
+```
+
+This keeps the monthly pool first, falls through within the pool when a provider is exhausted or temporarily unhealthy, and still allows the runtime to probe the monthly pool again later. `unknown` balance is not treated as exhausted, and only confirmed exhausted snapshots may demote routing.
+
 ### Monthly Only
 
 Use this when you would rather fail than spill into a paid fallback.
