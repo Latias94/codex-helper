@@ -7,8 +7,8 @@ use crate::lb::{LoadBalancer, SelectedUpstream};
 use crate::logging::log_retry_trace;
 use crate::model_routing;
 use crate::routing_ir::{
-    RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState, RoutePlanSkipReason,
-    RoutePlanStationRuntimeState, RoutePlanUpstreamRuntimeState,
+    RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState,
+    RoutePlanSkipReason, RoutePlanStationRuntimeState, RoutePlanUpstreamRuntimeState,
     compile_legacy_route_plan_template,
 };
 
@@ -19,6 +19,8 @@ pub(super) struct RouteExecutorShadowAttempt {
     pub(super) upstream_index: usize,
     pub(super) upstream_base_url: String,
     pub(super) provider_id: Option<String>,
+    pub(super) endpoint_id: Option<String>,
+    pub(super) route_path: Vec<String>,
     pub(super) avoid_for_station: Vec<usize>,
     pub(super) avoided_total: usize,
     pub(super) total_upstreams: usize,
@@ -105,6 +107,7 @@ fn executor_shadow_attempts(
             shadow_attempt(
                 "skipped_capability_mismatch",
                 &skipped.selected_upstream,
+                ShadowRouteMetadata::from_candidate(skipped.candidate),
                 skipped.avoid_for_station,
                 skipped.avoided_total,
                 skipped.total_upstreams,
@@ -118,6 +121,7 @@ fn executor_shadow_attempts(
         attempts.push(shadow_attempt(
             "selected",
             &selected.selected_upstream,
+            ShadowRouteMetadata::from_candidate(selected.candidate),
             selection.avoid_for_station,
             selection.avoided_total,
             selection.total_upstreams,
@@ -207,6 +211,7 @@ fn legacy_shadow_attempts(
                 attempts.push(shadow_attempt(
                     "skipped_capability_mismatch",
                     &selected,
+                    ShadowRouteMetadata::from_legacy_selected(&selected),
                     sorted_avoid_set(&avoid),
                     avoided_total,
                     total_upstreams,
@@ -218,6 +223,7 @@ fn legacy_shadow_attempts(
             attempts.push(shadow_attempt(
                 "selected",
                 &selected,
+                ShadowRouteMetadata::from_legacy_selected(&selected),
                 sorted_avoid_set(&avoid),
                 avoided_total,
                 total_upstreams,
@@ -232,6 +238,50 @@ fn legacy_shadow_attempts(
     attempts
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShadowRouteMetadata {
+    endpoint_id: Option<String>,
+    route_path: Vec<String>,
+}
+
+impl ShadowRouteMetadata {
+    fn from_candidate(candidate: &RouteCandidate) -> Self {
+        Self {
+            endpoint_id: Some(candidate.endpoint_id.clone()),
+            route_path: candidate.route_path.clone(),
+        }
+    }
+
+    fn from_legacy_selected(selected: &SelectedUpstream) -> Self {
+        Self {
+            endpoint_id: Some(legacy_selected_endpoint_id(selected)),
+            route_path: vec![
+                "legacy".to_string(),
+                selected.station_name.clone(),
+                legacy_selected_provider_id(selected),
+            ],
+        }
+    }
+}
+
+fn legacy_selected_provider_id(selected: &SelectedUpstream) -> String {
+    selected
+        .upstream
+        .tags
+        .get("provider_id")
+        .cloned()
+        .unwrap_or_else(|| format!("{}#{}", selected.station_name, selected.index))
+}
+
+fn legacy_selected_endpoint_id(selected: &SelectedUpstream) -> String {
+    selected
+        .upstream
+        .tags
+        .get("endpoint_id")
+        .cloned()
+        .unwrap_or_else(|| selected.index.to_string())
+}
+
 fn clone_load_balancer_with_state_snapshot(lb: &LoadBalancer) -> LoadBalancer {
     let state_snapshot = match lb.states.lock() {
         Ok(states) => states.clone(),
@@ -243,6 +293,7 @@ fn clone_load_balancer_with_state_snapshot(lb: &LoadBalancer) -> LoadBalancer {
 fn shadow_attempt(
     decision: &'static str,
     selected: &SelectedUpstream,
+    route_metadata: ShadowRouteMetadata,
     avoid_for_station: Vec<usize>,
     avoided_total: usize,
     total_upstreams: usize,
@@ -254,6 +305,8 @@ fn shadow_attempt(
         upstream_index: selected.index,
         upstream_base_url: selected.upstream.base_url.clone(),
         provider_id: selected.upstream.tags.get("provider_id").cloned(),
+        endpoint_id: route_metadata.endpoint_id,
+        route_path: route_metadata.route_path,
         avoid_for_station,
         avoided_total,
         total_upstreams,
@@ -334,6 +387,16 @@ mod tests {
         );
         assert_eq!(report.executor_attempts[0].avoid_for_station, vec![0]);
         assert_eq!(report.executor_attempts[1].avoid_for_station, vec![0]);
+        assert_eq!(report.executor_attempts[0].station_name, "routing");
+        assert_eq!(report.executor_attempts[0].upstream_index, 0);
+        assert_eq!(
+            report.executor_attempts[0].endpoint_id.as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            report.executor_attempts[0].route_path,
+            vec!["legacy", "routing", "old"]
+        );
     }
 
     #[test]

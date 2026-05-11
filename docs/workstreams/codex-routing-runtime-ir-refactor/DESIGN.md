@@ -184,6 +184,11 @@ legacy `LbState`. This preserves current dry-run selection semantics for
 unsupported-model skips, and multi-station failover without mutating the live
 load-balancer state or changing production request execution.
 
+Shadow attempt records keep the legacy `station_name` and `upstream_index`
+fields as the compatibility contract, and add route metadata such as
+`endpoint_id` and `route_path` for internal parity checks and future explain
+surfaces.
+
 ## First Phase No-Behavior-Change Contract
 
 Phase 1 must not change:

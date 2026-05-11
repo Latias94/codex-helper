@@ -51,7 +51,7 @@ Acceptance:
 - [x] Add structured control-trace detail for route executor shadow mismatches.
 - [x] Preserve current retry, cooldown, unsupported-model skip, and failover
   semantics.
-- [ ] Keep legacy station/upstream log fields while adding route metadata
+- [x] Keep legacy station/upstream log fields while adding route metadata
   internally.
 - [ ] Port or duplicate request-path failover tests to prove route executor
   parity once the executor is ready to drive attempts.
