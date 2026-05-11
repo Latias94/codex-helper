@@ -238,6 +238,11 @@ service / station_name / upstream_index
 This keeps existing logs and state maps usable while allowing future health and
 balance state to move to provider endpoint keys.
 
+P3 starts by materializing this as `ProviderEndpointKey`,
+`LegacyUpstreamKey`, and `RuntimeUpstreamIdentity`. Each route candidate can now
+report both its future provider-endpoint identity and its current compatibility
+station/upstream identity before runtime state is re-keyed.
+
 ## Runtime Signal Layers
 
 Route planning should keep these layers separate:

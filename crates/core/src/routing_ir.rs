@@ -8,6 +8,7 @@ use crate::config::{
 };
 use crate::lb::SelectedUpstream;
 use crate::model_routing;
+use crate::runtime_identity::{LegacyUpstreamKey, ProviderEndpointKey, RuntimeUpstreamIdentity};
 
 const V4_COMPATIBILITY_STATION_NAME: &str = "routing";
 
@@ -19,6 +20,31 @@ pub struct RoutePlanTemplate {
     pub expanded_provider_order: Vec<String>,
     pub candidates: Vec<RouteCandidate>,
     pub compatibility_station_name: Option<String>,
+}
+
+impl RoutePlanTemplate {
+    pub fn candidate_identity(&self, candidate: &RouteCandidate) -> RuntimeUpstreamIdentity {
+        RuntimeUpstreamIdentity::new(
+            ProviderEndpointKey::new(
+                self.service_name.clone(),
+                candidate.provider_id.clone(),
+                candidate.endpoint_id.clone(),
+            ),
+            LegacyUpstreamKey::new(
+                self.service_name.clone(),
+                candidate_compatibility_station_name(self, candidate),
+                candidate_compatibility_upstream_index(candidate),
+            ),
+            candidate.base_url.clone(),
+        )
+    }
+
+    pub fn candidate_identities(&self) -> Vec<RuntimeUpstreamIdentity> {
+        self.candidates
+            .iter()
+            .map(|candidate| self.candidate_identity(candidate))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,14 +291,8 @@ impl<'a> RoutePlanExecutor<'a> {
 
     pub fn selected_upstream_for_candidate(&self, candidate: &RouteCandidate) -> SelectedUpstream {
         SelectedUpstream {
-            station_name: candidate
-                .compatibility_station_name
-                .clone()
-                .or_else(|| self.template.compatibility_station_name.clone())
-                .unwrap_or_else(|| self.template.service_name.clone()),
-            index: candidate
-                .compatibility_upstream_index
-                .unwrap_or(candidate.stable_index),
+            station_name: candidate_compatibility_station_name(self.template, candidate),
+            index: candidate_compatibility_upstream_index(candidate),
             upstream: candidate.to_upstream_config(),
         }
     }
@@ -282,7 +302,7 @@ impl<'a> RoutePlanExecutor<'a> {
         state: &RoutePlanAttemptState,
     ) -> Option<&'a RouteCandidate> {
         self.template.candidates.iter().find(|candidate| {
-            let station_name = self.candidate_compatibility_station_name(candidate);
+            let station_name = candidate_compatibility_station_name(self.template, candidate);
             !state.avoids_upstream(
                 station_name.as_str(),
                 candidate_compatibility_upstream_index(candidate),
@@ -293,20 +313,12 @@ impl<'a> RoutePlanExecutor<'a> {
     fn candidates_exhausted(&self, state: &RoutePlanAttemptState) -> bool {
         !self.template.candidates.is_empty()
             && self.template.candidates.iter().all(|candidate| {
-                let station_name = self.candidate_compatibility_station_name(candidate);
+                let station_name = candidate_compatibility_station_name(self.template, candidate);
                 state.avoids_upstream(
                     station_name.as_str(),
                     candidate_compatibility_upstream_index(candidate),
                 )
             })
-    }
-
-    fn candidate_compatibility_station_name(&self, candidate: &RouteCandidate) -> String {
-        candidate
-            .compatibility_station_name
-            .clone()
-            .or_else(|| self.template.compatibility_station_name.clone())
-            .unwrap_or_else(|| self.template.service_name.clone())
     }
 }
 
@@ -912,6 +924,17 @@ fn candidate_compatibility_upstream_index(candidate: &RouteCandidate) -> usize {
         .unwrap_or(candidate.stable_index)
 }
 
+fn candidate_compatibility_station_name(
+    template: &RoutePlanTemplate,
+    candidate: &RouteCandidate,
+) -> String {
+    candidate
+        .compatibility_station_name
+        .clone()
+        .or_else(|| template.compatibility_station_name.clone())
+        .unwrap_or_else(|| template.service_name.clone())
+}
+
 fn candidate_supports_model(candidate: &RouteCandidate, requested_model: &str) -> bool {
     model_routing::is_model_supported(
         &btree_bool_map_to_hash_map(&candidate.supported_models),
@@ -979,6 +1002,22 @@ mod tests {
             .candidates
             .iter()
             .map(|candidate| candidate.provider_id.clone())
+            .collect()
+    }
+
+    fn provider_endpoint_keys(template: &RoutePlanTemplate) -> Vec<String> {
+        template
+            .candidate_identities()
+            .into_iter()
+            .map(|identity| identity.provider_endpoint.stable_key())
+            .collect()
+    }
+
+    fn legacy_upstream_keys(template: &RoutePlanTemplate) -> Vec<String> {
+        template
+            .candidate_identities()
+            .into_iter()
+            .map(|identity| identity.legacy.stable_key())
             .collect()
     }
 
@@ -1238,6 +1277,28 @@ mod tests {
     }
 
     #[test]
+    fn routing_ir_v4_candidate_identity_retains_provider_endpoint_and_legacy_key() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                provider("https://input.example/v1"),
+            )]),
+            ..ServiceViewV4::default()
+        };
+
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let identities = template.candidate_identities();
+
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            identities[0].provider_endpoint.stable_key(),
+            "codex/input/default"
+        );
+        assert_eq!(identities[0].legacy.stable_key(), "codex/routing/0");
+        assert_eq!(identities[0].base_url, "https://input.example/v1");
+    }
+
+    #[test]
     fn routing_ir_ordered_failover_matches_resolved_order() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([
@@ -1447,6 +1508,14 @@ mod tests {
         assert_eq!(template.candidates[0].endpoint_id, "fast");
         assert_eq!(template.candidates[1].endpoint_id, "slow");
         assert_eq!(
+            provider_endpoint_keys(&template),
+            vec!["codex/input/fast", "codex/input/slow"]
+        );
+        assert_eq!(
+            legacy_upstream_keys(&template),
+            vec!["codex/routing/0", "codex/routing/1"]
+        );
+        assert_eq!(
             template.candidates[0]
                 .tags
                 .get("billing")
@@ -1475,6 +1544,34 @@ mod tests {
             template.candidates[1].supported_models.get("gpt-4.1"),
             Some(&true)
         );
+    }
+
+    #[test]
+    fn routing_ir_legacy_template_identity_uses_tagged_provider_and_station_index() {
+        let service = ServiceConfig {
+            name: "legacy-station".to_string(),
+            alias: None,
+            enabled: true,
+            level: 1,
+            upstreams: vec![UpstreamConfig {
+                base_url: "https://legacy.example/v1".to_string(),
+                auth: UpstreamAuth::default(),
+                tags: HashMap::from([("provider_id".to_string(), "tagged".to_string())]),
+                supported_models: HashMap::new(),
+                model_mapping: HashMap::new(),
+            }],
+        };
+
+        let template = compile_legacy_route_plan_template("codex", [&service]);
+        let identities = template.candidate_identities();
+
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            identities[0].provider_endpoint.stable_key(),
+            "codex/tagged/0"
+        );
+        assert_eq!(identities[0].legacy.stable_key(), "codex/legacy-station/0");
+        assert_eq!(identities[0].base_url, "https://legacy.example/v1");
     }
 
     #[test]

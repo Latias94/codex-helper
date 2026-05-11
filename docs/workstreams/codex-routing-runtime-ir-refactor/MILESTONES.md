@@ -65,7 +65,7 @@ Acceptance:
 
 ## P3 - Runtime State Re-Keying
 
-- [ ] Introduce provider endpoint keys alongside station/upstream compatibility
+- [x] Introduce provider endpoint keys alongside station/upstream compatibility
   keys.
 - [ ] Associate passive health, cooldown, and balance summaries with candidates.
 - [ ] Keep compatibility reads for v2 and legacy station APIs.
