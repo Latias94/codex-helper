@@ -350,6 +350,75 @@ impl<'a> RoutePlanExecutor<'a> {
         }
     }
 
+    pub fn select_supported_station_candidate_with_runtime_state(
+        &self,
+        state: &mut RoutePlanAttemptState,
+        runtime: &RoutePlanRuntimeState,
+        station_name: &str,
+        request_model: Option<&str>,
+    ) -> RoutePlanAttemptSelection<'_> {
+        let total_upstreams = self.template.candidates.len();
+        let mut skipped = Vec::new();
+
+        loop {
+            if state.station_exhausted_for(station_name, self.station_candidate_count(station_name))
+            {
+                return RoutePlanAttemptSelection {
+                    selected: None,
+                    skipped,
+                    avoid_for_station: state.avoid_for_station_name(station_name),
+                    avoided_total: state.avoided_total(),
+                    total_upstreams,
+                };
+            }
+
+            let Some(candidate) =
+                self.next_unavoided_station_candidate(state, runtime, station_name)
+            else {
+                return RoutePlanAttemptSelection {
+                    selected: None,
+                    skipped,
+                    avoid_for_station: state.avoid_for_station_name(station_name),
+                    avoided_total: state.avoided_total(),
+                    total_upstreams,
+                };
+            };
+            let selected_upstream = self.selected_upstream_for_candidate(candidate);
+
+            if let Some(requested_model) = request_model
+                && !candidate_supports_model(candidate, requested_model)
+            {
+                state.avoid_selected_upstream(&selected_upstream);
+                let avoid_for_station =
+                    state.avoid_for_station_name(selected_upstream.station_name.as_str());
+                skipped.push(SkippedRouteCandidate {
+                    candidate,
+                    selected_upstream,
+                    reason: RoutePlanSkipReason::UnsupportedModel {
+                        requested_model: requested_model.to_string(),
+                    },
+                    avoid_for_station,
+                    avoided_total: state.avoided_total(),
+                    total_upstreams,
+                });
+                continue;
+            }
+
+            let avoid_for_station =
+                state.avoid_for_station_name(selected_upstream.station_name.as_str());
+            return RoutePlanAttemptSelection {
+                selected: Some(SelectedRouteCandidate {
+                    candidate,
+                    selected_upstream,
+                }),
+                skipped,
+                avoid_for_station,
+                avoided_total: state.avoided_total(),
+                total_upstreams,
+            };
+        }
+    }
+
     pub fn selected_upstream_for_candidate(&self, candidate: &RouteCandidate) -> SelectedUpstream {
         SelectedUpstream {
             station_name: candidate_compatibility_station_name(self.template, candidate),

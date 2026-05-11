@@ -25,7 +25,7 @@ pub async fn handle_proxy(
 
     let prepared = prepare_proxy_request(&proxy, req, &start, started_at_ms).await?;
     log_retry_options(proxy.service_name, prepared.request_id, &prepared.plan);
-    let provider_execution = execute_provider_chain(ExecuteProviderChainParams {
+    let provider_chain_params = ExecuteProviderChainParams {
         proxy: &proxy,
         lbs: &prepared.lbs,
         method: &prepared.method,
@@ -58,8 +58,18 @@ pub async fn handle_proxy(
         client_body_warn: prepared.client_body_warn.as_ref(),
         plan: &prepared.plan,
         cooldown_backoff: prepared.cooldown_backoff,
-    })
-    .await;
+    };
+    #[cfg(test)]
+    let provider_execution = if super::provider_execution::route_executor_request_path_test_enabled(
+        &prepared.client_headers,
+    ) {
+        super::provider_execution::execute_provider_chain_with_route_executor(provider_chain_params)
+            .await
+    } else {
+        execute_provider_chain(provider_chain_params).await
+    };
+    #[cfg(not(test))]
+    let provider_execution = execute_provider_chain(provider_chain_params).await;
     let (upstream_chain, route_attempts, last_err) = match provider_execution {
         ProviderExecutionOutcome::Return(response) => return Ok(response),
         ProviderExecutionOutcome::Exhausted(state) => {

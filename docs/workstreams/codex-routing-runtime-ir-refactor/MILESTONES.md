@@ -53,7 +53,7 @@ Acceptance:
   semantics.
 - [x] Keep legacy station/upstream log fields while adding route metadata
   internally.
-- [ ] Port or duplicate request-path failover tests to prove route executor
+- [x] Port or duplicate request-path failover tests to prove route executor
   parity once the executor is ready to drive attempts.
 
 Acceptance:
