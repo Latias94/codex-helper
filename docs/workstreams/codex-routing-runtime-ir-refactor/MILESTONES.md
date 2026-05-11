@@ -37,13 +37,15 @@ Acceptance:
 
 ## P2 - RoutePlanExecutor Parity
 
-- [ ] Add a `RoutePlanExecutor` that can iterate `RouteCandidate` values.
-- [ ] Map each candidate to the existing upstream request execution setup.
+- [x] Add a read-only `RoutePlanExecutor` that can iterate `RouteCandidate`
+  values without driving production routing.
+- [x] Map each candidate to the existing `SelectedUpstream` compatibility shape.
 - [ ] Preserve current retry, cooldown, unsupported-model skip, and failover
   semantics.
 - [ ] Keep legacy station/upstream log fields while adding route metadata
   internally.
-- [ ] Port or duplicate failover tests to prove route executor parity.
+- [ ] Port or duplicate request-path failover tests to prove route executor
+  parity once the executor is ready to drive attempts.
 
 Acceptance:
 

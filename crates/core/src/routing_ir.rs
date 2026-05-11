@@ -1,11 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 
 use crate::config::{
     ProviderConfigV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4,
-    ServiceViewV4, UpstreamAuth, effective_v4_routing,
+    ServiceViewV4, UpstreamAuth, UpstreamConfig, effective_v4_routing,
 };
+use crate::lb::SelectedUpstream;
 
 const V4_COMPATIBILITY_STATION_NAME: &str = "routing";
 
@@ -58,6 +59,62 @@ pub struct RouteCandidate {
     pub stable_index: usize,
     pub compatibility_station_name: Option<String>,
     pub compatibility_upstream_index: Option<usize>,
+}
+
+impl RouteCandidate {
+    pub fn to_upstream_config(&self) -> UpstreamConfig {
+        UpstreamConfig {
+            base_url: self.base_url.clone(),
+            auth: self.auth.clone(),
+            tags: btree_string_map_to_hash_map(&self.tags),
+            supported_models: btree_bool_map_to_hash_map(&self.supported_models),
+            model_mapping: btree_string_map_to_hash_map(&self.model_mapping),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedRouteCandidate<'a> {
+    pub candidate: &'a RouteCandidate,
+    pub selected_upstream: SelectedUpstream,
+}
+
+pub struct RoutePlanExecutor<'a> {
+    template: &'a RoutePlanTemplate,
+}
+
+impl<'a> RoutePlanExecutor<'a> {
+    pub fn new(template: &'a RoutePlanTemplate) -> Self {
+        Self { template }
+    }
+
+    pub fn iter_candidates(&self) -> impl Iterator<Item = &RouteCandidate> + '_ {
+        self.template.candidates.iter()
+    }
+
+    pub fn iter_selected_upstreams(&self) -> impl Iterator<Item = SelectedRouteCandidate<'_>> + '_ {
+        self.template
+            .candidates
+            .iter()
+            .map(|candidate| SelectedRouteCandidate {
+                candidate,
+                selected_upstream: self.selected_upstream_for_candidate(candidate),
+            })
+    }
+
+    pub fn selected_upstream_for_candidate(&self, candidate: &RouteCandidate) -> SelectedUpstream {
+        SelectedUpstream {
+            station_name: candidate
+                .compatibility_station_name
+                .clone()
+                .or_else(|| self.template.compatibility_station_name.clone())
+                .unwrap_or_else(|| self.template.service_name.clone()),
+            index: candidate
+                .compatibility_upstream_index
+                .unwrap_or(candidate.stable_index),
+            upstream: candidate.to_upstream_config(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -599,13 +656,30 @@ fn merge_bool_maps(
     merged
 }
 
+fn btree_string_map_to_hash_map(values: &BTreeMap<String, String>) -> HashMap<String, String> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn btree_bool_map_to_hash_map(values: &BTreeMap<String, bool>) -> HashMap<String, bool> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), *value))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        ProviderEndpointV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4,
-        RoutingPolicyV4, resolved_v4_provider_order,
+        ProviderEndpointV4, ProxyConfigV4, RoutingConfigV4, RoutingExhaustedActionV4,
+        RoutingNodeV4, RoutingPolicyV4, compile_v4_to_runtime, resolved_v4_provider_order,
     };
+    use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
 
     fn provider(base_url: &str) -> ProviderConfigV4 {
         ProviderConfigV4 {
@@ -634,6 +708,88 @@ mod tests {
         let resolved = resolved_v4_provider_order("routing-ir-test", view).expect("resolved order");
         assert_eq!(template.expanded_provider_order, resolved);
         assert_eq!(provider_ids(template), resolved);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct UpstreamSignature {
+        station_name: String,
+        index: usize,
+        base_url: String,
+        tags: BTreeMap<String, String>,
+        supported_models: BTreeMap<String, bool>,
+        model_mapping: BTreeMap<String, String>,
+    }
+
+    fn hash_string_map_to_btree(values: &HashMap<String, String>) -> BTreeMap<String, String> {
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    fn hash_bool_map_to_btree(values: &HashMap<String, bool>) -> BTreeMap<String, bool> {
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), *value))
+            .collect()
+    }
+
+    fn upstream_signature(selected: &SelectedUpstream) -> UpstreamSignature {
+        UpstreamSignature {
+            station_name: selected.station_name.clone(),
+            index: selected.index,
+            base_url: selected.upstream.base_url.clone(),
+            tags: hash_string_map_to_btree(&selected.upstream.tags),
+            supported_models: hash_bool_map_to_btree(&selected.upstream.supported_models),
+            model_mapping: hash_string_map_to_btree(&selected.upstream.model_mapping),
+        }
+    }
+
+    fn executor_selected_upstream_signatures(
+        template: &RoutePlanTemplate,
+    ) -> Vec<UpstreamSignature> {
+        RoutePlanExecutor::new(template)
+            .iter_selected_upstreams()
+            .map(|selected| upstream_signature(&selected.selected_upstream))
+            .collect()
+    }
+
+    fn legacy_load_balancer_selected_upstream_signatures(
+        view: ServiceViewV4,
+    ) -> Vec<UpstreamSignature> {
+        let runtime = compile_v4_to_runtime(&ProxyConfigV4 {
+            codex: view,
+            ..ProxyConfigV4::default()
+        })
+        .expect("compile v4 runtime");
+        let service = runtime
+            .codex
+            .station("routing")
+            .expect("routing station")
+            .clone();
+        let upstream_count = service.upstreams.len();
+        let lb = LoadBalancer::new(
+            Arc::new(service),
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        );
+        let mut avoid = HashSet::new();
+        let mut selected = Vec::new();
+        while selected.len() < upstream_count {
+            let next = lb
+                .select_upstream_avoiding_strict(&avoid)
+                .expect("legacy selected upstream");
+            avoid.insert(next.index);
+            selected.push(upstream_signature(&next));
+        }
+        selected
+    }
+
+    fn assert_executor_matches_legacy_load_balancer(view: ServiceViewV4) {
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        assert_eq!(
+            executor_selected_upstream_signatures(&template),
+            legacy_load_balancer_selected_upstream_signatures(view)
+        );
     }
 
     #[test]
@@ -900,5 +1056,116 @@ mod tests {
             template.candidates[1].supported_models.get("gpt-4.1"),
             Some(&true)
         );
+    }
+
+    #[test]
+    fn route_plan_executor_matches_legacy_load_balancer_for_nested_route() {
+        assert_executor_matches_legacy_load_balancer(ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    tagged_provider("https://input.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "input1".to_string(),
+                    tagged_provider("https://input1.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "paygo".to_string(),
+                    tagged_provider("https://paygo.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "monthly_first".to_string(),
+                routes: BTreeMap::from([
+                    (
+                        "monthly_pool".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::OrderedFailover,
+                            children: vec!["input".to_string(), "input1".to_string()],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                    (
+                        "monthly_first".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::OrderedFailover,
+                            children: vec!["monthly_pool".to_string(), "paygo".to_string()],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                ]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        });
+    }
+
+    #[test]
+    fn route_plan_executor_matches_legacy_load_balancer_for_tag_preferred() {
+        assert_executor_matches_legacy_load_balancer(ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "paygo".to_string(),
+                    tagged_provider("https://paygo.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::tag_preferred(
+                vec!["paygo".to_string(), "monthly".to_string()],
+                vec![BTreeMap::from([(
+                    "billing".to_string(),
+                    "monthly".to_string(),
+                )])],
+                RoutingExhaustedActionV4::Continue,
+            )),
+            ..ServiceViewV4::default()
+        });
+    }
+
+    #[test]
+    fn route_plan_executor_matches_legacy_load_balancer_for_multi_endpoint_provider() {
+        let mut endpoints = BTreeMap::new();
+        endpoints.insert(
+            "slow".to_string(),
+            ProviderEndpointV4 {
+                base_url: "https://slow.example/v1".to_string(),
+                enabled: true,
+                priority: 10,
+                tags: BTreeMap::from([("region".to_string(), "us".to_string())]),
+                supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
+                model_mapping: BTreeMap::new(),
+            },
+        );
+        endpoints.insert(
+            "fast".to_string(),
+            ProviderEndpointV4 {
+                base_url: "https://fast.example/v1".to_string(),
+                enabled: true,
+                priority: 0,
+                tags: BTreeMap::from([("region".to_string(), "hk".to_string())]),
+                supported_models: BTreeMap::new(),
+                model_mapping: BTreeMap::from([(
+                    "gpt-5".to_string(),
+                    "provider-gpt-5".to_string(),
+                )]),
+            },
+        );
+
+        assert_executor_matches_legacy_load_balancer(ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfigV4 {
+                    tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                    supported_models: BTreeMap::from([("gpt-5".to_string(), true)]),
+                    endpoints,
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            ..ServiceViewV4::default()
+        });
     }
 }
