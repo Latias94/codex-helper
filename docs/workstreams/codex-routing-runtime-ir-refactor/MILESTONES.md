@@ -48,6 +48,7 @@ Acceptance:
 - [x] Add an opt-in request-path shadow diff hook that compares the legacy
   `LoadBalancer` dry-run order with the route executor order without changing
   selected upstreams.
+- [x] Add structured control-trace detail for route executor shadow mismatches.
 - [ ] Preserve current retry, cooldown, unsupported-model skip, and failover
   semantics.
 - [ ] Keep legacy station/upstream log fields while adding route metadata
