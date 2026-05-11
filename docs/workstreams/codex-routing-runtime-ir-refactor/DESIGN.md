@@ -258,6 +258,12 @@ Route planning should keep these layers separate:
 No layer should rewrite another layer. For example, balance exhaustion may demote
 or skip a candidate at runtime, but it must not rewrite route graph config.
 
+P3 keeps this separation by adding a read-only `RouteCandidateRuntimeSignals`
+view. The view joins each candidate's identity with existing passive health,
+load-balancer cooldown/usage state, and provider balance summaries through the
+legacy compatibility key. It does not re-key storage or alter request routing
+behavior yet.
+
 ## Explainability
 
 The eventual `routing explain` and admin APIs should be able to return:
