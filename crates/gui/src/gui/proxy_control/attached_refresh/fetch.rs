@@ -152,6 +152,7 @@ pub(super) async fn refresh_from_base(
     let supports_providers = resolved_surface.providers;
     let supports_retry_config_api = resolved_surface.retry_config;
     let supports_pricing_catalog_api = resolved_surface.pricing_catalog;
+    let supports_provider_balance_refresh_api = resolved_surface.provider_balance_refresh;
     let supports_provider_spec_api = resolved_surface.provider_specs;
     let supports_station_spec_api = resolved_surface.station_specs;
     let supports_default_profile_override = resolved_surface.default_profile_override;
@@ -434,6 +435,7 @@ pub(super) async fn refresh_from_base(
             supports_operator_summary_api,
             supports_pricing_catalog_api,
             supports_routing_explain_api,
+            supports_provider_balance_refresh_api,
             configured_retry: configured_retry
                 .as_ref()
                 .map(|(configured, _)| configured.clone()),
@@ -751,6 +753,7 @@ pub(super) async fn refresh_from_base(
         supports_operator_summary_api,
         supports_pricing_catalog_api,
         supports_routing_explain_api,
+        supports_provider_balance_refresh_api,
         configured_retry: configured_retry
             .as_ref()
             .map(|(configured, _)| configured.clone()),

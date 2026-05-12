@@ -227,6 +227,7 @@ pub(super) fn render_station_balance_section(
     balances: Option<&[ProviderBalanceSnapshot]>,
 ) {
     ui.label(pick(ctx.lang, "余额 / 配额", "Balance / quota"));
+    render_station_balance_refresh_controls(ui, ctx, cfg.name.as_str());
     if let Some(balances) = balances {
         if balances.is_empty() {
             ui.label(pick(
@@ -338,6 +339,58 @@ pub(super) fn render_station_balance_section(
             "(no balance/quota data)",
         ));
     }
+}
+
+fn render_station_balance_refresh_controls(
+    ui: &mut egui::Ui,
+    ctx: &mut PageCtx<'_>,
+    station: &str,
+) {
+    let status = ctx.proxy.provider_balance_refresh_status().clone();
+    let can_refresh = ctx.proxy.supports_provider_balance_refresh();
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                can_refresh && !status.refreshing,
+                egui::Button::new(pick(ctx.lang, "刷新当前", "Refresh selected")),
+            )
+            .clicked()
+        {
+            match ctx.proxy.request_provider_balance_refresh(
+                ctx.rt,
+                Some(station.to_string()),
+                None,
+            ) {
+                Ok(true) => {
+                    *ctx.last_info = Some(
+                        pick(ctx.lang, "余额刷新已开始", "Balance refresh started").to_string(),
+                    );
+                }
+                Ok(false) => {
+                    *ctx.last_info = Some(
+                        pick(ctx.lang, "余额刷新进行中", "Balance refresh in progress").to_string(),
+                    );
+                }
+                Err(err) => {
+                    *ctx.last_error = Some(format!("balance refresh failed: {err}"));
+                }
+            }
+        }
+
+        if status.refreshing {
+            ui.small(pick(ctx.lang, "刷新中...", "Refreshing..."));
+        } else if !can_refresh {
+            ui.small(pick(
+                ctx.lang,
+                "当前代理不支持刷新余额",
+                "Current proxy does not support balance refresh",
+            ));
+        } else if let Some(err) = status.last_error.as_deref() {
+            ui.colored_label(egui::Color32::from_rgb(200, 120, 40), shorten(err, 72));
+        } else if let Some(msg) = status.last_message.as_deref() {
+            ui.small(format!("last: {}", shorten(msg, 72)));
+        }
+    });
 }
 
 pub(super) fn render_station_breaker_section(

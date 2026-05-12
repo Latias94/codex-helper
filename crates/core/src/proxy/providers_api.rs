@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Json;
 use axum::extract::Query;
@@ -116,6 +116,42 @@ fn merge_refresh_summary(
     summary.auto_attempted += extra.auto_attempted;
     summary.auto_refreshed += extra.auto_refreshed;
     summary.auto_failed += extra.auto_failed;
+    summary.deduplicated += extra.deduplicated;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderBalanceRefreshKey {
+    service_name: String,
+    station_name: Option<String>,
+    provider_id: Option<String>,
+}
+
+static IN_FLIGHT_PROVIDER_BALANCE_REFRESHES: OnceLock<Mutex<HashSet<ProviderBalanceRefreshKey>>> =
+    OnceLock::new();
+
+struct ProviderBalanceRefreshInFlight {
+    key: ProviderBalanceRefreshKey,
+}
+
+impl Drop for ProviderBalanceRefreshInFlight {
+    fn drop(&mut self) {
+        if let Some(in_flight) = IN_FLIGHT_PROVIDER_BALANCE_REFRESHES.get()
+            && let Ok(mut guard) = in_flight.lock()
+        {
+            guard.remove(&self.key);
+        }
+    }
+}
+
+fn try_mark_provider_balance_refresh_in_flight(
+    key: ProviderBalanceRefreshKey,
+) -> Option<ProviderBalanceRefreshInFlight> {
+    let in_flight = IN_FLIGHT_PROVIDER_BALANCE_REFRESHES.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = in_flight.lock().ok()?;
+    if !guard.insert(key.clone()) {
+        return None;
+    }
+    Some(ProviderBalanceRefreshInFlight { key })
 }
 
 fn merge_auth_v4(block: &UpstreamAuth, inline: &UpstreamAuth) -> UpstreamAuth {
@@ -626,6 +662,24 @@ pub(super) async fn refresh_provider_balances_for_proxy(
     station_name_filter: Option<&str>,
     provider_id_filter: Option<&str>,
 ) -> Result<UsageProviderRefreshSummary, (StatusCode, String)> {
+    let refresh_key = ProviderBalanceRefreshKey {
+        service_name: proxy.service_name.to_string(),
+        station_name: station_name_filter.map(ToOwned::to_owned),
+        provider_id: provider_id_filter.map(ToOwned::to_owned),
+    };
+    let Some(_in_flight) = try_mark_provider_balance_refresh_in_flight(refresh_key) else {
+        tracing::debug!(
+            "provider balance refresh deduplicated: service={}, station={:?}, provider_id={:?}",
+            proxy.service_name,
+            station_name_filter,
+            provider_id_filter
+        );
+        return Ok(UsageProviderRefreshSummary {
+            deduplicated: 1,
+            ..UsageProviderRefreshSummary::default()
+        });
+    };
+
     let cfg = proxy.config.snapshot().await;
     let mut refresh = refresh_balances_for_service(
         cfg,
@@ -652,4 +706,25 @@ pub(super) async fn refresh_provider_balances_for_proxy(
     }
 
     Ok(refresh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_balance_refresh_in_flight_guard_deduplicates_exact_key() {
+        let key = ProviderBalanceRefreshKey {
+            service_name: "codex-test-dedupe".to_string(),
+            station_name: Some("monthly".to_string()),
+            provider_id: Some("provider-a".to_string()),
+        };
+
+        let guard = try_mark_provider_balance_refresh_in_flight(key.clone())
+            .expect("first refresh should enter");
+        assert!(try_mark_provider_balance_refresh_in_flight(key.clone()).is_none());
+
+        drop(guard);
+        assert!(try_mark_provider_balance_refresh_in_flight(key).is_some());
+    }
 }

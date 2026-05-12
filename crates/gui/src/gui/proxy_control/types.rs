@@ -26,6 +26,7 @@ use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
     ProxyState, SessionIdentityCard, SessionStats, StationHealth, UsageRollupView,
 };
+use crate::usage_providers::UsageProviderRefreshSummary;
 
 use super::attached_discovery::DiscoveredProxy;
 
@@ -115,6 +116,7 @@ pub(super) struct AttachedRefreshResult {
     pub(super) supports_operator_summary_api: bool,
     pub(super) supports_pricing_catalog_api: bool,
     pub(super) supports_routing_explain_api: bool,
+    pub(super) supports_provider_balance_refresh_api: bool,
     pub(super) configured_retry: Option<RetryConfig>,
     pub(super) resolved_retry: Option<ResolvedRetryConfig>,
     pub(super) supports_retry_config_api: bool,
@@ -143,6 +145,25 @@ pub(super) enum ProxyBackgroundRefreshResult {
 pub(super) struct ProxyBackgroundRefreshTask {
     pub(super) rx: std::sync::mpsc::Receiver<anyhow::Result<ProxyBackgroundRefreshResult>>,
     pub(super) join: JoinHandle<()>,
+}
+
+pub(super) struct ProviderBalanceRefreshResult {
+    pub(super) refresh: UsageProviderRefreshSummary,
+    pub(super) provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+}
+
+pub(super) struct ProviderBalanceRefreshTask {
+    pub(super) rx: std::sync::mpsc::Receiver<anyhow::Result<ProviderBalanceRefreshResult>>,
+    pub(super) join: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderBalanceRefreshStatus {
+    pub refreshing: bool,
+    pub last_started_at: Option<Instant>,
+    pub last_finished_at: Option<Instant>,
+    pub last_message: Option<String>,
+    pub last_error: Option<String>,
 }
 
 pub struct AttachedStatus {
@@ -188,6 +209,7 @@ pub struct AttachedStatus {
     pub operator_summary_links: Option<OperatorSummaryLinks>,
     pub supports_operator_summary_api: bool,
     pub supports_pricing_catalog_api: bool,
+    pub supports_provider_balance_refresh_api: bool,
     pub configured_retry: Option<RetryConfig>,
     pub resolved_retry: Option<ResolvedRetryConfig>,
     pub supports_retry_config_api: bool,
@@ -253,6 +275,7 @@ impl AttachedStatus {
             operator_summary_links: None,
             supports_operator_summary_api: false,
             supports_pricing_catalog_api: false,
+            supports_provider_balance_refresh_api: false,
             configured_retry: None,
             resolved_retry: None,
             supports_retry_config_api: false,
@@ -373,6 +396,8 @@ pub struct ProxyController {
     pub(super) discovered: Vec<DiscoveredProxy>,
     pub(super) last_discovery_scan: Option<Instant>,
     pub(super) background_refresh: Option<ProxyBackgroundRefreshTask>,
+    pub(super) provider_balance_refresh: Option<ProviderBalanceRefreshTask>,
+    pub(super) provider_balance_refresh_status: ProviderBalanceRefreshStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -44,6 +44,7 @@ pub(in crate::gui::proxy_control) fn apply_refresh_result(
     att.supports_operator_summary_api = result.supports_operator_summary_api;
     att.supports_pricing_catalog_api = result.supports_pricing_catalog_api;
     att.supports_routing_explain_api = result.supports_routing_explain_api;
+    att.supports_provider_balance_refresh_api = result.supports_provider_balance_refresh_api;
     att.configured_retry = result.configured_retry;
     att.resolved_retry = result.resolved_retry;
     att.supports_retry_config_api = result.supports_retry_config_api;

@@ -9,48 +9,52 @@ All notable changes to this project will be documented in this file.
 
 ### 破坏性变更 / Breaking
 
-- `version = 4` 成为新的公共配置格式：routing 从 v3 扁平 `policy/order/target` 重构为 route graph，`routing.entry` 指向入口节点，`routing.routes.*` 可组合 provider 和其他 route node。
-  `version = 4` is the new public config format: routing moves from flat v3 `policy/order/target` fields to a route graph where `routing.entry` points to a route node and `routing.routes.*` can compose providers and other route nodes.
-- 移除新增公共 `pool-fallback` 语法的方向，月包池和 paygo 兜底改用嵌套 route nodes 表达；旧 v3 `pool-fallback` 仅作为迁移输入读取。
-  Public `pool-fallback` authoring is superseded by nested route nodes for monthly pools and paygo fallback; legacy v3 `pool-fallback` is accepted only as migration input.
+- `version = 4` 成为新的公共配置格式，路由改为可组合的 route graph。旧配置会自动迁移，常见用户不需要手动重写。
+  `version = 4` is now the public config format, with routing represented as a composable route graph. Existing configs migrate automatically for normal use.
+- 月包池、付费兜底等复杂路由统一用嵌套 route nodes 表达；旧的 v3 routing 写法仍可作为迁移输入读取。
+  Monthly pools, paid fallback, and other complex routing are now expressed with nested route nodes; legacy v3 routing remains readable as migration input.
 
 ### 新增 / Added
 
-- 控制面、CLI、TUI 和 GUI 写回 v4 route graph 时会保留 `entry/routes` 结构，provider CRUD 不再把嵌套路由压平成单一 order。
-  Control-plane, CLI, TUI, and GUI writes preserve v4 `entry/routes` structure; provider CRUD no longer collapses nested routes into one flat order.
-- TUI 路由页和 GUI routing 编辑预览新增 route graph 树形可视化，展示入口节点、嵌套 route node、条件分支、provider 叶子、缺失引用和不可达节点。
-  TUI routing and GUI routing-editor previews now include a route graph tree that shows the entry node, nested route nodes, conditional branches, provider leaves, missing references, and unreachable nodes.
-- GUI routing 设置新增 route node 编辑器，可创建、重命名、删除和保存嵌套 route node，支持 `ordered-failover`、`manual-sticky`、`tag-preferred` 和 `conditional` 节点。
-  GUI routing settings now include a route node editor for creating, renaming, deleting, and saving nested route nodes across `ordered-failover`, `manual-sticky`, `tag-preferred`, and `conditional` nodes.
-- 新增 route graph 会话粘性：同一会话按 `session_id + service + route_graph_key` 粘住可用 provider，失败重试后才按当前路由图继续切换；路由规则变化会让旧粘性自然失效。
-  Added route-graph session affinity: a session sticks to a usable provider by `session_id + service + route_graph_key`, falls through through the current route graph only after retry failure, and naturally invalidates old affinity when routing rules change.
-- TUI Requests 和 GUI 请求列表/详情新增缓存命中率展示，统一走 core 的 usage token 口径，并按服务区分 direct cache read 是否已包含在 input 中。
-  TUI Requests plus GUI request lists/details now show cache hit rate through the shared core usage-token calculation, with service-aware handling for whether direct cache-read tokens are already included in input.
+- TUI 和 GUI 新增 route graph 可视化，可以更直观看到入口、嵌套节点、provider 顺序、缺失引用和不可达节点。
+  TUI and GUI now visualize route graphs, making entries, nested nodes, provider order, missing references, and unreachable nodes easier to inspect.
+- GUI 新增 route node 编辑器，可创建、重命名、删除和保存常见路由节点，不必切到原始配置文件完成日常调整。
+  GUI now includes a route node editor for common routing changes without switching to the raw config file.
+- 同一会话会尽量粘住已选 provider；只有失败重试或路由规则变化时，才按当前路由继续切换。
+  Sessions now prefer staying on their selected provider, and only move on after retry failure or routing changes.
+- TUI 和 GUI 请求视图新增缓存命中率，成本估算也更贴近不同服务的实际 usage 口径。
+  TUI and GUI request views now show cache hit rate, with cost estimates aligned more closely with each service's usage accounting.
+- GUI 余额/配额视图新增手动刷新入口，支持全量刷新和当前站点刷新，并显示刷新状态。
+  GUI balance/quota views now have manual refresh actions for all providers or the selected station, with visible refresh status.
 
 ### 改进 / Improved
 
-- History / Recent 会话加载继续优化：展示行展开改为有界并发读取统计与尾部时间戳，GUI 按日期浏览也并发读取 header，TUI Recent 的 git 分支查询会先去重再并发。
-  History / Recent loading now expands displayed rows with bounded concurrent stats and tail-timestamp reads, GUI all-by-date browsing reads headers concurrently, and TUI Recent deduplicates git branch lookups before concurrent probing.
+- History / Recent 加载更轻快，打开页面和刷新列表时更少卡顿。
+  History / Recent loading is faster and causes less UI blocking when opening or refreshing lists.
+- 路由编辑、provider 管理和配置写回会保留嵌套路由结构，避免把复杂配置意外压平成简单顺序。
+  Routing edits, provider management, and config writes preserve nested route structure instead of flattening complex configs.
+- 余额刷新会避免重复请求，多个界面同时触发刷新时不会反复打外部余额接口。
+  Balance refresh avoids duplicate requests when multiple UI paths trigger refresh at the same time.
+- 路由预览和候选状态更清晰地区分余额未知、余额过期、已耗尽和运行时冷却。
+  Routing previews and candidate status now distinguish unknown, stale, exhausted, and cooldown states more clearly.
 
 ### 文档 / Documentation
 
-- 补充月包 provider 池与 paygo 兜底的配置说明，明确 `unknown` 余额不等于耗尽，临时故障应通过 cooldown 和后续回探恢复。
-  Added monthly provider pool / paygo fallback guidance, clarifying that `unknown` balance is not exhaustion and temporary failures should recover through cooldown and later reprobe.
+- 补充 v4 route graph 配置示例，覆盖月包优先、月包池、付费兜底和余额未知时的行为说明。
+  Added v4 route graph examples for monthly-first routing, monthly pools, paid fallback, and unknown-balance behavior.
 
 ### 修复 / Fixed
 
-- TUI 对 Sub2API 订阅窗口懒刷新返回的零额度改为显示 `lazy reset`，避免把待实际请求触发刷新前的套餐窗口误判为确定耗尽。
-  TUI now labels Sub2API subscription-window zero balance from lazy refresh as `lazy reset`, avoiding a misleading hard-exhausted signal before a real request refreshes the plan window.
-- TUI 的 dashboard、Requests、Sessions 和 History 里的 session 标识不再被过早截断；详情面板和标题优先显示完整 session，列表列宽也相应放宽。
-  TUI session identifiers are no longer prematurely truncated in dashboard, Requests, Sessions, and History; detail panes and titles now prefer the full session id, and table columns were widened accordingly.
-- TUI 的 History / Recent 会话刷新改为后台异步加载，打开页面和手动刷新时不再阻塞主事件循环；刷新失败时保留已有列表并展示错误。
-  TUI History / Recent session refresh now runs in the background, so opening those pages and manual refresh no longer block the main event loop; failed refreshes keep the existing list visible while surfacing the error.
-- GUI 基础 routing 编辑器保存入口节点策略/顺序时会保留已有嵌套 route nodes，并允许 entry children 引用 route node，不再把复杂图误压平。
-  GUI basic routing editor now preserves existing nested route nodes when saving entry policy/order and allows entry children to reference route nodes, avoiding accidental flattening of complex graphs.
-- Route plan runtime 现在会初始化共享 LB station 状态，即使请求因 capability mismatch 等中立跳过而没有真正命中上游，UI/API 的 LB 视图也能看到对应站点。
-  Route plan runtime now initializes shared LB station state, so UI/API LB views include stations even when requests are neutrally skipped before hitting an upstream, such as capability mismatches.
-- 缓存命中率和成本估算现在使用服务感知的缓存计费口径：Codex/Gemini 风格 direct cache read 会从有效 input 中扣除，Claude/未知服务仍按独立 cache bucket 处理。
-  Cache hit-rate and cost estimation now use service-aware cache accounting: Codex/Gemini-style direct cache reads are subtracted from effective input, while Claude/unknown services keep them as separate cache buckets.
+- TUI 的 dashboard、Requests、Sessions 和 History 不再过早截断 session id，详情区域优先显示完整会话标识。
+  TUI dashboard, Requests, Sessions, and History no longer truncate session ids too aggressively; detail areas prefer the full id.
+- TUI History / Recent 刷新改为后台加载，失败时保留已有列表并显示错误。
+  TUI History / Recent refresh runs in the background; failures keep the existing list visible and show the error.
+- Sub2API 订阅窗口的懒刷新零额度不再被误显示成确定耗尽。
+  Lazy Sub2API subscription-window zero balances are no longer shown as hard exhaustion.
+- GUI routing 编辑保存时不再意外丢失嵌套节点。
+  GUI routing edits no longer accidentally drop nested route nodes.
+- 缓存命中率和成本估算修正了不同服务的 cache token 口径差异。
+  Cache hit-rate and cost estimates now handle service-specific cache token accounting correctly.
 
 ## [0.13.0] - 2026-05-09
 

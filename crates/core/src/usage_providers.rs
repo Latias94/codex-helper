@@ -179,7 +179,7 @@ struct UsageProviderTargetKey {
     upstream_index: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageProviderRefreshSummary {
     pub providers_configured: usize,
     pub providers_matched: usize,
@@ -194,6 +194,8 @@ pub struct UsageProviderRefreshSummary {
     pub auto_refreshed: usize,
     #[serde(skip_serializing_if = "usize_is_zero")]
     pub auto_failed: usize,
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub deduplicated: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -17,6 +17,7 @@ mod attached_discovery;
 mod attached_refresh;
 mod background_refresh;
 mod control_mutations;
+mod provider_balance_refresh;
 mod running_refresh;
 mod runtime_lifecycle;
 mod runtime_operations;
@@ -28,6 +29,8 @@ use self::attached_discovery::{
     local_shared_control_plane_capabilities,
 };
 use self::types::PortInUseModal;
+#[allow(unused_imports)]
+pub use self::types::ProviderBalanceRefreshStatus;
 pub use self::types::{
     AttachedStatus, ControlTraceDataSource, ControlTraceReadResult, GuiRuntimeSnapshot,
     PortInUseAction, ProxyController, ProxyMode, ProxyModeKind, RequestLedgerDataSource,
@@ -82,6 +85,8 @@ impl ProxyController {
             discovered: Vec::new(),
             last_discovery_scan: None,
             background_refresh: None,
+            provider_balance_refresh: None,
+            provider_balance_refresh_status: Default::default(),
         }
     }
 
@@ -490,6 +495,7 @@ impl ProxyController {
 
     pub fn stop(&mut self, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         self.clear_background_refresh();
+        self.clear_provider_balance_refresh();
         let ProxyMode::Running(mut running) = std::mem::replace(&mut self.mode, ProxyMode::Stopped)
         else {
             self.mode = ProxyMode::Stopped;
@@ -523,6 +529,7 @@ impl ProxyController {
 
     pub fn detach(&mut self) {
         self.clear_background_refresh();
+        self.clear_provider_balance_refresh();
         self.mode = ProxyMode::Stopped;
         self.last_start_error = None;
         self.port_in_use_modal = None;

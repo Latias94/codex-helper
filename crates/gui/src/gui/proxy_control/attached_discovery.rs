@@ -77,6 +77,7 @@ pub(super) struct ResolvedApiV1Surface {
     pub(super) providers: bool,
     pub(super) retry_config: bool,
     pub(super) pricing_catalog: bool,
+    pub(super) provider_balance_refresh: bool,
     pub(super) provider_specs: bool,
     pub(super) station_specs: bool,
     pub(super) default_profile_override: bool,
@@ -100,6 +101,8 @@ const API_V1_OPERATOR_SUMMARY_ENDPOINT: &str = "/__codex_helper/api/v1/operator/
 const API_V1_PROFILES_ENDPOINT: &str = "/__codex_helper/api/v1/profiles";
 const API_V1_PROVIDERS_ENDPOINT: &str = "/__codex_helper/api/v1/providers";
 const API_V1_PROVIDERS_RUNTIME_ENDPOINT: &str = "/__codex_helper/api/v1/providers/runtime";
+const API_V1_PROVIDERS_BALANCES_REFRESH_ENDPOINT: &str =
+    "/__codex_helper/api/v1/providers/balances/refresh";
 const API_V1_RETRY_CONFIG_ENDPOINT: &str = "/__codex_helper/api/v1/retry/config";
 const API_V1_PROVIDER_SPECS_ENDPOINT: &str = "/__codex_helper/api/v1/providers/specs";
 const API_V1_STATIONS_ENDPOINT: &str = "/__codex_helper/api/v1/stations";
@@ -175,6 +178,11 @@ pub(super) fn resolve_api_v1_surface(
             surface.pricing_catalog,
             endpoints,
             API_V1_PRICING_CATALOG_ENDPOINT,
+        ),
+        provider_balance_refresh: supports_capability_flag(
+            surface.provider_balance_refresh,
+            endpoints,
+            API_V1_PROVIDERS_BALANCES_REFRESH_ENDPOINT,
         ),
         provider_specs: supports_capability_flag(
             surface.provider_specs,
@@ -263,6 +271,7 @@ fn apply_resolved_surface(attached: &mut AttachedStatus, resolved_surface: Resol
     attached.supports_operator_summary_api = resolved_surface.operator_summary;
     attached.supports_retry_config_api = resolved_surface.retry_config;
     attached.supports_pricing_catalog_api = resolved_surface.pricing_catalog;
+    attached.supports_provider_balance_refresh_api = resolved_surface.provider_balance_refresh;
     attached.supports_provider_spec_api = resolved_surface.provider_specs;
     attached.supports_station_spec_api = resolved_surface.station_specs;
     attached.supports_default_profile_override = resolved_surface.default_profile_override;
@@ -383,6 +392,7 @@ fn sort_discovered_proxies(found: &mut [DiscoveredProxy]) {
 impl ProxyController {
     pub fn request_attach_with_admin_base(&mut self, port: u16, admin_base_url: Option<String>) {
         self.clear_background_refresh();
+        self.clear_provider_balance_refresh();
         let mut attached = AttachedStatus::new(port);
         if let Some(admin_base_url) = admin_base_url {
             attached.admin_base_url = admin_base_url.clone();

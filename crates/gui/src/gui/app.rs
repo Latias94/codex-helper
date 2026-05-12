@@ -511,6 +511,7 @@ impl eframe::App for GuiApp {
         // Keep proxy snapshots fresh without blocking the UI thread.
         self.proxy
             .refresh_current_background_if_due(&self.rt, refresh);
+        self.proxy.poll_provider_balance_refresh();
 
         egui::TopBottomPanel::top("top_nav").show(ctx, |ui| {
             super::pages::nav(ui, lang, &mut self.page, &self.proxy);
