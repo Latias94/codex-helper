@@ -502,9 +502,7 @@ mod tests {
         );
         {
             let mut guard = lb.states.lock().expect("lb state lock");
-            let entry = guard
-                .entry("routing".to_string())
-                .or_insert_with(LbState::default);
+            let entry = guard.entry("routing".to_string()).or_default();
             entry.ensure_layout(&lb.service.upstreams);
             entry.usage_exhausted[0] = true;
         }
@@ -533,9 +531,7 @@ mod tests {
         );
         {
             let mut guard = lb.states.lock().expect("lb state lock");
-            let entry = guard
-                .entry("routing".to_string())
-                .or_insert_with(LbState::default);
+            let entry = guard.entry("routing".to_string()).or_default();
             entry.ensure_layout(&lb.service.upstreams);
             entry.usage_exhausted[0] = true;
             entry.usage_exhausted[1] = true;

@@ -771,6 +771,12 @@ struct RouteExpansionContext<'a> {
     conditional: ConditionalExpansion,
 }
 
+struct RouteExpansionFrame<'a> {
+    route_name: &'a str,
+    node: &'a RoutingNodeV4,
+    node_path: &'a [String],
+}
+
 pub fn compile_v4_route_plan_template(
     service_name: &str,
     view: &ServiceViewV4,
@@ -1105,47 +1111,24 @@ fn expand_route_node(
     stack.push(route_name.to_string());
     let mut node_path = parent_path.to_vec();
     node_path.push(route_name.to_string());
+    let frame = RouteExpansionFrame {
+        route_name,
+        node,
+        node_path: &node_path,
+    };
     let result = match node.strategy {
-        RoutingPolicyV4::OrderedFailover => expand_ordered_route_children(
-            service_name,
-            view,
-            routing,
-            route_name,
-            node,
-            &node_path,
-            expansion,
-            stack,
-        ),
-        RoutingPolicyV4::ManualSticky => expand_manual_sticky_route(
-            service_name,
-            view,
-            routing,
-            route_name,
-            node,
-            &node_path,
-            expansion,
-            stack,
-        ),
-        RoutingPolicyV4::TagPreferred => expand_tag_preferred_route(
-            service_name,
-            view,
-            routing,
-            route_name,
-            node,
-            &node_path,
-            expansion,
-            stack,
-        ),
-        RoutingPolicyV4::Conditional => expand_conditional_route(
-            service_name,
-            view,
-            routing,
-            route_name,
-            node,
-            &node_path,
-            expansion,
-            stack,
-        ),
+        RoutingPolicyV4::OrderedFailover => {
+            expand_ordered_route_children(service_name, view, routing, &frame, expansion, stack)
+        }
+        RoutingPolicyV4::ManualSticky => {
+            expand_manual_sticky_route(service_name, view, routing, &frame, expansion, stack)
+        }
+        RoutingPolicyV4::TagPreferred => {
+            expand_tag_preferred_route(service_name, view, routing, &frame, expansion, stack)
+        }
+        RoutingPolicyV4::Conditional => {
+            expand_conditional_route(service_name, view, routing, &frame, expansion, stack)
+        }
     };
     stack.pop();
     result
@@ -1155,26 +1138,25 @@ fn expand_ordered_route_children(
     service_name: &str,
     view: &ServiceViewV4,
     routing: &RoutingConfigV4,
-    route_name: &str,
-    node: &RoutingNodeV4,
-    node_path: &[String],
+    frame: &RouteExpansionFrame<'_>,
     expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
-    if node.children.is_empty() {
+    if frame.node.children.is_empty() {
         anyhow::bail!(
-            "[{service_name}] ordered-failover route '{route_name}' requires at least one child"
+            "[{service_name}] ordered-failover route '{}' requires at least one child",
+            frame.route_name
         );
     }
 
     let mut leaves = Vec::new();
-    for child_name in &node.children {
+    for child_name in &frame.node.children {
         leaves.extend(expand_route_ref(
             service_name,
             view,
             routing,
             child_name.as_str(),
-            node_path,
+            frame.node_path,
             expansion,
             stack,
         )?);
@@ -1186,24 +1168,27 @@ fn expand_manual_sticky_route(
     service_name: &str,
     view: &ServiceViewV4,
     routing: &RoutingConfigV4,
-    route_name: &str,
-    node: &RoutingNodeV4,
-    node_path: &[String],
+    frame: &RouteExpansionFrame<'_>,
     expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
-    let target = node
+    let target = frame
+        .node
         .target
         .as_deref()
-        .or_else(|| node.children.first().map(String::as_str))
+        .or_else(|| frame.node.children.first().map(String::as_str))
         .with_context(|| {
-            format!("[{service_name}] manual-sticky route '{route_name}' requires target")
+            format!(
+                "[{service_name}] manual-sticky route '{}' requires target",
+                frame.route_name
+            )
         })?;
     if let Some(provider) = view.providers.get(target)
         && !provider.enabled
     {
         anyhow::bail!(
-            "[{service_name}] manual-sticky route '{route_name}' targets disabled provider '{target}'"
+            "[{service_name}] manual-sticky route '{}' targets disabled provider '{target}'",
+            frame.route_name
         );
     }
 
@@ -1212,7 +1197,7 @@ fn expand_manual_sticky_route(
         view,
         routing,
         target,
-        node_path,
+        frame.node_path,
         expansion,
         stack,
     )
@@ -1222,44 +1207,47 @@ fn expand_tag_preferred_route(
     service_name: &str,
     view: &ServiceViewV4,
     routing: &RoutingConfigV4,
-    route_name: &str,
-    node: &RoutingNodeV4,
-    node_path: &[String],
+    frame: &RouteExpansionFrame<'_>,
     expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
-    if node.children.is_empty() {
+    if frame.node.children.is_empty() {
         anyhow::bail!(
-            "[{service_name}] tag-preferred route '{route_name}' requires at least one child"
+            "[{service_name}] tag-preferred route '{}' requires at least one child",
+            frame.route_name
         );
     }
-    if node.prefer_tags.is_empty() {
-        anyhow::bail!("[{service_name}] tag-preferred route '{route_name}' requires prefer_tags");
+    if frame.node.prefer_tags.is_empty() {
+        anyhow::bail!(
+            "[{service_name}] tag-preferred route '{}' requires prefer_tags",
+            frame.route_name
+        );
     }
 
     let mut preferred = Vec::new();
     let mut fallback = Vec::new();
-    for child_name in &node.children {
+    for child_name in &frame.node.children {
         let child_leaves = expand_route_ref(
             service_name,
             view,
             routing,
             child_name.as_str(),
-            node_path,
+            frame.node_path,
             expansion,
             stack,
         )?;
-        if child_route_matches_any_filter(view, &child_leaves, &node.prefer_tags) {
+        if child_route_matches_any_filter(view, &child_leaves, &frame.node.prefer_tags) {
             preferred.extend(child_leaves);
         } else {
             fallback.extend(child_leaves);
         }
     }
 
-    if matches!(node.on_exhausted, RoutingExhaustedActionV4::Stop) {
+    if matches!(frame.node.on_exhausted, RoutingExhaustedActionV4::Stop) {
         if preferred.is_empty() {
             anyhow::bail!(
-                "[{service_name}] tag-preferred route '{route_name}' with on_exhausted = 'stop' matched no providers"
+                "[{service_name}] tag-preferred route '{}' with on_exhausted = 'stop' matched no providers",
+                frame.route_name
             );
         }
         return Ok(preferred);
@@ -1273,26 +1261,34 @@ fn expand_conditional_route(
     service_name: &str,
     view: &ServiceViewV4,
     routing: &RoutingConfigV4,
-    route_name: &str,
-    node: &RoutingNodeV4,
-    node_path: &[String],
+    frame: &RouteExpansionFrame<'_>,
     expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
-    let condition = node.when.as_ref().with_context(|| {
-        format!("[{service_name}] conditional route '{route_name}' requires when")
+    let condition = frame.node.when.as_ref().with_context(|| {
+        format!(
+            "[{service_name}] conditional route '{}' requires when",
+            frame.route_name
+        )
     })?;
     if condition.is_empty() {
         anyhow::bail!(
-            "[{service_name}] conditional route '{route_name}' requires at least one condition field"
+            "[{service_name}] conditional route '{}' requires at least one condition field",
+            frame.route_name
         );
     }
 
-    let then = node.then.as_deref().with_context(|| {
-        format!("[{service_name}] conditional route '{route_name}' requires then")
+    let then = frame.node.then.as_deref().with_context(|| {
+        format!(
+            "[{service_name}] conditional route '{}' requires then",
+            frame.route_name
+        )
     })?;
-    let default_route = node.default_route.as_deref().with_context(|| {
-        format!("[{service_name}] conditional route '{route_name}' requires default")
+    let default_route = frame.node.default_route.as_deref().with_context(|| {
+        format!(
+            "[{service_name}] conditional route '{}' requires default",
+            frame.route_name
+        )
     })?;
     match expansion.conditional {
         ConditionalExpansion::MatchRequest => {
@@ -1306,7 +1302,7 @@ fn expand_conditional_route(
                 view,
                 routing,
                 selected,
-                node_path,
+                frame.node_path,
                 expansion,
                 stack,
             )
@@ -1318,7 +1314,7 @@ fn expand_conditional_route(
                 view,
                 routing,
                 then,
-                node_path,
+                frame.node_path,
                 expansion,
                 stack,
             )?);
@@ -1327,7 +1323,7 @@ fn expand_conditional_route(
                 view,
                 routing,
                 default_route,
-                node_path,
+                frame.node_path,
                 expansion,
                 stack,
             )?);

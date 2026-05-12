@@ -245,7 +245,7 @@ pub(super) async fn get_routing_explain(
         Some(proxy.config.last_loaded_at_ms()),
         request,
         session_id,
-        &template,
+        template,
         &runtime,
     )))
 }

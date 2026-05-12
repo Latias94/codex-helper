@@ -221,28 +221,6 @@ pub(in super::super) fn render_last_route_decision_card(
     );
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_route_decision_provider_endpoint_prefers_endpoint_identity() {
-        assert_eq!(
-            format_route_decision_provider_endpoint(Some("alpha"), Some("default")),
-            Some("alpha/default".to_string())
-        );
-        assert_eq!(
-            format_route_decision_provider_endpoint(Some("alpha"), None),
-            Some("alpha".to_string())
-        );
-        assert_eq!(
-            format_route_decision_provider_endpoint(None, Some("default")),
-            Some("default".to_string())
-        );
-        assert_eq!(format_route_decision_provider_endpoint(None, None), None);
-    }
-}
-
 fn observed_route_snapshot_rows(
     row: &SessionRow,
     lang: Language,
@@ -455,4 +433,26 @@ pub(in super::super) fn render_session_route_snapshot_card(
             );
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_route_decision_provider_endpoint_prefers_endpoint_identity() {
+        assert_eq!(
+            format_route_decision_provider_endpoint(Some("alpha"), Some("default")),
+            Some("alpha/default".to_string())
+        );
+        assert_eq!(
+            format_route_decision_provider_endpoint(Some("alpha"), None),
+            Some("alpha".to_string())
+        );
+        assert_eq!(
+            format_route_decision_provider_endpoint(None, Some("default")),
+            Some("default".to_string())
+        );
+        assert_eq!(format_route_decision_provider_endpoint(None, None), None);
+    }
 }

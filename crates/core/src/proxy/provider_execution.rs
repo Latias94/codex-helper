@@ -181,7 +181,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
         );
         &legacy_template
     };
-    let executor = RoutePlanExecutor::new(&template);
+    let executor = RoutePlanExecutor::new(template);
     let upstream_overrides = proxy
         .state
         .get_upstream_meta_overrides(proxy.service_name)
@@ -465,7 +465,7 @@ async fn execute_station_upstreams_with_route_executor(
             client_body_debug,
             client_body_warn,
             plan,
-            route_graph_key: route_graph_key.as_deref(),
+            route_graph_key,
             upstream_opt: &plan.upstream,
             provider_opt: &plan.route,
             provider_attempt,
