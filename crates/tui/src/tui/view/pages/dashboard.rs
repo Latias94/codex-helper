@@ -77,7 +77,7 @@ fn render_sessions_panel(
             let sid = r
                 .session_id
                 .as_deref()
-                .map(|s| short_sid(s, 12))
+                .map(|s| short_sid(s, 18))
                 .unwrap_or_else(|| "-".to_string());
 
             let cwd = r
@@ -315,7 +315,7 @@ fn render_session_details(
         kv_line(
             p,
             l("session"),
-            short_sid(sid, 24),
+            sid.to_string(),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ),
         kv_line(p, l("identity"), identity, Style::default().fg(p.text)),
@@ -463,7 +463,7 @@ fn render_requests_panel(
             .rows
             .get(ui.selected_session_idx)
             .and_then(|r| r.session_id.as_deref())
-            .map(|sid| format!("{} [{}]", l("Requests"), short_sid(sid, 12)))
+            .map(|sid| format!("{} [{}]", l("Requests"), sid))
             .unwrap_or_else(|| l("Requests").to_string()),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     );

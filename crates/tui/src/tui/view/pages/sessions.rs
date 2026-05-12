@@ -121,7 +121,7 @@ pub(super) fn render_sessions_page(
             let sid = row
                 .session_id
                 .as_deref()
-                .map(|s| short_sid(s, 16))
+                .map(|s| short_sid(s, 18))
                 .unwrap_or_else(|| "-".to_string());
             let cwd = row
                 .cwd

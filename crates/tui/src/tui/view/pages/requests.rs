@@ -6,8 +6,7 @@ use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, T
 use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, duration_short, format_age, now_ms, request_matches_page_filters,
-    request_page_focus_session_id, short_sid, shorten, shorten_middle, status_style,
-    usage_line_lang,
+    request_page_focus_session_id, shorten, shorten_middle, status_style, usage_line_lang,
 };
 use crate::tui::state::UiState;
 
@@ -56,7 +55,7 @@ pub(super) fn render_requests_page(
     let scope_label = if ui.request_page_scope_session {
         focused_sid
             .as_deref()
-            .map(|sid| format!("session {}", short_sid(sid, 16)))
+            .map(|sid| format!("session {}", sid))
             .unwrap_or_else(|| l("session").to_string())
     } else {
         l("all").to_string()
@@ -164,7 +163,7 @@ pub(super) fn render_requests_page(
                 if ui.request_page_scope_session {
                     focused_sid
                         .as_deref()
-                        .map(|sid| short_sid(sid, 20))
+                        .map(|sid| sid.to_string())
                         .unwrap_or_else(|| "-".to_string())
                 } else {
                     l("all requests").to_string()
