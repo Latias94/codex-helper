@@ -64,7 +64,7 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
 
     let explain = client
         .get(format!(
-            "http://{}/__codex_helper/api/v1/routing/explain?model=gpt-5&session=sid-route",
+            "http://{}/__codex_helper/api/v1/routing/explain?model=gpt-5&session=sid-route&service_tier=priority&reasoning_effort=high&path=/v1/chat/completions&method=POST&header=X-Plan%3Dgold",
             proxy_addr
         ))
         .send()
@@ -80,6 +80,28 @@ async fn proxy_api_v1_routing_explain_returns_selected_route_and_structured_skip
     assert_eq!(explain["service_name"].as_str(), Some("codex"));
     assert_eq!(explain["request_model"].as_str(), Some("gpt-5"));
     assert_eq!(explain["session_id"].as_str(), Some("sid-route"));
+    assert_eq!(
+        explain["request_context"]["service_tier"].as_str(),
+        Some("priority")
+    );
+    assert_eq!(
+        explain["request_context"]["reasoning_effort"].as_str(),
+        Some("high")
+    );
+    assert_eq!(
+        explain["request_context"]["headers"]
+            .as_array()
+            .map(|items| items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()),
+        Some(vec!["X-Plan"])
+    );
+    assert!(
+        !serde_json::to_string(&explain)
+            .expect("serialize explain")
+            .contains("gold")
+    );
     assert_eq!(explain["candidates"].as_array().map(Vec::len), Some(2));
     assert_eq!(
         explain["selected_route"]["provider_id"].as_str(),

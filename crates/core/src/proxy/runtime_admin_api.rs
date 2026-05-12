@@ -3,11 +3,15 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::Query;
 use axum::http::StatusCode;
+use serde::de::{self, SeqAccess, Visitor};
 
 use crate::config::ProxyConfig;
 use crate::lb::LoadBalancer;
-use crate::routing_explain::{RoutingExplainResponse, build_routing_explain_response};
-use crate::routing_ir::compile_legacy_route_plan_template;
+use crate::routing_explain::{
+    RoutingExplainResponse, build_routing_explain_response_with_request,
+    parse_routing_explain_headers,
+};
+use crate::routing_ir::{RouteRequestContext, compile_legacy_route_plan_template};
 
 use super::ProxyService;
 use super::api_responses::{
@@ -73,6 +77,17 @@ pub(super) struct RequestLedgerSummaryQuery {
 #[derive(serde::Deserialize)]
 pub(super) struct RoutingExplainQuery {
     model: Option<String>,
+    service_tier: Option<String>,
+    reasoning_effort: Option<String>,
+    path: Option<String>,
+    method: Option<String>,
+    #[serde(
+        default,
+        rename = "header",
+        alias = "headers",
+        deserialize_with = "deserialize_query_string_list"
+    )]
+    headers: Vec<String>,
     session: Option<String>,
     session_id: Option<String>,
 }
@@ -98,9 +113,58 @@ fn clean_filter(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn deserialize_query_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct StringListVisitor;
+
+    impl<'de> Visitor<'de> for StringListVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string or repeated string query parameter")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            while let Some(value) = seq.next_element::<String>()? {
+                out.push(value);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(StringListVisitor)
+}
+
 impl RoutingExplainQuery {
-    fn request_model(&self) -> Option<String> {
-        clean_filter(self.model.clone())
+    fn request_context(&self) -> Result<RouteRequestContext, String> {
+        Ok(RouteRequestContext {
+            model: clean_filter(self.model.clone()),
+            service_tier: clean_filter(self.service_tier.clone()),
+            reasoning_effort: clean_filter(self.reasoning_effort.clone()),
+            path: clean_filter(self.path.clone()),
+            method: clean_filter(self.method.clone()),
+            headers: parse_routing_explain_headers(&self.headers)?,
+        })
     }
 
     fn session_id(&self) -> Option<String> {
@@ -132,7 +196,9 @@ pub(super) async fn get_routing_explain(
     Query(q): Query<RoutingExplainQuery>,
 ) -> Result<Json<RoutingExplainResponse>, (StatusCode, String)> {
     let cfg = proxy.config.snapshot().await;
-    let request_model = q.request_model();
+    let request = q
+        .request_context()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     let session_id = q.session_id();
     let lbs = routing_explain_load_balancers(&proxy, cfg.as_ref(), session_id.as_deref()).await;
     let template = compile_legacy_route_plan_template(
@@ -140,10 +206,10 @@ pub(super) async fn get_routing_explain(
         lbs.iter().map(|lb| lb.service.as_ref()),
     );
     let runtime = route_plan_runtime_state_from_lbs(&lbs);
-    Ok(Json(build_routing_explain_response(
+    Ok(Json(build_routing_explain_response_with_request(
         proxy.service_name,
         Some(proxy.config.last_loaded_at_ms()),
-        request_model,
+        request,
         session_id,
         &template,
         &runtime,

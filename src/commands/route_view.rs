@@ -8,10 +8,13 @@ use crate::config::{
     explain_service_routing, storage::config_file_path,
 };
 use crate::routing_explain::{
-    RoutingExplainResponse, RoutingExplainSkipReason, build_routing_explain_response,
+    RoutingExplainCondition, RoutingExplainConditionalBranch, RoutingExplainResponse,
+    RoutingExplainRouteRef, RoutingExplainRouteRefKind, RoutingExplainSkipReason,
+    build_routing_explain_response_with_request, parse_routing_explain_headers,
 };
 use crate::routing_ir::{
-    RoutePlanRuntimeState, compile_legacy_route_plan_template, compile_v4_route_plan_template,
+    RoutePlanRuntimeState, RouteRequestContext, compile_legacy_route_plan_template,
+    compile_v4_route_plan_template_with_request,
 };
 use crate::{CliError, CliResult, RoutingCommand};
 use serde::Serialize;
@@ -220,16 +223,34 @@ fn clean_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn build_route_request_context(
+    model: Option<String>,
+    service_tier: Option<String>,
+    reasoning_effort: Option<String>,
+    path: Option<String>,
+    method: Option<String>,
+    headers: Vec<String>,
+) -> anyhow::Result<RouteRequestContext> {
+    Ok(RouteRequestContext {
+        model: clean_optional(model),
+        service_tier: clean_optional(service_tier),
+        reasoning_effort: clean_optional(reasoning_effort),
+        path: clean_optional(path),
+        method: clean_optional(method),
+        headers: parse_routing_explain_headers(&headers).map_err(anyhow::Error::msg)?,
+    })
+}
+
 fn build_v4_runtime_explain(
     service_name: &str,
     view: &ServiceViewV4,
-    request_model: Option<String>,
+    request: RouteRequestContext,
 ) -> anyhow::Result<RoutingExplainResponse> {
-    let template = compile_v4_route_plan_template(service_name, view)?;
-    Ok(build_routing_explain_response(
+    let template = compile_v4_route_plan_template_with_request(service_name, view, &request)?;
+    Ok(build_routing_explain_response_with_request(
         service_name,
         None,
-        request_model,
+        request,
         None,
         &template,
         &RoutePlanRuntimeState::default(),
@@ -240,14 +261,14 @@ fn build_legacy_runtime_explain(
     service_name: &str,
     mgr: &ServiceConfigManager,
     routing: &ServiceRoutingExplanation,
-    request_model: Option<String>,
+    request: RouteRequestContext,
 ) -> RoutingExplainResponse {
     let services = legacy_runtime_services_for_explain(mgr, routing);
     let template = compile_legacy_route_plan_template(service_name, services);
-    build_routing_explain_response(
+    build_routing_explain_response_with_request(
         service_name,
         None,
-        request_model,
+        request,
         None,
         &template,
         &RoutePlanRuntimeState::default(),
@@ -281,6 +302,24 @@ fn legacy_runtime_services_for_explain<'a>(
 fn print_runtime_explain_text(explain: &RoutingExplainResponse) {
     if let Some(model) = explain.request_model.as_deref() {
         println!("Request model: {model}");
+    }
+    if let Some(service_tier) = explain.request_context.service_tier.as_deref() {
+        println!("Request service tier: {service_tier}");
+    }
+    if let Some(reasoning_effort) = explain.request_context.reasoning_effort.as_deref() {
+        println!("Request reasoning effort: {reasoning_effort}");
+    }
+    if let Some(path) = explain.request_context.path.as_deref() {
+        println!("Request path: {path}");
+    }
+    if let Some(method) = explain.request_context.method.as_deref() {
+        println!("Request method: {method}");
+    }
+    if !explain.request_context.headers.is_empty() {
+        println!(
+            "Request headers: {}",
+            explain.request_context.headers.join(", ")
+        );
     }
     if let Some(selected) = &explain.selected_route {
         println!(
@@ -316,6 +355,25 @@ fn print_runtime_explain_text(explain: &RoutingExplainResponse) {
             candidate.route_path.join(" > ")
         );
     }
+
+    if !explain.conditional_routes.is_empty() {
+        println!("Conditional routes:");
+        for route in &explain.conditional_routes {
+            let target = route
+                .selected_target
+                .as_ref()
+                .map(format_route_ref)
+                .unwrap_or_else(|| "<none>".to_string());
+            println!(
+                "  {} matched={} branch={} target={} condition=[{}]",
+                route.route_name,
+                route.matched,
+                format_conditional_branch(route.selected_branch),
+                target,
+                format_condition(&route.condition)
+            );
+        }
+    }
 }
 
 fn format_skip_reasons(reasons: &[RoutingExplainSkipReason]) -> String {
@@ -328,6 +386,49 @@ fn format_skip_reasons(reasons: &[RoutingExplainSkipReason]) -> String {
         .map(RoutingExplainSkipReason::code)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn format_conditional_branch(branch: RoutingExplainConditionalBranch) -> &'static str {
+    match branch {
+        RoutingExplainConditionalBranch::Then => "then",
+        RoutingExplainConditionalBranch::Default => "default",
+    }
+}
+
+fn format_route_ref(route_ref: &RoutingExplainRouteRef) -> String {
+    let kind = match route_ref.kind {
+        RoutingExplainRouteRefKind::Route => "route",
+        RoutingExplainRouteRefKind::Provider => "provider",
+    };
+    format!("{kind}:{}", route_ref.name)
+}
+
+fn format_condition(condition: &RoutingExplainCondition) -> String {
+    let mut parts = Vec::new();
+    if let Some(model) = condition.model.as_deref() {
+        parts.push(format!("model={model}"));
+    }
+    if let Some(service_tier) = condition.service_tier.as_deref() {
+        parts.push(format!("service_tier={service_tier}"));
+    }
+    if let Some(reasoning_effort) = condition.reasoning_effort.as_deref() {
+        parts.push(format!("reasoning_effort={reasoning_effort}"));
+    }
+    if let Some(path) = condition.path.as_deref() {
+        parts.push(format!("path={path}"));
+    }
+    if let Some(method) = condition.method.as_deref() {
+        parts.push(format!("method={method}"));
+    }
+    if !condition.headers.is_empty() {
+        parts.push(format!("headers={}", condition.headers.join(",")));
+    }
+
+    if parts.is_empty() {
+        "<empty>".to_string()
+    } else {
+        parts.join(",")
+    }
 }
 
 fn build_group_explain(
@@ -501,6 +602,11 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
             json,
             provider,
             model,
+            service_tier,
+            reasoning_effort,
+            path,
+            method,
+            headers,
         } => {
             let service = resolve_service(codex, claude)
                 .await
@@ -508,13 +614,20 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
             let document = load_config_document()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let request_model = clean_optional(model);
+            let request = build_route_request_context(
+                model,
+                service_tier,
+                reasoning_effort,
+                path,
+                method,
+                headers,
+            )
+            .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
 
             if let ConfigDocument::V4(cfg) = &document {
                 let (view, label) = select_v4_service_view(cfg, service);
-                let runtime_explain =
-                    build_v4_runtime_explain(service, view, request_model.clone())
-                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                let runtime_explain = build_v4_runtime_explain(service, view, request.clone())
+                    .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 if json {
                     if let Some(provider_name) = provider.as_deref()
                         && explain_v4_provider(view, provider_name).is_none()
@@ -542,8 +655,7 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
             let routing = explain_service_routing(mgr);
             let group_detail = build_group_explain(mgr, provider.as_deref())
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            let runtime_explain =
-                build_legacy_runtime_explain(service, mgr, &routing, request_model);
+            let runtime_explain = build_legacy_runtime_explain(service, mgr, &routing, request);
 
             if json {
                 if let Some(provider_name) = provider.as_deref()
@@ -610,8 +722,15 @@ mod tests {
             ..ServiceViewV4::default()
         };
 
-        let explain = build_v4_runtime_explain("codex", &view, Some("gpt-5".to_string()))
-            .expect("runtime explain");
+        let explain = build_v4_runtime_explain(
+            "codex",
+            &view,
+            RouteRequestContext {
+                model: Some("gpt-5".to_string()),
+                ..RouteRequestContext::default()
+            },
+        )
+        .expect("runtime explain");
         let value = serde_json::to_value(&explain).expect("serialize runtime explain");
 
         assert_eq!(value["api_version"].as_u64(), Some(1));

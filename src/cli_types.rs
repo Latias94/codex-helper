@@ -271,6 +271,21 @@ pub enum RoutingCommand {
         /// Explain selection for a requested model
         #[arg(long)]
         model: Option<String>,
+        /// Explain selection for a requested service tier
+        #[arg(long = "service-tier")]
+        service_tier: Option<String>,
+        /// Explain selection for a requested reasoning effort
+        #[arg(long = "reasoning-effort")]
+        reasoning_effort: Option<String>,
+        /// Explain selection for a request path
+        #[arg(long)]
+        path: Option<String>,
+        /// Explain selection for an HTTP method
+        #[arg(long)]
+        method: Option<String>,
+        /// Explain selection for a header condition, as NAME=VALUE; repeatable
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        headers: Vec<String>,
     },
     /// Patch routing fields directly
     Set {

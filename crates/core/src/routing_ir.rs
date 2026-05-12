@@ -1179,7 +1179,7 @@ fn expand_conditional_route(
     )
 }
 
-fn request_matches_condition(
+pub(crate) fn request_matches_condition(
     request: &RouteRequestContext,
     condition: &RoutingConditionV4,
 ) -> bool {

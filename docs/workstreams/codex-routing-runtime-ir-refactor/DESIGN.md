@@ -137,11 +137,17 @@ Phase 1 parity requirement:
 
 ### conditional
 
-Conditional routing is not part of Phase 1.
+Conditional routing is introduced after executor parity, not in Phase 1.
 
-The IR should reserve a strategy extension point so later work can evaluate
-conditions over request metadata, such as model, path, headers, service tier,
-reasoning effort, session metadata, or project identity.
+The first supported condition set is deliberately request-local and available
+before routing: model, service tier, reasoning effort, path, method, and
+headers. A conditional node must define a non-empty `when`, an explicit `then`
+target, and an explicit `default` target. Both targets may point to providers or
+route nodes, so conditionals compose with existing ordered fallback.
+
+Header condition values are used for matching but redacted from explain output.
+Explain surfaces report header names, the selected branch, and the selected
+target without exposing configured or requested header values.
 
 ## Compilation Pipeline
 
@@ -308,6 +314,16 @@ all current runtime candidates, `route_path`, `endpoint_id`, and structured
 The CLI `routing explain --json` uses the same response contract, with
 `runtime_loaded_at_ms` set to `null` when it explains the local compiled config
 without a running proxy snapshot.
+
+P5 extends that response with additive fields:
+
+- `request_context` for request fields used by request-aware routing;
+- `conditional_routes` for each evaluated conditional node, including condition
+  fields, header names, match result, selected branch, and selected target.
+
+The legacy v4-to-v2 runtime path still cannot execute conditional nodes. Until
+P6 moves v4 execution onto request-aware route plan IR, production config
+flattening rejects `conditional` instead of silently guessing a branch.
 
 ## Testing Strategy
 

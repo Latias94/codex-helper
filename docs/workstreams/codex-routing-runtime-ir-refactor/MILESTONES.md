@@ -104,15 +104,16 @@ Acceptance:
 Acceptance:
 
 - [x] conditional routing composes with existing ordered fallback;
-- [ ] conditions are explainable from the runtime explain contract;
+- [x] conditions are explainable from the runtime explain contract;
 - [x] unsupported or ambiguous conditions fail validation instead of being
   guessed.
 
 Status note:
 
-- The P5 schema and IR compiler support is in place. Production request routing
-  still rejects `conditional` on the legacy v4-to-v2 flattening path until P6
-  moves v4 execution onto request-aware route plan IR.
+- The P5 schema, IR compiler, and explain contract support are in place.
+  Production request routing still rejects `conditional` on the legacy
+  v4-to-v2 flattening path until P6 moves v4 execution onto request-aware route
+  plan IR.
 
 ## P6 - Legacy Flattening Cleanup
 
