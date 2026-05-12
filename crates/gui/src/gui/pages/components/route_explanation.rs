@@ -56,6 +56,18 @@ pub(in super::super) fn format_resolved_route_value_for_field(
     }
 }
 
+pub(in super::super) fn format_route_decision_provider_endpoint(
+    provider_id: Option<&str>,
+    endpoint_id: Option<&str>,
+) -> Option<String> {
+    match (provider_id, endpoint_id) {
+        (Some(provider), Some(endpoint)) => Some(format!("{provider}/{endpoint}")),
+        (Some(provider), None) => Some(provider.to_string()),
+        (None, Some(endpoint)) => Some(endpoint.to_string()),
+        (None, None) => None,
+    }
+}
+
 pub(in super::super) fn render_effective_route_explanation_grid(
     ui: &mut egui::Ui,
     lang: Language,
@@ -138,8 +150,14 @@ pub(in super::super) fn render_last_route_decision_card(
                     session_binding_mode_label(decision.binding_continuity_mode, lang)
                 ));
             }
-            if let Some(provider) = decision.provider_id.as_deref() {
-                ui.small(format!("provider(decided): {provider}"));
+            if let Some(provider_endpoint) = format_route_decision_provider_endpoint(
+                decision.provider_id.as_deref(),
+                decision.endpoint_id.as_deref(),
+            ) {
+                ui.small(format!(
+                    "{}: {provider_endpoint}",
+                    pick(lang, "provider/endpoint(决策)", "provider/endpoint")
+                ));
             }
 
             egui::Grid::new((
@@ -201,6 +219,28 @@ pub(in super::super) fn render_last_route_decision_card(
             }
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_route_decision_provider_endpoint_prefers_endpoint_identity() {
+        assert_eq!(
+            format_route_decision_provider_endpoint(Some("alpha"), Some("default")),
+            Some("alpha/default".to_string())
+        );
+        assert_eq!(
+            format_route_decision_provider_endpoint(Some("alpha"), None),
+            Some("alpha".to_string())
+        );
+        assert_eq!(
+            format_route_decision_provider_endpoint(None, Some("default")),
+            Some("default".to_string())
+        );
+        assert_eq!(format_route_decision_provider_endpoint(None, None), None);
+    }
 }
 
 fn observed_route_snapshot_rows(

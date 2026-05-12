@@ -231,6 +231,7 @@ fn session_current_target_summary_uses_decision_provider_when_aligned() {
     });
     row.last_route_decision = Some(RouteDecisionProvenance {
         provider_id: Some("right".to_string()),
+        endpoint_id: Some("default".to_string()),
         effective_station: Some(ResolvedRouteValue {
             value: "right".to_string(),
             source: RouteValueSource::RuntimeFallback,
@@ -245,7 +246,7 @@ fn session_current_target_summary_uses_decision_provider_when_aligned() {
     let summary = session_current_target_summary(&row, Language::En);
 
     assert!(summary.contains("station=right [global override]"));
-    assert!(summary.contains("provider=right [last decision]"));
+    assert!(summary.contains("provider=right/default [last decision]"));
     assert!(summary.contains("upstream=api.right.example [runtime fallback]"));
 }
 
@@ -265,6 +266,7 @@ fn session_current_target_summary_marks_provider_as_needing_refresh_after_drift(
     });
     row.last_route_decision = Some(RouteDecisionProvenance {
         provider_id: Some("right".to_string()),
+        endpoint_id: Some("default".to_string()),
         effective_station: Some(ResolvedRouteValue {
             value: "right".to_string(),
             source: RouteValueSource::RuntimeFallback,
@@ -281,6 +283,17 @@ fn session_current_target_summary_marks_provider_as_needing_refresh_after_drift(
     assert!(summary.contains("station=vibe [global override]"));
     assert!(summary.contains("provider=<needs fresh request>"));
     assert!(summary.contains("upstream=api.vibe.example [runtime fallback]"));
+}
+
+#[test]
+fn session_row_matches_query_finds_route_endpoint_id() {
+    let mut row = sample_session_row();
+    row.last_route_decision = Some(RouteDecisionProvenance {
+        endpoint_id: Some("default".to_string()),
+        ..Default::default()
+    });
+
+    assert!(session_row_matches_query(&row, "default"));
 }
 
 #[test]

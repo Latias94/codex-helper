@@ -17,6 +17,9 @@ pub(super) fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
         row.last_service_tier.as_deref(),
         row.last_provider_id.as_deref(),
         row.last_station_name(),
+        row.last_route_decision
+            .as_ref()
+            .and_then(|decision| decision.endpoint_id.as_deref()),
         row.last_upstream_base_url.as_deref(),
         row.binding_profile_name.as_deref(),
         row.effective_model.as_ref().map(|v| v.value.as_str()),
@@ -103,10 +106,11 @@ pub(super) fn session_current_target_summary(row: &SessionRow, lang: Language) -
             .as_ref()
             .map(|value| value.value.as_str());
         if current_station == decision_station && current_upstream == decision_upstream {
-            decision
-                .provider_id
-                .as_deref()
-                .map(|provider| format!("{provider} [{}]", pick(lang, "最近决策", "last decision")))
+            format_route_decision_provider_endpoint(
+                decision.provider_id.as_deref(),
+                decision.endpoint_id.as_deref(),
+            )
+            .map(|provider| format!("{provider} [{}]", pick(lang, "最近决策", "last decision")))
         } else {
             None
         }
@@ -117,9 +121,9 @@ pub(super) fn session_current_target_summary(row: &SessionRow, lang: Language) -
         let observed_station = row.last_station_name();
         let observed_upstream = row.last_upstream_base_url.as_deref();
         if current_station == observed_station && current_upstream == observed_upstream {
-            row.last_provider_id.as_deref().map(|provider| {
-                format!("{provider} [{}]", pick(lang, "最近执行", "last execution"))
-            })
+            format_route_decision_provider_endpoint(row.last_provider_id.as_deref(), None).map(
+                |provider| format!("{provider} [{}]", pick(lang, "最近执行", "last execution")),
+            )
         } else {
             None
         }
@@ -135,10 +139,21 @@ pub(super) fn session_last_executed_target_summary(row: &SessionRow, lang: Langu
         .as_deref()
         .map(|value| summarize_upstream_target(value, 56))
         .unwrap_or_else(|| "-".to_string());
+    let provider = if let Some(decision) = row.last_route_decision.as_ref() {
+        format_route_decision_provider_endpoint(
+            decision.provider_id.as_deref(),
+            decision.endpoint_id.as_deref(),
+        )
+        .or_else(|| row.last_provider_id.as_deref().map(ToOwned::to_owned))
+    } else {
+        row.last_provider_id.as_deref().map(ToOwned::to_owned)
+    }
+    .unwrap_or_else(|| "-".to_string());
+
     format!(
         "station={}, provider={}, upstream={}, service_tier={}",
         row.last_station_name().unwrap_or("-"),
-        row.last_provider_id.as_deref().unwrap_or("-"),
+        provider,
         upstream,
         format_service_tier_display(row.last_service_tier.as_deref(), lang, "-"),
     )

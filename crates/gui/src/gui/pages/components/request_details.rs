@@ -394,12 +394,19 @@ fn render_request_control_trace_card(ui: &mut egui::Ui, lang: Language, request:
                 session_binding_mode_label(decision.binding_continuity_mode, lang)
             ));
         }
-        if let Some(provider) = decision
-            .provider_id
-            .as_deref()
-            .or(request.provider_id.as_deref())
+        if let Some(provider_endpoint) =
+            super::route_explanation::format_route_decision_provider_endpoint(
+                decision
+                    .provider_id
+                    .as_deref()
+                    .or(request.provider_id.as_deref()),
+                decision.endpoint_id.as_deref(),
+            )
         {
-            ui.small(format!("provider(decided): {provider}"));
+            ui.small(format!(
+                "{}: {provider_endpoint}",
+                pick(lang, "provider/endpoint(决策)", "provider/endpoint")
+            ));
         }
 
         ui.add_space(6.0);

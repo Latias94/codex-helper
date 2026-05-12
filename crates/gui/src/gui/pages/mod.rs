@@ -157,10 +157,10 @@ mod view_state;
 
 #[allow(unused_imports)]
 use components::route_explanation::{
-    format_resolved_route_value_for_field, format_route_value_for_field,
-    format_service_tier_display, render_effective_route_explanation_grid,
-    render_last_route_decision_card, render_observed_route_snapshot_card,
-    render_session_route_snapshot_card,
+    format_resolved_route_value_for_field, format_route_decision_provider_endpoint,
+    format_route_value_for_field, format_service_tier_display,
+    render_effective_route_explanation_grid, render_last_route_decision_card,
+    render_observed_route_snapshot_card, render_session_route_snapshot_card,
 };
 #[allow(unused_imports)]
 use formatting::*;

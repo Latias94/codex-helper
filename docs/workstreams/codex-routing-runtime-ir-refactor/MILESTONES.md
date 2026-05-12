@@ -82,6 +82,8 @@ Status note:
 - Provider endpoint overrides now key off `service / provider_id /
   endpoint_id` first. The legacy `base_url` view remains as a compatibility
   alias for older callers and UI surfaces.
+- Session summaries and route decision cards now surface provider/endpoint
+  identity when it is available, and session search matches endpoint IDs too.
 
 ## P4 - Decision Trace And Explain APIs
 
