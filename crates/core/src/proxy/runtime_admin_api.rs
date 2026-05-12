@@ -223,8 +223,11 @@ pub(super) async fn get_routing_explain(
         .state
         .get_upstream_meta_overrides(proxy.service_name)
         .await;
-    let runtime =
-        route_plan_runtime_state_from_lbs_with_overrides(&route_selection.lbs, &upstream_overrides);
+    let runtime = route_plan_runtime_state_from_lbs_with_overrides(
+        proxy.service_name,
+        &route_selection.lbs,
+        &upstream_overrides,
+    );
     Ok(Json(build_routing_explain_response_with_request(
         proxy.service_name,
         Some(proxy.config.last_loaded_at_ms()),

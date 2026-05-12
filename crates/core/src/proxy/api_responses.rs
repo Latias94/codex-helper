@@ -130,6 +130,7 @@ pub(super) async fn build_operator_summary(
         .ok()
         .map(|persisted_cfg| {
             build_provider_options_from_view(
+                proxy.service_name,
                 service_view_v2(&persisted_cfg, proxy.service_name),
                 &provider_upstream_overrides,
             )

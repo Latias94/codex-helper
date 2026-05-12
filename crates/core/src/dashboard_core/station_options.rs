@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use crate::config::{
     ProviderConfigV2, ServiceConfig, ServiceConfigManager, ServiceViewV2, UpstreamConfig,
 };
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::RuntimeConfigState;
 
 use super::types::{
@@ -90,6 +91,7 @@ pub fn build_model_options_from_mgr(mgr: &ServiceConfigManager) -> Vec<String> {
 }
 
 pub fn build_provider_options_from_view(
+    service_name: &str,
     view: &ServiceViewV2,
     upstream_overrides: &HashMap<String, (Option<bool>, Option<RuntimeConfigState>)>,
 ) -> Vec<ProviderOption> {
@@ -102,6 +104,7 @@ pub fn build_provider_options_from_view(
                 .iter()
                 .map(|(endpoint_name, endpoint)| {
                     build_provider_endpoint_option(
+                        service_name,
                         provider_name,
                         provider,
                         endpoint_name,
@@ -176,15 +179,19 @@ fn build_station_capability_summary(station: &ServiceConfig) -> StationCapabilit
 }
 
 fn build_provider_endpoint_option(
+    service_name: &str,
     provider_name: &str,
     provider: &ProviderConfigV2,
     endpoint_name: &str,
     endpoint: &crate::config::ProviderEndpointV2,
     upstream_overrides: &HashMap<String, (Option<bool>, Option<RuntimeConfigState>)>,
 ) -> ProviderEndpointOption {
+    let override_key =
+        ProviderEndpointKey::new(service_name, provider_name, endpoint_name).stable_key();
     let (runtime_enabled_override, runtime_state_override) = upstream_overrides
-        .get(endpoint.base_url.as_str())
+        .get(override_key.as_str())
         .copied()
+        .or_else(|| upstream_overrides.get(endpoint.base_url.as_str()).copied())
         .unwrap_or((None, None));
     let runtime_state = runtime_state_override.unwrap_or_default();
     let configured_enabled = provider.enabled && endpoint.enabled;
@@ -512,6 +519,7 @@ mod tests {
         );
 
         let options = build_provider_options_from_view(
+            "codex",
             &view,
             &HashMap::from([
                 (

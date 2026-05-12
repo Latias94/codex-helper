@@ -4,13 +4,15 @@ use crate::lb::LoadBalancer;
 use crate::routing_ir::{
     RoutePlanRuntimeState, RoutePlanStationRuntimeState, RoutePlanUpstreamRuntimeState,
 };
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::RuntimeConfigState;
 
 pub(super) fn route_plan_runtime_state_from_lbs(lbs: &[LoadBalancer]) -> RoutePlanRuntimeState {
-    route_plan_runtime_state_from_lbs_with_overrides(lbs, &HashMap::new())
+    route_plan_runtime_state_from_lbs_with_overrides("", lbs, &HashMap::new())
 }
 
 pub(super) fn route_plan_runtime_state_from_lbs_with_overrides(
+    service_name: &str,
     lbs: &[LoadBalancer],
     upstream_overrides: &HashMap<String, (Option<bool>, Option<RuntimeConfigState>)>,
 ) -> RoutePlanRuntimeState {
@@ -44,9 +46,20 @@ pub(super) fn route_plan_runtime_state_from_lbs_with_overrides(
             } else {
                 state.failure_counts.get(idx).copied().unwrap_or_default()
             };
-            let (enabled_override, state_override) = upstream_overrides
-                .get(upstream.base_url.as_str())
-                .copied()
+            let override_key = upstream.tags.get("provider_id").and_then(|provider_id| {
+                upstream.tags.get("endpoint_id").map(|endpoint_id| {
+                    ProviderEndpointKey::new(
+                        service_name,
+                        provider_id.as_str(),
+                        endpoint_id.as_str(),
+                    )
+                    .stable_key()
+                })
+            });
+            let (enabled_override, state_override) = override_key
+                .as_deref()
+                .and_then(|key| upstream_overrides.get(key).copied())
+                .or_else(|| upstream_overrides.get(upstream.base_url.as_str()).copied())
                 .unwrap_or((None, None));
             station.set_upstream(
                 idx,

@@ -12,6 +12,7 @@ use crate::config::{
 };
 use crate::dashboard_core::{ProviderOption, build_provider_options_from_view};
 use crate::logging::{log_retry_trace, now_ms};
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::RuntimeConfigState;
 use crate::usage_providers::{UsageProviderRefreshSummary, refresh_balances_for_service};
 
@@ -76,6 +77,29 @@ fn normalize_optional_filter(value: Option<String>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn provider_endpoint_override_key(
+    service_name: &str,
+    provider_name: &str,
+    endpoint_name: &str,
+) -> String {
+    ProviderEndpointKey::new(service_name, provider_name, endpoint_name).stable_key()
+}
+
+fn endpoint_base_url_is_unique(
+    provider: &crate::config::ProviderConfigV2,
+    endpoint_name: &str,
+) -> bool {
+    let Some(endpoint) = provider.endpoints.get(endpoint_name) else {
+        return false;
+    };
+    provider
+        .endpoints
+        .values()
+        .filter(|candidate| candidate.base_url == endpoint.base_url)
+        .count()
+        == 1
 }
 
 fn merge_refresh_summary(
@@ -396,6 +420,7 @@ pub(super) async fn list_providers(
         .get_upstream_meta_overrides(proxy.service_name)
         .await;
     Ok(Json(build_provider_options_from_view(
+        proxy.service_name,
         service_view_v2(&cfg, proxy.service_name),
         &upstream_overrides,
     )))
@@ -419,43 +444,141 @@ pub(super) async fn apply_provider_runtime_meta(
     let provider_name = normalize_provider_name(payload.provider_name.as_str())?;
     let endpoint_name = normalize_optional_endpoint_name(payload.endpoint_name);
     let cfg = load_persisted_proxy_settings_v2().await?;
-    let base_urls = resolve_target_base_urls(
-        service_view_v2(&cfg, proxy.service_name),
-        provider_name.as_str(),
-        endpoint_name.as_deref(),
-    )?;
+    let view = service_view_v2(&cfg, proxy.service_name);
+    let base_urls =
+        resolve_target_base_urls(view, provider_name.as_str(), endpoint_name.as_deref())?;
     let runtime_state = payload.runtime_state;
     let applied_base_urls = base_urls.clone();
 
     let now = now_ms();
-    for base_url in base_urls {
+    if let Some(endpoint_name) = endpoint_name.as_deref() {
+        let provider = view.providers.get(provider_name.as_str()).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("provider '{}' not found", provider_name),
+            )
+        })?;
+        let Some(endpoint) = provider.endpoints.get(endpoint_name) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!(
+                    "provider endpoint '{}.{}' not found",
+                    provider_name, endpoint_name
+                ),
+            ));
+        };
+        let override_key = provider_endpoint_override_key(
+            proxy.service_name,
+            provider_name.as_str(),
+            endpoint_name,
+        );
         if payload.clear_enabled {
             proxy
                 .state
-                .clear_upstream_enabled_override(proxy.service_name, base_url.as_str())
+                .clear_upstream_enabled_override(proxy.service_name, override_key.as_str())
                 .await;
         } else if let Some(enabled) = payload.enabled {
             proxy
                 .state
-                .set_upstream_enabled_override(proxy.service_name, base_url.clone(), enabled, now)
+                .set_upstream_enabled_override(
+                    proxy.service_name,
+                    override_key.clone(),
+                    enabled,
+                    now,
+                )
                 .await;
+        }
+        if endpoint_base_url_is_unique(provider, endpoint_name) {
+            if payload.clear_enabled {
+                proxy
+                    .state
+                    .clear_upstream_enabled_override(proxy.service_name, endpoint.base_url.as_str())
+                    .await;
+            } else if let Some(enabled) = payload.enabled {
+                proxy
+                    .state
+                    .set_upstream_enabled_override(
+                        proxy.service_name,
+                        endpoint.base_url.clone(),
+                        enabled,
+                        now,
+                    )
+                    .await;
+            }
         }
 
         if payload.clear_runtime_state {
             proxy
                 .state
-                .clear_upstream_runtime_state_override(proxy.service_name, base_url.as_str())
+                .clear_upstream_runtime_state_override(proxy.service_name, override_key.as_str())
                 .await;
         } else if let Some(runtime_state) = payload.runtime_state {
             proxy
                 .state
                 .set_upstream_runtime_state_override(
                     proxy.service_name,
-                    base_url.clone(),
+                    override_key,
                     runtime_state,
                     now,
                 )
                 .await;
+        }
+        if endpoint_base_url_is_unique(provider, endpoint_name) {
+            if payload.clear_runtime_state {
+                proxy
+                    .state
+                    .clear_upstream_runtime_state_override(
+                        proxy.service_name,
+                        endpoint.base_url.as_str(),
+                    )
+                    .await;
+            } else if let Some(runtime_state) = payload.runtime_state {
+                proxy
+                    .state
+                    .set_upstream_runtime_state_override(
+                        proxy.service_name,
+                        endpoint.base_url.clone(),
+                        runtime_state,
+                        now,
+                    )
+                    .await;
+            }
+        }
+    } else {
+        for base_url in base_urls {
+            if payload.clear_enabled {
+                proxy
+                    .state
+                    .clear_upstream_enabled_override(proxy.service_name, base_url.as_str())
+                    .await;
+            } else if let Some(enabled) = payload.enabled {
+                proxy
+                    .state
+                    .set_upstream_enabled_override(
+                        proxy.service_name,
+                        base_url.clone(),
+                        enabled,
+                        now,
+                    )
+                    .await;
+            }
+
+            if payload.clear_runtime_state {
+                proxy
+                    .state
+                    .clear_upstream_runtime_state_override(proxy.service_name, base_url.as_str())
+                    .await;
+            } else if let Some(runtime_state) = payload.runtime_state {
+                proxy
+                    .state
+                    .set_upstream_runtime_state_override(
+                        proxy.service_name,
+                        base_url.clone(),
+                        runtime_state,
+                        now,
+                    )
+                    .await;
+            }
         }
     }
 
