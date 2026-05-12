@@ -10,8 +10,8 @@ use crate::tui::ProviderOption;
 use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, basename, duration_short, format_age,
-    format_observed_client_identity, now_ms, session_balance_brief_lang,
-    session_control_posture_lang, session_observation_scope_label_lang,
+    format_observed_client_identity, now_ms, request_cache_hit_rate_label,
+    session_balance_brief_lang, session_control_posture_lang, session_observation_scope_label_lang,
     session_primary_balance_snapshot, session_row_has_any_override,
     session_transcript_host_status_lang, short_sid, shorten, shorten_middle, status_style,
     tokens_short, usage_line_lang,
@@ -490,17 +490,27 @@ fn render_requests_panel(
         .take(60)
         .collect::<Vec<_>>();
 
-    let header = Row::new(vec![
+    let show_cache_hit = area.width >= 74;
+    let mut header_cells = vec![
         Cell::from(Span::styled(l("Age"), Style::default().fg(p.muted))),
         Cell::from(Span::styled(l("St"), Style::default().fg(p.muted))),
         Cell::from(Span::styled(l("TTFB"), Style::default().fg(p.muted))),
         Cell::from(Span::styled(l("Total"), Style::default().fg(p.muted))),
         Cell::from(Span::styled(l("In"), Style::default().fg(p.muted))),
         Cell::from(Span::styled(l("Out"), Style::default().fg(p.muted))),
+    ];
+    if show_cache_hit {
+        header_cells.push(Cell::from(Span::styled(
+            l("Hit%"),
+            Style::default().fg(p.muted),
+        )));
+    }
+    header_cells.extend([
         Cell::from(Span::styled(l("CRead"), Style::default().fg(p.muted))),
         Cell::from(Span::styled(l("CNew"), Style::default().fg(p.muted))),
         Cell::from(Span::styled(l("Tok"), Style::default().fg(p.muted))),
     ]);
+    let header = Row::new(header_cells);
 
     let now = now_ms();
     let rows = filtered
@@ -529,43 +539,61 @@ fn render_requests_panel(
             let cache_new = usage
                 .map(|u| tokens_short(u.cache_creation_tokens_total()))
                 .unwrap_or_else(|| "-".to_string());
+            let cache_hit = request_cache_hit_rate_label(r);
             let total_tokens = usage
                 .map(|u| tokens_short(u.total_tokens))
                 .unwrap_or_else(|| "-".to_string());
 
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(Span::styled(age, Style::default().fg(p.muted))),
                 Cell::from(Line::from(vec![status])),
                 Cell::from(Span::styled(ttfb, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(total_dur, Style::default().fg(p.muted))),
                 Cell::from(input),
                 Cell::from(output),
+            ];
+            if show_cache_hit {
+                cells.push(Cell::from(Span::styled(
+                    cache_hit,
+                    Style::default().fg(if r.cache_hit_rate().is_some() {
+                        p.accent
+                    } else {
+                        p.muted
+                    }),
+                )));
+            }
+            cells.extend([
                 Cell::from(cache_read),
                 Cell::from(cache_new),
                 Cell::from(Span::styled(total_tokens, Style::default().fg(p.accent))),
-            ])
-            .style(Style::default().bg(p.panel).fg(p.text))
+            ]);
+
+            Row::new(cells).style(Style::default().bg(p.panel).fg(p.text))
         })
         .collect::<Vec<_>>();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(6),
-            Constraint::Length(4),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(6),
-            Constraint::Length(6),
-        ],
-    )
-    .header(header)
-    .block(block)
-    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
-    .highlight_spacing(HighlightSpacing::Always);
+    let mut widths = vec![
+        Constraint::Length(6),
+        Constraint::Length(4),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(6),
+        Constraint::Length(6),
+    ];
+    if show_cache_hit {
+        widths.push(Constraint::Length(6));
+    }
+    widths.extend([
+        Constraint::Length(7),
+        Constraint::Length(6),
+        Constraint::Length(6),
+    ]);
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+        .highlight_spacing(HighlightSpacing::Always);
 
     f.render_stateful_widget(table, area, &mut ui.requests_table);
 

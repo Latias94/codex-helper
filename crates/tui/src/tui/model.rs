@@ -1225,6 +1225,13 @@ pub(in crate::tui) fn usage_line_lang(usage: &UsageMetrics, lang: Language) -> S
     line
 }
 
+pub(in crate::tui) fn request_cache_hit_rate_label(request: &FinishedRequest) -> String {
+    request
+        .cache_hit_rate()
+        .map(|rate| format!("{:.1}%", rate * 100.0))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 pub(in crate::tui) fn status_style(p: Palette, status: Option<u16>) -> Style {
     match status {
         Some(s) if (200..300).contains(&s) => Style::default().fg(p.good),

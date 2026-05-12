@@ -5,8 +5,9 @@ use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, T
 
 use crate::tui::i18n;
 use crate::tui::model::{
-    Palette, Snapshot, duration_short, format_age, now_ms, request_matches_page_filters,
-    request_page_focus_session_id, shorten, shorten_middle, status_style, usage_line_lang,
+    Palette, Snapshot, duration_short, format_age, now_ms, request_cache_hit_rate_label,
+    request_matches_page_filters, request_page_focus_session_id, shorten, shorten_middle,
+    status_style, usage_line_lang,
 };
 use crate::tui::state::UiState;
 
@@ -107,7 +108,7 @@ pub(super) fn render_requests_page(
             let dur = duration_short(r.duration_ms);
             let attempts_n = r.attempt_count();
             let attempts = attempts_n.to_string();
-            let cache_hit = request_cache_hit_rate(r);
+            let cache_hit = request_cache_hit_rate_label(r);
             let cache_hit_style =
                 Style::default().fg(if cache_hit != "-" { p.accent } else { p.muted });
             let model = r.model.as_deref().unwrap_or("-").to_string();
@@ -449,13 +450,6 @@ fn request_cost_parts_line(request: &crate::state::FinishedRequest) -> Option<St
         parts.push(format!("create=${value}"));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
-}
-
-fn request_cache_hit_rate(request: &crate::state::FinishedRequest) -> String {
-    request
-        .cache_hit_rate()
-        .map(|rate| format!("{:.1}%", rate * 100.0))
-        .unwrap_or_else(|| "-".to_string())
 }
 
 fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> String {

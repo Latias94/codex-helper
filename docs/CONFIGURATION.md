@@ -20,6 +20,7 @@ Some runtime internals still use the legacy `station` wording, but hand-written 
 - Balance adapters: `~/.codex-helper/usage_providers.json`
 - Pricing overrides: `~/.codex-helper/pricing_overrides.toml`
 - Request log: `~/.codex-helper/logs/requests.jsonl`
+- Routing/control trace: `~/.codex-helper/logs/control_trace.jsonl`
 
 Codex-owned files remain owned by Codex:
 
@@ -213,6 +214,64 @@ children = ["monthly_pool", "codex_for"]
 ```
 
 This keeps the monthly pool as a first-class route node. Temporary 502/429-style failures recover through cooldown and later reprobe. `unknown` balance is not treated as exhausted. Confirmed exhaustion is the only balance signal that can demote a monthly candidate.
+
+### Monthly Pool With Relay Fallback Pool
+
+Use this when you want to spend monthly providers first, then try several relay fallbacks in a fixed order.
+
+```toml
+version = 4
+
+[codex.providers.monthly_a]
+base_url = "https://monthly-a.example/v1"
+auth_token_env = "MONTHLY_A_API_KEY"
+tags = { billing = "monthly" }
+
+[codex.providers.monthly_b]
+base_url = "https://monthly-b.example/v1"
+auth_token_env = "MONTHLY_B_API_KEY"
+tags = { billing = "monthly" }
+
+[codex.providers.monthly_c]
+base_url = "https://monthly-c.example/v1"
+auth_token_env = "MONTHLY_C_API_KEY"
+tags = { billing = "monthly" }
+
+[codex.providers.right]
+base_url = "https://right.example/v1"
+auth_token_env = "RIGHT_API_KEY"
+tags = { billing = "paygo", kind = "relay" }
+
+[codex.providers.cch]
+base_url = "https://cch.example/v1"
+auth_token_env = "CCH_API_KEY"
+tags = { billing = "paygo", kind = "relay" }
+
+[codex.providers.codex_for]
+base_url = "https://codex-for.example/v1"
+auth_token_env = "CODEX_FOR_API_KEY"
+tags = { billing = "paygo", kind = "relay" }
+
+[codex.routing]
+entry = "monthly_first"
+
+[codex.routing.routes.monthly_pool]
+strategy = "ordered-failover"
+children = ["monthly_a", "monthly_b", "monthly_c"]
+on_exhausted = "continue"
+
+[codex.routing.routes.fallback_pool]
+strategy = "ordered-failover"
+children = ["right", "cch", "codex_for"]
+on_exhausted = "continue"
+
+[codex.routing.routes.monthly_first]
+strategy = "ordered-failover"
+children = ["monthly_pool", "fallback_pool"]
+on_exhausted = "continue"
+```
+
+This is the clearest shape for "monthly first, several relays as backup". Session affinity still applies: a conversation keeps using the last successful provider while the route graph stays the same, then moves forward only after that provider fails, cools down, no longer supports the request, or is confirmed exhausted.
 
 ### Monthly First By Tag
 
@@ -536,6 +595,34 @@ Use `--claude` on provider/routing commands when editing the Claude service inst
 `routing show` reads persisted config. `routing list` and `routing explain` read the compiled runtime candidate view.
 Use `routing explain --model <MODEL> --json` to inspect the same selected route, candidate order, route paths, and structured skip reasons exposed by the runtime admin explain API.
 In that response, `provider_id`, `endpoint_id`, and `route_path` are the primary v4 routing identity. Legacy station/upstream identity is reported under each candidate's `compatibility` object; the older top-level `station_name` and `upstream_index` fields remain for backward-compatible clients.
+
+## Inspect Routing And Logs
+
+Use these commands before editing TOML by hand:
+
+```bash
+codex-helper routing show
+codex-helper routing explain --json
+codex-helper routing explain --model <MODEL> --json
+```
+
+`routing show` answers "what is saved in config". `routing explain` answers "what the runtime would try now", including candidate order, route paths, and skip reasons such as disabled provider, unsupported model, cooldown, or trusted balance exhaustion.
+
+Every completed request is written to:
+
+```text
+~/.codex-helper/logs/requests.jsonl
+```
+
+When a request retries or switches provider, the request log stores `retry.route_attempts[]`. The most useful fields are `provider_id`, `endpoint_id`, `route_path`, `decision`, `status_code`, and `error_class`.
+
+The control trace is enabled by default and is written to:
+
+```text
+~/.codex-helper/logs/control_trace.jsonl
+```
+
+It records routing selection events such as the compiled v4 route plan, pinned-route decisions, retry options, and failover reasons. Set `CODEX_HELPER_CONTROL_TRACE=0` to turn it off, or `CODEX_HELPER_CONTROL_TRACE_PATH` to write it somewhere else. The older `retry_trace.jsonl` file is only written when `CODEX_HELPER_RETRY_TRACE=1`.
 
 ## UI Editing
 
