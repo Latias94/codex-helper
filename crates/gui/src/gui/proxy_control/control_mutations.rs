@@ -378,4 +378,72 @@ impl ProxyController {
             _ => bail!("proxy is not running/attached"),
         }
     }
+
+    pub fn set_provider_runtime_meta(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        provider_name: String,
+        endpoint_name: Option<String>,
+        enabled: Option<Option<bool>>,
+        runtime_state: Option<Option<RuntimeConfigState>>,
+    ) -> anyhow::Result<()> {
+        if enabled.is_none() && runtime_state.is_none() {
+            bail!("at least one provider runtime action must be provided");
+        }
+
+        let provider_name = provider_name.trim().to_string();
+        if provider_name.is_empty() {
+            bail!("provider_name cannot be empty");
+        }
+        let endpoint_name = endpoint_name
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let url = mode_control_url(
+            &self.mode,
+            |att| att.api_version == Some(1),
+            "proxy does not support provider runtime control (need api v1)",
+            |_links| None,
+            "/__codex_helper/api/v1/providers/runtime",
+        )?;
+
+        let client = self.http_client.clone();
+        let fut = async move {
+            let clear_enabled = matches!(enabled, Some(None));
+            let clear_runtime_state = matches!(runtime_state, Some(None));
+            let mut body = serde_json::Map::new();
+            body.insert(
+                "provider_name".to_string(),
+                serde_json::Value::String(provider_name),
+            );
+            body.insert(
+                "endpoint_name".to_string(),
+                serde_json::json!(endpoint_name),
+            );
+            body.insert("enabled".to_string(), serde_json::json!(enabled.flatten()));
+            body.insert(
+                "clear_enabled".to_string(),
+                serde_json::json!(clear_enabled),
+            );
+            body.insert(
+                "runtime_state".to_string(),
+                serde_json::json!(runtime_state.flatten()),
+            );
+            body.insert(
+                "clear_runtime_state".to_string(),
+                serde_json::json!(clear_runtime_state),
+            );
+            send_admin_request(
+                client
+                    .post(url)
+                    .timeout(Duration::from_millis(1200))
+                    .json(&serde_json::Value::Object(body)),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        rt.block_on(fut)?;
+        self.refresh_current_if_due(rt, Duration::from_secs(0));
+        Ok(())
+    }
 }
