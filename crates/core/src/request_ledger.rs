@@ -6,9 +6,9 @@ use std::path::Path;
 use serde_json::Value as JsonValue;
 
 pub use crate::logging::request_log_path;
-use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog};
+use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
 use crate::state::{FinishedRequest, RequestObservability, RouteDecisionProvenance};
-use crate::usage::UsageMetrics;
+use crate::usage::{CacheInputAccounting, UsageMetrics};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestLogLine {
@@ -121,7 +121,12 @@ pub struct RequestUsageAggregate {
 }
 
 impl RequestUsageAggregate {
-    pub fn record(&mut self, duration_ms: u64, usage: Option<&UsageMetrics>) {
+    pub fn record(
+        &mut self,
+        duration_ms: u64,
+        usage: Option<&UsageMetrics>,
+        accounting: CacheInputAccounting,
+    ) {
         self.requests = self.requests.saturating_add(1);
         self.duration_ms_total = self.duration_ms_total.saturating_add(duration_ms);
         let Some(usage) = usage else {
@@ -137,11 +142,13 @@ impl RequestUsageAggregate {
             .saturating_add(reasoning_tokens(usage));
         self.cache_read_input_tokens = self
             .cache_read_input_tokens
-            .saturating_add(usage.cache_read_input_tokens.max(0));
+            .saturating_add(usage.cache_read_tokens_total());
         self.cache_creation_input_tokens = self
             .cache_creation_input_tokens
             .saturating_add(cache_creation_tokens(usage));
-        self.total_tokens = self.total_tokens.saturating_add(total_tokens(usage));
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(total_tokens(usage, accounting));
     }
 
     pub fn average_duration_ms(&self) -> u64 {
@@ -296,8 +303,14 @@ fn summarize_request_log_lines<'a>(
         }
         let group_value = group.key(record);
         let duration_ms = u64_field(record, "duration_ms").unwrap_or(0);
+        let service = str_field(record, "service").unwrap_or("-");
+        let usage = usage_metrics(record);
         let entry = aggregate.entry(group_value).or_default();
-        entry.record(duration_ms, usage_metrics(record).as_ref());
+        entry.record(
+            duration_ms,
+            usage.as_ref(),
+            CacheInputAccounting::for_service(service),
+        );
     }
 
     let mut items: Vec<RequestUsageSummaryRow> = aggregate
@@ -338,7 +351,7 @@ pub fn format_request_log_record_lines(record: &JsonValue) -> Vec<String> {
     let speed = usage
         .as_ref()
         .and_then(|usage| output_tokens_per_second(usage, duration_ms, ttfb_ms));
-    let cost = request_cost_display(model.as_str(), usage.as_ref());
+    let cost = request_cost_display(service, model.as_str(), usage.as_ref());
 
     lines.push(format!(
         "    timing duration={} ttfb={} output_speed={} cost={}",
@@ -353,10 +366,10 @@ pub fn format_request_log_record_lines(record: &JsonValue) -> Vec<String> {
             "    tokens input={} output={} cache_read={} cache_create={} reasoning={} total={}",
             usage.input_tokens.max(0),
             usage.output_tokens.max(0),
-            usage.cache_read_input_tokens.max(0),
+            usage.cache_read_tokens_total(),
             cache_creation_tokens(usage),
             reasoning_tokens(usage),
-            total_tokens(usage)
+            total_tokens(usage, CacheInputAccounting::for_service(service))
         ));
     } else {
         lines.push("    tokens -".to_string());
@@ -390,10 +403,12 @@ pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<Fi
     let duration_ms = u64_field(record, "duration_ms").unwrap_or(0);
     let usage = usage_metrics(record);
     let model = request_model(record);
-    let cost = estimate_request_cost_from_operator_catalog(
+    let service = str_field(record, "service").unwrap_or("-");
+    let cost = estimate_request_cost_from_operator_catalog_for_service(
         model.as_deref(),
         usage.as_ref(),
         CostAdjustments::default(),
+        service,
     );
     let retry = record
         .get("retry")
@@ -420,7 +435,7 @@ pub fn finished_request_from_request_log_record(record: &JsonValue) -> Option<Fi
         cost,
         retry,
         observability: RequestObservability::default(),
-        service: str_field(record, "service").unwrap_or("-").to_string(),
+        service: service.to_string(),
         method: str_field(record, "method").unwrap_or("-").to_string(),
         path: str_field(record, "path").unwrap_or("-").to_string(),
         status_code,
@@ -501,13 +516,17 @@ fn usage_metrics(record: &JsonValue) -> Option<UsageMetrics> {
         .and_then(|usage| serde_json::from_value::<UsageMetrics>(usage.clone()).ok())
 }
 
-fn request_cost_display(model: &str, usage: Option<&UsageMetrics>) -> String {
+fn request_cost_display(service: &str, model: &str, usage: Option<&UsageMetrics>) -> String {
     let model = model.trim();
     if model.is_empty() || model == "-" {
         return "-".to_string();
     }
-    let cost =
-        estimate_request_cost_from_operator_catalog(Some(model), usage, CostAdjustments::default());
+    let cost = estimate_request_cost_from_operator_catalog_for_service(
+        Some(model),
+        usage,
+        CostAdjustments::default(),
+        service,
+    );
     cost.display_total_with_confidence()
 }
 
@@ -648,16 +667,16 @@ fn cache_creation_tokens(usage: &UsageMetrics) -> i64 {
     usage.cache_creation_tokens_total().max(0)
 }
 
-fn total_tokens(usage: &UsageMetrics) -> i64 {
+fn total_tokens(usage: &UsageMetrics, accounting: CacheInputAccounting) -> i64 {
     if usage.total_tokens > 0 {
         usage.total_tokens
     } else {
-        usage
-            .input_tokens
-            .max(0)
+        let breakdown = usage.cache_usage_breakdown(accounting);
+        breakdown
+            .effective_input_tokens
             .saturating_add(usage.output_tokens.max(0))
-            .saturating_add(usage.cache_read_input_tokens.max(0))
-            .saturating_add(cache_creation_tokens(usage))
+            .saturating_add(breakdown.cache_read_input_tokens)
+            .saturating_add(breakdown.cache_creation_input_tokens)
     }
 }
 
@@ -745,8 +764,9 @@ mod tests {
                 reasoning_output_tokens: 4,
                 ..UsageMetrics::default()
             }),
+            CacheInputAccounting::default(),
         );
-        aggregate.record(400, None);
+        aggregate.record(400, None, CacheInputAccounting::default());
 
         assert_eq!(
             aggregate.summary_line("main"),

@@ -17,7 +17,7 @@ use crate::config::ServiceConfigManager;
 use crate::lb::LbState;
 #[cfg(test)]
 use crate::pricing::CostBreakdown;
-use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog};
+use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
 use crate::usage::UsageMetrics;
@@ -2042,10 +2042,11 @@ impl ProxyState {
             .and_then(|decision| decision.effective_model.as_ref())
             .map(|value| value.value.as_str())
             .or(req.model.as_deref());
-        let cost = estimate_request_cost_from_operator_catalog(
+        let cost = estimate_request_cost_from_operator_catalog_for_service(
             pricing_model,
             params.usage.as_ref(),
             CostAdjustments::default(),
+            &req.service,
         );
 
         let mut finished = FinishedRequest {

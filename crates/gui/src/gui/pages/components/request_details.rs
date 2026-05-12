@@ -329,7 +329,7 @@ fn render_request_usage_speed_cost_card(
                 let token_rows = request
                     .usage
                     .as_ref()
-                    .map(request_token_rows)
+                    .map(|usage| request_token_rows(usage, request.cache_input_accounting()))
                     .unwrap_or_else(|| {
                         vec![(
                             "usage".to_string(),
@@ -660,7 +660,11 @@ fn request_speed_rows(request: &FinishedRequest) -> Vec<(String, String)> {
     rows
 }
 
-fn request_token_rows(usage: &crate::usage::UsageMetrics) -> Vec<(String, String)> {
+fn request_token_rows(
+    usage: &crate::usage::UsageMetrics,
+    accounting: crate::usage::CacheInputAccounting,
+) -> Vec<(String, String)> {
+    let cache = usage.cache_usage_breakdown(accounting);
     let mut rows = vec![
         ("input".to_string(), usage.input_tokens.to_string()),
         ("output".to_string(), usage.output_tokens.to_string()),
@@ -671,6 +675,10 @@ fn request_token_rows(usage: &crate::usage::UsageMetrics) -> Vec<(String, String
         ("total".to_string(), usage.total_tokens.to_string()),
     ];
     if usage.has_cache_tokens() {
+        rows.push((
+            "effective_input".to_string(),
+            cache.effective_input_tokens.to_string(),
+        ));
         rows.push((
             "cached_input".to_string(),
             usage.cached_input_tokens.to_string(),
@@ -694,7 +702,7 @@ fn request_token_rows(usage: &crate::usage::UsageMetrics) -> Vec<(String, String
             ));
         }
     }
-    if let Some(rate) = usage.cache_hit_rate() {
+    if let Some(rate) = usage.cache_hit_rate_with_accounting(accounting) {
         rows.push((
             "cache_hit_rate".to_string(),
             format!("{:.1}%", rate * 100.0),

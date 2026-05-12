@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 use crate::file_replace::write_text_file;
-use crate::usage::UsageMetrics;
+use crate::usage::{CacheInputAccounting, UsageMetrics};
 
 const BASELLM_ALL_JSON_URL: &str = "https://basellm.github.io/llm-metadata/api/all.json";
 const FEMTO_USD_PER_USD: i128 = 1_000_000_000_000_000;
@@ -317,19 +317,20 @@ pub struct BillableTokenUsage {
 
 impl BillableTokenUsage {
     pub fn from_usage(usage: &UsageMetrics) -> Self {
-        let cached_input_tokens = usage.cached_input_tokens.max(0);
-        let cache_read_input_tokens = cached_input_tokens
-            .saturating_add(usage.cache_read_input_tokens.max(0))
-            .max(0);
+        Self::from_usage_with_accounting(usage, CacheInputAccounting::default())
+    }
+
+    pub fn from_usage_with_accounting(
+        usage: &UsageMetrics,
+        accounting: CacheInputAccounting,
+    ) -> Self {
+        let breakdown = usage.cache_usage_breakdown(accounting);
 
         Self {
-            input_tokens: usage
-                .input_tokens
-                .max(0)
-                .saturating_sub(cached_input_tokens),
+            input_tokens: breakdown.effective_input_tokens,
             output_tokens: usage.output_tokens.max(0),
-            cache_read_input_tokens,
-            cache_creation_input_tokens: usage.cache_creation_tokens_total().max(0),
+            cache_read_input_tokens: breakdown.cache_read_input_tokens,
+            cache_creation_input_tokens: breakdown.cache_creation_input_tokens,
         }
     }
 }
@@ -643,10 +644,25 @@ impl ModelPriceCatalog {
         usage: &UsageMetrics,
         adjustments: CostAdjustments,
     ) -> CostBreakdown {
+        self.estimate_usage_cost_with_accounting(
+            model,
+            usage,
+            adjustments,
+            CacheInputAccounting::default(),
+        )
+    }
+
+    pub fn estimate_usage_cost_with_accounting(
+        &self,
+        model: &str,
+        usage: &UsageMetrics,
+        adjustments: CostAdjustments,
+        accounting: CacheInputAccounting,
+    ) -> CostBreakdown {
         let Some(price) = self.price_for_model(model) else {
             return CostBreakdown::unknown();
         };
-        estimate_usage_cost(usage, price, adjustments)
+        estimate_usage_cost_with_accounting(usage, price, adjustments, accounting)
     }
 
     pub fn len(&self) -> usize {
@@ -965,11 +981,39 @@ pub fn estimate_request_cost_from_operator_catalog(
     usage: Option<&UsageMetrics>,
     adjustments: CostAdjustments,
 ) -> CostBreakdown {
+    estimate_request_cost_from_operator_catalog_with_accounting(
+        model,
+        usage,
+        adjustments,
+        CacheInputAccounting::default(),
+    )
+}
+
+pub fn estimate_request_cost_from_operator_catalog_for_service(
+    model: Option<&str>,
+    usage: Option<&UsageMetrics>,
+    adjustments: CostAdjustments,
+    service: &str,
+) -> CostBreakdown {
+    estimate_request_cost_from_operator_catalog_with_accounting(
+        model,
+        usage,
+        adjustments,
+        CacheInputAccounting::for_service(service),
+    )
+}
+
+pub fn estimate_request_cost_from_operator_catalog_with_accounting(
+    model: Option<&str>,
+    usage: Option<&UsageMetrics>,
+    adjustments: CostAdjustments,
+    accounting: CacheInputAccounting,
+) -> CostBreakdown {
     let (Some(model), Some(usage)) = (model, usage) else {
         return CostBreakdown::unknown();
     };
     let (catalog, _) = build_operator_model_price_catalog();
-    catalog.estimate_usage_cost(model, usage, adjustments)
+    catalog.estimate_usage_cost_with_accounting(model, usage, adjustments, accounting)
 }
 
 pub fn estimate_request_cost_from_bundled_catalog(
@@ -977,10 +1021,29 @@ pub fn estimate_request_cost_from_bundled_catalog(
     usage: Option<&UsageMetrics>,
     adjustments: CostAdjustments,
 ) -> CostBreakdown {
+    estimate_request_cost_from_bundled_catalog_with_accounting(
+        model,
+        usage,
+        adjustments,
+        CacheInputAccounting::default(),
+    )
+}
+
+pub fn estimate_request_cost_from_bundled_catalog_with_accounting(
+    model: Option<&str>,
+    usage: Option<&UsageMetrics>,
+    adjustments: CostAdjustments,
+    accounting: CacheInputAccounting,
+) -> CostBreakdown {
     let (Some(model), Some(usage)) = (model, usage) else {
         return CostBreakdown::unknown();
     };
-    bundled_model_price_catalog().estimate_usage_cost(model, usage, adjustments)
+    bundled_model_price_catalog().estimate_usage_cost_with_accounting(
+        model,
+        usage,
+        adjustments,
+        accounting,
+    )
 }
 
 pub fn estimate_usage_cost(
@@ -988,7 +1051,16 @@ pub fn estimate_usage_cost(
     price: &ModelPrice,
     adjustments: CostAdjustments,
 ) -> CostBreakdown {
-    let billable = BillableTokenUsage::from_usage(usage);
+    estimate_usage_cost_with_accounting(usage, price, adjustments, CacheInputAccounting::default())
+}
+
+pub fn estimate_usage_cost_with_accounting(
+    usage: &UsageMetrics,
+    price: &ModelPrice,
+    adjustments: CostAdjustments,
+    accounting: CacheInputAccounting,
+) -> CostBreakdown {
+    let billable = BillableTokenUsage::from_usage_with_accounting(usage, accounting);
 
     let Some(cache_read_price) = required_price(
         billable.cache_read_input_tokens,
@@ -1299,6 +1371,26 @@ mod tests {
         assert_eq!(billable.input_tokens, 10);
         assert_eq!(billable.cache_read_input_tokens, 30);
         assert_eq!(billable.cache_creation_input_tokens, 60);
+    }
+
+    #[test]
+    fn subtracts_direct_cache_read_for_codex_style_accounting() {
+        let usage = UsageMetrics {
+            input_tokens: 100,
+            output_tokens: 5,
+            cache_read_input_tokens: 30,
+            cache_creation_input_tokens: 10,
+            ..UsageMetrics::default()
+        };
+
+        let billable = BillableTokenUsage::from_usage_with_accounting(
+            &usage,
+            CacheInputAccounting::DirectReadIncludedInInput,
+        );
+
+        assert_eq!(billable.input_tokens, 70);
+        assert_eq!(billable.cache_read_input_tokens, 30);
+        assert_eq!(billable.cache_creation_input_tokens, 10);
     }
 
     #[test]

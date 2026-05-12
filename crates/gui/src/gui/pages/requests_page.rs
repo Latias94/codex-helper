@@ -109,14 +109,12 @@ fn request_list_metrics(request: &FinishedRequest) -> String {
             compact_count(usage.total_tokens)
         ));
         let cache_total = usage
-            .cached_input_tokens
-            .max(0)
-            .saturating_add(usage.cache_read_input_tokens.max(0))
+            .cache_read_tokens_total()
             .saturating_add(usage.cache_creation_tokens_total().max(0));
         if cache_total > 0 {
             parts.push(format!("cache={}", compact_count(cache_total)));
         }
-        if let Some(hit_rate) = usage.cache_hit_rate() {
+        if let Some(hit_rate) = request.cache_hit_rate() {
             parts.push(format!("hit={:.1}%", hit_rate * 100.0));
         }
     }
@@ -289,10 +287,11 @@ mod tests {
         .expect("price");
         let mut request = request_fixture();
         request.usage = Some(usage.clone());
-        request.cost = crate::pricing::estimate_usage_cost(
+        request.cost = crate::pricing::estimate_usage_cost_with_accounting(
             &usage,
             &price,
             crate::pricing::CostAdjustments::default(),
+            request.cache_input_accounting(),
         );
 
         let label = request_list_label(&request, 10_000);
@@ -300,7 +299,7 @@ mod tests {
         assert!(label.contains("fast"));
         assert!(label.contains("tok=1.5k/100/1.6k"));
         assert!(label.contains("cache=300"));
-        assert!(label.contains("hit=17.1%"));
+        assert!(label.contains("hit=20.0%"));
         assert!(label.contains("out/s=200.0"));
         assert!(label.contains("cost=$"));
     }

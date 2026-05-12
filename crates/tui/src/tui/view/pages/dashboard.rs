@@ -524,7 +524,7 @@ fn render_requests_panel(
                 .map(|u| tokens_short(u.output_tokens))
                 .unwrap_or_else(|| "-".to_string());
             let cache_read = usage
-                .map(|u| tokens_short(u.cache_read_input_tokens.max(u.cached_input_tokens)))
+                .map(|u| tokens_short(u.cache_read_tokens_total()))
                 .unwrap_or_else(|| "-".to_string());
             let cache_new = usage
                 .map(|u| tokens_short(u.cache_creation_tokens_total()))

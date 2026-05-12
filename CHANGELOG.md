@@ -24,8 +24,8 @@ All notable changes to this project will be documented in this file.
   GUI routing settings now include a route node editor for creating, renaming, deleting, and saving nested route nodes across `ordered-failover`, `manual-sticky`, `tag-preferred`, and `conditional` nodes.
 - 新增 route graph 会话粘性：同一会话按 `session_id + service + route_graph_key` 粘住可用 provider，失败重试后才按当前路由图继续切换；路由规则变化会让旧粘性自然失效。
   Added route-graph session affinity: a session sticks to a usable provider by `session_id + service + route_graph_key`, falls through through the current route graph only after retry failure, and naturally invalidates old affinity when routing rules change.
-- TUI Requests 和 GUI 请求列表/详情新增缓存命中率展示，统一使用 core 的 `UsageMetrics::cache_hit_rate()` 口径。
-  TUI Requests plus GUI request lists/details now show cache hit rate using the shared core `UsageMetrics::cache_hit_rate()` calculation.
+- TUI Requests 和 GUI 请求列表/详情新增缓存命中率展示，统一走 core 的 usage token 口径，并按服务区分 direct cache read 是否已包含在 input 中。
+  TUI Requests plus GUI request lists/details now show cache hit rate through the shared core usage-token calculation, with service-aware handling for whether direct cache-read tokens are already included in input.
 
 ### 改进 / Improved
 
@@ -49,6 +49,8 @@ All notable changes to this project will be documented in this file.
   GUI basic routing editor now preserves existing nested route nodes when saving entry policy/order and allows entry children to reference route nodes, avoiding accidental flattening of complex graphs.
 - Route plan runtime 现在会初始化共享 LB station 状态，即使请求因 capability mismatch 等中立跳过而没有真正命中上游，UI/API 的 LB 视图也能看到对应站点。
   Route plan runtime now initializes shared LB station state, so UI/API LB views include stations even when requests are neutrally skipped before hitting an upstream, such as capability mismatches.
+- 缓存命中率和成本估算现在使用服务感知的缓存计费口径：Codex/Gemini 风格 direct cache read 会从有效 input 中扣除，Claude/未知服务仍按独立 cache bucket 处理。
+  Cache hit-rate and cost estimation now use service-aware cache accounting: Codex/Gemini-style direct cache reads are subtracted from effective input, while Claude/unknown services keep them as separate cache buckets.
 
 ## [0.13.0] - 2026-05-09
 

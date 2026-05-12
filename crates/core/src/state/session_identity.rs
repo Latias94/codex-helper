@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::ServiceConfigManager;
 use crate::pricing::CostBreakdown;
 use crate::sessions;
-use crate::usage::UsageMetrics;
+use crate::usage::{CacheInputAccounting, UsageMetrics};
 
 fn bool_is_false(value: &bool) -> bool {
     !*value
@@ -161,6 +161,16 @@ pub struct FinishedRequest {
 }
 
 impl FinishedRequest {
+    pub fn cache_input_accounting(&self) -> CacheInputAccounting {
+        CacheInputAccounting::for_service(&self.service)
+    }
+
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        self.usage
+            .as_ref()
+            .and_then(|usage| usage.cache_hit_rate_with_accounting(self.cache_input_accounting()))
+    }
+
     pub fn observability_view(&self) -> RequestObservability {
         RequestObservability::from_finished_request(self)
     }

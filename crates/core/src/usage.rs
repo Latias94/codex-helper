@@ -5,6 +5,38 @@ fn i64_is_zero(value: &i64) -> bool {
     *value == 0
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheInputAccounting {
+    #[default]
+    DirectReadSeparate,
+    DirectReadIncludedInInput,
+}
+
+impl CacheInputAccounting {
+    pub fn for_service(service: &str) -> Self {
+        match service.trim().to_ascii_lowercase().as_str() {
+            "codex" | "gemini" => Self::DirectReadIncludedInInput,
+            _ => Self::DirectReadSeparate,
+        }
+    }
+
+    fn includes_direct_read_in_input(self) -> bool {
+        matches!(self, Self::DirectReadIncludedInInput)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheUsageBreakdown {
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub direct_cache_read_input_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub effective_input_tokens: i64,
+    pub denominator_tokens: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UsageMetrics {
     #[serde(default)]
@@ -86,16 +118,61 @@ impl UsageMetrics {
             .saturating_add(self.cache_read_input_tokens.max(0))
     }
 
-    pub fn cache_hit_rate(&self) -> Option<f64> {
+    pub fn cache_usage_breakdown(&self, accounting: CacheInputAccounting) -> CacheUsageBreakdown {
+        let input = self.input_tokens.max(0);
         let cached = self.cached_input_tokens.max(0);
-        let read = self.cache_read_tokens_total();
+        let direct_read = self.cache_read_input_tokens.max(0);
+        let read = cached.saturating_add(direct_read);
         let create = self.cache_creation_tokens_total().max(0);
-        let effective_input = self.input_tokens.max(0).saturating_sub(cached);
+        let included_read = if accounting.includes_direct_read_in_input() {
+            read
+        } else {
+            cached
+        };
+        let effective_input = input.saturating_sub(included_read);
         let denom = effective_input.saturating_add(create).saturating_add(read);
+
+        CacheUsageBreakdown {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            direct_cache_read_input_tokens: direct_read,
+            cache_read_input_tokens: read,
+            cache_creation_input_tokens: create,
+            effective_input_tokens: effective_input,
+            denominator_tokens: denom,
+        }
+    }
+
+    pub fn cache_hit_rate_with_accounting(&self, accounting: CacheInputAccounting) -> Option<f64> {
+        let breakdown = self.cache_usage_breakdown(accounting);
+        if breakdown.denominator_tokens <= 0 {
+            return None;
+        }
+        Some(breakdown.cache_read_input_tokens as f64 / breakdown.denominator_tokens as f64)
+    }
+
+    pub fn cache_hit_rate_for_service(&self, service: &str) -> Option<f64> {
+        self.cache_hit_rate_with_accounting(CacheInputAccounting::for_service(service))
+    }
+
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        self.cache_hit_rate_with_accounting(CacheInputAccounting::default())
+    }
+
+    pub fn effective_input_tokens_with_accounting(&self, accounting: CacheInputAccounting) -> i64 {
+        self.cache_usage_breakdown(accounting)
+            .effective_input_tokens
+    }
+
+    pub fn cache_denominator_tokens_with_accounting(
+        &self,
+        accounting: CacheInputAccounting,
+    ) -> Option<i64> {
+        let denom = self.cache_usage_breakdown(accounting).denominator_tokens;
         if denom <= 0 {
             return None;
         }
-        Some(read as f64 / denom as f64)
+        Some(denom)
     }
 
     fn derived_total_tokens(&self) -> i64 {
@@ -485,6 +562,22 @@ mod tests {
     }
 
     #[test]
+    fn computes_cache_hit_rate_when_direct_cache_read_is_included_in_input() {
+        let usage = UsageMetrics {
+            input_tokens: 100,
+            cache_read_input_tokens: 30,
+            cache_creation_input_tokens: 20,
+            ..UsageMetrics::default()
+        };
+
+        let rate = usage
+            .cache_hit_rate_with_accounting(CacheInputAccounting::DirectReadIncludedInInput)
+            .expect("cache hit rate");
+
+        assert_eq!(rate, 0.25);
+    }
+
+    #[test]
     fn computes_cache_hit_rate_from_cached_input_tokens() {
         let usage = UsageMetrics {
             input_tokens: 100,
@@ -509,6 +602,22 @@ mod tests {
         let rate = usage.cache_hit_rate().expect("cache hit rate");
 
         assert!((rate - (300.0 / 1_750.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn computes_service_specific_cache_hit_rate_from_mixed_usage_cache_fields() {
+        let usage = UsageMetrics {
+            input_tokens: 1_500,
+            cached_input_tokens: 50,
+            cache_read_input_tokens: 250,
+            ..UsageMetrics::default()
+        };
+
+        let rate = usage
+            .cache_hit_rate_for_service("codex")
+            .expect("cache hit rate");
+
+        assert!((rate - (300.0 / 1_500.0)).abs() < f64::EPSILON);
     }
 
     #[test]

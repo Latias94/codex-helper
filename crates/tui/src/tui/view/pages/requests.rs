@@ -107,7 +107,7 @@ pub(super) fn render_requests_page(
             let dur = duration_short(r.duration_ms);
             let attempts_n = r.attempt_count();
             let attempts = attempts_n.to_string();
-            let cache_hit = request_cache_hit_rate(r.usage.as_ref());
+            let cache_hit = request_cache_hit_rate(r);
             let cache_hit_style =
                 Style::default().fg(if cache_hit != "-" { p.accent } else { p.muted });
             let model = r.model.as_deref().unwrap_or("-").to_string();
@@ -288,7 +288,7 @@ pub(super) fn render_requests_page(
                 Span::styled(format!("{}: ", l("usage")), Style::default().fg(p.muted)),
                 Span::styled(usage_line_lang(u, lang), Style::default().fg(p.accent)),
             ]));
-            if let Some(rate) = u.cache_hit_rate() {
+            if let Some(rate) = r.cache_hit_rate() {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{}: ", l("cache hit rate")),
@@ -451,9 +451,9 @@ fn request_cost_parts_line(request: &crate::state::FinishedRequest) -> Option<St
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-fn request_cache_hit_rate(usage: Option<&crate::usage::UsageMetrics>) -> String {
-    usage
-        .and_then(|usage| usage.cache_hit_rate())
+fn request_cache_hit_rate(request: &crate::state::FinishedRequest) -> String {
+    request
+        .cache_hit_rate()
         .map(|rate| format!("{:.1}%", rate * 100.0))
         .unwrap_or_else(|| "-".to_string())
 }
