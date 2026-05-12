@@ -49,11 +49,11 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
                 .or(s.created_at.as_deref())
                 .map(|t| shorten_middle(t, 20))
                 .unwrap_or_else(|| "-".to_string());
-            let sid = short_sid(s.id.as_str(), 14);
+            let sid = short_sid(s.id.as_str(), 18);
             let cwd = s
                 .cwd
                 .as_deref()
-                .map(|v| shorten(basename(v), 16))
+                .map(|v| shorten(basename(v), 14))
                 .unwrap_or_else(|| "-".to_string());
             let rounds = s.rounds.to_string();
             let msg = s
@@ -77,8 +77,8 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
         rows,
         [
             Constraint::Length(20),
-            Constraint::Length(16),
             Constraint::Length(18),
+            Constraint::Length(16),
             Constraint::Length(6),
             Constraint::Min(20),
         ],
