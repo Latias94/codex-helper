@@ -365,24 +365,20 @@ fn routing_editor_source_signature(service: &crate::config::ServiceViewV4) -> St
                 .iter()
                 .map(|(name, node)| {
                     format!(
-                        "{name}:{:?}:{}:{}:{}",
+                        "{name}:{:?}:{}:{}:{}:{}:{}:{}:{}",
                         node.strategy,
                         node.children.join(","),
                         node.target.as_deref().unwrap_or_default(),
-                        format_routing_prefer_tag_sets(&node.prefer_tags)
+                        format_routing_prefer_tag_sets(&node.prefer_tags),
+                        routing_exhausted_label(node.on_exhausted),
+                        node.then.as_deref().unwrap_or_default(),
+                        node.default_route.as_deref().unwrap_or_default(),
+                        routing_condition_preview(node.when.as_ref())
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("|");
-            format!(
-                "{}|{}|{}",
-                routing.entry,
-                routes,
-                routing
-                    .entry_node()
-                    .map(|node| routing_exhausted_label(node.on_exhausted))
-                    .unwrap_or("continue")
-            )
+            format!("{}|{}", routing.entry, routes)
         })
         .unwrap_or_else(|| "<implicit>".to_string());
     let providers = service
@@ -457,24 +453,34 @@ fn build_routing_from_editor(
     editor: &ProxySettingsRoutingEditorState,
     service: &crate::config::ServiceViewV4,
 ) -> Result<crate::config::RoutingConfigV4, String> {
-    let order = normalize_routing_editor_order(&editor.order, service)?;
+    let mut routing = editor.original_routing.clone().unwrap_or_default();
+    let order = normalize_routing_editor_order(&editor.order, service, Some(&routing))?;
     let on_exhausted = editor.on_exhausted;
+    let entry = routing.entry.clone();
+
     match editor.policy {
         crate::config::RoutingPolicyV4::ManualSticky => {
             let target = editor.target.trim();
             if target.is_empty() {
                 return Err("manual-sticky routing requires a target provider".to_string());
             }
-            if !service.providers.contains_key(target) {
-                return Err(format!("target provider '{target}' does not exist"));
+            if !route_ref_exists(service, &routing, target) {
+                return Err(format!("target route/provider '{target}' does not exist"));
             }
-            Ok(crate::config::RoutingConfigV4::manual_sticky(
-                target.to_string(),
-                order,
-            ))
+            let node = routing.routes.entry(entry.clone()).or_default();
+            node.strategy = crate::config::RoutingPolicyV4::ManualSticky;
+            node.target = Some(target.to_string());
+            node.children = order;
+            node.prefer_tags.clear();
+            node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
         }
         crate::config::RoutingPolicyV4::OrderedFailover => {
-            Ok(crate::config::RoutingConfigV4::ordered_failover(order))
+            let node = routing.routes.entry(entry.clone()).or_default();
+            node.strategy = crate::config::RoutingPolicyV4::OrderedFailover;
+            node.target = None;
+            node.children = order;
+            node.prefer_tags.clear();
+            node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
         }
         crate::config::RoutingPolicyV4::TagPreferred => {
             let prefer_tags = parse_routing_prefer_tag_sets(&editor.prefer_tags)?;
@@ -492,41 +498,83 @@ fn build_routing_from_editor(
                     "tag-preferred routing with on_exhausted=stop matches no providers".to_string(),
                 );
             }
-            Ok(crate::config::RoutingConfigV4::tag_preferred(
-                order,
-                prefer_tags,
-                on_exhausted,
-            ))
+            let node = routing.routes.entry(entry.clone()).or_default();
+            node.strategy = crate::config::RoutingPolicyV4::TagPreferred;
+            node.target = None;
+            node.children = order;
+            node.prefer_tags = prefer_tags;
+            node.on_exhausted = on_exhausted;
         }
         crate::config::RoutingPolicyV4::Conditional => {
-            Err("conditional routing is not editable in the basic routing editor".to_string())
+            return Err(
+                "conditional routing is not editable in the basic routing editor".to_string(),
+            );
         }
     }
+
+    if let Some(node) = routing.routes.get_mut(entry.as_str()) {
+        node.when = None;
+        node.then = None;
+        node.default_route = None;
+    }
+    routing.sync_compat_from_graph();
+    Ok(routing)
 }
 
 fn normalize_routing_editor_order(
     raw: &str,
     service: &crate::config::ServiceViewV4,
+    routing: Option<&crate::config::RoutingConfigV4>,
 ) -> Result<Vec<String>, String> {
     let mut order = parse_routing_provider_list(raw);
     if order.is_empty() {
         order = ordered_provider_names_for_editor(service);
     }
     let mut seen = BTreeSet::new();
+    let mut has_route_ref = false;
     for name in &order {
-        if !service.providers.contains_key(name) {
-            return Err(format!("provider '{name}' in routing entry does not exist"));
+        if !route_ref_exists_optional(service, routing, name) {
+            return Err(format!(
+                "route/provider '{name}' in routing entry does not exist"
+            ));
         }
         if !seen.insert(name.clone()) {
-            return Err(format!("duplicate provider '{name}' in routing entry"));
+            return Err(format!(
+                "duplicate route/provider '{name}' in routing entry"
+            ));
+        }
+        if routing.is_some_and(|routing| routing.routes.contains_key(name.as_str())) {
+            has_route_ref = true;
         }
     }
-    for name in ordered_provider_names_for_editor(service) {
-        if seen.insert(name.clone()) {
-            order.push(name);
+    if !has_route_ref {
+        for name in ordered_provider_names_for_editor(service) {
+            if seen.insert(name.clone()) {
+                order.push(name);
+            }
         }
     }
     Ok(order)
+}
+
+fn route_ref_exists(
+    service: &crate::config::ServiceViewV4,
+    routing: &crate::config::RoutingConfigV4,
+    name: &str,
+) -> bool {
+    route_ref_exists_optional(service, Some(routing), name)
+}
+
+fn route_ref_exists_optional(
+    service: &crate::config::ServiceViewV4,
+    routing: Option<&crate::config::RoutingConfigV4>,
+    name: &str,
+) -> bool {
+    if routing.is_some_and(|routing| routing.entry == name) {
+        return false;
+    }
+    service.providers.contains_key(name)
+        || routing.is_some_and(|routing| routing.routes.contains_key(name))
 }
 
 fn parse_routing_provider_list(raw: &str) -> Vec<String> {
@@ -1468,6 +1516,63 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("missing ref missing"))
         );
+    }
+
+    #[test]
+    fn routing_editor_preserves_nested_route_nodes_when_updating_entry() {
+        let mut service = crate::config::ServiceViewV4::default();
+        service.providers.insert(
+            "monthly".to_string(),
+            crate::config::ProviderConfigV4::default(),
+        );
+        service.providers.insert(
+            "paygo".to_string(),
+            crate::config::ProviderConfigV4::default(),
+        );
+        let original = crate::config::RoutingConfigV4 {
+            entry: "main".to_string(),
+            routes: BTreeMap::from([
+                (
+                    "main".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                        children: vec!["monthly_pool".to_string(), "paygo".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+                (
+                    "monthly_pool".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                        children: vec!["monthly".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+            ]),
+            ..crate::config::RoutingConfigV4::default()
+        };
+        service.routing = Some(original.clone());
+        let editor = ProxySettingsRoutingEditorState {
+            original_routing: Some(original),
+            policy: crate::config::RoutingPolicyV4::TagPreferred,
+            order: "monthly_pool, paygo".to_string(),
+            prefer_tags: "billing=monthly".to_string(),
+            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
+            ..ProxySettingsRoutingEditorState::default()
+        };
+
+        let routing = build_routing_from_editor(&editor, &service).expect("routing should build");
+
+        assert!(
+            routing.routes.contains_key("monthly_pool"),
+            "nested route node should be preserved"
+        );
+        let entry = routing.entry_node().expect("entry should exist");
+        assert_eq!(
+            entry.children,
+            vec!["monthly_pool".to_string(), "paygo".to_string()]
+        );
+        assert_eq!(entry.strategy, crate::config::RoutingPolicyV4::TagPreferred);
     }
 
     #[test]

@@ -34,6 +34,8 @@ All notable changes to this project will be documented in this file.
   TUI session identifiers are no longer prematurely truncated in dashboard, Requests, Sessions, and History; detail panes and titles now prefer the full session id, and table columns were widened accordingly.
 - TUI 的 History / Recent 会话刷新改为后台异步加载，打开页面和手动刷新时不再阻塞主事件循环；刷新失败时保留已有列表并展示错误。
   TUI History / Recent session refresh now runs in the background, so opening those pages and manual refresh no longer block the main event loop; failed refreshes keep the existing list visible while surfacing the error.
+- GUI 基础 routing 编辑器保存入口节点策略/顺序时会保留已有嵌套 route nodes，并允许 entry children 引用 route node，不再把复杂图误压平。
+  GUI basic routing editor now preserves existing nested route nodes when saving entry policy/order and allows entry children to reference route nodes, avoiding accidental flattening of complex graphs.
 
 ## [0.13.0] - 2026-05-09
 
