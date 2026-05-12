@@ -18,6 +18,9 @@ All notable changes to this project will be documented in this file.
 
 - 控制面、CLI、TUI 和 GUI 写回 v4 route graph 时会保留 `entry/routes` 结构，provider CRUD 不再把嵌套路由压平成单一 order。
   Control-plane, CLI, TUI, and GUI writes preserve v4 `entry/routes` structure; provider CRUD no longer collapses nested routes into one flat order.
+- TUI 路由页和 GUI routing 编辑预览新增 route graph 树形可视化，展示入口节点、嵌套 route node、条件分支、provider 叶子、缺失引用和不可达节点。
+  TUI routing and GUI routing-editor previews now include a route graph tree that shows the entry node, nested route nodes, conditional branches, provider leaves, missing references, and unreachable nodes.
+
 ### 文档 / Documentation
 
 - 补充月包 provider 池与 paygo 兜底的配置说明，明确 `unknown` 余额不等于耗尽，临时故障应通过 cooldown 和后续回探恢复。

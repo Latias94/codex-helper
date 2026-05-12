@@ -601,12 +601,260 @@ fn render_routing_editor_preview(
                         ui.small(format!("... +{} more", rows.len() - 12));
                     }
                 }
+                ui.separator();
+                ui.label(pick(lang, "Route graph", "Route graph"));
+                let graph_lines = routing_graph_preview_lines(service, routing);
+                for line in graph_lines.iter().take(24) {
+                    if line.contains("missing ref") || line.contains("[cycle]") {
+                        ui.colored_label(egui::Color32::from_rgb(200, 120, 40), line);
+                    } else {
+                        ui.small(line);
+                    }
+                }
+                if graph_lines.len() > 24 {
+                    ui.small(format!("... +{} more", graph_lines.len() - 24));
+                }
             }
             Err(err) => {
                 ui.colored_label(egui::Color32::from_rgb(200, 120, 40), err);
             }
         }
     });
+}
+
+fn routing_graph_preview_lines(
+    service: &crate::config::ServiceViewV4,
+    routing: &crate::config::RoutingConfigV4,
+) -> Vec<String> {
+    let effective = {
+        let mut service = service.clone();
+        service.routing = Some(routing.clone());
+        crate::config::effective_v4_routing(&service)
+    };
+    let mut visited_routes = BTreeSet::new();
+    let mut stack = BTreeSet::new();
+    let mut lines = Vec::new();
+
+    push_routing_graph_ref_line(
+        service,
+        &effective,
+        effective.entry.as_str(),
+        0,
+        &mut visited_routes,
+        &mut stack,
+        &mut lines,
+    );
+
+    for route_name in effective.routes.keys() {
+        if visited_routes.contains(route_name) {
+            continue;
+        }
+        lines.push(format!("unreachable route {route_name}:"));
+        push_routing_graph_ref_line(
+            service,
+            &effective,
+            route_name,
+            1,
+            &mut visited_routes,
+            &mut stack,
+            &mut lines,
+        );
+    }
+
+    lines
+}
+
+fn push_routing_graph_ref_line(
+    service: &crate::config::ServiceViewV4,
+    routing: &crate::config::RoutingConfigV4,
+    name: &str,
+    depth: usize,
+    visited_routes: &mut BTreeSet<String>,
+    stack: &mut BTreeSet<String>,
+    lines: &mut Vec<String>,
+) {
+    let indent = "  ".repeat(depth);
+    if let Some(provider) = service.providers.get(name) {
+        let state = if provider.enabled { "on" } else { "off" };
+        let tags = if provider.tags.is_empty() {
+            "-".to_string()
+        } else {
+            format_provider_editor_tags(&provider.tags)
+        };
+        lines.push(format!("{indent}- provider {name} [{state}, tags={tags}]"));
+        return;
+    }
+
+    let Some(node) = routing.routes.get(name) else {
+        lines.push(format!("{indent}- missing ref {name}"));
+        return;
+    };
+
+    if !stack.insert(name.to_string()) {
+        lines.push(format!("{indent}- route {name} [cycle]"));
+        return;
+    }
+    visited_routes.insert(name.to_string());
+
+    let route_kind = if name == routing.entry {
+        "entry route"
+    } else {
+        "route"
+    };
+    lines.push(format!(
+        "{indent}- {route_kind} {name} [{}]",
+        routing_graph_node_brief(node)
+    ));
+
+    match node.strategy {
+        crate::config::RoutingPolicyV4::Conditional => {
+            lines.push(format!(
+                "{indent}  when: {}",
+                routing_condition_preview(node.when.as_ref())
+            ));
+            if let Some(target) = node.then.as_deref() {
+                lines.push(format!("{indent}  then:"));
+                push_routing_graph_ref_line(
+                    service,
+                    routing,
+                    target,
+                    depth + 2,
+                    visited_routes,
+                    stack,
+                    lines,
+                );
+            } else {
+                lines.push(format!("{indent}  then: <missing>"));
+            }
+            if let Some(target) = node.default_route.as_deref() {
+                lines.push(format!("{indent}  default:"));
+                push_routing_graph_ref_line(
+                    service,
+                    routing,
+                    target,
+                    depth + 2,
+                    visited_routes,
+                    stack,
+                    lines,
+                );
+            } else {
+                lines.push(format!("{indent}  default: <missing>"));
+            }
+        }
+        crate::config::RoutingPolicyV4::ManualSticky => {
+            if let Some(target) = node.target.as_deref() {
+                lines.push(format!("{indent}  target:"));
+                push_routing_graph_ref_line(
+                    service,
+                    routing,
+                    target,
+                    depth + 2,
+                    visited_routes,
+                    stack,
+                    lines,
+                );
+            }
+            push_routing_graph_children_lines(
+                service,
+                routing,
+                &node.children,
+                depth,
+                visited_routes,
+                stack,
+                lines,
+            );
+        }
+        crate::config::RoutingPolicyV4::OrderedFailover
+        | crate::config::RoutingPolicyV4::TagPreferred => {
+            push_routing_graph_children_lines(
+                service,
+                routing,
+                &node.children,
+                depth,
+                visited_routes,
+                stack,
+                lines,
+            );
+        }
+    }
+
+    stack.remove(name);
+}
+
+fn push_routing_graph_children_lines(
+    service: &crate::config::ServiceViewV4,
+    routing: &crate::config::RoutingConfigV4,
+    children: &[String],
+    depth: usize,
+    visited_routes: &mut BTreeSet<String>,
+    stack: &mut BTreeSet<String>,
+    lines: &mut Vec<String>,
+) {
+    if children.is_empty() {
+        lines.push(format!("{}  (no children)", "  ".repeat(depth)));
+        return;
+    }
+    for child in children {
+        push_routing_graph_ref_line(
+            service,
+            routing,
+            child,
+            depth + 1,
+            visited_routes,
+            stack,
+            lines,
+        );
+    }
+}
+
+fn routing_graph_node_brief(node: &crate::config::RoutingNodeV4) -> String {
+    let mut parts = vec![routing_policy_label(node.strategy).to_string()];
+    if let Some(target) = node.target.as_deref() {
+        parts.push(format!("target={target}"));
+    }
+    if !node.prefer_tags.is_empty() {
+        parts.push(format!(
+            "prefer_tags={}",
+            format_routing_prefer_tag_sets(&node.prefer_tags)
+        ));
+    }
+    if node.on_exhausted != crate::config::RoutingExhaustedActionV4::Continue {
+        parts.push(format!(
+            "on_exhausted={}",
+            routing_exhausted_label(node.on_exhausted)
+        ));
+    }
+    parts.join(", ")
+}
+
+fn routing_condition_preview(condition: Option<&crate::config::RoutingConditionV4>) -> String {
+    let Some(condition) = condition else {
+        return "<always>".to_string();
+    };
+    if condition.is_empty() {
+        return "<always>".to_string();
+    }
+
+    let mut parts = Vec::new();
+    if let Some(value) = condition.model.as_deref() {
+        parts.push(format!("model={value}"));
+    }
+    if let Some(value) = condition.service_tier.as_deref() {
+        parts.push(format!("service_tier={value}"));
+    }
+    if let Some(value) = condition.reasoning_effort.as_deref() {
+        parts.push(format!("reasoning_effort={value}"));
+    }
+    if let Some(value) = condition.method.as_deref() {
+        parts.push(format!("method={value}"));
+    }
+    if let Some(value) = condition.path.as_deref() {
+        parts.push(format!("path={value}"));
+    }
+    for (key, value) in &condition.headers {
+        parts.push(format!("header:{key}={value}"));
+    }
+    parts.join(" ")
 }
 
 fn routing_preview_rows(
@@ -1166,6 +1414,59 @@ mod tests {
                 .map(|row| (row.provider.as_str(), row.role))
                 .collect::<Vec<_>>(),
             vec![("monthly", "preferred"), ("paygo", "fallback")]
+        );
+    }
+
+    #[test]
+    fn routing_graph_preview_lines_show_nested_routes() {
+        let mut service = crate::config::ServiceViewV4::default();
+        service.providers.insert(
+            "monthly".to_string(),
+            crate::config::ProviderConfigV4 {
+                tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                ..crate::config::ProviderConfigV4::default()
+            },
+        );
+        service.providers.insert(
+            "paygo".to_string(),
+            crate::config::ProviderConfigV4::default(),
+        );
+        let routing = crate::config::RoutingConfigV4 {
+            entry: "main".to_string(),
+            routes: BTreeMap::from([
+                (
+                    "main".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                        children: vec!["monthly_pool".to_string(), "missing".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+                (
+                    "monthly_pool".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::TagPreferred,
+                        children: vec!["monthly".to_string(), "paygo".to_string()],
+                        prefer_tags: vec![BTreeMap::from([(
+                            "billing".to_string(),
+                            "monthly".to_string(),
+                        )])],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+            ]),
+            ..crate::config::RoutingConfigV4::default()
+        };
+
+        let lines = routing_graph_preview_lines(&service, &routing);
+
+        assert!(lines.iter().any(|line| line.contains("entry route main")));
+        assert!(lines.iter().any(|line| line.contains("route monthly_pool")));
+        assert!(lines.iter().any(|line| line.contains("provider monthly")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("missing ref missing"))
         );
     }
 

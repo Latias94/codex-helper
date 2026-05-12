@@ -491,6 +491,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "root" => "根目录",
         "rounds" => "轮次",
         "rt" => "运行态",
+        "route graph" => "路由图",
         "routing" => "路由",
         "routing update failed" => "routing 更新失败",
         "routing: apply failed" => "routing: 应用失败",
