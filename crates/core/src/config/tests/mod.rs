@@ -4,6 +4,7 @@ use std::sync::{Mutex, OnceLock};
 mod basic;
 mod io_bootstrap;
 mod retry_profiles;
+mod route_graph_ops;
 mod v2_schema;
 mod v4_schema;
 

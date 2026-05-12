@@ -1,6 +1,7 @@
 use super::proxy_settings_document::start_proxy_settings_save;
 use super::proxy_settings_v4_editors::{
-    render_v4_provider_editor, render_v4_routing_editor, routing_policy_label,
+    render_v4_provider_editor, render_v4_route_node_editor, render_v4_routing_editor,
+    routing_policy_label,
 };
 use super::*;
 
@@ -141,6 +142,17 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
                     cfg,
                     routing_service,
                     &mut ctx.view.proxy_settings.routing_editor,
+                );
+            }
+            if editor_action.is_none() {
+                ui.separator();
+                let routing_service = ctx.view.proxy_settings.provider_editor.service;
+                editor_action = render_v4_route_node_editor(
+                    ui,
+                    lang,
+                    cfg,
+                    routing_service,
+                    &mut ctx.view.proxy_settings.route_node_editor,
                 );
             }
         }

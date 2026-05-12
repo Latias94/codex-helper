@@ -20,6 +20,8 @@ All notable changes to this project will be documented in this file.
   Control-plane, CLI, TUI, and GUI writes preserve v4 `entry/routes` structure; provider CRUD no longer collapses nested routes into one flat order.
 - TUI 路由页和 GUI routing 编辑预览新增 route graph 树形可视化，展示入口节点、嵌套 route node、条件分支、provider 叶子、缺失引用和不可达节点。
   TUI routing and GUI routing-editor previews now include a route graph tree that shows the entry node, nested route nodes, conditional branches, provider leaves, missing references, and unreachable nodes.
+- GUI routing 设置新增 route node 编辑器，可创建、重命名、删除和保存嵌套 route node，支持 `ordered-failover`、`manual-sticky`、`tag-preferred` 和 `conditional` 节点。
+  GUI routing settings now include a route node editor for creating, renaming, deleting, and saving nested route nodes across `ordered-failover`, `manual-sticky`, `tag-preferred`, and `conditional` nodes.
 
 ### 文档 / Documentation
 
@@ -36,6 +38,8 @@ All notable changes to this project will be documented in this file.
   TUI History / Recent session refresh now runs in the background, so opening those pages and manual refresh no longer block the main event loop; failed refreshes keep the existing list visible while surfacing the error.
 - GUI 基础 routing 编辑器保存入口节点策略/顺序时会保留已有嵌套 route nodes，并允许 entry children 引用 route node，不再把复杂图误压平。
   GUI basic routing editor now preserves existing nested route nodes when saving entry policy/order and allows entry children to reference route nodes, avoiding accidental flattening of complex graphs.
+- Route plan runtime 现在会初始化共享 LB station 状态，即使请求因 capability mismatch 等中立跳过而没有真正命中上游，UI/API 的 LB 视图也能看到对应站点。
+  Route plan runtime now initializes shared LB station state, so UI/API LB views include stations even when requests are neutrally skipped before hitting an upstream, such as capability mismatches.
 
 ## [0.13.0] - 2026-05-09
 

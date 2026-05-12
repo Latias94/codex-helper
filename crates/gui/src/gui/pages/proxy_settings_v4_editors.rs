@@ -339,6 +339,267 @@ pub(super) fn render_v4_routing_editor(
     action
 }
 
+pub(super) fn render_v4_route_node_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    cfg: &mut crate::config::ProxyConfigV4,
+    service_kind: ProxySettingsProviderEditorService,
+    editor: &mut ProxySettingsRouteNodeEditorState,
+) -> Option<Result<String, String>> {
+    let signature = {
+        let service = select_provider_editor_service(cfg, service_kind);
+        routing_editor_source_signature(service)
+    };
+    if editor.source_signature.as_deref() != Some(signature.as_str()) {
+        let service = select_provider_editor_service(cfg, service_kind);
+        load_route_node_editor_from_service(editor, service, signature.clone());
+    }
+
+    ui.heading(pick(lang, "Route node 编辑", "Route node editor"));
+    ui.small(format!(
+        "{}: {}",
+        pick(lang, "当前服务", "Service"),
+        provider_editor_service_label(lang, service_kind)
+    ));
+    ui.add_space(6.0);
+
+    let service = select_provider_editor_service(cfg, service_kind);
+    let routing_snapshot = editor.original_routing.clone();
+    let routing = routing_snapshot.as_ref();
+    let route_refs =
+        route_ref_names_for_service(service, routing, editor.selected_route.as_deref());
+
+    let mut selection = editor.selected_route.clone();
+    ui.horizontal(|ui| {
+        ui.label(pick(lang, "Route node", "Route node"));
+        egui::ComboBox::from_id_salt("proxy_settings_route_node_selector")
+            .selected_text(
+                selection
+                    .as_deref()
+                    .unwrap_or_else(|| pick(lang, "<新建>", "<new>")),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selection, None, pick(lang, "<新建>", "<new>"));
+                for name in routing
+                    .map(|routing| routing.route_node_names())
+                    .unwrap_or_default()
+                {
+                    ui.selectable_value(&mut selection, Some(name.clone()), name);
+                }
+            });
+        if ui.button(pick(lang, "新建", "New")).clicked() {
+            selection = None;
+        }
+        if ui.button(pick(lang, "重置", "Reset")).clicked() {
+            let signature = {
+                let service = select_provider_editor_service(cfg, service_kind);
+                routing_editor_source_signature(service)
+            };
+            let service = select_provider_editor_service(cfg, service_kind);
+            load_route_node_editor_from_service(editor, service, signature);
+        }
+    });
+    if selection != editor.selected_route {
+        editor.selected_route = selection;
+        load_route_node_editor_from_service(
+            editor,
+            select_provider_editor_service(cfg, service_kind),
+            signature,
+        );
+    }
+
+    if let Some(name) = editor.selected_route.as_deref() {
+        let refs = routing
+            .map(|routing| routing.route_node_references(name))
+            .unwrap_or_default();
+        ui.small(format!(
+            "{}: {}  {}: {}",
+            pick(lang, "selected", "selected"),
+            name,
+            pick(lang, "refs", "refs"),
+            if refs.is_empty() {
+                "-".to_string()
+            } else {
+                refs.join(", ")
+            }
+        ));
+    } else {
+        ui.small(pick(
+            lang,
+            "选择 <new> 可创建新的 route node。",
+            "Select <new> to create a new route node.",
+        ));
+    }
+
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(pick(lang, "名称", "Name"));
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.draft_name)
+                    .desired_width(220.0)
+                    .hint_text("monthly_pool"),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("policy");
+            egui::ComboBox::from_id_salt("proxy_settings_route_node_policy")
+                .selected_text(routing_policy_label(editor.policy))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut editor.policy,
+                        crate::config::RoutingPolicyV4::OrderedFailover,
+                        "ordered-failover",
+                    );
+                    ui.selectable_value(
+                        &mut editor.policy,
+                        crate::config::RoutingPolicyV4::ManualSticky,
+                        "manual-sticky",
+                    );
+                    ui.selectable_value(
+                        &mut editor.policy,
+                        crate::config::RoutingPolicyV4::TagPreferred,
+                        "tag-preferred",
+                    );
+                    ui.selectable_value(
+                        &mut editor.policy,
+                        crate::config::RoutingPolicyV4::Conditional,
+                        "conditional",
+                    );
+                });
+
+            ui.label("on_exhausted");
+            egui::ComboBox::from_id_salt("proxy_settings_route_node_on_exhausted")
+                .selected_text(routing_exhausted_label(editor.on_exhausted))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut editor.on_exhausted,
+                        crate::config::RoutingExhaustedActionV4::Continue,
+                        "continue",
+                    );
+                    ui.selectable_value(
+                        &mut editor.on_exhausted,
+                        crate::config::RoutingExhaustedActionV4::Stop,
+                        "stop",
+                    );
+                });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("target");
+            egui::ComboBox::from_id_salt("proxy_settings_route_node_target")
+                .selected_text(if editor.target.trim().is_empty() {
+                    "<none>"
+                } else {
+                    editor.target.trim()
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut editor.target, String::new(), "<none>");
+                    for name in &route_refs {
+                        ui.selectable_value(&mut editor.target, name.clone(), name);
+                    }
+                });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("order");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.order)
+                    .desired_width(460.0)
+                    .hint_text("monthly_pool, paygo"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("prefer_tags");
+            ui.add_enabled(
+                matches!(editor.policy, crate::config::RoutingPolicyV4::TagPreferred),
+                egui::TextEdit::singleline(&mut editor.prefer_tags)
+                    .desired_width(360.0)
+                    .hint_text("billing=monthly"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("when");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.when)
+                    .desired_width(420.0)
+                    .hint_text("model=..."),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("then");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.then)
+                    .desired_width(220.0)
+                    .hint_text("large_pool"),
+            );
+            ui.label("default");
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.default_route)
+                    .desired_width(220.0)
+                    .hint_text("small_pool"),
+            );
+        });
+        ui.small(pick(
+            lang,
+            "route node 可引用 provider 或其他 route node；conditional 的 when/then/default 会写入节点，order 在 conditional 下会被清空。",
+            "Route nodes may reference providers or other route nodes; conditional writes when/then/default to the node, and order is cleared for conditional routes.",
+        ));
+    });
+
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui
+            .button(pick(lang, "保存 route node", "Save route node"))
+            .clicked()
+        {
+            action = Some(save_route_node_from_editor(cfg, editor, service_kind, lang));
+        }
+
+        let can_delete = editor.selected_route.as_deref().is_some_and(|name| {
+            routing.as_ref().is_some_and(|routing| {
+                name != routing.entry.as_str() && routing.route_node_references(name).is_empty()
+            })
+        });
+        if ui
+            .add_enabled(
+                can_delete,
+                egui::Button::new(pick(lang, "删除 route node", "Delete route node")),
+            )
+            .clicked()
+        {
+            action = Some(delete_route_node_from_editor(
+                cfg,
+                editor,
+                service_kind,
+                lang,
+            ));
+        }
+    });
+
+    action
+}
+
+fn route_ref_names_for_service(
+    service: &crate::config::ServiceViewV4,
+    routing: Option<&crate::config::RoutingConfigV4>,
+    excluded_route: Option<&str>,
+) -> Vec<String> {
+    let mut names = ordered_provider_names_for_editor(service);
+    let mut seen = names.iter().cloned().collect::<BTreeSet<_>>();
+    if let Some(routing) = routing {
+        for name in routing.route_node_names() {
+            if name == routing.entry || excluded_route == Some(name.as_str()) {
+                continue;
+            }
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
 pub(super) fn routing_policy_label(policy: crate::config::RoutingPolicyV4) -> &'static str {
     match policy {
         crate::config::RoutingPolicyV4::ManualSticky => "manual-sticky",
@@ -449,6 +710,246 @@ fn save_routing_from_editor(
     ))
 }
 
+fn reset_route_node_editor_draft(editor: &mut ProxySettingsRouteNodeEditorState) {
+    editor.selected_route = None;
+    editor.draft_name.clear();
+    editor.policy = crate::config::RoutingPolicyV4::OrderedFailover;
+    editor.target.clear();
+    editor.order.clear();
+    editor.prefer_tags.clear();
+    editor.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
+    editor.when.clear();
+    editor.then.clear();
+    editor.default_route.clear();
+}
+
+fn load_route_node_editor_from_service(
+    editor: &mut ProxySettingsRouteNodeEditorState,
+    service: &crate::config::ServiceViewV4,
+    signature: String,
+) {
+    let routing = service.routing.as_ref().map(|routing| {
+        let mut routing = routing.clone();
+        routing.sync_graph_from_compat();
+        routing
+    });
+    let selected = editor.selected_route.clone();
+
+    if let Some(name) = selected.as_deref()
+        && let Some(routing) = routing.as_ref()
+        && let Some(node) = routing.routes.get(name)
+    {
+        editor.draft_name = name.to_string();
+        editor.policy = node.strategy;
+        editor.target = node.target.clone().unwrap_or_default();
+        editor.order = node.children.join(", ");
+        editor.prefer_tags = format_routing_prefer_tag_sets(&node.prefer_tags);
+        editor.on_exhausted = node.on_exhausted;
+        editor.when = node
+            .when
+            .as_ref()
+            .filter(|condition| !condition.is_empty())
+            .map(|condition| routing_condition_preview(Some(condition)))
+            .unwrap_or_default();
+        editor.then = node.then.clone().unwrap_or_default();
+        editor.default_route = node.default_route.clone().unwrap_or_default();
+        editor.original_routing = Some(routing.clone());
+        editor.source_signature = Some(signature);
+        return;
+    }
+
+    reset_route_node_editor_draft(editor);
+    editor.order = ordered_provider_names_for_editor(service).join(", ");
+    editor.original_routing = routing;
+    editor.source_signature = Some(signature);
+}
+
+fn save_route_node_from_editor(
+    cfg: &mut crate::config::ProxyConfigV4,
+    editor: &mut ProxySettingsRouteNodeEditorState,
+    service_kind: ProxySettingsProviderEditorService,
+    lang: Language,
+) -> Result<String, String> {
+    let name = normalize_route_node_name(&editor.draft_name)?;
+    let service = select_provider_editor_service_mut(cfg, service_kind);
+    let mut routing = editor
+        .original_routing
+        .clone()
+        .or_else(|| service.routing.clone())
+        .unwrap_or_default();
+    routing.sync_graph_from_compat();
+    let selected = editor.selected_route.clone();
+
+    if service.providers.contains_key(name.as_str()) {
+        return Err(format!("route node '{name}' conflicts with a provider"));
+    }
+
+    if let Some(existing) = selected.as_deref() {
+        if existing != name.as_str() {
+            routing
+                .rename_route_node(existing, name.clone())
+                .map_err(|err| err.to_string())?;
+        } else if !routing.routes.contains_key(name.as_str()) {
+            return Err(format!("route node '{name}' no longer exists"));
+        }
+    } else if routing.routes.contains_key(name.as_str()) {
+        return Err(format!("route node '{name}' already exists"));
+    }
+
+    if routing.routes.is_empty() && selected.is_none() {
+        routing.entry = name.clone();
+    }
+
+    match editor.policy {
+        crate::config::RoutingPolicyV4::ManualSticky => {
+            let target = editor.target.trim();
+            if target.is_empty() {
+                return Err("manual-sticky route node requires a target".to_string());
+            }
+            if target == name {
+                return Err(format!("route node '{name}' cannot reference itself"));
+            }
+            if !route_ref_exists_optional(service, Some(&routing), target) {
+                return Err(format!("target route/provider '{target}' does not exist"));
+            }
+            let order = normalize_route_node_editor_order(
+                &editor.order,
+                service,
+                &routing,
+                name.as_str(),
+                true,
+            )?;
+            let node = routing.routes.entry(name.clone()).or_default();
+            node.strategy = crate::config::RoutingPolicyV4::ManualSticky;
+            node.target = Some(target.to_string());
+            node.children = order;
+            node.prefer_tags.clear();
+            node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
+            node.when = None;
+            node.then = None;
+            node.default_route = None;
+        }
+        crate::config::RoutingPolicyV4::OrderedFailover => {
+            let order = normalize_route_node_editor_order(
+                &editor.order,
+                service,
+                &routing,
+                name.as_str(),
+                false,
+            )?;
+            let node = routing.routes.entry(name.clone()).or_default();
+            node.strategy = crate::config::RoutingPolicyV4::OrderedFailover;
+            node.target = None;
+            node.children = order;
+            node.prefer_tags.clear();
+            node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
+            node.when = None;
+            node.then = None;
+            node.default_route = None;
+        }
+        crate::config::RoutingPolicyV4::TagPreferred => {
+            let order = normalize_route_node_editor_order(
+                &editor.order,
+                service,
+                &routing,
+                name.as_str(),
+                false,
+            )?;
+            let prefer_tags = parse_routing_prefer_tag_sets(&editor.prefer_tags)?;
+            if prefer_tags.is_empty() {
+                return Err("tag-preferred route node requires prefer_tags".to_string());
+            }
+            let node = routing.routes.entry(name.clone()).or_default();
+            node.strategy = crate::config::RoutingPolicyV4::TagPreferred;
+            node.target = None;
+            node.children = order;
+            node.prefer_tags = prefer_tags;
+            node.on_exhausted = editor.on_exhausted;
+            node.when = None;
+            node.then = None;
+            node.default_route = None;
+        }
+        crate::config::RoutingPolicyV4::Conditional => {
+            let condition = parse_routing_condition_text(&editor.when)?;
+            if condition.is_empty() {
+                return Err("conditional route node requires when".to_string());
+            }
+            let then = editor.then.trim();
+            if then.is_empty() {
+                return Err("conditional route node requires then".to_string());
+            }
+            if then == name {
+                return Err(format!("route node '{name}' cannot reference itself"));
+            }
+            if !route_ref_exists_optional(service, Some(&routing), then) {
+                return Err(format!("then route/provider '{then}' does not exist"));
+            }
+            let default_route = editor.default_route.trim();
+            if default_route.is_empty() {
+                return Err("conditional route node requires default".to_string());
+            }
+            if default_route == name {
+                return Err(format!("route node '{name}' cannot reference itself"));
+            }
+            if !route_ref_exists_optional(service, Some(&routing), default_route) {
+                return Err(format!(
+                    "default route/provider '{default_route}' does not exist"
+                ));
+            }
+            let node = routing.routes.entry(name.clone()).or_default();
+            node.strategy = crate::config::RoutingPolicyV4::Conditional;
+            node.target = None;
+            node.children.clear();
+            node.prefer_tags.clear();
+            node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
+            node.when = Some(condition);
+            node.then = Some(then.to_string());
+            node.default_route = Some(default_route.to_string());
+        }
+    }
+
+    routing.sync_compat_from_graph();
+    service.routing = Some(routing);
+    editor.selected_route = Some(name.clone());
+    editor.source_signature = None;
+    Ok(format!(
+        "{} {} '{}'",
+        pick(lang, "已保存 route node", "Saved route node"),
+        provider_editor_service_label(lang, service_kind),
+        name
+    ))
+}
+
+fn delete_route_node_from_editor(
+    cfg: &mut crate::config::ProxyConfigV4,
+    editor: &mut ProxySettingsRouteNodeEditorState,
+    service_kind: ProxySettingsProviderEditorService,
+    lang: Language,
+) -> Result<String, String> {
+    let Some(name) = editor.selected_route.clone() else {
+        return Err("no route node selected".to_string());
+    };
+    let service = select_provider_editor_service_mut(cfg, service_kind);
+    let mut routing = editor
+        .original_routing
+        .clone()
+        .or_else(|| service.routing.clone())
+        .unwrap_or_default();
+    routing.sync_graph_from_compat();
+    routing
+        .delete_route_node(name.as_str())
+        .map_err(|err| err.to_string())?;
+    service.routing = Some(routing);
+    reset_route_node_editor_draft(editor);
+    editor.source_signature = None;
+    Ok(format!(
+        "{} {} '{}'",
+        pick(lang, "已删除 route node", "Removed route node"),
+        provider_editor_service_label(lang, service_kind),
+        name
+    ))
+}
+
 fn build_routing_from_editor(
     editor: &ProxySettingsRoutingEditorState,
     service: &crate::config::ServiceViewV4,
@@ -552,6 +1053,42 @@ fn normalize_routing_editor_order(
             if seen.insert(name.clone()) {
                 order.push(name);
             }
+        }
+    }
+    Ok(order)
+}
+
+fn normalize_route_node_editor_order(
+    raw: &str,
+    service: &crate::config::ServiceViewV4,
+    routing: &crate::config::RoutingConfigV4,
+    current_route: &str,
+    allow_empty: bool,
+) -> Result<Vec<String>, String> {
+    let order = parse_routing_provider_list(raw);
+    if order.is_empty() {
+        if allow_empty {
+            return Ok(Vec::new());
+        }
+        return Err("route node order requires at least one child".to_string());
+    }
+
+    let mut seen = BTreeSet::new();
+    for name in &order {
+        if name == current_route {
+            return Err(format!(
+                "route node '{current_route}' cannot reference itself"
+            ));
+        }
+        if !route_ref_exists_optional(service, Some(routing), name) {
+            return Err(format!(
+                "route/provider '{name}' in route node order does not exist"
+            ));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(format!(
+                "duplicate route/provider '{name}' in route node order"
+            ));
         }
     }
     Ok(order)
@@ -903,6 +1440,49 @@ fn routing_condition_preview(condition: Option<&crate::config::RoutingConditionV
         parts.push(format!("header:{key}={value}"));
     }
     parts.join(" ")
+}
+
+fn parse_routing_condition_text(raw: &str) -> Result<crate::config::RoutingConditionV4, String> {
+    let mut condition = crate::config::RoutingConditionV4::default();
+    for part in raw.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';')) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            return Err(format!("condition '{part}' must use key=value form"));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            return Err(format!("condition '{part}' has an empty key"));
+        }
+        if value.is_empty() {
+            return Err(format!("condition '{part}' has an empty value"));
+        }
+        match key {
+            "model" => condition.model = Some(value.to_string()),
+            "service_tier" => condition.service_tier = Some(value.to_string()),
+            "reasoning_effort" => condition.reasoning_effort = Some(value.to_string()),
+            "path" => condition.path = Some(value.to_string()),
+            "method" => condition.method = Some(value.to_string()),
+            _ if key.starts_with("header:") => {
+                let header_key = key.trim_start_matches("header:").trim();
+                if header_key.is_empty() {
+                    return Err(format!("condition '{part}' has an empty header name"));
+                }
+                if condition
+                    .headers
+                    .insert(header_key.to_string(), value.to_string())
+                    .is_some()
+                {
+                    return Err(format!("duplicate condition header '{header_key}'"));
+                }
+            }
+            _ => return Err(format!("unknown condition field '{key}'")),
+        }
+    }
+    Ok(condition)
 }
 
 fn routing_preview_rows(
@@ -1261,6 +1841,10 @@ fn normalize_provider_editor_name(raw: &str) -> Result<String, String> {
         );
     }
     Ok(name.to_string())
+}
+
+fn normalize_route_node_name(raw: &str) -> Result<String, String> {
+    normalize_provider_editor_name(raw)
 }
 
 fn normalize_required_provider_editor_field(raw: &str, field: &str) -> Result<String, String> {
@@ -1633,5 +2217,227 @@ mod tests {
             .expect_err("stop should reject unmatched tag filters");
 
         assert!(err.contains("matches no providers"));
+    }
+
+    #[test]
+    fn route_node_editor_renames_nodes_and_updates_references() {
+        let mut cfg = crate::config::ProxyConfigV4::default();
+        cfg.codex.providers.insert(
+            "alpha".to_string(),
+            crate::config::ProviderConfigV4::default(),
+        );
+        cfg.codex.providers.insert(
+            "paygo".to_string(),
+            crate::config::ProviderConfigV4::default(),
+        );
+        cfg.codex.routing = Some(crate::config::RoutingConfigV4 {
+            entry: "main".to_string(),
+            routes: BTreeMap::from([
+                (
+                    "main".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                        children: vec!["pool".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+                (
+                    "pool".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                        children: vec!["alpha".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+                (
+                    "consumer".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::ManualSticky,
+                        target: Some("pool".to_string()),
+                        children: vec!["pool".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+            ]),
+            ..crate::config::RoutingConfigV4::default()
+        });
+        let mut editor = ProxySettingsRouteNodeEditorState {
+            selected_route: Some("pool".to_string()),
+            draft_name: "monthly_pool".to_string(),
+            order: "alpha".to_string(),
+            ..ProxySettingsRouteNodeEditorState::default()
+        };
+
+        save_route_node_from_editor(
+            &mut cfg,
+            &mut editor,
+            ProxySettingsProviderEditorService::Codex,
+            Language::En,
+        )
+        .expect("route node should rename");
+
+        let routing = cfg.codex.routing.as_ref().expect("routing exists");
+        assert!(routing.routes.contains_key("monthly_pool"));
+        assert!(!routing.routes.contains_key("pool"));
+        assert_eq!(
+            routing.entry_node().map(|node| node.children.as_slice()),
+            Some(&["monthly_pool".to_string()][..])
+        );
+        assert_eq!(
+            routing
+                .routes
+                .get("consumer")
+                .and_then(|node| node.target.as_deref()),
+            Some("monthly_pool")
+        );
+        assert_eq!(editor.selected_route.as_deref(), Some("monthly_pool"));
+    }
+
+    #[test]
+    fn route_node_editor_creates_entry_when_graph_is_empty() {
+        let mut cfg = crate::config::ProxyConfigV4::default();
+        cfg.codex.providers.insert(
+            "alpha".to_string(),
+            crate::config::ProviderConfigV4::default(),
+        );
+        let mut editor = ProxySettingsRouteNodeEditorState {
+            draft_name: "main_route".to_string(),
+            order: "alpha".to_string(),
+            ..ProxySettingsRouteNodeEditorState::default()
+        };
+
+        save_route_node_from_editor(
+            &mut cfg,
+            &mut editor,
+            ProxySettingsProviderEditorService::Codex,
+            Language::En,
+        )
+        .expect("route node should save");
+
+        let routing = cfg.codex.routing.as_ref().expect("routing exists");
+        assert_eq!(routing.entry, "main_route");
+        assert_eq!(
+            routing.entry_node().map(|node| node.children.as_slice()),
+            Some(&["alpha".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn route_node_editor_preserves_empty_manual_sticky_children() {
+        let mut cfg = crate::config::ProxyConfigV4::default();
+        cfg.codex.providers.insert(
+            "alpha".to_string(),
+            crate::config::ProviderConfigV4::default(),
+        );
+        cfg.codex.providers.insert(
+            "beta".to_string(),
+            crate::config::ProviderConfigV4::default(),
+        );
+        cfg.codex.routing = Some(crate::config::RoutingConfigV4 {
+            entry: "main".to_string(),
+            routes: BTreeMap::from([
+                (
+                    "main".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                        children: vec!["sticky".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+                (
+                    "sticky".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::ManualSticky,
+                        target: Some("alpha".to_string()),
+                        children: Vec::new(),
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+            ]),
+            ..crate::config::RoutingConfigV4::default()
+        });
+        let mut editor = ProxySettingsRouteNodeEditorState {
+            selected_route: Some("sticky".to_string()),
+            ..ProxySettingsRouteNodeEditorState::default()
+        };
+
+        load_route_node_editor_from_service(&mut editor, &cfg.codex, "sig".to_string());
+        assert!(editor.order.is_empty());
+
+        save_route_node_from_editor(
+            &mut cfg,
+            &mut editor,
+            ProxySettingsProviderEditorService::Codex,
+            Language::En,
+        )
+        .expect("route node should save without filling children");
+
+        let sticky = cfg
+            .codex
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.routes.get("sticky"))
+            .expect("sticky route should remain");
+        assert!(sticky.children.is_empty());
+        assert_eq!(sticky.target.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn route_node_editor_parses_conditional_when_text() {
+        let condition = parse_routing_condition_text(
+            "model=gpt-5 service_tier=priority path=/v1/chat/completions header:X-Plan=gold",
+        )
+        .expect("condition should parse");
+
+        assert_eq!(condition.model.as_deref(), Some("gpt-5"));
+        assert_eq!(condition.service_tier.as_deref(), Some("priority"));
+        assert_eq!(condition.path.as_deref(), Some("/v1/chat/completions"));
+        assert_eq!(
+            condition.headers.get("X-Plan").map(String::as_str),
+            Some("gold")
+        );
+    }
+
+    #[test]
+    fn route_node_editor_deletes_unreferenced_nodes() {
+        let mut cfg = crate::config::ProxyConfigV4::default();
+        cfg.codex.routing = Some(crate::config::RoutingConfigV4 {
+            entry: "main".to_string(),
+            routes: BTreeMap::from([
+                (
+                    "main".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                        children: vec!["alpha".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+                (
+                    "unused".to_string(),
+                    crate::config::RoutingNodeV4 {
+                        strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                        children: vec!["alpha".to_string()],
+                        ..crate::config::RoutingNodeV4::default()
+                    },
+                ),
+            ]),
+            ..crate::config::RoutingConfigV4::default()
+        });
+        let mut editor = ProxySettingsRouteNodeEditorState {
+            selected_route: Some("unused".to_string()),
+            ..ProxySettingsRouteNodeEditorState::default()
+        };
+
+        delete_route_node_from_editor(
+            &mut cfg,
+            &mut editor,
+            ProxySettingsProviderEditorService::Codex,
+            Language::En,
+        )
+        .expect("route node should delete");
+
+        let routing = cfg.codex.routing.as_ref().expect("routing exists");
+        assert!(!routing.routes.contains_key("unused"));
+        assert!(editor.selected_route.is_none());
     }
 }

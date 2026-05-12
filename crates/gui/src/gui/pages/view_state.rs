@@ -339,6 +339,7 @@ pub struct ProxySettingsViewState {
     pub(super) import_codex: ImportCodexModalState,
     pub(super) provider_editor: ProxySettingsProviderEditorState,
     pub(super) routing_editor: ProxySettingsRoutingEditorState,
+    pub(super) route_node_editor: ProxySettingsRouteNodeEditorState,
 }
 
 impl Default for ProxySettingsViewState {
@@ -352,6 +353,7 @@ impl Default for ProxySettingsViewState {
             import_codex: ImportCodexModalState::default(),
             provider_editor: ProxySettingsProviderEditorState::default(),
             routing_editor: ProxySettingsRoutingEditorState::default(),
+            route_node_editor: ProxySettingsRouteNodeEditorState::default(),
         }
     }
 }
@@ -450,6 +452,41 @@ impl Default for ProxySettingsRoutingEditorState {
             order: String::new(),
             prefer_tags: String::new(),
             on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ProxySettingsRouteNodeEditorState {
+    pub(super) source_signature: Option<String>,
+    pub(super) original_routing: Option<crate::config::RoutingConfigV4>,
+    pub(super) selected_route: Option<String>,
+    pub(super) draft_name: String,
+    pub(super) policy: crate::config::RoutingPolicyV4,
+    pub(super) target: String,
+    pub(super) order: String,
+    pub(super) prefer_tags: String,
+    pub(super) on_exhausted: crate::config::RoutingExhaustedActionV4,
+    pub(super) when: String,
+    pub(super) then: String,
+    pub(super) default_route: String,
+}
+
+impl Default for ProxySettingsRouteNodeEditorState {
+    fn default() -> Self {
+        Self {
+            source_signature: None,
+            original_routing: None,
+            selected_route: None,
+            draft_name: String::new(),
+            policy: crate::config::RoutingPolicyV4::OrderedFailover,
+            target: String::new(),
+            order: String::new(),
+            prefer_tags: String::new(),
+            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
+            when: String::new(),
+            then: String::new(),
+            default_route: String::new(),
         }
     }
 }

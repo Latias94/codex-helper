@@ -730,10 +730,11 @@ impl RoutingConfigV4 {
     }
 
     pub fn sync_graph_from_compat(&mut self) {
+        if !self.has_compat_authoring_fields() {
+            return;
+        }
+
         if self.routes.is_empty() {
-            if !self.has_compat_authoring_fields() {
-                return;
-            }
             self.entry =
                 non_conflicting_default_route_entry_from_refs(&self.order, self.target.as_deref());
             self.routes
@@ -749,6 +750,71 @@ impl RoutingConfigV4 {
         if !self.order.is_empty() {
             node.children = self.order.clone();
         }
+    }
+
+    pub fn route_node_names(&self) -> Vec<String> {
+        self.routes.keys().cloned().collect()
+    }
+
+    pub fn route_node_references(&self, target: &str) -> Vec<String> {
+        self.routes
+            .iter()
+            .filter_map(|(route_name, node)| {
+                if node.children.iter().any(|child| child == target)
+                    || node.target.as_deref() == Some(target)
+                    || node.then.as_deref() == Some(target)
+                    || node.default_route.as_deref() == Some(target)
+                {
+                    Some(route_name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn rename_route_node(&mut self, old: &str, new: String) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        if !self.routes.contains_key(old) {
+            anyhow::bail!("route node '{old}' does not exist");
+        }
+        if self.routes.contains_key(new.as_str()) {
+            anyhow::bail!("route node '{new}' already exists");
+        }
+
+        let Some(node) = self.routes.remove(old) else {
+            anyhow::bail!("route node '{old}' does not exist");
+        };
+        self.routes.insert(new.clone(), node);
+        if self.entry == old {
+            self.entry = new.clone();
+        }
+        for node in self.routes.values_mut() {
+            rewrite_route_node_refs(node, old, new.as_str());
+        }
+        self.sync_compat_from_graph();
+        Ok(())
+    }
+
+    pub fn delete_route_node(&mut self, name: &str) -> Result<()> {
+        if self.entry == name {
+            anyhow::bail!("entry route node '{name}' cannot be deleted");
+        }
+        if !self.routes.contains_key(name) {
+            anyhow::bail!("route node '{name}' does not exist");
+        }
+        let refs = self.route_node_references(name);
+        if !refs.is_empty() {
+            anyhow::bail!(
+                "route node '{name}' is still referenced by: {}",
+                refs.join(", ")
+            );
+        }
+        self.routes.remove(name);
+        self.sync_compat_from_graph();
+        Ok(())
     }
 }
 
@@ -781,6 +847,23 @@ fn non_conflicting_default_route_entry_from_refs(
         idx += 1;
     }
     candidate
+}
+
+fn rewrite_route_node_refs(node: &mut RoutingNodeV4, old: &str, new: &str) {
+    for child in &mut node.children {
+        if child == old {
+            *child = new.to_string();
+        }
+    }
+    if node.target.as_deref() == Some(old) {
+        node.target = Some(new.to_string());
+    }
+    if node.then.as_deref() == Some(old) {
+        node.then = Some(new.to_string());
+    }
+    if node.default_route.as_deref() == Some(old) {
+        node.default_route = Some(new.to_string());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
