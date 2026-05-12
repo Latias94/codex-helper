@@ -80,6 +80,17 @@ impl UsageMetrics {
             || self.cache_creation_tokens_total() > 0
     }
 
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        let read = self.cache_read_input_tokens.max(0);
+        let create = self.cache_creation_tokens_total().max(0);
+        let effective_input = self.input_tokens.max(0).saturating_sub(read);
+        let denom = effective_input.saturating_add(create).saturating_add(read);
+        if denom <= 0 {
+            return None;
+        }
+        Some(read as f64 / denom as f64)
+    }
+
     fn derived_total_tokens(&self) -> i64 {
         self.input_tokens
             .saturating_add(self.output_tokens)
@@ -450,6 +461,20 @@ mod tests {
                 ..UsageMetrics::default()
             })
         );
+    }
+
+    #[test]
+    fn computes_cache_hit_rate_from_read_and_creation_tokens() {
+        let usage = UsageMetrics {
+            input_tokens: 100,
+            cache_read_input_tokens: 30,
+            cache_creation_input_tokens: 20,
+            ..UsageMetrics::default()
+        };
+
+        let rate = usage.cache_hit_rate().expect("cache hit rate");
+
+        assert_eq!(rate, 0.25);
     }
 
     #[test]

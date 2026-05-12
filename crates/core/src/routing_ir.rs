@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 
 use anyhow::{Context, Result};
 
@@ -24,6 +25,40 @@ pub struct RoutePlanTemplate {
 }
 
 impl RoutePlanTemplate {
+    pub fn route_graph_key(&self) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.service_name.hash(&mut hasher);
+        self.entry.hash(&mut hasher);
+        self.compatibility_station_name.hash(&mut hasher);
+        self.expanded_provider_order.hash(&mut hasher);
+        hash_route_nodes(&self.nodes, &mut hasher);
+        for candidate in &self.candidates {
+            hash_route_candidate(candidate, &mut hasher);
+        }
+        format!("v4:{:016x}", hasher.finish())
+    }
+
+    pub fn compatibility_index_for_provider_endpoint(
+        &self,
+        provider_id: &str,
+        endpoint_id: &str,
+        base_url: &str,
+    ) -> Option<(String, usize)> {
+        self.candidates
+            .iter()
+            .find(|candidate| {
+                candidate.provider_id == provider_id
+                    && candidate.endpoint_id == endpoint_id
+                    && candidate.base_url == base_url
+            })
+            .map(|candidate| {
+                (
+                    candidate_compatibility_station_name(self, candidate),
+                    candidate_compatibility_upstream_index(candidate),
+                )
+            })
+    }
+
     pub fn candidate_identity(&self, candidate: &RouteCandidate) -> RuntimeUpstreamIdentity {
         RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new(
@@ -48,6 +83,40 @@ impl RoutePlanTemplate {
     }
 }
 
+// Keep the affinity key aligned with selection semantics, not just leaf identity.
+// Any change that can alter route selection or the selected upstream's routing metadata
+// must change this fingerprint so session stickiness does not bleed across config edits.
+fn hash_route_nodes<H: Hasher>(nodes: &BTreeMap<String, RouteNodePlan>, hasher: &mut H) {
+    for (name, node) in nodes {
+        name.hash(hasher);
+        hash_route_node(node, hasher);
+    }
+}
+
+fn hash_route_node<H: Hasher>(node: &RouteNodePlan, hasher: &mut H) {
+    node.strategy.hash(hasher);
+    node.children.hash(hasher);
+    node.target.hash(hasher);
+    node.prefer_tags.hash(hasher);
+    node.on_exhausted.hash(hasher);
+    node.when.hash(hasher);
+    node.then.hash(hasher);
+    node.default_route.hash(hasher);
+}
+
+fn hash_route_candidate<H: Hasher>(candidate: &RouteCandidate, hasher: &mut H) {
+    candidate.provider_id.hash(hasher);
+    candidate.endpoint_id.hash(hasher);
+    candidate.base_url.hash(hasher);
+    candidate.tags.hash(hasher);
+    candidate.supported_models.hash(hasher);
+    candidate.model_mapping.hash(hasher);
+    candidate.route_path.hash(hasher);
+    candidate.stable_index.hash(hasher);
+    candidate.compatibility_station_name.hash(hasher);
+    candidate.compatibility_upstream_index.hash(hasher);
+}
+
 #[derive(Debug, Clone)]
 pub struct RoutePlan {
     pub service_name: String,
@@ -70,7 +139,7 @@ pub struct RouteNodePlan {
     pub default_route: Option<RouteRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RouteRef {
     Route(String),
     Provider(String),
@@ -203,6 +272,23 @@ impl RoutePlanRuntimeState {
 
     pub fn station(&self, station_name: &str) -> Option<&RoutePlanStationRuntimeState> {
         self.stations.get(station_name)
+    }
+
+    pub fn clear_last_good_indices(&mut self) {
+        for station in self.stations.values_mut() {
+            station.last_good_index = None;
+        }
+    }
+
+    pub fn set_station_last_good_index(
+        &mut self,
+        station_name: impl Into<String>,
+        last_good_index: Option<usize>,
+    ) {
+        self.stations
+            .entry(station_name.into())
+            .or_default()
+            .last_good_index = last_good_index;
     }
 }
 
@@ -1604,6 +1690,85 @@ mod tests {
         let resolved = resolved_v4_provider_order("routing-ir-test", view).expect("resolved order");
         assert_eq!(template.expanded_provider_order, resolved);
         assert_eq!(provider_ids(template), resolved);
+    }
+
+    #[test]
+    fn route_graph_key_changes_when_route_rules_change() {
+        let providers = BTreeMap::from([
+            (
+                "a".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("http://a.example/v1".to_string()),
+                    tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                    ..ProviderConfigV4::default()
+                },
+            ),
+            (
+                "b".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("http://b.example/v1".to_string()),
+                    tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                    ..ProviderConfigV4::default()
+                },
+            ),
+        ]);
+        let request = RouteRequestContext::default();
+        let ordered = ServiceViewV4 {
+            providers: providers.clone(),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::OrderedFailover,
+                        children: vec!["a".to_string(), "b".to_string()],
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+        let tag_preferred = ServiceViewV4 {
+            providers,
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::TagPreferred,
+                        children: vec!["a".to_string(), "b".to_string()],
+                        prefer_tags: vec![BTreeMap::from([(
+                            "billing".to_string(),
+                            "monthly".to_string(),
+                        )])],
+                        on_exhausted: RoutingExhaustedActionV4::Continue,
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        let ordered_template =
+            compile_v4_route_plan_template_with_request("routing-ir-test", &ordered, &request)
+                .expect("ordered template");
+        let tag_preferred_template = compile_v4_route_plan_template_with_request(
+            "routing-ir-test",
+            &tag_preferred,
+            &request,
+        )
+        .expect("tag-preferred template");
+
+        assert_eq!(
+            provider_ids(&ordered_template),
+            provider_ids(&tag_preferred_template)
+        );
+        assert_ne!(
+            ordered_template.route_graph_key(),
+            tag_preferred_template.route_graph_key()
+        );
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

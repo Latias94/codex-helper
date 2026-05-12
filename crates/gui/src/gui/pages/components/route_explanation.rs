@@ -428,6 +428,24 @@ pub(in super::super) fn render_session_route_snapshot_card(
                 );
             });
             ui.add_space(6.0);
+            if let Some(affinity) = row.route_affinity.as_ref() {
+                let provider = format_route_decision_provider_endpoint(
+                    affinity.provider_id.as_deref(),
+                    affinity.endpoint_id.as_deref(),
+                )
+                .unwrap_or_else(|| "-".to_string());
+                console_note(
+                    ui,
+                    format!(
+                        "{}: station={}, provider={}, upstream={}, reason={}",
+                        pick(lang, "session 粘性", "Session affinity"),
+                        affinity.station_name,
+                        provider,
+                        shorten_middle(&affinity.upstream_base_url, 72),
+                        affinity.change_reason,
+                    ),
+                );
+            }
             console_note(
                 ui,
                 format!(

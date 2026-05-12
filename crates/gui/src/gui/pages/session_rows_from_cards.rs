@@ -31,6 +31,7 @@ pub(super) fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Ve
                 binding_profile_name: card.binding_profile_name.clone(),
                 binding_continuity_mode: card.binding_continuity_mode,
                 last_route_decision: card.last_route_decision.clone(),
+                route_affinity: card.route_affinity.clone(),
                 effective_model: card.effective_model.clone(),
                 effective_reasoning_effort: card.effective_reasoning_effort.clone(),
                 effective_service_tier: card.effective_service_tier.clone(),

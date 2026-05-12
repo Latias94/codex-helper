@@ -18,7 +18,7 @@ use crate::state::{
     ActiveRequest, BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
     ProviderBalanceSnapshot, ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource,
     RuntimeConfigState, SessionContinuityMode, SessionIdentityCard, SessionObservationScope,
-    SessionStats, StationHealth,
+    SessionRouteAffinity, SessionStats, StationHealth,
 };
 use crate::usage::UsageMetrics;
 

@@ -22,6 +22,15 @@ All notable changes to this project will be documented in this file.
   TUI routing and GUI routing-editor previews now include a route graph tree that shows the entry node, nested route nodes, conditional branches, provider leaves, missing references, and unreachable nodes.
 - GUI routing 设置新增 route node 编辑器，可创建、重命名、删除和保存嵌套 route node，支持 `ordered-failover`、`manual-sticky`、`tag-preferred` 和 `conditional` 节点。
   GUI routing settings now include a route node editor for creating, renaming, deleting, and saving nested route nodes across `ordered-failover`, `manual-sticky`, `tag-preferred`, and `conditional` nodes.
+- 新增 route graph 会话粘性：同一会话按 `session_id + service + route_graph_key` 粘住可用 provider，失败重试后才按当前路由图继续切换；路由规则变化会让旧粘性自然失效。
+  Added route-graph session affinity: a session sticks to a usable provider by `session_id + service + route_graph_key`, falls through through the current route graph only after retry failure, and naturally invalidates old affinity when routing rules change.
+- TUI Requests 和 GUI 请求列表/详情新增缓存命中率展示，统一使用 core 的 `UsageMetrics::cache_hit_rate()` 口径。
+  TUI Requests plus GUI request lists/details now show cache hit rate using the shared core `UsageMetrics::cache_hit_rate()` calculation.
+
+### 改进 / Improved
+
+- History / Recent 会话加载继续优化：展示行展开改为有界并发读取统计与尾部时间戳，GUI 按日期浏览也并发读取 header，TUI Recent 的 git 分支查询会先去重再并发。
+  History / Recent loading now expands displayed rows with bounded concurrent stats and tail-timestamp reads, GUI all-by-date browsing reads headers concurrently, and TUI Recent deduplicates git branch lookups before concurrent probing.
 
 ### 文档 / Documentation
 

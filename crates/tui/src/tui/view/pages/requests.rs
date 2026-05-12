@@ -86,6 +86,7 @@ pub(super) fn render_requests_page(
         "St",
         l("Dur"),
         "Att",
+        l("Hit%"),
         l("Model"),
         "Stn",
         "Pid",
@@ -106,10 +107,13 @@ pub(super) fn render_requests_page(
             let dur = duration_short(r.duration_ms);
             let attempts_n = r.attempt_count();
             let attempts = attempts_n.to_string();
+            let cache_hit = request_cache_hit_rate(r.usage.as_ref());
+            let cache_hit_style =
+                Style::default().fg(if cache_hit != "-" { p.accent } else { p.muted });
             let model = r.model.as_deref().unwrap_or("-").to_string();
             let cfg = r.station_name.as_deref().unwrap_or("-").to_string();
             let pid = r.provider_id.as_deref().unwrap_or("-").to_string();
-            let path = shorten_middle(&r.path, 60);
+            let path = shorten_middle(&r.path, 48);
 
             Row::new(vec![
                 Cell::from(Span::styled(age, Style::default().fg(p.muted))),
@@ -119,8 +123,9 @@ pub(super) fn render_requests_page(
                     attempts,
                     Style::default().fg(if attempts_n > 1 { p.warn } else { p.muted }),
                 )),
-                Cell::from(shorten(&model, 18)),
-                Cell::from(shorten(&cfg, 14)),
+                Cell::from(Span::styled(cache_hit, cache_hit_style)),
+                Cell::from(shorten(&model, 14)),
+                Cell::from(shorten(&cfg, 12)),
                 Cell::from(shorten(&pid, 10)),
                 Cell::from(path),
             ])
@@ -135,10 +140,11 @@ pub(super) fn render_requests_page(
             Constraint::Length(4),
             Constraint::Length(8),
             Constraint::Length(4),
-            Constraint::Length(18),
+            Constraint::Length(6),
             Constraint::Length(14),
+            Constraint::Length(12),
             Constraint::Length(10),
-            Constraint::Min(20),
+            Constraint::Min(14),
         ],
     )
     .header(header)
@@ -282,6 +288,15 @@ pub(super) fn render_requests_page(
                 Span::styled(format!("{}: ", l("usage")), Style::default().fg(p.muted)),
                 Span::styled(usage_line_lang(u, lang), Style::default().fg(p.accent)),
             ]));
+            if let Some(rate) = u.cache_hit_rate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}: ", l("cache hit rate")),
+                        Style::default().fg(p.muted),
+                    ),
+                    Span::styled(format!("{:.1}%", rate * 100.0), Style::default().fg(p.text)),
+                ]));
+            }
             lines.push(Line::from(vec![
                 Span::styled(format!("{}: ", l("cost")), Style::default().fg(p.muted)),
                 Span::styled(
@@ -434,6 +449,13 @@ fn request_cost_parts_line(request: &crate::state::FinishedRequest) -> Option<St
         parts.push(format!("create=${value}"));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn request_cache_hit_rate(usage: Option<&crate::usage::UsageMetrics>) -> String {
+    usage
+        .and_then(|usage| usage.cache_hit_rate())
+        .map(|rate| format!("{:.1}%", rate * 100.0))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> String {

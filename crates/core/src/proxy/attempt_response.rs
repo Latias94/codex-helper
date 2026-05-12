@@ -20,6 +20,7 @@ use super::retry::{
     RetryLayerOptions, RetryPlan, retry_info_for_observed_attempts, retry_sleep,
     should_never_retry, should_retry_class, should_retry_status,
 };
+use super::route_affinity::record_session_route_affinity_success;
 use super::route_attempts::{StatusRouteAttemptParams, record_status_route_attempt};
 use super::stream::{SseSuccessMeta, build_sse_success_response};
 
@@ -48,6 +49,7 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) cwd: Option<&'a str>,
     pub(super) effective_effort: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
+    pub(super) route_graph_key: Option<&'a str>,
     pub(super) upstream_chain: &'a mut Vec<String>,
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
     pub(super) route_attempt_index: usize,
@@ -85,6 +87,7 @@ pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) cwd: Option<&'a str>,
     pub(super) effective_effort: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
+    pub(super) route_graph_key: Option<&'a str>,
     pub(super) request_id: u64,
     pub(super) is_user_turn: bool,
     pub(super) is_codex_service: bool,
@@ -136,6 +139,7 @@ pub(super) async fn handle_streaming_attempt_success(
         cwd,
         effective_effort,
         base_service_tier,
+        route_graph_key,
         request_id,
         is_user_turn,
         is_codex_service,
@@ -167,6 +171,15 @@ pub(super) async fn handle_streaming_attempt_success(
             cooldown_reason: None,
         },
     );
+    record_session_route_affinity_success(
+        proxy,
+        session_id,
+        route_graph_key,
+        selected,
+        route_attempts,
+        route_attempt_index,
+    )
+    .await;
     let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
     build_sse_success_response(
         proxy,
@@ -223,6 +236,7 @@ pub(super) async fn handle_attempt_response(
         cwd,
         effective_effort,
         base_service_tier,
+        route_graph_key,
         upstream_chain,
         route_attempts,
         route_attempt_index,
@@ -280,6 +294,15 @@ pub(super) async fn handle_attempt_response(
             &selected.station_name,
             &selected.upstream.base_url,
             status_code,
+        )
+        .await;
+        record_session_route_affinity_success(
+            proxy,
+            session_id,
+            route_graph_key,
+            selected,
+            route_attempts,
+            route_attempt_index,
         )
         .await;
 

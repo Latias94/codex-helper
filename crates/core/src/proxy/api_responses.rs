@@ -69,6 +69,7 @@ pub(super) async fn build_operator_summary(
         session_effort,
         session_service_tier,
         session_bindings,
+        session_route_affinities,
         session_stats,
         default_profile,
         station_meta_overrides,
@@ -86,6 +87,7 @@ pub(super) async fn build_operator_summary(
         proxy.state.list_session_effort_overrides(),
         proxy.state.list_session_service_tier_overrides(),
         proxy.state.list_session_bindings(),
+        proxy.state.list_session_route_affinities(),
         proxy.state.list_session_stats(),
         effective_default_profile_name(proxy.state.as_ref(), proxy.service_name, mgr),
         proxy.state.get_station_meta_overrides(proxy.service_name),
@@ -105,6 +107,7 @@ pub(super) async fn build_operator_summary(
         model_overrides: &session_model,
         service_tier_overrides: &session_service_tier,
         bindings: &session_bindings,
+        route_affinities: &session_route_affinities,
         global_station_override: global_station_override.as_deref(),
         stats: &session_stats,
     });

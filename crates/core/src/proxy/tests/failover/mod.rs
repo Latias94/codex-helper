@@ -205,6 +205,221 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
 }
 
 #[tokio::test]
+async fn proxy_v4_route_graph_affinity_is_session_scoped() {
+    let input_hits = Arc::new(AtomicUsize::new(0));
+    let input1_hits = Arc::new(AtomicUsize::new(0));
+    let right_hits = Arc::new(AtomicUsize::new(0));
+
+    let input_counter = input_hits.clone();
+    let input = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let input_counter = input_counter.clone();
+            async move {
+                let hit = input_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 2 {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "provider": "input", "err": "quota" })),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "provider": "input" })),
+                    )
+                }
+            }
+        }),
+    );
+    let (input_addr, input_handle) = spawn_axum_server(input);
+
+    let input1_counter = input1_hits.clone();
+    let input1 = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let input1_counter = input1_counter.clone();
+            async move {
+                let hit = input1_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 1 {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "provider": "input1", "err": "quota" })),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "provider": "input1" })),
+                    )
+                }
+            }
+        }),
+    );
+    let (input1_addr, input1_handle) = spawn_axum_server(input1);
+
+    let right_counter = right_hits.clone();
+    let right = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let right_counter = right_counter.clone();
+            async move {
+                right_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "right" })),
+                )
+            }
+        }),
+    );
+    let (right_addr, right_handle) = spawn_axum_server(right);
+
+    let retry = RetryConfig {
+        profile: Some(RetryProfileName::AggressiveFailover),
+        upstream: Some(retry_layer_config(
+            1,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        provider: Some(retry_layer_config(
+            4,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        allow_cross_station_before_first_output: Some(true),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let monthly_tags =
+        std::collections::BTreeMap::from([("billing".to_string(), "monthly".to_string())]);
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "input".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{input_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        tags: monthly_tags.clone(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "input1".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{input1_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        tags: monthly_tags,
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "right".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{right_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "monthly_first".to_string(),
+                routes: std::collections::BTreeMap::from([
+                    (
+                        "monthly_first".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::TagPreferred,
+                            children: vec!["monthly_pool".to_string(), "right".to_string()],
+                            prefer_tags: vec![std::collections::BTreeMap::from([(
+                                "billing".to_string(),
+                                "monthly".to_string(),
+                            )])],
+                            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                    (
+                        "monthly_pool".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::OrderedFailover,
+                            children: vec!["input".to_string(), "input1".to_string()],
+                            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                ]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compat runtime");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let first = send_responses_json(&client, proxy_addr, Some("sid-input")).await;
+    assert_eq!(first["provider"].as_str(), Some("input"));
+
+    let fallback = send_responses_json(&client, proxy_addr, Some("sid-right")).await;
+    assert_eq!(fallback["provider"].as_str(), Some("right"));
+
+    let sticky = send_responses_json(&client, proxy_addr, Some("sid-input")).await;
+    assert_eq!(sticky["provider"].as_str(), Some("input"));
+
+    let new_session = send_responses_json(&client, proxy_addr, Some("sid-new")).await;
+    assert_eq!(new_session["provider"].as_str(), Some("input"));
+
+    assert_eq!(input_hits.load(Ordering::SeqCst), 4);
+    assert_eq!(input1_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(right_hits.load(Ordering::SeqCst), 1);
+
+    let affinities = state.list_session_route_affinities().await;
+    assert_eq!(
+        affinities
+            .get("sid-input")
+            .and_then(|affinity| affinity.provider_id.as_deref()),
+        Some("input")
+    );
+    let fallback_affinity = affinities.get("sid-right").expect("right affinity");
+    assert_eq!(fallback_affinity.provider_id.as_deref(), Some("right"));
+    assert_eq!(
+        fallback_affinity.change_reason.as_str(),
+        "failover_after_status_502"
+    );
+
+    let cards = state.list_session_identity_cards(20).await;
+    let right_card = cards
+        .iter()
+        .find(|card| card.session_id.as_deref() == Some("sid-right"))
+        .expect("right card");
+    assert_eq!(
+        right_card
+            .route_affinity
+            .as_ref()
+            .and_then(|affinity| affinity.provider_id.as_deref()),
+        Some("right")
+    );
+
+    proxy_handle.abort();
+    input_handle.abort();
+    input1_handle.abort();
+    right_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_v4_conditional_routing_selects_branch_by_request_model() {
     let small_hits = Arc::new(AtomicUsize::new(0));
     let large_hits = Arc::new(AtomicUsize::new(0));

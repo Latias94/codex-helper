@@ -22,6 +22,7 @@ use super::api_responses::{
 use super::control_plane_service::{
     prune_runtime_observability_after_reload, save_runtime_proxy_settings_and_reload,
 };
+use super::route_affinity::apply_session_route_affinity_to_runtime;
 use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
 use super::routing_plan::{
     PinnedRoutingSelection, build_station_routing_plan, resolve_pinned_station_selection,
@@ -223,11 +224,22 @@ pub(super) async fn get_routing_explain(
         .state
         .get_upstream_meta_overrides(proxy.service_name)
         .await;
-    let runtime = route_plan_runtime_state_from_lbs_with_overrides(
+    let mut runtime = route_plan_runtime_state_from_lbs_with_overrides(
         proxy.service_name,
         &route_selection.lbs,
         &upstream_overrides,
     );
+    if let Some(template) = route_selection.route_plan_template.as_ref() {
+        let route_graph_key = template.route_graph_key();
+        apply_session_route_affinity_to_runtime(
+            &proxy,
+            session_id.as_deref(),
+            template,
+            route_graph_key.as_str(),
+            &mut runtime,
+        )
+        .await;
+    }
     Ok(Json(build_routing_explain_response_with_request(
         proxy.service_name,
         Some(proxy.config.last_loaded_at_ms()),

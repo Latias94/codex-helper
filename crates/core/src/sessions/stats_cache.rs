@@ -18,6 +18,13 @@ struct SessionStatsCacheFile {
     entries: HashMap<String, CachedSessionStats>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct SessionStatsSnapshot {
+    pub(super) user_turns: usize,
+    pub(super) assistant_turns: usize,
+    pub(super) last_response_at: Option<String>,
+}
+
 pub(super) struct SessionStatsCache {
     path: PathBuf,
     data: SessionStatsCacheFile,
@@ -72,51 +79,46 @@ impl SessionStatsCache {
         Ok(())
     }
 
-    pub(super) async fn get_or_compute(
+    pub(super) fn lookup(
+        &self,
+        key: &str,
+        mtime_ms: u64,
+        size: u64,
+    ) -> Option<SessionStatsSnapshot> {
+        if mtime_ms == 0 {
+            return None;
+        }
+        let cached = self.data.entries.get(key)?;
+        if cached.mtime_ms != mtime_ms || cached.size != size {
+            return None;
+        }
+        Some(SessionStatsSnapshot {
+            user_turns: cached.user_turns,
+            assistant_turns: cached.assistant_turns,
+            last_response_at: cached.last_response_at.clone(),
+        })
+    }
+
+    pub(super) fn insert(
         &mut self,
-        path: &Path,
-    ) -> Result<(usize, usize, Option<String>)> {
-        let key = path.to_string_lossy().to_string();
-        let meta = fs::metadata(path)
-            .await
-            .with_context(|| format!("failed to stat session file {:?}", path))?;
-        let size = meta.len();
-        let mtime_ms = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        if mtime_ms > 0
-            && let Some(cached) = self.data.entries.get(&key)
-            && cached.mtime_ms == mtime_ms
-            && cached.size == size
-        {
-            return Ok((
-                cached.user_turns,
-                cached.assistant_turns,
-                cached.last_response_at.clone(),
-            ));
+        key: String,
+        mtime_ms: u64,
+        size: u64,
+        stats: &SessionStatsSnapshot,
+    ) {
+        if mtime_ms == 0 {
+            return;
         }
-
-        let (user_turns, assistant_turns) = count_turns_in_file(path).await?;
-        let last_response_at = read_last_assistant_timestamp_from_tail(path).await?;
-
-        if mtime_ms > 0 {
-            self.data.entries.insert(
-                key,
-                CachedSessionStats {
-                    mtime_ms,
-                    size,
-                    user_turns,
-                    assistant_turns,
-                    last_response_at: last_response_at.clone(),
-                },
-            );
-            self.dirty = true;
-        }
-
-        Ok((user_turns, assistant_turns, last_response_at))
+        self.data.entries.insert(
+            key,
+            CachedSessionStats {
+                mtime_ms,
+                size,
+                user_turns: stats.user_turns,
+                assistant_turns: stats.assistant_turns,
+                last_response_at: stats.last_response_at.clone(),
+            },
+        );
+        self.dirty = true;
     }
 }

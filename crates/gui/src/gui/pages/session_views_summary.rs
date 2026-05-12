@@ -17,6 +17,15 @@ pub(super) fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
         row.last_service_tier.as_deref(),
         row.last_provider_id.as_deref(),
         row.last_station_name(),
+        row.route_affinity
+            .as_ref()
+            .and_then(|affinity| affinity.provider_id.as_deref()),
+        row.route_affinity
+            .as_ref()
+            .and_then(|affinity| affinity.endpoint_id.as_deref()),
+        row.route_affinity
+            .as_ref()
+            .map(|affinity| affinity.upstream_base_url.as_str()),
         row.last_route_decision
             .as_ref()
             .and_then(|decision| decision.endpoint_id.as_deref()),
@@ -96,7 +105,18 @@ pub(super) fn session_current_target_summary(row: &SessionRow, lang: Language) -
 
     let current_station = resolved_route_value_text(row.effective_station());
     let current_upstream = resolved_route_value_text(row.effective_upstream_base_url.as_ref());
-    let provider = if let Some(decision) = row.last_route_decision.as_ref() {
+    let provider = if let Some(affinity) = row.route_affinity.as_ref() {
+        format_route_decision_provider_endpoint(
+            affinity.provider_id.as_deref(),
+            affinity.endpoint_id.as_deref(),
+        )
+        .map(|provider| {
+            format!(
+                "{provider} [{}]",
+                pick(lang, "session 粘性", "session affinity")
+            )
+        })
+    } else if let Some(decision) = row.last_route_decision.as_ref() {
         let decision_station = decision
             .effective_station
             .as_ref()
@@ -131,6 +151,23 @@ pub(super) fn session_current_target_summary(row: &SessionRow, lang: Language) -
     .unwrap_or_else(|| pick(lang, "<需新请求刷新>", "<needs fresh request>").to_string());
 
     format!("station={station}, provider={provider}, upstream={upstream}")
+}
+
+pub(super) fn session_route_affinity_summary(row: &SessionRow, lang: Language) -> Option<String> {
+    let affinity = row.route_affinity.as_ref()?;
+    let provider = format_route_decision_provider_endpoint(
+        affinity.provider_id.as_deref(),
+        affinity.endpoint_id.as_deref(),
+    )
+    .unwrap_or_else(|| "-".to_string());
+    Some(format!(
+        "{} / {} / {} [{}] {}",
+        affinity.station_name,
+        provider,
+        shorten_middle(&affinity.upstream_base_url, 56),
+        pick(lang, "路由图", "route graph"),
+        affinity.change_reason,
+    ))
 }
 
 pub(super) fn session_last_executed_target_summary(row: &SessionRow, lang: Language) -> String {

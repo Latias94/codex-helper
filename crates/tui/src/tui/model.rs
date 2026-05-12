@@ -12,7 +12,7 @@ use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
 use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
     ProviderBalanceSnapshot, ProxyState, ResolvedRouteValue, SessionIdentityCard,
-    SessionObservationScope, StationHealth, UsageRollupView,
+    SessionObservationScope, SessionRouteAffinity, StationHealth, UsageRollupView,
 };
 use crate::tui::Language;
 use crate::tui::i18n;
@@ -248,6 +248,7 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) turns_with_usage: Option<u64>,
     pub(in crate::tui) binding_profile_name: Option<String>,
     pub(in crate::tui) binding_continuity_mode: Option<crate::state::SessionContinuityMode>,
+    pub(in crate::tui) route_affinity: Option<SessionRouteAffinity>,
     pub(in crate::tui) effective_model: Option<ResolvedRouteValue>,
     pub(in crate::tui) effective_reasoning_effort: Option<ResolvedRouteValue>,
     pub(in crate::tui) effective_service_tier: Option<ResolvedRouteValue>,
@@ -1265,6 +1266,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
                 turns_with_usage: card.turns_with_usage,
                 binding_profile_name: card.binding_profile_name.clone(),
                 binding_continuity_mode: card.binding_continuity_mode,
+                route_affinity: card.route_affinity.clone(),
                 effective_model: card.effective_model.clone(),
                 effective_reasoning_effort: card.effective_reasoning_effort.clone(),
                 effective_service_tier: card.effective_service_tier.clone(),
@@ -1602,6 +1604,7 @@ mod tests {
             turns_with_usage: None,
             binding_profile_name: None,
             binding_continuity_mode: None,
+            route_affinity: None,
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,
@@ -1839,6 +1842,7 @@ mod tests {
                 turns_with_usage: None,
                 binding_profile_name: None,
                 binding_continuity_mode: None,
+                route_affinity: None,
                 effective_model: None,
                 effective_reasoning_effort: None,
                 effective_service_tier: None,
@@ -1901,6 +1905,7 @@ mod tests {
                 turns_with_usage: None,
                 binding_profile_name: None,
                 binding_continuity_mode: None,
+                route_affinity: None,
                 effective_model: None,
                 effective_reasoning_effort: None,
                 effective_service_tier: None,
@@ -2007,6 +2012,42 @@ mod tests {
     }
 
     #[test]
+    fn build_session_rows_from_cards_preserves_route_affinity() {
+        let rows = build_session_rows_from_cards(&[SessionIdentityCard {
+            session_id: Some("sid-1".to_string()),
+            route_affinity: Some(SessionRouteAffinity {
+                route_graph_key: "v4:deadbeef".to_string(),
+                station_name: "monthly_first".to_string(),
+                upstream_index: 2,
+                provider_id: Some("right".to_string()),
+                endpoint_id: Some("default".to_string()),
+                upstream_base_url: "https://right.example/v1".to_string(),
+                route_path: vec!["monthly_first".to_string(), "right".to_string()],
+                last_selected_at_ms: 1_000,
+                last_changed_at_ms: 900,
+                change_reason: "failover_after_status_502".to_string(),
+            }),
+            ..SessionIdentityCard::default()
+        }]);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .route_affinity
+                .as_ref()
+                .and_then(|affinity| affinity.provider_id.as_deref()),
+            Some("right")
+        );
+        assert_eq!(
+            rows[0]
+                .route_affinity
+                .as_ref()
+                .map(|affinity| affinity.change_reason.as_str()),
+            Some("failover_after_status_502")
+        );
+    }
+
+    #[test]
     fn session_control_posture_reports_profile_overrides() {
         let row = SessionRow {
             session_id: Some("sid-1".to_string()),
@@ -2034,6 +2075,7 @@ mod tests {
             turns_with_usage: None,
             binding_profile_name: Some("fast".to_string()),
             binding_continuity_mode: None,
+            route_affinity: None,
             effective_model: None,
             effective_reasoning_effort: None,
             effective_service_tier: None,

@@ -26,6 +26,7 @@ pub(in crate::gui::pages) fn empty_observed_session_row(session_id: Option<Strin
         binding_profile_name: None,
         binding_continuity_mode: None,
         last_route_decision: None,
+        route_affinity: None,
         effective_model: None,
         effective_reasoning_effort: None,
         effective_service_tier: None,
@@ -51,6 +52,7 @@ pub(in crate::gui::pages) fn observed_session_row_from_active(req: &ActiveReques
     row.last_station = req.station_name.clone();
     row.last_upstream_base_url = req.upstream_base_url.clone();
     row.last_route_decision = req.route_decision.clone();
+    row.route_affinity = None;
     row
 }
 
@@ -69,6 +71,7 @@ pub(in crate::gui::pages) fn observed_session_row_from_recent(
     row.last_upstream_base_url = request.upstream_base_url.clone();
     row.last_usage = request.usage.clone();
     row.last_route_decision = request.route_decision.clone();
+    row.route_affinity = None;
     row
 }
 
@@ -78,6 +81,7 @@ pub(in crate::gui::pages) fn observed_session_row_from_stats(
 ) -> SessionRow {
     let mut row = empty_observed_session_row(session_id);
     row.last_route_decision = stats.last_route_decision.clone();
+    row.route_affinity = None;
     row
 }
 

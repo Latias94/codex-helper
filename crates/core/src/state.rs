@@ -37,8 +37,8 @@ pub use self::session_identity::{
     ActiveRequest, FinishRequestParams, FinishedRequest, RequestObservability, ResolvedRouteValue,
     RouteDecisionProvenance, RouteValueSource, SessionBinding, SessionContinuityMode,
     SessionIdentityCard, SessionIdentityCardBuildInputs, SessionManualOverrides,
-    SessionObservationScope, SessionStats, build_session_identity_cards_from_parts,
-    enrich_session_identity_cards_with_host_transcripts,
+    SessionObservationScope, SessionRouteAffinity, SessionRouteAffinityTarget, SessionStats,
+    build_session_identity_cards_from_parts, enrich_session_identity_cards_with_host_transcripts,
     enrich_session_identity_cards_with_runtime,
 };
 use self::session_identity::{
@@ -65,6 +65,8 @@ struct RuntimePolicy {
     session_override_ttl_ms: u64,
     session_binding_ttl_ms: u64,
     session_binding_max_entries: usize,
+    session_route_affinity_ttl_ms: u64,
+    session_route_affinity_max_entries: usize,
     session_cwd_cache_ttl_ms: u64,
     session_cwd_cache_max_entries: usize,
     session_transcript_path_cache_ttl_ms: u64,
@@ -185,6 +187,8 @@ pub struct ProxyState {
     // Bindings are sticky by default; operators can opt into pruning with a separate TTL.
     session_binding_ttl_ms: u64,
     session_binding_max_entries: usize,
+    session_route_affinity_ttl_ms: u64,
+    session_route_affinity_max_entries: usize,
     session_cwd_cache_ttl_ms: u64,
     session_cwd_cache_max_entries: usize,
     session_transcript_path_cache_ttl_ms: u64,
@@ -194,6 +198,7 @@ pub struct ProxyState {
     session_model_overrides: RwLock<HashMap<String, SessionModelOverride>>,
     session_service_tier_overrides: RwLock<HashMap<String, SessionServiceTierOverride>>,
     session_bindings: RwLock<HashMap<String, SessionBindingEntry>>,
+    session_route_affinities: RwLock<HashMap<String, SessionRouteAffinity>>,
     global_station_override: RwLock<Option<String>>,
     runtime_default_profiles: RwLock<HashMap<String, RuntimeDefaultProfileOverride>>,
     station_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
@@ -243,6 +248,16 @@ impl ProxyState {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(2_000);
+        let route_affinity_ttl_secs = std::env::var("CODEX_HELPER_SESSION_ROUTE_AFFINITY_TTL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let route_affinity_ttl_ms = route_affinity_ttl_secs.saturating_mul(1000);
+        let route_affinity_max_entries =
+            std::env::var("CODEX_HELPER_SESSION_ROUTE_AFFINITY_MAX_ENTRIES")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(5_000);
 
         let cwd_cache_ttl_secs = std::env::var("CODEX_HELPER_SESSION_CWD_CACHE_TTL_SECS")
             .ok()
@@ -271,6 +286,8 @@ impl ProxyState {
                 session_override_ttl_ms: ttl_ms,
                 session_binding_ttl_ms: binding_ttl_ms,
                 session_binding_max_entries: binding_max_entries,
+                session_route_affinity_ttl_ms: route_affinity_ttl_ms,
+                session_route_affinity_max_entries: route_affinity_max_entries,
                 session_cwd_cache_ttl_ms: cwd_cache_ttl_ms,
                 session_cwd_cache_max_entries: cwd_cache_max_entries,
                 session_transcript_path_cache_ttl_ms: transcript_path_cache_ttl_ms,
@@ -288,6 +305,8 @@ impl ProxyState {
             session_override_ttl_ms: policy.session_override_ttl_ms,
             session_binding_ttl_ms: policy.session_binding_ttl_ms,
             session_binding_max_entries: policy.session_binding_max_entries,
+            session_route_affinity_ttl_ms: policy.session_route_affinity_ttl_ms,
+            session_route_affinity_max_entries: policy.session_route_affinity_max_entries,
             session_cwd_cache_ttl_ms: policy.session_cwd_cache_ttl_ms,
             session_cwd_cache_max_entries: policy.session_cwd_cache_max_entries,
             session_transcript_path_cache_ttl_ms: policy.session_transcript_path_cache_ttl_ms,
@@ -298,6 +317,7 @@ impl ProxyState {
             session_model_overrides: RwLock::new(HashMap::new()),
             session_service_tier_overrides: RwLock::new(HashMap::new()),
             session_bindings: RwLock::new(HashMap::new()),
+            session_route_affinities: RwLock::new(HashMap::new()),
             global_station_override: RwLock::new(None),
             runtime_default_profiles: RwLock::new(HashMap::new()),
             station_meta_overrides: RwLock::new(HashMap::new()),
@@ -482,6 +502,57 @@ impl ProxyState {
             .iter()
             .map(|(sid, entry)| (sid.clone(), entry.binding.clone()))
             .collect()
+    }
+
+    pub async fn get_session_route_affinity(
+        &self,
+        session_id: &str,
+    ) -> Option<SessionRouteAffinity> {
+        let guard = self.session_route_affinities.read().await;
+        guard.get(session_id).cloned()
+    }
+
+    pub async fn list_session_route_affinities(&self) -> HashMap<String, SessionRouteAffinity> {
+        let guard = self.session_route_affinities.read().await;
+        guard.clone()
+    }
+
+    pub async fn record_session_route_affinity_success(
+        &self,
+        session_id: &str,
+        target: SessionRouteAffinityTarget,
+        reason_hint: Option<String>,
+        now_ms: u64,
+    ) -> SessionRouteAffinity {
+        let mut guard = self.session_route_affinities.write().await;
+        let reason = match guard.get_mut(session_id) {
+            Some(existing) if target.same_target(existing) => {
+                existing.last_selected_at_ms = now_ms;
+                return existing.clone();
+            }
+            Some(_) => reason_hint.unwrap_or_else(|| "target_changed".to_string()),
+            None => reason_hint.unwrap_or_else(|| "first_success".to_string()),
+        };
+
+        let affinity = SessionRouteAffinity {
+            route_graph_key: target.route_graph_key,
+            station_name: target.station_name,
+            upstream_index: target.upstream_index,
+            provider_id: target.provider_id,
+            endpoint_id: target.endpoint_id,
+            upstream_base_url: target.upstream_base_url,
+            route_path: target.route_path,
+            last_selected_at_ms: now_ms,
+            last_changed_at_ms: now_ms,
+            change_reason: reason,
+        };
+        guard.insert(session_id.to_string(), affinity.clone());
+        prune_lru_cache(
+            &mut guard,
+            self.session_route_affinity_max_entries,
+            |entry| entry.last_selected_at_ms,
+        );
+        affinity
     }
 
     pub async fn set_session_binding(&self, binding: SessionBinding) {
@@ -2160,6 +2231,7 @@ impl ProxyState {
             model_overrides,
             service_tier_overrides,
             bindings,
+            route_affinities,
             global_station_override,
             stats,
         ) = tokio::join!(
@@ -2170,6 +2242,7 @@ impl ProxyState {
             self.list_session_model_overrides(),
             self.list_session_service_tier_overrides(),
             self.list_session_bindings(),
+            self.list_session_route_affinities(),
             self.get_global_station_override(),
             self.list_session_stats(),
         );
@@ -2181,6 +2254,7 @@ impl ProxyState {
             model_overrides: &model_overrides,
             service_tier_overrides: &service_tier_overrides,
             bindings: &bindings,
+            route_affinities: &route_affinities,
             global_station_override: global_station_override.as_deref(),
             stats: &stats,
         })
@@ -2398,6 +2472,24 @@ impl ProxyState {
             }
         }
 
+        {
+            let mut affinities = self.session_route_affinities.write().await;
+            if self.session_route_affinity_ttl_ms > 0
+                && now_ms >= self.session_route_affinity_ttl_ms
+            {
+                let cutoff_affinity = now_ms - self.session_route_affinity_ttl_ms;
+                affinities.retain(|sid, affinity| {
+                    active_sessions.contains_key(sid)
+                        || affinity.last_selected_at_ms >= cutoff_affinity
+                });
+            }
+            prune_lru_cache(
+                &mut affinities,
+                self.session_route_affinity_max_entries,
+                |entry| entry.last_selected_at_ms,
+            );
+        }
+
         // Keep a bounded number of days of rollup data to avoid unbounded growth.
         let keep_days: i32 = std::env::var("CODEX_HELPER_USAGE_ROLLUP_KEEP_DAYS")
             .ok()
@@ -2506,6 +2598,8 @@ mod tests {
             session_override_ttl_ms,
             session_binding_ttl_ms,
             session_binding_max_entries,
+            session_route_affinity_ttl_ms: 0,
+            session_route_affinity_max_entries: 5_000,
             session_cwd_cache_ttl_ms: 0,
             session_cwd_cache_max_entries: 0,
             session_transcript_path_cache_ttl_ms: 30_000,
@@ -2845,6 +2939,7 @@ mod tests {
             model_overrides: &model_overrides,
             service_tier_overrides: &service_tier_overrides,
             bindings: &HashMap::new(),
+            route_affinities: &HashMap::new(),
             global_station_override: None,
             stats: &stats,
         });
@@ -2960,6 +3055,7 @@ mod tests {
             model_overrides: &HashMap::new(),
             service_tier_overrides: &HashMap::new(),
             bindings: &bindings,
+            route_affinities: &HashMap::new(),
             global_station_override: None,
             stats: &HashMap::new(),
         });
@@ -3048,6 +3144,7 @@ mod tests {
             model_overrides: &HashMap::new(),
             service_tier_overrides: &HashMap::new(),
             bindings: &bindings,
+            route_affinities: &HashMap::new(),
             global_station_override: Some("right"),
             stats: &HashMap::new(),
         });

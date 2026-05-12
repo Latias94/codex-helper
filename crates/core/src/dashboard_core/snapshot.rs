@@ -94,6 +94,7 @@ pub async fn build_dashboard_snapshot(
         session_effort,
         session_service_tier,
         session_bindings,
+        session_route_affinities,
         session_stats,
         usage_rollup,
         station_health,
@@ -109,6 +110,7 @@ pub async fn build_dashboard_snapshot(
         state.list_session_effort_overrides(),
         state.list_session_service_tier_overrides(),
         state.list_session_bindings(),
+        state.list_session_route_affinities(),
         state.list_session_stats(),
         state.get_usage_rollup_view(service_name, 12, stats_days),
         state.get_station_health(service_name),
@@ -128,6 +130,7 @@ pub async fn build_dashboard_snapshot(
             model_overrides: &session_model,
             service_tier_overrides: &session_service_tier,
             bindings: &session_bindings,
+            route_affinities: &session_route_affinities,
             global_station_override: global_station_override.as_deref(),
             stats: &session_stats,
         });

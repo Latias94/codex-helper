@@ -904,7 +904,7 @@ impl Default for RoutingNodeV4 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 pub struct RoutingConditionV4 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -931,7 +931,7 @@ impl RoutingConditionV4 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum RoutingPolicyV4 {
     ManualSticky,
@@ -944,7 +944,7 @@ fn default_routing_policy_v4() -> RoutingPolicyV4 {
     RoutingPolicyV4::OrderedFailover
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum RoutingExhaustedActionV4 {
     Continue,

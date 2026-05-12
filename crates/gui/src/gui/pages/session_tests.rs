@@ -28,6 +28,7 @@ fn sample_session_row() -> SessionRow {
         binding_profile_name: None,
         binding_continuity_mode: None,
         last_route_decision: None,
+        route_affinity: None,
         effective_model: None,
         effective_reasoning_effort: None,
         effective_service_tier: None,
@@ -283,6 +284,36 @@ fn session_current_target_summary_marks_provider_as_needing_refresh_after_drift(
     assert!(summary.contains("station=vibe [global override]"));
     assert!(summary.contains("provider=<needs fresh request>"));
     assert!(summary.contains("upstream=api.vibe.example [runtime fallback]"));
+}
+
+#[test]
+fn session_current_target_summary_prefers_session_affinity() {
+    let mut row = sample_session_row();
+    row.effective_station_value = Some(ResolvedRouteValue {
+        value: "monthly_first".to_string(),
+        source: RouteValueSource::RuntimeFallback,
+    });
+    row.effective_upstream_base_url = Some(ResolvedRouteValue {
+        value: "https://api.right.example/v1".to_string(),
+        source: RouteValueSource::RuntimeFallback,
+    });
+    row.route_affinity = Some(SessionRouteAffinity {
+        route_graph_key: "v4:deadbeef".to_string(),
+        station_name: "monthly_first".to_string(),
+        upstream_index: 2,
+        provider_id: Some("right".to_string()),
+        endpoint_id: Some("default".to_string()),
+        upstream_base_url: "https://api.right.example/v1".to_string(),
+        route_path: vec!["monthly_first".to_string(), "right".to_string()],
+        last_selected_at_ms: 1_000,
+        last_changed_at_ms: 900,
+        change_reason: "failover_after_status_502".to_string(),
+    });
+
+    let summary = session_current_target_summary(&row, Language::En);
+
+    assert!(summary.contains("provider=right/default [session affinity]"));
+    assert!(summary.contains("upstream=api.right.example [runtime fallback]"));
 }
 
 #[test]

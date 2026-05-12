@@ -266,6 +266,28 @@ pub(super) fn render_sessions_page(
         } else {
             "auto".to_string()
         };
+        let route_affinity = row
+            .route_affinity
+            .as_ref()
+            .map(|affinity| {
+                let provider = match (
+                    affinity.provider_id.as_deref(),
+                    affinity.endpoint_id.as_deref(),
+                ) {
+                    (Some(provider), Some(endpoint)) => format!("{provider}/{endpoint}"),
+                    (Some(provider), None) => provider.to_string(),
+                    (None, Some(endpoint)) => endpoint.to_string(),
+                    (None, None) => "-".to_string(),
+                };
+                format!(
+                    "station={} provider={} upstream={} reason={}",
+                    affinity.station_name,
+                    provider,
+                    shorten_middle(&affinity.upstream_base_url, 64),
+                    affinity.change_reason
+                )
+            })
+            .unwrap_or_else(|| "-".to_string());
 
         lines.push(kv_line(
             p,
@@ -411,6 +433,16 @@ pub(super) fn render_sessions_page(
             l("routing"),
             routing,
             Style::default().fg(p.muted),
+        ));
+        lines.push(kv_line(
+            p,
+            "session_affinity",
+            route_affinity,
+            Style::default().fg(if row.route_affinity.is_some() {
+                p.accent
+            } else {
+                p.muted
+            }),
         ));
 
         let last_status = row

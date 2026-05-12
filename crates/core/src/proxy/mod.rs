@@ -37,6 +37,7 @@ mod request_preparation;
 mod request_routing;
 mod response_finalization;
 mod retry;
+mod route_affinity;
 mod route_attempts;
 mod route_executor_runtime;
 mod route_executor_shadow;

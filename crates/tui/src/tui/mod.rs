@@ -12,6 +12,7 @@ pub use i18n::{detect_system_language, parse_language, resolve_language_preferen
 #[allow(unused_imports)]
 pub use model::{ProviderOption, UpstreamSummary, build_provider_options};
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,7 @@ use crossterm::ExecutableCommand;
 use crossterm::event::{Event, EventStream};
 use crossterm::terminal::LeaveAlternateScreen;
 use futures_util::StreamExt;
+use futures_util::stream;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, watch};
@@ -89,8 +91,10 @@ struct CodexRecentRefreshResult {
 #[derive(Debug)]
 struct CodexRecentRefreshPayload {
     rows: Vec<RecentCodexRow>,
-    branch_cache: std::collections::HashMap<String, Option<String>>,
+    branch_cache: HashMap<String, Option<String>>,
 }
+
+const CODEX_RECENT_BRANCH_LOOKUP_CONCURRENCY: usize = 8;
 
 impl RenderSurfaceKey {
     fn capture(ui: &UiState) -> Self {
@@ -497,11 +501,13 @@ fn apply_codex_recent_refresh_result(ui: &mut UiState, result: CodexRecentRefres
 
 async fn load_codex_recent_rows(
     raw_cwd: bool,
-    mut branch_cache: std::collections::HashMap<String, Option<String>>,
+    mut branch_cache: HashMap<String, Option<String>>,
 ) -> anyhow::Result<CodexRecentRefreshPayload> {
     let since = Duration::from_secs(24 * 60 * 60);
     let list = crate::sessions::find_recent_codex_sessions(since, 500).await?;
     let mut rows = Vec::with_capacity(list.len());
+    let mut missing_roots = Vec::new();
+    let mut missing_seen = HashSet::new();
     for s in list {
         let cwd_opt = s.cwd.clone();
         let cwd = cwd_opt.as_deref().unwrap_or("-");
@@ -516,9 +522,10 @@ async fn load_codex_recent_rows(
             } else if let Some(v) = branch_cache.get(&root) {
                 v.clone()
             } else {
-                let v = read_git_branch_shallow(&root).await;
-                branch_cache.insert(root.clone(), v.clone());
-                v
+                if missing_seen.insert(root.clone()) {
+                    missing_roots.push(root.clone());
+                }
+                None
             };
         rows.push(RecentCodexRow {
             root,
@@ -527,6 +534,24 @@ async fn load_codex_recent_rows(
             cwd: cwd_opt,
             mtime_ms: s.mtime_ms,
         });
+    }
+
+    let mut branch_stream = stream::iter(missing_roots)
+        .map(|root| async move {
+            let branch = read_git_branch_shallow(&root).await;
+            (root, branch)
+        })
+        .buffer_unordered(CODEX_RECENT_BRANCH_LOOKUP_CONCURRENCY);
+    while let Some((root, branch)) = branch_stream.next().await {
+        branch_cache.insert(root, branch);
+    }
+
+    for row in &mut rows {
+        if row.branch.is_none()
+            && let Some(branch) = branch_cache.get(&row.root)
+        {
+            row.branch = branch.clone();
+        }
     }
 
     Ok(CodexRecentRefreshPayload { rows, branch_cache })

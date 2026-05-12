@@ -384,6 +384,46 @@ pub struct RouteDecisionProvenance {
     pub route_path: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRouteAffinity {
+    pub route_graph_key: String,
+    pub station_name: String,
+    pub upstream_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
+    pub upstream_base_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_path: Vec<String>,
+    pub last_selected_at_ms: u64,
+    pub last_changed_at_ms: u64,
+    pub change_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRouteAffinityTarget {
+    pub route_graph_key: String,
+    pub station_name: String,
+    pub upstream_index: usize,
+    pub provider_id: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub upstream_base_url: String,
+    pub route_path: Vec<String>,
+}
+
+impl SessionRouteAffinityTarget {
+    pub(crate) fn same_target(&self, affinity: &SessionRouteAffinity) -> bool {
+        self.route_graph_key == affinity.route_graph_key
+            && self.station_name == affinity.station_name
+            && self.upstream_index == affinity.upstream_index
+            && self.provider_id == affinity.provider_id
+            && self.endpoint_id == affinity.endpoint_id
+            && self.upstream_base_url == affinity.upstream_base_url
+            && self.route_path == affinity.route_path
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionIdentityCard {
     pub session_id: Option<String>,
@@ -432,6 +472,8 @@ pub struct SessionIdentityCard {
     pub binding_continuity_mode: Option<SessionContinuityMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_route_decision: Option<RouteDecisionProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_affinity: Option<SessionRouteAffinity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_model: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -542,6 +584,7 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         binding_profile_name: None,
         binding_continuity_mode: None,
         last_route_decision: None,
+        route_affinity: None,
         effective_model: None,
         effective_reasoning_effort: None,
         effective_service_tier: None,
@@ -763,6 +806,7 @@ pub struct SessionIdentityCardBuildInputs<'a> {
     pub model_overrides: &'a HashMap<String, String>,
     pub service_tier_overrides: &'a HashMap<String, String>,
     pub bindings: &'a HashMap<String, SessionBinding>,
+    pub route_affinities: &'a HashMap<String, SessionRouteAffinity>,
     pub global_station_override: Option<&'a str>,
     pub stats: &'a HashMap<String, SessionStats>,
 }
@@ -778,6 +822,7 @@ pub fn build_session_identity_cards_from_parts(
         model_overrides,
         service_tier_overrides,
         bindings,
+        route_affinities,
         global_station_override,
         stats,
     } = inputs;
@@ -945,6 +990,14 @@ pub fn build_session_identity_cards_from_parts(
             .entry(key.clone())
             .or_insert_with(|| empty_session_identity_card(key));
         entry.override_service_tier = Some(service_tier.clone());
+    }
+
+    for (sid, affinity) in route_affinities {
+        let key = Some(sid.clone());
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| empty_session_identity_card(key));
+        entry.route_affinity = Some(affinity.clone());
     }
 
     let mut cards = map.into_values().collect::<Vec<_>>();

@@ -694,6 +694,12 @@ fn request_token_rows(usage: &crate::usage::UsageMetrics) -> Vec<(String, String
             ));
         }
     }
+    if let Some(rate) = usage.cache_hit_rate() {
+        rows.push((
+            "cache_hit_rate".to_string(),
+            format!("{:.1}%", rate * 100.0),
+        ));
+    }
     rows
 }
 

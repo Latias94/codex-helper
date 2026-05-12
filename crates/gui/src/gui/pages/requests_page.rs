@@ -116,6 +116,9 @@ fn request_list_metrics(request: &FinishedRequest) -> String {
         if cache_total > 0 {
             parts.push(format!("cache={}", compact_count(cache_total)));
         }
+        if let Some(hit_rate) = usage.cache_hit_rate() {
+            parts.push(format!("hit={:.1}%", hit_rate * 100.0));
+        }
     }
 
     if let Some(rate) = request.output_tokens_per_second() {
@@ -297,6 +300,7 @@ mod tests {
         assert!(label.contains("fast"));
         assert!(label.contains("tok=1.5k/100/1.6k"));
         assert!(label.contains("cache=300"));
+        assert!(label.contains("hit=16.7%"));
         assert!(label.contains("out/s=200.0"));
         assert!(label.contains("cost=$"));
     }

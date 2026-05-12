@@ -86,19 +86,8 @@ fn fmt_avg_generation_ms(bucket: &UsageBucket) -> String {
     duration_short(bucket.generation_ms_total / bucket.requests_with_usage)
 }
 
-fn cache_creation_tokens(usage: &UsageMetrics) -> i64 {
-    usage.cache_creation_tokens_total().max(0)
-}
-
 fn cache_hit_rate(usage: &UsageMetrics) -> Option<f64> {
-    let read = usage.cache_read_input_tokens.max(0);
-    let create = cache_creation_tokens(usage);
-    let effective_input = usage.input_tokens.max(0).saturating_sub(read);
-    let denom = effective_input.saturating_add(create).saturating_add(read);
-    if denom <= 0 {
-        return None;
-    }
-    Some(read as f64 / denom as f64)
+    usage.cache_hit_rate()
 }
 
 fn fmt_cache_hit(usage: &UsageMetrics) -> String {

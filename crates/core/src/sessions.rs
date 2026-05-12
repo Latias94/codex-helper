@@ -1,9 +1,12 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use futures_util::StreamExt;
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs;
@@ -15,7 +18,7 @@ use crate::file_replace::write_bytes_file_async;
 mod stats_cache;
 mod transcript;
 
-use stats_cache::SessionStatsCache;
+use stats_cache::{SessionStatsCache, SessionStatsSnapshot};
 pub use transcript::{codex_session_transcript_tail_contains_query, read_codex_session_transcript};
 
 /// Summary information for a Codex conversation session.
@@ -112,6 +115,7 @@ const MAX_SCAN_FILES: usize = 10_000;
 const HEAD_SCAN_LINES: usize = 512;
 const IO_CHUNK_SIZE: usize = 64 * 1024;
 const TAIL_SCAN_MAX_BYTES: usize = 1024 * 1024;
+const SESSION_IO_CONCURRENCY: usize = 8;
 
 const MAX_SCAN_FILES_RECENT: usize = 200_000;
 
@@ -357,30 +361,48 @@ pub async fn list_codex_sessions_in_day_dir(
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let day_files = collect_rollout_files_sorted(day_dir).await?;
     let mut out: Vec<SessionIndexItem> = Vec::new();
-    for path in day_files {
+    for chunk in day_files.chunks(SESSION_IO_CONCURRENCY) {
+        let cwd = cwd.clone();
+        let mut stream = stream::iter(chunk.iter().cloned())
+            .map(move |path| {
+                let cwd = cwd.clone();
+                async move { read_session_index_item(path, cwd).await }
+            })
+            .buffer_unordered(SESSION_IO_CONCURRENCY);
+
+        while let Some(item) = stream.next().await {
+            if let Some(item) = item? {
+                out.push(item);
+            }
+        }
         if out.len() >= limit {
             break;
         }
-        let header_opt = read_session_header(&path, &cwd).await?;
-        let Some(mut header) = header_opt else {
-            continue;
-        };
-        header.updated_hint = read_last_timestamp_from_tail(&header.path)
-            .await?
-            .or_else(|| header.created_at.clone());
-        out.push(SessionIndexItem {
-            id: header.id,
-            path: header.path,
-            cwd: header.cwd,
-            created_at: header.created_at,
-            updated_hint: header.updated_hint,
-            mtime_ms: header.mtime_ms,
-            first_user_message: Some(header.first_user_message),
-        });
     }
 
     out.sort_by_key(|item| Reverse(item.mtime_ms));
+    out.truncate(limit);
     Ok(out)
+}
+
+#[cfg(feature = "gui")]
+async fn read_session_index_item(path: PathBuf, cwd: PathBuf) -> Result<Option<SessionIndexItem>> {
+    let header_opt = read_session_header(&path, &cwd).await?;
+    let Some(mut header) = header_opt else {
+        return Ok(None);
+    };
+    header.updated_hint = read_last_timestamp_from_tail(&header.path)
+        .await?
+        .or_else(|| header.created_at.clone());
+    Ok(Some(SessionIndexItem {
+        id: header.id,
+        path: header.path,
+        cwd: header.cwd,
+        created_at: header.created_at,
+        updated_hint: header.updated_hint,
+        mtime_ms: header.mtime_ms,
+        first_user_message: Some(header.first_user_message),
+    }))
 }
 
 async fn find_recent_codex_sessions_in_dir(
@@ -813,19 +835,27 @@ async fn select_and_expand_headers(
     if chosen.len() > limit {
         chosen.truncate(limit);
     }
-    // Only for the rows we will display, compute a more precise timestamp from the JSONL tail.
-    for header in &mut chosen {
-        header.updated_hint = read_last_timestamp_from_tail(&header.path)
-            .await?
-            .or_else(|| header.created_at.clone());
+
+    let cache = Arc::new(Mutex::new(SessionStatsCache::load_default().await));
+    let mut out: Vec<SessionSummary> = Vec::with_capacity(chosen.len().min(limit));
+    let mut stream = stream::iter(chosen)
+        .map(|header| {
+            let cache = Arc::clone(&cache);
+            async move { expand_header_to_summary_cached(cache, header).await }
+        })
+        .buffer_unordered(SESSION_IO_CONCURRENCY);
+
+    while let Some(summary) = stream.next().await {
+        out.push(summary?);
     }
 
-    let mut cache = SessionStatsCache::load_default().await;
-    let mut out: Vec<SessionSummary> = Vec::with_capacity(chosen.len().min(limit));
-    for header in chosen {
-        out.push(expand_header_to_summary(&mut cache, header).await?);
-    }
+    drop(stream);
+    let mut cache = Arc::try_unwrap(cache)
+        .map_err(|_| anyhow!("session stats cache still has active workers"))?
+        .into_inner()
+        .map_err(|_| anyhow!("session stats cache lock poisoned"))?;
     cache.save_if_dirty().await?;
+
     sort_by_updated_desc(&mut out);
     out.truncate(limit);
     Ok(out)
@@ -859,17 +889,65 @@ fn build_summary_from_stats(
     }
 }
 
-async fn expand_header_to_summary(
-    cache: &mut SessionStatsCache,
-    header: SessionHeader,
+async fn expand_header_to_summary_cached(
+    cache: Arc<Mutex<SessionStatsCache>>,
+    mut header: SessionHeader,
 ) -> Result<SessionSummary> {
-    let (user_turns, assistant_turns, last_response_at) =
-        cache.get_or_compute(&header.path).await?;
+    let path = header.path.clone();
+    let key = path.to_string_lossy().to_string();
+    let meta = fs::metadata(&path)
+        .await
+        .with_context(|| format!("failed to stat session file {:?}", path))?;
+    let size = meta.len();
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let cached = {
+        let cache = cache
+            .lock()
+            .map_err(|_| anyhow!("session stats cache lock poisoned"))?;
+        cache.lookup(&key, mtime_ms, size)
+    };
+
+    let stats = if let Some(stats) = cached {
+        if stats.last_response_at.is_none() && header.updated_hint.is_none() {
+            header.updated_hint = read_last_timestamp_from_tail(&path)
+                .await?
+                .or_else(|| header.created_at.clone());
+        }
+        stats
+    } else {
+        let (counts, tail) = tokio::join!(
+            count_turns_in_file(&path),
+            read_tail_timestamps(&path, true)
+        );
+        let (user_turns, assistant_turns) = counts?;
+        let tail = tail?;
+        header.updated_hint = tail.last_record_at.or_else(|| header.created_at.clone());
+
+        let stats = SessionStatsSnapshot {
+            user_turns,
+            assistant_turns,
+            last_response_at: tail.last_assistant_at,
+        };
+        {
+            let mut cache = cache
+                .lock()
+                .map_err(|_| anyhow!("session stats cache lock poisoned"))?;
+            cache.insert(key, mtime_ms, size, &stats);
+        }
+        stats
+    };
+
     Ok(build_summary_from_stats(
         header,
-        user_turns,
-        assistant_turns,
-        last_response_at,
+        stats.user_turns,
+        stats.assistant_turns,
+        stats.last_response_at,
     ))
 }
 
@@ -950,18 +1028,24 @@ fn count_subslice(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+#[derive(Debug, Default)]
+struct TailTimestamps {
+    last_record_at: Option<String>,
+    last_assistant_at: Option<String>,
+}
+
 async fn read_last_timestamp_from_tail(path: &Path) -> Result<Option<String>> {
-    scan_tail_for_timestamp(path, None).await
+    Ok(read_tail_timestamps(path, false).await?.last_record_at)
 }
 
+#[cfg(test)]
 async fn read_last_assistant_timestamp_from_tail(path: &Path) -> Result<Option<String>> {
-    scan_tail_for_timestamp(path, Some(br#""role":"assistant""#)).await
+    Ok(read_tail_timestamps(path, true).await?.last_assistant_at)
 }
 
-async fn scan_tail_for_timestamp(
-    path: &Path,
-    required_substring: Option<&[u8]>,
-) -> Result<Option<String>> {
+async fn read_tail_timestamps(path: &Path, include_assistant: bool) -> Result<TailTimestamps> {
+    const ASSISTANT_ROLE_NEEDLE: &[u8] = br#""role":"assistant""#;
+
     let mut file = fs::File::open(path)
         .await
         .with_context(|| format!("failed to open session file {:?}", path))?;
@@ -971,12 +1055,13 @@ async fn scan_tail_for_timestamp(
         .with_context(|| format!("failed to stat session file {:?}", path))?;
     let mut pos = meta.len();
     if pos == 0 {
-        return Ok(None);
+        return Ok(TailTimestamps::default());
     }
 
     let mut scanned = 0usize;
     let mut carry: Vec<u8> = Vec::new();
     let chunk_size = IO_CHUNK_SIZE as u64;
+    let mut found = TailTimestamps::default();
 
     while pos > 0 && scanned < TAIL_SCAN_MAX_BYTES {
         let start = pos.saturating_sub(chunk_size);
@@ -1004,9 +1089,12 @@ async fn scan_tail_for_timestamp(
             if line.is_empty() {
                 continue;
             }
-            if let Some(needle) = required_substring
-                && !contains_bytes(line, needle)
-            {
+
+            let wants_record = found.last_record_at.is_none();
+            let wants_assistant = include_assistant
+                && found.last_assistant_at.is_none()
+                && contains_bytes(line, ASSISTANT_ROLE_NEEDLE);
+            if !wants_record && !wants_assistant {
                 continue;
             }
 
@@ -1015,7 +1103,18 @@ async fn scan_tail_for_timestamp(
                 Err(_) => continue,
             };
             if let Some(ts) = value.get("timestamp").and_then(|v| v.as_str()) {
-                return Ok(Some(ts.to_string()));
+                let ts = ts.to_string();
+                if wants_record {
+                    found.last_record_at = Some(ts.clone());
+                }
+                if wants_assistant {
+                    found.last_assistant_at = Some(ts);
+                }
+                if found.last_record_at.is_some()
+                    && (!include_assistant || found.last_assistant_at.is_some())
+                {
+                    return Ok(found);
+                }
             }
         }
 
@@ -1029,7 +1128,7 @@ async fn scan_tail_for_timestamp(
         pos = start;
     }
 
-    Ok(None)
+    Ok(found)
 }
 
 fn path_matches_current_dir(session_cwd: &str, current_dir: &Path) -> bool {

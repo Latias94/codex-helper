@@ -97,6 +97,7 @@ pub(super) struct SessionRow {
     pub(super) binding_profile_name: Option<String>,
     pub(super) binding_continuity_mode: Option<crate::state::SessionContinuityMode>,
     pub(super) last_route_decision: Option<RouteDecisionProvenance>,
+    pub(super) route_affinity: Option<SessionRouteAffinity>,
     pub(super) effective_model: Option<ResolvedRouteValue>,
     pub(super) effective_reasoning_effort: Option<ResolvedRouteValue>,
     pub(super) effective_service_tier: Option<ResolvedRouteValue>,
