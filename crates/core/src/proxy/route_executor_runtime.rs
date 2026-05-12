@@ -36,9 +36,11 @@ pub(super) fn route_plan_runtime_state_from_lbs(lbs: &[LoadBalancer]) -> RoutePl
             station.set_upstream(
                 idx,
                 RoutePlanUpstreamRuntimeState {
+                    runtime_disabled: false,
                     failure_count,
                     cooldown_active,
                     usage_exhausted: state.usage_exhausted.get(idx).copied().unwrap_or(false),
+                    missing_auth: false,
                 },
             );
         }

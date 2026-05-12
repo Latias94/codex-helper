@@ -215,20 +215,44 @@ impl RoutePlanStationRuntimeState {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoutePlanUpstreamRuntimeState {
+    pub runtime_disabled: bool,
     pub failure_count: u32,
     pub cooldown_active: bool,
     pub usage_exhausted: bool,
+    pub missing_auth: bool,
 }
 
 impl RoutePlanUpstreamRuntimeState {
     fn breaker_open(self) -> bool {
         self.cooldown_active || self.failure_count >= FAILURE_THRESHOLD
     }
+
+    fn hard_unavailable(self) -> bool {
+        self.runtime_disabled || self.missing_auth || self.breaker_open()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutePlanSkipReason {
     UnsupportedModel { requested_model: String },
+    RuntimeDisabled,
+    Cooldown,
+    BreakerOpen { failure_count: u32 },
+    UsageExhausted,
+    MissingAuth,
+}
+
+impl RoutePlanSkipReason {
+    pub fn code(&self) -> &'static str {
+        match self {
+            RoutePlanSkipReason::UnsupportedModel { .. } => "unsupported_model",
+            RoutePlanSkipReason::RuntimeDisabled => "runtime_disabled",
+            RoutePlanSkipReason::Cooldown => "cooldown",
+            RoutePlanSkipReason::BreakerOpen { .. } => "breaker_open",
+            RoutePlanSkipReason::UsageExhausted => "usage_exhausted",
+            RoutePlanSkipReason::MissingAuth => "missing_auth",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +263,13 @@ pub struct SkippedRouteCandidate<'a> {
     pub avoid_for_station: Vec<usize>,
     pub avoided_total: usize,
     pub total_upstreams: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteCandidateSkipExplanation<'a> {
+    pub candidate: &'a RouteCandidate,
+    pub selected_upstream: SelectedUpstream,
+    pub reasons: Vec<RoutePlanSkipReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +302,30 @@ impl<'a> RoutePlanExecutor<'a> {
                 candidate,
                 selected_upstream: self.selected_upstream_for_candidate(candidate),
             })
+    }
+
+    pub fn explain_candidate_skip_reasons_with_runtime_state(
+        &self,
+        runtime: &RoutePlanRuntimeState,
+        request_model: Option<&str>,
+    ) -> Vec<RouteCandidateSkipExplanation<'_>> {
+        self.template
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                let selected_upstream = self.selected_upstream_for_candidate(candidate);
+                let runtime_state = runtime
+                    .station(selected_upstream.station_name.as_str())
+                    .map(|station| station.upstream(selected_upstream.index))
+                    .unwrap_or_default();
+                let reasons = self.candidate_skip_reasons(candidate, runtime_state, request_model);
+                (!reasons.is_empty()).then_some(RouteCandidateSkipExplanation {
+                    candidate,
+                    selected_upstream,
+                    reasons,
+                })
+            })
+            .collect()
     }
 
     pub fn select_supported_candidate(
@@ -466,6 +521,39 @@ impl<'a> RoutePlanExecutor<'a> {
             })
     }
 
+    fn candidate_skip_reasons(
+        &self,
+        candidate: &RouteCandidate,
+        runtime_state: RoutePlanUpstreamRuntimeState,
+        request_model: Option<&str>,
+    ) -> Vec<RoutePlanSkipReason> {
+        let mut reasons = Vec::new();
+        if let Some(requested_model) = request_model
+            && !candidate_supports_model(candidate, requested_model)
+        {
+            reasons.push(RoutePlanSkipReason::UnsupportedModel {
+                requested_model: requested_model.to_string(),
+            });
+        }
+        if runtime_state.runtime_disabled {
+            reasons.push(RoutePlanSkipReason::RuntimeDisabled);
+        }
+        if runtime_state.cooldown_active {
+            reasons.push(RoutePlanSkipReason::Cooldown);
+        } else if runtime_state.failure_count >= FAILURE_THRESHOLD {
+            reasons.push(RoutePlanSkipReason::BreakerOpen {
+                failure_count: runtime_state.failure_count,
+            });
+        }
+        if runtime_state.usage_exhausted {
+            reasons.push(RoutePlanSkipReason::UsageExhausted);
+        }
+        if runtime_state.missing_auth {
+            reasons.push(RoutePlanSkipReason::MissingAuth);
+        }
+        reasons
+    }
+
     fn station_candidate_count(&self, station_name: &str) -> usize {
         self.template
             .candidates
@@ -504,7 +592,7 @@ impl<'a> RoutePlanExecutor<'a> {
                     && station_runtime
                         .map(|station| station.upstream(last_good_index))
                         .is_none_or(|upstream| {
-                            !upstream.breaker_open() && !upstream.usage_exhausted
+                            !upstream.hard_unavailable() && !upstream.usage_exhausted
                         })
             })
         {
@@ -515,7 +603,7 @@ impl<'a> RoutePlanExecutor<'a> {
             let index = candidate_compatibility_upstream_index(candidate);
             station_runtime
                 .map(|station| station.upstream(index))
-                .is_none_or(|upstream| !upstream.breaker_open() && !upstream.usage_exhausted)
+                .is_none_or(|upstream| !upstream.hard_unavailable() && !upstream.usage_exhausted)
         }) {
             return Some(candidate);
         }
@@ -524,7 +612,7 @@ impl<'a> RoutePlanExecutor<'a> {
             let index = candidate_compatibility_upstream_index(candidate);
             station_runtime
                 .map(|station| station.upstream(index))
-                .is_none_or(|upstream| !upstream.breaker_open())
+                .is_none_or(|upstream| !upstream.hard_unavailable())
         })
     }
 }
@@ -1294,9 +1382,7 @@ mod tests {
     }
 
     fn skip_reason(reason: &RoutePlanSkipReason) -> &'static str {
-        match reason {
-            RoutePlanSkipReason::UnsupportedModel { .. } => "unsupported_model",
-        }
+        reason.code()
     }
 
     fn sorted_hash_set(values: &HashSet<usize>) -> Vec<usize> {
@@ -2030,6 +2116,144 @@ mod tests {
         assert_eq!(selection.skipped.len(), 2);
         assert_eq!(selection.avoid_for_station, vec![0, 1]);
         assert!(state.station_exhausted(selection.total_upstreams));
+    }
+
+    #[test]
+    fn route_plan_executor_explains_structured_skip_reasons() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "unsupported".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://unsupported.example/v1".to_string()),
+                        supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "disabled".to_string(),
+                    provider("https://disabled.example/v1"),
+                ),
+                (
+                    "cooldown".to_string(),
+                    provider("https://cooldown.example/v1"),
+                ),
+                (
+                    "breaker".to_string(),
+                    provider("https://breaker.example/v1"),
+                ),
+                ("usage".to_string(), provider("https://usage.example/v1")),
+                (
+                    "missing-auth".to_string(),
+                    provider("https://missing-auth.example/v1"),
+                ),
+                (
+                    "healthy".to_string(),
+                    provider("https://healthy.example/v1"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "unsupported".to_string(),
+                "disabled".to_string(),
+                "cooldown".to_string(),
+                "breaker".to_string(),
+                "usage".to_string(),
+                "missing-auth".to_string(),
+                "healthy".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        let mut station = RoutePlanStationRuntimeState::default();
+        station.set_upstream(
+            1,
+            RoutePlanUpstreamRuntimeState {
+                runtime_disabled: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        station.set_upstream(
+            2,
+            RoutePlanUpstreamRuntimeState {
+                cooldown_active: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        station.set_upstream(
+            3,
+            RoutePlanUpstreamRuntimeState {
+                failure_count: FAILURE_THRESHOLD,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        station.set_upstream(
+            4,
+            RoutePlanUpstreamRuntimeState {
+                usage_exhausted: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        station.set_upstream(
+            5,
+            RoutePlanUpstreamRuntimeState {
+                missing_auth: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        runtime.set_station("routing", station);
+
+        let explanations =
+            executor.explain_candidate_skip_reasons_with_runtime_state(&runtime, Some("gpt-5"));
+        let reasons_by_provider = explanations
+            .iter()
+            .map(|explanation| {
+                (
+                    explanation.candidate.provider_id.as_str(),
+                    explanation
+                        .reasons
+                        .iter()
+                        .map(RoutePlanSkipReason::code)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            reasons_by_provider.get("unsupported").cloned(),
+            Some(vec!["unsupported_model"])
+        );
+        assert_eq!(
+            reasons_by_provider.get("disabled").cloned(),
+            Some(vec!["runtime_disabled"])
+        );
+        assert_eq!(
+            reasons_by_provider.get("cooldown").cloned(),
+            Some(vec!["cooldown"])
+        );
+        assert_eq!(
+            reasons_by_provider.get("breaker").cloned(),
+            Some(vec!["breaker_open"])
+        );
+        assert_eq!(
+            reasons_by_provider.get("usage").cloned(),
+            Some(vec!["usage_exhausted"])
+        );
+        assert_eq!(
+            reasons_by_provider.get("missing-auth").cloned(),
+            Some(vec!["missing_auth"])
+        );
+        assert!(!reasons_by_provider.contains_key("healthy"));
+
+        let mut state = RoutePlanAttemptState::default();
+        let selection = executor.select_supported_candidate_with_runtime_state(
+            &mut state,
+            &runtime,
+            Some("gpt-5"),
+        );
+        let selected = selection.selected.expect("healthy candidate selected");
+        assert_eq!(selected.candidate.provider_id, "healthy");
     }
 
     #[test]

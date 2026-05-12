@@ -822,7 +822,9 @@ fn record_executor_unsupported_model_skips(
     provider_max_attempts: u32,
 ) {
     for skipped in skipped {
-        let RoutePlanSkipReason::UnsupportedModel { requested_model } = &skipped.reason;
+        let RoutePlanSkipReason::UnsupportedModel { requested_model } = &skipped.reason else {
+            continue;
+        };
         let avoid_set = hash_set_from_indices(&skipped.avoid_for_station);
         record_unsupported_model_skip(
             upstream_chain,

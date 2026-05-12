@@ -271,9 +271,7 @@ fn shadow_attempt(
 }
 
 fn skip_reason(reason: &RoutePlanSkipReason) -> &'static str {
-    match reason {
-        RoutePlanSkipReason::UnsupportedModel { .. } => "unsupported_model",
-    }
+    reason.code()
 }
 
 fn sorted_avoid_set(avoid: &HashSet<usize>) -> Vec<usize> {

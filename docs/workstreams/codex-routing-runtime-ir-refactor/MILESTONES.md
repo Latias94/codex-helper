@@ -79,7 +79,7 @@ Acceptance:
 
 ## P4 - Decision Trace And Explain APIs
 
-- [ ] Record structured skip reasons for capability mismatch, breaker open,
+- [x] Record structured skip reasons for capability mismatch, breaker open,
   runtime disabled, cooldown, usage exhaustion, and missing auth.
 - [x] Include route path in attempt logs and request history.
 - [ ] Extend `routing explain` and admin APIs with selected route, candidates,
