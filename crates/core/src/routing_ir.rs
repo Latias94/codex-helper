@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use anyhow::{Context, Result};
 
 use crate::config::{
-    ProviderConfigV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4,
-    ServiceConfig, ServiceViewV4, UpstreamAuth, UpstreamConfig, effective_v4_routing,
+    ProviderConfigV4, RoutingConditionV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4,
+    RoutingPolicyV4, ServiceConfig, ServiceViewV4, UpstreamAuth, UpstreamConfig,
+    effective_v4_routing,
 };
 use crate::lb::{FAILURE_THRESHOLD, SelectedUpstream};
 use crate::model_routing;
@@ -64,6 +65,9 @@ pub struct RouteNodePlan {
     pub prefer_tags: Vec<BTreeMap<String, String>>,
     pub on_exhausted: RoutingExhaustedActionV4,
     pub metadata: BTreeMap<String, String>,
+    pub when: Option<RoutingConditionV4>,
+    pub then: Option<RouteRef>,
+    pub default_route: Option<RouteRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,6 +626,16 @@ pub struct RouteDecisionTrace {
     pub events: Vec<RouteDecisionEvent>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteRequestContext {
+    pub model: Option<String>,
+    pub service_tier: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub path: Option<String>,
+    pub method: Option<String>,
+    pub headers: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteDecisionEvent {
     pub route_path: Vec<String>,
@@ -659,11 +673,19 @@ pub fn compile_v4_route_plan_template(
     service_name: &str,
     view: &ServiceViewV4,
 ) -> Result<RoutePlanTemplate> {
+    compile_v4_route_plan_template_with_request(service_name, view, &RouteRequestContext::default())
+}
+
+pub fn compile_v4_route_plan_template_with_request(
+    service_name: &str,
+    view: &ServiceViewV4,
+    request: &RouteRequestContext,
+) -> Result<RoutePlanTemplate> {
     let routing = effective_v4_routing(view);
     validate_route_provider_name_conflicts(service_name, view, &routing)?;
 
     let nodes = normalize_route_nodes(service_name, view, &routing)?;
-    let leaves = expand_v4_route_leaves(service_name, view, &routing)?;
+    let leaves = expand_v4_route_leaves(service_name, view, &routing, request)?;
     ensure_unique_provider_leaves(service_name, &leaves)?;
 
     let expanded_provider_order = leaves
@@ -762,6 +784,7 @@ fn normalize_route_nodes(
 ) -> Result<BTreeMap<String, RouteNodePlan>> {
     let mut out = BTreeMap::new();
     for (route_name, node) in &routing.routes {
+        validate_route_node_shape(service_name, view, routing, route_name, node)?;
         let children = node
             .children
             .iter()
@@ -769,6 +792,16 @@ fn normalize_route_nodes(
             .collect::<Result<Vec<_>>>()?;
         let target = node
             .target
+            .as_deref()
+            .map(|target| normalize_route_ref(service_name, view, routing, target))
+            .transpose()?;
+        let then = node
+            .then
+            .as_deref()
+            .map(|target| normalize_route_ref(service_name, view, routing, target))
+            .transpose()?;
+        let default_route = node
+            .default_route
             .as_deref()
             .map(|target| normalize_route_ref(service_name, view, routing, target))
             .transpose()?;
@@ -782,10 +815,59 @@ fn normalize_route_nodes(
                 prefer_tags: node.prefer_tags.clone(),
                 on_exhausted: node.on_exhausted,
                 metadata: node.metadata.clone(),
+                when: node.when.clone(),
+                then,
+                default_route,
             },
         );
     }
     Ok(out)
+}
+
+fn validate_route_node_shape(
+    service_name: &str,
+    view: &ServiceViewV4,
+    routing: &RoutingConfigV4,
+    route_name: &str,
+    node: &RoutingNodeV4,
+) -> Result<()> {
+    match node.strategy {
+        RoutingPolicyV4::Conditional => {
+            let Some(condition) = node.when.as_ref() else {
+                anyhow::bail!("[{service_name}] conditional route '{route_name}' requires when");
+            };
+            if condition.is_empty() {
+                anyhow::bail!(
+                    "[{service_name}] conditional route '{route_name}' requires at least one condition field"
+                );
+            }
+            let then = node
+                .then
+                .as_deref()
+                .filter(|value| !value.trim().is_empty());
+            let default_route = node
+                .default_route
+                .as_deref()
+                .filter(|value| !value.trim().is_empty());
+            let Some(then) = then else {
+                anyhow::bail!("[{service_name}] conditional route '{route_name}' requires then");
+            };
+            let Some(default_route) = default_route else {
+                anyhow::bail!("[{service_name}] conditional route '{route_name}' requires default");
+            };
+            normalize_route_ref(service_name, view, routing, then)?;
+            normalize_route_ref(service_name, view, routing, default_route)?;
+        }
+        _ => {
+            if node.when.is_some() || node.then.is_some() || node.default_route.is_some() {
+                anyhow::bail!(
+                    "[{service_name}] route '{route_name}' uses conditional fields but strategy is not conditional"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn normalize_route_ref(
@@ -807,6 +889,7 @@ fn expand_v4_route_leaves(
     service_name: &str,
     view: &ServiceViewV4,
     routing: &RoutingConfigV4,
+    request: &RouteRequestContext,
 ) -> Result<Vec<RouteLeaf>> {
     if view.providers.is_empty() && routing.routes.is_empty() {
         return Ok(Vec::new());
@@ -829,6 +912,7 @@ fn expand_v4_route_leaves(
         routing,
         routing.entry.as_str(),
         &[],
+        request,
         &mut stack,
     )
 }
@@ -839,6 +923,7 @@ fn expand_route_ref(
     routing: &RoutingConfigV4,
     child_name: &str,
     parent_path: &[String],
+    request: &RouteRequestContext,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     if view.providers.contains_key(child_name) {
@@ -850,7 +935,15 @@ fn expand_route_ref(
         }]);
     }
 
-    expand_route_node(service_name, view, routing, child_name, parent_path, stack)
+    expand_route_node(
+        service_name,
+        view,
+        routing,
+        child_name,
+        parent_path,
+        request,
+        stack,
+    )
 }
 
 fn expand_route_node(
@@ -859,6 +952,7 @@ fn expand_route_node(
     routing: &RoutingConfigV4,
     route_name: &str,
     parent_path: &[String],
+    request: &RouteRequestContext,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     if stack.iter().any(|name| name == route_name) {
@@ -887,6 +981,7 @@ fn expand_route_node(
             route_name,
             node,
             &node_path,
+            request,
             stack,
         ),
         RoutingPolicyV4::ManualSticky => expand_manual_sticky_route(
@@ -896,6 +991,7 @@ fn expand_route_node(
             route_name,
             node,
             &node_path,
+            request,
             stack,
         ),
         RoutingPolicyV4::TagPreferred => expand_tag_preferred_route(
@@ -905,6 +1001,17 @@ fn expand_route_node(
             route_name,
             node,
             &node_path,
+            request,
+            stack,
+        ),
+        RoutingPolicyV4::Conditional => expand_conditional_route(
+            service_name,
+            view,
+            routing,
+            route_name,
+            node,
+            &node_path,
+            request,
             stack,
         ),
     };
@@ -919,6 +1026,7 @@ fn expand_ordered_route_children(
     route_name: &str,
     node: &RoutingNodeV4,
     node_path: &[String],
+    request: &RouteRequestContext,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     if node.children.is_empty() {
@@ -935,6 +1043,7 @@ fn expand_ordered_route_children(
             routing,
             child_name.as_str(),
             node_path,
+            request,
             stack,
         )?);
     }
@@ -948,6 +1057,7 @@ fn expand_manual_sticky_route(
     route_name: &str,
     node: &RoutingNodeV4,
     node_path: &[String],
+    request: &RouteRequestContext,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     let target = node
@@ -965,7 +1075,15 @@ fn expand_manual_sticky_route(
         );
     }
 
-    expand_route_ref(service_name, view, routing, target, node_path, stack)
+    expand_route_ref(
+        service_name,
+        view,
+        routing,
+        target,
+        node_path,
+        request,
+        stack,
+    )
 }
 
 fn expand_tag_preferred_route(
@@ -975,6 +1093,7 @@ fn expand_tag_preferred_route(
     route_name: &str,
     node: &RoutingNodeV4,
     node_path: &[String],
+    request: &RouteRequestContext,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     if node.children.is_empty() {
@@ -995,6 +1114,7 @@ fn expand_tag_preferred_route(
             routing,
             child_name.as_str(),
             node_path,
+            request,
             stack,
         )?;
         if child_route_matches_any_filter(view, &child_leaves, &node.prefer_tags) {
@@ -1015,6 +1135,92 @@ fn expand_tag_preferred_route(
 
     preferred.extend(fallback);
     Ok(preferred)
+}
+
+fn expand_conditional_route(
+    service_name: &str,
+    view: &ServiceViewV4,
+    routing: &RoutingConfigV4,
+    route_name: &str,
+    node: &RoutingNodeV4,
+    node_path: &[String],
+    request: &RouteRequestContext,
+    stack: &mut Vec<String>,
+) -> Result<Vec<RouteLeaf>> {
+    let condition = node.when.as_ref().with_context(|| {
+        format!("[{service_name}] conditional route '{route_name}' requires when")
+    })?;
+    if condition.is_empty() {
+        anyhow::bail!(
+            "[{service_name}] conditional route '{route_name}' requires at least one condition field"
+        );
+    }
+
+    let then = node.then.as_deref().with_context(|| {
+        format!("[{service_name}] conditional route '{route_name}' requires then")
+    })?;
+    let default_route = node.default_route.as_deref().with_context(|| {
+        format!("[{service_name}] conditional route '{route_name}' requires default")
+    })?;
+    let selected = if request_matches_condition(request, condition) {
+        then
+    } else {
+        default_route
+    };
+
+    expand_route_ref(
+        service_name,
+        view,
+        routing,
+        selected,
+        node_path,
+        request,
+        stack,
+    )
+}
+
+fn request_matches_condition(
+    request: &RouteRequestContext,
+    condition: &RoutingConditionV4,
+) -> bool {
+    optional_field_matches(request.model.as_deref(), condition.model.as_deref(), false)
+        && optional_field_matches(
+            request.service_tier.as_deref(),
+            condition.service_tier.as_deref(),
+            true,
+        )
+        && optional_field_matches(
+            request.reasoning_effort.as_deref(),
+            condition.reasoning_effort.as_deref(),
+            true,
+        )
+        && optional_field_matches(request.path.as_deref(), condition.path.as_deref(), false)
+        && optional_field_matches(request.method.as_deref(), condition.method.as_deref(), true)
+        && condition.headers.iter().all(|(key, expected)| {
+            request
+                .headers
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+                .is_some_and(|(_, actual)| actual == expected)
+        })
+}
+
+fn optional_field_matches(
+    actual: Option<&str>,
+    expected: Option<&str>,
+    ignore_ascii_case: bool,
+) -> bool {
+    let Some(expected) = expected.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let Some(actual) = actual.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if ignore_ascii_case {
+        actual.eq_ignore_ascii_case(expected)
+    } else {
+        actual == expected
+    }
 }
 
 fn child_route_matches_any_filter(
@@ -1270,8 +1476,9 @@ fn btree_bool_map_to_hash_map(values: &BTreeMap<String, bool>) -> HashMap<String
 mod tests {
     use super::*;
     use crate::config::{
-        ProviderEndpointV4, ProxyConfigV4, RoutingConfigV4, RoutingExhaustedActionV4,
-        RoutingNodeV4, RoutingPolicyV4, compile_v4_to_runtime, resolved_v4_provider_order,
+        ProviderEndpointV4, ProxyConfigV4, RoutingConditionV4, RoutingConfigV4,
+        RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4, compile_v4_to_runtime,
+        resolved_v4_provider_order,
     };
     use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
     use std::collections::{HashMap, HashSet};
@@ -1752,6 +1959,268 @@ mod tests {
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(provider_ids(&template), vec!["monthly"]);
+    }
+
+    #[test]
+    fn routing_ir_conditional_route_selects_then_branch_for_matching_request() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                ("small".to_string(), provider("https://small.example/v1")),
+                ("large".to_string(), provider("https://large.example/v1")),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::Conditional,
+                        when: Some(RoutingConditionV4 {
+                            model: Some("gpt-5".to_string()),
+                            ..RoutingConditionV4::default()
+                        }),
+                        then: Some("large".to_string()),
+                        default_route: Some("small".to_string()),
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        let template = compile_v4_route_plan_template_with_request(
+            "codex",
+            &view,
+            &RouteRequestContext {
+                model: Some("gpt-5".to_string()),
+                ..RouteRequestContext::default()
+            },
+        )
+        .expect("conditional route template");
+
+        assert_eq!(provider_ids(&template), vec!["large"]);
+        assert_eq!(template.candidates[0].route_path, vec!["root", "large"]);
+    }
+
+    #[test]
+    fn routing_ir_conditional_route_uses_default_branch_for_no_match() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                ("small".to_string(), provider("https://small.example/v1")),
+                ("large".to_string(), provider("https://large.example/v1")),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::Conditional,
+                        when: Some(RoutingConditionV4 {
+                            service_tier: Some("priority".to_string()),
+                            ..RoutingConditionV4::default()
+                        }),
+                        then: Some("large".to_string()),
+                        default_route: Some("small".to_string()),
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        let template = compile_v4_route_plan_template_with_request(
+            "codex",
+            &view,
+            &RouteRequestContext {
+                service_tier: Some("default".to_string()),
+                ..RouteRequestContext::default()
+            },
+        )
+        .expect("conditional route template");
+
+        assert_eq!(provider_ids(&template), vec!["small"]);
+        assert_eq!(template.candidates[0].route_path, vec!["root", "small"]);
+    }
+
+    #[test]
+    fn routing_ir_conditional_route_composes_with_ordered_fallback_branch() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "large-primary".to_string(),
+                    provider("https://large-primary.example/v1"),
+                ),
+                (
+                    "large-backup".to_string(),
+                    provider("https://large-backup.example/v1"),
+                ),
+                ("small".to_string(), provider("https://small.example/v1")),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([
+                    (
+                        "root".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::Conditional,
+                            when: Some(RoutingConditionV4 {
+                                model: Some("gpt-5".to_string()),
+                                ..RoutingConditionV4::default()
+                            }),
+                            then: Some("large_pool".to_string()),
+                            default_route: Some("small".to_string()),
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                    (
+                        "large_pool".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::OrderedFailover,
+                            children: vec!["large-primary".to_string(), "large-backup".to_string()],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                ]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        let template = compile_v4_route_plan_template_with_request(
+            "codex",
+            &view,
+            &RouteRequestContext {
+                model: Some("gpt-5".to_string()),
+                ..RouteRequestContext::default()
+            },
+        )
+        .expect("conditional route template");
+
+        assert_eq!(
+            provider_ids(&template),
+            vec!["large-primary", "large-backup"]
+        );
+        assert_eq!(
+            template.candidates[1].route_path,
+            vec!["root", "large_pool", "large-backup"]
+        );
+    }
+
+    #[test]
+    fn routing_ir_conditional_route_rejects_missing_default() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                ("small".to_string(), provider("https://small.example/v1")),
+                ("large".to_string(), provider("https://large.example/v1")),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::Conditional,
+                        when: Some(RoutingConditionV4 {
+                            model: Some("gpt-5".to_string()),
+                            ..RoutingConditionV4::default()
+                        }),
+                        then: Some("large".to_string()),
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        let err = compile_v4_route_plan_template_with_request(
+            "codex",
+            &view,
+            &RouteRequestContext {
+                model: Some("gpt-5".to_string()),
+                ..RouteRequestContext::default()
+            },
+        )
+        .expect_err("missing default should fail");
+
+        assert!(err.to_string().contains("requires default"));
+    }
+
+    #[test]
+    fn routing_ir_conditional_route_rejects_empty_condition() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                ("small".to_string(), provider("https://small.example/v1")),
+                ("large".to_string(), provider("https://large.example/v1")),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::Conditional,
+                        when: Some(RoutingConditionV4::default()),
+                        then: Some("large".to_string()),
+                        default_route: Some("small".to_string()),
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        let err = compile_v4_route_plan_template_with_request(
+            "codex",
+            &view,
+            &RouteRequestContext::default(),
+        )
+        .expect_err("empty condition should fail");
+
+        assert!(
+            err.to_string()
+                .contains("requires at least one condition field")
+        );
+    }
+
+    #[test]
+    fn routing_ir_conditional_route_is_not_flattened_to_legacy_runtime_path() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                ("small".to_string(), provider("https://small.example/v1")),
+                ("large".to_string(), provider("https://large.example/v1")),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::Conditional,
+                        when: Some(RoutingConditionV4 {
+                            model: Some("gpt-5".to_string()),
+                            ..RoutingConditionV4::default()
+                        }),
+                        then: Some("large".to_string()),
+                        default_route: Some("small".to_string()),
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+        let cfg = ProxyConfigV4 {
+            version: 4,
+            codex: view,
+            ..ProxyConfigV4::default()
+        };
+
+        let err = compile_v4_to_runtime(&cfg).expect_err("conditional should not flatten");
+
+        assert!(
+            err.to_string()
+                .contains("requires request-aware route execution")
+        );
     }
 
     #[test]

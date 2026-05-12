@@ -381,6 +381,7 @@ fn routing_policy_label(policy: crate::config::RoutingPolicyV4) -> &'static str 
         crate::config::RoutingPolicyV4::ManualSticky => "manual-sticky",
         crate::config::RoutingPolicyV4::OrderedFailover => "ordered-failover",
         crate::config::RoutingPolicyV4::TagPreferred => "tag-preferred",
+        crate::config::RoutingPolicyV4::Conditional => "conditional",
     }
 }
 

@@ -344,6 +344,7 @@ pub(super) fn routing_policy_label(policy: crate::config::RoutingPolicyV4) -> &'
         crate::config::RoutingPolicyV4::ManualSticky => "manual-sticky",
         crate::config::RoutingPolicyV4::OrderedFailover => "ordered-failover",
         crate::config::RoutingPolicyV4::TagPreferred => "tag-preferred",
+        crate::config::RoutingPolicyV4::Conditional => "conditional",
     }
 }
 
@@ -496,6 +497,9 @@ fn build_routing_from_editor(
                 prefer_tags,
                 on_exhausted,
             ))
+        }
+        crate::config::RoutingPolicyV4::Conditional => {
+            Err("conditional routing is not editable in the basic routing editor".to_string())
         }
     }
 }
@@ -655,6 +659,14 @@ fn routing_preview_rows(
                 for name in children {
                     push_routing_preview_row(&mut rows, &mut seen, service, name, "fallback");
                 }
+            }
+        }
+        crate::config::RoutingPolicyV4::Conditional => {
+            if let Some(target) = node.and_then(|node| node.then.as_deref()) {
+                push_routing_preview_row(&mut rows, &mut seen, service, target, "then");
+            }
+            if let Some(target) = node.and_then(|node| node.default_route.as_deref()) {
+                push_routing_preview_row(&mut rows, &mut seen, service, target, "default");
             }
         }
     }

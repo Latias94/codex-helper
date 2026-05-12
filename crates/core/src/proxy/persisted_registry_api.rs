@@ -520,6 +520,9 @@ fn sanitize_routing_spec_request(
                     prefer_tags: Vec::new(),
                     on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
                     metadata: std::collections::BTreeMap::new(),
+                    when: None,
+                    then: None,
+                    default_route: None,
                 },
             );
         }
@@ -564,6 +567,11 @@ fn sanitize_routing_spec_request(
         if !matches!(node.strategy, crate::config::RoutingPolicyV4::TagPreferred) {
             node.prefer_tags.clear();
         }
+        if !matches!(node.strategy, crate::config::RoutingPolicyV4::Conditional) {
+            node.when = None;
+            node.then = None;
+            node.default_route = None;
+        }
         if node.children.is_empty() {
             node.children = view.providers.keys().cloned().collect();
         }
@@ -593,12 +601,29 @@ fn sanitize_route_nodes(
                 node.target = Some(target.to_string());
             }
         }
+        if let Some(target) = node.then.take() {
+            let target = target.trim();
+            if !target.is_empty() {
+                node.then = Some(target.to_string());
+            }
+        }
+        if let Some(target) = node.default_route.take() {
+            let target = target.trim();
+            if !target.is_empty() {
+                node.default_route = Some(target.to_string());
+            }
+        }
         node.prefer_tags = sanitize_routing_prefer_tags(node.prefer_tags)?;
         if !matches!(node.strategy, crate::config::RoutingPolicyV4::ManualSticky) {
             node.target = None;
         }
         if !matches!(node.strategy, crate::config::RoutingPolicyV4::TagPreferred) {
             node.prefer_tags.clear();
+        }
+        if !matches!(node.strategy, crate::config::RoutingPolicyV4::Conditional) {
+            node.when = None;
+            node.then = None;
+            node.default_route = None;
         }
         if out.insert(route_name.to_string(), node).is_some() {
             return Err((

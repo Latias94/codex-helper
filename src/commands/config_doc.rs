@@ -235,6 +235,7 @@ pub(super) fn routing_policy_label(policy: RoutingPolicyV4) -> &'static str {
         RoutingPolicyV4::ManualSticky => "manual-sticky",
         RoutingPolicyV4::OrderedFailover => "ordered-failover",
         RoutingPolicyV4::TagPreferred => "tag-preferred",
+        RoutingPolicyV4::Conditional => "conditional",
     }
 }
 

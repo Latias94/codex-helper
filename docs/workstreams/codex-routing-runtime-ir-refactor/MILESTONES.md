@@ -95,17 +95,24 @@ Acceptance:
 
 ## P5 - Conditional Routing
 
-- [ ] Add a minimal `conditional` route strategy after executor parity is stable.
-- [ ] Start with request fields that are already available before routing:
+- [x] Add a minimal `conditional` route strategy after executor parity is stable.
+- [x] Start with request fields that are already available before routing:
   model, service tier, reasoning effort, path, method, and headers.
-- [ ] Require deterministic defaults and explicit fallback children.
-- [ ] Add tests for match, no-match fallback, and invalid condition specs.
+- [x] Require deterministic defaults and explicit fallback children.
+- [x] Add tests for match, no-match fallback, and invalid condition specs.
 
 Acceptance:
 
-- conditional routing composes with existing ordered fallback;
-- conditions are explainable;
-- unsupported or ambiguous conditions fail validation instead of being guessed.
+- [x] conditional routing composes with existing ordered fallback;
+- [ ] conditions are explainable from the runtime explain contract;
+- [x] unsupported or ambiguous conditions fail validation instead of being
+  guessed.
+
+Status note:
+
+- The P5 schema and IR compiler support is in place. Production request routing
+  still rejects `conditional` on the legacy v4-to-v2 flattening path until P6
+  moves v4 execution onto request-aware route plan IR.
 
 ## P6 - Legacy Flattening Cleanup
 

@@ -236,6 +236,11 @@ fn expand_route_node(
         RoutingPolicyV4::TagPreferred => {
             expand_tag_preferred_route(service_name, view, routing, route_name, node, stack)
         }
+        RoutingPolicyV4::Conditional => {
+            anyhow::bail!(
+                "[{service_name}] conditional route '{route_name}' requires request-aware route execution and cannot be flattened to the legacy runtime path"
+            );
+        }
     };
     stack.pop();
     result
@@ -966,6 +971,9 @@ pub mod legacy {
                             prefer_tags: Vec::new(),
                             on_exhausted: RoutingExhaustedActionV4::Continue,
                             metadata: BTreeMap::new(),
+                            when: None,
+                            then: None,
+                            default_route: None,
                         },
                     );
                     root_children.push(route_name);

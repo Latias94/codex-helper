@@ -795,6 +795,12 @@ pub struct RoutingNodeV4 {
     pub on_exhausted: RoutingExhaustedActionV4,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<RoutingConditionV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then: Option<String>,
+    #[serde(default, rename = "default", skip_serializing_if = "Option::is_none")]
+    pub default_route: Option<String>,
 }
 
 impl Default for RoutingNodeV4 {
@@ -806,7 +812,37 @@ impl Default for RoutingNodeV4 {
             prefer_tags: Vec::new(),
             on_exhausted: default_routing_on_exhausted_v4(),
             metadata: BTreeMap::new(),
+            when: None,
+            then: None,
+            default_route: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RoutingConditionV4 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl RoutingConditionV4 {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.service_tier.is_none()
+            && self.reasoning_effort.is_none()
+            && self.path.is_none()
+            && self.method.is_none()
+            && self.headers.is_empty()
     }
 }
 
@@ -816,6 +852,7 @@ pub enum RoutingPolicyV4 {
     ManualSticky,
     OrderedFailover,
     TagPreferred,
+    Conditional,
 }
 
 fn default_routing_policy_v4() -> RoutingPolicyV4 {
