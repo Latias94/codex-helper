@@ -56,20 +56,20 @@ fn retry_config_with_cooldowns(
 
 #[tokio::test]
 async fn proxy_failover_retries_502_then_uses_second_upstream() {
-    run_failover_retries_502_then_uses_second_upstream(false).await;
+    run_failover_retries_502_then_uses_second_upstream().await;
 }
 
 #[tokio::test]
-async fn route_executor_request_path_retries_502_then_uses_second_upstream() {
+async fn production_request_path_uses_route_plan_executor() {
     let before = super::super::provider_execution::route_executor_request_path_test_invocations();
 
-    run_failover_retries_502_then_uses_second_upstream(true).await;
+    run_failover_retries_502_then_uses_second_upstream().await;
 
     let after = super::super::provider_execution::route_executor_request_path_test_invocations();
-    assert_eq!(after, before + 1);
+    assert!(after > before);
 }
 
-async fn run_failover_retries_502_then_uses_second_upstream(use_route_executor: bool) {
+async fn run_failover_retries_502_then_uses_second_upstream() {
     let upstream1_hits = Arc::new(AtomicUsize::new(0));
     let upstream2_hits = Arc::new(AtomicUsize::new(0));
 
@@ -150,16 +150,10 @@ async fn run_failover_retries_502_then_uses_second_upstream(use_route_executor: 
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
     let client = reqwest::Client::new();
-    let mut req = client
+    let req = client
         .post(format!("http://{}/v1/responses", proxy_addr))
         .header("content-type", "application/json")
         .body(r#"{"model":"gpt","input":"hi"}"#);
-    if use_route_executor {
-        req = req.header(
-            super::super::provider_execution::ROUTE_EXECUTOR_REQUEST_PATH_TEST_HEADER,
-            "1",
-        );
-    }
     let resp = req.send().await.expect("send");
 
     assert_eq!(resp.status(), StatusCode::OK);

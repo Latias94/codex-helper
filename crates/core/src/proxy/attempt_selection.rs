@@ -1,11 +1,16 @@
 use std::collections::HashSet;
 
+#[cfg(test)]
 use crate::lb::{LoadBalancer, SelectedUpstream};
+#[cfg(test)]
 use crate::logging::RouteAttemptLog;
+#[cfg(test)]
 use crate::model_routing;
 
+#[cfg(test)]
 use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
 
+#[cfg(test)]
 pub(super) struct SelectSupportedUpstreamParams<'a> {
     pub lb: &'a LoadBalancer,
     pub request_model: Option<&'a str>,
@@ -31,6 +36,7 @@ pub(super) fn station_upstreams_exhausted(
             >= upstream_total
 }
 
+#[cfg(test)]
 pub(super) fn select_supported_upstream(
     params: SelectSupportedUpstreamParams<'_>,
 ) -> Option<SelectedUpstream> {

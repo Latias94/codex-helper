@@ -6,7 +6,8 @@ use tracing::instrument;
 
 use super::ProxyService;
 use super::provider_execution::{
-    ExecuteProviderChainParams, ProviderExecutionOutcome, execute_provider_chain, log_retry_options,
+    ExecuteProviderChainParams, ProviderExecutionOutcome,
+    execute_provider_chain_with_route_executor, log_retry_options,
 };
 use super::request_context::prepare_proxy_request;
 use super::request_failures::finish_failed_proxy_request;
@@ -59,17 +60,8 @@ pub async fn handle_proxy(
         plan: &prepared.plan,
         cooldown_backoff: prepared.cooldown_backoff,
     };
-    #[cfg(test)]
-    let provider_execution = if super::provider_execution::route_executor_request_path_test_enabled(
-        &prepared.client_headers,
-    ) {
-        super::provider_execution::execute_provider_chain_with_route_executor(provider_chain_params)
-            .await
-    } else {
-        execute_provider_chain(provider_chain_params).await
-    };
-    #[cfg(not(test))]
-    let provider_execution = execute_provider_chain(provider_chain_params).await;
+    let provider_execution =
+        execute_provider_chain_with_route_executor(provider_chain_params).await;
     let (upstream_chain, route_attempts, last_err) = match provider_execution {
         ProviderExecutionOutcome::Return(response) => return Ok(response),
         ProviderExecutionOutcome::Exhausted(state) => {

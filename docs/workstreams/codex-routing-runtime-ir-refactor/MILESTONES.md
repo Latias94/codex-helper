@@ -117,6 +117,8 @@ Status note:
 
 ## P6 - Legacy Flattening Cleanup
 
+- [x] Move production request attempts from the legacy upstream selector loop to
+  `RoutePlanExecutor` over compatibility route plans.
 - [ ] Stop using v4-to-v2-to-runtime as the main v4 execution path.
 - [ ] Demote the synthetic `routing` station to compatibility only.
 - [ ] Remove v4-only UI and API assumptions that expose station concepts as the
