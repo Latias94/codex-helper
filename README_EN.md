@@ -4,7 +4,7 @@ A local relay proxy and operator console for Codex CLI.
 
 codex-helper puts a local proxy between Codex and your upstream providers. It lets you manage multiple relays, keys, balances, request logs, cost estimates, and fallback policies without interrupting the normal Codex workflow.
 
-Current development version: `v0.14.0` route graph refactor
+Current release: `v0.14.0`
 
 中文说明: [README.md](README.md)
 

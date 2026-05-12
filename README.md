@@ -4,7 +4,7 @@ Codex CLI 的本地中转代理与控制台。
 
 它把 Codex 请求先送到本机代理，再按你配置的 provider / routing 转发到 OpenAI 官方或各类中转站。这样你可以在不中断 Codex 使用体验的情况下集中管理多个中转、多个 key、余额/套餐、请求日志、成本估算和 fallback 策略。
 
-当前开发版本：`v0.14.0` route graph 重构中
+当前发布版本：`v0.14.0`
 
 English: [README_EN.md](README_EN.md)
 
