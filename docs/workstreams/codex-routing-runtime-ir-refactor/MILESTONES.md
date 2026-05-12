@@ -117,6 +117,8 @@ Status note:
 
 ## P6 - Legacy Flattening Cleanup
 
+Status: complete.
+
 - [x] Move production request attempts from the legacy upstream selector loop to
   `RoutePlanExecutor` over compatibility route plans.
 - [x] Retain the loaded v4 route graph beside the compatibility runtime config.
@@ -126,9 +128,9 @@ Status note:
   source configs.
 - [x] Stop using v4-to-v2-to-runtime as the main v4 execution path.
 - [x] Demote the synthetic `routing` station to compatibility only.
-- [ ] Remove v4-only UI and API assumptions that expose station concepts as the
+- [x] Remove v4-only UI and API assumptions that expose station concepts as the
   main provider routing model.
-- [ ] Update docs and migration notes.
+- [x] Update docs and migration notes.
 
 Acceptance:
 
@@ -143,6 +145,10 @@ Status note:
   possible branches for compatibility state, while request execution still
   evaluates the request-aware branch. The v2 bridge remains for migrations and
   compatibility tooling, not for the main v4 runtime compiler.
+- The runtime explain API now exposes legacy station/upstream identity under a
+  `compatibility` object while keeping the older top-level fields for backward
+  compatibility. CLI and GUI explain text presents route/provider/path first and
+  labels station identity as compatibility state.
 
 ## Done When
 

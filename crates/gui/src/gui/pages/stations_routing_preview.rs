@@ -24,9 +24,24 @@ pub(super) fn render_stations_routing_preview(
         ));
         ui.small(pick(
             ctx.lang,
-            "按当前运行态解释新请求会如何选择 station、哪些目标被排除，以及 retry 何时允许跨站。具体会话仍会先应用 session pin / profile binding。",
-            "Explain how new requests choose stations under the current runtime, which targets are excluded, and when retry may cross station boundaries. Concrete sessions still apply session pins and profile bindings first.",
+            "按当前运行态解释新请求会如何选择 route/provider、哪些候选被排除，以及 legacy station 兼容状态如何影响 pin / retry。",
+            "Explain how new requests choose routes/providers under the current runtime, which candidates are excluded, and how legacy station compatibility affects pins and retry.",
         ));
+        if let Some(explain) = snapshot.routing_explain.as_ref() {
+            ui.add_space(4.0);
+            ui.label(pick(ctx.lang, "运行态选路", "Runtime route"));
+            ui.small(format_runtime_selected_route(ctx.lang, explain));
+            for candidate in &explain.candidates {
+                ui.small(format_runtime_candidate(candidate));
+            }
+        } else if snapshot.supports_routing_explain_api {
+            ui.add_space(4.0);
+            ui.small(pick(
+                ctx.lang,
+                "运行态 explain API 暂无可用快照。",
+                "Runtime explain API has no available snapshot yet.",
+            ));
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
                 "{}: {}",
@@ -88,20 +103,6 @@ pub(super) fn render_stations_routing_preview(
             }
         }
 
-        ui.add_space(6.0);
-        if let Some(explain) = snapshot.routing_explain.as_ref() {
-            ui.label(pick(ctx.lang, "运行态选路", "Runtime route"));
-            ui.small(format_runtime_selected_route(ctx.lang, explain));
-            for candidate in &explain.candidates {
-                ui.small(format_runtime_candidate(candidate));
-            }
-        } else if snapshot.supports_routing_explain_api {
-            ui.small(pick(
-                ctx.lang,
-                "运行态 explain API 暂无可用快照。",
-                "Runtime explain API has no available snapshot yet.",
-            ));
-        }
     });
 }
 
@@ -354,20 +355,20 @@ fn format_runtime_selected_route(
     match explain.selected_route.as_ref() {
         Some(selected) => match lang {
             Language::Zh => format!(
-                "selected={} endpoint={} station={} upstream#{} path={}",
+                "selected={} endpoint={} path={} compat_station={} upstream#{}",
                 selected.provider_id,
                 selected.endpoint_id,
-                selected.station_name,
-                selected.upstream_index,
-                selected.route_path.join(" > ")
+                selected.route_path.join(" > "),
+                selected.compatibility.station_name,
+                selected.compatibility.upstream_index
             ),
             Language::En => format!(
-                "selected={} endpoint={} station={} upstream#{} path={}",
+                "selected={} endpoint={} path={} compat_station={} upstream#{}",
                 selected.provider_id,
                 selected.endpoint_id,
-                selected.station_name,
-                selected.upstream_index,
-                selected.route_path.join(" > ")
+                selected.route_path.join(" > "),
+                selected.compatibility.station_name,
+                selected.compatibility.upstream_index
             ),
         },
         None => pick(lang, "selected=<none>", "selected=<none>").to_string(),
@@ -377,14 +378,14 @@ fn format_runtime_selected_route(
 fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCandidate) -> String {
     let marker = if candidate.selected { "*" } else { " " };
     format!(
-        "{} {} endpoint={} station={} upstream#{} skip={} path={}",
+        "{} {} endpoint={} path={} skip={} compat_station={} upstream#{}",
         marker,
         candidate.provider_id,
         candidate.endpoint_id,
-        candidate.station_name,
-        candidate.upstream_index,
+        candidate.route_path.join(" > "),
         format_runtime_skip_reasons(&candidate.skip_reasons),
-        candidate.route_path.join(" > ")
+        candidate.compatibility.station_name,
+        candidate.compatibility.upstream_index
     )
 }
 

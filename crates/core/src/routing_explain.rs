@@ -107,11 +107,19 @@ pub struct RoutingExplainCandidate {
     pub provider_alias: Option<String>,
     pub endpoint_id: String,
     pub route_path: Vec<String>,
+    #[serde(default)]
+    pub compatibility: RoutingExplainCompatibility,
     pub station_name: String,
     pub upstream_index: usize,
     pub upstream_base_url: String,
     pub selected: bool,
     pub skip_reasons: Vec<RoutingExplainSkipReason>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RoutingExplainCompatibility {
+    pub station_name: String,
+    pub upstream_index: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -279,6 +287,10 @@ fn routing_explain_candidate(
         provider_alias: candidate.provider_alias.clone(),
         endpoint_id: candidate.endpoint_id.clone(),
         route_path: candidate.route_path.clone(),
+        compatibility: RoutingExplainCompatibility {
+            station_name: selected_upstream.station_name.clone(),
+            upstream_index: selected_upstream.index,
+        },
         station_name: selected_upstream.station_name.clone(),
         upstream_index: selected_upstream.index,
         upstream_base_url: selected_upstream.upstream.base_url.clone(),

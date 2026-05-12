@@ -520,6 +520,7 @@ Use `--claude` on provider/routing commands when editing the Claude service inst
 
 `routing show` reads persisted config. `routing list` and `routing explain` read the compiled runtime candidate view.
 Use `routing explain --model <MODEL> --json` to inspect the same selected route, candidate order, route paths, and structured skip reasons exposed by the runtime admin explain API.
+In that response, `provider_id`, `endpoint_id`, and `route_path` are the primary v4 routing identity. Legacy station/upstream identity is reported under each candidate's `compatibility` object; the older top-level `station_name` and `upstream_index` fields remain for backward-compatible clients.
 
 ## UI Editing
 
@@ -565,7 +566,7 @@ Migration rules:
 - business tags such as `billing=monthly` are never guessed;
 - endpoint-scoped station groups may warn because v4 provider routing is provider-level by default.
 
-After migration, treat provider and routing graph as the public write surface.
+After migration, treat provider and routing graph as the public write surface. The proxy still derives a synthetic `routing` station for legacy runtime state and older APIs, but v4 request execution uses the preserved route graph and request-aware route plan rather than the old v2 flattening path.
 
 ## Design Boundaries
 

@@ -323,12 +323,12 @@ fn print_runtime_explain_text(explain: &RoutingExplainResponse) {
     }
     if let Some(selected) = &explain.selected_route {
         println!(
-            "Selected route: {} endpoint={} station={} upstream#{} path=[{}]",
+            "Selected route: {} endpoint={} path=[{}] compat_station={} upstream#{}",
             selected.provider_id,
             selected.endpoint_id,
-            selected.station_name,
-            selected.upstream_index,
-            selected.route_path.join(" > ")
+            selected.route_path.join(" > "),
+            selected.compatibility.station_name,
+            selected.compatibility.upstream_index
         );
     } else {
         println!("Selected route: <none>");
@@ -344,15 +344,15 @@ fn print_runtime_explain_text(explain: &RoutingExplainResponse) {
         let marker = if candidate.selected { "*" } else { " " };
         let skips = format_skip_reasons(&candidate.skip_reasons);
         println!(
-            "  {} {}. {} endpoint={} station={} upstream#{} skip={} path=[{}]",
+            "  {} {}. {} endpoint={} path=[{}] skip={} compat_station={} upstream#{}",
             marker,
             idx + 1,
             candidate.provider_id,
             candidate.endpoint_id,
-            candidate.station_name,
-            candidate.upstream_index,
+            candidate.route_path.join(" > "),
             skips,
-            candidate.route_path.join(" > ")
+            candidate.compatibility.station_name,
+            candidate.compatibility.upstream_index
         );
     }
 
