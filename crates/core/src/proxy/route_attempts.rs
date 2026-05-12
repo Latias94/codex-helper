@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use crate::lb::SelectedUpstream;
 use crate::logging::RouteAttemptLog;
 
+use super::route_metadata::selected_route_metadata;
+
 pub(super) struct StartRouteAttemptParams<'a> {
     pub(super) selected: &'a SelectedUpstream,
     pub(super) provider_id: Option<&'a str>,
@@ -98,9 +100,14 @@ pub(super) fn start_selected_route_attempt(
         params.model_note
     );
     let attempt_index = route_attempts.len() as u32;
+    let route_metadata = selected_route_metadata(params.selected);
     route_attempts.push(RouteAttemptLog {
         attempt_index,
-        provider_id: non_dash(params.provider_id).map(ToOwned::to_owned),
+        provider_id: non_dash(params.provider_id)
+            .map(ToOwned::to_owned)
+            .or(route_metadata.provider_id),
+        endpoint_id: route_metadata.endpoint_id,
+        route_path: route_metadata.route_path,
         provider_attempt: Some(params.provider_attempt + 1),
         upstream_attempt: Some(params.upstream_attempt + 1),
         provider_max_attempts: Some(params.provider_max_attempts),
@@ -131,9 +138,13 @@ pub(super) fn record_unsupported_model_skip(
         params.selected.index,
         params.requested_model
     );
+    let route_metadata = selected_route_metadata(params.selected);
     upstream_chain.push(raw.clone());
     route_attempts.push(RouteAttemptLog {
         attempt_index: route_attempts.len() as u32,
+        provider_id: route_metadata.provider_id,
+        endpoint_id: route_metadata.endpoint_id,
+        route_path: route_metadata.route_path,
         provider_attempt: Some(params.provider_attempt + 1),
         provider_max_attempts: Some(params.provider_max_attempts),
         station_name: Some(params.selected.station_name.clone()),
@@ -167,8 +178,18 @@ pub(super) fn record_status_route_attempt(
         params.model_note
     );
     upstream_chain.push(raw.clone());
+    let route_metadata = selected_route_metadata(params.selected);
 
     if let Some(attempt) = route_attempts.get_mut(params.route_attempt_index) {
+        if attempt.provider_id.is_none() {
+            attempt.provider_id = route_metadata.provider_id.clone();
+        }
+        if attempt.endpoint_id.is_none() {
+            attempt.endpoint_id = route_metadata.endpoint_id.clone();
+        }
+        if attempt.route_path.is_empty() {
+            attempt.route_path = route_metadata.route_path.clone();
+        }
         attempt.decision = if (200..300).contains(&params.status_code) {
             "completed".to_string()
         } else {
@@ -188,6 +209,9 @@ pub(super) fn record_status_route_attempt(
 
     route_attempts.push(RouteAttemptLog {
         attempt_index: route_attempts.len() as u32,
+        provider_id: route_metadata.provider_id,
+        endpoint_id: route_metadata.endpoint_id,
+        route_path: route_metadata.route_path,
         station_name: Some(params.selected.station_name.clone()),
         upstream_base_url: Some(params.selected.upstream.base_url.clone()),
         upstream_index: Some(params.selected.index),
@@ -224,8 +248,18 @@ pub(super) fn record_error_route_attempt(
         params.model_note
     );
     upstream_chain.push(raw.clone());
+    let route_metadata = selected_route_metadata(params.selected);
 
     if let Some(attempt) = route_attempts.get_mut(params.route_attempt_index) {
+        if attempt.provider_id.is_none() {
+            attempt.provider_id = route_metadata.provider_id.clone();
+        }
+        if attempt.endpoint_id.is_none() {
+            attempt.endpoint_id = route_metadata.endpoint_id.clone();
+        }
+        if attempt.route_path.is_empty() {
+            attempt.route_path = route_metadata.route_path.clone();
+        }
         attempt.decision = params.kind.decision().to_string();
         attempt.reason = Some(params.reason.to_string());
         attempt.error_class = Some(params.kind.error_class().to_string());
@@ -240,6 +274,9 @@ pub(super) fn record_error_route_attempt(
 
     route_attempts.push(RouteAttemptLog {
         attempt_index: route_attempts.len() as u32,
+        provider_id: route_metadata.provider_id,
+        endpoint_id: route_metadata.endpoint_id,
+        route_path: route_metadata.route_path,
         station_name: Some(params.selected.station_name.clone()),
         upstream_base_url: Some(params.selected.upstream.base_url.clone()),
         upstream_index: Some(params.selected.index),

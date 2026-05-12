@@ -2,6 +2,8 @@ use crate::lb::SelectedUpstream;
 use crate::model_routing;
 use crate::state::{ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource, SessionBinding};
 
+use super::route_metadata::selected_route_metadata;
+
 fn trim_non_empty(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -83,6 +85,7 @@ pub(super) fn build_route_decision_provenance(
         selected,
         provider_id,
     } = params;
+    let route_metadata = selected_route_metadata(selected);
 
     let mut effective_model = resolve_request_field_provenance(
         request_model,
@@ -124,7 +127,9 @@ pub(super) fn build_route_decision_provenance(
             selected.upstream.base_url.clone(),
             RouteValueSource::RuntimeFallback,
         )),
-        provider_id: trim_non_empty(provider_id),
+        provider_id: trim_non_empty(provider_id).or(route_metadata.provider_id),
+        endpoint_id: route_metadata.endpoint_id,
+        route_path: route_metadata.route_path,
     }
 }
 
@@ -237,6 +242,11 @@ mod tests {
             RouteValueSource::RuntimeFallback,
         );
         assert_eq!(decision.provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(decision.endpoint_id.as_deref(), Some("0"));
+        assert_eq!(
+            decision.route_path,
+            vec!["legacy", "selected-station", "selected-station#0"]
+        );
     }
 
     #[test]
@@ -359,6 +369,12 @@ mod tests {
                     source: RouteValueSource::RuntimeFallback,
                 }),
                 provider_id: None,
+                endpoint_id: Some("0".to_string()),
+                route_path: vec![
+                    "legacy".to_string(),
+                    "selected-station".to_string(),
+                    "selected-station#0".to_string(),
+                ],
             }
         );
     }

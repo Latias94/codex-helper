@@ -81,7 +81,7 @@ Acceptance:
 
 - [ ] Record structured skip reasons for capability mismatch, breaker open,
   runtime disabled, cooldown, usage exhaustion, and missing auth.
-- [ ] Include route path in attempt logs and request history.
+- [x] Include route path in attempt logs and request history.
 - [ ] Extend `routing explain` and admin APIs with selected route, candidates,
   and skip reasons.
 - [ ] Update GUI/TUI only after the API shape is stable.

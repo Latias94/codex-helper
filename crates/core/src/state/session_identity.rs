@@ -378,6 +378,10 @@ pub struct RouteDecisionProvenance {
     pub effective_upstream_base_url: Option<ResolvedRouteValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_path: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

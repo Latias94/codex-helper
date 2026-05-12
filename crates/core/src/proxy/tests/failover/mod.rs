@@ -145,6 +145,7 @@ async fn run_failover_retries_502_then_uses_second_upstream(use_route_executor: 
         "codex",
         Arc::new(std::sync::Mutex::new(HashMap::new())),
     );
+    let state = proxy.state.clone();
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -167,6 +168,39 @@ async fn run_failover_retries_502_then_uses_second_upstream(use_route_executor: 
         body.contains(r#""upstream":2"#),
         "expected response from upstream2, got: {body}"
     );
+    let finished = state.list_recent_finished(10).await;
+    let request = finished
+        .iter()
+        .find(|request| request.status_code == StatusCode::OK)
+        .expect("finished request");
+    let retry = request.retry.as_ref().expect("retry info");
+    assert_eq!(retry.route_attempts.len(), 3);
+    assert_eq!(
+        retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.endpoint_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("0"), Some("0"), Some("1")]
+    );
+    assert_eq!(
+        retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.route_path.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            vec!["legacy".to_string(), "test".to_string(), "u1".to_string()],
+            vec!["legacy".to_string(), "test".to_string(), "u1".to_string()],
+            vec!["legacy".to_string(), "test".to_string(), "u2".to_string()],
+        ]
+    );
+    let route_decision = request
+        .route_decision
+        .as_ref()
+        .expect("finished route decision");
+    assert_eq!(route_decision.endpoint_id.as_deref(), Some("1"));
+    assert_eq!(route_decision.route_path, vec!["legacy", "test", "u2"]);
     // Two-layer model: retry current upstream first, then fail over.
     assert_eq!(upstream1_hits.load(Ordering::SeqCst), 2);
     assert_eq!(upstream2_hits.load(Ordering::SeqCst), 1);

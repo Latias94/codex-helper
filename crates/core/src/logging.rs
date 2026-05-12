@@ -319,6 +319,10 @@ fn route_attempt_avoid_for_station_is_empty(value: &[usize]) -> bool {
     value.is_empty()
 }
 
+fn route_attempt_route_path_is_empty(value: &[String]) -> bool {
+    value.is_empty()
+}
+
 fn bool_is_false(value: &bool) -> bool {
     !*value
 }
@@ -328,6 +332,10 @@ pub struct RouteAttemptLog {
     pub attempt_index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "route_attempt_route_path_is_empty")]
+    pub route_path: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_attempt: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

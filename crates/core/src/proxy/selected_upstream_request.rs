@@ -213,6 +213,11 @@ mod tests {
             setup.route_decision.provider_id.as_deref(),
             Some("test-provider")
         );
+        assert_eq!(setup.route_decision.endpoint_id.as_deref(), Some("0"));
+        assert_eq!(
+            setup.route_decision.route_path,
+            vec!["legacy", "alpha", "test-provider"]
+        );
         assert_eq!(setup.upstream_request_body_len, setup.filtered_body.len());
         assert!(setup.upstream_request_body_debug.is_some());
         assert!(String::from_utf8_lossy(setup.filtered_body.as_ref()).contains("gpt-5.4"));
