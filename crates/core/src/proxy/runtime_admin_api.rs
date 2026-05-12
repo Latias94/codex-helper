@@ -200,12 +200,26 @@ pub(super) async fn get_routing_explain(
         .request_context()
         .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     let session_id = q.session_id();
-    let lbs = routing_explain_load_balancers(&proxy, cfg.as_ref(), session_id.as_deref()).await;
-    let template = compile_legacy_route_plan_template(
-        proxy.service_name,
-        lbs.iter().map(|lb| lb.service.as_ref()),
-    );
-    let runtime = route_plan_runtime_state_from_lbs(&lbs);
+    let v4 = proxy.config.v4_snapshot().await;
+    let route_selection = routing_explain_load_balancers(
+        &proxy,
+        cfg.as_ref(),
+        v4.as_deref(),
+        &request,
+        session_id.as_deref(),
+    )
+    .await;
+    let legacy_template;
+    let template = if let Some(template) = route_selection.route_plan_template.as_ref() {
+        template
+    } else {
+        legacy_template = compile_legacy_route_plan_template(
+            proxy.service_name,
+            route_selection.lbs.iter().map(|lb| lb.service.as_ref()),
+        );
+        &legacy_template
+    };
+    let runtime = route_plan_runtime_state_from_lbs(&route_selection.lbs);
     Ok(Json(build_routing_explain_response_with_request(
         proxy.service_name,
         Some(proxy.config.last_loaded_at_ms()),
@@ -236,8 +250,10 @@ pub(super) async fn get_request_ledger_recent(
 async fn routing_explain_load_balancers(
     proxy: &ProxyService,
     cfg: &ProxyConfig,
+    v4: Option<&crate::config::ProxyConfigV4>,
+    request: &RouteRequestContext,
     session_id: Option<&str>,
-) -> Vec<LoadBalancer> {
+) -> super::request_routing::RequestRouteSelection {
     let mgr = proxy.service_manager(cfg);
     let (meta_overrides, state_overrides, upstream_overrides, provider_balances) = tokio::join!(
         proxy.state.get_station_meta_overrides(proxy.service_name),
@@ -260,11 +276,18 @@ async fn routing_explain_load_balancers(
             PinnedRoutingSelection::Selected(candidate) => vec![LoadBalancer::new(
                 Arc::new(candidate.service),
                 proxy.lb_states.clone(),
-            )],
+            )]
+            .into(),
             PinnedRoutingSelection::BlockedBreakerOpen | PinnedRoutingSelection::Missing => {
-                Vec::new()
+                Vec::new().into()
             }
         };
+    }
+
+    if let Some(v4) = v4
+        && let Some(selection) = proxy.v4_route_selection_for_request(v4, request)
+    {
+        return selection;
     }
 
     let plan = build_station_routing_plan(
@@ -279,7 +302,8 @@ async fn routing_explain_load_balancers(
     plan.selected_stations
         .into_iter()
         .map(|candidate| LoadBalancer::new(Arc::new(candidate.service), proxy.lb_states.clone()))
-        .collect()
+        .collect::<Vec<_>>()
+        .into()
 }
 
 pub(super) async fn get_request_ledger_summary(

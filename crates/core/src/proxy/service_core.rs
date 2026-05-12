@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use reqwest::Client;
 
-use crate::config::{ProxyConfig, ServiceConfigManager};
+use crate::config::{ProxyConfig, ProxyConfigV4, ServiceConfigManager};
 use crate::filter::RequestFilter;
 use crate::lb::LbState;
 use crate::state::{ProxyState, SessionBinding, SessionContinuityMode};
@@ -15,6 +15,16 @@ impl ProxyService {
     pub fn new(
         client: Client,
         config: Arc<ProxyConfig>,
+        service_name: &'static str,
+        lb_states: Arc<Mutex<HashMap<String, LbState>>>,
+    ) -> Self {
+        Self::new_with_v4_source(client, config, None, service_name, lb_states)
+    }
+
+    pub fn new_with_v4_source(
+        client: Client,
+        config: Arc<ProxyConfig>,
+        v4_source: Option<Arc<ProxyConfigV4>>,
         service_name: &'static str,
         lb_states: Arc<Mutex<HashMap<String, LbState>>>,
     ) -> Self {
@@ -43,7 +53,7 @@ impl ProxyService {
         }
         Self {
             client,
-            config: Arc::new(RuntimeConfig::new(config)),
+            config: Arc::new(RuntimeConfig::new_with_v4(config, v4_source)),
             service_name,
             lb_states,
             filter: RequestFilter::new(),

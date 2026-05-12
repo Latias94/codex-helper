@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 
 use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{BodyPreview, HeaderEntry, ServiceTierLog};
+use crate::routing_ir::{RoutePlanTemplate, RouteRequestContext};
 use crate::state::SessionBinding;
 
 use super::ProxyService;
@@ -26,6 +27,7 @@ pub(super) struct PreparedProxyRequest {
     pub(super) session_id: Option<String>,
     pub(super) session_binding: Option<SessionBinding>,
     pub(super) lbs: Vec<LoadBalancer>,
+    pub(super) route_plan_template: Option<RoutePlanTemplate>,
     pub(super) cwd: Option<String>,
     pub(super) session_override_config: Option<String>,
     pub(super) global_station_override: Option<String>,
@@ -82,25 +84,6 @@ pub(super) async fn prepare_proxy_request(
     } else {
         None
     };
-    let lbs = proxy
-        .lbs_for_request(cfg_snapshot.as_ref(), session_id.as_deref())
-        .await;
-    if lbs.is_empty() {
-        let dur = start.elapsed().as_millis() as u64;
-        let client_headers_entries = client_headers_entries_cache
-            .get_or_init(|| header_map_to_entries(&client_headers))
-            .clone();
-        return Err(log_no_routable_station(
-            proxy,
-            &method,
-            uri.path(),
-            client_uri.as_str(),
-            session_id.clone(),
-            client_headers_entries,
-            dur,
-        ));
-    }
-
     let request_flavor =
         detect_request_flavor(proxy.service_name, &method, &client_headers, uri.path());
     let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
@@ -221,10 +204,43 @@ pub(super) async fn prepare_proxy_request(
         max_secs: plan.cooldown_backoff_max_secs,
     };
 
+    let route_request = route_request_context(
+        &method,
+        &uri,
+        &client_headers,
+        request_model.clone(),
+        effective_effort.clone(),
+        effective_service_tier.clone(),
+    );
+    let v4_snapshot = proxy.config.v4_snapshot().await;
+    let route_selection = proxy
+        .lbs_for_request(
+            cfg_snapshot.as_ref(),
+            v4_snapshot.as_deref(),
+            &route_request,
+            session_id.as_deref(),
+        )
+        .await;
+    if route_selection.lbs.is_empty() {
+        let dur = start.elapsed().as_millis() as u64;
+        let client_headers_entries = client_headers_entries_cache
+            .get_or_init(|| header_map_to_entries(&client_headers))
+            .clone();
+        return Err(log_no_routable_station(
+            proxy,
+            &method,
+            uri.path(),
+            client_uri.as_str(),
+            session_id.clone(),
+            client_headers_entries,
+            dur,
+        ));
+    }
+
     super::route_executor_shadow::maybe_log_route_executor_shadow_diff(
         proxy.service_name,
         request_id,
-        &lbs,
+        &route_selection.lbs,
         request_model.as_deref(),
     );
 
@@ -236,7 +252,8 @@ pub(super) async fn prepare_proxy_request(
         client_headers_entries_cache,
         session_id,
         session_binding,
-        lbs,
+        lbs: route_selection.lbs,
+        route_plan_template: route_selection.route_plan_template,
         cwd,
         session_override_config,
         global_station_override,
@@ -259,6 +276,32 @@ pub(super) async fn prepare_proxy_request(
         plan,
         cooldown_backoff,
     })
+}
+
+fn route_request_context(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+) -> RouteRequestContext {
+    RouteRequestContext {
+        model,
+        service_tier,
+        reasoning_effort,
+        path: Some(uri.path().to_string()),
+        method: Some(method.as_str().to_string()),
+        headers: headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect(),
+    }
 }
 
 async fn resolve_and_touch_session_state(

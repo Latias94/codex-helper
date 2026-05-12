@@ -94,10 +94,15 @@ pub struct RouteCandidate {
 
 impl RouteCandidate {
     pub fn to_upstream_config(&self) -> UpstreamConfig {
+        let mut tags = self.tags.clone();
+        tags.insert("endpoint_id".to_string(), self.endpoint_id.clone());
+        if let Ok(route_path) = serde_json::to_string(&self.route_path) {
+            tags.insert("route_path".to_string(), route_path);
+        }
         UpstreamConfig {
             base_url: self.base_url.clone(),
             auth: self.auth.clone(),
-            tags: btree_string_map_to_hash_map(&self.tags),
+            tags: btree_string_map_to_hash_map(&tags),
             supported_models: btree_bool_map_to_hash_map(&self.supported_models),
             model_mapping: btree_string_map_to_hash_map(&self.model_mapping),
         }
@@ -1556,6 +1561,14 @@ mod tests {
             .collect()
     }
 
+    fn legacy_parity_tags(values: &HashMap<String, String>) -> BTreeMap<String, String> {
+        values
+            .iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "endpoint_id" | "route_path"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
     fn hash_bool_map_to_btree(values: &HashMap<String, bool>) -> BTreeMap<String, bool> {
         values
             .iter()
@@ -1568,7 +1581,7 @@ mod tests {
             station_name: selected.station_name.clone(),
             index: selected.index,
             base_url: selected.upstream.base_url.clone(),
-            tags: hash_string_map_to_btree(&selected.upstream.tags),
+            tags: legacy_parity_tags(&selected.upstream.tags),
             supported_models: hash_bool_map_to_btree(&selected.upstream.supported_models),
             model_mapping: hash_string_map_to_btree(&selected.upstream.model_mapping),
         }
@@ -2184,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_ir_conditional_route_is_not_flattened_to_legacy_runtime_path() {
+    fn routing_ir_conditional_route_flattens_only_for_compat_runtime_path() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([
                 ("small".to_string(), provider("https://small.example/v1")),
@@ -2215,11 +2228,23 @@ mod tests {
             ..ProxyConfigV4::default()
         };
 
-        let err = compile_v4_to_runtime(&cfg).expect_err("conditional should not flatten");
+        let runtime = compile_v4_to_runtime(&cfg).expect("compat runtime");
+        let routing = runtime
+            .codex
+            .station("routing")
+            .expect("compat routing station");
 
-        assert!(
-            err.to_string()
-                .contains("requires request-aware route execution")
+        assert_eq!(
+            routing
+                .upstreams
+                .iter()
+                .map(|upstream| upstream
+                    .tags
+                    .get("provider_id")
+                    .map(String::as_str)
+                    .unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec!["large", "small"]
         );
     }
 

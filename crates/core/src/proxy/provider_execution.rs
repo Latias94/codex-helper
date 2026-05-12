@@ -12,7 +12,7 @@ use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace};
 use crate::routing_ir::{
     RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState, RoutePlanSkipReason,
-    SkippedRouteCandidate, compile_legacy_route_plan_template,
+    RoutePlanTemplate, SkippedRouteCandidate, compile_legacy_route_plan_template,
 };
 use crate::state::SessionBinding;
 
@@ -34,6 +34,7 @@ use super::route_executor_runtime::route_plan_runtime_state_from_lbs;
 pub(super) struct ExecuteProviderChainParams<'a> {
     pub(super) proxy: &'a ProxyService,
     pub(super) lbs: &'a [LoadBalancer],
+    pub(super) route_plan_template: Option<&'a RoutePlanTemplate>,
     pub(super) method: &'a Method,
     pub(super) uri: &'a Uri,
     pub(super) client_headers: &'a HeaderMap,
@@ -131,6 +132,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
     let ExecuteProviderChainParams {
         proxy,
         lbs,
+        route_plan_template,
         method,
         uri,
         client_headers,
@@ -168,10 +170,16 @@ pub(super) async fn execute_provider_chain_with_route_executor(
         .iter()
         .map(|lb| lb.service.upstreams.len())
         .sum::<usize>();
-    let template = compile_legacy_route_plan_template(
-        proxy.service_name,
-        lbs.iter().map(|lb| lb.service.as_ref()),
-    );
+    let legacy_template;
+    let template = if let Some(template) = route_plan_template {
+        template
+    } else {
+        legacy_template = compile_legacy_route_plan_template(
+            proxy.service_name,
+            lbs.iter().map(|lb| lb.service.as_ref()),
+        );
+        &legacy_template
+    };
     let executor = RoutePlanExecutor::new(&template);
     let runtime = route_plan_runtime_state_from_lbs(lbs);
     let mut route_state = RoutePlanAttemptState::default();

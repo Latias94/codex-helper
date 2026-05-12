@@ -22,10 +22,11 @@ use super::{
     codex_auth_json_value,
 };
 use crate::config::{
-    GroupConfigV2, GroupMemberRefV2, ProviderConfigV2, ProviderEndpointV2, ProxyConfig,
-    ProxyConfigV2, RetryConfig, RetryProfileName, RetryStrategy, ServiceConfig,
-    ServiceConfigManager, ServiceControlProfile, ServiceViewV2, UiConfig, UpstreamAuth,
-    UpstreamConfig,
+    GroupConfigV2, GroupMemberRefV2, ProviderConfigV2, ProviderConfigV4, ProviderEndpointV2,
+    ProxyConfig, ProxyConfigV2, ProxyConfigV4, RetryConfig, RetryProfileName, RetryStrategy,
+    RoutingConditionV4, RoutingConfigV4, RoutingNodeV4, RoutingPolicyV4, ServiceConfig,
+    ServiceConfigManager, ServiceControlProfile, ServiceViewV2, ServiceViewV4, UiConfig,
+    UpstreamAuth, UpstreamConfig,
 };
 use crate::proxy::ProxyService;
 use crate::state::RuntimeConfigState;

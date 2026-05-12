@@ -46,8 +46,9 @@ pub use auth_sync_impl::{
 pub(crate) use auth_sync_impl::{infer_env_key_from_auth_json, read_file_if_exists};
 pub use bootstrap_impl::{
     import_codex_config_from_codex_cli, load_or_bootstrap_for_service,
-    load_or_bootstrap_from_claude, load_or_bootstrap_from_codex,
-    overwrite_codex_config_from_codex_cli_in_place, probe_codex_bootstrap_from_cli,
+    load_or_bootstrap_for_service_with_v4_source, load_or_bootstrap_from_claude,
+    load_or_bootstrap_from_codex, overwrite_codex_config_from_codex_cli_in_place,
+    probe_codex_bootstrap_from_cli,
 };
 pub(crate) use profiles_impl::validate_service_profiles;
 pub use profiles_impl::{
@@ -60,7 +61,8 @@ pub use retry_impl::{
 };
 pub use routing_impl::{RoutingCandidate, ServiceRoutingExplanation, explain_service_routing};
 pub use storage_impl::{
-    config_file_path, init_config_toml, load_config, save_config, save_config_v2, save_config_v4,
+    LoadedProxyConfig, config_file_path, init_config_toml, load_config, load_config_with_v4_source,
+    save_config, save_config_v2, save_config_v4,
 };
 pub use v2_impl::{
     build_persisted_provider_catalog, build_persisted_station_catalog, compact_v2_config,
@@ -82,8 +84,8 @@ use bootstrap_impl::bootstrap_from_codex;
 
 pub mod storage {
     pub use super::storage_impl::{
-        config_file_path, init_config_toml, load_config, save_config, save_config_v2,
-        save_config_v4,
+        LoadedProxyConfig, config_file_path, init_config_toml, load_config,
+        load_config_with_v4_source, save_config, save_config_v2, save_config_v4,
     };
 }
 

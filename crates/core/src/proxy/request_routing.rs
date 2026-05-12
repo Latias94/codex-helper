@@ -1,14 +1,22 @@
 use std::sync::Arc;
 
-use crate::config::{ProxyConfig, ServiceConfigManager};
+use crate::config::{ProxyConfig, ProxyConfigV4, ServiceConfig, ServiceConfigManager};
 use crate::lb::LoadBalancer;
 use crate::logging::log_retry_trace;
+use crate::routing_ir::{
+    RoutePlanTemplate, RouteRequestContext, compile_v4_route_plan_template_with_request,
+};
 
 use super::ProxyService;
 use super::routing_plan::{
     PinnedRoutingSelection, StationRoutingCandidate, StationRoutingMode,
     build_station_routing_plan, resolve_pinned_station_selection,
 };
+
+pub(super) struct RequestRouteSelection {
+    pub(super) lbs: Vec<LoadBalancer>,
+    pub(super) route_plan_template: Option<RoutePlanTemplate>,
+}
 
 fn station_candidate_json(candidate: &StationRoutingCandidate) -> serde_json::Value {
     serde_json::json!({
@@ -89,8 +97,10 @@ impl ProxyService {
     pub(super) async fn lbs_for_request(
         &self,
         cfg: &ProxyConfig,
+        v4: Option<&ProxyConfigV4>,
+        request: &RouteRequestContext,
         session_id: Option<&str>,
-    ) -> Vec<LoadBalancer> {
+    ) -> RequestRouteSelection {
         let mgr = self.service_manager(cfg);
         let meta_overrides = self
             .state
@@ -131,7 +141,7 @@ impl ProxyService {
                         "active_station": mgr.active.as_deref(),
                         "station_count": mgr.station_count(),
                     }));
-                    return Vec::new();
+                    return RequestRouteSelection::empty();
                 }
                 PinnedRoutingSelection::Missing => {
                     log_retry_trace(serde_json::json!({
@@ -146,7 +156,7 @@ impl ProxyService {
                         "station_count": mgr.station_count(),
                         "note": "pinned_station_missing_or_all_upstreams_filtered",
                     }));
-                    return Vec::new();
+                    return RequestRouteSelection::empty();
                 }
                 PinnedRoutingSelection::Selected(candidate) => {
                     log_retry_trace(serde_json::json!({
@@ -163,12 +173,18 @@ impl ProxyService {
                         "active_station": mgr.active.as_deref(),
                         "station_count": mgr.station_count(),
                     }));
-                    return vec![LoadBalancer::new(
+                    return RequestRouteSelection::legacy(vec![LoadBalancer::new(
                         Arc::new(candidate.service),
                         self.lb_states.clone(),
-                    )];
+                    )]);
                 }
             }
+        }
+
+        if let Some(v4) = v4
+            && let Some(selection) = self.v4_route_selection_for_request(v4, request)
+        {
+            return selection;
         }
 
         let plan = build_station_routing_plan(
@@ -269,7 +285,94 @@ impl ProxyService {
             .into_iter()
             .map(|candidate| LoadBalancer::new(Arc::new(candidate.service), self.lb_states.clone()))
             .collect::<Vec<_>>()
+            .into()
     }
+
+    pub(super) fn v4_route_selection_for_request(
+        &self,
+        v4: &ProxyConfigV4,
+        request: &RouteRequestContext,
+    ) -> Option<RequestRouteSelection> {
+        let view = match self.service_name {
+            "claude" => &v4.claude,
+            _ => &v4.codex,
+        };
+        let template =
+            match compile_v4_route_plan_template_with_request(self.service_name, view, request) {
+                Ok(template) => template,
+                Err(err) => {
+                    log_retry_trace(serde_json::json!({
+                        "event": "lbs_for_request",
+                        "service": self.service_name,
+                        "mode": "v4_route_plan_compile_error",
+                        "error": err.to_string(),
+                    }));
+                    return Some(RequestRouteSelection::empty());
+                }
+            };
+        let lbs = load_balancers_from_v4_route_template(&template, self.lb_states.clone());
+        log_retry_trace(serde_json::json!({
+            "event": "lbs_for_request",
+            "service": self.service_name,
+            "mode": "v4_route_plan_ir",
+            "entry": template.entry.as_str(),
+            "candidate_count": template.candidates.len(),
+            "station_count": lbs.len(),
+        }));
+        Some(RequestRouteSelection {
+            lbs,
+            route_plan_template: Some(template),
+        })
+    }
+}
+
+impl RequestRouteSelection {
+    fn empty() -> Self {
+        Self {
+            lbs: Vec::new(),
+            route_plan_template: None,
+        }
+    }
+
+    fn legacy(lbs: Vec<LoadBalancer>) -> Self {
+        Self {
+            lbs,
+            route_plan_template: None,
+        }
+    }
+}
+
+impl From<Vec<LoadBalancer>> for RequestRouteSelection {
+    fn from(lbs: Vec<LoadBalancer>) -> Self {
+        Self::legacy(lbs)
+    }
+}
+
+fn load_balancers_from_v4_route_template(
+    template: &RoutePlanTemplate,
+    lb_states: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::lb::LbState>>>,
+) -> Vec<LoadBalancer> {
+    if template.candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let station_name = template
+        .compatibility_station_name
+        .clone()
+        .unwrap_or_else(|| "routing".to_string());
+    let service = ServiceConfig {
+        name: station_name,
+        alias: Some("active routing".to_string()),
+        enabled: true,
+        level: 1,
+        upstreams: template
+            .candidates
+            .iter()
+            .map(|candidate| candidate.to_upstream_config())
+            .collect(),
+    };
+
+    vec![LoadBalancer::new(Arc::new(service), lb_states)]
 }
 
 #[cfg(test)]

@@ -111,14 +111,19 @@ Acceptance:
 Status note:
 
 - The P5 schema, IR compiler, and explain contract support are in place.
-  Production request routing still rejects `conditional` on the legacy
-  v4-to-v2 flattening path until P6 moves v4 execution onto request-aware route
-  plan IR.
+  P6 moved production request routing onto request-aware route plan IR for v4
+  source configs, so `conditional` can now drive request routing while the
+  flattened runtime view remains compatibility-only.
 
 ## P6 - Legacy Flattening Cleanup
 
 - [x] Move production request attempts from the legacy upstream selector loop to
   `RoutePlanExecutor` over compatibility route plans.
+- [x] Retain the loaded v4 route graph beside the compatibility runtime config.
+- [x] Compile v4 route plans with real request context before selecting
+  candidates.
+- [x] Keep the synthetic `routing` station as compatibility state only for v4
+  source configs.
 - [ ] Stop using v4-to-v2-to-runtime as the main v4 execution path.
 - [ ] Demote the synthetic `routing` station to compatibility only.
 - [ ] Remove v4-only UI and API assumptions that expose station concepts as the

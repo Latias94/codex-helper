@@ -6,10 +6,11 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 #[cfg(not(test))]
 use tracing::warn;
 
-use crate::config::ProxyConfig;
+use crate::config::{ProxyConfig, ProxyConfigV4};
 
 pub(super) struct RuntimeConfig {
     current: AsyncRwLock<Arc<ProxyConfig>>,
+    current_v4: AsyncRwLock<Option<Arc<ProxyConfigV4>>>,
     last_loaded_at_ms: AtomicU64,
     #[cfg_attr(test, allow(dead_code))]
     reload: AsyncMutex<RuntimeConfigReloadState>,
@@ -23,13 +24,17 @@ struct RuntimeConfigReloadState {
 }
 
 impl RuntimeConfig {
-    pub(super) fn new(initial: Arc<ProxyConfig>) -> Self {
+    pub(super) fn new_with_v4(
+        initial: Arc<ProxyConfig>,
+        initial_v4: Option<Arc<ProxyConfigV4>>,
+    ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         Self {
             current: AsyncRwLock::new(initial),
+            current_v4: AsyncRwLock::new(initial_v4),
             last_loaded_at_ms: AtomicU64::new(now),
             reload: AsyncMutex::new(RuntimeConfigReloadState {
                 last_check_at: Instant::now()
@@ -42,6 +47,10 @@ impl RuntimeConfig {
 
     pub(super) async fn snapshot(&self) -> Arc<ProxyConfig> {
         self.current.read().await.clone()
+    }
+
+    pub(super) async fn v4_snapshot(&self) -> Option<Arc<ProxyConfigV4>> {
+        self.current_v4.read().await.clone()
     }
 
     pub(super) fn last_loaded_at_ms(&self) -> u64 {
@@ -62,8 +71,9 @@ impl RuntimeConfig {
             .ok()
             .and_then(|m| m.modified().ok());
 
-        let cfg = crate::config::load_config().await?;
-        *self.current.write().await = Arc::new(cfg);
+        let loaded = crate::config::load_config_with_v4_source().await?;
+        *self.current.write().await = Arc::new(loaded.runtime);
+        *self.current_v4.write().await = loaded.v4.map(Arc::new);
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -105,9 +115,10 @@ impl RuntimeConfig {
         }
 
         let mut reloaded = false;
-        match crate::config::load_config().await {
-            Ok(cfg) => {
-                *self.current.write().await = Arc::new(cfg);
+        match crate::config::load_config_with_v4_source().await {
+            Ok(loaded) => {
+                *self.current.write().await = Arc::new(loaded.runtime);
+                *self.current_v4.write().await = loaded.v4.map(Arc::new);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)

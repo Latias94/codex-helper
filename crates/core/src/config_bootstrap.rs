@@ -390,6 +390,17 @@ pub async fn load_or_bootstrap_for_service(kind: ServiceKind) -> Result<ProxyCon
     }
 }
 
+pub async fn load_or_bootstrap_for_service_with_v4_source(
+    kind: ServiceKind,
+) -> Result<LoadedProxyConfig> {
+    let runtime = load_or_bootstrap_for_service(kind).await?;
+    let source = load_config_with_v4_source().await?;
+    Ok(LoadedProxyConfig {
+        runtime,
+        v4: source.v4,
+    })
+}
+
 /// Probe whether we can successfully bootstrap Codex upstreams from
 /// ~/.codex/config.toml and ~/.codex/auth.json without mutating any
 /// codex-helper configs. Intended for diagnostics (`codex-helper doctor`).

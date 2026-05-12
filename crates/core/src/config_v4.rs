@@ -237,9 +237,7 @@ fn expand_route_node(
             expand_tag_preferred_route(service_name, view, routing, route_name, node, stack)
         }
         RoutingPolicyV4::Conditional => {
-            anyhow::bail!(
-                "[{service_name}] conditional route '{route_name}' requires request-aware route execution and cannot be flattened to the legacy runtime path"
-            );
+            expand_conditional_route_compat(service_name, view, routing, route_name, node, stack)
         }
     };
     stack.pop();
@@ -325,6 +323,58 @@ fn expand_tag_preferred_route(
 
     preferred.extend(fallback);
     Ok(preferred)
+}
+
+fn expand_conditional_route_compat(
+    service_name: &str,
+    view: &ServiceViewV4,
+    routing: &RoutingConfigV4,
+    route_name: &str,
+    node: &RoutingNodeV4,
+    stack: &mut Vec<String>,
+) -> Result<Vec<String>> {
+    let condition = node.when.as_ref().with_context(|| {
+        format!("[{service_name}] conditional route '{route_name}' requires when")
+    })?;
+    if condition.is_empty() {
+        anyhow::bail!(
+            "[{service_name}] conditional route '{route_name}' requires at least one condition field"
+        );
+    }
+
+    let then = node
+        .then
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| {
+            format!("[{service_name}] conditional route '{route_name}' requires then")
+        })?;
+    let default_route = node
+        .default_route
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| {
+            format!("[{service_name}] conditional route '{route_name}' requires default")
+        })?;
+
+    let mut order = Vec::new();
+    order.extend(expand_route_ref(service_name, view, routing, then, stack)?);
+    order.extend(expand_route_ref(
+        service_name,
+        view,
+        routing,
+        default_route,
+        stack,
+    )?);
+    dedupe_preserving_order(&mut order);
+    Ok(order)
+}
+
+fn dedupe_preserving_order(values: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    values.retain(|value| seen.insert(value.clone()));
 }
 
 fn provider_matches_any_filter(

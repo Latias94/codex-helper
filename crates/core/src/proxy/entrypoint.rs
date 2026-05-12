@@ -29,6 +29,7 @@ pub async fn handle_proxy(
     let provider_chain_params = ExecuteProviderChainParams {
         proxy: &proxy,
         lbs: &prepared.lbs,
+        route_plan_template: prepared.route_plan_template.as_ref(),
         method: &prepared.method,
         uri: &prepared.uri,
         client_headers: &prepared.client_headers,

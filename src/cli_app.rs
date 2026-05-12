@@ -3,7 +3,8 @@ use crate::codex_integration;
 use crate::commands;
 use crate::config::{
     ServiceKind, claude_settings_backup_path, claude_settings_path, codex_config_path,
-    codex_switch_state_path, load_config, load_or_bootstrap_for_service, model_routing_warnings,
+    codex_switch_state_path, load_config, load_or_bootstrap_for_service_with_v4_source,
+    model_routing_warnings,
 };
 use crate::notify;
 use crate::proxy::{
@@ -300,11 +301,13 @@ async fn run_server(
         }
     }
 
-    let mut cfg = match service_name {
-        "codex" => load_or_bootstrap_for_service(ServiceKind::Codex).await?,
-        "claude" => load_or_bootstrap_for_service(ServiceKind::Claude).await?,
-        _ => load_or_bootstrap_for_service(ServiceKind::Codex).await?,
+    let loaded = match service_name {
+        "codex" => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?,
+        "claude" => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Claude).await?,
+        _ => load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex).await?,
     };
+    let mut cfg = loaded.runtime;
+    let v4_source = loaded.v4.map(Arc::new);
 
     let tui_lang = {
         if let Ok(s) = std::env::var("CODEX_HELPER_TUI_LANG") {
@@ -357,7 +360,13 @@ async fn run_server(
     let admin_addr = admin_loopback_addr_for_proxy_port(port);
 
     // Select service config based on service_name.
-    let proxy = ProxyService::new(client, cfg.clone(), service_name, lb_states.clone());
+    let proxy = ProxyService::new_with_v4_source(
+        client,
+        cfg.clone(),
+        v4_source,
+        service_name,
+        lb_states.clone(),
+    );
     let state = proxy.state_handle();
     let app: Router = proxy_only_router_with_admin_base_url(
         proxy.clone(),

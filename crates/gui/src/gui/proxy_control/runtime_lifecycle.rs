@@ -8,7 +8,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::{
-    ProxyConfig, ServiceKind, load_or_bootstrap_for_service, model_routing_warnings,
+    ProxyConfig, ServiceKind, load_or_bootstrap_for_service_with_v4_source, model_routing_warnings,
 };
 use crate::proxy::{
     ProxyService, admin_listener_router, admin_port_for_proxy_port, local_proxy_base_url,
@@ -168,7 +168,9 @@ impl ProxyController {
         };
 
         let task = async move {
-            let cfg = Arc::new(load_or_bootstrap_for_service(service).await?);
+            let loaded = load_or_bootstrap_for_service_with_v4_source(service).await?;
+            let v4_source = loaded.v4.map(Arc::new);
+            let cfg = Arc::new(loaded.runtime);
             let admin_port = admin_port_for_proxy_port(port);
 
             if service_name == "codex" {
@@ -194,7 +196,13 @@ impl ProxyController {
 
             let client = Client::builder().build()?;
             let lb_states = Arc::new(Mutex::new(std::collections::HashMap::new()));
-            let proxy = ProxyService::new(client, cfg.clone(), service_name, lb_states);
+            let proxy = ProxyService::new_with_v4_source(
+                client,
+                cfg.clone(),
+                v4_source,
+                service_name,
+                lb_states,
+            );
             let state = proxy.state_handle();
             let app = proxy_only_router_with_admin_base_url(
                 proxy.clone(),

@@ -50,6 +50,12 @@ pub fn config_file_path() -> PathBuf {
 
 const CONFIG_VERSION: u32 = 4;
 
+#[derive(Debug, Clone)]
+pub struct LoadedProxyConfig {
+    pub runtime: ProxyConfig,
+    pub v4: Option<ProxyConfigV4>,
+}
+
 fn ensure_config_version(cfg: &mut ProxyConfig) {
     if cfg.version.is_none() {
         cfg.version = Some(CONFIG_VERSION);
@@ -351,6 +357,10 @@ pub async fn init_config_toml(force: bool, import_codex: bool) -> Result<PathBuf
 }
 
 pub async fn load_config() -> Result<ProxyConfig> {
+    Ok(load_config_with_v4_source().await?.runtime)
+}
+
+pub async fn load_config_with_v4_source() -> Result<LoadedProxyConfig> {
     let toml_path = config_toml_path();
     if toml_path.exists() {
         let text = fs::read_to_string(&toml_path).await?;
@@ -387,7 +397,10 @@ pub async fn load_config() -> Result<ProxyConfig> {
         } else if let Some(cfg_v4) = loaded_v4.as_ref() {
             auto_compact_loaded_v4_config(cfg_v4, "config.toml").await;
         }
-        return Ok(cfg);
+        return Ok(LoadedProxyConfig {
+            runtime: cfg,
+            v4: loaded_v4,
+        });
     }
 
     let json_path = config_path();
@@ -399,14 +412,20 @@ pub async fn load_config() -> Result<ProxyConfig> {
         normalize_proxy_config(&mut cfg);
         validate_proxy_config(&cfg)?;
         auto_migrate_loaded_config(&mut cfg, "config.json", version).await;
-        return Ok(cfg);
+        return Ok(LoadedProxyConfig {
+            runtime: cfg,
+            v4: None,
+        });
     }
 
     let mut cfg = ProxyConfig::default();
     ensure_config_version(&mut cfg);
     normalize_proxy_config(&mut cfg);
     validate_proxy_config(&cfg)?;
-    Ok(cfg)
+    Ok(LoadedProxyConfig {
+        runtime: cfg,
+        v4: None,
+    })
 }
 
 async fn auto_migrate_loaded_config(

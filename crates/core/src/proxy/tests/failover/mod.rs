@@ -205,6 +205,144 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
 }
 
 #[tokio::test]
+async fn proxy_v4_conditional_routing_selects_branch_by_request_model() {
+    let small_hits = Arc::new(AtomicUsize::new(0));
+    let large_hits = Arc::new(AtomicUsize::new(0));
+
+    let small_counter = small_hits.clone();
+    let small = axum::Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            small_counter.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "provider": "small" })),
+            )
+        }),
+    );
+    let (small_addr, small_handle) = spawn_axum_server(small);
+
+    let large_counter = large_hits.clone();
+    let large = axum::Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            large_counter.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "provider": "large" })),
+            )
+        }),
+    );
+    let (large_addr, large_handle) = spawn_axum_server(large);
+
+    let v4 = ProxyConfigV4 {
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "small".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{}/v1", small_addr)),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "large".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{}/v1", large_addr)),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: std::collections::BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::Conditional,
+                        when: Some(RoutingConditionV4 {
+                            model: Some("gpt-5".to_string()),
+                            ..RoutingConditionV4::default()
+                        }),
+                        then: Some("large".to_string()),
+                        default_route: Some("small".to_string()),
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compat runtime");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let large_resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send large branch")
+        .error_for_status()
+        .expect("large branch status")
+        .text()
+        .await
+        .expect("large branch body");
+    assert!(large_resp.contains(r#""provider":"large"#));
+
+    let small_resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4.1","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send small branch")
+        .error_for_status()
+        .expect("small branch status")
+        .text()
+        .await
+        .expect("small branch body");
+    assert!(small_resp.contains(r#""provider":"small"#));
+
+    assert_eq!(large_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(small_hits.load(Ordering::SeqCst), 1);
+
+    let finished = state.list_recent_finished(10).await;
+    let route_paths = finished
+        .iter()
+        .filter_map(|request| request.route_decision.as_ref())
+        .map(|decision| decision.route_path.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        route_paths
+            .iter()
+            .any(|path| path == &vec!["root", "large"])
+    );
+    assert!(
+        route_paths
+            .iter()
+            .any(|path| path == &vec!["root", "small"])
+    );
+
+    proxy_handle.abort();
+    small_handle.abort();
+    large_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_same_upstream_retries_502_then_succeeds_without_failover() {
     let upstream1_hits = Arc::new(AtomicUsize::new(0));
     let upstream2_hits = Arc::new(AtomicUsize::new(0));
