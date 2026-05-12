@@ -29,7 +29,7 @@ use super::provider_orchestration::{
 use super::request_preparation::RequestFlavor;
 use super::retry::{RetryPlan, backoff_sleep};
 use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
-use super::route_executor_runtime::route_plan_runtime_state_from_lbs;
+use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
 
 pub(super) struct ExecuteProviderChainParams<'a> {
     pub(super) proxy: &'a ProxyService,
@@ -181,7 +181,11 @@ pub(super) async fn execute_provider_chain_with_route_executor(
         &legacy_template
     };
     let executor = RoutePlanExecutor::new(&template);
-    let runtime = route_plan_runtime_state_from_lbs(lbs);
+    let upstream_overrides = proxy
+        .state
+        .get_upstream_meta_overrides(proxy.service_name)
+        .await;
+    let runtime = route_plan_runtime_state_from_lbs_with_overrides(lbs, &upstream_overrides);
     let mut route_state = RoutePlanAttemptState::default();
     let mut upstream_chain: Vec<String> = Vec::new();
     let mut route_attempts: Vec<RouteAttemptLog> = Vec::new();

@@ -1,4 +1,7 @@
 use super::*;
+use std::collections::BTreeMap;
+
+use crate::config::ProviderEndpointV4;
 use crate::state::FinishRequestParams;
 
 #[tokio::test]
@@ -817,6 +820,209 @@ async fn proxy_api_v1_provider_runtime_override_filters_real_routing() {
         .json::<serde_json::Value>()
         .await
         .expect("routed request after runtime override json");
+    assert_eq!(
+        after.get("id").and_then(|value| value.as_str()),
+        Some("resp-backup")
+    );
+
+    proxy_handle.abort();
+    default_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() {
+    let _env_lock = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+
+    let upstream_default = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": "resp-default",
+                    "output": [],
+                })),
+            )
+        }),
+    );
+    let upstream_backup = axum::Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": "resp-backup",
+                    "output": [],
+                })),
+            )
+        }),
+    );
+    let (default_addr, default_handle) = spawn_axum_server(upstream_default);
+    let (backup_addr, backup_handle) = spawn_axum_server(upstream_backup);
+
+    let cfg = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "alpha".to_string(),
+                ProviderConfigV4 {
+                    endpoints: BTreeMap::from([
+                        (
+                            "default".to_string(),
+                            ProviderEndpointV4 {
+                                base_url: format!("http://{default_addr}/v1"),
+                                enabled: true,
+                                priority: 0,
+                                tags: BTreeMap::new(),
+                                supported_models: BTreeMap::new(),
+                                model_mapping: BTreeMap::new(),
+                            },
+                        ),
+                        (
+                            "backup".to_string(),
+                            ProviderEndpointV4 {
+                                base_url: format!("http://{backup_addr}/v1"),
+                                enabled: true,
+                                priority: 1,
+                                tags: BTreeMap::new(),
+                                supported_models: BTreeMap::new(),
+                                model_mapping: BTreeMap::new(),
+                            },
+                        ),
+                    ]),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec!["alpha".to_string()])),
+            ..ServiceViewV4::default()
+        },
+        claude: ServiceViewV4::default(),
+        retry: RetryConfig::default(),
+        notify: Default::default(),
+        default_service: None,
+        ui: UiConfig::default(),
+    };
+
+    crate::config::save_config_v4(&cfg)
+        .await
+        .expect("write provider runtime v4 config");
+    let loaded = crate::config::load_config_with_v4_source()
+        .await
+        .expect("load provider runtime v4 config");
+
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(loaded.runtime),
+        loaded.v4.map(Arc::new),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let initial = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"input":"hello"}"#)
+        .send()
+        .await
+        .expect("initial v4 routed request")
+        .error_for_status()
+        .expect("initial v4 routed request status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("initial v4 routed request json");
+    assert_eq!(
+        initial.get("id").and_then(|value| value.as_str()),
+        Some("resp-default")
+    );
+
+    let initial_provider_surface = client
+        .get(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/providers"
+        ))
+        .send()
+        .await
+        .expect("get v4 providers send")
+        .error_for_status()
+        .expect("get v4 providers status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v4 providers json");
+    let provider_name = initial_provider_surface[0]
+        .get("name")
+        .and_then(|value| value.as_str())
+        .expect("provider name")
+        .to_string();
+    let default_base_url = format!("http://{default_addr}/v1");
+    let default_endpoint_name = initial_provider_surface[0]["endpoints"]
+        .as_array()
+        .and_then(|endpoints| {
+            endpoints.iter().find_map(|endpoint| {
+                (endpoint.get("base_url").and_then(|value| value.as_str())
+                    == Some(default_base_url.as_str()))
+                .then(|| endpoint.get("name").and_then(|value| value.as_str()))
+                .flatten()
+            })
+        })
+        .expect("default endpoint name")
+        .to_string();
+
+    let update = client
+        .post(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/providers/runtime"
+        ))
+        .json(&serde_json::json!({
+            "provider_name": provider_name,
+            "endpoint_name": default_endpoint_name,
+            "enabled": false,
+            "runtime_state": "breaker_open"
+        }))
+        .send()
+        .await
+        .expect("apply v4 provider runtime override send");
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let explain = client
+        .get(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/routing/explain"
+        ))
+        .send()
+        .await
+        .expect("v4 routing explain send")
+        .error_for_status()
+        .expect("v4 routing explain status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("v4 routing explain json");
+    assert_eq!(
+        explain["selected_route"]["endpoint_id"].as_str(),
+        Some("backup")
+    );
+    assert_eq!(
+        explain["candidates"][0]["skip_reasons"][0]["code"].as_str(),
+        Some("runtime_disabled")
+    );
+
+    let after = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"input":"hello again"}"#)
+        .send()
+        .await
+        .expect("v4 routed request after runtime override")
+        .error_for_status()
+        .expect("v4 routed request after runtime override status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("v4 routed request after runtime override json");
     assert_eq!(
         after.get("id").and_then(|value| value.as_str()),
         Some("resp-backup")
