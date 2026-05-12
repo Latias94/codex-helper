@@ -61,6 +61,10 @@ After executor parity is proven, remove or demote these to compatibility code:
 - any v4-only UI label that makes users edit station concepts instead of route
   nodes and provider leaves.
 
+P6 status: v4 runtime compatibility config is now compiled directly from
+`ProxyConfigV4`; `compile_v4_to_v2` remains for migration and compatibility
+tooling, not as the main v4 runtime compiler.
+
 ## Compatibility Rules
 
 - Existing v4 configs must keep loading.

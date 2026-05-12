@@ -125,6 +125,124 @@ fn provider_v4_to_v2(
     })
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeProviderEndpointV4 {
+    name: String,
+    base_url: String,
+    enabled: bool,
+    priority: u32,
+    tags: BTreeMap<String, String>,
+    supported_models: BTreeMap<String, bool>,
+    model_mapping: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeProviderV4 {
+    enabled: bool,
+    auth: UpstreamAuth,
+    tags: BTreeMap<String, String>,
+    supported_models: BTreeMap<String, bool>,
+    model_mapping: BTreeMap<String, String>,
+    endpoints: Vec<RuntimeProviderEndpointV4>,
+}
+
+fn merge_runtime_string_maps(
+    provider_values: &BTreeMap<String, String>,
+    endpoint_values: &BTreeMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = provider_values
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    for (key, value) in endpoint_values {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
+}
+
+fn merge_runtime_bool_maps(
+    provider_values: &BTreeMap<String, bool>,
+    endpoint_values: &BTreeMap<String, bool>,
+) -> HashMap<String, bool> {
+    let mut merged = provider_values
+        .iter()
+        .map(|(key, value)| (key.clone(), *value))
+        .collect::<HashMap<_, _>>();
+    for (key, value) in endpoint_values {
+        merged.insert(key.clone(), *value);
+    }
+    merged
+}
+
+fn normalize_runtime_provider_v4(
+    service_name: &str,
+    provider_name: &str,
+    provider: &ProviderConfigV4,
+) -> Result<RuntimeProviderV4> {
+    let mut endpoints = Vec::new();
+    if let Some(base_url) = provider
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if provider.endpoints.contains_key("default") {
+            anyhow::bail!(
+                "[{service_name}] provider '{provider_name}' cannot define both base_url and endpoints.default"
+            );
+        }
+        endpoints.push(RuntimeProviderEndpointV4 {
+            name: "default".to_string(),
+            base_url: base_url.to_string(),
+            enabled: true,
+            priority: default_provider_endpoint_priority(),
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
+        });
+    }
+
+    for (endpoint_name, endpoint) in &provider.endpoints {
+        if endpoint.base_url.trim().is_empty() {
+            anyhow::bail!(
+                "[{service_name}] provider '{provider_name}' endpoint '{endpoint_name}' has an empty base_url"
+            );
+        }
+        endpoints.push(RuntimeProviderEndpointV4 {
+            name: endpoint_name.clone(),
+            base_url: endpoint.base_url.trim().to_string(),
+            enabled: endpoint.enabled,
+            priority: endpoint.priority,
+            tags: endpoint.tags.clone(),
+            supported_models: endpoint.supported_models.clone(),
+            model_mapping: endpoint.model_mapping.clone(),
+        });
+    }
+
+    if endpoints.is_empty() {
+        anyhow::bail!("[{service_name}] provider '{provider_name}' has no base_url or endpoints");
+    }
+
+    endpoints.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.base_url.cmp(&right.base_url))
+    });
+
+    let mut tags = provider.tags.clone();
+    tags.insert("provider_id".to_string(), provider_name.to_string());
+
+    Ok(RuntimeProviderV4 {
+        enabled: provider.enabled,
+        auth: merge_auth(&provider.auth, &provider.inline_auth),
+        tags,
+        supported_models: provider.supported_models.clone(),
+        model_mapping: provider.model_mapping.clone(),
+        endpoints,
+    })
+}
+
 fn provider_order_from_routing(
     service_name: &str,
     view: &ServiceViewV4,
@@ -459,6 +577,80 @@ fn compile_service_view_v4(service_name: &str, view: &ServiceViewV4) -> Result<S
     })
 }
 
+fn compile_service_view_v4_runtime(
+    service_name: &str,
+    view: &ServiceViewV4,
+) -> Result<ServiceConfigManager> {
+    let providers = view
+        .providers
+        .iter()
+        .map(|(provider_name, provider)| {
+            normalize_runtime_provider_v4(service_name, provider_name, provider)
+                .map(|provider| (provider_name.clone(), provider))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    let route_order = resolved_v4_provider_order(service_name, view)?;
+    let mut configs = HashMap::new();
+    if !route_order.is_empty() {
+        let mut upstreams = Vec::new();
+        for provider_name in &route_order {
+            let provider = providers.get(provider_name.as_str()).with_context(|| {
+                format!(
+                    "[{service_name}] route references missing provider '{}'",
+                    provider_name
+                )
+            })?;
+            if !provider.enabled {
+                continue;
+            }
+
+            for endpoint in &provider.endpoints {
+                if !endpoint.enabled {
+                    continue;
+                }
+                upstreams.push(UpstreamConfig {
+                    base_url: endpoint.base_url.clone(),
+                    auth: provider.auth.clone(),
+                    tags: merge_runtime_string_maps(&provider.tags, &endpoint.tags),
+                    supported_models: merge_runtime_bool_maps(
+                        &provider.supported_models,
+                        &endpoint.supported_models,
+                    ),
+                    model_mapping: merge_runtime_string_maps(
+                        &provider.model_mapping,
+                        &endpoint.model_mapping,
+                    ),
+                });
+            }
+        }
+
+        configs.insert(
+            ROUTING_STATION_NAME.to_string(),
+            ServiceConfig {
+                name: ROUTING_STATION_NAME.to_string(),
+                alias: Some("active routing".to_string()),
+                enabled: true,
+                level: default_service_config_level(),
+                upstreams,
+            },
+        );
+    }
+
+    let mgr = ServiceConfigManager {
+        active: if configs.is_empty() {
+            None
+        } else {
+            Some(ROUTING_STATION_NAME.to_string())
+        },
+        default_profile: view.default_profile.clone(),
+        profiles: view.profiles.clone(),
+        configs,
+    };
+    validate_service_profiles(service_name, &mgr)?;
+    Ok(mgr)
+}
+
 pub fn compile_v4_to_v2(v4: &ProxyConfigV4) -> Result<ProxyConfigV2> {
     if v4.version != 4 {
         anyhow::bail!("unsupported v4 config version: {}", v4.version);
@@ -476,10 +668,19 @@ pub fn compile_v4_to_v2(v4: &ProxyConfigV4) -> Result<ProxyConfigV2> {
 }
 
 pub fn compile_v4_to_runtime(v4: &ProxyConfigV4) -> Result<ProxyConfig> {
-    let v2 = compile_v4_to_v2(v4)?;
-    let mut runtime = compile_v2_to_runtime(&v2)?;
-    runtime.version = Some(4);
-    Ok(runtime)
+    if v4.version != 4 {
+        anyhow::bail!("unsupported v4 config version: {}", v4.version);
+    }
+
+    Ok(ProxyConfig {
+        version: Some(v4.version),
+        codex: compile_service_view_v4_runtime("codex", &v4.codex)?,
+        claude: compile_service_view_v4_runtime("claude", &v4.claude)?,
+        retry: v4.retry.clone(),
+        notify: v4.notify.clone(),
+        default_service: v4.default_service,
+        ui: v4.ui.clone(),
+    })
 }
 
 fn endpoint_v2_to_v4(endpoint: &ProviderEndpointV2) -> ProviderEndpointV4 {

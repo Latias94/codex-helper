@@ -1,8 +1,8 @@
 # Design: Codex Routing Runtime IR
 
-## Current Runtime Shape
+## Runtime Shape
 
-The current v4 path is:
+Before P6, the persisted v4 path was:
 
 1. `ServiceViewV4` stores providers and route nodes.
 2. `resolved_v4_provider_order` expands the route graph into a flat provider
@@ -17,6 +17,17 @@ The current v4 path is:
 This works, but the route graph is gone before request execution. The runtime
 sees stations and upstreams, not route nodes, provider leaves, and endpoint
 candidates.
+
+The P6 runtime path is now:
+
+1. load the v4 config as a sidecar next to a runtime compatibility config;
+2. compile v4 directly into a compatibility `ProxyConfig` for legacy state,
+   admin, and UI surfaces, without using the v2 bridge as the main compiler;
+3. for non-pinned v4 requests, compile a request-aware `RoutePlanTemplate` from
+   the preserved v4 graph;
+4. execute attempts through `RoutePlanExecutor`;
+5. keep the synthetic `routing` station only as compatibility state while older
+   station-oriented surfaces are migrated.
 
 ## Target Runtime Vocabulary
 
@@ -321,9 +332,10 @@ P5 extends that response with additive fields:
 - `conditional_routes` for each evaluated conditional node, including condition
   fields, header names, match result, selected branch, and selected target.
 
-The legacy v4-to-v2 runtime path still cannot execute conditional nodes. Until
-P6 moves v4 execution onto request-aware route plan IR, production config
-flattening rejects `conditional` instead of silently guessing a branch.
+P6 keeps v4 source configs beside the compatibility runtime config, so
+conditional nodes can drive production request routing through request-aware IR.
+The flattened `routing` station includes all possible conditional branch
+candidates only for compatibility state and older surfaces.
 
 ## Testing Strategy
 

@@ -215,6 +215,136 @@ fn v4_nested_route_graph_expands_monthly_pool_before_paygo() {
 }
 
 #[test]
+fn compile_v4_to_runtime_direct_path_matches_v2_bridge_for_compat_state() {
+    let v4 = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
+            default_profile: Some("daily".to_string()),
+            profiles: BTreeMap::from([(
+                "daily".to_string(),
+                ServiceControlProfile {
+                    reasoning_effort: Some("medium".to_string()),
+                    ..ServiceControlProfile::default()
+                },
+            )]),
+            providers: BTreeMap::from([
+                (
+                    "input".to_string(),
+                    ProviderConfigV4 {
+                        inline_auth: UpstreamAuth {
+                            auth_token_env: Some("INPUT_API_KEY".to_string()),
+                            ..UpstreamAuth::default()
+                        },
+                        tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                        supported_models: BTreeMap::from([("gpt-5".to_string(), true)]),
+                        endpoints: BTreeMap::from([
+                            (
+                                "slow".to_string(),
+                                ProviderEndpointV4 {
+                                    base_url: "https://slow.example.com/v1".to_string(),
+                                    enabled: true,
+                                    priority: 10,
+                                    tags: BTreeMap::from([(
+                                        "region".to_string(),
+                                        "us".to_string(),
+                                    )]),
+                                    supported_models: BTreeMap::new(),
+                                    model_mapping: BTreeMap::new(),
+                                },
+                            ),
+                            (
+                                "fast".to_string(),
+                                ProviderEndpointV4 {
+                                    base_url: "https://fast.example.com/v1".to_string(),
+                                    enabled: true,
+                                    priority: 0,
+                                    tags: BTreeMap::from([(
+                                        "region".to_string(),
+                                        "hk".to_string(),
+                                    )]),
+                                    supported_models: BTreeMap::new(),
+                                    model_mapping: BTreeMap::from([(
+                                        "gpt-5".to_string(),
+                                        "provider-gpt-5".to_string(),
+                                    )]),
+                                },
+                            ),
+                        ]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "disabled".to_string(),
+                    ProviderConfigV4 {
+                        enabled: false,
+                        base_url: Some("https://disabled.example.com/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "paygo".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://paygo.example.com/v1".to_string()),
+                        tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "input".to_string(),
+                "disabled".to_string(),
+                "paygo".to_string(),
+            ])),
+        },
+        claude: ServiceViewV4::default(),
+        retry: RetryConfig::default(),
+        notify: NotifyConfig::default(),
+        default_service: Some(ServiceKind::Codex),
+        ui: UiConfig::default(),
+    };
+
+    let direct = compile_v4_to_runtime(&v4).expect("compile direct v4 runtime");
+    let bridge_v2 = compile_v4_to_v2(&v4).expect("compile v4 bridge v2");
+    let mut bridge = compile_v2_to_runtime(&bridge_v2).expect("compile bridge runtime");
+    bridge.version = Some(4);
+
+    assert_eq!(
+        serde_json::to_value(&direct).expect("serialize direct runtime"),
+        serde_json::to_value(&bridge).expect("serialize bridge runtime")
+    );
+    let routing = direct
+        .codex
+        .station("routing")
+        .expect("routing station should exist");
+    assert_eq!(
+        routing
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.base_url.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "https://fast.example.com/v1",
+            "https://slow.example.com/v1",
+            "https://paygo.example.com/v1",
+        ]
+    );
+    assert_eq!(
+        routing.upstreams[0]
+            .tags
+            .get("provider_id")
+            .map(String::as_str),
+        Some("input")
+    );
+    assert_eq!(
+        routing.upstreams[0]
+            .model_mapping
+            .get("gpt-5")
+            .map(String::as_str),
+        Some("provider-gpt-5")
+    );
+}
+
+#[test]
 fn v4_route_graph_rejects_cycles() {
     let v4 = ProxyConfigV4 {
         version: 4,

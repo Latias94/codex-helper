@@ -124,7 +124,7 @@ Status note:
   candidates.
 - [x] Keep the synthetic `routing` station as compatibility state only for v4
   source configs.
-- [ ] Stop using v4-to-v2-to-runtime as the main v4 execution path.
+- [x] Stop using v4-to-v2-to-runtime as the main v4 execution path.
 - [ ] Demote the synthetic `routing` station to compatibility only.
 - [ ] Remove v4-only UI and API assumptions that expose station concepts as the
   main provider routing model.
@@ -135,6 +135,12 @@ Acceptance:
 - v4 runtime execution uses route plan IR directly;
 - legacy configs still have a documented compatibility path;
 - route graph, runtime execution, and explain output describe the same plan.
+
+Status note:
+
+- v4 source configs now use a direct v4-to-runtime compatibility compiler for
+  the synthetic `routing` station. The v2 bridge remains for migrations and
+  compatibility tooling, not for the main v4 runtime compiler.
 
 ## Done When
 
