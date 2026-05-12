@@ -418,6 +418,10 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
         Some(true)
     );
     assert_eq!(
+        capabilities["surface_capabilities"]["routing_explain"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
         capabilities["surface_capabilities"]["station_specs"].as_bool(),
         Some(false)
     );

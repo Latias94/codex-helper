@@ -189,6 +189,8 @@ pub struct OperatorSummaryLinks {
     pub global_station_override: String,
     #[serde(default)]
     pub routing: String,
+    #[serde(default)]
+    pub routing_explain: String,
     pub stations: String,
     pub station_by_name_template: String,
     pub station_specs: String,

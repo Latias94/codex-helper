@@ -117,6 +117,32 @@ pub(super) fn control_trace_summary(entry: &ControlTraceLogEntry, lang: Language
                 base_urls.len()
             )
         }
+        Some(ControlTraceDetail::RouteExecutorShadowMismatch {
+            request_model,
+            legacy_attempt_count,
+            executor_attempt_count,
+            first_mismatch_index,
+            legacy_station_name,
+            executor_station_name,
+            ..
+        }) => {
+            let model = request_model.unwrap_or_else(|| "-".to_string());
+            let mismatch = first_mismatch_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let legacy_station = legacy_station_name.unwrap_or_else(|| "-".to_string());
+            let executor_station = executor_station_name.unwrap_or_else(|| "-".to_string());
+            format!(
+                "{} model={} mismatch={} legacy_attempts={} executor_attempts={} legacy_station={} executor_station={}",
+                pick(lang, "路由执行器影子差异", "Route executor shadow mismatch"),
+                model,
+                mismatch,
+                legacy_attempt_count,
+                executor_attempt_count,
+                legacy_station,
+                executor_station
+            )
+        }
         Some(ControlTraceDetail::RetryEvent {
             event_name,
             station_name,

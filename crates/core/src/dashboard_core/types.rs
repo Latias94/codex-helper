@@ -67,6 +67,8 @@ pub struct ControlPlaneSurfaceCapabilities {
     #[serde(default)]
     pub routing: bool,
     #[serde(default)]
+    pub routing_explain: bool,
+    #[serde(default)]
     pub stations: bool,
     #[serde(default)]
     pub station_runtime: bool,

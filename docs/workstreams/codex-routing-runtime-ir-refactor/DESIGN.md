@@ -301,6 +301,11 @@ The eventual `routing explain` and admin APIs should be able to return:
 
 Phase 1 only needs enough inspectability to prove parity.
 
+The first stable runtime admin surface is
+`GET /__codex_helper/api/v1/routing/explain`. It returns the selected route,
+all current runtime candidates, `route_path`, `endpoint_id`, and structured
+`skip_reasons` objects tagged by `code`.
+
 ## Testing Strategy
 
 Phase 1 tests should cover:

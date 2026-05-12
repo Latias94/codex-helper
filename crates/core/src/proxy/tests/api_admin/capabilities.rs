@@ -123,6 +123,11 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
         items
             .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/routing/explain"))
+    }));
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
             .any(|item| item.as_str() == Some("/__codex_helper/api/v1/stations/{name}"))
     }));
     assert!(caps["endpoints"].as_array().is_some_and(|items| {
@@ -221,6 +226,10 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
     );
     assert_eq!(
         caps["surface_capabilities"]["routing"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        caps["surface_capabilities"]["routing_explain"].as_bool(),
         Some(true)
     );
     assert_eq!(

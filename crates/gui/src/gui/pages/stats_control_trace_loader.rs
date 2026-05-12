@@ -201,6 +201,9 @@ fn resolved_control_trace_event(entry: &ControlTraceLogEntry) -> Option<String> 
             ControlTraceDetail::ProviderRuntimeOverride { .. } => {
                 "provider_runtime_override".to_string()
             }
+            ControlTraceDetail::RouteExecutorShadowMismatch { .. } => {
+                "route_executor_shadow_mismatch".to_string()
+            }
             ControlTraceDetail::RetryEvent { event_name, .. } => event_name,
         })
     })

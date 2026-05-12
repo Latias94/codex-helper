@@ -21,6 +21,7 @@ pub(super) const API_V1_CONTROL_TRACE: &str = "/__codex_helper/api/v1/control-tr
 pub(super) const API_V1_RETRY_CONFIG: &str = "/__codex_helper/api/v1/retry/config";
 pub(super) const API_V1_PRICING_CATALOG: &str = "/__codex_helper/api/v1/pricing/catalog";
 pub(super) const API_V1_ROUTING: &str = "/__codex_helper/api/v1/routing";
+pub(super) const API_V1_ROUTING_EXPLAIN: &str = "/__codex_helper/api/v1/routing/explain";
 pub(super) const API_V1_STATIONS: &str = "/__codex_helper/api/v1/stations";
 pub(super) const API_V1_STATIONS_RUNTIME: &str = "/__codex_helper/api/v1/stations/runtime";
 pub(super) const API_V1_STATIONS_ACTIVE: &str = "/__codex_helper/api/v1/stations/active";
@@ -77,6 +78,7 @@ const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_RETRY_CONFIG,
     API_V1_PRICING_CATALOG,
     API_V1_ROUTING,
+    API_V1_ROUTING_EXPLAIN,
     API_V1_STATIONS,
     API_V1_STATIONS_RUNTIME,
     API_V1_STATIONS_ACTIVE,
@@ -130,6 +132,7 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
         retry_config: true,
         pricing_catalog: true,
         routing: true,
+        routing_explain: true,
         stations: true,
         station_runtime: true,
         station_persisted_settings: true,
@@ -172,6 +175,7 @@ pub(super) fn api_v1_operator_summary_links() -> OperatorSummaryLinks {
         retry_config: API_V1_RETRY_CONFIG.to_string(),
         pricing_catalog: API_V1_PRICING_CATALOG.to_string(),
         routing: API_V1_ROUTING.to_string(),
+        routing_explain: API_V1_ROUTING_EXPLAIN.to_string(),
         sessions: API_V1_SESSIONS.to_string(),
         session_by_id_template: API_V1_SESSION_BY_ID.to_string(),
         session_overrides: API_V1_SESSION_OVERRIDES.to_string(),
@@ -211,5 +215,6 @@ mod tests {
     #[test]
     fn api_v1_endpoint_paths_include_routing_surface() {
         assert!(API_V1_ENDPOINT_PATHS.contains(&super::API_V1_ROUTING));
+        assert!(API_V1_ENDPOINT_PATHS.contains(&super::API_V1_ROUTING_EXPLAIN));
     }
 }
