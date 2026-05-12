@@ -1,4 +1,5 @@
 use super::*;
+use crate::routing_explain::RoutingExplainResponse;
 
 pub(super) fn render_running_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     let Some(running) = ctx.proxy.running() else {
@@ -50,13 +51,24 @@ pub(super) fn render_running_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<
             .active_station()
             .map(|config| config.name.clone()),
     };
+    if let Some(routing_explain) = running.routing_explain.as_ref()
+        && let Some(summary) = format_running_route_summary(routing_explain)
+    {
+        ui.small(format!(
+            "{}: {summary}",
+            pick(ctx.lang, "当前路由", "Current route")
+        ));
+    }
     let active_display = active_name
-        .clone()
-        .or(active_fallback.clone())
+        .or(active_fallback)
         .unwrap_or_else(|| "-".to_string());
     ui.label(format!(
         "{}: {}",
-        pick(ctx.lang, "当前站点(active)", "Active station"),
+        pick(
+            ctx.lang,
+            "配置 active_station(兼容)",
+            "Configured active_station (compat)"
+        ),
         active_display
     ));
 
@@ -95,5 +107,66 @@ pub(super) fn render_running_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<
                     ui.colored_label(egui::Color32::from_rgb(200, 120, 40), warning);
                 }
             });
+    }
+}
+
+fn format_running_route_summary(explain: &RoutingExplainResponse) -> Option<String> {
+    let selected = explain.selected_route.as_ref()?;
+    let path = if selected.route_path.is_empty() {
+        "-".to_string()
+    } else {
+        selected.route_path.join(" > ")
+    };
+    let compat_station = if selected.compatibility.station_name.is_empty() {
+        "-"
+    } else {
+        selected.compatibility.station_name.as_str()
+    };
+    Some(format!(
+        "provider={}/{} path={} compat_station={}",
+        selected.provider_id.as_str(),
+        selected.endpoint_id.as_str(),
+        path,
+        compat_station
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_running_route_summary_prefers_provider_endpoint_identity() {
+        let explain = RoutingExplainResponse {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            runtime_loaded_at_ms: Some(123),
+            request_model: Some("gpt-5.4".to_string()),
+            session_id: Some("sid-1".to_string()),
+            request_context: Default::default(),
+            selected_route: Some(crate::routing_explain::RoutingExplainCandidate {
+                provider_id: "alpha".to_string(),
+                provider_alias: Some("Alpha".to_string()),
+                endpoint_id: "default".to_string(),
+                route_path: vec!["entry".to_string(), "alpha".to_string()],
+                compatibility: crate::routing_explain::RoutingExplainCompatibility {
+                    station_name: "routing".to_string(),
+                    upstream_index: 0,
+                },
+                station_name: "routing".to_string(),
+                upstream_index: 0,
+                upstream_base_url: "https://alpha.example/v1".to_string(),
+                selected: true,
+                skip_reasons: Vec::new(),
+            }),
+            candidates: Vec::new(),
+            conditional_routes: Vec::new(),
+        };
+
+        let summary = format_running_route_summary(&explain).expect("route summary");
+
+        assert!(summary.contains("provider=alpha/default"));
+        assert!(summary.contains("path=entry > alpha"));
+        assert!(summary.contains("compat_station=routing"));
     }
 }
