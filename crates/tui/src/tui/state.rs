@@ -3,6 +3,7 @@ use ratatui::widgets::{ListState, TableState};
 use crate::config::ResolvedRetryConfig;
 use crate::dashboard_core::ControlProfileOption;
 use crate::proxy::admin_port_for_proxy_port;
+use crate::routing_explain::RoutingExplainResponse;
 use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
 };
@@ -63,6 +64,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) provider_menu_idx: usize,
     pub(in crate::tui) routing_menu_idx: usize,
     pub(in crate::tui) routing_spec: Option<RoutingSpecView>,
+    pub(in crate::tui) routing_explain: Option<RoutingExplainResponse>,
     pub(in crate::tui) last_routing_control_refresh_at: Option<std::time::Instant>,
     pub(in crate::tui) session_model_options: Vec<String>,
     pub(in crate::tui) session_model_input: String,
@@ -154,6 +156,7 @@ impl Default for UiState {
             provider_menu_idx: 0,
             routing_menu_idx: 0,
             routing_spec: None,
+            routing_explain: None,
             last_routing_control_refresh_at: None,
             session_model_options: Vec::new(),
             session_model_input: String::new(),

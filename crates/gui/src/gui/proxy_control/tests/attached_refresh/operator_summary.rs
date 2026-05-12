@@ -386,6 +386,7 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
             "snapshot": true,
             "profiles": true,
             "retry_config": true,
+            "routing_explain": true,
             "station_specs": true,
             "provider_specs": true
         },
@@ -450,6 +451,7 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
             "status_station_health": "/__alt/v1/status/station-health",
             "control_trace": "/__alt/v1/control-trace",
             "retry_config": "/__alt/v1/retry/config",
+            "routing_explain": "/__alt/v1/routing/explain",
             "sessions": "/__alt/v1/sessions",
             "session_by_id_template": "/__alt/v1/sessions/{session_id}",
             "session_overrides": "/__alt/v1/overrides/session",
@@ -474,6 +476,7 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
             "snapshot": true,
             "profiles": true,
             "retry_config": true,
+            "routing_explain": true,
             "station_specs": true,
             "provider_specs": true
         },
@@ -575,6 +578,42 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
             }),
         )
         .route(
+            "/__alt/v1/routing/explain",
+            get(|| async {
+                Json(serde_json::json!({
+                    "api_version": 1,
+                    "service_name": "codex",
+                    "runtime_loaded_at_ms": 77,
+                    "request_model": null,
+                    "session_id": null,
+                    "selected_route": {
+                        "provider_id": "right",
+                        "provider_alias": null,
+                        "endpoint_id": "primary",
+                        "route_path": ["legacy", "linked-station", "right"],
+                        "station_name": "linked-station",
+                        "upstream_index": 0,
+                        "upstream_base_url": "https://right.example.com/v1",
+                        "selected": true,
+                        "skip_reasons": []
+                    },
+                    "candidates": [
+                        {
+                            "provider_id": "right",
+                            "provider_alias": null,
+                            "endpoint_id": "primary",
+                            "route_path": ["legacy", "linked-station", "right"],
+                            "station_name": "linked-station",
+                            "upstream_index": 0,
+                            "upstream_base_url": "https://right.example.com/v1",
+                            "selected": true,
+                            "skip_reasons": []
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
             "/__alt/v1/stations/specs",
             get(|| async {
                 Json(serde_json::json!({
@@ -661,6 +700,15 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
     );
     assert_eq!(snapshot.stations.len(), 1);
     assert_eq!(snapshot.stations[0].name, "linked-station");
+    assert!(snapshot.supports_routing_explain_api);
+    assert_eq!(
+        snapshot
+            .routing_explain
+            .as_ref()
+            .and_then(|explain| explain.selected_route.as_ref())
+            .map(|candidate| candidate.provider_id.as_str()),
+        Some("right")
+    );
 
     handle.abort();
 }

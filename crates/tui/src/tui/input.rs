@@ -785,7 +785,8 @@ async fn apply_global_station_pin(
 }
 
 pub(in crate::tui) async fn refresh_routing_control_state(ui: &mut UiState) -> anyhow::Result<()> {
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let response = client
         .get(format!(
             "http://127.0.0.1:{}/__codex_helper/api/v1/routing",
             ui.admin_port
@@ -796,6 +797,24 @@ pub(in crate::tui) async fn refresh_routing_control_state(ui: &mut UiState) -> a
         .error_for_status()?
         .json::<RoutingSpecView>()
         .await?;
+    let routing_explain = client
+        .get(format!(
+            "http://127.0.0.1:{}/__codex_helper/api/v1/routing/explain",
+            ui.admin_port
+        ))
+        .timeout(Duration::from_millis(1200))
+        .send()
+        .await
+        .ok()
+        .and_then(|response| response.error_for_status().ok());
+    ui.routing_explain = if let Some(response) = routing_explain {
+        response
+            .json::<crate::routing_explain::RoutingExplainResponse>()
+            .await
+            .ok()
+    } else {
+        None
+    };
     ui.routing_menu_idx = ui
         .routing_menu_idx
         .min(routing_provider_names(&response).len().saturating_sub(1));

@@ -84,6 +84,7 @@ fn running_controller(cfg: ProxyConfig) -> ProxyController {
         configured_retry: None,
         resolved_retry: None,
         lb_view: HashMap::new(),
+        routing_explain: None,
         shutdown_tx,
         server_handle: None,
     });

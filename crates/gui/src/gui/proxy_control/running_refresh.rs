@@ -9,7 +9,7 @@ use crate::dashboard_core::{
 use crate::state::{ProxyState, RuntimeConfigState};
 
 use super::types::RunningRefreshResult;
-use super::{ProxyController, ProxyMode, RunningProxy};
+use super::{ProxyController, ProxyMode, RunningProxy, send_admin_request};
 
 pub(super) async fn effective_default_profile_from_cfg_state(
     state: &ProxyState,
@@ -83,10 +83,13 @@ impl ProxyController {
         }
         r.last_refresh = Some(Instant::now());
 
+        let client = self.http_client.clone();
         match rt.block_on(build_running_refresh_result(
             r.state.clone(),
             r.service_name.to_string(),
             r.cfg.clone(),
+            client,
+            r.admin_port,
         )) {
             Ok(result) => {
                 apply_running_refresh_result(r, result);
@@ -102,6 +105,8 @@ pub(super) async fn build_running_refresh_result(
     state: std::sync::Arc<ProxyState>,
     service_name: String,
     cfg: std::sync::Arc<ProxyConfig>,
+    client: reqwest::Client,
+    admin_port: u16,
 ) -> anyhow::Result<RunningRefreshResult> {
     let mut snapshot = build_dashboard_snapshot(&state, service_name.as_str(), 600, 21).await;
     let mgr = match service_name.as_str() {
@@ -126,6 +131,7 @@ pub(super) async fn build_running_refresh_result(
     let stations =
         effective_stations_from_cfg_state(state.as_ref(), service_name.as_str(), cfg.as_ref())
             .await;
+    let routing_explain = fetch_running_routing_explain(client, admin_port).await;
 
     Ok(RunningRefreshResult {
         snapshot,
@@ -135,7 +141,26 @@ pub(super) async fn build_running_refresh_result(
         default_profile,
         profiles,
         stations,
+        routing_explain,
     })
+}
+
+async fn fetch_running_routing_explain(
+    client: reqwest::Client,
+    admin_port: u16,
+) -> Option<crate::routing_explain::RoutingExplainResponse> {
+    send_admin_request(
+        client
+            .get(format!(
+                "http://127.0.0.1:{admin_port}/__codex_helper/api/v1/routing/explain"
+            ))
+            .timeout(Duration::from_millis(800)),
+    )
+    .await
+    .ok()?
+    .json::<crate::routing_explain::RoutingExplainResponse>()
+    .await
+    .ok()
 }
 
 pub(super) fn apply_running_refresh_result(r: &mut RunningProxy, result: RunningRefreshResult) {
@@ -165,4 +190,5 @@ pub(super) fn apply_running_refresh_result(r: &mut RunningProxy, result: Running
     r.stats_5m = snap.stats_5m;
     r.stats_1h = snap.stats_1h;
     r.lb_view = snap.lb_view;
+    r.routing_explain = result.routing_explain;
 }

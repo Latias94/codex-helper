@@ -66,6 +66,8 @@ fn empty_snapshot() -> GuiRuntimeSnapshot {
         stats_5m: WindowStats::default(),
         stats_1h: WindowStats::default(),
         pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+        routing_explain: None,
+        supports_routing_explain_api: false,
         operator_retry_summary: None,
         supports_pricing_catalog_api: false,
         configured_retry: None,

@@ -87,6 +87,21 @@ pub(super) fn render_stations_routing_preview(
                 ));
             }
         }
+
+        ui.add_space(6.0);
+        if let Some(explain) = snapshot.routing_explain.as_ref() {
+            ui.label(pick(ctx.lang, "运行态选路", "Runtime route"));
+            ui.small(format_runtime_selected_route(ctx.lang, explain));
+            for candidate in &explain.candidates {
+                ui.small(format_runtime_candidate(candidate));
+            }
+        } else if snapshot.supports_routing_explain_api {
+            ui.small(pick(
+                ctx.lang,
+                "运行态 explain API 暂无可用快照。",
+                "Runtime explain API has no available snapshot yet.",
+            ));
+        }
     });
 }
 
@@ -330,6 +345,60 @@ fn format_skip_reason(lang: Language, reason: &StationRoutingSkipReason) -> Stri
         )
         .to_string(),
     }
+}
+
+fn format_runtime_selected_route(
+    lang: Language,
+    explain: &crate::routing_explain::RoutingExplainResponse,
+) -> String {
+    match explain.selected_route.as_ref() {
+        Some(selected) => match lang {
+            Language::Zh => format!(
+                "selected={} endpoint={} station={} upstream#{} path={}",
+                selected.provider_id,
+                selected.endpoint_id,
+                selected.station_name,
+                selected.upstream_index,
+                selected.route_path.join(" > ")
+            ),
+            Language::En => format!(
+                "selected={} endpoint={} station={} upstream#{} path={}",
+                selected.provider_id,
+                selected.endpoint_id,
+                selected.station_name,
+                selected.upstream_index,
+                selected.route_path.join(" > ")
+            ),
+        },
+        None => pick(lang, "selected=<none>", "selected=<none>").to_string(),
+    }
+}
+
+fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCandidate) -> String {
+    let marker = if candidate.selected { "*" } else { " " };
+    format!(
+        "{} {} endpoint={} station={} upstream#{} skip={} path={}",
+        marker,
+        candidate.provider_id,
+        candidate.endpoint_id,
+        candidate.station_name,
+        candidate.upstream_index,
+        format_runtime_skip_reasons(&candidate.skip_reasons),
+        candidate.route_path.join(" > ")
+    )
+}
+
+fn format_runtime_skip_reasons(
+    reasons: &[crate::routing_explain::RoutingExplainSkipReason],
+) -> String {
+    if reasons.is_empty() {
+        return "-".to_string();
+    }
+    reasons
+        .iter()
+        .map(crate::routing_explain::RoutingExplainSkipReason::code)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn session_pin_note(lang: Language, session_pin_count: usize) -> Option<String> {

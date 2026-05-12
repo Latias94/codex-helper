@@ -11,6 +11,7 @@ use crate::dashboard_core::{
     OperatorSummaryLinks, ProviderOption, StationOption, WindowStats,
 };
 use crate::pricing::{ModelPriceCatalogSnapshot, bundled_model_price_catalog_snapshot};
+use crate::routing_explain::RoutingExplainResponse;
 use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, SessionManualOverrides, SessionStats,
     StationHealth, UsageRollupView,

@@ -306,6 +306,7 @@ impl ProxyController {
             configured_retry: Some(configured_retry),
             resolved_retry: Some(resolved_retry),
             lb_view: HashMap::new(),
+            routing_explain: None,
             shutdown_tx,
             server_handle: Some(server_handle),
         });

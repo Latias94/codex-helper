@@ -32,6 +32,7 @@ pub(in crate::gui::proxy_control) fn apply_refresh_result(
     att.stats_5m = result.stats_5m;
     att.stats_1h = result.stats_1h;
     att.pricing_catalog = result.pricing_catalog;
+    att.routing_explain = result.routing_explain;
     att.lb_view = result.lb_view;
     att.runtime_loaded_at_ms = result.runtime_loaded_at_ms;
     att.runtime_source_mtime_ms = result.runtime_source_mtime_ms;
@@ -42,6 +43,7 @@ pub(in crate::gui::proxy_control) fn apply_refresh_result(
     att.operator_summary_links = result.operator_summary_links;
     att.supports_operator_summary_api = result.supports_operator_summary_api;
     att.supports_pricing_catalog_api = result.supports_pricing_catalog_api;
+    att.supports_routing_explain_api = result.supports_routing_explain_api;
     att.configured_retry = result.configured_retry;
     att.resolved_retry = result.resolved_retry;
     att.supports_retry_config_api = result.supports_retry_config_api;

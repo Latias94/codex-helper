@@ -21,6 +21,7 @@ use crate::dashboard_core::{
 use crate::logging::ControlTraceLogEntry;
 use crate::pricing::{ModelPriceCatalogSnapshot, bundled_model_price_catalog_snapshot};
 use crate::proxy::{local_admin_base_url_for_proxy_port, local_proxy_base_url};
+use crate::routing_explain::RoutingExplainResponse;
 use crate::state::{
     ActiveRequest, FinishedRequest, HealthCheckStatus, LbConfigView, ProviderBalanceSnapshot,
     ProxyState, SessionIdentityCard, SessionStats, StationHealth, UsageRollupView,
@@ -72,6 +73,7 @@ pub(super) struct RunningRefreshResult {
     pub(super) default_profile: Option<String>,
     pub(super) profiles: Vec<ControlProfileOption>,
     pub(super) stations: Vec<StationOption>,
+    pub(super) routing_explain: Option<RoutingExplainResponse>,
 }
 
 pub(super) struct AttachedRefreshResult {
@@ -101,6 +103,7 @@ pub(super) struct AttachedRefreshResult {
     pub(super) stats_5m: WindowStats,
     pub(super) stats_1h: WindowStats,
     pub(super) pricing_catalog: ModelPriceCatalogSnapshot,
+    pub(super) routing_explain: Option<RoutingExplainResponse>,
     pub(super) lb_view: HashMap<String, LbConfigView>,
     pub(super) runtime_loaded_at_ms: Option<u64>,
     pub(super) runtime_source_mtime_ms: Option<u64>,
@@ -111,6 +114,7 @@ pub(super) struct AttachedRefreshResult {
     pub(super) operator_summary_links: Option<OperatorSummaryLinks>,
     pub(super) supports_operator_summary_api: bool,
     pub(super) supports_pricing_catalog_api: bool,
+    pub(super) supports_routing_explain_api: bool,
     pub(super) configured_retry: Option<RetryConfig>,
     pub(super) resolved_retry: Option<ResolvedRetryConfig>,
     pub(super) supports_retry_config_api: bool,
@@ -172,6 +176,8 @@ pub struct AttachedStatus {
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
     pub pricing_catalog: ModelPriceCatalogSnapshot,
+    pub routing_explain: Option<RoutingExplainResponse>,
+    pub supports_routing_explain_api: bool,
     pub lb_view: HashMap<String, LbConfigView>,
     pub runtime_loaded_at_ms: Option<u64>,
     pub runtime_source_mtime_ms: Option<u64>,
@@ -235,6 +241,8 @@ impl AttachedStatus {
             stats_5m: WindowStats::default(),
             stats_1h: WindowStats::default(),
             pricing_catalog: bundled_model_price_catalog_snapshot(),
+            routing_explain: None,
+            supports_routing_explain_api: false,
             lb_view: HashMap::new(),
             runtime_loaded_at_ms: None,
             runtime_source_mtime_ms: None,
@@ -294,6 +302,8 @@ pub struct GuiRuntimeSnapshot {
     pub stats_5m: WindowStats,
     pub stats_1h: WindowStats,
     pub pricing_catalog: ModelPriceCatalogSnapshot,
+    pub routing_explain: Option<RoutingExplainResponse>,
+    pub supports_routing_explain_api: bool,
     pub operator_retry_summary: Option<OperatorRetrySummary>,
     pub supports_pricing_catalog_api: bool,
     pub configured_retry: Option<RetryConfig>,
@@ -340,6 +350,7 @@ pub struct RunningProxy {
     pub configured_retry: Option<RetryConfig>,
     pub resolved_retry: Option<ResolvedRetryConfig>,
     pub lb_view: HashMap<String, LbConfigView>,
+    pub routing_explain: Option<RoutingExplainResponse>,
     pub(super) shutdown_tx: watch::Sender<bool>,
     pub(super) server_handle: Option<JoinHandle<anyhow::Result<()>>>,
 }

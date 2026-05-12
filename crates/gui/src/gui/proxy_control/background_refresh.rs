@@ -30,11 +30,14 @@ impl ProxyController {
                 let state = r.state.clone();
                 let service_name = r.service_name.to_string();
                 let cfg = r.cfg.clone();
+                let client = self.http_client.clone();
+                let admin_port = r.admin_port;
                 let (tx, rx) = std::sync::mpsc::channel();
                 let join = rt.spawn(async move {
-                    let result = build_running_refresh_result(state, service_name, cfg)
-                        .await
-                        .map(|result| ProxyBackgroundRefreshResult::Running(Box::new(result)));
+                    let result =
+                        build_running_refresh_result(state, service_name, cfg, client, admin_port)
+                            .await
+                            .map(|result| ProxyBackgroundRefreshResult::Running(Box::new(result)));
                     let _ = tx.send(result);
                 });
 

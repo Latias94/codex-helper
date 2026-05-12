@@ -54,7 +54,10 @@ fn linked_url(
     select: impl FnOnce(&OperatorSummaryLinks) -> &str,
     fallback: &str,
 ) -> String {
-    let path = links.map(select).unwrap_or(fallback);
+    let path = links
+        .map(select)
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(fallback);
     format!("{base}{path}")
 }
 
@@ -156,6 +159,7 @@ pub(super) async fn refresh_from_base(
     let supports_control_trace_api = resolved_surface.control_trace;
     let supports_session_override_aggregate = resolved_surface.session_override_aggregate;
     let supports_global_station_override = resolved_surface.global_station_override;
+    let supports_routing_explain_api = resolved_surface.routing_explain;
     let supports_session_station = resolved_surface.session_station;
     let supports_session_effort = resolved_surface.session_reasoning_effort;
     let supports_station_api = resolved_surface.station_api;
@@ -202,6 +206,22 @@ pub(super) async fn refresh_from_base(
         .as_ref()
         .and_then(|summary| summary.links.clone());
     let operator_summary_links_ref = operator_summary_links.as_ref();
+    let routing_explain = if supports_routing_explain_api {
+        get_json::<RoutingExplainResponse>(
+            client,
+            linked_url(
+                base,
+                operator_summary_links_ref,
+                |summary_links| summary_links.routing_explain.as_str(),
+                "/__codex_helper/api/v1/routing/explain",
+            ),
+            req_timeout,
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
     let pricing_catalog = if supports_pricing_catalog_api {
         get_json::<ModelPriceCatalogSnapshot>(
             client,
@@ -396,6 +416,7 @@ pub(super) async fn refresh_from_base(
             stats_5m: snapshot.stats_5m,
             stats_1h: snapshot.stats_1h,
             pricing_catalog,
+            routing_explain,
             lb_view: snapshot.lb_view,
             runtime_loaded_at_ms: operator_runtime_summary
                 .as_ref()
@@ -412,6 +433,7 @@ pub(super) async fn refresh_from_base(
             operator_summary_links,
             supports_operator_summary_api,
             supports_pricing_catalog_api,
+            supports_routing_explain_api,
             configured_retry: configured_retry
                 .as_ref()
                 .map(|(configured, _)| configured.clone()),
@@ -711,6 +733,7 @@ pub(super) async fn refresh_from_base(
         stats_5m: WindowStats::default(),
         stats_1h: WindowStats::default(),
         pricing_catalog,
+        routing_explain,
         lb_view: HashMap::new(),
         runtime_loaded_at_ms: operator_runtime_summary
             .as_ref()
@@ -727,6 +750,7 @@ pub(super) async fn refresh_from_base(
         operator_summary_links,
         supports_operator_summary_api,
         supports_pricing_catalog_api,
+        supports_routing_explain_api,
         configured_retry: configured_retry
             .as_ref()
             .map(|(configured, _)| configured.clone()),

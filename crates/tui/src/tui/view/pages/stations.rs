@@ -334,6 +334,48 @@ fn format_skip_reason_lang(reason: &StationRoutingSkipReason, lang: Language) ->
     }
 }
 
+fn format_runtime_selected_route(
+    explain: &crate::routing_explain::RoutingExplainResponse,
+) -> String {
+    match explain.selected_route.as_ref() {
+        Some(selected) => format!(
+            "selected={} endpoint={} station={} upstream#{} path={}",
+            selected.provider_id,
+            selected.endpoint_id,
+            selected.station_name,
+            selected.upstream_index,
+            selected.route_path.join(" > ")
+        ),
+        None => "selected=<none>".to_string(),
+    }
+}
+
+fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCandidate) -> String {
+    let marker = if candidate.selected { "*" } else { " " };
+    format!(
+        "{} {} endpoint={} station={} upstream#{} skip={}",
+        marker,
+        candidate.provider_id,
+        candidate.endpoint_id,
+        candidate.station_name,
+        candidate.upstream_index,
+        format_runtime_skip_reasons(&candidate.skip_reasons)
+    )
+}
+
+fn format_runtime_skip_reasons(
+    reasons: &[crate::routing_explain::RoutingExplainSkipReason],
+) -> String {
+    if reasons.is_empty() {
+        return "-".to_string();
+    }
+    reasons
+        .iter()
+        .map(crate::routing_explain::RoutingExplainSkipReason::code)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn routing_policy_label(policy: crate::config::RoutingPolicyV4) -> &'static str {
     match policy {
         crate::config::RoutingPolicyV4::ManualSticky => "manual-sticky",
@@ -1061,6 +1103,36 @@ pub(super) fn render_stations_page(
                     Style::default().fg(p.muted),
                 ),
             ]));
+        }
+        if let Some(explain) = ui.routing_explain.as_ref() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}: ", l("Runtime route")),
+                    Style::default().fg(p.muted),
+                ),
+                Span::styled(
+                    shorten_middle(&format_runtime_selected_route(explain), 96),
+                    Style::default().fg(p.text),
+                ),
+            ]));
+            let candidates = explain
+                .candidates
+                .iter()
+                .map(format_runtime_candidate)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if !candidates.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}: ", l("Runtime candidates")),
+                        Style::default().fg(p.muted),
+                    ),
+                    Span::styled(
+                        shorten_middle(&candidates, 96),
+                        Style::default().fg(p.muted),
+                    ),
+                ]));
+            }
         }
 
         if let Some(st) = snapshot.health_checks.get(cfg.name.as_str()) {

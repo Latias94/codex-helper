@@ -85,7 +85,7 @@ Acceptance:
 - [x] Add admin API runtime explain output with selected route, candidates,
   and skip reasons.
 - [x] Extend CLI `routing explain` with the same runtime explain contract.
-- [ ] Update GUI/TUI only after the API shape is stable.
+- [x] Update GUI/TUI only after the API shape is stable.
 
 Acceptance:
 
