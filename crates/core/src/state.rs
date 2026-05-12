@@ -18,6 +18,7 @@ use crate::lb::LbState;
 #[cfg(test)]
 use crate::pricing::CostBreakdown;
 use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog};
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
 use crate::usage::UsageMetrics;
 
@@ -196,6 +197,10 @@ pub struct ProxyState {
     global_station_override: RwLock<Option<String>>,
     runtime_default_profiles: RwLock<HashMap<String, RuntimeDefaultProfileOverride>>,
     station_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
+    // Primary provider-endpoint overrides keyed by stable provider identity.
+    provider_endpoint_meta_overrides:
+        RwLock<HashMap<String, HashMap<ProviderEndpointKey, ConfigMetaOverride>>>,
+    // Legacy base_url-keyed overrides kept for compatibility with station-oriented callers.
     upstream_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     session_cwd_cache: RwLock<HashMap<String, SessionCwdCacheEntry>>,
     session_transcript_path_cache: RwLock<HashMap<String, SessionTranscriptPathCacheEntry>>,
@@ -296,6 +301,7 @@ impl ProxyState {
             global_station_override: RwLock::new(None),
             runtime_default_profiles: RwLock::new(HashMap::new()),
             station_meta_overrides: RwLock::new(HashMap::new()),
+            provider_endpoint_meta_overrides: RwLock::new(HashMap::new()),
             upstream_meta_overrides: RwLock::new(HashMap::new()),
             session_cwd_cache: RwLock::new(HashMap::new()),
             session_transcript_path_cache: RwLock::new(HashMap::new()),
@@ -792,6 +798,76 @@ impl ProxyState {
             .unwrap_or_default()
     }
 
+    pub async fn set_provider_endpoint_enabled_override(
+        &self,
+        service_name: &str,
+        endpoint_key: ProviderEndpointKey,
+        enabled: bool,
+        now_ms: u64,
+    ) {
+        let mut guard = self.provider_endpoint_meta_overrides.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let entry = per_service.entry(endpoint_key).or_default();
+        entry.enabled = Some(enabled);
+        entry.updated_at_ms = now_ms;
+    }
+
+    pub async fn clear_provider_endpoint_enabled_override(
+        &self,
+        service_name: &str,
+        endpoint_key: &ProviderEndpointKey,
+    ) {
+        let mut guard = self.provider_endpoint_meta_overrides.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return;
+        };
+        let Some(entry) = per_service.get_mut(endpoint_key) else {
+            return;
+        };
+        entry.enabled = None;
+        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
+            per_service.remove(endpoint_key);
+        }
+        if per_service.is_empty() {
+            guard.remove(service_name);
+        }
+    }
+
+    pub async fn set_provider_endpoint_runtime_state_override(
+        &self,
+        service_name: &str,
+        endpoint_key: ProviderEndpointKey,
+        state: RuntimeConfigState,
+        now_ms: u64,
+    ) {
+        let mut guard = self.provider_endpoint_meta_overrides.write().await;
+        let per_service = guard.entry(service_name.to_string()).or_default();
+        let entry = per_service.entry(endpoint_key).or_default();
+        entry.state = Some(state);
+        entry.updated_at_ms = now_ms;
+    }
+
+    pub async fn clear_provider_endpoint_runtime_state_override(
+        &self,
+        service_name: &str,
+        endpoint_key: &ProviderEndpointKey,
+    ) {
+        let mut guard = self.provider_endpoint_meta_overrides.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return;
+        };
+        let Some(entry) = per_service.get_mut(endpoint_key) else {
+            return;
+        };
+        entry.state = None;
+        if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
+            per_service.remove(endpoint_key);
+        }
+        if per_service.is_empty() {
+            guard.remove(service_name);
+        }
+    }
+
     pub async fn set_upstream_enabled_override(
         &self,
         service_name: &str,
@@ -858,15 +934,31 @@ impl ProxyState {
         &self,
         service_name: &str,
     ) -> HashMap<String, (Option<bool>, Option<RuntimeConfigState>)> {
-        let guard = self.upstream_meta_overrides.read().await;
-        guard
-            .get(service_name)
-            .map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), (v.enabled, v.state)))
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default()
+        let mut overrides = HashMap::new();
+
+        {
+            let guard = self.upstream_meta_overrides.read().await;
+            if let Some(per_service) = guard.get(service_name) {
+                overrides.extend(
+                    per_service
+                        .iter()
+                        .map(|(k, v)| (k.clone(), (v.enabled, v.state))),
+                );
+            }
+        }
+
+        {
+            let guard = self.provider_endpoint_meta_overrides.read().await;
+            if let Some(per_service) = guard.get(service_name) {
+                overrides.extend(
+                    per_service
+                        .iter()
+                        .map(|(k, v)| (k.stable_key(), (v.enabled, v.state))),
+                );
+            }
+        }
+
+        overrides
     }
 
     pub async fn prune_runtime_observability_for_service(
@@ -965,6 +1057,11 @@ impl ProxyState {
                     guard.remove(service_name);
                 }
             }
+        }
+
+        if active_stations.is_empty() {
+            let mut guard = self.provider_endpoint_meta_overrides.write().await;
+            guard.remove(service_name);
         }
 
         {
@@ -2398,6 +2495,7 @@ mod tests {
     use super::*;
 
     use crate::config::{ServiceConfig, ServiceConfigManager, UpstreamAuth, UpstreamConfig};
+    use crate::runtime_identity::ProviderEndpointKey;
 
     fn test_runtime_policy(
         session_override_ttl_ms: u64,
@@ -3586,6 +3684,58 @@ mod tests {
             let rollup = state.get_usage_rollup_view("codex", 10, 10).await;
             assert!(rollup.by_config.is_empty());
             assert!(rollup.by_provider.is_empty());
+        });
+    }
+
+    #[test]
+    fn get_upstream_meta_overrides_merges_endpoint_and_legacy_base_url_entries() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+
+            state
+                .set_provider_endpoint_enabled_override(
+                    "codex",
+                    ProviderEndpointKey::new("codex", "alpha", "default"),
+                    false,
+                    1,
+                )
+                .await;
+            state
+                .set_provider_endpoint_runtime_state_override(
+                    "codex",
+                    ProviderEndpointKey::new("codex", "alpha", "default"),
+                    RuntimeConfigState::BreakerOpen,
+                    2,
+                )
+                .await;
+            state
+                .set_upstream_enabled_override(
+                    "codex",
+                    "https://legacy.example/v1".to_string(),
+                    true,
+                    3,
+                )
+                .await;
+            state
+                .set_upstream_runtime_state_override(
+                    "codex",
+                    "https://legacy.example/v1".to_string(),
+                    RuntimeConfigState::Draining,
+                    4,
+                )
+                .await;
+
+            let overrides = state.get_upstream_meta_overrides("codex").await;
+
+            assert_eq!(
+                overrides.get("codex/alpha/default"),
+                Some(&(Some(false), Some(RuntimeConfigState::BreakerOpen)))
+            );
+            assert_eq!(
+                overrides.get("https://legacy.example/v1"),
+                Some(&(Some(true), Some(RuntimeConfigState::Draining)))
+            );
         });
     }
 

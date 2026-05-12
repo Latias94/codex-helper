@@ -523,6 +523,10 @@ mod tests {
             &view,
             &HashMap::from([
                 (
+                    ProviderEndpointKey::new("codex", "alpha", "default").stable_key(),
+                    (Some(true), Some(RuntimeConfigState::Normal)),
+                ),
+                (
                     "https://alpha.example/v1".to_string(),
                     (Some(false), Some(RuntimeConfigState::BreakerOpen)),
                 ),
@@ -538,16 +542,16 @@ mod tests {
         assert_eq!(provider.name, "alpha");
         assert!(provider.configured_enabled);
         assert!(provider.effective_enabled);
-        assert_eq!(provider.routable_endpoints, 0);
+        assert_eq!(provider.routable_endpoints, 1);
         assert_eq!(provider.endpoints.len(), 2);
         assert_eq!(provider.endpoints[0].name, "default");
-        assert_eq!(provider.endpoints[0].runtime_enabled_override, Some(false));
+        assert_eq!(provider.endpoints[0].runtime_enabled_override, Some(true));
         assert_eq!(
             provider.endpoints[0].runtime_state_override,
-            Some(RuntimeConfigState::BreakerOpen)
+            Some(RuntimeConfigState::Normal)
         );
-        assert!(!provider.endpoints[0].effective_enabled);
-        assert!(!provider.endpoints[0].routable);
+        assert!(provider.endpoints[0].effective_enabled);
+        assert!(provider.endpoints[0].routable);
         assert_eq!(provider.endpoints[1].name, "backup");
         assert_eq!(
             provider.endpoints[1].runtime_state_override,

@@ -83,8 +83,8 @@ fn provider_endpoint_override_key(
     service_name: &str,
     provider_name: &str,
     endpoint_name: &str,
-) -> String {
-    ProviderEndpointKey::new(service_name, provider_name, endpoint_name).stable_key()
+) -> ProviderEndpointKey {
+    ProviderEndpointKey::new(service_name, provider_name, endpoint_name)
 }
 
 fn endpoint_base_url_is_unique(
@@ -475,12 +475,12 @@ pub(super) async fn apply_provider_runtime_meta(
         if payload.clear_enabled {
             proxy
                 .state
-                .clear_upstream_enabled_override(proxy.service_name, override_key.as_str())
+                .clear_provider_endpoint_enabled_override(proxy.service_name, &override_key)
                 .await;
         } else if let Some(enabled) = payload.enabled {
             proxy
                 .state
-                .set_upstream_enabled_override(
+                .set_provider_endpoint_enabled_override(
                     proxy.service_name,
                     override_key.clone(),
                     enabled,
@@ -510,12 +510,12 @@ pub(super) async fn apply_provider_runtime_meta(
         if payload.clear_runtime_state {
             proxy
                 .state
-                .clear_upstream_runtime_state_override(proxy.service_name, override_key.as_str())
+                .clear_provider_endpoint_runtime_state_override(proxy.service_name, &override_key)
                 .await;
         } else if let Some(runtime_state) = payload.runtime_state {
             proxy
                 .state
-                .set_upstream_runtime_state_override(
+                .set_provider_endpoint_runtime_state_override(
                     proxy.service_name,
                     override_key,
                     runtime_state,

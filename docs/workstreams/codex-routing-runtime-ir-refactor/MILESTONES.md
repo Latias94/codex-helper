@@ -77,6 +77,12 @@ Acceptance:
 - legacy station state remains available during the migration window;
 - no stale state survives provider endpoint layout changes.
 
+Status note:
+
+- Provider endpoint overrides now key off `service / provider_id /
+  endpoint_id` first. The legacy `base_url` view remains as a compatibility
+  alias for older callers and UI surfaces.
+
 ## P4 - Decision Trace And Explain APIs
 
 - [x] Record structured skip reasons for capability mismatch, breaker open,

@@ -97,7 +97,8 @@ Guardrail:
 
 - keep station/upstream compatibility keys until the executor switch has full
   coverage;
-- introduce provider endpoint keys as additive metadata first.
+- introduce provider endpoint keys as the primary runtime identity, while
+  keeping `base_url` only as a compatibility alias.
 
 ### Explain Output Overpromises
 
