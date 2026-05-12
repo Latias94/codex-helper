@@ -300,7 +300,7 @@ mod tests {
         assert!(label.contains("fast"));
         assert!(label.contains("tok=1.5k/100/1.6k"));
         assert!(label.contains("cache=300"));
-        assert!(label.contains("hit=16.7%"));
+        assert!(label.contains("hit=17.1%"));
         assert!(label.contains("out/s=200.0"));
         assert!(label.contains("cost=$"));
     }

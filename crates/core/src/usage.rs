@@ -80,10 +80,17 @@ impl UsageMetrics {
             || self.cache_creation_tokens_total() > 0
     }
 
+    pub fn cache_read_tokens_total(&self) -> i64 {
+        self.cached_input_tokens
+            .max(0)
+            .saturating_add(self.cache_read_input_tokens.max(0))
+    }
+
     pub fn cache_hit_rate(&self) -> Option<f64> {
-        let read = self.cache_read_input_tokens.max(0);
+        let cached = self.cached_input_tokens.max(0);
+        let read = self.cache_read_tokens_total();
         let create = self.cache_creation_tokens_total().max(0);
-        let effective_input = self.input_tokens.max(0).saturating_sub(read);
+        let effective_input = self.input_tokens.max(0).saturating_sub(cached);
         let denom = effective_input.saturating_add(create).saturating_add(read);
         if denom <= 0 {
             return None;
@@ -474,7 +481,34 @@ mod tests {
 
         let rate = usage.cache_hit_rate().expect("cache hit rate");
 
-        assert_eq!(rate, 0.25);
+        assert_eq!(rate, 0.2);
+    }
+
+    #[test]
+    fn computes_cache_hit_rate_from_cached_input_tokens() {
+        let usage = UsageMetrics {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            ..UsageMetrics::default()
+        };
+
+        let rate = usage.cache_hit_rate().expect("cache hit rate");
+
+        assert_eq!(rate, 0.4);
+    }
+
+    #[test]
+    fn computes_cache_hit_rate_from_mixed_usage_cache_fields() {
+        let usage = UsageMetrics {
+            input_tokens: 1_500,
+            cached_input_tokens: 50,
+            cache_read_input_tokens: 250,
+            ..UsageMetrics::default()
+        };
+
+        let rate = usage.cache_hit_rate().expect("cache hit rate");
+
+        assert!((rate - (300.0 / 1_750.0)).abs() < f64::EPSILON);
     }
 
     #[test]
