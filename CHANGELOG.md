@@ -29,6 +29,8 @@ All notable changes to this project will be documented in this file.
   TUI now labels Sub2API subscription-window zero balance from lazy refresh as `lazy reset`, avoiding a misleading hard-exhausted signal before a real request refreshes the plan window.
 - TUI 的 dashboard、Requests、Sessions 和 History 里的 session 标识不再被过早截断；详情面板和标题优先显示完整 session，列表列宽也相应放宽。
   TUI session identifiers are no longer prematurely truncated in dashboard, Requests, Sessions, and History; detail panes and titles now prefer the full session id, and table columns were widened accordingly.
+- TUI 的 History / Recent 会话刷新改为后台异步加载，打开页面和手动刷新时不再阻塞主事件循环；刷新失败时保留已有列表并展示错误。
+  TUI History / Recent session refresh now runs in the background, so opening those pages and manual refresh no longer block the main event loop; failed refreshes keep the existing list visible while surfacing the error.
 
 ## [0.13.0] - 2026-05-09
 

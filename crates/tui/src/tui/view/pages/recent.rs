@@ -133,6 +133,13 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
         .style(Style::default().bg(p.panel));
 
     let mut lines = Vec::new();
+    if ui.codex_recent_loading && !ui.codex_recent_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            i18n::text(ui.language, msg::RECENT_REFRESHING),
+            Style::default().fg(p.accent),
+        )));
+        lines.push(Line::from(""));
+    }
     if let Some(err) = ui.codex_recent_error.as_deref() {
         lines.push(Line::from(Span::styled(
             format!("{}: {err}", l("error")),
@@ -143,7 +150,11 @@ pub(super) fn render_recent_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState
 
     if ui.codex_recent_rows.is_empty() {
         lines.push(Line::from(Span::styled(
-            i18n::text(ui.language, msg::RECENT_EMPTY),
+            if ui.codex_recent_loading {
+                i18n::text(ui.language, msg::RECENT_REFRESHING)
+            } else {
+                i18n::text(ui.language, msg::RECENT_EMPTY)
+            },
             Style::default().fg(p.muted),
         )));
     } else if let Some(r) = visible.get(ui.codex_recent_selected_idx) {

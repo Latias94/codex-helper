@@ -23,14 +23,14 @@ use crossterm::terminal::LeaveAlternateScreen;
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::ProxyConfig;
 use crate::config::storage::load_config;
 use crate::state::ProxyState;
 
 use self::model::{Palette, now_ms, refresh_snapshot};
-use self::state::{UiState, merge_codex_history_external_focus};
+use self::state::{RecentCodexRow, UiState, merge_codex_history_external_focus};
 use self::terminal::TerminalGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,24 @@ struct RenderSurfaceKey {
     provider_menu_idx: usize,
     station_info_scroll: u16,
     session_transcript_scroll: u16,
+}
+
+#[derive(Debug)]
+struct CodexHistoryRefreshResult {
+    generation: u64,
+    result: Result<Vec<crate::sessions::SessionSummary>, String>,
+}
+
+#[derive(Debug)]
+struct CodexRecentRefreshResult {
+    generation: u64,
+    result: Result<CodexRecentRefreshPayload, String>,
+}
+
+#[derive(Debug)]
+struct CodexRecentRefreshPayload {
+    rows: Vec<RecentCodexRow>,
+    branch_cache: std::collections::HashMap<String, Option<String>>,
 }
 
 impl RenderSurfaceKey {
@@ -151,7 +169,11 @@ pub async fn run_dashboard(
     let mut providers = providers;
     ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
     let (balance_refresh_tx, mut balance_refresh_rx) =
-        tokio::sync::mpsc::unbounded_channel::<input::BalanceRefreshOutcome>();
+        mpsc::unbounded_channel::<input::BalanceRefreshOutcome>();
+    let (history_refresh_tx, mut history_refresh_rx) =
+        mpsc::unbounded_channel::<CodexHistoryRefreshResult>();
+    let (recent_refresh_tx, mut recent_refresh_rx) =
+        mpsc::unbounded_channel::<CodexRecentRefreshResult>();
 
     let mut render_invalidation = RenderInvalidation::FullClear;
     let mut last_drawn_page = ui.page;
@@ -260,6 +282,20 @@ pub async fn run_dashboard(
                     request_redraw(&mut render_invalidation);
                 }
             }
+            maybe_history_refresh = history_refresh_rx.recv() => {
+                if let Some(result) = maybe_history_refresh
+                    && apply_codex_history_refresh_result(&mut ui, result)
+                {
+                    request_redraw(&mut render_invalidation);
+                }
+            }
+            maybe_recent_refresh = recent_refresh_rx.recv() => {
+                if let Some(result) = maybe_recent_refresh
+                    && apply_codex_recent_refresh_result(&mut ui, result)
+                {
+                    request_redraw(&mut render_invalidation);
+                }
+            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 ui.should_exit = true;
@@ -315,104 +351,11 @@ pub async fn run_dashboard(
                                 ui.needs_snapshot_refresh = false;
                             }
                             if ui.needs_codex_history_refresh {
-                                ui.codex_history_error = None;
-                                match crate::sessions::find_codex_sessions_for_current_dir(200).await {
-                                    Ok(list) => {
-                                        ui.codex_history_sessions = list;
-                                        if let Some(focus) = ui.codex_history_external_focus.as_ref() {
-                                            merge_codex_history_external_focus(&mut ui.codex_history_sessions, focus);
-                                        }
-                                        ui.codex_history_loaded_at_ms = Some(now_ms());
-                                        ui.sync_codex_history_selection();
-                                        ui.toast = Some((
-                                            i18n::format_history_loaded(
-                                                ui.language,
-                                                ui.codex_history_sessions.len(),
-                                            ),
-                                            Instant::now(),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        ui.codex_history_sessions.clear();
-                                        if let Some(focus) = ui.codex_history_external_focus.as_ref() {
-                                            merge_codex_history_external_focus(&mut ui.codex_history_sessions, focus);
-                                        }
-                                        ui.codex_history_loaded_at_ms = Some(now_ms());
-                                        ui.codex_history_error = Some(e.to_string());
-                                        ui.sync_codex_history_selection();
-                                        ui.toast = Some((
-                                            i18n::format_history_load_failed(ui.language, &e),
-                                            Instant::now(),
-                                        ));
-                                    }
-                                }
+                                start_codex_history_refresh(&mut ui, history_refresh_tx.clone());
                                 ui.needs_codex_history_refresh = false;
                             }
                             if ui.needs_codex_recent_refresh {
-                                ui.codex_recent_error = None;
-                                let since = Duration::from_secs(24 * 60 * 60);
-                                match crate::sessions::find_recent_codex_sessions(since, 500).await {
-                                    Ok(list) => {
-                                        let mut rows = Vec::with_capacity(list.len());
-                                        for s in list {
-                                            let cwd_opt = s.cwd.clone();
-                                            let cwd = cwd_opt.as_deref().unwrap_or("-");
-                                            let root = if ui.codex_recent_raw_cwd {
-                                                cwd.to_string()
-                                            } else {
-                                                crate::sessions::infer_project_root_from_cwd(cwd)
-                                            };
-                                            let branch = if root.trim().is_empty()
-                                                || root == "-"
-                                                || !std::path::Path::new(&root).exists()
-                                            {
-                                                None
-                                            } else if let Some(v) = ui.codex_recent_branch_cache.get(&root) {
-                                                v.clone()
-                                            } else {
-                                                let v = read_git_branch_shallow(&root).await;
-                                                ui.codex_recent_branch_cache
-                                                    .insert(root.clone(), v.clone());
-                                                v
-                                            };
-                                            rows.push(crate::tui::state::RecentCodexRow {
-                                                root,
-                                                branch,
-                                                session_id: s.id,
-                                                cwd: cwd_opt,
-                                                mtime_ms: s.mtime_ms,
-                                            });
-                                        }
-                                        ui.codex_recent_rows = rows;
-                                        ui.codex_recent_loaded_at_ms = Some(now_ms());
-                                        ui.codex_recent_selected_idx = 0;
-                                        ui.codex_recent_selected_id = ui
-                                            .codex_recent_rows
-                                            .first()
-                                            .map(|r| r.session_id.clone());
-                                        ui.codex_recent_table.select(if ui.codex_recent_rows.is_empty() {
-                                            None
-                                        } else {
-                                            Some(0)
-                                        });
-                                        ui.toast = Some((
-                                            i18n::format_recent_loaded(
-                                                ui.language,
-                                                ui.codex_recent_rows.len(),
-                                            ),
-                                            Instant::now(),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        ui.codex_recent_rows.clear();
-                                        ui.codex_recent_loaded_at_ms = Some(now_ms());
-                                        ui.codex_recent_error = Some(e.to_string());
-                                        ui.toast = Some((
-                                            i18n::format_recent_load_failed(ui.language, &e),
-                                            Instant::now(),
-                                        ));
-                                    }
-                                }
+                                start_codex_recent_refresh(&mut ui, recent_refresh_tx.clone());
                                 ui.needs_codex_recent_refresh = false;
                             }
                             let after_surface = RenderSurfaceKey::capture(&ui);
@@ -438,6 +381,155 @@ pub async fn run_dashboard(
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     term_guard.disarm();
     Ok(())
+}
+
+fn start_codex_history_refresh(
+    ui: &mut UiState,
+    tx: mpsc::UnboundedSender<CodexHistoryRefreshResult>,
+) {
+    ui.codex_history_refresh_generation = ui.codex_history_refresh_generation.wrapping_add(1);
+    let generation = ui.codex_history_refresh_generation;
+    ui.codex_history_loading = true;
+    ui.codex_history_error = None;
+    ui.toast = Some((
+        i18n::text(ui.language, i18n::msg::HISTORY_REFRESHING).to_string(),
+        Instant::now(),
+    ));
+
+    tokio::spawn(async move {
+        let result = crate::sessions::find_codex_sessions_for_current_dir(200)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = tx.send(CodexHistoryRefreshResult { generation, result });
+    });
+}
+
+fn apply_codex_history_refresh_result(ui: &mut UiState, result: CodexHistoryRefreshResult) -> bool {
+    if result.generation != ui.codex_history_refresh_generation {
+        return false;
+    }
+
+    ui.codex_history_loading = false;
+    ui.codex_history_loaded_at_ms = Some(now_ms());
+    match result.result {
+        Ok(list) => {
+            ui.codex_history_sessions = list;
+            if let Some(focus) = ui.codex_history_external_focus.as_ref() {
+                merge_codex_history_external_focus(&mut ui.codex_history_sessions, focus);
+            }
+            ui.codex_history_error = None;
+            ui.sync_codex_history_selection();
+            ui.toast = Some((
+                i18n::format_history_loaded(ui.language, ui.codex_history_sessions.len()),
+                Instant::now(),
+            ));
+        }
+        Err(err) => {
+            if let Some(focus) = ui.codex_history_external_focus.as_ref() {
+                merge_codex_history_external_focus(&mut ui.codex_history_sessions, focus);
+            }
+            ui.codex_history_error = Some(err.clone());
+            ui.sync_codex_history_selection();
+            ui.toast = Some((
+                i18n::format_history_load_failed(ui.language, &err),
+                Instant::now(),
+            ));
+        }
+    }
+    true
+}
+
+fn start_codex_recent_refresh(
+    ui: &mut UiState,
+    tx: mpsc::UnboundedSender<CodexRecentRefreshResult>,
+) {
+    ui.codex_recent_refresh_generation = ui.codex_recent_refresh_generation.wrapping_add(1);
+    let generation = ui.codex_recent_refresh_generation;
+    let raw_cwd = ui.codex_recent_raw_cwd;
+    let branch_cache = ui.codex_recent_branch_cache.clone();
+    ui.codex_recent_loading = true;
+    ui.codex_recent_error = None;
+    ui.toast = Some((
+        i18n::text(ui.language, i18n::msg::RECENT_REFRESHING).to_string(),
+        Instant::now(),
+    ));
+
+    tokio::spawn(async move {
+        let result = load_codex_recent_rows(raw_cwd, branch_cache)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = tx.send(CodexRecentRefreshResult { generation, result });
+    });
+}
+
+fn apply_codex_recent_refresh_result(ui: &mut UiState, result: CodexRecentRefreshResult) -> bool {
+    if result.generation != ui.codex_recent_refresh_generation {
+        return false;
+    }
+
+    ui.codex_recent_loading = false;
+    ui.codex_recent_loaded_at_ms = Some(now_ms());
+    match result.result {
+        Ok(payload) => {
+            ui.codex_recent_rows = payload.rows;
+            ui.codex_recent_branch_cache = payload.branch_cache;
+            ui.codex_recent_error = None;
+            ui.codex_recent_selected_idx = 0;
+            ui.codex_recent_selected_id =
+                ui.codex_recent_rows.first().map(|r| r.session_id.clone());
+            ui.codex_recent_table
+                .select((!ui.codex_recent_rows.is_empty()).then_some(0));
+            ui.toast = Some((
+                i18n::format_recent_loaded(ui.language, ui.codex_recent_rows.len()),
+                Instant::now(),
+            ));
+        }
+        Err(err) => {
+            ui.codex_recent_error = Some(err.clone());
+            ui.toast = Some((
+                i18n::format_recent_load_failed(ui.language, &err),
+                Instant::now(),
+            ));
+        }
+    }
+    true
+}
+
+async fn load_codex_recent_rows(
+    raw_cwd: bool,
+    mut branch_cache: std::collections::HashMap<String, Option<String>>,
+) -> anyhow::Result<CodexRecentRefreshPayload> {
+    let since = Duration::from_secs(24 * 60 * 60);
+    let list = crate::sessions::find_recent_codex_sessions(since, 500).await?;
+    let mut rows = Vec::with_capacity(list.len());
+    for s in list {
+        let cwd_opt = s.cwd.clone();
+        let cwd = cwd_opt.as_deref().unwrap_or("-");
+        let root = if raw_cwd {
+            cwd.to_string()
+        } else {
+            crate::sessions::infer_project_root_from_cwd(cwd)
+        };
+        let branch =
+            if root.trim().is_empty() || root == "-" || !std::path::Path::new(&root).exists() {
+                None
+            } else if let Some(v) = branch_cache.get(&root) {
+                v.clone()
+            } else {
+                let v = read_git_branch_shallow(&root).await;
+                branch_cache.insert(root.clone(), v.clone());
+                v
+            };
+        rows.push(RecentCodexRow {
+            root,
+            branch,
+            session_id: s.id,
+            cwd: cwd_opt,
+            mtime_ms: s.mtime_ms,
+        });
+    }
+
+    Ok(CodexRecentRefreshPayload { rows, branch_cache })
 }
 
 async fn read_git_branch_shallow(workdir: &str) -> Option<String> {

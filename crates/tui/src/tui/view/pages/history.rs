@@ -100,6 +100,13 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
         .style(Style::default().bg(p.panel));
 
     let mut lines = Vec::new();
+    if ui.codex_history_loading && !ui.codex_history_sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            i18n::text(ui.language, msg::HISTORY_REFRESHING),
+            Style::default().fg(p.accent),
+        )));
+        lines.push(Line::from(""));
+    }
     if let Some(err) = ui.codex_history_error.as_deref() {
         lines.push(Line::from(Span::styled(
             format!("{}: {err}", l("error")),
@@ -110,7 +117,11 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
 
     if ui.codex_history_sessions.is_empty() {
         lines.push(Line::from(Span::styled(
-            i18n::text(ui.language, msg::HISTORY_EMPTY),
+            if ui.codex_history_loading {
+                i18n::text(ui.language, msg::HISTORY_REFRESHING)
+            } else {
+                i18n::text(ui.language, msg::HISTORY_EMPTY)
+            },
             Style::default().fg(p.muted),
         )));
     } else if let Some(s) = ui.codex_history_sessions.get(ui.selected_codex_history_idx) {
