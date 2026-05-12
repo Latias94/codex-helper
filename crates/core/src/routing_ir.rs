@@ -674,6 +674,17 @@ struct EndpointParts {
     model_mapping: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalExpansion {
+    MatchRequest,
+    AllBranchesForCompatibility,
+}
+
+struct RouteExpansionContext<'a> {
+    request: &'a RouteRequestContext,
+    conditional: ConditionalExpansion,
+}
+
 pub fn compile_v4_route_plan_template(
     service_name: &str,
     view: &ServiceViewV4,
@@ -686,11 +697,41 @@ pub fn compile_v4_route_plan_template_with_request(
     view: &ServiceViewV4,
     request: &RouteRequestContext,
 ) -> Result<RoutePlanTemplate> {
+    compile_v4_route_plan_template_with_expansion(
+        service_name,
+        view,
+        request,
+        ConditionalExpansion::MatchRequest,
+    )
+}
+
+pub fn compile_v4_route_plan_template_for_compat_runtime(
+    service_name: &str,
+    view: &ServiceViewV4,
+) -> Result<RoutePlanTemplate> {
+    compile_v4_route_plan_template_with_expansion(
+        service_name,
+        view,
+        &RouteRequestContext::default(),
+        ConditionalExpansion::AllBranchesForCompatibility,
+    )
+}
+
+fn compile_v4_route_plan_template_with_expansion(
+    service_name: &str,
+    view: &ServiceViewV4,
+    request: &RouteRequestContext,
+    conditional: ConditionalExpansion,
+) -> Result<RoutePlanTemplate> {
     let routing = effective_v4_routing(view);
     validate_route_provider_name_conflicts(service_name, view, &routing)?;
 
     let nodes = normalize_route_nodes(service_name, view, &routing)?;
-    let leaves = expand_v4_route_leaves(service_name, view, &routing, request)?;
+    let expansion = RouteExpansionContext {
+        request,
+        conditional,
+    };
+    let leaves = expand_v4_route_leaves(service_name, view, &routing, &expansion)?;
     ensure_unique_provider_leaves(service_name, &leaves)?;
 
     let expanded_provider_order = leaves
@@ -894,7 +935,7 @@ fn expand_v4_route_leaves(
     service_name: &str,
     view: &ServiceViewV4,
     routing: &RoutingConfigV4,
-    request: &RouteRequestContext,
+    expansion: &RouteExpansionContext<'_>,
 ) -> Result<Vec<RouteLeaf>> {
     if view.providers.is_empty() && routing.routes.is_empty() {
         return Ok(Vec::new());
@@ -917,7 +958,7 @@ fn expand_v4_route_leaves(
         routing,
         routing.entry.as_str(),
         &[],
-        request,
+        expansion,
         &mut stack,
     )
 }
@@ -928,7 +969,7 @@ fn expand_route_ref(
     routing: &RoutingConfigV4,
     child_name: &str,
     parent_path: &[String],
-    request: &RouteRequestContext,
+    expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     if view.providers.contains_key(child_name) {
@@ -946,7 +987,7 @@ fn expand_route_ref(
         routing,
         child_name,
         parent_path,
-        request,
+        expansion,
         stack,
     )
 }
@@ -957,7 +998,7 @@ fn expand_route_node(
     routing: &RoutingConfigV4,
     route_name: &str,
     parent_path: &[String],
-    request: &RouteRequestContext,
+    expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     if stack.iter().any(|name| name == route_name) {
@@ -986,7 +1027,7 @@ fn expand_route_node(
             route_name,
             node,
             &node_path,
-            request,
+            expansion,
             stack,
         ),
         RoutingPolicyV4::ManualSticky => expand_manual_sticky_route(
@@ -996,7 +1037,7 @@ fn expand_route_node(
             route_name,
             node,
             &node_path,
-            request,
+            expansion,
             stack,
         ),
         RoutingPolicyV4::TagPreferred => expand_tag_preferred_route(
@@ -1006,7 +1047,7 @@ fn expand_route_node(
             route_name,
             node,
             &node_path,
-            request,
+            expansion,
             stack,
         ),
         RoutingPolicyV4::Conditional => expand_conditional_route(
@@ -1016,7 +1057,7 @@ fn expand_route_node(
             route_name,
             node,
             &node_path,
-            request,
+            expansion,
             stack,
         ),
     };
@@ -1031,7 +1072,7 @@ fn expand_ordered_route_children(
     route_name: &str,
     node: &RoutingNodeV4,
     node_path: &[String],
-    request: &RouteRequestContext,
+    expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     if node.children.is_empty() {
@@ -1048,7 +1089,7 @@ fn expand_ordered_route_children(
             routing,
             child_name.as_str(),
             node_path,
-            request,
+            expansion,
             stack,
         )?);
     }
@@ -1062,7 +1103,7 @@ fn expand_manual_sticky_route(
     route_name: &str,
     node: &RoutingNodeV4,
     node_path: &[String],
-    request: &RouteRequestContext,
+    expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     let target = node
@@ -1086,7 +1127,7 @@ fn expand_manual_sticky_route(
         routing,
         target,
         node_path,
-        request,
+        expansion,
         stack,
     )
 }
@@ -1098,7 +1139,7 @@ fn expand_tag_preferred_route(
     route_name: &str,
     node: &RoutingNodeV4,
     node_path: &[String],
-    request: &RouteRequestContext,
+    expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     if node.children.is_empty() {
@@ -1119,7 +1160,7 @@ fn expand_tag_preferred_route(
             routing,
             child_name.as_str(),
             node_path,
-            request,
+            expansion,
             stack,
         )?;
         if child_route_matches_any_filter(view, &child_leaves, &node.prefer_tags) {
@@ -1149,7 +1190,7 @@ fn expand_conditional_route(
     route_name: &str,
     node: &RoutingNodeV4,
     node_path: &[String],
-    request: &RouteRequestContext,
+    expansion: &RouteExpansionContext<'_>,
     stack: &mut Vec<String>,
 ) -> Result<Vec<RouteLeaf>> {
     let condition = node.when.as_ref().with_context(|| {
@@ -1167,21 +1208,52 @@ fn expand_conditional_route(
     let default_route = node.default_route.as_deref().with_context(|| {
         format!("[{service_name}] conditional route '{route_name}' requires default")
     })?;
-    let selected = if request_matches_condition(request, condition) {
-        then
-    } else {
-        default_route
-    };
+    match expansion.conditional {
+        ConditionalExpansion::MatchRequest => {
+            let selected = if request_matches_condition(expansion.request, condition) {
+                then
+            } else {
+                default_route
+            };
+            expand_route_ref(
+                service_name,
+                view,
+                routing,
+                selected,
+                node_path,
+                expansion,
+                stack,
+            )
+        }
+        ConditionalExpansion::AllBranchesForCompatibility => {
+            let mut leaves = Vec::new();
+            leaves.extend(expand_route_ref(
+                service_name,
+                view,
+                routing,
+                then,
+                node_path,
+                expansion,
+                stack,
+            )?);
+            leaves.extend(expand_route_ref(
+                service_name,
+                view,
+                routing,
+                default_route,
+                node_path,
+                expansion,
+                stack,
+            )?);
+            dedupe_route_leaves_by_provider(&mut leaves);
+            Ok(leaves)
+        }
+    }
+}
 
-    expand_route_ref(
-        service_name,
-        view,
-        routing,
-        selected,
-        node_path,
-        request,
-        stack,
-    )
+fn dedupe_route_leaves_by_provider(leaves: &mut Vec<RouteLeaf>) {
+    let mut seen = BTreeSet::new();
+    leaves.retain(|leaf| seen.insert(leaf.provider_id.clone()));
 }
 
 pub(crate) fn request_matches_condition(

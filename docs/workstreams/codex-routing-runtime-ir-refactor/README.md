@@ -20,8 +20,9 @@ The v4 route graph already gives users a better authoring model:
 
 The original runtime path compiled that graph through the legacy v2 shape and
 then into a single `routing` station. P6 now keeps the loaded v4 graph beside a
-direct runtime compatibility config and drives non-pinned v4 requests through
-`RoutePlanExecutor`, but older station-oriented surfaces still need cleanup:
+route-plan-derived runtime compatibility config and drives non-pinned v4
+requests through `RoutePlanExecutor`, but older station-oriented surfaces still
+need cleanup:
 
 - route node paths are not preserved in request execution;
 - provider identity is mostly carried as an upstream tag;

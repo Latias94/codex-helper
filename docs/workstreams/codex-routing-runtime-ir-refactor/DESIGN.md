@@ -21,8 +21,9 @@ candidates.
 The P6 runtime path is now:
 
 1. load the v4 config as a sidecar next to a runtime compatibility config;
-2. compile v4 directly into a compatibility `ProxyConfig` for legacy state,
-   admin, and UI surfaces, without using the v2 bridge as the main compiler;
+2. compile v4 into a compatibility `RoutePlanTemplate`, then derive a
+   compatibility `ProxyConfig` for legacy state, admin, and UI surfaces without
+   using the v2 bridge as the main compiler;
 3. for non-pinned v4 requests, compile a request-aware `RoutePlanTemplate` from
    the preserved v4 graph;
 4. execute attempts through `RoutePlanExecutor`;

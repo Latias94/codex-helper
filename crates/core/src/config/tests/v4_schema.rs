@@ -416,7 +416,7 @@ fn v4_route_graph_rejects_missing_reference() {
     let err = compile_v4_to_runtime(&v4).expect_err("missing reference should fail");
     assert!(
         err.to_string()
-            .contains("routing entry references missing route node 'missing'")
+            .contains("routing references missing route or provider 'missing'")
     );
 }
 
