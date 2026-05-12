@@ -43,8 +43,8 @@ Acceptance:
 
 ## P1 - UI / UX
 
-- [ ] Show the full route graph in TUI and GUI.
-- [ ] Distinguish provider leaves from route nodes visually.
+- [x] Show the full route graph in TUI and GUI.
+- [x] Distinguish provider leaves from route nodes visually.
 - [ ] Explain why a node was chosen, skipped, or cooled down.
 - [x] Keep runtime health and config intent visually separate enough that balances do not rewrite static config.
 

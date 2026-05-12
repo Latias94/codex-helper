@@ -100,6 +100,21 @@ Rules:
 - Duplicate provider leaves are rejected because they make fallback behavior ambiguous.
 - Runtime health, cooldown, balance exhaustion, and reprobe state are not stored in static config.
 
+## Session Affinity
+
+Route graph session affinity is runtime state, not TOML config.
+
+For each request with a session id, codex-helper keys affinity by `session_id + service + route_graph_key`. While the route graph is unchanged, the same session tries to keep using the previously selected provider/endpoint. This improves upstream prompt-cache locality for relay providers that cache by account or upstream target.
+
+Affinity is not a hard pin:
+
+- request retry, provider health, capability mismatch, cooldown, and trusted balance exhaustion still apply;
+- if the sticky provider fails, the request continues through the current route graph and then sticks to the next successful provider;
+- if provider tags, route node strategy, children, entry, or provider endpoint identity change, the route graph key changes and old affinity no longer matches;
+- manual `routing pin` and session/global overrides remain explicit operator controls and can supersede automatic affinity.
+
+This means monthly pools such as `monthly_pool -> paygo` normally keep a conversation on one monthly provider until that provider stops being viable, instead of round-robining every request and reducing upstream cache hit rate.
+
 ## Recipes
 
 Pick one recipe first. You can refine fields later.
@@ -527,7 +542,9 @@ In that response, `provider_id`, `endpoint_id`, and `route_path` are the primary
 TUI and GUI should keep the same mental model as the config file:
 
 - Provider list: names, aliases, enabled state, tags, balance, and expanded fallback order.
-- Routing editor: entry strategy, target, children/order, preferred tags, and exhaustion behavior.
+- Routing editor: entry strategy, target, children/order, preferred tags, exhaustion behavior, and route graph tree preview.
+- GUI route node editor: create, rename, delete, and save nested route nodes for common graph edits.
+- Requests and sessions: provider choice, route affinity, retry chain, token/cache token usage, cache hit rate, and estimated cost.
 - Runtime steering: useful for temporary choices, but durable provider intent belongs in `[service.providers]` and `[service.routing]`.
 
 TUI routing editor shortcuts:

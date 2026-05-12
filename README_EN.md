@@ -27,9 +27,9 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
 - **Safe Codex patching**: only touches the local proxy fields in `~/.codex/config.toml`; unrelated Codex edits are preserved.
 - **Provider / routing config**: `version = 4` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
-- **Failover**: route around failed, unavailable, or trusted-exhausted candidates according to policy.
+- **Session affinity and failover**: each Codex session tries to keep using the selected provider, then falls through to other route candidates when requests fail, upstreams are unavailable, or trusted balance snapshots are exhausted.
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
-- **Request observability**: provider, model, tokens, cache tokens, TTFB, duration, output rate, retry chain, and estimated cost.
+- **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, and estimated cost.
 - **TUI and GUI**: built-in TUI for terminal use; GUI for local or attached operation.
 
 ## Quick Start
@@ -179,9 +179,9 @@ codex-helper --version
 Useful pages:
 
 - `Overview`: proxy status, current sessions, and recent requests.
-- `Routing` / `Stations`: provider order, balance/plan, tags, health, and routing preview.
-- `Sessions`: session identity, effective route, and per-session overrides.
-- `Stats` / `Requests`: tokens, cache tokens, latency, retries, cost, and request logs.
+- `Routing` / `Stations`: route graph, provider order, balance/plan, tags, health, and routing preview.
+- `Sessions`: session identity, effective route, route affinity, and per-session overrides.
+- `Stats` / `Requests`: tokens, cache tokens, cache hit rate, latency, retries, cost, and request logs.
 
 Shortcut hints are shown at the bottom. Under v4 config, durable provider/routing edits should go through the routing page, provider/routing CLI commands, or raw TOML. Press `R` after manual config edits to reload runtime config.
 
@@ -195,7 +195,7 @@ codex-helper-gui
 cargo run --release --features gui --bin codex-helper-gui
 ```
 
-The GUI can start or attach to a proxy, edit common single-endpoint providers and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
+The GUI can start or attach to a proxy, edit common single-endpoint providers, route nodes, and routing, and inspect requests, balances, pricing, sessions, health, breaker state, and control-plane status. Complex multi-endpoint providers, model mappings, and advanced fields should still be edited through CLI or raw TOML.
 
 ## File Locations
 

@@ -38,9 +38,9 @@ English: [README_EN.md](README_EN.md)
 - **本地代理**：默认监听 `127.0.0.1:3211`，Codex 继续按原方式使用。
 - **安全 Codex 局部修改**：只改本地代理片段，不影响 Codex 运行中写入的其他配置。
 - **provider / routing 配置**：`version = 4` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
-- **自动兜底**：请求失败、上游不可用或可信余额显示耗尽时，可按策略切换候选 provider/upstream。
+- **会话粘性与自动兜底**：同一 Codex 会话会尽量粘住已选 provider，请求失败、上游不可用或可信余额显示耗尽时再按策略切换候选 provider/upstream。
 - **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
-- **请求可观测**：记录 provider、model、token、cache token、TTFB、总耗时、输出速度、重试链和估算成本。
+- **请求可观测**：记录 provider、model、token、cache token、缓存命中率、TTFB、总耗时、输出速度、重试链和估算成本。
 - **TUI/GUI**：TUI 内置在命令行里；GUI 可作为本地控制台或 attached 控制台使用。
 
 ## 快速开始
@@ -191,9 +191,9 @@ codex-helper --version
 常用页面：
 
 - `Overview`：代理状态、当前会话和最近请求。
-- `Routing` / `Stations`：provider 顺序、余额/套餐、tags、健康状态和 routing 预览。
-- `Sessions`：session identity、effective route、单会话覆盖。
-- `Stats` / `Requests`：token、cache token、耗时、重试、成本和请求日志。
+- `Routing` / `Stations`：route graph、provider 顺序、余额/套餐、tags、健康状态和 routing 预览。
+- `Sessions`：session identity、effective route、route affinity、单会话覆盖。
+- `Stats` / `Requests`：token、cache token、缓存命中率、耗时、重试、成本和请求日志。
 
 常用快捷键会显示在底部。TUI 的持久化 provider/routing 编辑优先使用 routing 页面，手动改配置后可用 `R` 重新加载运行态配置。
 
@@ -207,7 +207,7 @@ codex-helper-gui
 cargo run --release --features gui --bin codex-helper-gui
 ```
 
-GUI 可以启动/附着本地代理，编辑常见单 endpoint provider 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
+GUI 可以启动/附着本地代理，编辑常见单 endpoint provider、route node 和 routing，查看请求、余额、价格目录、session、health、breaker 和控制面板状态。复杂多 endpoint provider、模型映射和高级字段仍建议用 CLI 或 raw TOML。
 
 ## 配置文件位置
 
