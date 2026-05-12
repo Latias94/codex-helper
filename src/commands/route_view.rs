@@ -4,8 +4,14 @@ use super::config_doc::{
     select_v4_service_view,
 };
 use crate::config::{
-    ServiceConfigManager, ServiceRoutingExplanation, ServiceViewV4, explain_service_routing,
-    storage::config_file_path,
+    ServiceConfig, ServiceConfigManager, ServiceRoutingExplanation, ServiceViewV4,
+    explain_service_routing, storage::config_file_path,
+};
+use crate::routing_explain::{
+    RoutingExplainResponse, RoutingExplainSkipReason, build_routing_explain_response,
+};
+use crate::routing_ir::{
+    RoutePlanRuntimeState, compile_legacy_route_plan_template, compile_v4_route_plan_template,
 };
 use crate::{CliError, CliResult, RoutingCommand};
 use serde::Serialize;
@@ -18,15 +24,6 @@ struct ConfigExplainProvider {
     enabled: bool,
     level: u8,
     upstreams: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ConfigExplainPayload {
-    schema_version: u32,
-    service: String,
-    active_provider: Option<String>,
-    routing: ServiceRoutingExplanation,
-    provider: Option<ConfigExplainProvider>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -56,15 +53,6 @@ struct ConfigExplainV4Routing {
     expanded_order: Vec<String>,
     prefer_tags: Vec<BTreeMap<String, String>>,
     on_exhausted: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ConfigExplainV4Payload {
-    schema_version: u32,
-    service: String,
-    routing: ConfigExplainV4Routing,
-    providers: Vec<ConfigExplainV4Provider>,
-    provider: Option<ConfigExplainV4Provider>,
 }
 
 fn explain_v4_routing(view: &ServiceViewV4) -> ConfigExplainV4Routing {
@@ -224,6 +212,122 @@ fn print_v4_explain_text(
     }
 
     Ok(())
+}
+
+fn clean_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn build_v4_runtime_explain(
+    service_name: &str,
+    view: &ServiceViewV4,
+    request_model: Option<String>,
+) -> anyhow::Result<RoutingExplainResponse> {
+    let template = compile_v4_route_plan_template(service_name, view)?;
+    Ok(build_routing_explain_response(
+        service_name,
+        None,
+        request_model,
+        None,
+        &template,
+        &RoutePlanRuntimeState::default(),
+    ))
+}
+
+fn build_legacy_runtime_explain(
+    service_name: &str,
+    mgr: &ServiceConfigManager,
+    routing: &ServiceRoutingExplanation,
+    request_model: Option<String>,
+) -> RoutingExplainResponse {
+    let services = legacy_runtime_services_for_explain(mgr, routing);
+    let template = compile_legacy_route_plan_template(service_name, services);
+    build_routing_explain_response(
+        service_name,
+        None,
+        request_model,
+        None,
+        &template,
+        &RoutePlanRuntimeState::default(),
+    )
+}
+
+fn legacy_runtime_services_for_explain<'a>(
+    mgr: &'a ServiceConfigManager,
+    routing: &ServiceRoutingExplanation,
+) -> Vec<&'a ServiceConfig> {
+    let names = if routing.eligible_stations.is_empty() {
+        routing
+            .fallback_station
+            .as_ref()
+            .map(|candidate| vec![candidate.name.as_str()])
+            .unwrap_or_default()
+    } else {
+        routing
+            .eligible_stations
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>()
+    };
+
+    names
+        .into_iter()
+        .filter_map(|name| mgr.station(name))
+        .collect()
+}
+
+fn print_runtime_explain_text(explain: &RoutingExplainResponse) {
+    if let Some(model) = explain.request_model.as_deref() {
+        println!("Request model: {model}");
+    }
+    if let Some(selected) = &explain.selected_route {
+        println!(
+            "Selected route: {} endpoint={} station={} upstream#{} path=[{}]",
+            selected.provider_id,
+            selected.endpoint_id,
+            selected.station_name,
+            selected.upstream_index,
+            selected.route_path.join(" > ")
+        );
+    } else {
+        println!("Selected route: <none>");
+    }
+
+    if explain.candidates.is_empty() {
+        println!("Runtime candidates: <empty>");
+        return;
+    }
+
+    println!("Runtime candidates:");
+    for (idx, candidate) in explain.candidates.iter().enumerate() {
+        let marker = if candidate.selected { "*" } else { " " };
+        let skips = format_skip_reasons(&candidate.skip_reasons);
+        println!(
+            "  {} {}. {} endpoint={} station={} upstream#{} skip={} path=[{}]",
+            marker,
+            idx + 1,
+            candidate.provider_id,
+            candidate.endpoint_id,
+            candidate.station_name,
+            candidate.upstream_index,
+            skips,
+            candidate.route_path.join(" > ")
+        );
+    }
+}
+
+fn format_skip_reasons(reasons: &[RoutingExplainSkipReason]) -> String {
+    if reasons.is_empty() {
+        return "-".to_string();
+    }
+
+    reasons
+        .iter()
+        .map(RoutingExplainSkipReason::code)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn build_group_explain(
@@ -396,6 +500,7 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
             claude,
             json,
             provider,
+            model,
         } => {
             let service = resolve_service(codex, claude)
                 .await
@@ -403,30 +508,29 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
             let document = load_config_document()
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let request_model = clean_optional(model);
 
             if let ConfigDocument::V4(cfg) = &document {
                 let (view, label) = select_v4_service_view(cfg, service);
+                let runtime_explain =
+                    build_v4_runtime_explain(service, view, request_model.clone())
+                        .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 if json {
-                    let provider = if let Some(provider_name) = provider.as_deref() {
-                        Some(explain_v4_provider(view, provider_name).ok_or_else(|| {
-                            CliError::ProxyConfig(format!("provider '{}' not found", provider_name))
-                        })?)
-                    } else {
-                        None
-                    };
-                    let payload = ConfigExplainV4Payload {
-                        schema_version: document.schema_version(),
-                        service: service.to_string(),
-                        routing: explain_v4_routing(view),
-                        providers: explain_v4_providers(view),
-                        provider,
-                    };
-                    let text = serde_json::to_string_pretty(&payload)
+                    if let Some(provider_name) = provider.as_deref()
+                        && explain_v4_provider(view, provider_name).is_none()
+                    {
+                        return Err(CliError::ProxyConfig(format!(
+                            "provider '{}' not found",
+                            provider_name
+                        )));
+                    }
+                    let text = serde_json::to_string_pretty(&runtime_explain)
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                     println!("{text}");
                 } else {
                     print_v4_explain_text(label, view, provider.as_deref())
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+                    print_runtime_explain_text(&runtime_explain);
                 }
                 return Ok(());
             }
@@ -438,16 +542,19 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
             let routing = explain_service_routing(mgr);
             let group_detail = build_group_explain(mgr, provider.as_deref())
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let runtime_explain =
+                build_legacy_runtime_explain(service, mgr, &routing, request_model);
 
             if json {
-                let payload = ConfigExplainPayload {
-                    schema_version: document.schema_version(),
-                    service: service.to_string(),
-                    active_provider: mgr.active.clone(),
-                    routing,
-                    provider: group_detail,
-                };
-                let text = serde_json::to_string_pretty(&payload)
+                if let Some(provider_name) = provider.as_deref()
+                    && group_detail.is_none()
+                {
+                    return Err(CliError::ProxyConfig(format!(
+                        "provider '{}' not found",
+                        provider_name
+                    )));
+                }
+                let text = serde_json::to_string_pretty(&runtime_explain)
                     .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 println!("{text}");
             } else {
@@ -457,10 +564,77 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
                     &routing,
                     group_detail.as_ref(),
                 );
+                print_runtime_explain_text(&runtime_explain);
             }
         }
         _ => unreachable!("route view handles only routing list/explain"),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ProviderConfigV4, RoutingConfigV4, UpstreamAuth};
+
+    fn provider(base_url: &str, supported_models: &[&str]) -> ProviderConfigV4 {
+        ProviderConfigV4 {
+            base_url: Some(base_url.to_string()),
+            inline_auth: UpstreamAuth::default(),
+            supported_models: supported_models
+                .iter()
+                .map(|model| ((*model).to_string(), true))
+                .collect(),
+            ..ProviderConfigV4::default()
+        }
+    }
+
+    #[test]
+    fn v4_runtime_explain_json_contract_reports_selected_route_and_model_skips() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "old".to_string(),
+                    provider("https://old.example/v1", &["gpt-4.1"]),
+                ),
+                (
+                    "new".to_string(),
+                    provider("https://new.example/v1", &["gpt-5"]),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "old".to_string(),
+                "new".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+
+        let explain = build_v4_runtime_explain("codex", &view, Some("gpt-5".to_string()))
+            .expect("runtime explain");
+        let value = serde_json::to_value(&explain).expect("serialize runtime explain");
+
+        assert_eq!(value["api_version"].as_u64(), Some(1));
+        assert_eq!(value["service_name"].as_str(), Some("codex"));
+        assert_eq!(value["request_model"].as_str(), Some("gpt-5"));
+        assert!(value["runtime_loaded_at_ms"].is_null());
+        assert_eq!(value["selected_route"]["provider_id"].as_str(), Some("new"));
+        assert_eq!(
+            value["selected_route"]["route_path"]
+                .as_array()
+                .map(|items| items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .collect::<Vec<_>>()),
+            Some(vec!["main", "new"])
+        );
+        assert_eq!(
+            value["candidates"][0]["skip_reasons"][0]["code"].as_str(),
+            Some("unsupported_model")
+        );
+        assert_eq!(
+            value["candidates"][0]["skip_reasons"][0]["requested_model"].as_str(),
+            Some("gpt-5")
+        );
+    }
 }

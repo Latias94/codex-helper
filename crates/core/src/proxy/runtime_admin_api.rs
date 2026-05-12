@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -6,11 +5,9 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 
 use crate::config::ProxyConfig;
-use crate::lb::{LoadBalancer, SelectedUpstream};
-use crate::routing_ir::{
-    RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanSkipReason,
-    compile_legacy_route_plan_template,
-};
+use crate::lb::LoadBalancer;
+use crate::routing_explain::{RoutingExplainResponse, build_routing_explain_response};
+use crate::routing_ir::compile_legacy_route_plan_template;
 
 use super::ProxyService;
 use super::api_responses::{
@@ -80,41 +77,6 @@ pub(super) struct RoutingExplainQuery {
     session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub(super) struct RoutingExplainResponse {
-    api_version: u32,
-    service_name: String,
-    runtime_loaded_at_ms: u64,
-    request_model: Option<String>,
-    session_id: Option<String>,
-    selected_route: Option<RoutingExplainCandidate>,
-    candidates: Vec<RoutingExplainCandidate>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(super) struct RoutingExplainCandidate {
-    provider_id: String,
-    provider_alias: Option<String>,
-    endpoint_id: String,
-    route_path: Vec<String>,
-    station_name: String,
-    upstream_index: usize,
-    upstream_base_url: String,
-    selected: bool,
-    skip_reasons: Vec<RoutingExplainSkipReason>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "code", rename_all = "snake_case")]
-pub(super) enum RoutingExplainSkipReason {
-    UnsupportedModel { requested_model: String },
-    RuntimeDisabled,
-    Cooldown,
-    BreakerOpen { failure_count: u32 },
-    UsageExhausted,
-    MissingAuth,
-}
-
 impl RequestLedgerSummaryQuery {
     fn filters(&self) -> crate::request_ledger::RequestLogFilters {
         crate::request_ledger::RequestLogFilters {
@@ -143,27 +105,6 @@ impl RoutingExplainQuery {
 
     fn session_id(&self) -> Option<String> {
         clean_filter(self.session_id.clone()).or_else(|| clean_filter(self.session.clone()))
-    }
-}
-
-impl From<&RoutePlanSkipReason> for RoutingExplainSkipReason {
-    fn from(reason: &RoutePlanSkipReason) -> Self {
-        match reason {
-            RoutePlanSkipReason::UnsupportedModel { requested_model } => {
-                RoutingExplainSkipReason::UnsupportedModel {
-                    requested_model: requested_model.clone(),
-                }
-            }
-            RoutePlanSkipReason::RuntimeDisabled => RoutingExplainSkipReason::RuntimeDisabled,
-            RoutePlanSkipReason::Cooldown => RoutingExplainSkipReason::Cooldown,
-            RoutePlanSkipReason::BreakerOpen { failure_count } => {
-                RoutingExplainSkipReason::BreakerOpen {
-                    failure_count: *failure_count,
-                }
-            }
-            RoutePlanSkipReason::UsageExhausted => RoutingExplainSkipReason::UsageExhausted,
-            RoutePlanSkipReason::MissingAuth => RoutingExplainSkipReason::MissingAuth,
-        }
     }
 }
 
@@ -198,62 +139,15 @@ pub(super) async fn get_routing_explain(
         proxy.service_name,
         lbs.iter().map(|lb| lb.service.as_ref()),
     );
-    let executor = RoutePlanExecutor::new(&template);
     let runtime = route_plan_runtime_state_from_lbs(&lbs);
-    let mut state = RoutePlanAttemptState::default();
-    let selection = executor.select_supported_candidate_with_runtime_state(
-        &mut state,
-        &runtime,
-        request_model.as_deref(),
-    );
-    let selected_key = selection
-        .selected
-        .as_ref()
-        .map(|selected| candidate_key(&selected.selected_upstream));
-    let skip_reasons_by_candidate = executor
-        .explain_candidate_skip_reasons_with_runtime_state(&runtime, request_model.as_deref())
-        .into_iter()
-        .map(|explanation| {
-            (
-                candidate_key(&explanation.selected_upstream),
-                explanation
-                    .reasons
-                    .iter()
-                    .map(RoutingExplainSkipReason::from)
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    let candidates = executor
-        .iter_selected_upstreams()
-        .map(|selected| {
-            let key = candidate_key(&selected.selected_upstream);
-            routing_explain_candidate(
-                selected.candidate,
-                &selected.selected_upstream,
-                selected_key.as_ref() == Some(&key),
-                skip_reasons_by_candidate
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let selected_route = candidates
-        .iter()
-        .find(|candidate| candidate.selected)
-        .cloned();
-
-    Ok(Json(RoutingExplainResponse {
-        api_version: 1,
-        service_name: proxy.service_name.to_string(),
-        runtime_loaded_at_ms: proxy.config.last_loaded_at_ms(),
+    Ok(Json(build_routing_explain_response(
+        proxy.service_name,
+        Some(proxy.config.last_loaded_at_ms()),
         request_model,
         session_id,
-        selected_route,
-        candidates,
-    }))
+        &template,
+        &runtime,
+    )))
 }
 
 pub(super) async fn get_request_ledger_recent(
@@ -320,29 +214,6 @@ async fn routing_explain_load_balancers(
         .into_iter()
         .map(|candidate| LoadBalancer::new(Arc::new(candidate.service), proxy.lb_states.clone()))
         .collect()
-}
-
-fn candidate_key(selected: &SelectedUpstream) -> (String, usize) {
-    (selected.station_name.clone(), selected.index)
-}
-
-fn routing_explain_candidate(
-    candidate: &RouteCandidate,
-    selected_upstream: &SelectedUpstream,
-    selected: bool,
-    skip_reasons: Vec<RoutingExplainSkipReason>,
-) -> RoutingExplainCandidate {
-    RoutingExplainCandidate {
-        provider_id: candidate.provider_id.clone(),
-        provider_alias: candidate.provider_alias.clone(),
-        endpoint_id: candidate.endpoint_id.clone(),
-        route_path: candidate.route_path.clone(),
-        station_name: selected_upstream.station_name.clone(),
-        upstream_index: selected_upstream.index,
-        upstream_base_url: selected_upstream.upstream.base_url.clone(),
-        selected,
-        skip_reasons,
-    }
 }
 
 pub(super) async fn get_request_ledger_summary(

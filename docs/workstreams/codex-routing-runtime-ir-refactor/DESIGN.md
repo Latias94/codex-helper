@@ -305,6 +305,9 @@ The first stable runtime admin surface is
 `GET /__codex_helper/api/v1/routing/explain`. It returns the selected route,
 all current runtime candidates, `route_path`, `endpoint_id`, and structured
 `skip_reasons` objects tagged by `code`.
+The CLI `routing explain --json` uses the same response contract, with
+`runtime_loaded_at_ms` set to `null` when it explains the local compiled config
+without a running proxy snapshot.
 
 ## Testing Strategy
 

@@ -84,7 +84,7 @@ Acceptance:
 - [x] Include route path in attempt logs and request history.
 - [x] Add admin API runtime explain output with selected route, candidates,
   and skip reasons.
-- [ ] Extend CLI `routing explain` with the same runtime explain contract.
+- [x] Extend CLI `routing explain` with the same runtime explain contract.
 - [ ] Update GUI/TUI only after the API shape is stable.
 
 Acceptance:

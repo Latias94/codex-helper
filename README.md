@@ -159,6 +159,7 @@ codex-helper provider disable input
 codex-helper provider enable input
 codex-helper routing show
 codex-helper routing explain
+codex-helper routing explain --model gpt-5 --json
 
 # 会话
 codex-helper session list

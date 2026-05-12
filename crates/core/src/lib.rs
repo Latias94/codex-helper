@@ -14,6 +14,7 @@ pub mod notify;
 pub mod pricing;
 pub mod proxy;
 pub mod request_ledger;
+pub mod routing_explain;
 pub mod routing_ir;
 pub mod runtime_candidate_state;
 pub mod runtime_identity;

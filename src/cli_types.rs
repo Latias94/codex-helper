@@ -268,6 +268,9 @@ pub enum RoutingCommand {
         /// Show details for a single provider
         #[arg(long)]
         provider: Option<String>,
+        /// Explain selection for a requested model
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Patch routing fields directly
     Set {

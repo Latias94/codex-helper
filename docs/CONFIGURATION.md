@@ -519,6 +519,7 @@ The CLI preserves existing v4 graph structure when it only edits the entry node.
 Use `--claude` on provider/routing commands when editing the Claude service instead of Codex.
 
 `routing show` reads persisted config. `routing list` and `routing explain` read the compiled runtime candidate view.
+Use `routing explain --model <MODEL> --json` to inspect the same selected route, candidate order, route paths, and structured skip reasons exposed by the runtime admin explain API.
 
 ## UI Editing
 
