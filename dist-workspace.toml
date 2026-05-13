@@ -5,7 +5,7 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.31.0"
-# Build with GUI support enabled so the `codex-helper-gui` binary (required-features=["gui"]) is produced.
+# Features to pass to cargo build
 features = ["gui"]
 # CI backends to support
 ci = "github"
