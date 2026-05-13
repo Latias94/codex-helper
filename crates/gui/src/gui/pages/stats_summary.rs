@@ -64,9 +64,8 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
             if window.usage.has_cache_tokens() {
                 ui.label(pick(ctx.lang, "Cache Tokens", "Cache tokens"));
                 ui.label(format!(
-                    "cached={}  read={}  create={}",
-                    tokens_short(window.usage.cached_input_tokens),
-                    tokens_short(window.usage.cache_read_input_tokens),
+                    "read={}  create={}",
+                    tokens_short(window.usage.cache_read_tokens_total()),
                     tokens_short(window.usage.cache_creation_tokens_total())
                 ));
                 ui.end_row();

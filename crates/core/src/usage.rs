@@ -275,8 +275,7 @@ fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
     {
         m.cached_input_tokens = to_i64(v);
         recognized = true;
-    }
-    if let Some(details) = usage_obj
+    } else if let Some(details) = usage_obj
         .get("prompt_tokens_details")
         .or_else(|| usage_obj.get("prompt_token_details"))
         .and_then(|v| v.as_object())
@@ -284,13 +283,10 @@ fn usage_from_value(usage_obj: &Value) -> Option<UsageMetrics> {
     {
         m.cached_input_tokens = to_i64(v);
         recognized = true;
-    }
-
-    if let Some(v) = usage_obj.get("cached_input_tokens") {
+    } else if let Some(v) = usage_obj.get("cached_input_tokens") {
         m.cached_input_tokens = to_i64(v);
         recognized = true;
-    }
-    if let Some(v) = usage_obj
+    } else if let Some(v) = usage_obj
         .get("cache_read_input_tokens")
         .or_else(|| usage_obj.get("cache_read_tokens"))
     {
@@ -514,6 +510,28 @@ mod tests {
                 output_tokens: 20,
                 reasoning_tokens: 7,
                 reasoning_output_tokens: 7,
+                cached_input_tokens: 40,
+                total_tokens: 120,
+                ..UsageMetrics::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_openai_cached_tokens_before_direct_cache_read_tokens() {
+        let json = r#"{
+          "usage":{
+            "input_tokens":100,
+            "output_tokens":20,
+            "input_tokens_details":{"cached_tokens":40},
+            "cache_read_input_tokens":30
+          }
+        }"#;
+        assert_eq!(
+            extract_usage_from_bytes(json.as_bytes()),
+            Some(UsageMetrics {
+                input_tokens: 100,
+                output_tokens: 20,
                 cached_input_tokens: 40,
                 total_tokens: 120,
                 ..UsageMetrics::default()

@@ -327,7 +327,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "budget" => "预算",
         "binding" => "绑定",
         "cache" => "缓存",
-        "cache cached/read/create" => "缓存 总/读/新建",
+        "cache read/create" => "缓存 读/新建",
         "cache hit" => "缓存命中",
         "cache hit rate" => "缓存命中率",
         "Hit%" => "命中率",

@@ -134,10 +134,9 @@ fn fmt_usage_line(u: &UsageMetrics, lang: Language) -> String {
     );
     if u.has_cache_tokens() {
         line.push_str(&format!(
-            " {}: {}/{}/{}",
-            i18n::label(lang, "cache"),
-            tokens_short(u.cached_input_tokens),
-            tokens_short(u.cache_read_input_tokens),
+            " {}: {}/{}",
+            i18n::label(lang, "cache read/create"),
+            tokens_short(u.cache_read_tokens_total()),
             tokens_short(u.cache_creation_tokens_total())
         ));
     }

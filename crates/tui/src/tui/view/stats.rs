@@ -708,7 +708,7 @@ fn render_detail_panel(
             Span::styled(
                 format!(
                     "{}/{}",
-                    tokens_short(bucket.usage.cache_read_input_tokens),
+                    tokens_short(bucket.usage.cache_read_tokens_total()),
                     tokens_short(bucket.usage.cache_creation_tokens_total()),
                 ),
                 Style::default().fg(p.muted),

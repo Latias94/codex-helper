@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
+### 修复 / Fixed
+
+- 请求用量里的缓存读数改为单一口径，`cached_input_tokens` 不再和 `cache_read_input_tokens` 叠加，详情页和统计视图现在展示一致的读缓存/新缓存值。
+  Request usage cache accounting now uses a single read-cache total; `cached_input_tokens` no longer stacks with `cache_read_input_tokens`, and detail/stat views now show consistent read-cache/new-cache values.
+
 ## [0.14.0] - 2026-05-12
 
 ### 破坏性变更 / Breaking

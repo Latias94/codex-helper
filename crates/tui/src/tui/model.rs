@@ -1215,10 +1215,9 @@ pub(in crate::tui) fn usage_line_lang(usage: &UsageMetrics, lang: Language) -> S
     );
     if usage.has_cache_tokens() {
         line.push_str(&format!(
-            " {}: {}/{}/{}",
-            i18n::label(lang, "cache cached/read/create"),
-            tokens_short(usage.cached_input_tokens),
-            tokens_short(usage.cache_read_input_tokens),
+            " {}: {}/{}",
+            i18n::label(lang, "cache read/create"),
+            tokens_short(usage.cache_read_tokens_total()),
             tokens_short(usage.cache_creation_tokens_total())
         ));
     }

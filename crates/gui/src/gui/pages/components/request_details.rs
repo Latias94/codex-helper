@@ -680,12 +680,8 @@ fn request_token_rows(
             cache.effective_input_tokens.to_string(),
         ));
         rows.push((
-            "cached_input".to_string(),
-            usage.cached_input_tokens.to_string(),
-        ));
-        rows.push((
             "cache_read".to_string(),
-            usage.cache_read_input_tokens.to_string(),
+            usage.cache_read_tokens_total().to_string(),
         ));
         rows.push((
             "cache_create".to_string(),

@@ -157,9 +157,8 @@ pub(super) fn usage_line(usage: &UsageMetrics) -> String {
     );
     if usage.has_cache_tokens() {
         line.push_str(&format!(
-            " cache cached/read/create: {}/{}/{}",
-            tokens_short(usage.cached_input_tokens),
-            tokens_short(usage.cache_read_input_tokens),
+            " cache read/create: {}/{}",
+            tokens_short(usage.cache_read_tokens_total()),
             tokens_short(usage.cache_creation_tokens_total())
         ));
     }
