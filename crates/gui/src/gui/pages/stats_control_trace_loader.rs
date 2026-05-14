@@ -204,6 +204,9 @@ fn resolved_control_trace_event(entry: &ControlTraceLogEntry) -> Option<String> 
             ControlTraceDetail::RouteExecutorShadowMismatch { .. } => {
                 "route_executor_shadow_mismatch".to_string()
             }
+            ControlTraceDetail::RouteGraphSelectionExplain { .. } => {
+                "route_graph_selection_explain".to_string()
+            }
             ControlTraceDetail::RetryEvent { event_name, .. } => event_name,
         })
     })
@@ -227,6 +230,9 @@ mod tests {
                 upstream_index: Some(0),
                 upstream_base_url: None,
                 provider_id: Some("right".to_string()),
+                endpoint_id: Some("default".to_string()),
+                provider_endpoint_key: Some("codex/right/default".to_string()),
+                preference_group: Some(0),
                 model: Some("gpt-5".to_string()),
             }),
             payload: serde_json::json!({}),

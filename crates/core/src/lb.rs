@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::config::{ServiceConfig, UpstreamConfig};
+use crate::runtime_identity::ProviderEndpointKey;
 use tracing::info;
 
 pub const FAILURE_THRESHOLD: u32 = 3;
@@ -15,7 +16,7 @@ pub struct CooldownBackoff {
 }
 
 impl CooldownBackoff {
-    fn effective_cooldown_secs(&self, base_secs: u64, penalty_streak: u32) -> u64 {
+    pub(crate) fn effective_cooldown_secs(&self, base_secs: u64, penalty_streak: u32) -> u64 {
         if base_secs == 0 {
             return 0;
         }
@@ -50,6 +51,35 @@ pub struct LbState {
 }
 
 impl LbState {
+    pub(crate) fn ensure_layout(&mut self, service_name: &str, upstreams: &[UpstreamConfig]) {
+        let signature = upstreams
+            .iter()
+            .enumerate()
+            .map(|(idx, upstream)| upstream_signature_key(service_name, idx, upstream))
+            .collect::<Vec<_>>();
+        let legacy_signature = upstreams
+            .iter()
+            .map(|upstream| upstream.base_url.clone())
+            .collect::<Vec<_>>();
+
+        if has_duplicate_signatures(&signature) {
+            self.reset_for_layout(signature);
+            return;
+        }
+
+        let len = upstreams.len();
+        if self.upstream_signature == signature
+            && self.failure_counts.len() == len
+            && self.cooldown_until.len() == len
+            && self.usage_exhausted.len() == len
+            && self.penalty_streak.len() == len
+        {
+            return;
+        }
+
+        self.migrate_layout(signature, legacy_signature);
+    }
+
     fn reset_for_layout(&mut self, signature: Vec<String>) {
         let len = signature.len();
         self.failure_counts = vec![0; len];
@@ -61,25 +91,96 @@ impl LbState {
         self.upstream_signature = signature;
     }
 
-    pub(crate) fn ensure_layout(&mut self, upstreams: &[UpstreamConfig]) {
-        let signature = upstreams
-            .iter()
-            .map(|upstream| upstream.base_url.clone())
-            .collect::<Vec<_>>();
-        if self.upstream_signature != signature {
+    fn migrate_layout(&mut self, signature: Vec<String>, legacy_signature: Vec<String>) {
+        if self.upstream_signature.is_empty() {
             self.reset_for_layout(signature);
             return;
         }
 
-        let len = upstreams.len();
-        if self.failure_counts.len() != len
-            || self.cooldown_until.len() != len
-            || self.usage_exhausted.len() != len
-            || self.penalty_streak.len() != len
-        {
+        let old_signature = std::mem::take(&mut self.upstream_signature);
+        if has_duplicate_signatures(&old_signature) {
             self.reset_for_layout(signature);
+            return;
         }
+
+        let old_index_by_signature = old_signature
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| (key.clone(), idx))
+            .collect::<std::collections::HashMap<_, _>>();
+        let legacy_fallback_enabled = !has_duplicate_signatures(&legacy_signature);
+
+        let old_failure_counts = std::mem::take(&mut self.failure_counts);
+        let old_cooldown_until = std::mem::take(&mut self.cooldown_until);
+        let old_usage_exhausted = std::mem::take(&mut self.usage_exhausted);
+        let old_penalty_streak = std::mem::take(&mut self.penalty_streak);
+        let old_last_good_index = self.last_good_index.take();
+
+        let len = signature.len();
+        self.failure_counts = vec![0; len];
+        self.cooldown_until = vec![None; len];
+        self.usage_exhausted = vec![false; len];
+        self.penalty_streak = vec![0; len];
+
+        for (new_idx, key) in signature.iter().enumerate() {
+            let old_idx = old_index_by_signature.get(key).copied().or_else(|| {
+                legacy_fallback_enabled
+                    .then(|| legacy_signature.get(new_idx))
+                    .flatten()
+                    .and_then(|legacy_key| old_index_by_signature.get(legacy_key).copied())
+            });
+            let Some(old_idx) = old_idx else {
+                continue;
+            };
+            self.failure_counts[new_idx] = old_failure_counts.get(old_idx).copied().unwrap_or(0);
+            self.cooldown_until[new_idx] = old_cooldown_until.get(old_idx).and_then(|until| *until);
+            self.usage_exhausted[new_idx] =
+                old_usage_exhausted.get(old_idx).copied().unwrap_or(false);
+            self.penalty_streak[new_idx] = old_penalty_streak.get(old_idx).copied().unwrap_or(0);
+        }
+
+        self.last_good_index = old_last_good_index.and_then(|old_idx| {
+            old_signature.get(old_idx).and_then(|key| {
+                signature
+                    .iter()
+                    .position(|new_key| new_key == key)
+                    .or_else(|| {
+                        legacy_fallback_enabled
+                            .then(|| {
+                                legacy_signature
+                                    .iter()
+                                    .position(|legacy_key| legacy_key == key)
+                            })
+                            .flatten()
+                    })
+            })
+        });
+        self.upstream_signature = signature;
     }
+}
+
+fn has_duplicate_signatures(values: &[String]) -> bool {
+    let mut seen = HashSet::new();
+    values.iter().any(|value| !seen.insert(value))
+}
+
+fn upstream_signature_key(
+    service_name: &str,
+    upstream_index: usize,
+    upstream: &UpstreamConfig,
+) -> String {
+    let provider_id = upstream
+        .tags
+        .get("provider_id")
+        .cloned()
+        .unwrap_or_else(|| format!("{service_name}#{upstream_index}"));
+    let endpoint_id = upstream
+        .tags
+        .get("endpoint_id")
+        .cloned()
+        .unwrap_or_else(|| upstream_index.to_string());
+    let provider_endpoint = ProviderEndpointKey::new(service_name, provider_id, endpoint_id);
+    format!("{}|{}", provider_endpoint.stable_key(), upstream.base_url)
 }
 
 /// Upstream selection result
@@ -132,7 +233,7 @@ impl LoadBalancer {
             Err(e) => e.into_inner(),
         };
         let entry = map.entry(self.service.name.clone()).or_default();
-        entry.ensure_layout(&self.service.upstreams);
+        entry.ensure_layout(self.service.name.as_str(), &self.service.upstreams);
 
         let now = std::time::Instant::now();
 
@@ -247,7 +348,7 @@ impl LoadBalancer {
         let entry = map
             .entry(self.service.name.clone())
             .or_insert_with(LbState::default);
-        entry.ensure_layout(&self.service.upstreams);
+        entry.ensure_layout(self.service.name.as_str(), &self.service.upstreams);
         if index >= entry.failure_counts.len() {
             return;
         }
@@ -286,7 +387,7 @@ impl LoadBalancer {
         let entry = map
             .entry(self.service.name.clone())
             .or_insert_with(LbState::default);
-        entry.ensure_layout(&self.service.upstreams);
+        entry.ensure_layout(self.service.name.as_str(), &self.service.upstreams);
         if index >= entry.failure_counts.len() {
             return;
         }
@@ -370,6 +471,36 @@ mod tests {
         }
     }
 
+    fn make_provider_endpoint_service(
+        name: &str,
+        upstreams: &[(&str, &str, &str)],
+    ) -> ServiceConfig {
+        ServiceConfig {
+            name: name.to_string(),
+            alias: None,
+            enabled: true,
+            level: 1,
+            upstreams: upstreams
+                .iter()
+                .map(|(base_url, provider_id, endpoint_id)| UpstreamConfig {
+                    base_url: (*base_url).to_string(),
+                    auth: UpstreamAuth {
+                        auth_token: Some("sk-test".to_string()),
+                        auth_token_env: None,
+                        api_key: None,
+                        api_key_env: None,
+                    },
+                    tags: HashMap::from([
+                        ("provider_id".to_string(), (*provider_id).to_string()),
+                        ("endpoint_id".to_string(), (*endpoint_id).to_string()),
+                    ]),
+                    supported_models: HashMap::new(),
+                    model_mapping: HashMap::new(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn lb_prefers_non_exhausted_upstream_when_available() {
         let service = make_service(
@@ -389,7 +520,7 @@ mod tests {
             let entry = guard
                 .entry("codex-main".to_string())
                 .or_insert_with(LbState::default);
-            entry.ensure_layout(&lb.service.upstreams);
+            entry.ensure_layout(lb.service.name.as_str(), &lb.service.upstreams);
             entry.usage_exhausted[0] = true;
             entry.usage_exhausted[1] = false;
         }
@@ -416,7 +547,7 @@ mod tests {
             let entry = guard
                 .entry("codex-main".to_string())
                 .or_insert_with(LbState::default);
-            entry.ensure_layout(&lb.service.upstreams);
+            entry.ensure_layout(lb.service.name.as_str(), &lb.service.upstreams);
             entry.usage_exhausted[0] = true;
             entry.usage_exhausted[1] = true;
         }
@@ -442,7 +573,7 @@ mod tests {
             let entry = guard
                 .entry("codex-main".to_string())
                 .or_insert_with(LbState::default);
-            entry.ensure_layout(&lb.service.upstreams);
+            entry.ensure_layout(lb.service.name.as_str(), &lb.service.upstreams);
             entry.usage_exhausted[0] = true;
             entry.usage_exhausted[1] = true;
         }
@@ -494,6 +625,153 @@ mod tests {
         let guard = states.lock().unwrap();
         let entry = guard.get("codex-main").expect("state exists");
         assert_eq!(entry.failure_counts, vec![0, 0]);
+        assert_eq!(entry.last_good_index, None);
+    }
+
+    #[test]
+    fn lb_migrates_state_when_provider_endpoint_order_changes() {
+        let states = Arc::new(Mutex::new(HashMap::new()));
+        let initial = LoadBalancer::new(
+            Arc::new(make_provider_endpoint_service(
+                "routing",
+                &[
+                    ("https://primary.example", "primary", "default"),
+                    ("https://backup.example", "backup", "default"),
+                ],
+            )),
+            states.clone(),
+        );
+
+        {
+            let mut guard = states.lock().unwrap();
+            let entry = guard
+                .entry("routing".to_string())
+                .or_insert_with(LbState::default);
+            entry.ensure_layout(initial.service.name.as_str(), &initial.service.upstreams);
+            entry.failure_counts[0] = 2;
+            entry.cooldown_until[0] =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+            entry.penalty_streak[0] = 3;
+            entry.usage_exhausted[1] = true;
+            entry.last_good_index = Some(1);
+        }
+
+        let reordered = LoadBalancer::new(
+            Arc::new(make_provider_endpoint_service(
+                "routing",
+                &[
+                    ("https://backup.example", "backup", "default"),
+                    ("https://primary.example", "primary", "default"),
+                ],
+            )),
+            states.clone(),
+        );
+        let selected = reordered
+            .select_upstream()
+            .expect("should select a migrated non-exhausted upstream");
+        assert_eq!(selected.index, 1);
+
+        let guard = states.lock().unwrap();
+        let entry = guard.get("routing").expect("state exists");
+        assert_eq!(entry.failure_counts, vec![0, 2]);
+        assert_eq!(entry.usage_exhausted, vec![true, false]);
+        assert_eq!(entry.penalty_streak, vec![0, 3]);
+        assert!(entry.cooldown_until[0].is_none());
+        assert!(entry.cooldown_until[1].is_some());
+        assert_eq!(entry.last_good_index, Some(0));
+    }
+
+    #[test]
+    fn lb_migrates_legacy_base_url_signature_when_endpoint_identity_is_unambiguous() {
+        let states = Arc::new(Mutex::new(HashMap::new()));
+        let primary_url = "https://primary.example";
+        let backup_url = "https://backup.example";
+
+        {
+            let mut guard = states.lock().unwrap();
+            guard.insert(
+                "routing".to_string(),
+                LbState {
+                    failure_counts: vec![FAILURE_THRESHOLD, 0],
+                    cooldown_until: vec![None, None],
+                    usage_exhausted: vec![false, true],
+                    last_good_index: Some(1),
+                    penalty_streak: vec![2, 0],
+                    upstream_signature: vec![primary_url.to_string(), backup_url.to_string()],
+                },
+            );
+        }
+
+        let reordered = LoadBalancer::new(
+            Arc::new(make_provider_endpoint_service(
+                "routing",
+                &[
+                    (backup_url, "backup", "default"),
+                    (primary_url, "primary", "default"),
+                ],
+            )),
+            states.clone(),
+        );
+        {
+            let mut guard = states.lock().unwrap();
+            let entry = guard.get_mut("routing").expect("state exists");
+            entry.ensure_layout(
+                reordered.service.name.as_str(),
+                &reordered.service.upstreams,
+            );
+        }
+
+        let guard = states.lock().unwrap();
+        let entry = guard.get("routing").expect("state exists");
+        assert_eq!(entry.failure_counts, vec![0, FAILURE_THRESHOLD]);
+        assert_eq!(entry.usage_exhausted, vec![true, false]);
+        assert_eq!(entry.penalty_streak, vec![0, 2]);
+        assert_eq!(entry.last_good_index, Some(0));
+    }
+
+    #[test]
+    fn lb_replaces_state_when_provider_endpoint_base_url_changes() {
+        let states = Arc::new(Mutex::new(HashMap::new()));
+        let initial = LoadBalancer::new(
+            Arc::new(make_provider_endpoint_service(
+                "routing",
+                &[("https://old.example", "input", "default")],
+            )),
+            states.clone(),
+        );
+
+        {
+            let mut guard = states.lock().unwrap();
+            let entry = guard
+                .entry("routing".to_string())
+                .or_insert_with(LbState::default);
+            entry.ensure_layout(initial.service.name.as_str(), &initial.service.upstreams);
+            entry.failure_counts[0] = FAILURE_THRESHOLD;
+            entry.cooldown_until[0] =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+            entry.usage_exhausted[0] = true;
+            entry.penalty_streak[0] = 2;
+            entry.last_good_index = Some(0);
+        }
+
+        let updated = LoadBalancer::new(
+            Arc::new(make_provider_endpoint_service(
+                "routing",
+                &[("https://new.example", "input", "default")],
+            )),
+            states.clone(),
+        );
+        let selected = updated
+            .select_upstream()
+            .expect("new endpoint URL should be selectable after state replacement");
+        assert_eq!(selected.index, 0);
+
+        let guard = states.lock().unwrap();
+        let entry = guard.get("routing").expect("state exists");
+        assert_eq!(entry.failure_counts, vec![0]);
+        assert_eq!(entry.cooldown_until, vec![None]);
+        assert_eq!(entry.usage_exhausted, vec![false]);
+        assert_eq!(entry.penalty_streak, vec![0]);
         assert_eq!(entry.last_good_index, None);
     }
 

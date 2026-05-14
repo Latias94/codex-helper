@@ -4,11 +4,15 @@ use std::time::Instant;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 
-use crate::lb::{CooldownBackoff, LoadBalancer, SelectedUpstream};
+use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{RouteAttemptLog, ServiceTierLog, make_body_preview};
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
 
 use super::ProxyService;
+use super::attempt_health::{
+    penalize_attempt_target, record_attempt_failure, record_attempt_success,
+};
+use super::attempt_target::AttemptTarget;
 use super::classify::{class_is_health_neutral, classify_upstream_response};
 use super::http_debug::HttpDebugBase;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
@@ -32,8 +36,8 @@ pub(super) enum AttemptResponseOutcome {
 
 pub(super) struct AttemptResponseParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) lb: &'a LoadBalancer,
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) legacy_lb: Option<&'a LoadBalancer>,
+    pub(super) target: &'a AttemptTarget,
     pub(super) method: &'a Method,
     pub(super) path: &'a str,
     pub(super) status: StatusCode,
@@ -66,8 +70,8 @@ pub(super) struct AttemptResponseParams<'a> {
 
 pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) lb: &'a LoadBalancer,
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) legacy_lb: Option<&'a LoadBalancer>,
+    pub(super) target: &'a AttemptTarget,
     pub(super) response: reqwest::Response,
     pub(super) status: StatusCode,
     pub(super) response_headers: HeaderMap,
@@ -118,8 +122,8 @@ pub(super) async fn handle_streaming_attempt_success(
 ) -> Response<Body> {
     let StreamingAttemptResponseParams {
         proxy,
-        lb,
-        selected,
+        legacy_lb,
+        target,
         response,
         status,
         response_headers,
@@ -149,18 +153,21 @@ pub(super) async fn handle_streaming_attempt_success(
         path,
     } = params;
 
-    lb.record_result_with_backoff(
-        selected.index,
-        true,
+    record_attempt_success(
+        proxy.state.as_ref(),
+        proxy.service_name,
+        legacy_lb,
+        target,
         crate::lb::COOLDOWN_SECS,
         cooldown_backoff,
-    );
+    )
+    .await;
     let duration_ms = start.elapsed().as_millis() as u64;
     record_status_route_attempt(
         upstream_chain,
         route_attempts,
         StatusRouteAttemptParams {
-            selected,
+            target,
             route_attempt_index,
             status_code: status.as_u16(),
             error_class: None,
@@ -175,7 +182,7 @@ pub(super) async fn handle_streaming_attempt_success(
         proxy,
         session_id,
         route_graph_key,
-        selected,
+        target,
         route_attempts,
         route_attempt_index,
     )
@@ -183,8 +190,8 @@ pub(super) async fn handle_streaming_attempt_success(
     let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
     build_sse_success_response(
         proxy,
-        lb.clone(),
-        selected.clone(),
+        legacy_lb.cloned(),
+        target.clone(),
         response,
         SseSuccessMeta {
             status,
@@ -219,8 +226,8 @@ pub(super) async fn handle_attempt_response(
 ) -> AttemptResponseOutcome {
     let AttemptResponseParams {
         proxy,
-        lb,
-        selected,
+        legacy_lb,
+        target,
         method,
         path,
         status,
@@ -269,7 +276,7 @@ pub(super) async fn handle_attempt_response(
         upstream_chain,
         route_attempts,
         StatusRouteAttemptParams {
-            selected,
+            target,
             route_attempt_index,
             status_code,
             error_class: cls.as_deref(),
@@ -282,25 +289,30 @@ pub(super) async fn handle_attempt_response(
     );
 
     if status.is_success() {
-        lb.record_result_with_backoff(
-            selected.index,
-            true,
-            crate::lb::COOLDOWN_SECS,
-            cooldown_backoff,
-        );
-        record_passive_upstream_success(
+        record_attempt_success(
             proxy.state.as_ref(),
             proxy.service_name,
-            &selected.station_name,
-            &selected.upstream.base_url,
-            status_code,
+            legacy_lb,
+            target,
+            crate::lb::COOLDOWN_SECS,
+            cooldown_backoff,
         )
         .await;
+        if let Some(station_name) = target.compatibility_station_name() {
+            record_passive_upstream_success(
+                proxy.state.as_ref(),
+                proxy.service_name,
+                station_name,
+                &target.upstream().base_url,
+                status_code,
+            )
+            .await;
+        }
         record_session_route_affinity_success(
             proxy,
             session_id,
             route_graph_key,
-            selected,
+            target,
             route_attempts,
             route_attempt_index,
         )
@@ -313,7 +325,7 @@ pub(super) async fn handle_attempt_response(
                 proxy,
                 method,
                 path,
-                selected,
+                target,
                 request_id,
                 status,
                 duration_ms,
@@ -337,23 +349,28 @@ pub(super) async fn handle_attempt_response(
     let response_text = summarize_upstream_error_body(&response_body, &response_headers);
     if never_retry {
         if !class_is_health_neutral(cls.as_deref()) {
-            lb.record_result_with_backoff(
-                selected.index,
-                false,
+            record_attempt_failure(
+                proxy.state.as_ref(),
+                proxy.service_name,
+                legacy_lb,
+                target,
                 crate::lb::COOLDOWN_SECS,
                 cooldown_backoff,
-            );
+            )
+            .await;
         }
-        record_passive_upstream_failure(
-            proxy.state.as_ref(),
-            proxy.service_name,
-            &selected.station_name,
-            &selected.upstream.base_url,
-            Some(status_code),
-            cls.as_deref(),
-            Some(response_text),
-        )
-        .await;
+        if let Some(station_name) = target.compatibility_station_name() {
+            record_passive_upstream_failure(
+                proxy.state.as_ref(),
+                proxy.service_name,
+                station_name,
+                &target.upstream().base_url,
+                Some(status_code),
+                cls.as_deref(),
+                Some(response_text),
+            )
+            .await;
+        }
 
         let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
         return AttemptResponseOutcome::Return(
@@ -361,7 +378,7 @@ pub(super) async fn handle_attempt_response(
                 proxy,
                 method,
                 path,
-                selected,
+                target,
                 request_id,
                 status,
                 duration_ms,
@@ -390,49 +407,57 @@ pub(super) async fn handle_attempt_response(
     if provider_retryable {
         if !class_is_health_neutral(cls.as_deref()) {
             let penalty_reason = format!("status_{status_code}");
-            lb.penalize_with_backoff(
-                selected.index,
+            penalize_attempt_target(
+                proxy.state.as_ref(),
+                proxy.service_name,
+                legacy_lb,
+                target,
                 plan.transport_cooldown_secs,
                 penalty_reason.as_str(),
                 cooldown_backoff,
-            );
+            )
+            .await;
         }
-        record_passive_upstream_failure(
-            proxy.state.as_ref(),
-            proxy.service_name,
-            &selected.station_name,
-            &selected.upstream.base_url,
-            Some(status_code),
-            cls.as_deref(),
-            Some(response_text.clone()),
-        )
-        .await;
+        if let Some(station_name) = target.compatibility_station_name() {
+            record_passive_upstream_failure(
+                proxy.state.as_ref(),
+                proxy.service_name,
+                station_name,
+                &target.upstream().base_url,
+                Some(status_code),
+                cls.as_deref(),
+                Some(response_text.clone()),
+            )
+            .await;
+        }
         *last_err = Some((status, response_text));
 
-        if avoid_set.insert(selected.index) {
+        if avoid_set.insert(target.attempt_avoid_index()) {
             *avoided_total = avoided_total.saturating_add(1);
         }
         return AttemptResponseOutcome::TryNextUpstream;
     }
 
     let retry = retry_info_for_observed_attempts(upstream_chain, route_attempts);
-    record_passive_upstream_failure(
-        proxy.state.as_ref(),
-        proxy.service_name,
-        &selected.station_name,
-        &selected.upstream.base_url,
-        Some(status_code),
-        cls.as_deref(),
-        Some(response_text),
-    )
-    .await;
+    if let Some(station_name) = target.compatibility_station_name() {
+        record_passive_upstream_failure(
+            proxy.state.as_ref(),
+            proxy.service_name,
+            station_name,
+            &target.upstream().base_url,
+            Some(status_code),
+            cls.as_deref(),
+            Some(response_text),
+        )
+        .await;
+    }
 
     AttemptResponseOutcome::Return(
         finish_attempt_forward_response(
             proxy,
             method,
             path,
-            selected,
+            target,
             request_id,
             status,
             duration_ms,
@@ -458,7 +483,7 @@ async fn finish_attempt_forward_response(
     proxy: &ProxyService,
     method: &Method,
     path: &str,
-    selected: &SelectedUpstream,
+    target: &AttemptTarget,
     request_id: u64,
     status: StatusCode,
     duration_ms: u64,
@@ -490,9 +515,13 @@ async fn finish_attempt_forward_response(
             duration_ms,
             started_at_ms,
             upstream_headers_ms,
-            station_name: selected.station_name.clone(),
-            provider_id: provider_id.map(ToOwned::to_owned),
-            upstream_base_url: selected.upstream.base_url.clone(),
+            station_name: target.compatibility_station_name().map(ToOwned::to_owned),
+            provider_id: provider_id
+                .map(ToOwned::to_owned)
+                .or_else(|| target.provider_id().map(ToOwned::to_owned)),
+            endpoint_id: target.endpoint_id(),
+            provider_endpoint_key: target.provider_endpoint_key(),
+            upstream_base_url: target.upstream().base_url.clone(),
             session_id: session_id.map(ToOwned::to_owned),
             cwd: cwd.map(ToOwned::to_owned),
             effective_effort: effective_effort.map(ToOwned::to_owned),

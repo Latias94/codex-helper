@@ -38,7 +38,7 @@ on_exhausted = "continue"
         );
 
         let cfg = super::load_config().await.expect("load v4 config");
-        assert_eq!(cfg.version, Some(4));
+        assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
         assert_eq!(cfg.codex.active.as_deref(), Some("routing"));
 
         let routing = cfg
@@ -478,7 +478,7 @@ fn legacy_v3_pool_fallback_migrates_to_nested_v4_route_nodes() {
 
     let report = crate::config::legacy::migrate_v3_legacy_to_v4(&legacy)
         .expect("legacy v3 should migrate to v4");
-    assert_eq!(report.config.version, 4);
+    assert_eq!(report.config.version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION);
     let routing = report
         .config
         .codex
@@ -729,6 +729,7 @@ fn migrate_v2_to_v4_report_warns_when_flattening_endpoint_scoped_groups() {
     assert!(warnings.contains("flattens the effective route"));
     assert!(warnings.contains("scopes provider 'relay'"));
     assert!(warnings.contains("de-duplicated"));
+    assert!(warnings.contains("fallback-sticky"));
 
     let routing = report
         .config
@@ -740,6 +741,70 @@ fn migrate_v2_to_v4_report_warns_when_flattening_endpoint_scoped_groups() {
         routing.entry_node().map(|node| node.children.clone()),
         Some(vec!["relay".to_string(), "backup".to_string()])
     );
+}
+
+#[test]
+fn v4_route_graph_affinity_upgrade_warning_mentions_fallback_sticky() {
+    let cfg = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://monthly.example.com/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "paygo".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://paygo.example.com/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "monthly".to_string(),
+                "paygo".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+
+    let mut warnings = Vec::new();
+    collect_route_graph_affinity_migration_warnings("codex", &cfg.codex, &mut warnings);
+
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("preferred-group"));
+    assert!(warnings[0].contains("fallback-sticky"));
+}
+
+#[test]
+fn v4_route_graph_affinity_upgrade_warning_ignores_single_provider() {
+    let cfg = ProxyConfigV4 {
+        version: 4,
+        codex: ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "monthly".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("https://monthly.example.com/v1".to_string()),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "monthly".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+
+    let mut warnings = Vec::new();
+    collect_route_graph_affinity_migration_warnings("codex", &cfg.codex, &mut warnings);
+
+    assert!(warnings.is_empty());
 }
 
 #[test]
@@ -879,9 +944,10 @@ fn save_config_v4_writes_v4_route_graph_schema() {
 
         let path = super::save_config_v4(&cfg).await.expect("save v4");
         let saved = std::fs::read_to_string(path).expect("read saved v4 config");
-        assert!(saved.contains("version = 4"));
+        assert!(saved.contains("version = 5"));
         assert!(saved.contains("[codex.routing]"));
         assert!(saved.contains("entry = \"main_route\""));
+        assert!(!saved.contains("affinity_policy"));
         assert!(saved.contains("[codex.routing.routes.main_route]"));
         assert!(saved.contains("strategy = \"manual-sticky\""));
         assert!(saved.contains("target = \"main\""));
@@ -928,9 +994,9 @@ target = "input"
         );
 
         let cfg = super::load_config().await.expect("load legacy v3 config");
-        assert_eq!(cfg.version, Some(4));
+        assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
         let saved = std::fs::read_to_string(&toml_path).expect("read compacted config");
-        assert!(saved.contains("version = 4"));
+        assert!(saved.contains("version = 5"));
         assert!(saved.contains("[codex.routing.routes.main]"));
         assert!(saved.contains("strategy = \"manual-sticky\""));
         assert!(saved.contains("[codex.providers.input]"));
@@ -952,6 +1018,15 @@ fn save_config_preserves_v4_route_graph_when_only_runtime_metadata_changes() {
         .expect("build tokio runtime");
 
     rt.block_on(async move {
+        let mut routing = RoutingConfigV4::tag_preferred(
+            vec!["monthly".to_string(), "paygo".to_string()],
+            vec![BTreeMap::from([(
+                "billing".to_string(),
+                "monthly".to_string(),
+            )])],
+            RoutingExhaustedActionV4::Stop,
+        );
+        routing.affinity_policy = RoutingAffinityPolicyV5::FallbackSticky;
         let cfg = ProxyConfigV4 {
             version: 4,
             codex: ServiceViewV4 {
@@ -973,14 +1048,7 @@ fn save_config_preserves_v4_route_graph_when_only_runtime_metadata_changes() {
                         },
                     ),
                 ]),
-                routing: Some(RoutingConfigV4::tag_preferred(
-                    vec!["monthly".to_string(), "paygo".to_string()],
-                    vec![BTreeMap::from([(
-                        "billing".to_string(),
-                        "monthly".to_string(),
-                    )])],
-                    RoutingExhaustedActionV4::Stop,
-                )),
+                routing: Some(routing),
                 ..ServiceViewV4::default()
             },
             ..ProxyConfigV4::default()
@@ -995,12 +1063,308 @@ fn save_config_preserves_v4_route_graph_when_only_runtime_metadata_changes() {
 
         let saved = std::fs::read_to_string(path).expect("read saved config");
         let reparsed = toml::from_str::<ProxyConfigV4>(&saved).expect("parse v4");
-        assert_eq!(reparsed.version, 4);
+        assert_eq!(reparsed.version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION);
         let routing = reparsed.codex.routing.expect("routing should remain");
         let entry = routing.entry_node().expect("entry node should remain");
         assert_eq!(entry.strategy, RoutingPolicyV4::TagPreferred);
         assert_eq!(entry.on_exhausted, RoutingExhaustedActionV4::Stop);
         assert_eq!(entry.children, vec!["monthly", "paygo"]);
+        assert_eq!(
+            routing.affinity_policy,
+            RoutingAffinityPolicyV5::FallbackSticky
+        );
         assert_eq!(reparsed.ui.language.as_deref(), Some("zh"));
     });
+}
+
+#[test]
+fn old_v4_route_graph_auto_migrates_to_v5_and_preserves_endpoint_identity() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        write_file(
+            &toml_path,
+            r#"
+version = 4
+
+[codex.providers.monthly]
+auth_token_env = "MONTHLY_API_KEY"
+tags = { billing = "monthly" }
+
+[codex.providers.monthly.endpoints.fast]
+base_url = "https://monthly-fast.example.com/v1"
+priority = 0
+tags = { region = "hk" }
+
+[codex.providers.monthly.endpoints.slow]
+base_url = "https://monthly-slow.example.com/v1"
+priority = 10
+tags = { region = "us" }
+
+[codex.providers.paygo]
+base_url = "https://paygo.example.com/v1"
+tags = { billing = "paygo" }
+
+[codex.routing]
+entry = "main"
+fallback_ttl_ms = 120000
+reprobe_preferred_after_ms = 30000
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["monthly", "paygo"]
+"#,
+        );
+
+        let loaded = super::load_config_with_v4_source()
+            .await
+            .expect("load old v4 route graph");
+        assert_eq!(
+            loaded.runtime.version,
+            Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION)
+        );
+        assert_eq!(
+            loaded.v4.as_ref().map(|cfg| cfg.version),
+            Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION)
+        );
+
+        let saved = std::fs::read_to_string(&toml_path).expect("read migrated v5 config");
+        assert!(saved.contains("version = 5"));
+        assert!(saved.contains("fallback_ttl_ms = 120000"));
+        assert!(saved.contains("reprobe_preferred_after_ms = 30000"));
+        assert!(saved.contains("[codex.routing.routes.main]"));
+        assert!(saved.contains("[codex.providers.monthly.endpoints.fast]"));
+        assert!(saved.contains("auth_token_env = \"MONTHLY_API_KEY\""));
+
+        let backup = std::fs::read_to_string(&backup_path).expect("read old v4 backup");
+        assert!(backup.contains("version = 4"));
+        assert!(backup.contains("[codex.providers.monthly.endpoints.fast]"));
+
+        let reparsed = toml::from_str::<ProxyConfigV4>(&saved).expect("parse migrated v5 config");
+        let reparsed_routing = reparsed
+            .codex
+            .routing
+            .as_ref()
+            .expect("migrated routing should remain");
+        assert_eq!(reparsed_routing.fallback_ttl_ms, Some(120_000));
+        assert_eq!(reparsed_routing.reprobe_preferred_after_ms, Some(30_000));
+        let runtime = compile_v4_to_runtime(&reparsed).expect("compile migrated v5 config");
+        let routing = runtime
+            .codex
+            .station("routing")
+            .expect("compat routing projection should exist");
+        assert_eq!(
+            routing
+                .upstreams
+                .iter()
+                .map(|upstream| upstream.base_url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://monthly-fast.example.com/v1",
+                "https://monthly-slow.example.com/v1",
+                "https://paygo.example.com/v1",
+            ]
+        );
+        assert_eq!(
+            routing.upstreams[0]
+                .tags
+                .get("provider_id")
+                .map(String::as_str),
+            Some("monthly")
+        );
+        assert_eq!(
+            routing.upstreams[0]
+                .tags
+                .get("endpoint_id")
+                .map(String::as_str),
+            Some("fast")
+        );
+        assert_eq!(
+            routing.upstreams[2]
+                .tags
+                .get("endpoint_id")
+                .map(String::as_str),
+            Some("default")
+        );
+    });
+}
+
+#[test]
+fn station_shaped_v2_config_migrates_to_route_graph_without_profile_station_binding() {
+    let v2 = ProxyConfigV2 {
+        version: 2,
+        codex: ServiceViewV2 {
+            active_group: Some("monthly-first".to_string()),
+            default_profile: Some("daily".to_string()),
+            profiles: BTreeMap::from([(
+                "daily".to_string(),
+                ServiceControlProfile {
+                    station: Some("monthly-first".to_string()),
+                    model: Some("gpt-5".to_string()),
+                    ..ServiceControlProfile::default()
+                },
+            )]),
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    ProviderConfigV2 {
+                        tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                        endpoints: BTreeMap::from([
+                            (
+                                "fast".to_string(),
+                                ProviderEndpointV2 {
+                                    base_url: "https://monthly-fast.example.com/v1".to_string(),
+                                    enabled: true,
+                                    priority: 0,
+                                    tags: BTreeMap::from([(
+                                        "region".to_string(),
+                                        "hk".to_string(),
+                                    )]),
+                                    supported_models: BTreeMap::new(),
+                                    model_mapping: BTreeMap::new(),
+                                },
+                            ),
+                            (
+                                "slow".to_string(),
+                                ProviderEndpointV2 {
+                                    base_url: "https://monthly-slow.example.com/v1".to_string(),
+                                    enabled: true,
+                                    priority: 10,
+                                    tags: BTreeMap::from([(
+                                        "region".to_string(),
+                                        "us".to_string(),
+                                    )]),
+                                    supported_models: BTreeMap::new(),
+                                    model_mapping: BTreeMap::new(),
+                                },
+                            ),
+                        ]),
+                        ..ProviderConfigV2::default()
+                    },
+                ),
+                (
+                    "paygo".to_string(),
+                    ProviderConfigV2 {
+                        tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
+                        endpoints: BTreeMap::from([(
+                            "default".to_string(),
+                            ProviderEndpointV2 {
+                                base_url: "https://paygo.example.com/v1".to_string(),
+                                enabled: true,
+                                priority: 0,
+                                tags: BTreeMap::new(),
+                                supported_models: BTreeMap::new(),
+                                model_mapping: BTreeMap::new(),
+                            },
+                        )]),
+                        ..ProviderConfigV2::default()
+                    },
+                ),
+            ]),
+            groups: BTreeMap::from([
+                (
+                    "monthly-first".to_string(),
+                    GroupConfigV2 {
+                        enabled: true,
+                        level: 1,
+                        members: vec![GroupMemberRefV2 {
+                            provider: "monthly".to_string(),
+                            endpoint_names: vec!["fast".to_string()],
+                            preferred: false,
+                        }],
+                        ..GroupConfigV2::default()
+                    },
+                ),
+                (
+                    "fallback".to_string(),
+                    GroupConfigV2 {
+                        enabled: true,
+                        level: 2,
+                        members: vec![GroupMemberRefV2 {
+                            provider: "paygo".to_string(),
+                            endpoint_names: Vec::new(),
+                            preferred: false,
+                        }],
+                        ..GroupConfigV2::default()
+                    },
+                ),
+            ]),
+        },
+        claude: ServiceViewV2::default(),
+        retry: RetryConfig::default(),
+        notify: NotifyConfig::default(),
+        default_service: Some(ServiceKind::Codex),
+        ui: UiConfig::default(),
+    };
+
+    let report = migrate_v2_to_v4_with_report(&v2).expect("migrate station-shaped config");
+    assert_eq!(report.config.version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("profile station bindings are cleared"))
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("scopes provider 'monthly'"))
+    );
+
+    let codex = &report.config.codex;
+    assert_eq!(
+        codex
+            .profiles
+            .get("daily")
+            .and_then(|profile| profile.station.as_deref()),
+        None
+    );
+    let routing = codex.routing.as_ref().expect("routing should be emitted");
+    assert_eq!(routing.order, vec!["monthly", "paygo"]);
+    assert_eq!(
+        routing.entry_node().map(|node| node.children.clone()),
+        Some(vec!["monthly".to_string(), "paygo".to_string()])
+    );
+
+    let runtime = compile_v4_to_runtime(&report.config).expect("compile migrated route graph");
+    assert_eq!(runtime.codex.station_count(), 1);
+    assert_eq!(runtime.codex.active.as_deref(), Some("routing"));
+    let routing_station = runtime
+        .codex
+        .station("routing")
+        .expect("compat routing projection should exist");
+    assert_eq!(
+        routing_station
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.base_url.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "https://monthly-fast.example.com/v1",
+            "https://monthly-slow.example.com/v1",
+            "https://paygo.example.com/v1",
+        ]
+    );
+    assert_eq!(
+        routing_station.upstreams[0]
+            .tags
+            .get("provider_id")
+            .map(String::as_str),
+        Some("monthly")
+    );
+    assert_eq!(
+        routing_station.upstreams[0]
+            .tags
+            .get("endpoint_id")
+            .map(String::as_str),
+        Some("fast")
+    );
 }

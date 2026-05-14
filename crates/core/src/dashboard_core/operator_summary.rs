@@ -51,6 +51,8 @@ pub struct OperatorRuntimeSummary {
     #[serde(default)]
     pub global_station_override: Option<String>,
     #[serde(default)]
+    pub global_route_target_override: Option<String>,
+    #[serde(default)]
     pub configured_default_profile: Option<String>,
     #[serde(default)]
     pub default_profile: Option<String>,
@@ -187,6 +189,8 @@ pub struct OperatorSummaryLinks {
     pub session_by_id_template: String,
     pub session_overrides: String,
     pub global_station_override: String,
+    #[serde(default)]
+    pub global_route_override: String,
     #[serde(default)]
     pub routing: String,
     #[serde(default)]

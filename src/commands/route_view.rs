@@ -4,13 +4,14 @@ use super::config_doc::{
     select_v4_service_view,
 };
 use crate::config::{
-    ServiceConfig, ServiceConfigManager, ServiceRoutingExplanation, ServiceViewV4,
-    explain_service_routing, storage::config_file_path,
+    CURRENT_ROUTE_GRAPH_CONFIG_VERSION, ServiceConfig, ServiceConfigManager,
+    ServiceRoutingExplanation, ServiceViewV4, explain_service_routing, storage::config_file_path,
 };
 use crate::routing_explain::{
-    RoutingExplainCondition, RoutingExplainConditionalBranch, RoutingExplainResponse,
-    RoutingExplainRouteRef, RoutingExplainRouteRefKind, RoutingExplainSkipReason,
-    build_routing_explain_response_with_request, parse_routing_explain_headers,
+    RoutingExplainCompatibility, RoutingExplainCondition, RoutingExplainConditionalBranch,
+    RoutingExplainResponse, RoutingExplainRouteRef, RoutingExplainRouteRefKind,
+    RoutingExplainSkipReason, build_routing_explain_response_with_request,
+    parse_routing_explain_headers,
 };
 use crate::routing_ir::{
     RoutePlanRuntimeState, RouteRequestContext, compile_legacy_route_plan_template,
@@ -146,7 +147,7 @@ fn print_v4_explain_text(
     provider_name: Option<&str>,
 ) -> anyhow::Result<()> {
     let routing = explain_v4_routing(view);
-    println!("Schema version: v4");
+    println!("Schema version: v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION}");
     println!("Service: {label}");
     println!("Routing entry: {}", routing.entry);
     println!("Routing policy: {}", routing.policy);
@@ -299,80 +300,102 @@ fn legacy_runtime_services_for_explain<'a>(
         .collect()
 }
 
-fn print_runtime_explain_text(explain: &RoutingExplainResponse) {
+fn runtime_explain_text_lines(explain: &RoutingExplainResponse) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(model) = explain.request_model.as_deref() {
-        println!("Request model: {model}");
+        lines.push(format!("Request model: {model}"));
     }
     if let Some(service_tier) = explain.request_context.service_tier.as_deref() {
-        println!("Request service tier: {service_tier}");
+        lines.push(format!("Request service tier: {service_tier}"));
     }
     if let Some(reasoning_effort) = explain.request_context.reasoning_effort.as_deref() {
-        println!("Request reasoning effort: {reasoning_effort}");
+        lines.push(format!("Request reasoning effort: {reasoning_effort}"));
     }
     if let Some(path) = explain.request_context.path.as_deref() {
-        println!("Request path: {path}");
+        lines.push(format!("Request path: {path}"));
     }
     if let Some(method) = explain.request_context.method.as_deref() {
-        println!("Request method: {method}");
+        lines.push(format!("Request method: {method}"));
     }
     if !explain.request_context.headers.is_empty() {
-        println!(
+        lines.push(format!(
             "Request headers: {}",
             explain.request_context.headers.join(", ")
-        );
+        ));
     }
     if let Some(selected) = &explain.selected_route {
-        println!(
-            "Selected route: {} endpoint={} path=[{}] compat_station={} upstream#{}",
+        let compatibility = format_explain_compatibility(selected.compatibility.as_ref());
+        lines.push(format!(
+            "Selected route: endpoint={} group={} provider={} path=[{}] {}",
+            selected.provider_endpoint_key,
+            selected.preference_group,
             selected.provider_id,
-            selected.endpoint_id,
             selected.route_path.join(" > "),
-            selected.compatibility.station_name,
-            selected.compatibility.upstream_index
-        );
+            compatibility
+        ));
     } else {
-        println!("Selected route: <none>");
+        lines.push("Selected route: <none>".to_string());
     }
 
     if explain.candidates.is_empty() {
-        println!("Runtime candidates: <empty>");
-        return;
+        lines.push("Runtime candidates: <empty>".to_string());
+        return lines;
     }
 
-    println!("Runtime candidates:");
+    lines.push("Runtime candidates:".to_string());
     for (idx, candidate) in explain.candidates.iter().enumerate() {
         let marker = if candidate.selected { "*" } else { " " };
         let skips = format_skip_reasons(&candidate.skip_reasons);
-        println!(
-            "  {} {}. {} endpoint={} path=[{}] skip={} compat_station={} upstream#{}",
+        let compatibility = format_explain_compatibility(candidate.compatibility.as_ref());
+        lines.push(format!(
+            "  {} {}. endpoint={} group={} provider={} path=[{}] skip={} {}",
             marker,
             idx + 1,
+            candidate.provider_endpoint_key,
+            candidate.preference_group,
             candidate.provider_id,
-            candidate.endpoint_id,
             candidate.route_path.join(" > "),
             skips,
-            candidate.compatibility.station_name,
-            candidate.compatibility.upstream_index
-        );
+            compatibility
+        ));
     }
 
     if !explain.conditional_routes.is_empty() {
-        println!("Conditional routes:");
+        lines.push("Conditional routes:".to_string());
         for route in &explain.conditional_routes {
             let target = route
                 .selected_target
                 .as_ref()
                 .map(format_route_ref)
                 .unwrap_or_else(|| "<none>".to_string());
-            println!(
+            lines.push(format!(
                 "  {} matched={} branch={} target={} condition=[{}]",
                 route.route_name,
                 route.matched,
                 format_conditional_branch(route.selected_branch),
                 target,
                 format_condition(&route.condition)
-            );
+            ));
         }
+    }
+
+    lines
+}
+
+fn format_explain_compatibility(compatibility: Option<&RoutingExplainCompatibility>) -> String {
+    compatibility
+        .map(|compatibility| {
+            format!(
+                "compat_station={} upstream_index={}",
+                compatibility.station_name, compatibility.upstream_index
+            )
+        })
+        .unwrap_or_else(|| "compatibility=-".to_string())
+}
+
+fn print_runtime_explain_text(explain: &RoutingExplainResponse) {
+    for line in runtime_explain_text_lines(explain) {
+        println!("{line}");
     }
 }
 
@@ -399,6 +422,7 @@ fn format_route_ref(route_ref: &RoutingExplainRouteRef) -> String {
     let kind = match route_ref.kind {
         RoutingExplainRouteRefKind::Route => "route",
         RoutingExplainRouteRefKind::Provider => "provider",
+        RoutingExplainRouteRefKind::ProviderEndpoint => "endpoint",
     };
     format!("{kind}:{}", route_ref.name)
 }
@@ -689,6 +713,9 @@ pub async fn handle_route_view_cmd(cmd: RoutingCommand) -> CliResult<()> {
 mod tests {
     use super::*;
     use crate::config::{ProviderConfigV4, RoutingConfigV4, UpstreamAuth};
+    use crate::routing_explain::{
+        RoutingExplainCandidate, RoutingExplainCompatibility, RoutingExplainResponse,
+    };
 
     fn provider(base_url: &str, supported_models: &[&str]) -> ProviderConfigV4 {
         ProviderConfigV4 {
@@ -755,5 +782,61 @@ mod tests {
             value["candidates"][0]["skip_reasons"][0]["requested_model"].as_str(),
             Some("gpt-5")
         );
+    }
+
+    #[test]
+    fn runtime_explain_text_prefers_provider_endpoint_identity() {
+        let explain = RoutingExplainResponse {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            runtime_loaded_at_ms: None,
+            request_model: None,
+            session_id: None,
+            request_context: Default::default(),
+            selected_route: Some(RoutingExplainCandidate {
+                provider_id: "input".to_string(),
+                provider_alias: None,
+                endpoint_id: "default".to_string(),
+                provider_endpoint_key: "codex/input/default".to_string(),
+                route_path: vec!["main".to_string(), "input".to_string()],
+                preference_group: 0,
+                compatibility: Some(RoutingExplainCompatibility {
+                    station_name: "legacy".to_string(),
+                    upstream_index: 1,
+                }),
+                upstream_base_url: "https://input.example/v1".to_string(),
+                selected: true,
+                skip_reasons: Vec::new(),
+            }),
+            candidates: vec![RoutingExplainCandidate {
+                provider_id: "input".to_string(),
+                provider_alias: None,
+                endpoint_id: "default".to_string(),
+                provider_endpoint_key: "codex/input/default".to_string(),
+                route_path: vec!["main".to_string(), "input".to_string()],
+                preference_group: 0,
+                compatibility: Some(RoutingExplainCompatibility {
+                    station_name: "legacy".to_string(),
+                    upstream_index: 1,
+                }),
+                upstream_base_url: "https://input.example/v1".to_string(),
+                selected: true,
+                skip_reasons: Vec::new(),
+            }],
+            affinity_policy: "preferred_group".to_string(),
+            affinity: None,
+            conditional_routes: Vec::new(),
+        };
+
+        let lines = runtime_explain_text_lines(&explain);
+
+        assert_eq!(
+            lines[0],
+            "Selected route: endpoint=codex/input/default group=0 provider=input path=[main > input] compat_station=legacy upstream_index=1"
+        );
+        assert_eq!(lines[1], "Runtime candidates:");
+        assert!(lines[2].starts_with(
+            "  * 1. endpoint=codex/input/default group=0 provider=input path=[main > input]"
+        ));
     }
 }

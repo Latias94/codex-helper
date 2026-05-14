@@ -70,8 +70,9 @@ fn candidate_passive_health(
     identity: &RuntimeUpstreamIdentity,
     station_health: Option<&HashMap<String, StationHealth>>,
 ) -> Option<PassiveUpstreamHealth> {
+    let compatibility = identity.compatibility.as_ref()?;
     station_health?
-        .get(identity.legacy.station_name.as_str())?
+        .get(compatibility.station_name.as_str())?
         .upstreams
         .iter()
         .find(|upstream| upstream.base_url == identity.base_url)
@@ -82,10 +83,11 @@ fn candidate_load_balancer_state(
     identity: &RuntimeUpstreamIdentity,
     load_balancers: Option<&HashMap<String, LbConfigView>>,
 ) -> Option<LbUpstreamView> {
+    let compatibility = identity.compatibility.as_ref()?;
     load_balancers?
-        .get(identity.legacy.station_name.as_str())?
+        .get(compatibility.station_name.as_str())?
         .upstreams
-        .get(identity.legacy.upstream_index)
+        .get(compatibility.upstream_index)
         .cloned()
 }
 
@@ -94,8 +96,11 @@ fn candidate_balance_summary(
     provider_balances: Option<&HashMap<String, Vec<ProviderBalanceSnapshot>>>,
     now_ms: u64,
 ) -> StationRoutingBalanceSummary {
+    let Some(compatibility) = identity.compatibility.as_ref() else {
+        return StationRoutingBalanceSummary::default();
+    };
     let Some(snapshots) =
-        provider_balances.and_then(|balances| balances.get(identity.legacy.station_name.as_str()))
+        provider_balances.and_then(|balances| balances.get(compatibility.station_name.as_str()))
     else {
         return StationRoutingBalanceSummary::default();
     };
@@ -112,9 +117,12 @@ fn balance_snapshot_matches_candidate(
     snapshot: &ProviderBalanceSnapshot,
     identity: &RuntimeUpstreamIdentity,
 ) -> bool {
+    let Some(compatibility) = identity.compatibility.as_ref() else {
+        return false;
+    };
     snapshot.provider_id == identity.provider_endpoint.provider_id
-        && snapshot.station_name.as_deref() == Some(identity.legacy.station_name.as_str())
-        && snapshot.upstream_index == Some(identity.legacy.upstream_index)
+        && snapshot.station_name.as_deref() == Some(compatibility.station_name.as_str())
+        && snapshot.upstream_index == Some(compatibility.upstream_index)
 }
 
 #[cfg(test)]
@@ -221,23 +229,10 @@ mod tests {
             signals[0].identity.provider_endpoint.stable_key(),
             "codex/input/default"
         );
-        assert_eq!(signals[0].identity.legacy.stable_key(), "codex/routing/0");
-        assert_eq!(
-            signals[0]
-                .passive_health
-                .as_ref()
-                .map(|health| health.state),
-            Some(PassiveHealthState::Failing)
-        );
-        assert_eq!(
-            signals[0]
-                .load_balancer
-                .as_ref()
-                .and_then(|view| view.cooldown_remaining_secs),
-            Some(11)
-        );
-        assert_eq!(signals[0].balance.exhausted, 1);
-        assert_eq!(signals[0].balance.routing_exhausted, 1);
+        assert!(signals[0].identity.compatibility.is_none());
+        assert!(signals[0].passive_health.is_none());
+        assert!(signals[0].load_balancer.is_none());
+        assert!(signals[0].balance.is_empty());
     }
 
     #[test]
@@ -318,19 +313,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["codex/input/fast", "codex/input/slow"]
         );
-        assert_eq!(signals[0].balance.ok, 1);
-        assert_eq!(signals[0].balance.exhausted, 0);
-        assert_eq!(signals[0].load_balancer.as_ref().unwrap().failure_count, 0);
-        assert_eq!(signals[1].balance.ok, 0);
-        assert_eq!(signals[1].balance.exhausted, 1);
-        assert_eq!(
-            signals[1]
-                .load_balancer
-                .as_ref()
-                .unwrap()
-                .cooldown_remaining_secs,
-            Some(30)
-        );
+        assert!(signals[0].identity.compatibility.is_none());
+        assert!(signals[1].identity.compatibility.is_none());
+        assert!(signals[0].balance.is_empty());
+        assert!(signals[1].balance.is_empty());
+        assert!(signals[0].load_balancer.is_none());
+        assert!(signals[1].load_balancer.is_none());
     }
 
     #[test]
@@ -393,7 +381,15 @@ mod tests {
             signals[0].identity.provider_endpoint.stable_key(),
             "codex/legacy-provider/legacy-endpoint"
         );
-        assert_eq!(signals[0].identity.legacy.stable_key(), "codex/primary/0");
+        assert_eq!(
+            signals[0]
+                .identity
+                .compatibility
+                .as_ref()
+                .map(crate::runtime_identity::LegacyUpstreamKey::stable_key)
+                .as_deref(),
+            Some("codex/primary/0")
+        );
         assert_eq!(
             signals[0]
                 .passive_health

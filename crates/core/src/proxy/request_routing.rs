@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
-use crate::config::{ProxyConfig, ProxyConfigV4, ServiceConfig, ServiceConfigManager};
+use crate::config::{
+    ProxyConfig, ProxyConfigV4, RoutingExhaustedActionV4, RoutingPolicyV4, ServiceConfigManager,
+    ServiceViewV4, effective_v4_routing, resolved_v4_provider_order,
+};
 use crate::lb::LoadBalancer;
 use crate::logging::log_retry_trace;
 use crate::routing_ir::{
-    RoutePlanTemplate, RouteRequestContext, compile_v4_route_plan_template_with_request,
+    RouteCandidate, RoutePlanTemplate, RouteRequestContext,
+    compile_v4_route_plan_template_with_request,
 };
 
 use super::ProxyService;
@@ -13,9 +17,9 @@ use super::routing_plan::{
     build_station_routing_plan, resolve_pinned_station_selection,
 };
 
-pub(super) struct RequestRouteSelection {
-    pub(super) lbs: Vec<LoadBalancer>,
-    pub(super) route_plan_template: Option<RoutePlanTemplate>,
+pub(super) enum RequestRouteSelection {
+    Legacy { lbs: Vec<LoadBalancer> },
+    RouteGraph { template: RoutePlanTemplate },
 }
 
 fn station_candidate_json(candidate: &StationRoutingCandidate) -> serde_json::Value {
@@ -66,7 +70,74 @@ fn station_balance_state(candidate: &StationRoutingCandidate) -> &'static str {
     }
 }
 
+fn route_candidate_trace_json(
+    template: &RoutePlanTemplate,
+    candidate: &RouteCandidate,
+) -> serde_json::Value {
+    let identity = template.candidate_identity(candidate);
+    serde_json::json!({
+        "provider_id": candidate.provider_id.as_str(),
+        "endpoint_id": candidate.endpoint_id.as_str(),
+        "provider_endpoint_key": identity.provider_endpoint.stable_key(),
+        "preference_group": candidate.preference_group,
+        "route_path": &candidate.route_path,
+    })
+}
+
+pub(super) fn service_view_with_route_target_override(
+    service_name: &str,
+    view: &ServiceViewV4,
+    target: &str,
+) -> anyhow::Result<ServiceViewV4> {
+    let target = target.trim();
+    if target.is_empty() {
+        anyhow::bail!("route target override is empty");
+    }
+
+    let mut view = view.clone();
+    let mut routing = effective_v4_routing(&view);
+    let entry_name = routing.entry.clone();
+    if target == entry_name {
+        anyhow::bail!(
+            "[{service_name}] route target override cannot target entry route '{target}'"
+        );
+    }
+
+    let fallback_order = resolved_v4_provider_order(service_name, &view).unwrap_or_default();
+    let node = routing.routes.entry(entry_name).or_default();
+    node.strategy = RoutingPolicyV4::ManualSticky;
+    node.target = Some(target.to_string());
+    if node.children.is_empty() {
+        node.children = fallback_order;
+    }
+    node.prefer_tags.clear();
+    node.on_exhausted = RoutingExhaustedActionV4::Continue;
+    node.when = None;
+    node.then = None;
+    node.default_route = None;
+    view.routing = Some(routing);
+    Ok(view)
+}
+
 impl ProxyService {
+    pub(super) async fn route_target_override_for_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<(String, &'static str)> {
+        if let Some(sid) = session_id
+            && let Some(target) = self.state.get_session_route_target_override(sid).await
+            && !target.trim().is_empty()
+        {
+            return Some((target, "session_route_target_override"));
+        }
+        if let Some(target) = self.state.get_global_route_target_override().await
+            && !target.trim().is_empty()
+        {
+            return Some((target, "global_route_target_override"));
+        }
+        None
+    }
+
     pub(super) async fn pinned_config(
         &self,
         mgr: &ServiceConfigManager,
@@ -118,6 +189,32 @@ impl ProxyService {
             .state
             .get_provider_balance_summary_view(self.service_name)
             .await;
+        let route_target_override = if v4.is_some() {
+            self.route_target_override_for_session(session_id).await
+        } else {
+            None
+        };
+        if let Some(v4) = v4
+            && let Some(selection) = self.v4_route_selection_for_request(
+                v4,
+                request,
+                route_target_override
+                    .as_ref()
+                    .map(|(target, _)| target.as_str()),
+            )
+        {
+            if let Some((target, source)) = route_target_override {
+                log_retry_trace(serde_json::json!({
+                    "event": "route_target_override_applied",
+                    "service": self.service_name,
+                    "session_id": session_id,
+                    "source": source,
+                    "target": target,
+                }));
+            }
+            return selection;
+        }
+
         if let Some((name, source)) = self.pinned_config(mgr, session_id).await {
             let pinned_runtime_state = state_overrides
                 .get(name.as_str())
@@ -179,12 +276,6 @@ impl ProxyService {
                     )]);
                 }
             }
-        }
-
-        if let Some(v4) = v4
-            && let Some(selection) = self.v4_route_selection_for_request(v4, request)
-        {
-            return selection;
         }
 
         let plan = build_station_routing_plan(
@@ -292,10 +383,32 @@ impl ProxyService {
         &self,
         v4: &ProxyConfigV4,
         request: &RouteRequestContext,
+        route_target_override: Option<&str>,
     ) -> Option<RequestRouteSelection> {
-        let view = match self.service_name {
+        let base_view = match self.service_name {
             "claude" => &v4.claude,
             _ => &v4.codex,
+        };
+        let override_view;
+        let view = if let Some(target) = route_target_override {
+            match service_view_with_route_target_override(self.service_name, base_view, target) {
+                Ok(view) => {
+                    override_view = view;
+                    &override_view
+                }
+                Err(err) => {
+                    log_retry_trace(serde_json::json!({
+                        "event": "lbs_for_request",
+                        "service": self.service_name,
+                        "mode": "v4_route_target_override_error",
+                        "target": target,
+                        "error": err.to_string(),
+                    }));
+                    return Some(RequestRouteSelection::empty());
+                }
+            }
+        } else {
+            base_view
         };
         let template =
             match compile_v4_route_plan_template_with_request(self.service_name, view, request) {
@@ -310,34 +423,46 @@ impl ProxyService {
                     return Some(RequestRouteSelection::empty());
                 }
             };
-        let lbs = load_balancers_from_v4_route_template(&template, self.lb_states.clone());
         log_retry_trace(serde_json::json!({
             "event": "lbs_for_request",
             "service": self.service_name,
             "mode": "v4_route_plan_ir",
             "entry": template.entry.as_str(),
             "candidate_count": template.candidates.len(),
-            "station_count": lbs.len(),
+            "provider_endpoint_candidates": template
+                .candidates
+                .iter()
+                .map(|candidate| route_candidate_trace_json(&template, candidate))
+                .collect::<Vec<_>>(),
         }));
-        Some(RequestRouteSelection {
-            lbs,
-            route_plan_template: Some(template),
-        })
+        Some(RequestRouteSelection::route_graph(template))
     }
 }
 
 impl RequestRouteSelection {
     fn empty() -> Self {
-        Self {
-            lbs: Vec::new(),
-            route_plan_template: None,
-        }
+        Self::Legacy { lbs: Vec::new() }
     }
 
     fn legacy(lbs: Vec<LoadBalancer>) -> Self {
-        Self {
-            lbs,
-            route_plan_template: None,
+        Self::Legacy { lbs }
+    }
+
+    fn route_graph(template: RoutePlanTemplate) -> Self {
+        Self::RouteGraph { template }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        match self {
+            Self::Legacy { lbs } => lbs.is_empty(),
+            Self::RouteGraph { template } => template.candidates.is_empty(),
+        }
+    }
+
+    pub(super) fn legacy_lbs(&self) -> Option<&[LoadBalancer]> {
+        match self {
+            Self::Legacy { lbs } => Some(lbs),
+            Self::RouteGraph { .. } => None,
         }
     }
 }
@@ -346,33 +471,6 @@ impl From<Vec<LoadBalancer>> for RequestRouteSelection {
     fn from(lbs: Vec<LoadBalancer>) -> Self {
         Self::legacy(lbs)
     }
-}
-
-fn load_balancers_from_v4_route_template(
-    template: &RoutePlanTemplate,
-    lb_states: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::lb::LbState>>>,
-) -> Vec<LoadBalancer> {
-    if template.candidates.is_empty() {
-        return Vec::new();
-    }
-
-    let station_name = template
-        .compatibility_station_name
-        .clone()
-        .unwrap_or_else(|| "routing".to_string());
-    let service = ServiceConfig {
-        name: station_name,
-        alias: Some("active routing".to_string()),
-        enabled: true,
-        level: 1,
-        upstreams: template
-            .candidates
-            .iter()
-            .map(|candidate| candidate.to_upstream_config())
-            .collect(),
-    };
-
-    vec![LoadBalancer::new(Arc::new(service), lb_states)]
 }
 
 #[cfg(test)]

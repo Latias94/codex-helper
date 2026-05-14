@@ -8,9 +8,11 @@ mod admin;
 mod api_responses;
 mod attempt_execution;
 mod attempt_failures;
+mod attempt_health;
 mod attempt_request;
 mod attempt_response;
 mod attempt_selection;
+mod attempt_target;
 mod attempt_transport;
 mod auth_resolution;
 mod classify;
@@ -58,13 +60,16 @@ mod tests;
 
 use crate::filter::RequestFilter;
 use crate::lb::LbState;
-use crate::state::ProxyState;
+use crate::state::{ProviderBalanceSnapshot, ProxyState};
+use crate::usage_providers::UsageProviderRefreshSummary;
 
 pub use self::admin::{
     admin_base_url_from_proxy_base_url, admin_loopback_addr_for_proxy_port,
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
+pub use self::api_responses::{ProfilesResponse, ReloadResult, RuntimeStatusResponse};
 pub use self::entrypoint::handle_proxy;
+pub use self::persisted_registry_api::PersistedRoutingUpsertRequest;
 pub use self::router_setup::{
     admin_listener_router, proxy_only_router, proxy_only_router_with_admin_base_url, router,
 };
@@ -99,4 +104,52 @@ pub struct ProxyService {
     lb_states: Arc<Mutex<HashMap<String, LbState>>>,
     filter: RequestFilter,
     state: Arc<ProxyState>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProviderBalanceRefreshResponse {
+    pub service_name: String,
+    pub refresh: UsageProviderRefreshSummary,
+    pub provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyControlError {
+    status: axum::http::StatusCode,
+    message: String,
+}
+
+impl ProxyControlError {
+    pub fn new(status: axum::http::StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    pub fn status(&self) -> axum::http::StatusCode {
+        self.status
+    }
+
+    pub fn message(&self) -> &str {
+        self.message.as_str()
+    }
+
+    pub fn into_http_error(self) -> (axum::http::StatusCode, String) {
+        (self.status, self.message)
+    }
+}
+
+impl std::fmt::Display for ProxyControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "status={}, {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for ProxyControlError {}
+
+impl From<(axum::http::StatusCode, String)> for ProxyControlError {
+    fn from((status, message): (axum::http::StatusCode, String)) -> Self {
+        Self::new(status, message)
+    }
 }

@@ -152,12 +152,22 @@ pub(super) fn render_overview_station_summary(ui: &mut egui::Ui, ctx: &mut PageC
         }
     });
 
+    let global_runtime_override = if snapshot.supports_global_route_target_override {
+        (
+            pick(ctx.lang, "全局 route target", "Global route target"),
+            snapshot.global_route_target_override.as_deref(),
+        )
+    } else {
+        (
+            pick(ctx.lang, "全局站点覆盖", "Global pinned station"),
+            snapshot.global_station_override.as_deref(),
+        )
+    };
     ui.small(format!(
         "{}: {}",
-        pick(ctx.lang, "全局站点覆盖", "Global pinned station"),
-        snapshot
-            .global_station_override
-            .as_deref()
+        global_runtime_override.0,
+        global_runtime_override
+            .1
             .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
     ));
     ui.small(format!(

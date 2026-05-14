@@ -347,10 +347,18 @@ impl eframe::App for GuiApp {
                         }
                     }
                     TrayAction::ApplyPinnedStation { name } => {
-                        match self
+                        let use_route_target = self
                             .proxy
-                            .apply_global_station_override(&self.rt, name.clone())
-                        {
+                            .snapshot()
+                            .is_some_and(|snapshot| snapshot.supports_global_route_target_override);
+                        let result = if use_route_target {
+                            self.proxy
+                                .apply_global_route_target_override(&self.rt, name.clone())
+                        } else {
+                            self.proxy
+                                .apply_global_station_override(&self.rt, name.clone())
+                        };
+                        match result {
                             Ok(()) => {
                                 self.proxy.refresh_current_if_due(
                                     &self.rt,
@@ -583,11 +591,17 @@ fn tray_menu_model(proxy: &ProxyController) -> TrayMenuModel {
         service_name: snapshot.as_ref().and_then(|s| s.service_name.clone()),
         port: snapshot.as_ref().and_then(|s| s.port),
         supports_v1: snapshot.as_ref().is_some_and(|s| s.supports_v1),
+        supports_global_route_target_override: snapshot
+            .as_ref()
+            .is_some_and(|s| s.supports_global_route_target_override),
         active_display,
         stations,
         global_station_override: snapshot
             .as_ref()
             .and_then(|s| s.global_station_override.clone()),
+        global_route_target_override: snapshot
+            .as_ref()
+            .and_then(|s| s.global_route_target_override.clone()),
     }
 }
 

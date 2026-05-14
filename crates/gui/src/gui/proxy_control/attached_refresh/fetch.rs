@@ -99,6 +99,25 @@ async fn get_v1_global_station_override(
     .await
 }
 
+async fn get_v1_global_route_target_override(
+    client: &Client,
+    base: &str,
+    links: Option<&OperatorSummaryLinks>,
+    req_timeout: Duration,
+) -> anyhow::Result<Option<String>> {
+    get_json::<Option<String>>(
+        client,
+        linked_url(
+            base,
+            links,
+            |summary_links| summary_links.global_route_override.as_str(),
+            "/__codex_helper/api/v1/overrides/global-route",
+        ),
+        req_timeout,
+    )
+    .await
+}
+
 async fn get_v1_station_health(
     client: &Client,
     base: &str,
@@ -160,8 +179,10 @@ pub(super) async fn refresh_from_base(
     let supports_control_trace_api = resolved_surface.control_trace;
     let supports_session_override_aggregate = resolved_surface.session_override_aggregate;
     let supports_global_station_override = resolved_surface.global_station_override;
+    let supports_global_route_target_override = resolved_surface.global_route_override;
     let supports_routing_explain_api = resolved_surface.routing_explain;
     let supports_session_station = resolved_surface.session_station;
+    let supports_session_route_target = resolved_surface.session_route;
     let supports_session_effort = resolved_surface.session_reasoning_effort;
     let supports_station_api = resolved_surface.station_api;
     let supports_station_runtime_override = resolved_surface.station_runtime;
@@ -379,6 +400,14 @@ pub(super) async fn refresh_from_base(
                     .effective_global_station_override()
                     .map(str::to_owned)
             });
+        let global_route_target_override = operator_runtime_summary
+            .as_ref()
+            .and_then(|summary| summary.global_route_target_override.clone())
+            .or_else(|| {
+                snapshot
+                    .effective_global_route_target_override()
+                    .map(str::to_owned)
+            });
         let station_health = snapshot.effective_station_health().clone();
 
         return Ok(RefreshResult {
@@ -389,6 +418,7 @@ pub(super) async fn refresh_from_base(
             recent: snapshot.recent,
             session_cards: snapshot.session_cards,
             global_station_override,
+            global_route_target_override,
             configured_active_station: operator_runtime_summary
                 .as_ref()
                 .and_then(|summary| summary.configured_active_station.clone())
@@ -406,6 +436,7 @@ pub(super) async fn refresh_from_base(
             providers: providers.clone(),
             session_model: snapshot.session_model_overrides,
             session_station: snapshot.session_station_overrides,
+            session_route_target: snapshot.session_route_target_overrides,
             session_effort: snapshot.session_effort_overrides,
             session_service_tier: snapshot.session_service_tier_overrides,
             session_stats: snapshot.session_stats,
@@ -480,6 +511,8 @@ pub(super) async fn refresh_from_base(
             supports_station_spec_api,
             supports_default_profile_override,
             supports_station_runtime_override,
+            supports_session_route_target_override: supports_session_route_target,
+            supports_global_route_target_override: supports_global_route_target_override,
             supports_session_override_reset,
             supports_control_trace_api,
             supports_request_ledger_api,
@@ -496,6 +529,7 @@ pub(super) async fn refresh_from_base(
         recent,
         runtime,
         global_station_override,
+        global_route_target_override,
         stats,
         stations,
         station_health,
@@ -530,6 +564,24 @@ pub(super) async fn refresh_from_base(
                 Ok::<Option<String>, anyhow::Error>(None)
             } else {
                 get_v1_global_station_override(
+                    client,
+                    base,
+                    operator_summary_links_ref,
+                    req_timeout,
+                )
+                .await
+            }
+        },
+        async {
+            if operator_runtime_summary
+                .as_ref()
+                .and_then(|summary| summary.global_route_target_override.as_ref())
+                .is_some()
+                || !supports_global_route_target_override
+            {
+                Ok::<Option<String>, anyhow::Error>(None)
+            } else {
+                get_v1_global_route_target_override(
                     client,
                     base,
                     operator_summary_links_ref,
@@ -582,101 +634,124 @@ pub(super) async fn refresh_from_base(
 
     let supports_session_model = resolved_surface.session_model;
     let supports_session_service_tier = resolved_surface.session_service_tier;
-    let (session_station, session_effort, session_model, session_service_tier) =
-        if supports_session_override_aggregate {
-            let aggregate = get_json::<AttachedSessionManualOverridesListResponse>(
+    let (
+        session_station,
+        session_route_target,
+        session_effort,
+        session_model,
+        session_service_tier,
+    ) = if supports_session_override_aggregate {
+        let aggregate = get_json::<AttachedSessionManualOverridesListResponse>(
+            client,
+            linked_url(
+                base,
+                operator_summary_links_ref,
+                |summary_links| summary_links.session_overrides.as_str(),
+                "/__codex_helper/api/v1/overrides/session",
+            ),
+            req_timeout,
+        )
+        .await
+        .ok()
+        .unwrap_or_default();
+        let mut session_station = HashMap::new();
+        let mut session_route_target = HashMap::new();
+        let mut session_effort = HashMap::new();
+        let mut session_model = HashMap::new();
+        let mut session_service_tier = HashMap::new();
+        for (session_id, overrides) in aggregate.sessions {
+            if let Some(station_name) = overrides.station_name {
+                session_station.insert(session_id.clone(), station_name);
+            }
+            if let Some(route_target) = overrides.route_target {
+                session_route_target.insert(session_id.clone(), route_target);
+            }
+            if let Some(reasoning_effort) = overrides.reasoning_effort {
+                session_effort.insert(session_id.clone(), reasoning_effort);
+            }
+            if let Some(model) = overrides.model {
+                session_model.insert(session_id.clone(), model);
+            }
+            if let Some(service_tier) = overrides.service_tier {
+                session_service_tier.insert(session_id, service_tier);
+            }
+        }
+        (
+            session_station,
+            session_route_target,
+            session_effort,
+            session_model,
+            session_service_tier,
+        )
+    } else {
+        let session_station = if supports_session_station {
+            get_json::<HashMap<String, String>>(
                 client,
-                linked_url(
-                    base,
-                    operator_summary_links_ref,
-                    |summary_links| summary_links.session_overrides.as_str(),
-                    "/__codex_helper/api/v1/overrides/session",
-                ),
+                format!("{base}/__codex_helper/api/v1/overrides/session/station"),
                 req_timeout,
             )
             .await
             .ok()
-            .unwrap_or_default();
-            let mut session_station = HashMap::new();
-            let mut session_effort = HashMap::new();
-            let mut session_model = HashMap::new();
-            let mut session_service_tier = HashMap::new();
-            for (session_id, overrides) in aggregate.sessions {
-                if let Some(station_name) = overrides.station_name {
-                    session_station.insert(session_id.clone(), station_name);
-                }
-                if let Some(reasoning_effort) = overrides.reasoning_effort {
-                    session_effort.insert(session_id.clone(), reasoning_effort);
-                }
-                if let Some(model) = overrides.model {
-                    session_model.insert(session_id.clone(), model);
-                }
-                if let Some(service_tier) = overrides.service_tier {
-                    session_service_tier.insert(session_id, service_tier);
-                }
-            }
-            (
-                session_station,
-                session_effort,
-                session_model,
-                session_service_tier,
-            )
+            .unwrap_or_default()
         } else {
-            let session_station = if supports_session_station {
-                get_json::<HashMap<String, String>>(
-                    client,
-                    format!("{base}/__codex_helper/api/v1/overrides/session/station"),
-                    req_timeout,
-                )
-                .await
-                .ok()
-                .unwrap_or_default()
-            } else {
-                HashMap::new()
-            };
-            let session_effort = if supports_session_effort {
-                get_json::<HashMap<String, String>>(
-                    client,
-                    format!("{base}/__codex_helper/api/v1/overrides/session/effort"),
-                    req_timeout,
-                )
-                .await
-                .ok()
-                .unwrap_or_default()
-            } else {
-                HashMap::new()
-            };
-            let session_model = if supports_session_model {
-                get_json::<HashMap<String, String>>(
-                    client,
-                    format!("{base}/__codex_helper/api/v1/overrides/session/model"),
-                    req_timeout,
-                )
-                .await
-                .ok()
-                .unwrap_or_default()
-            } else {
-                HashMap::new()
-            };
-            let session_service_tier = if supports_session_service_tier {
-                get_json::<HashMap<String, String>>(
-                    client,
-                    format!("{base}/__codex_helper/api/v1/overrides/session/service-tier"),
-                    req_timeout,
-                )
-                .await
-                .ok()
-                .unwrap_or_default()
-            } else {
-                HashMap::new()
-            };
-            (
-                session_station,
-                session_effort,
-                session_model,
-                session_service_tier,
-            )
+            HashMap::new()
         };
+        let session_route_target = if supports_session_route_target {
+            get_json::<HashMap<String, String>>(
+                client,
+                format!("{base}/__codex_helper/api/v1/overrides/session/route"),
+                req_timeout,
+            )
+            .await
+            .ok()
+            .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        let session_effort = if supports_session_effort {
+            get_json::<HashMap<String, String>>(
+                client,
+                format!("{base}/__codex_helper/api/v1/overrides/session/effort"),
+                req_timeout,
+            )
+            .await
+            .ok()
+            .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        let session_model = if supports_session_model {
+            get_json::<HashMap<String, String>>(
+                client,
+                format!("{base}/__codex_helper/api/v1/overrides/session/model"),
+                req_timeout,
+            )
+            .await
+            .ok()
+            .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        let session_service_tier = if supports_session_service_tier {
+            get_json::<HashMap<String, String>>(
+                client,
+                format!("{base}/__codex_helper/api/v1/overrides/session/service-tier"),
+                req_timeout,
+            )
+            .await
+            .ok()
+            .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        (
+            session_station,
+            session_route_target,
+            session_effort,
+            session_model,
+            session_service_tier,
+        )
+    };
 
     let (configured_default_profile, default_profile, profiles) = match configured_profiles {
         Some(response) => (
@@ -693,6 +768,10 @@ pub(super) async fn refresh_from_base(
         .as_ref()
         .and_then(|summary| summary.global_station_override.clone())
         .or(global_station_override);
+    let global_route_target_override = operator_runtime_summary
+        .as_ref()
+        .and_then(|summary| summary.global_route_target_override.clone())
+        .or(global_route_target_override);
     let configured_active_station = operator_runtime_summary
         .as_ref()
         .and_then(|summary| summary.configured_active_station.clone());
@@ -716,6 +795,7 @@ pub(super) async fn refresh_from_base(
         recent,
         session_cards: operator_session_cards.unwrap_or_default(),
         global_station_override,
+        global_route_target_override,
         configured_active_station,
         effective_active_station,
         configured_default_profile,
@@ -724,6 +804,7 @@ pub(super) async fn refresh_from_base(
         providers,
         session_model,
         session_station,
+        session_route_target,
         session_effort,
         session_service_tier,
         session_stats: stats,
@@ -799,6 +880,8 @@ pub(super) async fn refresh_from_base(
         supports_station_spec_api,
         supports_default_profile_override,
         supports_station_runtime_override,
+        supports_session_route_target_override: supports_session_route_target,
+        supports_global_route_target_override: supports_global_route_target_override,
         supports_session_override_reset,
         supports_control_trace_api,
         supports_request_ledger_api,

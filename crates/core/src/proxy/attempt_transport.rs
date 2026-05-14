@@ -7,13 +7,14 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use futures_util::StreamExt;
 
-use crate::lb::{LoadBalancer, SelectedUpstream};
+use crate::lb::LoadBalancer;
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog};
 use crate::state::RouteDecisionProvenance;
 
 use super::ProxyService;
 use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upstream_failure};
 use super::attempt_request::{AttemptRequestSetupParams, prepare_attempt_request};
+use super::attempt_target::AttemptTarget;
 use super::http_debug::{HttpDebugBase, format_reqwest_error_for_retry_chain};
 use super::retry::{RetryLayerOptions, backoff_sleep, should_retry_class};
 use super::route_attempts::{
@@ -121,8 +122,8 @@ async fn read_response_body_with_limit(
 
 pub(super) struct AttemptTransportParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) lb: &'a LoadBalancer,
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) legacy_lb: Option<&'a LoadBalancer>,
+    pub(super) target: &'a AttemptTarget,
     pub(super) method: &'a Method,
     pub(super) uri: &'a Uri,
     pub(super) client_headers: &'a HeaderMap,
@@ -155,8 +156,8 @@ pub(super) struct AttemptTransportParams<'a> {
 
 pub(super) struct AttemptReadBodyParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) lb: &'a LoadBalancer,
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) legacy_lb: Option<&'a LoadBalancer>,
+    pub(super) target: &'a AttemptTarget,
     pub(super) response: reqwest::Response,
     pub(super) upstream_opt: &'a RetryLayerOptions,
     pub(super) upstream_attempt: u32,
@@ -176,8 +177,8 @@ pub(super) async fn handle_attempt_transport(
 ) -> AttemptTransportOutcome {
     let AttemptTransportParams {
         proxy,
-        lb,
-        selected,
+        legacy_lb,
+        target,
         method,
         uri,
         client_headers,
@@ -208,14 +209,14 @@ pub(super) async fn handle_attempt_transport(
         model_note,
     } = params;
 
-    let target_url = match proxy.build_target(selected, uri) {
+    let target_url = match proxy.build_target(target, uri) {
         Ok((url, _headers)) => url,
         Err(error) => {
             let err_str = error.to_string();
             apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
                 lb: None,
-                selected,
+                target,
                 error_class: "target_build_error",
                 penalize_reason: None,
                 cooldown_secs: transport_cooldown_secs,
@@ -230,7 +231,7 @@ pub(super) async fn handle_attempt_transport(
                 upstream_chain,
                 route_attempts,
                 ErrorRouteAttemptParams {
-                    selected,
+                    target,
                     route_attempt_index,
                     kind: RouteAttemptErrorKind::TargetBuild,
                     reason: err_str.as_str(),
@@ -246,7 +247,7 @@ pub(super) async fn handle_attempt_transport(
 
     let attempt_request = prepare_attempt_request(AttemptRequestSetupParams {
         proxy,
-        auth: &selected.upstream.auth,
+        auth: &target.upstream().auth,
         client_headers,
         client_headers_entries_cache,
         request_body_len,
@@ -265,9 +266,11 @@ pub(super) async fn handle_attempt_transport(
         .state
         .update_request_route(
             request_id,
-            selected.station_name.clone(),
-            provider_id.map(ToOwned::to_owned),
-            selected.upstream.base_url.clone(),
+            target.compatibility_station_name().map(ToOwned::to_owned),
+            provider_id
+                .map(ToOwned::to_owned)
+                .or_else(|| target.provider_id().map(ToOwned::to_owned)),
+            target.upstream().base_url.clone(),
             Some(route_decision.clone()),
         )
         .await;
@@ -290,7 +293,7 @@ pub(super) async fn handle_attempt_transport(
                 upstream_chain,
                 route_attempts,
                 ErrorRouteAttemptParams {
-                    selected,
+                    target,
                     route_attempt_index,
                     kind: RouteAttemptErrorKind::Transport,
                     reason: err_str.as_str(),
@@ -307,8 +310,8 @@ pub(super) async fn handle_attempt_transport(
 
             apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
-                lb: Some(lb),
-                selected,
+                lb: legacy_lb,
+                target,
                 error_class: "upstream_transport_error",
                 penalize_reason: Some("upstream_transport_error"),
                 cooldown_secs: transport_cooldown_secs,
@@ -336,8 +339,8 @@ pub(super) async fn read_attempt_response_body(
 ) -> AttemptReadBodyOutcome {
     let AttemptReadBodyParams {
         proxy,
-        lb,
-        selected,
+        legacy_lb,
+        target,
         response,
         upstream_opt,
         upstream_attempt,
@@ -378,7 +381,7 @@ pub(super) async fn read_attempt_response_body(
                 upstream_chain,
                 route_attempts,
                 ErrorRouteAttemptParams {
-                    selected,
+                    target,
                     route_attempt_index,
                     kind: route_kind,
                     reason: err_str.as_str(),
@@ -395,8 +398,8 @@ pub(super) async fn read_attempt_response_body(
 
             apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
                 proxy,
-                lb: Some(lb),
-                selected,
+                lb: legacy_lb,
+                target,
                 error_class,
                 penalize_reason: Some(error_class),
                 cooldown_secs: transport_cooldown_secs,

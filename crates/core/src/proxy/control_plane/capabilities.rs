@@ -2,6 +2,7 @@ use axum::Json;
 use axum::extract::Query;
 use axum::http::StatusCode;
 
+use crate::config::is_supported_route_graph_config_version;
 use crate::dashboard_core::{
     ApiV1Capabilities, ApiV1OperatorSummary, ApiV1Snapshot, HostLocalControlPlaneCapabilities,
     SharedControlPlaneCapabilities, build_profile_options_from_mgr,
@@ -21,9 +22,16 @@ async fn api_v1_surface_capabilities_for_proxy(
 ) -> crate::dashboard_core::ControlPlaneSurfaceCapabilities {
     let mut surface = api_v1_surface_capabilities();
     let cfg = proxy.config.snapshot().await;
-    if matches!(cfg.version, Some(3 | 4)) {
+    let route_graph_config = cfg
+        .version
+        .is_some_and(is_supported_route_graph_config_version);
+    surface.session_route_override = route_graph_config;
+    surface.global_route_override = route_graph_config;
+    if matches!(cfg.version, Some(3)) || route_graph_config {
         surface.station_persisted_settings = false;
         surface.station_specs = false;
+        surface.session_station_override = false;
+        surface.global_station_override = false;
     }
     surface
 }

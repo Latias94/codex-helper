@@ -21,9 +21,13 @@ pub struct DashboardSnapshot {
     #[serde(default)]
     pub global_station_override: Option<String>,
     #[serde(default)]
+    pub global_route_target_override: Option<String>,
+    #[serde(default)]
     pub session_model_overrides: HashMap<String, String>,
     #[serde(default)]
     pub session_station_overrides: HashMap<String, String>,
+    #[serde(default)]
+    pub session_route_target_overrides: HashMap<String, String>,
     #[serde(default)]
     pub session_effort_overrides: HashMap<String, String>,
     #[serde(default)]
@@ -43,6 +47,10 @@ pub struct DashboardSnapshot {
 impl DashboardSnapshot {
     pub fn effective_global_station_override(&self) -> Option<&str> {
         self.global_station_override.as_deref()
+    }
+
+    pub fn effective_global_route_target_override(&self) -> Option<&str> {
+        self.global_route_target_override.as_deref()
     }
 
     pub fn effective_station_health(&self) -> &HashMap<String, StationHealth> {
@@ -89,8 +97,10 @@ pub async fn build_dashboard_snapshot(
         active,
         mut recent_all,
         global_station_override,
+        global_route_target_override,
         session_model,
         session_cfg,
+        session_route_target,
         session_effort,
         session_service_tier,
         session_bindings,
@@ -105,8 +115,10 @@ pub async fn build_dashboard_snapshot(
         state.list_active_requests(),
         state.list_recent_finished(recent_for_stats),
         state.get_global_station_override(),
+        state.get_global_route_target_override(),
         state.list_session_model_overrides(),
         state.list_session_station_overrides(),
+        state.list_session_route_target_overrides(),
         state.list_session_effort_overrides(),
         state.list_session_service_tier_overrides(),
         state.list_session_bindings(),
@@ -148,8 +160,10 @@ pub async fn build_dashboard_snapshot(
         recent: recent_all,
         session_cards,
         global_station_override,
+        global_route_target_override,
         session_model_overrides: session_model,
         session_station_overrides: session_cfg,
+        session_route_target_overrides: session_route_target,
         session_effort_overrides: session_effort,
         session_service_tier_overrides: session_service_tier,
         session_stats,

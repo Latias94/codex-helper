@@ -14,9 +14,15 @@ pub(super) fn observed_session_row_from_snapshot(
         .iter()
         .find(|card| card.session_id.as_deref() == Some(session_id))
     {
-        return super::build_session_rows_from_cards(std::slice::from_ref(card))
+        let mut row = super::build_session_rows_from_cards(std::slice::from_ref(card))
             .into_iter()
             .next();
+        if let Some(row) = row.as_mut()
+            && let Some(route_target) = snapshot.session_route_target_overrides.get(session_id)
+        {
+            row.override_route_target = Some(route_target.clone());
+        }
+        return row;
     }
 
     super::build_session_rows(
@@ -25,6 +31,7 @@ pub(super) fn observed_session_row_from_snapshot(
         &snapshot.session_model_overrides,
         &snapshot.session_effort_overrides,
         &snapshot.session_station_overrides,
+        &snapshot.session_route_target_overrides,
         &snapshot.session_service_tier_overrides,
         snapshot.global_station_override.as_deref(),
         &snapshot.session_stats,

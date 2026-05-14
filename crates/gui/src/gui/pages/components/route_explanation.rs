@@ -367,16 +367,19 @@ pub(in super::super) fn render_session_route_snapshot_card(
     lang: Language,
     row: &SessionRow,
     global_station_override: Option<&str>,
+    global_route_target_override: Option<&str>,
 ) {
     let observed_rows = observed_route_snapshot_rows(row, lang, "(last)", false);
     let effective_rows = effective_route_snapshot_rows(row, lang);
     let override_summary = format!(
-        "model={}, effort={}, station={}, tier={}, global_station={}",
+        "model={}, effort={}, station={}, route_target={}, tier={}, global_station={}, global_route_target={}",
         row.override_model.as_deref().unwrap_or("-"),
         row.override_effort.as_deref().unwrap_or("-"),
         row.override_station_name().unwrap_or("-"),
+        row.override_route_target().unwrap_or("-"),
         row.override_service_tier.as_deref().unwrap_or("-"),
         global_station_override.unwrap_or("-"),
+        global_route_target_override.unwrap_or("-"),
     );
 
     console_section(
@@ -408,16 +411,16 @@ pub(in super::super) fn render_session_route_snapshot_card(
             ui.add_space(6.0);
             if let Some(affinity) = row.route_affinity.as_ref() {
                 let provider = format_route_decision_provider_endpoint(
-                    affinity.provider_id.as_deref(),
-                    affinity.endpoint_id.as_deref(),
+                    Some(affinity.provider_endpoint.provider_id.as_str()),
+                    Some(affinity.provider_endpoint.endpoint_id.as_str()),
                 )
                 .unwrap_or_else(|| "-".to_string());
                 console_note(
                     ui,
                     format!(
-                        "{}: station={}, provider={}, upstream={}, reason={}",
+                        "{}: target={}, provider={}, upstream={}, reason={}",
                         pick(lang, "session 粘性", "Session affinity"),
-                        affinity.station_name,
+                        affinity.provider_endpoint.stable_key(),
                         provider,
                         shorten_middle(&affinity.upstream_base_url, 72),
                         affinity.change_reason,

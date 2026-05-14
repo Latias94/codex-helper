@@ -5,10 +5,9 @@ use axum::Json;
 use axum::extract::Query;
 use axum::http::StatusCode;
 
-use crate::balance::ProviderBalanceSnapshot;
 use crate::config::{
-    ProxyConfig, ProxyConfigV2, ProxyConfigV4, ServiceConfig, ServiceConfigManager, ServiceViewV2,
-    ServiceViewV4, UpstreamAuth, UpstreamConfig,
+    CURRENT_ROUTE_GRAPH_CONFIG_VERSION, ProxyConfig, ProxyConfigV2, ProxyConfigV4, ServiceConfig,
+    ServiceConfigManager, ServiceViewV2, ServiceViewV4, UpstreamAuth, UpstreamConfig,
 };
 use crate::dashboard_core::{ProviderOption, build_provider_options_from_view};
 use crate::logging::{log_retry_trace, now_ms};
@@ -45,13 +44,6 @@ pub(super) struct ProviderBalanceRefreshQuery {
     provider_id: Option<String>,
 }
 
-#[derive(serde::Serialize)]
-pub(super) struct ProviderBalanceRefreshResponse {
-    service_name: String,
-    refresh: UsageProviderRefreshSummary,
-    provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
-}
-
 fn normalize_provider_name(value: &str) -> Result<String, (StatusCode, String)> {
     let value = value.trim();
     if value.is_empty() {
@@ -85,6 +77,25 @@ fn provider_endpoint_override_key(
     endpoint_name: &str,
 ) -> ProviderEndpointKey {
     ProviderEndpointKey::new(service_name, provider_name, endpoint_name)
+}
+
+fn canonical_provider_endpoint_override_key(
+    service_name: &str,
+    provider_name: &str,
+    endpoint_name: &str,
+    endpoint: &crate::config::ProviderEndpointV2,
+) -> ProviderEndpointKey {
+    let provider_id = endpoint
+        .tags
+        .get("provider_id")
+        .map(String::as_str)
+        .unwrap_or(provider_name);
+    let endpoint_id = endpoint
+        .tags
+        .get("endpoint_id")
+        .map(String::as_str)
+        .unwrap_or(endpoint_name);
+    provider_endpoint_override_key(service_name, provider_id, endpoint_id)
 }
 
 fn endpoint_base_url_is_unique(
@@ -202,11 +213,13 @@ fn merge_bool_maps(
 
 fn provider_tags_for_balance(
     provider_name: &str,
+    endpoint_name: &str,
     provider_tags: &BTreeMap<String, String>,
     endpoint_tags: &BTreeMap<String, String>,
 ) -> HashMap<String, String> {
     let mut tags = merge_string_maps(provider_tags, endpoint_tags);
     tags.insert("provider_id".to_string(), provider_name.to_string());
+    tags.insert("endpoint_id".to_string(), endpoint_name.to_string());
     tags
 }
 
@@ -228,7 +241,12 @@ fn service_manager_from_v4_provider_catalog(view: &ServiceViewV4) -> ServiceConf
             upstreams.push(UpstreamConfig {
                 base_url: base_url.to_string(),
                 auth: auth.clone(),
-                tags: provider_tags_for_balance(provider_name, &provider.tags, &BTreeMap::new()),
+                tags: provider_tags_for_balance(
+                    provider_name,
+                    "default",
+                    &provider.tags,
+                    &BTreeMap::new(),
+                ),
                 supported_models: provider
                     .supported_models
                     .iter()
@@ -249,14 +267,19 @@ fn service_manager_from_v4_provider_catalog(view: &ServiceViewV4) -> ServiceConf
                 .then_with(|| left_name.cmp(right_name))
                 .then_with(|| left.base_url.cmp(&right.base_url))
         });
-        for (_, endpoint) in endpoints {
+        for (endpoint_name, endpoint) in endpoints {
             if !endpoint.enabled {
                 continue;
             }
             upstreams.push(UpstreamConfig {
                 base_url: endpoint.base_url.clone(),
                 auth: auth.clone(),
-                tags: provider_tags_for_balance(provider_name, &provider.tags, &endpoint.tags),
+                tags: provider_tags_for_balance(
+                    provider_name,
+                    endpoint_name,
+                    &provider.tags,
+                    &endpoint.tags,
+                ),
                 supported_models: merge_bool_maps(
                     &provider.supported_models,
                     &endpoint.supported_models,
@@ -316,10 +339,15 @@ fn service_manager_from_v2_provider_catalog(view: &ServiceViewV2) -> ServiceConf
         let upstreams = endpoints
             .into_iter()
             .filter(|(_, endpoint)| endpoint.enabled)
-            .map(|(_, endpoint)| UpstreamConfig {
+            .map(|(endpoint_name, endpoint)| UpstreamConfig {
                 base_url: endpoint.base_url.clone(),
                 auth: provider.auth.clone(),
-                tags: provider_tags_for_balance(provider_name, &provider.tags, &endpoint.tags),
+                tags: provider_tags_for_balance(
+                    provider_name,
+                    endpoint_name,
+                    &provider.tags,
+                    &endpoint.tags,
+                ),
                 supported_models: merge_bool_maps(
                     &provider.supported_models,
                     &endpoint.supported_models,
@@ -352,7 +380,7 @@ fn service_manager_from_v2_provider_catalog(view: &ServiceViewV2) -> ServiceConf
 
 fn provider_catalog_runtime_from_v4(cfg: &ProxyConfigV4, service_name: &str) -> ProxyConfig {
     let mut runtime = ProxyConfig {
-        version: Some(4),
+        version: Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
         retry: cfg.retry.clone(),
         notify: cfg.notify.clone(),
         default_service: cfg.default_service,
@@ -503,10 +531,11 @@ pub(super) async fn apply_provider_runtime_meta(
                 ),
             ));
         };
-        let override_key = provider_endpoint_override_key(
+        let override_key = canonical_provider_endpoint_override_key(
             proxy.service_name,
             provider_name.as_str(),
             endpoint_name,
+            endpoint,
         );
         if payload.clear_enabled {
             proxy
@@ -636,25 +665,14 @@ pub(super) async fn apply_provider_runtime_meta(
 pub(super) async fn refresh_provider_balances(
     proxy: ProxyService,
     Query(query): Query<ProviderBalanceRefreshQuery>,
-) -> Result<Json<ProviderBalanceRefreshResponse>, (StatusCode, String)> {
+) -> Result<Json<super::ProviderBalanceRefreshResponse>, (StatusCode, String)> {
     let station_name = normalize_optional_filter(query.station_name);
     let provider_id = normalize_optional_filter(query.provider_id);
-    let refresh = refresh_provider_balances_for_proxy(
-        &proxy,
-        station_name.as_deref(),
-        provider_id.as_deref(),
-    )
-    .await?;
-    let provider_balances = proxy
-        .state
-        .get_provider_balance_view(proxy.service_name)
-        .await;
-
-    Ok(Json(ProviderBalanceRefreshResponse {
-        service_name: proxy.service_name.to_string(),
-        refresh,
-        provider_balances,
-    }))
+    let response = proxy
+        .refresh_provider_balances(station_name.as_deref(), provider_id.as_deref())
+        .await
+        .map_err(super::ProxyControlError::into_http_error)?;
+    Ok(Json(response))
 }
 
 pub(super) async fn refresh_provider_balances_for_proxy(
@@ -682,6 +700,7 @@ pub(super) async fn refresh_provider_balances_for_proxy(
 
     let cfg = proxy.config.snapshot().await;
     let mut refresh = refresh_balances_for_service(
+        &proxy.client,
         cfg,
         proxy.lb_states.clone(),
         proxy.state.clone(),
@@ -694,6 +713,7 @@ pub(super) async fn refresh_provider_balances_for_proxy(
     if let Some(provider_catalog_cfg) = load_provider_catalog_runtime(proxy.service_name).await? {
         let display_lb_states = Arc::new(Mutex::new(HashMap::new()));
         let provider_summary = refresh_balances_for_service(
+            &proxy.client,
             Arc::new(provider_catalog_cfg),
             display_lb_states,
             proxy.state.clone(),

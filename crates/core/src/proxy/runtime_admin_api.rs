@@ -16,12 +16,10 @@ use crate::routing_ir::{RouteRequestContext, compile_legacy_route_plan_template}
 use super::ProxyService;
 use super::api_responses::{
     ProfilesResponse, ReloadResult, RetryConfigResponse, RuntimeStatusResponse,
-    build_reload_result, build_retry_config_response, build_runtime_status_response,
-    make_profiles_response,
+    build_retry_config_response, make_profiles_response,
 };
-use super::control_plane_service::{
-    prune_runtime_observability_after_reload, save_runtime_proxy_settings_and_reload,
-};
+use super::control_plane_service::save_runtime_proxy_settings_and_reload;
+use super::request_routing::RequestRouteSelection;
 use super::route_affinity::apply_session_route_affinity_to_runtime;
 use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
 use super::routing_plan::{
@@ -176,7 +174,7 @@ impl RoutingExplainQuery {
 pub(super) async fn runtime_status(
     proxy: ProxyService,
 ) -> Result<Json<RuntimeStatusResponse>, (StatusCode, String)> {
-    Ok(Json(build_runtime_status_response(&proxy).await))
+    Ok(Json(proxy.runtime_status().await))
 }
 
 pub(super) async fn get_retry_config(
@@ -196,58 +194,78 @@ pub(super) async fn get_routing_explain(
     proxy: ProxyService,
     Query(q): Query<RoutingExplainQuery>,
 ) -> Result<Json<RoutingExplainResponse>, (StatusCode, String)> {
-    let cfg = proxy.config.snapshot().await;
     let request = q
         .request_context()
         .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     let session_id = q.session_id();
+    routing_explain_for_proxy(&proxy, request, session_id)
+        .await
+        .map(Json)
+}
+
+pub(super) async fn routing_explain_for_proxy(
+    proxy: &ProxyService,
+    request: RouteRequestContext,
+    session_id: Option<String>,
+) -> Result<RoutingExplainResponse, (StatusCode, String)> {
+    let cfg = proxy.config.snapshot().await;
     let v4 = proxy.config.v4_snapshot().await;
     let route_selection = routing_explain_load_balancers(
-        &proxy,
+        proxy,
         cfg.as_ref(),
         v4.as_deref(),
         &request,
         session_id.as_deref(),
     )
     .await;
-    let legacy_template;
-    let template = if let Some(template) = route_selection.route_plan_template.as_ref() {
-        template
-    } else {
-        legacy_template = compile_legacy_route_plan_template(
-            proxy.service_name,
-            route_selection.lbs.iter().map(|lb| lb.service.as_ref()),
-        );
-        &legacy_template
-    };
-    let upstream_overrides = proxy
-        .state
-        .get_upstream_meta_overrides(proxy.service_name)
-        .await;
-    let mut runtime = route_plan_runtime_state_from_lbs_with_overrides(
-        proxy.service_name,
-        &route_selection.lbs,
-        &upstream_overrides,
-    );
-    if let Some(template) = route_selection.route_plan_template.as_ref() {
-        let route_graph_key = template.route_graph_key();
-        apply_session_route_affinity_to_runtime(
-            &proxy,
-            session_id.as_deref(),
-            template,
-            route_graph_key.as_str(),
-            &mut runtime,
-        )
-        .await;
+    match &route_selection {
+        RequestRouteSelection::RouteGraph { template } => {
+            let mut runtime = proxy
+                .state
+                .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
+                .await;
+            let route_graph_key = template.route_graph_key();
+            apply_session_route_affinity_to_runtime(
+                proxy,
+                session_id.as_deref(),
+                template,
+                route_graph_key.as_str(),
+                &mut runtime,
+            )
+            .await;
+            Ok(build_routing_explain_response_with_request(
+                proxy.service_name,
+                Some(proxy.config.last_loaded_at_ms()),
+                request,
+                session_id,
+                template,
+                &runtime,
+            ))
+        }
+        RequestRouteSelection::Legacy { lbs } => {
+            let legacy_template = compile_legacy_route_plan_template(
+                proxy.service_name,
+                lbs.iter().map(|lb| lb.service.as_ref()),
+            );
+            let upstream_overrides = proxy
+                .state
+                .get_upstream_meta_overrides(proxy.service_name)
+                .await;
+            let runtime = route_plan_runtime_state_from_lbs_with_overrides(
+                proxy.service_name,
+                lbs,
+                &upstream_overrides,
+            );
+            Ok(build_routing_explain_response_with_request(
+                proxy.service_name,
+                Some(proxy.config.last_loaded_at_ms()),
+                request,
+                session_id,
+                &legacy_template,
+                &runtime,
+            ))
+        }
     }
-    Ok(Json(build_routing_explain_response_with_request(
-        proxy.service_name,
-        Some(proxy.config.last_loaded_at_ms()),
-        request,
-        session_id,
-        template,
-        &runtime,
-    )))
 }
 
 pub(super) async fn get_request_ledger_recent(
@@ -286,6 +304,21 @@ async fn routing_explain_load_balancers(
             .get_provider_balance_summary_view(proxy.service_name),
     );
 
+    let route_target_override = if v4.is_some() {
+        proxy
+            .route_target_override_for_session(session_id)
+            .await
+            .map(|(target, _)| target)
+    } else {
+        None
+    };
+    if let Some(v4) = v4
+        && let Some(selection) =
+            proxy.v4_route_selection_for_request(v4, request, route_target_override.as_deref())
+    {
+        return selection;
+    }
+
     if let Some((name, _source)) = proxy.pinned_config(mgr, session_id).await {
         return match resolve_pinned_station_selection(
             mgr,
@@ -304,12 +337,6 @@ async fn routing_explain_load_balancers(
         };
     }
 
-    if let Some(v4) = v4
-        && let Some(selection) = proxy.v4_route_selection_for_request(v4, request)
-    {
-        return selection;
-    }
-
     let plan = build_station_routing_plan(
         mgr,
         mgr.active.as_deref(),
@@ -319,11 +346,15 @@ async fn routing_explain_load_balancers(
         &provider_balances,
     );
 
-    plan.selected_stations
-        .into_iter()
-        .map(|candidate| LoadBalancer::new(Arc::new(candidate.service), proxy.lb_states.clone()))
-        .collect::<Vec<_>>()
-        .into()
+    RequestRouteSelection::Legacy {
+        lbs: plan
+            .selected_stations
+            .into_iter()
+            .map(|candidate| {
+                LoadBalancer::new(Arc::new(candidate.service), proxy.lb_states.clone())
+            })
+            .collect::<Vec<_>>(),
+    }
 }
 
 pub(super) async fn get_request_ledger_summary(
@@ -367,16 +398,11 @@ pub(super) async fn set_retry_config(
 pub(super) async fn reload_runtime_config(
     proxy: ProxyService,
 ) -> Result<Json<ReloadResult>, (StatusCode, String)> {
-    let changed = proxy
-        .config
-        .force_reload_from_disk()
+    proxy
+        .reload_runtime_config()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if changed {
-        prune_runtime_observability_after_reload(&proxy).await;
-    }
-    let status = build_runtime_status_response(&proxy).await;
-    Ok(Json(build_reload_result(changed, status)))
+        .map(Json)
+        .map_err(super::ProxyControlError::into_http_error)
 }
 
 pub(super) async fn list_profiles(

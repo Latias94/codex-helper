@@ -773,7 +773,11 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  Enter      打开 effort 菜单（会话列表）"),
             Line::from("  l/m/h/X    设置 low/medium/high/xhigh"),
             Line::from("  x          清除 effort 覆盖"),
-            Line::from("  R          重置当前会话 model/station/effort/service_tier 覆盖"),
+            Line::from(if is_route_graph {
+                "  R          重置当前会话 model/route_target/effort/service_tier 覆盖"
+            } else {
+                "  R          重置当前会话 model/station/effort/service_tier 覆盖"
+            }),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "模型覆盖",
@@ -792,16 +796,20 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  Custom...  输入任意 service_tier"),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "Provider 覆盖",
+                if is_route_graph {
+                    "Route target 覆盖"
+                } else {
+                    "Provider 覆盖"
+                },
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from(if is_route_graph {
-                "  p/P        打开 v4 routing 编辑器（provider 选择由 routing policy 管理）"
+                "  p/P        打开 route graph 编辑器（provider 选择由 routing policy 管理）"
             } else {
                 "  p          会话级 provider 覆盖（固定）"
             }),
             Line::from(if is_route_graph {
-                "  r          在 Stations 页打开 routing 编辑器"
+                "  r          在 Routing 页打开 routing 编辑器"
             } else {
                 "  P          全局站点 pin（运行时）"
             }),
@@ -822,17 +830,17 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
                 "  Enter      设置为全局 pin"
             }),
             Line::from(if is_route_graph {
-                "  Backspace  清除遗留运行时 station pin"
+                "  Backspace  清除全局 route target"
             } else {
                 "  Backspace  清除全局 pin（自动）"
             }),
             Line::from(if is_route_graph {
-                "  o          v4 路由图下不设置会话 station override"
+                "  o          设置会话 route target 为选中 provider"
             } else {
                 "  o          设置会话 override 为当前站点"
             }),
             Line::from(if is_route_graph {
-                "  O          清除遗留会话 station override"
+                "  O          清除会话 route target"
             } else {
                 "  O          清除会话 override"
             }),
@@ -924,7 +932,11 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  Enter      open effort menu (on Sessions)"),
             Line::from("  l/m/h/X    set low/medium/high/xhigh"),
             Line::from("  x          clear effort override"),
-            Line::from("  R          reset session model/station/effort/service_tier overrides"),
+            Line::from(if is_route_graph {
+                "  R          reset session model/route_target/effort/service_tier overrides"
+            } else {
+                "  R          reset session model/station/effort/service_tier overrides"
+            }),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "Model override",
@@ -943,16 +955,20 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  Custom...  enter any service_tier"),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "Provider override",
+                if is_route_graph {
+                    "Route target override"
+                } else {
+                    "Provider override"
+                },
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from(if is_route_graph {
-                "  p/P        open v4 routing editor (provider choice is routing policy)"
+                "  p/P        open route graph editor (provider choice is routing policy)"
             } else {
                 "  p          session provider override (pinned)"
             }),
             Line::from(if is_route_graph {
-                "  r          open routing editor on the Stations page"
+                "  r          open routing editor on the Routing page"
             } else {
                 "  P          global station pin (runtime)"
             }),
@@ -975,17 +991,17 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
                 "  Enter      set global pin"
             }),
             Line::from(if is_route_graph {
-                "  Backspace  clear legacy runtime station pin"
+                "  Backspace  clear global route target"
             } else {
                 "  Backspace  clear global pin (auto)"
             }),
             Line::from(if is_route_graph {
-                "  o          session station override is disabled under v4 routing"
+                "  o          set session route target to selected provider"
             } else {
                 "  o          set session override to selected station"
             }),
             Line::from(if is_route_graph {
-                "  O          clear legacy session station override"
+                "  O          clear session route target"
             } else {
                 "  O          clear session override"
             }),

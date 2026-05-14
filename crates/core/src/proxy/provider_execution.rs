@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,12 +7,13 @@ use std::time::Instant;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
 
-use crate::config::RetryStrategy;
+use crate::config::{RetryStrategy, RoutingAffinityPolicyV5};
 use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace};
 use crate::routing_ir::{
     RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState, RoutePlanSkipReason,
-    RoutePlanTemplate, SkippedRouteCandidate, compile_legacy_route_plan_template,
+    SelectedRouteCandidate, SkippedRouteCandidate, SkippedStationRouteCandidate,
+    compile_legacy_route_plan_template,
 };
 use crate::state::SessionBinding;
 
@@ -21,12 +22,14 @@ use super::attempt_execution::{
     ExecuteSelectedUpstreamParams, SelectedUpstreamExecutionOutcome, execute_selected_upstream,
 };
 use super::attempt_selection::station_upstreams_exhausted;
+use super::attempt_target::AttemptTarget;
 use super::provider_orchestration::{
     CrossStationFailoverBlockedParams, cross_station_failover_enabled,
     log_cross_station_failover_blocked, log_same_station_failover_trace,
     next_provider_load_balancer, provider_attempt_limit, station_loop_action_after_attempt,
 };
 use super::request_preparation::RequestFlavor;
+use super::request_routing::RequestRouteSelection;
 use super::retry::{RetryPlan, backoff_sleep};
 use super::route_affinity::apply_session_route_affinity_to_runtime;
 use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
@@ -34,8 +37,7 @@ use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overri
 
 pub(super) struct ExecuteProviderChainParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) lbs: &'a [LoadBalancer],
-    pub(super) route_plan_template: Option<&'a RoutePlanTemplate>,
+    pub(super) route_selection: &'a RequestRouteSelection,
     pub(super) method: &'a Method,
     pub(super) uri: &'a Uri,
     pub(super) client_headers: &'a HeaderMap,
@@ -132,8 +134,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
 
     let ExecuteProviderChainParams {
         proxy,
-        lbs,
-        route_plan_template,
+        route_selection,
         method,
         uri,
         client_headers,
@@ -167,136 +168,202 @@ pub(super) async fn execute_provider_chain_with_route_executor(
     } = params;
 
     let provider_opt = &plan.route;
-    let total_upstreams = lbs
-        .iter()
-        .map(|lb| lb.service.upstreams.len())
-        .sum::<usize>();
-    let legacy_template;
-    let template = if let Some(template) = route_plan_template {
-        template
-    } else {
-        legacy_template = compile_legacy_route_plan_template(
-            proxy.service_name,
-            lbs.iter().map(|lb| lb.service.as_ref()),
-        );
-        &legacy_template
-    };
-    let executor = RoutePlanExecutor::new(template);
-    let upstream_overrides = proxy
-        .state
-        .get_upstream_meta_overrides(proxy.service_name)
-        .await;
-    let mut runtime = route_plan_runtime_state_from_lbs_with_overrides(
-        proxy.service_name,
-        lbs,
-        &upstream_overrides,
-    );
-    let route_graph_key = route_plan_template.map(|template| template.route_graph_key());
-    if let (Some(template), Some(route_graph_key)) =
-        (route_plan_template, route_graph_key.as_deref())
-    {
-        apply_session_route_affinity_to_runtime(
-            proxy,
-            session_id,
-            template,
-            route_graph_key,
-            &mut runtime,
-        )
-        .await;
-    }
-    let mut route_state = RoutePlanAttemptState::default();
-    let mut upstream_chain: Vec<String> = Vec::new();
-    let mut route_attempts: Vec<RouteAttemptLog> = Vec::new();
-    let mut tried_stations: HashSet<String> = HashSet::new();
-    let strict_multi_config = lbs.len() > 1;
-    let cross_station_failover_enabled =
-        cross_station_failover_enabled(strict_multi_config, plan, provider_opt);
-    let provider_attempt_limit =
-        provider_attempt_limit(cross_station_failover_enabled, provider_opt.max_attempts);
-    let mut global_attempt: u32 = 0;
-    let mut last_err: Option<(StatusCode, String)> = None;
-
-    for provider_attempt in 0..provider_attempt_limit {
-        let Some(lb) = next_provider_load_balancer(lbs, &tried_stations) else {
-            break;
-        };
-        let station_name = lb.service.name.clone();
-
-        if let Some(response) =
-            execute_station_upstreams_with_route_executor(ExecuteRouteExecutorStationParams {
+    match route_selection {
+        RequestRouteSelection::RouteGraph { template } => {
+            let executor = RoutePlanExecutor::new(template);
+            let route_graph_key = template.route_graph_key();
+            let total_upstreams = template.candidates.len();
+            let mut runtime = proxy
+                .state
+                .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
+                .await;
+            apply_session_route_affinity_to_runtime(
                 proxy,
-                lb: &lb,
-                station_name: station_name.as_str(),
-                method,
-                uri,
-                client_headers,
-                client_headers_entries_cache,
-                client_uri,
-                start,
-                started_at_ms,
-                request_id,
-                request_body_len,
-                body_for_upstream,
-                request_model,
-                session_binding,
-                session_override_config,
-                global_station_override,
-                override_model,
-                override_effort,
-                override_service_tier,
-                effective_effort,
-                effective_service_tier,
-                base_service_tier,
                 session_id,
-                cwd,
-                request_flavor,
-                request_body_previews,
-                debug_max,
-                warn_max,
-                client_body_debug,
-                client_body_warn,
-                plan,
-                route_graph_key: route_graph_key.as_deref(),
-                provider_attempt,
-                total_upstreams,
-                cooldown_backoff,
-                executor: &executor,
-                runtime: &runtime,
-                route_state: &mut route_state,
-                global_attempt: &mut global_attempt,
-                last_err: &mut last_err,
-                upstream_chain: &mut upstream_chain,
-                route_attempts: &mut route_attempts,
-            })
+                template,
+                route_graph_key.as_str(),
+                &mut runtime,
+            )
+            .await;
+            let mut route_state = RoutePlanAttemptState::default();
+            let mut upstream_chain: Vec<String> = Vec::new();
+            let mut route_attempts: Vec<RouteAttemptLog> = Vec::new();
+            let mut global_attempt: u32 = 0;
+            let mut last_err: Option<(StatusCode, String)> = None;
+
+            if let Some(response) = execute_route_graph_candidates_with_route_executor(
+                ExecuteRouteGraphExecutorParams {
+                    proxy,
+                    method,
+                    uri,
+                    client_headers,
+                    client_headers_entries_cache,
+                    client_uri,
+                    start,
+                    started_at_ms,
+                    request_id,
+                    request_body_len,
+                    body_for_upstream,
+                    request_model,
+                    session_binding,
+                    session_override_config,
+                    global_station_override,
+                    override_model,
+                    override_effort,
+                    override_service_tier,
+                    effective_effort,
+                    effective_service_tier,
+                    base_service_tier,
+                    session_id,
+                    cwd,
+                    request_flavor,
+                    request_body_previews,
+                    debug_max,
+                    warn_max,
+                    client_body_debug,
+                    client_body_warn,
+                    plan,
+                    route_graph_key: Some(route_graph_key.as_str()),
+                    provider_attempt: 0,
+                    total_upstreams,
+                    cooldown_backoff,
+                    executor: &executor,
+                    runtime: &runtime,
+                    route_state: &mut route_state,
+                    global_attempt: &mut global_attempt,
+                    last_err: &mut last_err,
+                    upstream_chain: &mut upstream_chain,
+                    route_attempts: &mut route_attempts,
+                },
+            )
             .await
-        {
-            return ProviderExecutionOutcome::Return(response);
+            {
+                return ProviderExecutionOutcome::Return(response);
+            }
+
+            ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
+                upstream_chain,
+                route_attempts,
+                last_err,
+            })
         }
+        RequestRouteSelection::Legacy { lbs } => {
+            let legacy_template = compile_legacy_route_plan_template(
+                proxy.service_name,
+                lbs.iter().map(|lb| lb.service.as_ref()),
+            );
+            let executor = RoutePlanExecutor::new(&legacy_template);
+            let total_upstreams = lbs
+                .iter()
+                .map(|lb| lb.service.upstreams.len())
+                .sum::<usize>();
+            let upstream_overrides = proxy
+                .state
+                .get_upstream_meta_overrides(proxy.service_name)
+                .await;
+            let runtime = route_plan_runtime_state_from_lbs_with_overrides(
+                proxy.service_name,
+                lbs,
+                &upstream_overrides,
+            );
+            let mut route_state = RoutePlanAttemptState::default();
+            let mut upstream_chain: Vec<String> = Vec::new();
+            let mut route_attempts: Vec<RouteAttemptLog> = Vec::new();
+            let strict_multi_config = lbs.len() > 1;
+            let cross_station_failover_enabled =
+                cross_station_failover_enabled(strict_multi_config, plan, provider_opt);
+            let provider_attempt_limit =
+                provider_attempt_limit(cross_station_failover_enabled, provider_opt.max_attempts);
+            let mut global_attempt: u32 = 0;
+            let mut last_err: Option<(StatusCode, String)> = None;
+            let mut tried_stations: HashSet<String> = HashSet::new();
 
-        tried_stations.insert(station_name.clone());
+            for provider_attempt in 0..provider_attempt_limit {
+                let Some(lb) = next_provider_load_balancer(lbs, &tried_stations) else {
+                    break;
+                };
+                let station_name = lb.service.name.clone();
 
-        log_cross_station_failover_blocked(CrossStationFailoverBlockedParams {
-            service_name: proxy.service_name,
-            request_id,
-            station_name: station_name.as_str(),
-            strict_multi_config,
-            provider_attempt,
-            cross_station_failover_enabled,
-            provider_opt,
-            provider_attempt_limit,
-            allow_cross_station_before_first_output: plan.allow_cross_station_before_first_output,
-        });
+                if let Some(response) = execute_station_upstreams_with_route_executor(
+                    ExecuteRouteExecutorStationParams {
+                        proxy,
+                        lb: &lb,
+                        station_name: station_name.as_str(),
+                        method,
+                        uri,
+                        client_headers,
+                        client_headers_entries_cache,
+                        client_uri,
+                        start,
+                        started_at_ms,
+                        request_id,
+                        request_body_len,
+                        body_for_upstream,
+                        request_model,
+                        session_binding,
+                        session_override_config,
+                        global_station_override,
+                        override_model,
+                        override_effort,
+                        override_service_tier,
+                        effective_effort,
+                        effective_service_tier,
+                        base_service_tier,
+                        session_id,
+                        cwd,
+                        request_flavor,
+                        request_body_previews,
+                        debug_max,
+                        warn_max,
+                        client_body_debug,
+                        client_body_warn,
+                        plan,
+                        route_graph_key: None,
+                        provider_attempt,
+                        total_upstreams,
+                        cooldown_backoff,
+                        executor: &executor,
+                        runtime: &runtime,
+                        route_state: &mut route_state,
+                        global_attempt: &mut global_attempt,
+                        last_err: &mut last_err,
+                        upstream_chain: &mut upstream_chain,
+                        route_attempts: &mut route_attempts,
+                    },
+                )
+                .await
+                {
+                    return ProviderExecutionOutcome::Return(response);
+                }
 
-        if provider_opt.base_backoff_ms > 0 && provider_attempt + 1 < provider_attempt_limit {
-            backoff_sleep(provider_opt, provider_attempt).await;
+                tried_stations.insert(station_name.clone());
+
+                log_cross_station_failover_blocked(CrossStationFailoverBlockedParams {
+                    service_name: proxy.service_name,
+                    request_id,
+                    station_name: station_name.as_str(),
+                    strict_multi_config,
+                    provider_attempt,
+                    cross_station_failover_enabled,
+                    provider_opt,
+                    provider_attempt_limit,
+                    allow_cross_station_before_first_output: plan
+                        .allow_cross_station_before_first_output,
+                });
+
+                if provider_opt.base_backoff_ms > 0 && provider_attempt + 1 < provider_attempt_limit
+                {
+                    backoff_sleep(provider_opt, provider_attempt).await;
+                }
+            }
+
+            ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
+                upstream_chain,
+                route_attempts,
+                last_err,
+            })
         }
     }
-
-    ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
-        upstream_chain,
-        route_attempts,
-        last_err,
-    })
 }
 
 struct ExecuteRouteExecutorStationParams<'a, 'route> {
@@ -343,6 +410,192 @@ struct ExecuteRouteExecutorStationParams<'a, 'route> {
     last_err: &'a mut Option<(StatusCode, String)>,
     upstream_chain: &'a mut Vec<String>,
     route_attempts: &'a mut Vec<RouteAttemptLog>,
+}
+
+struct ExecuteRouteGraphExecutorParams<'a, 'route> {
+    proxy: &'a ProxyService,
+    method: &'a Method,
+    uri: &'a Uri,
+    client_headers: &'a HeaderMap,
+    client_headers_entries_cache: &'a OnceLock<Vec<HeaderEntry>>,
+    client_uri: &'a str,
+    start: &'a Instant,
+    started_at_ms: u64,
+    request_id: u64,
+    request_body_len: usize,
+    body_for_upstream: &'a Bytes,
+    request_model: Option<&'a str>,
+    session_binding: Option<&'a SessionBinding>,
+    session_override_config: Option<&'a str>,
+    global_station_override: Option<&'a str>,
+    override_model: Option<&'a str>,
+    override_effort: Option<&'a str>,
+    override_service_tier: Option<&'a str>,
+    effective_effort: Option<&'a str>,
+    effective_service_tier: Option<&'a str>,
+    base_service_tier: &'a ServiceTierLog,
+    session_id: Option<&'a str>,
+    cwd: Option<&'a str>,
+    request_flavor: &'a RequestFlavor,
+    request_body_previews: bool,
+    debug_max: usize,
+    warn_max: usize,
+    client_body_debug: Option<&'a BodyPreview>,
+    client_body_warn: Option<&'a BodyPreview>,
+    plan: &'a RetryPlan,
+    route_graph_key: Option<&'a str>,
+    provider_attempt: u32,
+    total_upstreams: usize,
+    cooldown_backoff: CooldownBackoff,
+    executor: &'a RoutePlanExecutor<'route>,
+    runtime: &'a RoutePlanRuntimeState,
+    route_state: &'a mut RoutePlanAttemptState,
+    global_attempt: &'a mut u32,
+    last_err: &'a mut Option<(StatusCode, String)>,
+    upstream_chain: &'a mut Vec<String>,
+    route_attempts: &'a mut Vec<RouteAttemptLog>,
+}
+
+async fn execute_route_graph_candidates_with_route_executor(
+    params: ExecuteRouteGraphExecutorParams<'_, '_>,
+) -> Option<Response<Body>> {
+    let ExecuteRouteGraphExecutorParams {
+        proxy,
+        method,
+        uri,
+        client_headers,
+        client_headers_entries_cache,
+        client_uri,
+        start,
+        started_at_ms,
+        request_id,
+        request_body_len,
+        body_for_upstream,
+        request_model,
+        session_binding,
+        session_override_config,
+        global_station_override,
+        override_model,
+        override_effort,
+        override_service_tier,
+        effective_effort,
+        effective_service_tier,
+        base_service_tier,
+        session_id,
+        cwd,
+        request_flavor,
+        request_body_previews,
+        debug_max,
+        warn_max,
+        client_body_debug,
+        client_body_warn,
+        plan,
+        route_graph_key,
+        provider_attempt,
+        total_upstreams,
+        cooldown_backoff,
+        executor,
+        runtime,
+        route_state,
+        global_attempt,
+        last_err,
+        upstream_chain,
+        route_attempts,
+    } = params;
+
+    loop {
+        let selection = executor.select_supported_candidate_with_runtime_state(
+            route_state,
+            runtime,
+            request_model,
+        );
+        record_executor_unsupported_model_skips(
+            proxy.service_name,
+            upstream_chain,
+            route_attempts,
+            &selection.skipped,
+            provider_attempt,
+            plan.route.max_attempts,
+        );
+
+        let avoided_candidate_indices = selection.avoided_candidate_indices.clone();
+        let mut avoided_total = selection.avoided_total;
+        let Some(selected) = selection.selected else {
+            break;
+        };
+        log_route_graph_selection_explain(
+            proxy.service_name,
+            request_id,
+            executor,
+            runtime,
+            route_state,
+            request_model,
+            &selected,
+        );
+        let selected_candidate = selected.candidate;
+        let mut avoid_set = hash_set_from_indices(&avoided_candidate_indices);
+
+        let target = AttemptTarget::from_candidate(proxy.service_name, selected_candidate);
+
+        match execute_selected_upstream(ExecuteSelectedUpstreamParams {
+            proxy,
+            legacy_lb: None,
+            target: &target,
+            method,
+            uri,
+            client_headers,
+            client_headers_entries_cache,
+            client_uri,
+            start,
+            started_at_ms,
+            request_id,
+            request_body_len,
+            body_for_upstream,
+            request_model,
+            session_binding,
+            session_override_config,
+            global_station_override,
+            override_model,
+            override_effort,
+            override_service_tier,
+            effective_effort,
+            effective_service_tier,
+            base_service_tier,
+            session_id,
+            cwd,
+            request_flavor,
+            request_body_previews,
+            debug_max,
+            warn_max,
+            client_body_debug,
+            client_body_warn,
+            plan,
+            route_graph_key,
+            upstream_opt: &plan.upstream,
+            provider_opt: &plan.route,
+            provider_attempt,
+            total_upstreams,
+            cooldown_backoff,
+            global_attempt,
+            avoid_set: &mut avoid_set,
+            avoided_total: &mut avoided_total,
+            last_err,
+            upstream_chain,
+            route_attempts,
+        })
+        .await
+        {
+            SelectedUpstreamExecutionOutcome::ContinueStation => {}
+            SelectedUpstreamExecutionOutcome::Return(response) => return Some(response),
+        }
+
+        if avoid_set.contains(&selected_candidate.stable_index) {
+            route_state.avoid_candidate(executor.template(), selected_candidate);
+        }
+        debug_assert_eq!(route_state.avoided_total(), avoided_total);
+    }
+
+    None
 }
 
 async fn execute_station_upstreams_with_route_executor(
@@ -416,7 +669,8 @@ async fn execute_station_upstreams_with_route_executor(
             station_name,
             request_model,
         );
-        record_executor_unsupported_model_skips(
+        record_executor_station_unsupported_model_skips(
+            proxy.service_name,
             upstream_chain,
             route_attempts,
             &selection.skipped,
@@ -430,12 +684,15 @@ async fn execute_station_upstreams_with_route_executor(
             break 'upstreams;
         };
         let selected = selected.selected_upstream;
+        let selected_station_name = selected.station_name.clone();
         let mut avoid_set = hash_set_from_indices(&avoid_for_station);
+
+        let target = AttemptTarget::legacy(selected.clone());
 
         match execute_selected_upstream(ExecuteSelectedUpstreamParams {
             proxy,
-            lb,
-            selected: &selected,
+            legacy_lb: Some(lb),
+            target: &target,
             method,
             uri,
             client_headers,
@@ -484,13 +741,13 @@ async fn execute_station_upstreams_with_route_executor(
             SelectedUpstreamExecutionOutcome::Return(response) => return Some(response),
         }
 
-        sync_route_state_from_avoid_set(route_state, station_name, &avoid_set);
+        sync_route_state_from_avoid_set(route_state, selected_station_name.as_str(), &avoid_set);
         debug_assert_eq!(route_state.avoided_total(), avoided_total);
 
         if station_loop_action_after_attempt(
             proxy.service_name,
             request_id,
-            station_name,
+            selected_station_name.as_str(),
             lb.service.upstreams.len(),
             &avoid_set,
         ) {
@@ -501,7 +758,110 @@ async fn execute_station_upstreams_with_route_executor(
     None
 }
 
+fn log_route_graph_selection_explain(
+    service_name: &str,
+    request_id: u64,
+    executor: &RoutePlanExecutor<'_>,
+    runtime: &RoutePlanRuntimeState,
+    route_state: &RoutePlanAttemptState,
+    request_model: Option<&str>,
+    selected: &SelectedRouteCandidate<'_>,
+) {
+    let selected_group = selected.candidate.preference_group;
+    if selected_group == 0 {
+        return;
+    }
+
+    let template = executor.template();
+    let selected_provider_endpoint_key = selected.provider_endpoint.stable_key();
+    let runtime_reason_map = executor
+        .explain_candidate_skip_reasons_with_runtime_state(runtime, request_model)
+        .into_iter()
+        .map(|skip| {
+            let reasons = skip
+                .reasons
+                .iter()
+                .map(RoutePlanSkipReason::code)
+                .collect::<Vec<_>>();
+            (skip.provider_endpoint.stable_key(), reasons)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut skipped_groups = BTreeSet::new();
+    let mut skipped_candidates = Vec::new();
+    for candidate in executor.iter_candidates() {
+        if candidate.preference_group >= selected_group {
+            continue;
+        }
+
+        let provider_endpoint_key = template
+            .candidate_provider_endpoint_key(candidate)
+            .stable_key();
+        let mut reasons = BTreeSet::new();
+        if route_state.avoids_candidate(template, candidate) {
+            reasons.insert("attempt_avoided");
+        }
+        if let Some(runtime_reasons) = runtime_reason_map.get(provider_endpoint_key.as_str()) {
+            reasons.extend(runtime_reasons.iter().copied());
+        }
+        if reasons.is_empty() {
+            reasons.insert("not_selected");
+        }
+        skipped_groups.insert(candidate.preference_group);
+        skipped_candidates.push(serde_json::json!({
+            "provider_id": candidate.provider_id.as_str(),
+            "endpoint_id": candidate.endpoint_id.as_str(),
+            "provider_endpoint_key": provider_endpoint_key,
+            "preference_group": candidate.preference_group,
+            "route_path": &candidate.route_path,
+            "reasons": reasons.into_iter().collect::<Vec<_>>(),
+        }));
+    }
+
+    if skipped_candidates.is_empty() {
+        return;
+    }
+
+    let affinity_provider_endpoint_key = runtime
+        .affinity_provider_endpoint()
+        .map(|key| key.stable_key());
+    let selected_matches_affinity = affinity_provider_endpoint_key
+        .as_deref()
+        .is_some_and(|key| key == selected_provider_endpoint_key);
+
+    log_retry_trace(serde_json::json!({
+        "event": "route_graph_selection_explain",
+        "service": service_name,
+        "request_id": request_id,
+        "request_model": request_model,
+        "affinity": {
+            "policy": routing_affinity_policy_trace_label(template.affinity_policy),
+            "provider_endpoint_key": affinity_provider_endpoint_key,
+            "selected_matches_affinity": selected_matches_affinity,
+        },
+        "selected": {
+            "provider_id": selected.candidate.provider_id.as_str(),
+            "endpoint_id": selected.candidate.endpoint_id.as_str(),
+            "provider_endpoint_key": selected_provider_endpoint_key,
+            "preference_group": selected_group,
+            "route_path": &selected.candidate.route_path,
+        },
+        "skipped_higher_priority_groups": skipped_groups.into_iter().collect::<Vec<_>>(),
+        "skipped_higher_priority_candidates": skipped_candidates,
+    }));
+}
+
+fn routing_affinity_policy_trace_label(policy: RoutingAffinityPolicyV5) -> &'static str {
+    match policy {
+        RoutingAffinityPolicyV5::Off => "off",
+        RoutingAffinityPolicyV5::PreferredGroup => "preferred_group",
+        RoutingAffinityPolicyV5::FallbackSticky => "fallback_sticky",
+        RoutingAffinityPolicyV5::Hard => "hard",
+    }
+}
+
 fn record_executor_unsupported_model_skips(
+    service_name: &str,
     upstream_chain: &mut Vec<String>,
     route_attempts: &mut Vec<RouteAttemptLog>,
     skipped: &[SkippedRouteCandidate<'_>],
@@ -512,12 +872,43 @@ fn record_executor_unsupported_model_skips(
         let RoutePlanSkipReason::UnsupportedModel { requested_model } = &skipped.reason else {
             continue;
         };
-        let avoid_set = hash_set_from_indices(&skipped.avoid_for_station);
+        let avoid_set = hash_set_from_indices(&skipped.avoided_candidate_indices);
+        let target = AttemptTarget::from_candidate(service_name, skipped.candidate);
         record_unsupported_model_skip(
             upstream_chain,
             route_attempts,
             UnsupportedModelSkipParams {
-                selected: &skipped.selected_upstream,
+                target: &target,
+                requested_model,
+                provider_attempt,
+                provider_max_attempts,
+                avoid_set: &avoid_set,
+                avoided_total: skipped.avoided_total,
+                total_upstreams: skipped.total_upstreams,
+            },
+        );
+    }
+}
+
+fn record_executor_station_unsupported_model_skips(
+    _service_name: &str,
+    upstream_chain: &mut Vec<String>,
+    route_attempts: &mut Vec<RouteAttemptLog>,
+    skipped: &[SkippedStationRouteCandidate<'_>],
+    provider_attempt: u32,
+    provider_max_attempts: u32,
+) {
+    for skipped in skipped {
+        let RoutePlanSkipReason::UnsupportedModel { requested_model } = &skipped.reason else {
+            continue;
+        };
+        let avoid_set = hash_set_from_indices(&skipped.avoid_for_station);
+        let target = AttemptTarget::legacy(skipped.selected_upstream.clone());
+        record_unsupported_model_skip(
+            upstream_chain,
+            route_attempts,
+            UnsupportedModelSkipParams {
+                target: &target,
                 requested_model,
                 provider_attempt,
                 provider_max_attempts,

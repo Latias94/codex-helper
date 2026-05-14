@@ -224,7 +224,12 @@ pub(super) fn render_header(
     let updated = snapshot.refreshed_at.elapsed().as_millis();
     let overrides_model = snapshot.model_overrides.len();
     let overrides_effort = snapshot.overrides.len();
-    let overrides_station = snapshot.station_overrides.len();
+    let uses_route_graph = ui.uses_route_graph_routing();
+    let overrides_route = if uses_route_graph {
+        snapshot.route_target_overrides.len()
+    } else {
+        snapshot.station_overrides.len()
+    };
     let overrides_tier = snapshot.service_tier_overrides.len();
     let (hc_running, hc_canceling) = {
         let mut running = 0usize;
@@ -245,6 +250,16 @@ pub(super) fn render_header(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("-");
+    let global_route_target = snapshot
+        .global_route_target_override
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("-");
+    let global_route_control = if uses_route_graph {
+        global_route_target
+    } else {
+        global_station
+    };
     let focus = match ui.focus {
         Focus::Sessions => i18n::text(ui.language, msg::FOCUS_SESSIONS),
         Focus::Requests => i18n::text(ui.language, msg::FOCUS_REQUESTS),
@@ -343,7 +358,7 @@ pub(super) fn render_header(
     let route_compact = format!("{}×{last_attempts}", shorten_middle(last_station, 18));
     let overrides_total = overrides_model
         .saturating_add(overrides_effort)
-        .saturating_add(overrides_station)
+        .saturating_add(overrides_route)
         .saturating_add(overrides_tier);
 
     let mut subtitle_spans = Vec::new();
@@ -450,16 +465,30 @@ pub(super) fn render_header(
         push_header_sep(&mut subtitle_spans, false);
         push_header_metric(
             &mut subtitle_spans,
-            i18n::text(ui.language, msg::STATUS_OVERRIDES_SHORT),
-            format!("{overrides_model}/{overrides_effort}/{overrides_station}/{overrides_tier}"),
+            i18n::text(
+                ui.language,
+                if uses_route_graph {
+                    msg::STATUS_OVERRIDES_ROUTE_SHORT
+                } else {
+                    msg::STATUS_OVERRIDES_SHORT
+                },
+            ),
+            format!("{overrides_model}/{overrides_effort}/{overrides_route}/{overrides_tier}"),
             Style::default().fg(p.muted),
             Style::default().fg(p.muted),
         );
         push_header_sep(&mut subtitle_spans, false);
         push_header_metric(
             &mut subtitle_spans,
-            i18n::text(ui.language, msg::STATUS_GLOBAL_STATION_OVERRIDE_SHORT),
-            global_station.to_string(),
+            i18n::text(
+                ui.language,
+                if uses_route_graph {
+                    msg::STATUS_GLOBAL_ROUTE_TARGET_SHORT
+                } else {
+                    msg::STATUS_GLOBAL_STATION_OVERRIDE_SHORT
+                },
+            ),
+            global_route_control.to_string(),
             Style::default().fg(p.muted),
             Style::default().fg(p.accent),
         );
@@ -523,12 +552,16 @@ pub(super) fn render_header(
                 Style::default().fg(p.muted),
             );
         }
-        if global_station != "-" {
+        if global_route_control != "-" {
             push_header_sep(&mut subtitle_spans, true);
             push_header_metric(
                 &mut subtitle_spans,
-                "global ",
-                shorten_middle(global_station, 18),
+                if uses_route_graph {
+                    "route "
+                } else {
+                    "global "
+                },
+                shorten_middle(global_route_control, 18),
                 Style::default().fg(p.muted),
                 Style::default().fg(p.accent),
             );
@@ -609,6 +642,9 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
 
     let left = match ui.overlay {
         Overlay::None => match ui.page {
+            Page::Dashboard if ui.uses_route_graph_routing() => {
+                i18n::text(ui.language, msg::FOOTER_DASHBOARD_ROUTE_GRAPH)
+            }
             Page::Dashboard => i18n::text(ui.language, msg::FOOTER_DASHBOARD),
             Page::Stations if ui.uses_route_graph_routing() => {
                 i18n::text(ui.language, msg::FOOTER_ROUTING)

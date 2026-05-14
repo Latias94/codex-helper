@@ -261,7 +261,7 @@ async fn proxy_api_v1_snapshot_works() {
         .state
         .update_request_route(
             req_id,
-            "test".to_string(),
+            Some("test".to_string()),
             Some("u1".to_string()),
             "http://127.0.0.1:9/v1".to_string(),
             None,

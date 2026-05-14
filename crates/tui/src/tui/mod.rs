@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::ProxyConfig;
 use crate::config::storage::load_config;
+use crate::proxy::ProxyService;
 use crate::state::ProxyState;
 
 use self::model::{Palette, now_ms, refresh_snapshot};
@@ -125,11 +126,12 @@ impl RenderSurfaceKey {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_dashboard(
+    proxy: ProxyService,
     state: Arc<ProxyState>,
     cfg: Arc<ProxyConfig>,
     service_name: &'static str,
     port: u16,
-    admin_port: u16,
+    _admin_port: u16,
     providers: Vec<ProviderOption>,
     language: Language,
     shutdown: watch::Sender<bool>,
@@ -153,13 +155,12 @@ pub async fn run_dashboard(
 
     let mut ui = UiState {
         service_name,
-        admin_port,
         language,
         refresh_ms,
         config_version: cfg.version,
         ..Default::default()
     };
-    let _ = input::refresh_profile_control_state(&mut ui).await;
+    let _ = input::refresh_profile_control_state(&mut ui, &proxy).await;
     let palette = Palette::default();
 
     let mut events = EventStream::new();
@@ -225,28 +226,10 @@ pub async fn run_dashboard(
                         .last_runtime_config_refresh_at
                         .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
                 {
-                    let url = format!(
-                        "http://127.0.0.1:{}/__codex_helper/api/v1/runtime/status",
-                        ui.admin_port
-                    );
-                    let fetch = async {
-                        let client = reqwest::Client::new();
-                        client
-                            .get(&url)
-                            .send()
-                            .await?
-                            .error_for_status()?
-                            .json::<serde_json::Value>()
-                            .await
-                    };
-                    if let Ok(Ok(v)) = tokio::time::timeout(io_timeout, fetch).await {
-                        ui.last_runtime_config_loaded_at_ms =
-                            v.get("loaded_at_ms").and_then(|x| x.as_u64());
-                        ui.last_runtime_config_source_mtime_ms =
-                            v.get("source_mtime_ms").and_then(|x| x.as_u64());
-                        ui.last_runtime_retry = v
-                            .get("retry")
-                            .and_then(|x| serde_json::from_value(x.clone()).ok());
+                    if let Ok(status) = tokio::time::timeout(io_timeout, proxy.runtime_status()).await {
+                        ui.last_runtime_config_loaded_at_ms = Some(status.loaded_at_ms);
+                        ui.last_runtime_config_source_mtime_ms = status.source_mtime_ms;
+                        ui.last_runtime_retry = Some(status.retry);
                     }
                     ui.last_runtime_config_refresh_at = Some(Instant::now());
                 }
@@ -256,7 +239,7 @@ pub async fn run_dashboard(
                         .last_routing_control_refresh_at
                         .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
                 {
-                    let refresh = input::refresh_routing_control_state(&mut ui);
+                    let refresh = input::refresh_routing_control_state(&mut ui, &proxy);
                     match tokio::time::timeout(io_timeout, refresh).await {
                         Ok(Ok(())) => {
                             ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
@@ -321,6 +304,7 @@ pub async fn run_dashboard(
                             &mut providers,
                             &mut ui,
                             &snapshot,
+                            &proxy,
                             balance_refresh_tx.clone(),
                             key,
                         )

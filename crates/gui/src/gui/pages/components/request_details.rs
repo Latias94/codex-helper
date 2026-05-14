@@ -72,8 +72,8 @@ pub(in super::super) fn request_route_decision_reason(
             "{} {}.",
             pick(
                 lang,
-                "当前没有会话级站点覆盖，因此命中了全局 pin",
-                "There was no session-level station override, so routing followed the global pin to",
+                "当前没有会话级覆盖，因此命中了全局运行时覆盖",
+                "There was no session-level override, so routing followed the global runtime override to",
             ),
             resolved.value
         ),
@@ -365,8 +365,8 @@ fn render_request_control_trace_card(ui: &mut egui::Ui, lang: Language, request:
                 ui,
                 pick(
                     lang,
-                    "当前请求还没有 route_decision 快照；可以看到最终观测结果，但无法准确解释它来自 request payload / session override / profile 默认还是全局 pin。",
-                    "This request has no route_decision snapshot yet. The final observed result is still visible, but the exact source chain across request payload, session override, profile default, and global pin cannot be reconstructed precisely.",
+                    "当前请求还没有 route_decision 快照；可以看到最终观测结果，但无法准确解释它来自 request payload / session override / profile 默认还是全局运行时覆盖。",
+                    "This request has no route_decision snapshot yet. The final observed result is still visible, but the exact source chain across request payload, session override, profile default, and global runtime override cannot be reconstructed precisely.",
                 ),
             );
             if let Some(note) = request_fast_mode_note(request, None, lang) {
@@ -534,18 +534,29 @@ fn render_request_retry_chain_card(ui: &mut egui::Ui, lang: Language, request: &
 }
 
 fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> String {
-    let target = match (
-        attempt.station_name.as_deref(),
-        attempt.upstream_base_url.as_deref(),
-    ) {
-        (Some(station), Some(upstream)) => format!("{station}:{}", shorten_middle(upstream, 64)),
-        (Some(station), None) => station.to_string(),
-        (None, Some(upstream)) => shorten_middle(upstream, 72),
-        (None, None) => "-".to_string(),
-    };
+    let target = attempt
+        .provider_endpoint_key
+        .as_deref()
+        .map(|value| format!("endpoint={}", shorten_middle(value, 42)))
+        .unwrap_or_else(|| {
+            match (
+                attempt.station_name.as_deref(),
+                attempt.upstream_base_url.as_deref(),
+            ) {
+                (Some(station), Some(upstream)) => {
+                    format!("legacy={station}:{}", shorten_middle(upstream, 48))
+                }
+                (Some(station), None) => format!("legacy={station}"),
+                (None, Some(upstream)) => format!("legacy={}", shorten_middle(upstream, 60)),
+                (None, None) => "legacy=-".to_string(),
+            }
+        });
     let mut parts = vec![attempt.decision.clone()];
     if let Some(provider_id) = attempt.provider_id.as_deref() {
         parts.push(format!("provider={}", shorten_middle(provider_id, 28)));
+    }
+    if let Some(group) = attempt.preference_group {
+        parts.push(format!("group={group}"));
     }
     let mut attempt_parts = Vec::new();
     if let Some(provider_attempt) = attempt.provider_attempt {
@@ -586,7 +597,15 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
     if let Some(cooldown_secs) = attempt.cooldown_secs {
         parts.push(format!("cooldown={cooldown_secs}s"));
     }
-    if !attempt.avoid_for_station.is_empty() {
+    if !attempt.avoided_candidate_indices.is_empty() {
+        let avoid = attempt
+            .avoided_candidate_indices
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("avoid_candidates=[{avoid}]"));
+    } else if !attempt.avoid_for_station.is_empty() {
         let avoid = attempt
             .avoid_for_station
             .iter()
@@ -605,6 +624,31 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
         parts.push(format!("reason={}", shorten_middle(reason, 56)));
     }
     format!("{target}  {}", parts.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_route_attempt_line_prefers_provider_endpoint_identity() {
+        let attempt = crate::logging::RouteAttemptLog {
+            decision: "failed_status".to_string(),
+            provider_endpoint_key: Some("codex/input/default".to_string()),
+            provider_id: Some("input".to_string()),
+            preference_group: Some(0),
+            provider_attempt: Some(1),
+            upstream_attempt: Some(1),
+            upstream_base_url: Some("https://input.example/v1".to_string()),
+            ..Default::default()
+        };
+
+        let line = request_route_attempt_line(&attempt);
+
+        assert!(line.starts_with("endpoint=codex/input/default"));
+        assert!(line.contains("group=0"));
+        assert!(line.contains("provider=input"));
+    }
 }
 
 fn request_upstream_host(request: &FinishedRequest) -> Option<String> {

@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, Method, Response, StatusCode};
 use futures_util::StreamExt;
 use tracing::{info, warn};
 
-use crate::lb::{LoadBalancer, SelectedUpstream};
+use crate::lb::LoadBalancer;
 use crate::logging::{
     HttpDebugLog, RetryInfo, ServiceTierLog, log_request_with_debug, make_body_preview,
     should_include_http_debug, should_include_http_warn,
@@ -16,6 +16,10 @@ use crate::state::ProxyState;
 use crate::usage_providers;
 
 use super::ProxyService;
+use super::attempt_health::{
+    penalize_attempt_target, record_attempt_failure, record_attempt_success,
+};
+use super::attempt_target::AttemptTarget;
 use super::classify::classify_upstream_response;
 use super::headers::header_map_to_entries;
 use super::http_debug::{HttpDebugBase, warn_http_debug};
@@ -48,6 +52,12 @@ struct StreamUsageState {
     service_tier_scan_pos: usize,
 }
 
+enum StreamHealthUpdate {
+    Success,
+    Failure,
+    FailureAndPenalty { error_reason: &'static str },
+}
+
 fn trim_stream_buffer(state: &mut StreamUsageState, max_keep: usize) {
     if max_keep == 0 || state.buffer.len() <= max_keep {
         return;
@@ -70,8 +80,10 @@ struct StreamFinalize {
     upstream_headers_ms: u64,
     request_body_len: usize,
     upstream_request_body_len: usize,
-    station_name: String,
+    compatibility_station_name: Option<String>,
     provider_id: Option<String>,
+    endpoint_id: Option<String>,
+    provider_endpoint_key: Option<String>,
     upstream_base_url: String,
     retry: Option<RetryInfo>,
     session_id: Option<String>,
@@ -83,8 +95,8 @@ struct StreamFinalize {
     resp_headers: HeaderMap,
     debug_base: Option<HttpDebugBase>,
     usage_state: Arc<Mutex<StreamUsageState>>,
-    lb: LoadBalancer,
-    upstream_index: usize,
+    legacy_lb: Option<LoadBalancer>,
+    target: AttemptTarget,
     transport_cooldown_secs: u64,
     cooldown_backoff: crate::lb::CooldownBackoff,
 }
@@ -214,8 +226,10 @@ impl Drop for StreamFinalize {
                 self.status_code,
                 dur,
                 guard.first_chunk_ms,
-                &self.station_name,
+                self.compatibility_station_name.as_deref(),
                 self.provider_id.clone(),
+                self.endpoint_id.clone(),
+                self.provider_endpoint_key.clone(),
                 &self.upstream_base_url,
                 self.session_id.clone(),
                 self.cwd.clone(),
@@ -234,32 +248,12 @@ impl Drop for StreamFinalize {
             .get("content-type")
             .and_then(|value| value.to_str().ok());
 
-        let passive_failure = if stream_error {
-            self.lb.record_result_with_backoff(
-                self.upstream_index,
-                false,
-                crate::lb::COOLDOWN_SECS,
-                self.cooldown_backoff,
-            );
-            self.lb.penalize_with_backoff(
-                self.upstream_index,
-                self.transport_cooldown_secs,
-                "upstream_stream_error",
-                self.cooldown_backoff,
-            );
-            Some((
-                Some(status_code),
-                Some("upstream_stream_error".to_string()),
-                summarize_error_body(response_body.as_slice(), resp_ct),
-            ))
+        let health_update = if stream_error {
+            Some(StreamHealthUpdate::FailureAndPenalty {
+                error_reason: "upstream_stream_error",
+            })
         } else if (200..300).contains(&status_code) {
-            self.lb.record_result_with_backoff(
-                self.upstream_index,
-                true,
-                crate::lb::COOLDOWN_SECS,
-                self.cooldown_backoff,
-            );
-            None
+            Some(StreamHealthUpdate::Success)
         } else {
             let (cls, _hint, _cf_ray) = classify_upstream_response(
                 status_code,
@@ -267,13 +261,26 @@ impl Drop for StreamFinalize {
                 response_body.as_slice(),
             );
             if status_code >= 500 || cls.is_some() {
-                self.lb.record_result_with_backoff(
-                    self.upstream_index,
-                    false,
-                    crate::lb::COOLDOWN_SECS,
-                    self.cooldown_backoff,
-                );
+                Some(StreamHealthUpdate::Failure)
+            } else {
+                None
             }
+        };
+
+        let passive_failure = if stream_error {
+            Some((
+                Some(status_code),
+                Some("upstream_stream_error".to_string()),
+                summarize_error_body(response_body.as_slice(), resp_ct),
+            ))
+        } else if (200..300).contains(&status_code) {
+            None
+        } else {
+            let (cls, _hint, _cf_ray) = classify_upstream_response(
+                status_code,
+                &self.resp_headers,
+                response_body.as_slice(),
+            );
             Some((
                 Some(status_code),
                 cls,
@@ -283,30 +290,82 @@ impl Drop for StreamFinalize {
 
         let state_for_passive = state.clone();
         let service_name_for_passive = self.service_name.clone();
-        let station_name_for_passive = self.station_name.clone();
+        let station_name_for_passive = self.compatibility_station_name.clone();
         let base_url_for_passive = self.upstream_base_url.clone();
+        let legacy_lb_for_health = self.legacy_lb.clone();
+        let target_for_health = self.target.clone();
+        let transport_cooldown_secs = self.transport_cooldown_secs;
+        let cooldown_backoff = self.cooldown_backoff;
 
         tokio::spawn(async move {
-            if let Some((status_code, error_class, error)) = passive_failure {
-                record_passive_upstream_failure(
-                    &state_for_passive,
-                    &service_name_for_passive,
-                    &station_name_for_passive,
-                    &base_url_for_passive,
-                    status_code,
-                    error_class.as_deref(),
-                    error,
-                )
-                .await;
-            } else {
-                record_passive_upstream_success(
-                    &state_for_passive,
-                    &service_name_for_passive,
-                    &station_name_for_passive,
-                    &base_url_for_passive,
-                    status_code,
-                )
-                .await;
+            match health_update {
+                Some(StreamHealthUpdate::Success) => {
+                    record_attempt_success(
+                        state.as_ref(),
+                        service_name_for_passive.as_str(),
+                        legacy_lb_for_health.as_ref(),
+                        &target_for_health,
+                        crate::lb::COOLDOWN_SECS,
+                        cooldown_backoff,
+                    )
+                    .await;
+                }
+                Some(StreamHealthUpdate::Failure) => {
+                    record_attempt_failure(
+                        state.as_ref(),
+                        service_name_for_passive.as_str(),
+                        legacy_lb_for_health.as_ref(),
+                        &target_for_health,
+                        crate::lb::COOLDOWN_SECS,
+                        cooldown_backoff,
+                    )
+                    .await;
+                }
+                Some(StreamHealthUpdate::FailureAndPenalty { error_reason }) => {
+                    record_attempt_failure(
+                        state.as_ref(),
+                        service_name_for_passive.as_str(),
+                        legacy_lb_for_health.as_ref(),
+                        &target_for_health,
+                        crate::lb::COOLDOWN_SECS,
+                        cooldown_backoff,
+                    )
+                    .await;
+                    penalize_attempt_target(
+                        state.as_ref(),
+                        service_name_for_passive.as_str(),
+                        legacy_lb_for_health.as_ref(),
+                        &target_for_health,
+                        transport_cooldown_secs,
+                        error_reason,
+                        cooldown_backoff,
+                    )
+                    .await;
+                }
+                None => {}
+            }
+            if let Some(station_name_for_passive) = station_name_for_passive.as_deref() {
+                if let Some((status_code, error_class, error)) = passive_failure {
+                    record_passive_upstream_failure(
+                        &state_for_passive,
+                        &service_name_for_passive,
+                        station_name_for_passive,
+                        &base_url_for_passive,
+                        status_code,
+                        error_class.as_deref(),
+                        error,
+                    )
+                    .await;
+                } else {
+                    record_passive_upstream_success(
+                        &state_for_passive,
+                        &service_name_for_passive,
+                        station_name_for_passive,
+                        &base_url_for_passive,
+                        status_code,
+                    )
+                    .await;
+                }
             }
             state
                 .finish_request(crate::state::FinishRequestParams {
@@ -327,8 +386,8 @@ impl Drop for StreamFinalize {
 
 pub(super) async fn build_sse_success_response(
     proxy: &ProxyService,
-    lb: LoadBalancer,
-    selected: SelectedUpstream,
+    legacy_lb: Option<LoadBalancer>,
+    target: AttemptTarget,
     resp: reqwest::Response,
     meta: SseSuccessMeta,
 ) -> Response<Body> {
@@ -358,21 +417,43 @@ pub(super) async fn build_sse_success_response(
     } = meta;
 
     if is_user_turn {
-        let provider_id = selected
-            .upstream
-            .tags
-            .get("provider_id")
-            .map(|s| s.as_str())
-            .unwrap_or("-");
-        info!(
-            "user turn {} {} using station '{}' upstream[{}] provider_id='{}' base_url='{}'",
-            method,
-            path,
-            selected.station_name,
-            selected.index,
-            provider_id,
-            selected.upstream.base_url
-        );
+        let provider_id = target.provider_id().unwrap_or("-");
+        if let Some(provider_endpoint_key) = target.provider_endpoint_key() {
+            if let (Some(station_name), Some(upstream_index)) = (
+                target.compatibility_station_name(),
+                target.compatibility_upstream_index(),
+            ) {
+                info!(
+                    "user turn {} {} using endpoint='{}' provider_id='{}' compat_station='{}' upstream[{}] base_url='{}'",
+                    method,
+                    path,
+                    provider_endpoint_key,
+                    provider_id,
+                    station_name,
+                    upstream_index,
+                    target.upstream().base_url
+                );
+            } else {
+                info!(
+                    "user turn {} {} using endpoint='{}' provider_id='{}' base_url='{}'",
+                    method,
+                    path,
+                    provider_endpoint_key,
+                    provider_id,
+                    target.upstream().base_url
+                );
+            }
+        } else {
+            info!(
+                "user turn {} {} using legacy station='{}' upstream[{}] provider_id='{}' base_url='{}'",
+                method,
+                path,
+                target.compatibility_station_name().unwrap_or("-"),
+                target.compatibility_upstream_index().unwrap_or_default(),
+                provider_id,
+                target.upstream().base_url
+            );
+        }
     }
 
     let max_keep = stream_buffer_max_bytes();
@@ -380,9 +461,13 @@ pub(super) async fn build_sse_success_response(
     let usage_state_inner = usage_state.clone();
     let method_s = method.to_string();
     let path_s = path.clone();
-    let station_name = selected.station_name.clone();
-    let provider_id = selected.upstream.tags.get("provider_id").cloned();
-    let base_url = selected.upstream.base_url.clone();
+    let target_label = target.log_target_label();
+    let compatibility_station_name = target.compatibility_station_name().map(ToOwned::to_owned);
+    let compatibility_station_name_for_stream = compatibility_station_name.clone();
+    let provider_id = target.provider_id().map(ToOwned::to_owned);
+    let endpoint_id = target.endpoint_id();
+    let provider_endpoint_key = target.provider_endpoint_key();
+    let base_url = target.upstream().base_url.clone();
     let service_name = proxy.service_name.to_string();
     let start_time = start;
     let status_code = status.as_u16();
@@ -398,8 +483,10 @@ pub(super) async fn build_sse_success_response(
         upstream_headers_ms,
         request_body_len,
         upstream_request_body_len,
-        station_name: station_name.clone(),
+        compatibility_station_name,
         provider_id: provider_id.clone(),
+        endpoint_id: endpoint_id.clone(),
+        provider_endpoint_key: provider_endpoint_key.clone(),
         upstream_base_url: base_url.clone(),
         retry: retry.clone(),
         session_id: session_id.clone(),
@@ -411,8 +498,8 @@ pub(super) async fn build_sse_success_response(
         resp_headers: resp_headers.clone(),
         debug_base,
         usage_state: usage_state.clone(),
-        lb: lb.clone(),
-        upstream_index: selected.index,
+        legacy_lb: legacy_lb.clone(),
+        target: target.clone(),
         transport_cooldown_secs,
         cooldown_backoff,
     };
@@ -423,19 +510,36 @@ pub(super) async fn build_sse_success_response(
             let cfg = cfg_snapshot;
             let lb_states = proxy.lb_states.clone();
             let state = proxy.state.clone();
+            let client = proxy.client.clone();
             let service_name = proxy.service_name.to_string();
-            let station_name = selected.station_name.clone();
-            let upstream_index = selected.index;
+            let provider_endpoint = target.provider_endpoint_ref().cloned();
+            let compatibility_station = target.compatibility_station_name().map(ToOwned::to_owned);
+            let compatibility_upstream_index = target.compatibility_upstream_index();
             async move {
-                usage_providers::poll_for_codex_upstream(
-                    cfg,
-                    lb_states,
-                    state,
-                    service_name.as_str(),
-                    &station_name,
-                    upstream_index,
-                )
-                .await;
+                if let Some(provider_endpoint) = provider_endpoint {
+                    usage_providers::poll_for_codex_provider_endpoint(
+                        client,
+                        cfg,
+                        lb_states,
+                        state,
+                        service_name.as_str(),
+                        provider_endpoint,
+                    )
+                    .await;
+                } else if let (Some(station_name), Some(upstream_index)) =
+                    (compatibility_station, compatibility_upstream_index)
+                {
+                    usage_providers::poll_for_codex_upstream(
+                        client,
+                        cfg,
+                        lb_states,
+                        state,
+                        service_name.as_str(),
+                        &station_name,
+                        upstream_index,
+                    )
+                    .await;
+                }
             }
         });
     }
@@ -472,8 +576,8 @@ pub(super) async fn build_sse_success_response(
                         warn_http_debug(status_code, &h);
                     } else {
                         warn!(
-                            "upstream returned non-2xx status {} for {} {} (station: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
-                            status_code, method_s, path_s, station_name
+                            "upstream returned non-2xx status {} for {} {} (target: {}); set CODEX_HELPER_HTTP_WARN=0 to disable preview logs (or CODEX_HELPER_HTTP_DEBUG=1 for full debug)",
+                            status_code, method_s, path_s, target_label
                         );
                     }
                     guard.warned_non_success = true;
@@ -521,8 +625,10 @@ pub(super) async fn build_sse_success_response(
                         status.as_u16(),
                         dur,
                         guard.first_chunk_ms,
-                        &station_name,
+                        compatibility_station_name_for_stream.as_deref(),
                         provider_id.clone(),
+                        endpoint_id.clone(),
+                        provider_endpoint_key.clone(),
                         &base_url,
                         session_id.clone(),
                         cwd.clone(),
@@ -545,8 +651,8 @@ pub(super) async fn build_sse_success_response(
                     guard.stream_error = true;
                 }
                 warn!(
-                    "upstream stream error: {} {} status={} station={} base_url={} err={}",
-                    method_s, path_s, status_code, station_name, base_url, e
+                    "upstream stream error: {} {} status={} target={} base_url={} err={}",
+                    method_s, path_s, status_code, target_label, base_url, e
                 );
                 Err(e)
             }

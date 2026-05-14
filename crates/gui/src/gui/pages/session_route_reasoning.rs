@@ -47,8 +47,8 @@ pub(super) fn explain_effective_route_field(
                 "{} {}，{}。",
                 pick(
                     lang,
-                    "当前 session 没有单独站点覆盖，命中了全局 pin，当前站点固定为",
-                    "The current session has no dedicated station override and therefore follows the global pin to",
+                    "当前 session 没有单独覆盖，命中了全局运行时覆盖，当前目标为",
+                    "The current session has no dedicated override and therefore follows the global runtime override to",
                 ),
                 resolved.value,
                 pick(

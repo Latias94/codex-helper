@@ -338,29 +338,44 @@ fn format_runtime_selected_route(
     explain: &crate::routing_explain::RoutingExplainResponse,
 ) -> String {
     match explain.selected_route.as_ref() {
-        Some(selected) => format!(
-            "selected={} endpoint={} station={} upstream#{} path={}",
-            selected.provider_id,
-            selected.endpoint_id,
-            selected.station_name,
-            selected.upstream_index,
-            selected.route_path.join(" > ")
-        ),
+        Some(selected) => {
+            let compatibility = format_runtime_compatibility(selected.compatibility.as_ref());
+            format!(
+                "selected={} endpoint={} {} path={}",
+                selected.provider_id,
+                selected.endpoint_id,
+                compatibility,
+                selected.route_path.join(" > ")
+            )
+        }
         None => "selected=<none>".to_string(),
     }
 }
 
 fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCandidate) -> String {
     let marker = if candidate.selected { "*" } else { " " };
+    let compatibility = format_runtime_compatibility(candidate.compatibility.as_ref());
     format!(
-        "{} {} endpoint={} station={} upstream#{} skip={}",
+        "{} {} endpoint={} {} skip={}",
         marker,
         candidate.provider_id,
         candidate.endpoint_id,
-        candidate.station_name,
-        candidate.upstream_index,
+        compatibility,
         format_runtime_skip_reasons(&candidate.skip_reasons)
     )
+}
+
+fn format_runtime_compatibility(
+    compatibility: Option<&crate::routing_explain::RoutingExplainCompatibility>,
+) -> String {
+    compatibility
+        .map(|compatibility| {
+            format!(
+                "compat_station={} upstream#{}",
+                compatibility.station_name, compatibility.upstream_index
+            )
+        })
+        .unwrap_or_else(|| "compatibility=-".to_string())
 }
 
 fn format_runtime_skip_reasons(
@@ -771,6 +786,16 @@ fn render_route_graph_routing_page(
     };
 
     let order = routing_provider_names(&spec);
+    let selected_session = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .and_then(|row| row.session_id.as_deref())
+        .unwrap_or("-");
+    let session_route_target = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .and_then(|row| row.override_route_target.as_deref());
+    let global_route_target = snapshot.global_route_target_override.as_deref();
     let provider_by_name = spec
         .providers
         .iter()
@@ -814,6 +839,10 @@ fn render_route_graph_routing_page(
             let balance = routing_provider_balance_brief_lang(snapshot, name, lang);
             let style = if !enabled {
                 Style::default().fg(p.muted)
+            } else if session_route_target == Some(name.as_str()) {
+                Style::default().fg(p.focus).add_modifier(Modifier::BOLD)
+            } else if global_route_target == Some(name.as_str()) {
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
             } else if spec.target.as_deref() == Some(name.as_str()) {
                 Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
             } else if provider
@@ -861,6 +890,31 @@ fn render_route_graph_routing_page(
         .unwrap_or_else(|| l("Provider routing").to_string());
 
     let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(format!("{}: ", l("session")), Style::default().fg(p.muted)),
+        Span::styled(
+            shorten_middle(selected_session, 24),
+            Style::default().fg(p.text),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("{}: ", l("route_target")),
+            Style::default().fg(p.muted),
+        ),
+        Span::styled(
+            session_route_target
+                .or(global_route_target)
+                .unwrap_or("-")
+                .to_string(),
+            Style::default().fg(if session_route_target.is_some() {
+                p.focus
+            } else if global_route_target.is_some() {
+                p.accent
+            } else {
+                p.muted
+            }),
+        ),
+    ]));
     lines.push(Line::from(vec![
         Span::styled(format!("{}: ", l("policy")), Style::default().fg(p.muted)),
         Span::styled(
@@ -1026,7 +1080,10 @@ fn render_route_graph_routing_page(
     )]));
     lines.extend(match lang {
         crate::tui::Language::Zh => vec![
-            Line::from("  Enter/r      打开 routing 编辑器"),
+            Line::from("  Enter        将全局 route target 设置为选中 provider"),
+            Line::from("  Backspace    清除全局 route target"),
+            Line::from("  o/O          设置/清除当前会话 route target"),
+            Line::from("  r            打开 routing 编辑器"),
             Line::from("  e            启用/禁用选中 provider"),
             Line::from("  f            优先 billing=monthly"),
             Line::from("  1/2/0        设置 monthly/paygo/清除 billing 标签"),
@@ -1034,7 +1091,10 @@ fn render_route_graph_routing_page(
             Line::from("  [/]/u/d      调整 fallback 顺序"),
         ],
         crate::tui::Language::En => vec![
-            Line::from("  Enter/r      open routing editor"),
+            Line::from("  Enter        set global route target to selected provider"),
+            Line::from("  Backspace    clear global route target"),
+            Line::from("  o/O          set/clear session route target"),
+            Line::from("  r            open routing editor"),
             Line::from("  e            enable/disable selected provider"),
             Line::from("  f            prefer billing=monthly"),
             Line::from("  1/2/0        set monthly/paygo/clear billing tag"),
@@ -1595,39 +1655,22 @@ pub(super) fn render_stations_page(
             ui.language,
             msg::ROUTING_ACTION_PROVIDER_DETAILS,
         )));
-        if ui.uses_route_graph_routing() {
-            lines.extend(match lang {
-                crate::tui::Language::Zh => vec![
-                    Line::from("  Enter/r      routing 编辑器（策略/顺序/标签/启停）"),
-                    Line::from("  Backspace    清除旧版运行时站点 pin"),
-                    Line::from("  o            禁用：provider 选择由 v4 routing 策略接管"),
-                    Line::from("  O            清除旧版会话站点覆盖"),
-                ],
-                crate::tui::Language::En => vec![
-                    Line::from("  Enter/r      routing editor (policy/order/tags/enable)"),
-                    Line::from("  Backspace    clear legacy runtime station pin"),
-                    Line::from("  o            disabled: provider choice is v4 routing policy"),
-                    Line::from("  O            clear legacy session station override"),
-                ],
-            });
-        } else {
-            lines.extend(match lang {
-                crate::tui::Language::Zh => vec![
-                    Line::from("  Enter        设置全局 pin"),
-                    Line::from("  Backspace    清除全局 pin（auto）"),
-                    Line::from("  r            routing 编辑器（策略/顺序/标签）"),
-                    Line::from("  o            将会话覆盖设置为选中站点"),
-                    Line::from("  O            清除会话覆盖"),
-                ],
-                crate::tui::Language::En => vec![
-                    Line::from("  Enter        set global pin"),
-                    Line::from("  Backspace    clear global pin (auto)"),
-                    Line::from("  r            routing editor (policy/order/tags)"),
-                    Line::from("  o            set session override to selected station"),
-                    Line::from("  O            clear session override"),
-                ],
-            });
-        }
+        lines.extend(match lang {
+            crate::tui::Language::Zh => vec![
+                Line::from("  Enter        设置全局 pin"),
+                Line::from("  Backspace    清除全局 pin（auto）"),
+                Line::from("  r            routing 编辑器（策略/顺序/标签）"),
+                Line::from("  o            将会话覆盖设置为选中站点"),
+                Line::from("  O            清除会话覆盖"),
+            ],
+            crate::tui::Language::En => vec![
+                Line::from("  Enter        set global pin"),
+                Line::from("  Backspace    clear global pin (auto)"),
+                Line::from("  r            routing editor (policy/order/tags)"),
+                Line::from("  o            set session override to selected station"),
+                Line::from("  O            clear session override"),
+            ],
+        });
         lines.extend(match lang {
             crate::tui::Language::Zh => vec![
                 Line::from("  h            检查选中站点健康"),

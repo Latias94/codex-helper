@@ -16,20 +16,20 @@ use super::profile_defaults::{
     configured_active_station_name, effective_active_station_name, effective_default_profile_name,
 };
 
-#[derive(serde::Serialize)]
-pub(super) struct ProfilesResponse {
-    default_profile: Option<String>,
-    configured_default_profile: Option<String>,
-    profiles: Vec<ControlProfileOption>,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProfilesResponse {
+    pub default_profile: Option<String>,
+    pub configured_default_profile: Option<String>,
+    pub profiles: Vec<ControlProfileOption>,
 }
 
-#[derive(serde::Serialize)]
-pub(super) struct RuntimeStatusResponse {
-    runtime_source_path: String,
-    config_path: String,
-    loaded_at_ms: u64,
-    source_mtime_ms: Option<u64>,
-    retry: crate::config::ResolvedRetryConfig,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeStatusResponse {
+    pub runtime_source_path: String,
+    pub config_path: String,
+    pub loaded_at_ms: u64,
+    pub source_mtime_ms: Option<u64>,
+    pub retry: crate::config::ResolvedRetryConfig,
 }
 
 #[derive(serde::Serialize)]
@@ -38,10 +38,10 @@ pub(super) struct RetryConfigResponse {
     resolved: crate::config::ResolvedRetryConfig,
 }
 
-#[derive(serde::Serialize)]
-pub(super) struct ReloadResult {
-    reloaded: bool,
-    status: RuntimeStatusResponse,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReloadResult {
+    pub reloaded: bool,
+    pub status: RuntimeStatusResponse,
 }
 
 pub(super) async fn build_operator_summary(
@@ -64,6 +64,7 @@ pub(super) async fn build_operator_summary(
         active,
         recent,
         global_station_override,
+        global_route_target_override,
         session_model,
         session_station,
         session_effort,
@@ -82,6 +83,7 @@ pub(super) async fn build_operator_summary(
         proxy.state.list_active_requests(),
         proxy.state.list_recent_finished(200),
         proxy.state.get_global_station_override(),
+        proxy.state.get_global_route_target_override(),
         proxy.state.list_session_model_overrides(),
         proxy.state.list_session_station_overrides(),
         proxy.state.list_session_effort_overrides(),
@@ -150,6 +152,7 @@ pub(super) async fn build_operator_summary(
             configured_active_station,
             effective_active_station,
             global_station_override,
+            global_route_target_override,
             configured_default_profile,
             default_profile,
             default_profile_summary,

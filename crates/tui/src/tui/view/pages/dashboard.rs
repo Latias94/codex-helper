@@ -124,6 +124,9 @@ fn render_sessions_panel(
             if r.override_station_name.is_some() {
                 badges.push(Span::styled("C", Style::default().fg(p.accent)));
             }
+            if r.override_route_target.is_some() {
+                badges.push(Span::styled("R", Style::default().fg(p.accent)));
+            }
             if r.override_model.is_some() {
                 badges.push(Span::styled("M", Style::default().fg(p.accent)));
             }
@@ -238,6 +241,9 @@ fn render_session_details(
     let override_cfg = selected
         .and_then(|r| r.override_station_name.as_deref())
         .unwrap_or("-");
+    let override_route_target = selected
+        .and_then(|r| r.override_route_target.as_deref())
+        .unwrap_or("-");
     let override_model = selected
         .and_then(|r| r.override_model.as_deref())
         .unwrap_or("-");
@@ -308,7 +314,13 @@ fn render_session_details(
         .map(|usage| usage_line_lang(usage, lang))
         .unwrap_or_else(|| format!("{}: -", l("tok in/out/rsn/ttl")));
     let posture = selected.map(|row| {
-        session_control_posture_lang(row, snapshot.global_station_override.as_deref(), lang)
+        session_control_posture_lang(
+            row,
+            snapshot.global_station_override.as_deref(),
+            snapshot.global_route_target_override.as_deref(),
+            ui.uses_route_graph_routing(),
+            lang,
+        )
     });
 
     let lines = vec![
@@ -398,12 +410,13 @@ fn render_session_details(
             p,
             l("override"),
             format!(
-                "model={override_model}, effort={override_effort}, station={override_cfg}, tier={override_service_tier}"
+                "model={override_model}, effort={override_effort}, station={override_cfg}, route={override_route_target}, tier={override_service_tier}"
             ),
             Style::default().fg(
                 if override_model != "-"
                     || override_effort != "-"
                     || override_cfg != "-"
+                    || override_route_target != "-"
                     || override_service_tier != "-"
                 {
                     p.accent

@@ -1,8 +1,7 @@
-use crate::lb::SelectedUpstream;
 use crate::model_routing;
 use crate::state::{ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource, SessionBinding};
 
-use super::route_metadata::selected_route_metadata;
+use super::attempt_target::AttemptTarget;
 
 fn trim_non_empty(value: Option<&str>) -> Option<String> {
     value
@@ -33,24 +32,31 @@ fn resolve_request_field_provenance(
 }
 
 fn resolve_station_provenance(
-    selected_station_name: &str,
+    selected_station_name: Option<&str>,
     session_override_config: Option<&str>,
     global_config_override: Option<&str>,
     binding_station_name: Option<&str>,
-) -> ResolvedRouteValue {
+) -> Option<ResolvedRouteValue> {
     if let Some(value) = trim_non_empty(session_override_config) {
-        return ResolvedRouteValue::new(value, RouteValueSource::SessionOverride);
+        return Some(ResolvedRouteValue::new(
+            value,
+            RouteValueSource::SessionOverride,
+        ));
     }
     if let Some(value) = trim_non_empty(global_config_override) {
-        return ResolvedRouteValue::new(value, RouteValueSource::GlobalOverride);
+        return Some(ResolvedRouteValue::new(
+            value,
+            RouteValueSource::GlobalOverride,
+        ));
     }
     if let Some(value) = trim_non_empty(binding_station_name) {
-        return ResolvedRouteValue::new(value, RouteValueSource::ProfileDefault);
+        return Some(ResolvedRouteValue::new(
+            value,
+            RouteValueSource::ProfileDefault,
+        ));
     }
-    ResolvedRouteValue::new(
-        selected_station_name.to_string(),
-        RouteValueSource::RuntimeFallback,
-    )
+    trim_non_empty(selected_station_name)
+        .map(|station| ResolvedRouteValue::new(station, RouteValueSource::RuntimeFallback))
 }
 
 pub(super) struct RouteDecisionProvenanceParams<'a> {
@@ -64,7 +70,7 @@ pub(super) struct RouteDecisionProvenanceParams<'a> {
     pub(super) request_model: Option<&'a str>,
     pub(super) effective_effort: Option<&'a str>,
     pub(super) effective_service_tier: Option<&'a str>,
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) target: &'a AttemptTarget,
     pub(super) provider_id: Option<&'a str>,
 }
 
@@ -82,10 +88,9 @@ pub(super) fn build_route_decision_provenance(
         request_model,
         effective_effort,
         effective_service_tier,
-        selected,
+        target,
         provider_id,
     } = params;
-    let route_metadata = selected_route_metadata(selected);
 
     let mut effective_model = resolve_request_field_provenance(
         request_model,
@@ -94,7 +99,7 @@ pub(super) fn build_route_decision_provenance(
     );
     if let Some(current) = effective_model.as_mut() {
         let mapped = model_routing::effective_model(
-            &selected.upstream.model_mapping,
+            &target.upstream().model_mapping,
             current.value.as_str(),
         );
         if mapped != current.value {
@@ -117,19 +122,20 @@ pub(super) fn build_route_decision_provenance(
             override_service_tier,
             session_binding.and_then(|binding| binding.service_tier.as_deref()),
         ),
-        effective_station: Some(resolve_station_provenance(
-            selected.station_name.as_str(),
+        effective_station: resolve_station_provenance(
+            target.compatibility_station_name(),
             session_override_config,
             global_config_override,
             session_binding.and_then(|binding| binding.station_name.as_deref()),
-        )),
+        ),
         effective_upstream_base_url: Some(ResolvedRouteValue::new(
-            selected.upstream.base_url.clone(),
+            target.upstream().base_url.clone(),
             RouteValueSource::RuntimeFallback,
         )),
-        provider_id: trim_non_empty(provider_id).or(route_metadata.provider_id),
-        endpoint_id: route_metadata.endpoint_id,
-        route_path: route_metadata.route_path,
+        provider_id: trim_non_empty(provider_id)
+            .or_else(|| target.provider_id().map(ToOwned::to_owned)),
+        endpoint_id: target.endpoint_id(),
+        route_path: target.route_path(),
     }
 }
 
@@ -137,12 +143,11 @@ pub(super) fn build_route_decision_provenance(
 mod tests {
     use std::collections::HashMap;
 
-    use super::{
-        ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource, SelectedUpstream,
-        SessionBinding,
-    };
+    use super::{ResolvedRouteValue, RouteDecisionProvenance, RouteValueSource, SessionBinding};
     use super::{RouteDecisionProvenanceParams, build_route_decision_provenance};
     use crate::config::{UpstreamAuth, UpstreamConfig};
+    use crate::lb::SelectedUpstream;
+    use crate::proxy::attempt_target::AttemptTarget;
     use crate::state::SessionContinuityMode;
 
     fn make_binding() -> SessionBinding {
@@ -195,6 +200,7 @@ mod tests {
     fn route_provenance_prefers_session_override_then_binding_then_request_payload() {
         let binding = make_binding();
         let selected = make_selected_upstream(&[]);
+        let target = AttemptTarget::legacy(selected);
 
         let decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
             decided_at_ms: 42,
@@ -207,7 +213,7 @@ mod tests {
             request_model: Some("request-model"),
             effective_effort: Some("request-effort"),
             effective_service_tier: Some("request-tier"),
-            selected: &selected,
+            target: &target,
             provider_id: Some(" provider-1 "),
         });
 
@@ -253,6 +259,7 @@ mod tests {
     fn route_provenance_uses_binding_and_runtime_fallback_when_overrides_absent() {
         let binding = make_binding();
         let selected = make_selected_upstream(&[]);
+        let target = AttemptTarget::legacy(selected);
 
         let decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
             decided_at_ms: 7,
@@ -265,7 +272,7 @@ mod tests {
             request_model: Some("request-model"),
             effective_effort: Some("request-effort"),
             effective_service_tier: Some("request-tier"),
-            selected: &selected,
+            target: &target,
             provider_id: Some(""),
         });
 
@@ -295,6 +302,7 @@ mod tests {
     #[test]
     fn route_provenance_marks_station_mapping_when_model_is_remapped() {
         let selected = make_selected_upstream(&[("gpt-5", "provider-model")]);
+        let target = AttemptTarget::legacy(selected);
 
         let decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
             decided_at_ms: 9,
@@ -307,7 +315,7 @@ mod tests {
             request_model: Some("gpt-5"),
             effective_effort: None,
             effective_service_tier: None,
-            selected: &selected,
+            target: &target,
             provider_id: None,
         });
 
@@ -326,6 +334,7 @@ mod tests {
     #[test]
     fn route_provenance_keeps_request_payload_when_no_binding_or_override_exists() {
         let selected = make_selected_upstream(&[]);
+        let target = AttemptTarget::legacy(selected);
 
         let decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
             decided_at_ms: 11,
@@ -338,7 +347,7 @@ mod tests {
             request_model: Some("request-model"),
             effective_effort: Some("low"),
             effective_service_tier: Some("priority"),
-            selected: &selected,
+            target: &target,
             provider_id: None,
         });
 

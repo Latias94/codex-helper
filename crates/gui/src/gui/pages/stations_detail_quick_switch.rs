@@ -25,6 +25,74 @@ pub(super) fn render_station_quick_switch_section(
         cfg.name
     ));
     ui.separator();
+    if snapshot.supports_global_route_target_override {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    true,
+                    egui::Button::new(pick(
+                        ctx.lang,
+                        "设为全局 route target",
+                        "Set global route target",
+                    )),
+                )
+                .clicked()
+            {
+                match ctx
+                    .proxy
+                    .apply_global_route_target_override(ctx.rt, Some(cfg.name.clone()))
+                {
+                    Ok(()) => {
+                        refresh_runtime_snapshot(ctx);
+                        *ctx.last_info = Some(
+                            pick(
+                                ctx.lang,
+                                "已应用全局 route target",
+                                "Global route target applied",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        *ctx.last_error =
+                            Some(format!("apply global route target failed: {error}"));
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    snapshot.global_route_target_override.is_some(),
+                    egui::Button::new(pick(ctx.lang, "清除 route target", "Clear route target")),
+                )
+                .clicked()
+            {
+                match ctx.proxy.apply_global_route_target_override(ctx.rt, None) {
+                    Ok(()) => {
+                        refresh_runtime_snapshot(ctx);
+                        *ctx.last_info = Some(
+                            pick(
+                                ctx.lang,
+                                "已清除全局 route target",
+                                "Global route target cleared",
+                            )
+                            .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        *ctx.last_error =
+                            Some(format!("clear global route target failed: {error}"));
+                    }
+                }
+            }
+        });
+        ui.small(pick(
+            ctx.lang,
+            "这里的 route target 只影响当前代理运行态，不会回写配置文件。",
+            "Route targets here only affect the current proxy runtime and do not rewrite the config file.",
+        ));
+        return;
+    }
+
     ui.horizontal(|ui| {
         if ui
             .add_enabled(

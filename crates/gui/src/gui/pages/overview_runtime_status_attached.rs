@@ -13,6 +13,8 @@ pub(super) fn render_attached_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx
         runtime_source_mtime_ms,
         last_error,
         global_station_override,
+        global_route_target_override,
+        supports_global_route_target_override,
         admin_base_url,
         host_local_capabilities,
         remote_admin_access,
@@ -32,6 +34,8 @@ pub(super) fn render_attached_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx
             attached.runtime_source_mtime_ms,
             attached.last_error.clone(),
             attached.global_station_override.clone(),
+            attached.global_route_target_override.clone(),
+            attached.supports_global_route_target_override,
             attached.admin_base_url.clone(),
             attached.host_local_capabilities.clone(),
             attached.remote_admin_access.clone(),
@@ -83,10 +87,17 @@ pub(super) fn render_attached_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx
     }
     ui.label(format!(
         "{}: {}",
-        pick(ctx.lang, "全局覆盖(Pinned)", "Global override (pinned)"),
-        global_station_override
-            .as_deref()
-            .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
+        if supports_global_route_target_override {
+            pick(ctx.lang, "全局 route target", "Global route target")
+        } else {
+            pick(ctx.lang, "全局覆盖(Pinned)", "Global override (pinned)")
+        },
+        if supports_global_route_target_override {
+            global_route_target_override.as_deref()
+        } else {
+            global_station_override.as_deref()
+        }
+        .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
     ));
     render_attached_provider_runtime_section(ui, ctx, providers.as_slice());
     ui.colored_label(

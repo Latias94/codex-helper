@@ -55,6 +55,7 @@ pub(super) fn render_sessions_split_view(
                 ctx.lang,
                 row,
                 global_station_override,
+                snapshot.global_route_target_override.as_deref(),
             );
         });
         cols[1].add_space(8.0);

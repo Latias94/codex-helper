@@ -6,8 +6,9 @@ use super::config_doc::{
 use super::route_view;
 use crate::cli_types::{RoutingCommand, RoutingPolicy};
 use crate::config::{
-    PersistedRoutingProviderRef, PersistedRoutingSpec, RoutingExhaustedActionV4, RoutingPolicyV4,
-    ServiceViewV4, storage::save_config_v4,
+    CURRENT_ROUTE_GRAPH_CONFIG_VERSION, PersistedRoutingProviderRef, PersistedRoutingSpec,
+    RoutingAffinityPolicyV5, RoutingExhaustedActionV4, RoutingPolicyV4, ServiceViewV4,
+    storage::save_config_v4,
 };
 use crate::{CliError, CliResult};
 use serde::Serialize;
@@ -34,7 +35,7 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             let routing = persisted_routing_spec_from_view(view);
             if json {
                 let payload = RoutingShowPayload {
-                    schema_version: 4,
+                    schema_version: CURRENT_ROUTE_GRAPH_CONFIG_VERSION,
                     service: service.to_string(),
                     routing,
                 };
@@ -183,7 +184,7 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             println!("{label} routing updated");
         }
         RoutingCommand::Pin {
-            provider,
+            target,
             codex,
             claude,
         } => {
@@ -192,15 +193,15 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             {
                 let (view, _) = select_v4_service_view_mut(&mut cfg, service);
-                ensure_provider_exists(view, provider.as_str())?;
+                ensure_routing_target_exists(view, target.as_str())?;
 
                 let order =
-                    normalize_complete_order(view, vec![provider.clone()], Some(provider.as_str()))
+                    normalize_complete_order(view, vec![target.clone()], Some(target.as_str()))
                         .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
                 set_v4_entry_routing(
                     view,
                     RoutingPolicyV4::ManualSticky,
-                    Some(provider.clone()),
+                    Some(target.clone()),
                     order,
                     Vec::new(),
                     RoutingExhaustedActionV4::Continue,
@@ -210,7 +211,7 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             save_config_v4(&cfg)
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
-            println!("{label} routing pinned to provider '{}'", provider);
+            println!("{label} routing pinned to target '{}'", target);
         }
         RoutingCommand::Order {
             providers,
@@ -336,6 +337,9 @@ fn persisted_routing_spec_from_view(view: &ServiceViewV4) -> PersistedRoutingSpe
         .collect();
     PersistedRoutingSpec {
         entry: routing.entry.clone(),
+        affinity_policy: routing.affinity_policy,
+        fallback_ttl_ms: routing.fallback_ttl_ms,
+        reprobe_preferred_after_ms: routing.reprobe_preferred_after_ms,
         routes: routing.routes.clone(),
         policy: routing.policy,
         order: entry_node
@@ -364,10 +368,15 @@ fn print_routing_text(label: &str, view: &ServiceViewV4) {
     let target = routing.target;
     let prefer_tags = routing.prefer_tags;
     let on_exhausted = routing.on_exhausted;
+    let affinity_policy = routing.affinity_policy;
     let providers = routing.providers;
-    println!("Schema version: v4");
+    println!("Schema version: v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION}");
     println!("Service: {label}");
     println!("Routing policy: {}", routing_policy_label(policy));
+    println!(
+        "Affinity policy: {}",
+        routing_affinity_policy_label(affinity_policy)
+    );
     println!("Routing target: {}", target.as_deref().unwrap_or("<none>"));
     let order = if order.is_empty() {
         "<provider key order>".to_string()
@@ -382,7 +391,12 @@ fn print_routing_text(label: &str, view: &ServiceViewV4) {
     println!("On exhausted: {}", routing_exhausted_label(on_exhausted));
     println!("Providers:");
     for provider in providers {
-        let marker = if target.as_deref() == Some(provider.name.as_str()) {
+        let marker = if target.as_deref() == Some(provider.name.as_str())
+            || target
+                .as_deref()
+                .and_then(route_target_provider_name)
+                .is_some_and(|target_provider| target_provider == provider.name)
+        {
             "*"
         } else if matches_prefer_tags(&provider.tags, prefer_tags.as_slice()) {
             "+"
@@ -408,6 +422,15 @@ fn print_routing_text(label: &str, view: &ServiceViewV4) {
         } else {
             println!("  {} {} {} tags={}", marker, enabled, provider.name, tags);
         }
+    }
+}
+
+fn routing_affinity_policy_label(policy: RoutingAffinityPolicyV5) -> &'static str {
+    match policy {
+        RoutingAffinityPolicyV5::Off => "off",
+        RoutingAffinityPolicyV5::PreferredGroup => "preferred-group",
+        RoutingAffinityPolicyV5::FallbackSticky => "fallback-sticky",
+        RoutingAffinityPolicyV5::Hard => "hard",
     }
 }
 
@@ -441,14 +464,96 @@ fn matches_prefer_tags(
     })
 }
 
-fn ensure_provider_exists(view: &ServiceViewV4, provider: &str) -> CliResult<()> {
-    if view.providers.contains_key(provider) {
+fn ensure_routing_target_exists(view: &ServiceViewV4, target: &str) -> CliResult<()> {
+    if routing_target_exists(view, target) {
         Ok(())
     } else {
         Err(CliError::ProxyConfig(format!(
-            "provider '{}' not found in v4 routing config",
-            provider
+            "routing target '{}' not found in v4 routing config",
+            target
         )))
+    }
+}
+
+fn routing_target_exists(view: &ServiceViewV4, target: &str) -> bool {
+    if view.providers.contains_key(target) {
+        return true;
+    }
+    if routing_target_is_route(view, target) {
+        return true;
+    }
+    let Some(provider_name) = route_target_provider_name(target) else {
+        return false;
+    };
+    let Some(endpoint_name) = route_target_endpoint_name(target) else {
+        return false;
+    };
+    view.providers
+        .get(provider_name)
+        .is_some_and(|provider| provider_endpoint_exists(provider, endpoint_name))
+}
+
+fn routing_target_is_route(view: &ServiceViewV4, target: &str) -> bool {
+    view.routing
+        .as_ref()
+        .is_some_and(|routing| routing.routes.contains_key(target))
+}
+
+fn route_target_provider_name(target: &str) -> Option<&str> {
+    let (provider_name, endpoint_name) = target.split_once('.')?;
+    let provider_name = provider_name.trim();
+    let endpoint_name = endpoint_name.trim();
+    if provider_name.is_empty() || endpoint_name.is_empty() {
+        return None;
+    }
+    Some(provider_name)
+}
+
+fn route_target_endpoint_name(target: &str) -> Option<&str> {
+    let (_, endpoint_name) = target.split_once('.')?;
+    let endpoint_name = endpoint_name.trim();
+    (!endpoint_name.is_empty()).then_some(endpoint_name)
+}
+
+fn provider_endpoint_exists(
+    provider: &crate::config::ProviderConfigV4,
+    endpoint_name: &str,
+) -> bool {
+    if endpoint_name == "default" {
+        return provider
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || provider.endpoints.contains_key(endpoint_name);
+    }
+    provider.endpoints.contains_key(endpoint_name)
+}
+
+fn provider_endpoint_enabled(
+    provider: &crate::config::ProviderConfigV4,
+    endpoint_name: &str,
+) -> bool {
+    if endpoint_name == "default"
+        && provider
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
+    provider
+        .endpoints
+        .get(endpoint_name)
+        .is_some_and(|endpoint| endpoint.enabled)
+}
+
+fn routing_order_provider_name<'a>(view: &ServiceViewV4, target: &'a str) -> &'a str {
+    if view.providers.contains_key(target) {
+        target
+    } else {
+        route_target_provider_name(target).unwrap_or(target)
     }
 }
 
@@ -475,10 +580,14 @@ fn normalize_complete_order(
     };
 
     if let Some(target) = target {
-        push_name(target)?;
+        if !routing_target_is_route(view, target) {
+            let provider_name = routing_order_provider_name(view, target);
+            push_name(provider_name)?;
+        }
     }
     for name in raw_order {
-        push_name(name.as_str())?;
+        let provider_name = routing_order_provider_name(view, name.as_str());
+        push_name(provider_name)?;
     }
     for name in ordered_v4_provider_names(view) {
         push_name(name.as_str())?;
@@ -495,7 +604,7 @@ fn validate_routing_fields(
     prefer_tags: &[BTreeMap<String, String>],
 ) -> anyhow::Result<()> {
     if matches!(policy, RoutingPolicyV4::ManualSticky) && target.is_none() {
-        anyhow::bail!("manual-sticky routing requires a target provider");
+        anyhow::bail!("manual-sticky routing requires a target provider or endpoint");
     }
     if !matches!(policy, RoutingPolicyV4::ManualSticky) && target.is_some() {
         anyhow::bail!("routing target only makes sense with manual-sticky policy");
@@ -509,17 +618,44 @@ fn validate_routing_fields(
         }
     }
     if let Some(target) = target
-        && !view.providers.contains_key(target)
+        && !routing_target_exists(view, target)
     {
-        anyhow::bail!("routing target references missing provider '{}'", target);
+        anyhow::bail!(
+            "routing target references missing provider or endpoint '{}'",
+            target
+        );
     }
     if let Some(target) = target {
-        let Some(provider) = view.providers.get(target) else {
-            anyhow::bail!("routing target references missing provider '{}'", target);
-        };
-        if !provider.enabled {
+        if routing_target_is_route(view, target) {
+            return Ok(());
+        }
+        if view.providers.contains_key(target) {
+            let Some(provider) = view.providers.get(target) else {
+                anyhow::bail!("routing target references missing provider '{}'", target);
+            };
+            if !provider.enabled {
+                anyhow::bail!(
+                    "routing target provider '{}' is disabled; enable it before pinning",
+                    target
+                );
+            }
+        } else if let Some(provider_name) = route_target_provider_name(target) {
+            let endpoint_name = route_target_endpoint_name(target).expect("endpoint target");
+            let Some(provider) = view.providers.get(provider_name) else {
+                anyhow::bail!(
+                    "routing target references missing provider '{}'",
+                    provider_name
+                );
+            };
+            if !provider.enabled || !provider_endpoint_enabled(provider, endpoint_name) {
+                anyhow::bail!(
+                    "routing target provider endpoint '{}' is disabled; enable it before pinning",
+                    target
+                );
+            }
+        } else {
             anyhow::bail!(
-                "routing target provider '{}' is disabled; enable it before pinning",
+                "routing target references missing provider or endpoint '{}'",
                 target
             );
         }
@@ -550,4 +686,141 @@ fn set_v4_entry_routing(
         node.prefer_tags.clear();
     }
     routing.sync_compat_from_graph();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ProviderConfigV4, ProviderEndpointV4, RoutingConfigV4, RoutingNodeV4};
+
+    fn endpoint(base_url: &str, enabled: bool) -> ProviderEndpointV4 {
+        ProviderEndpointV4 {
+            base_url: base_url.to_string(),
+            enabled,
+            priority: 0,
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn routing_helpers_accept_provider_endpoint_targets() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "backup".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://backup.example/v1".to_string()),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "input".to_string(),
+                    ProviderConfigV4 {
+                        endpoints: BTreeMap::from([(
+                            "fast".to_string(),
+                            endpoint("https://fast.example/v1", true),
+                        )]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            ..ServiceViewV4::default()
+        };
+
+        ensure_routing_target_exists(&view, "input.fast").expect("endpoint target exists");
+        let order =
+            normalize_complete_order(&view, vec!["input.fast".to_string()], Some("input.fast"))
+                .expect("endpoint target order");
+
+        assert_eq!(order, vec!["input".to_string(), "backup".to_string()]);
+        validate_routing_fields(
+            &view,
+            RoutingPolicyV4::ManualSticky,
+            Some("input.fast"),
+            &order,
+            &[],
+        )
+        .expect("endpoint target validates");
+    }
+
+    #[test]
+    fn routing_helpers_reject_disabled_provider_endpoint_targets() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfigV4 {
+                    endpoints: BTreeMap::from([(
+                        "fast".to_string(),
+                        endpoint("https://fast.example/v1", false),
+                    )]),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            ..ServiceViewV4::default()
+        };
+
+        let err = validate_routing_fields(
+            &view,
+            RoutingPolicyV4::ManualSticky,
+            Some("input.fast"),
+            &["input".to_string()],
+            &[],
+        )
+        .expect_err("disabled endpoint target should fail");
+
+        assert!(err.to_string().contains("provider endpoint 'input.fast'"));
+    }
+
+    #[test]
+    fn routing_helpers_accept_route_targets() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("https://input.example/v1".to_string()),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([
+                    (
+                        "root".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::ManualSticky,
+                            target: Some("monthly_first".to_string()),
+                            children: vec!["input".to_string()],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                    (
+                        "monthly_first".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::OrderedFailover,
+                            children: vec!["input".to_string()],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                ]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        ensure_routing_target_exists(&view, "monthly_first").expect("route target exists");
+        let order = normalize_complete_order(&view, Vec::new(), Some("monthly_first"))
+            .expect("route target order");
+
+        assert_eq!(order, vec!["input".to_string()]);
+        validate_routing_fields(
+            &view,
+            RoutingPolicyV4::ManualSticky,
+            Some("monthly_first"),
+            &order,
+            &[],
+        )
+        .expect("route target validates");
+    }
 }

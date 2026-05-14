@@ -1,7 +1,9 @@
 use crate::config::{
-    ConfigV4MigrationReport, ProviderConfigV4, ProxyConfig, ProxyConfigV2, ProxyConfigV4,
-    RoutingConfigV4, RoutingExhaustedActionV4, RoutingPolicyV4, ServiceConfigManager, ServiceKind,
-    ServiceViewV4, compile_v2_to_runtime, compile_v4_to_runtime, migrate_legacy_to_v4_with_report,
+    CURRENT_ROUTE_GRAPH_CONFIG_VERSION, ConfigV4MigrationReport, ProviderConfigV4, ProxyConfig,
+    ProxyConfigV2, ProxyConfigV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingPolicyV4,
+    ServiceConfigManager, ServiceKind, ServiceViewV4,
+    collect_route_graph_affinity_migration_warnings, compile_v2_to_runtime, compile_v4_to_runtime,
+    is_supported_route_graph_config_version, migrate_legacy_to_v4_with_report,
     migrate_v2_to_v4_with_report,
     storage::{config_file_path, load_config},
 };
@@ -36,10 +38,25 @@ impl ConfigDocument {
         match self {
             Self::Legacy(cfg) => migrate_legacy_to_v4_with_report(cfg),
             Self::V2(cfg) => migrate_v2_to_v4_with_report(cfg),
-            Self::V4(cfg) => Ok(ConfigV4MigrationReport {
-                config: (**cfg).clone(),
-                warnings: Vec::new(),
-            }),
+            Self::V4(cfg) => {
+                let mut warnings = Vec::new();
+                if cfg.version < CURRENT_ROUTE_GRAPH_CONFIG_VERSION {
+                    collect_route_graph_affinity_migration_warnings(
+                        "codex",
+                        &cfg.codex,
+                        &mut warnings,
+                    );
+                    collect_route_graph_affinity_migration_warnings(
+                        "claude",
+                        &cfg.claude,
+                        &mut warnings,
+                    );
+                }
+                Ok(ConfigV4MigrationReport {
+                    config: (**cfg).clone(),
+                    warnings,
+                })
+            }
         }
     }
 }
@@ -108,7 +125,7 @@ pub(super) async fn load_config_document() -> anyhow::Result<ConfigDocument> {
             }
         });
 
-    if version == Some(4) {
+    if version.is_some_and(is_supported_route_graph_config_version) {
         let mut cfg = toml::from_str::<ProxyConfigV4>(&text)?;
         cfg.sync_routing_compat_from_graph();
         compile_v4_to_runtime(&cfg)?;
@@ -138,7 +155,7 @@ pub(super) async fn load_v4_config(
     let document = load_config_document().await?;
     let ConfigDocument::V4(cfg) = document else {
         anyhow::bail!(
-            "{} commands require a version = 4 route graph config; run `codex-helper config migrate --write --yes` first",
+            "{} commands require a version = 5 route graph config; run `codex-helper config migrate --write --yes` first",
             command_group
         );
     };
@@ -273,7 +290,9 @@ pub(super) fn ordered_v4_provider_names(view: &ServiceViewV4) -> Vec<String> {
 pub(super) fn print_v4_provider_list(label: &str, view: &ServiceViewV4) {
     let provider_names = ordered_v4_provider_names(view);
     if view.providers.is_empty() {
-        println!("No {label} providers in v4 route graph config.");
+        println!(
+            "No {label} providers in v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION} route graph config."
+        );
         return;
     }
 
@@ -291,7 +310,7 @@ pub(super) fn print_v4_provider_list(label: &str, view: &ServiceViewV4) {
                 .unwrap_or_default()
         };
         println!(
-            "{label} providers (v4): entry={} policy={} target={} order=[{}] on_exhausted={}",
+            "{label} providers (v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION}): entry={} policy={} target={} order=[{}] on_exhausted={}",
             routing.entry,
             routing_policy_label(
                 entry
@@ -307,7 +326,9 @@ pub(super) fn print_v4_provider_list(label: &str, view: &ServiceViewV4) {
             )
         );
     } else {
-        println!("{label} providers (v4): routing=<implicit ordered-failover>");
+        println!(
+            "{label} providers (v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION}): routing=<implicit ordered-failover>"
+        );
     }
 
     let effective = crate::config::effective_v4_routing(view);

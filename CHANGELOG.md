@@ -5,61 +5,48 @@ All notable changes to this project will be documented in this file.
 
 ## [未发布 / Unreleased]
 
-### 修复 / Fixed
+- 暂无。
+  Nothing yet.
 
-- 请求用量里的缓存读数改为单一口径，`cached_input_tokens` 不再和 `cache_read_input_tokens` 叠加，详情页和统计视图现在展示一致的读缓存/新缓存值。
-  Request usage cache accounting now uses a single read-cache total; `cached_input_tokens` no longer stacks with `cache_read_input_tokens`, and detail/stat views now show consistent read-cache/new-cache values.
+## [0.15.0] - 2026-05-14
 
-## [0.14.0] - 2026-05-12
+### 重要变化 / Highlights
 
-### 破坏性变更 / Breaking
+- 配置格式升级到 `version = 5`。旧的 v2/v3/v4 和 legacy JSON 配置会自动迁移；迁移前仍会保留 `.bak` 备份。
+  Config format is now `version = 5`. Existing v2/v3/v4 and legacy JSON configs migrate automatically, with `.bak` backups kept before writing.
+- Route graph 现在是真正的运行时路由模型。月包优先、月包池、付费兜底和多 endpoint provider 都按 provider endpoint 选择，不再依赖 legacy station 状态。
+  Route graph is now the real runtime routing model. Monthly-first pools, paid fallback, and multi-endpoint providers are selected by provider endpoint instead of legacy station state.
+- 默认会话粘性改为 `preferred-group`：临时 fallback 后，只要高优先级月包 provider 恢复可用，后续请求会回到月包组。旧的 fallback 粘性需要显式设置 `affinity_policy = "fallback-sticky"`。
+  Session affinity now defaults to `preferred-group`: after temporary fallback, sessions return to the preferred monthly group once it is viable again. The old fallback-sticky behavior must be enabled explicitly with `affinity_policy = "fallback-sticky"`.
 
-- `version = 4` 成为新的公共配置格式，路由改为可组合的 route graph。旧配置会自动迁移，常见用户不需要手动重写。
-  `version = 4` is now the public config format, with routing represented as a composable route graph. Existing configs migrate automatically for normal use.
-- 月包池、付费兜底等复杂路由统一用嵌套 route nodes 表达；旧的 v3 routing 写法仍可作为迁移输入读取。
-  Monthly pools, paid fallback, and other complex routing are now expressed with nested route nodes; legacy v3 routing remains readable as migration input.
+### 用户可见改进 / Improved
 
-### 新增 / Added
-
-- TUI 和 GUI 新增 route graph 可视化，可以更直观看到入口、嵌套节点、provider 顺序、缺失引用和不可达节点。
-  TUI and GUI now visualize route graphs, making entries, nested nodes, provider order, missing references, and unreachable nodes easier to inspect.
-- GUI 新增 route node 编辑器，可创建、重命名、删除和保存常见路由节点，不必切到原始配置文件完成日常调整。
-  GUI now includes a route node editor for common routing changes without switching to the raw config file.
-- 同一会话会尽量粘住已选 provider；只有失败重试或路由规则变化时，才按当前路由继续切换。
-  Sessions now prefer staying on their selected provider, and only move on after retry failure or routing changes.
-- TUI 和 GUI 请求视图新增缓存命中率，成本估算也更贴近不同服务的实际 usage 口径。
-  TUI and GUI request views now show cache hit rate, with cost estimates aligned more closely with each service's usage accounting.
-- GUI 余额/配额视图新增手动刷新入口，支持全量刷新和当前站点刷新，并显示刷新状态。
-  GUI balance/quota views now have manual refresh actions for all providers or the selected station, with visible refresh status.
-
-### 改进 / Improved
-
-- History / Recent 加载更轻快，打开页面和刷新列表时更少卡顿。
-  History / Recent loading is faster and causes less UI blocking when opening or refreshing lists.
-- 路由编辑、provider 管理和配置写回会保留嵌套路由结构，避免把复杂配置意外压平成简单顺序。
-  Routing edits, provider management, and config writes preserve nested route structure instead of flattening complex configs.
-- 余额刷新会避免重复请求，多个界面同时触发刷新时不会反复打外部余额接口。
-  Balance refresh avoids duplicate requests when multiple UI paths trigger refresh at the same time.
-- 路由预览和候选状态更清晰地区分余额未知、余额过期、已耗尽和运行时冷却。
-  Routing previews and candidate status now distinguish unknown, stale, exhausted, and cooldown states more clearly.
-
-### 文档 / Documentation
-
-- 补充 v4 route graph 配置示例，覆盖月包优先、月包池、付费兜底和余额未知时的行为说明。
-  Added v4 route graph examples for monthly-first routing, monthly pools, paid fallback, and unknown-balance behavior.
+- TUI、GUI、`routing explain`、请求详情和日志统一显示 provider endpoint、preference group、跳过原因和兼容 station 信息，排查“为什么走了 fallback”更直接。
+  TUI, GUI, `routing explain`, request details, and logs now show provider endpoint, preference group, skip reasons, and compatibility station context, making fallback decisions easier to diagnose.
+- GUI/TUI 的路由和 provider 视图保留嵌套 route graph，不再把复杂配置意外压平成简单顺序。
+  GUI/TUI routing and provider views preserve nested route graphs instead of flattening complex configs.
+- 请求 usage 的缓存读数改为单一口径，详情页和统计视图现在展示一致的读缓存/新缓存值。
+  Request usage cache accounting now uses a single read-cache total, so detail and stats views show consistent read-cache/new-cache values.
+- 文档更新为 v5 route graph 示例，覆盖月包优先、fallback 恢复、余额未知和 trusted exhaustion 行为。
+  Documentation now uses v5 route graph examples for monthly-first routing, fallback recovery, unknown balances, and trusted exhaustion behavior.
 
 ### 修复 / Fixed
 
-- TUI 的 dashboard、Requests、Sessions 和 History 不再过早截断 session id，详情区域优先显示完整会话标识。
-  TUI dashboard, Requests, Sessions, and History no longer truncate session ids too aggressively; detail areas prefer the full id.
-- TUI History / Recent 刷新改为后台加载，失败时保留已有列表并显示错误。
-  TUI History / Recent refresh runs in the background; failures keep the existing list visible and show the error.
-- Sub2API 订阅窗口的懒刷新零额度不再被误显示成确定耗尽。
-  Lazy Sub2API subscription-window zero balances are no longer shown as hard exhaustion.
-- GUI routing 编辑保存时不再意外丢失嵌套节点。
-  GUI routing edits no longer accidentally drop nested route nodes.
-- 缓存命中率和成本估算修正了不同服务的 cache token 口径差异。
-  Cache hit-rate and cost estimates now handle service-specific cache token accounting correctly.
+- 余额刷新失败不会被当作耗尽，也不会中断其他 provider 的刷新；刷新请求现在有超时、复用代理运行态 HTTP client，并在日志中显示探测的 origin 和 adapter kind。
+  Balance refresh failures are not treated as exhaustion and do not stop other provider refreshes; refresh calls now have a timeout, reuse the proxy runtime HTTP client, and log the probed origin plus adapter kind.
+- TUI 按 `q` 退出时仍会优雅关停 proxy/admin server，但现在有短超时保护，避免被后台请求或长连接拖住太久。
+  Pressing `q` in the TUI still gracefully shuts down the proxy/admin server, but now has a short timeout guard to avoid long waits behind background requests or long-lived connections.
+- Sub2API 懒刷新零额度、余额查询失败、冷却和真实耗尽在 UI/路由预览中区分更清楚，降低误切到 fallback 的概率。
+  Sub2API lazy zero balances, lookup failures, cooldown, and real exhaustion are clearer in UI/routing previews, reducing accidental fallback decisions.
+
+### 升级说明 / Upgrade Notes
+
+- 正常升级无需手动重写配置；启动 CLI、TUI、GUI 或 proxy 时会自动迁移。
+  Normal upgrades do not require manual config rewrites; CLI, TUI, GUI, and proxy startup migrate configs automatically.
+- 外部脚本如果还在写 legacy station/active 字段，应迁移到 provider、route target、routing 命令/API 或 v5 TOML。
+  External scripts that still write legacy station/active fields should move to provider, route target, routing commands/APIs, or v5 TOML.
+- 当前版本仍使用系统/环境变量形式的 outbound proxy 支持；一等 `config.toml` outbound proxy 配置会在后续版本设计。
+  This version still relies on system/environment outbound proxy support; first-class `config.toml` outbound proxy settings are planned for a later version.
 
 ## [0.13.0] - 2026-05-09
 

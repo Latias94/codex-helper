@@ -18,10 +18,17 @@ fn refresh_attached_prefers_station_snapshot_payload() {
         "endpoints": [
             "/__codex_helper/api/v1/snapshot",
             "/__codex_helper/api/v1/stations",
-            "/__codex_helper/api/v1/stations/runtime"
+            "/__codex_helper/api/v1/stations/runtime",
+            "/__codex_helper/api/v1/overrides/global-route",
+            "/__codex_helper/api/v1/overrides/session/route"
         ]
     });
-    let snapshot = sample_snapshot(vec![sample_station("preferred-station")]);
+    let mut snapshot = sample_snapshot(vec![sample_station("preferred-station")]);
+    snapshot.snapshot.global_route_target_override = Some("monthly.default".to_string());
+    snapshot
+        .snapshot
+        .session_route_target_overrides
+        .insert("sid-route".to_string(), "paygo.default".to_string());
     let app = Router::new()
         .route(
             "/__codex_helper/api/v1/capabilities",
@@ -57,6 +64,19 @@ fn refresh_attached_prefers_station_snapshot_payload() {
     assert!(snapshot.host_local_capabilities.session_history);
     assert!(snapshot.host_local_capabilities.transcript_read);
     assert!(snapshot.host_local_capabilities.cwd_enrichment);
+    assert_eq!(
+        snapshot.global_route_target_override.as_deref(),
+        Some("monthly.default")
+    );
+    assert_eq!(
+        snapshot
+            .session_route_target_overrides
+            .get("sid-route")
+            .map(String::as_str),
+        Some("paygo.default")
+    );
+    assert!(snapshot.supports_global_route_target_override);
+    assert!(snapshot.supports_session_route_target_override);
     assert!(
         controller
             .attached()

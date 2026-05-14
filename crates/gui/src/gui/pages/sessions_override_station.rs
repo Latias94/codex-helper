@@ -7,6 +7,49 @@ pub(super) fn render_session_station_override_editor(
     sid: &str,
     cfg_options: &[(String, String)],
 ) {
+    if snapshot.supports_session_route_target_override {
+        ui.horizontal(|ui| {
+            ui.label(pick(ctx.lang, "Route target", "Route target"));
+
+            let mut desired_text = ctx
+                .view
+                .sessions
+                .editor
+                .config_override
+                .clone()
+                .unwrap_or_default();
+            let response = ui.text_edit_singleline(&mut desired_text);
+            if response.changed() {
+                let trimmed = desired_text.trim();
+                let normalized = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                ctx.view.sessions.editor.config_override = normalized;
+            }
+
+            if ui.button(pick(ctx.lang, "应用", "Apply")).clicked() {
+                let desired = ctx.view.sessions.editor.config_override.clone();
+                match ctx.proxy.apply_session_route_target_override(
+                    ctx.rt,
+                    sid.to_string(),
+                    desired,
+                ) {
+                    Ok(()) => {
+                        super::sessions_override_editors::refresh_runtime_snapshot(ctx);
+                        *ctx.last_info =
+                            Some(pick(ctx.lang, "已应用覆盖", "Override applied").to_string());
+                    }
+                    Err(error) => {
+                        *ctx.last_error = Some(format!("apply route target failed: {error}"));
+                    }
+                }
+            }
+        });
+        return;
+    }
+
     ui.horizontal(|ui| {
         ui.label(pick(ctx.lang, "固定站点", "Pinned station"));
 

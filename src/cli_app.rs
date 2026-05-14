@@ -449,6 +449,7 @@ async fn run_server(
         let providers = tui::build_provider_options(&cfg, service_name);
 
         let mut tui_handle = tokio::spawn(tui::run_dashboard(
+            proxy.clone(),
             state,
             cfg.clone(),
             service_name,
@@ -472,18 +473,18 @@ async fn run_server(
                     Ok(Ok(())) => {
                         // The dashboard requested a shutdown (or exited because shutdown was already triggered).
                         let _ = shutdown_tx.send(true);
-                        server_handle.await.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
+                        await_server_shutdown_with_timeout(server_handle).await?;
                         Ok::<(), anyhow::Error>(())
                     }
                     Ok(Err(err)) => {
                         // If the dashboard fails (e.g. terminal issues), keep running without it.
                         tracing::warn!("TUI dashboard failed; continuing without TUI: {}", err);
-                        server_handle.await.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
+                        await_server_shutdown_with_timeout(server_handle).await?;
                         Ok::<(), anyhow::Error>(())
                     }
                     Err(join_err) => {
                         tracing::warn!("TUI task join error; continuing without TUI: {}", join_err);
-                        server_handle.await.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
+                        await_server_shutdown_with_timeout(server_handle).await?;
                         Ok::<(), anyhow::Error>(())
                     }
                 }
@@ -520,6 +521,33 @@ async fn run_server(
     result?;
 
     Ok(())
+}
+
+async fn await_server_shutdown_with_timeout(
+    mut server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let timeout = std::time::Duration::from_secs(2);
+    tokio::select! {
+        joined = &mut server_handle => {
+            joined.map_err(|e| anyhow::anyhow!("server task join error: {e}"))??;
+            Ok(())
+        }
+        _ = tokio::time::sleep(timeout) => {
+            tracing::warn!(
+                "server graceful shutdown exceeded {}ms; aborting remaining server tasks",
+                timeout.as_millis()
+            );
+            server_handle.abort();
+            match server_handle.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(err)) => Err(err),
+                Err(join_err) if join_err.is_cancelled() => Ok(()),
+                Err(join_err) => Err(anyhow::anyhow!(
+                    "server task join error after abort: {join_err}"
+                )),
+            }
+        }
+    }
 }
 
 async fn bind_local_listener_or_explain(

@@ -29,7 +29,9 @@ pub(super) fn render_station_list_panel(
                 let is_selected = selected_name.as_deref() == Some(cfg.name.as_str());
                 let is_active = active_station == Some(cfg.name.as_str());
                 let is_pinned =
-                    snapshot.global_station_override.as_deref() == Some(cfg.name.as_str());
+                    snapshot.global_station_override.as_deref() == Some(cfg.name.as_str())
+                        || snapshot.global_route_target_override.as_deref()
+                            == Some(cfg.name.as_str());
                 let health_label = format_runtime_station_health_status(
                     runtime_maps.station_health.get(cfg.name.as_str()),
                     runtime_maps.health_checks.get(cfg.name.as_str()),

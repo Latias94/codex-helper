@@ -166,6 +166,9 @@ async fn fetch_running_routing_explain(
 pub(super) fn apply_running_refresh_result(r: &mut RunningProxy, result: RunningRefreshResult) {
     let snap = result.snapshot;
     let global_station_override = snap.effective_global_station_override().map(str::to_owned);
+    let global_route_target_override = snap
+        .effective_global_route_target_override()
+        .map(str::to_owned);
     let station_health = snap.effective_station_health().clone();
     r.last_error = None;
     r.configured_active_station = result.configured_active_station;
@@ -178,8 +181,10 @@ pub(super) fn apply_running_refresh_result(r: &mut RunningProxy, result: Running
     r.recent = snap.recent;
     r.session_cards = snap.session_cards;
     r.global_station_override = global_station_override;
+    r.global_route_target_override = global_route_target_override;
     r.session_model_overrides = snap.session_model_overrides;
     r.session_station_overrides = snap.session_station_overrides;
+    r.session_route_target_overrides = snap.session_route_target_overrides;
     r.session_effort_overrides = snap.session_effort_overrides;
     r.session_service_tier_overrides = snap.session_service_tier_overrides;
     r.session_stats = snap.session_stats;

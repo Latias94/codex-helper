@@ -174,7 +174,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         .state
         .update_request_route(
             recent_same_station,
-            "test".to_string(),
+            Some("test".to_string()),
             Some("u1".to_string()),
             "http://127.0.0.1:9/v1".to_string(),
             None,
@@ -218,7 +218,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         .state
         .update_request_route(
             recent_cross_station,
-            "test".to_string(),
+            Some("test".to_string()),
             Some("u1".to_string()),
             "http://127.0.0.1:9/v1".to_string(),
             None,
@@ -265,7 +265,7 @@ async fn proxy_api_v1_operator_summary_reports_runtime_target_and_retry() {
         .state
         .update_request_route(
             recent_fast_mode_only,
-            "test".to_string(),
+            Some("test".to_string()),
             Some("u1".to_string()),
             "http://127.0.0.1:9/v1".to_string(),
             None,

@@ -95,40 +95,50 @@ fn executor_shadow_attempts(
         compile_legacy_route_plan_template(service_name, lbs.iter().map(|lb| lb.service.as_ref()));
     let executor = RoutePlanExecutor::new(&template);
     let mut state = RoutePlanAttemptState::default();
-    let runtime = route_plan_runtime_state_from_lbs(lbs);
+    let runtime = route_plan_runtime_state_from_lbs(service_name, lbs);
     let mut attempts = Vec::new();
 
-    loop {
-        let selection = executor.select_supported_candidate_with_runtime_state(
-            &mut state,
-            &runtime,
-            request_model,
-        );
-        attempts.extend(selection.skipped.into_iter().map(|skipped| {
-            shadow_attempt(
-                "skipped_capability_mismatch",
-                &skipped.selected_upstream,
-                ShadowRouteMetadata::from_candidate(skipped.candidate),
-                skipped.avoid_for_station,
-                skipped.avoided_total,
-                skipped.total_upstreams,
-                Some(skip_reason(&skipped.reason)),
-            )
-        }));
+    for lb in lbs {
+        let station_name = lb.service.name.as_str();
+        loop {
+            let avoid_snapshot = state.avoid_for_station_name(station_name);
+            let avoid = avoid_snapshot.iter().copied().collect::<HashSet<_>>();
+            if station_upstreams_exhausted(lb.service.upstreams.len(), &avoid) {
+                break;
+            }
 
-        let Some(selected) = selection.selected else {
-            break;
-        };
-        attempts.push(shadow_attempt(
-            "selected",
-            &selected.selected_upstream,
-            ShadowRouteMetadata::from_candidate(selected.candidate),
-            selection.avoid_for_station,
-            selection.avoided_total,
-            selection.total_upstreams,
-            None,
-        ));
-        state.avoid_selected(&selected);
+            let selection = executor.select_supported_station_candidate_with_runtime_state(
+                &mut state,
+                &runtime,
+                station_name,
+                request_model,
+            );
+            attempts.extend(selection.skipped.into_iter().map(|skipped| {
+                shadow_attempt(
+                    "skipped_capability_mismatch",
+                    &skipped.selected_upstream,
+                    ShadowRouteMetadata::from_candidate(skipped.candidate),
+                    skipped.avoid_for_station,
+                    skipped.avoided_total,
+                    skipped.total_upstreams,
+                    Some(skip_reason(&skipped.reason)),
+                )
+            }));
+
+            let Some(selected) = selection.selected else {
+                break;
+            };
+            attempts.push(shadow_attempt(
+                "selected",
+                &selected.selected_upstream,
+                ShadowRouteMetadata::from_candidate(selected.candidate),
+                selection.avoid_for_station,
+                selection.avoided_total,
+                selection.total_upstreams,
+                None,
+            ));
+            state.avoid_selected_upstream(&selected.selected_upstream);
+        }
     }
 
     attempts
@@ -503,7 +513,7 @@ mod tests {
         {
             let mut guard = lb.states.lock().expect("lb state lock");
             let entry = guard.entry("routing".to_string()).or_default();
-            entry.ensure_layout(&lb.service.upstreams);
+            entry.ensure_layout(lb.service.name.as_str(), &lb.service.upstreams);
             entry.usage_exhausted[0] = true;
         }
 
@@ -532,7 +542,7 @@ mod tests {
         {
             let mut guard = lb.states.lock().expect("lb state lock");
             let entry = guard.entry("routing".to_string()).or_default();
-            entry.ensure_layout(&lb.service.upstreams);
+            entry.ensure_layout(lb.service.name.as_str(), &lb.service.upstreams);
             entry.usage_exhausted[0] = true;
             entry.usage_exhausted[1] = true;
         }

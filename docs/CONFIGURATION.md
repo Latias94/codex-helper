@@ -1,6 +1,6 @@
 # Configuration Guide
 
-This guide documents the public `version = 4` route graph config format.
+This guide documents the public `version = 5` route graph config format.
 
 The short version: define providers once, then point `routing.entry` at a named route node under `routing.routes`. Most users only need `[codex.providers.*]`, `[codex.routing]`, `[codex.routing.routes.*]`, and `[retry]`.
 
@@ -12,7 +12,7 @@ The short version: define providers once, then point `routing.entry` at a named 
 - `profiles` are request defaults such as model and reasoning effort. They should not pick providers.
 - `retry` controls how hard the proxy retries before returning an error.
 
-Some runtime internals still use the legacy `station` wording, but hand-written config should think in `provider` plus `route graph`.
+Legacy `station` data is migration input. Hand-written config should think in `provider`, `endpoint`, and `route graph`.
 
 ## File Locations
 
@@ -53,7 +53,7 @@ codex-helper config set-retry-profile balanced
 This creates the same thin TOML shape you would write by hand:
 
 ```toml
-version = 4
+version = 5
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
@@ -83,6 +83,10 @@ Every service can have its own route graph:
 ```toml
 [codex.routing]
 entry = "monthly_first"
+affinity_policy = "preferred-group"
+# Optional compatibility bounds for fallback-sticky affinity.
+# fallback_ttl_ms = 120000
+# reprobe_preferred_after_ms = 30000
 
 [codex.routing.routes.monthly_pool]
 strategy = "ordered-failover"
@@ -103,16 +107,21 @@ Rules:
 
 ## Session Affinity
 
-Route graph session affinity is runtime state, not TOML config.
+Route graph session affinity is runtime state. The TOML config chooses the affinity policy and can optionally bound fallback stickiness:
 
-For each request with a session id, codex-helper keys affinity by `session_id + service + route_graph_key`. While the route graph is unchanged, the same session tries to keep using the previously selected provider/endpoint. This improves upstream prompt-cache locality for relay providers that cache by account or upstream target.
+- `preferred-group` is the default. Session affinity is only applied inside the currently best available preference group, so a session that temporarily falls back to paygo returns to monthly as soon as a monthly provider is viable again.
+- `off` ignores automatic route affinity.
+- `fallback-sticky` keeps the old fallback-sticky behavior as an explicit compatibility mode. Set `fallback_ttl_ms` to cap how long a lower-priority fallback affinity can be reused, or `reprobe_preferred_after_ms` to force a preferred-group reprobe after a fallback target change.
+- `hard` treats an existing affinity target as strict for that route graph; if the target is unavailable, no alternate candidate is selected.
+
+For each request with a session id, codex-helper keys affinity by `session_id + service + route_graph_key`. While the route graph is unchanged, the same session can keep using the previously selected provider/endpoint according to the policy. This improves upstream prompt-cache locality for relay providers that cache by account or upstream target without letting automatic stickiness override user preference by default.
 
 Affinity is not a hard pin:
 
 - request retry, provider health, capability mismatch, cooldown, and trusted balance exhaustion still apply;
 - if the sticky provider fails, the request continues through the current route graph and then sticks to the next successful provider;
 - if provider tags, route node strategy, children, entry, or provider endpoint identity change, the route graph key changes and old affinity no longer matches;
-- manual `routing pin` and session/global overrides remain explicit operator controls and can supersede automatic affinity.
+- legacy station overrides are disabled for route graph configs; use route/provider/endpoint controls instead.
 
 This means monthly pools such as `monthly_pool -> paygo` normally keep a conversation on one monthly provider until that provider stops being viable, instead of round-robining every request and reducing upstream cache hit rate.
 
@@ -125,7 +134,7 @@ Pick one recipe first. You can refine fields later.
 Use this when you only want codex-helper as a local proxy and dashboard.
 
 ```toml
-version = 4
+version = 5
 
 [codex.providers.main]
 base_url = "https://api.example.com/v1"
@@ -147,7 +156,7 @@ profile = "balanced"
 Use this as the default for multiple relays: first working provider wins, then fallback in order.
 
 ```toml
-version = 4
+version = 5
 
 [codex.providers.monthly]
 base_url = "https://monthly.example/v1"
@@ -179,7 +188,7 @@ This is the most direct replacement for old priority or level-based setups.
 Use this when several monthly providers form one preferred group and a paygo provider is only the fallback of last resort.
 
 ```toml
-version = 4
+version = 5
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
@@ -220,7 +229,7 @@ This keeps the monthly pool as a first-class route node. Temporary 502/429-style
 Use this when you want to spend monthly providers first, then try several relay fallbacks in a fixed order.
 
 ```toml
-version = 4
+version = 5
 
 [codex.providers.monthly_a]
 base_url = "https://monthly-a.example/v1"
@@ -278,7 +287,7 @@ This is the clearest shape for "monthly first, several relays as backup". Sessio
 Use this when the business intent is metadata: prefer every provider tagged `billing=monthly`, then continue to the rest.
 
 ```toml
-version = 4
+version = 5
 
 [codex.providers.monthly_a]
 base_url = "https://monthly-a.example/v1"
@@ -335,7 +344,9 @@ target = "input"
 children = ["input", "openai"]
 ```
 
-A pinned target is explicit. If it is disabled, codex-helper rejects the route instead of silently selecting a different provider.
+A pinned target is explicit. It can name a route node, a provider, or a
+provider endpoint such as `relay.hk`. If it is disabled, codex-helper rejects
+the route instead of silently selecting a different provider.
 
 ### Multiple Endpoints For One Provider
 
@@ -426,7 +437,7 @@ extends = "daily"
 reasoning_effort = "high"
 ```
 
-Legacy profile station bindings are migration-only. New v4 configs should use `[codex.routing]`.
+Legacy profile station bindings are migration-only. New v5 configs should use `[codex.routing]`.
 
 ## Balance Adapters
 
@@ -513,6 +524,23 @@ Important balance behavior:
 - New API quota values are quota units converted with `QuotaPerUnit = 500000`; token usage snapshots with `unlimited_quota = true` are never treated as exhausted.
 - If a provider reports misleading zero balances for active subscriptions, set `trust_exhaustion_for_routing = false`.
 - UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh`.
+- Balance HTTP calls are bounded and reuse the same outbound client as proxy runtime calls. A failed lookup should surface the probed origin and adapter kind in logs, for example whether `sub2api_usage` or `openai_balance_http_json` returned non-JSON.
+
+## Outbound Proxy
+
+codex-helper is itself a local proxy, but it may still need an outbound proxy to reach some relays or dashboard balance APIs.
+
+Current behavior:
+
+- The underlying HTTP client uses reqwest's default system/environment proxy support. Standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` environment variables may affect outbound requests.
+- There is not yet a first-class `config.toml` outbound proxy section.
+
+Recommended model for a future config version:
+
+- Add a global outbound proxy profile for all provider and balance traffic.
+- Allow provider endpoint overrides when a specific relay needs a different egress path.
+- Prefer provider/endpoint-scoped proxy selection over route-scoped proxy selection. Route policy should decide which provider endpoint to use; the endpoint should own how it is reached.
+- Allow balance adapters to override proxy behavior only when their dashboard/balance API lives on a different network path than the model endpoint.
 
 Common adapter kinds:
 
@@ -588,13 +616,13 @@ codex-helper routing show
 codex-helper routing explain
 ```
 
-The CLI preserves existing v4 graph structure when it only edits the entry node. Advanced nested graph authoring is still best done in TOML until dedicated route-node commands are added.
+The CLI preserves existing route graph structure when it only edits the entry node. Advanced nested graph authoring is still best done in TOML until dedicated route-node commands are added.
 
 Use `--claude` on provider/routing commands when editing the Claude service instead of Codex.
 
 `routing show` reads persisted config. `routing list` and `routing explain` read the compiled runtime candidate view.
 Use `routing explain --model <MODEL> --json` to inspect the same selected route, candidate order, route paths, and structured skip reasons exposed by the runtime admin explain API.
-In that response, `provider_id`, `endpoint_id`, and `route_path` are the primary v4 routing identity. Legacy station/upstream identity is reported under each candidate's `compatibility` object; the older top-level `station_name` and `upstream_index` fields remain for backward-compatible clients.
+In that response, `provider_endpoint_key`, `provider_id`, `endpoint_id`, `route_path`, and `preference_group` are the primary v5 routing identity. Legacy station/upstream identity is reported under each candidate's `compatibility` object for migration diagnostics.
 
 ## Inspect Routing And Logs
 
@@ -622,7 +650,41 @@ The control trace is enabled by default and is written to:
 ~/.codex-helper/logs/control_trace.jsonl
 ```
 
-It records routing selection events such as the compiled v4 route plan, pinned-route decisions, retry options, and failover reasons. Set `CODEX_HELPER_CONTROL_TRACE=0` to turn it off, or `CODEX_HELPER_CONTROL_TRACE_PATH` to write it somewhere else. The older `retry_trace.jsonl` file is only written when `CODEX_HELPER_RETRY_TRACE=1`.
+It records routing selection events such as the compiled route plan, provider endpoint, preference group, skipped higher-priority groups, pinned-route decisions, retry options, and failover reasons. When a lower-priority preference group is selected, the `route_graph_selection_explain` event lists each higher-priority provider endpoint that was skipped and the structured reasons such as `unsupported_model`, `cooldown`, `usage_exhausted`, `runtime_disabled`, or `attempt_avoided`. Set `CODEX_HELPER_CONTROL_TRACE=0` to turn it off, or `CODEX_HELPER_CONTROL_TRACE_PATH` to write it somewhere else. The older `retry_trace.jsonl` file is only written when `CODEX_HELPER_RETRY_TRACE=1`.
+
+## Troubleshoot Monthly-First Routing
+
+If a route that should prefer monthly providers falls back to paygo, inspect the runtime state before changing the config:
+
+```bash
+codex-helper routing explain --model <MODEL> --json
+```
+
+Check these fields first:
+
+- `selected_route.provider_endpoint_key` and `selected_route.preference_group` show what the runtime would try now. Group `0` is the most preferred group.
+- `candidates[].skip_reasons` explains why a preferred candidate was skipped, for example `unsupported_model`, `cooldown`, `usage_exhausted`, `runtime_disabled`, or `attempt_avoided`.
+- `affinity.policy` / `affinity_policy` tells whether automatic affinity is `preferred-group`, `off`, `fallback-sticky`, or `hard`.
+- `compatibility` is legacy station/upstream context only. For route graph decisions, prefer `provider_endpoint_key`, `provider_id`, `endpoint_id`, and `route_path`.
+
+For a monthly-first setup, the normal default is `affinity_policy = "preferred-group"`. With that policy, a session may use a fallback provider during a temporary outage, but the next request returns to the best viable monthly group once a monthly provider is available again. If the route keeps using paygo, look for one of these causes:
+
+- an explicit session/global route target override is set;
+- the monthly provider is disabled or missing auth;
+- the requested model is unsupported by the monthly provider;
+- the monthly endpoint is cooling down after retryable failures;
+- trusted balance data marks the endpoint `usage_exhausted`;
+- the config explicitly uses `affinity_policy = "fallback-sticky"` or `hard`.
+
+Trusted balance exhaustion is a provider-endpoint runtime signal. It can demote a monthly endpoint for the current request/refresh window, but it is not a permanent session preference. If a provider reports misleading zero balances for an active subscription, set `trust_exhaustion_for_routing = false` for that usage provider or fix the balance extractor.
+
+Use the control trace when a lower-priority group is selected:
+
+```text
+~/.codex-helper/logs/control_trace.jsonl
+```
+
+Look for `route_graph_selection_explain`. It records the selected provider endpoint, selected preference group, skipped higher-priority groups, and per-candidate skip reasons. Use route/provider/endpoint controls for temporary steering; legacy station overrides are rejected for route graph configs.
 
 ## UI Editing
 
@@ -648,9 +710,11 @@ Advanced multi-endpoint providers, model mappings, custom balance extraction rul
 
 ## Migration
 
-`v0.14.0` treats `version = 4` as the public persisted schema.
+The current route graph schema writes `version = 5`. Existing `version = 4` route graph configs still load as migration input.
 
-On load, legacy `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json` are migrated to `config.toml` with `version = 4`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
+On load, legacy `version = 4`, `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json` are migrated to `config.toml` with `version = 5`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
+
+During migration, codex-helper warns when the resulting route graph would use the new `preferred-group` default instead of old fallback stickiness. If you want the old behavior back, set `affinity_policy = "fallback-sticky"` explicitly before or after migration.
 
 Preview migration before starting the proxy:
 
@@ -664,13 +728,13 @@ Migration rules:
 - old `active_station` becomes part of the initial route entry;
 - old `level` becomes ordering input only;
 - old station/group members flatten into provider entries and an entry route's `children`;
-- legacy v3 `policy/order/target/prefer_tags` becomes a v4 entry route node;
+- legacy v3 `policy/order/target/prefer_tags` becomes a v5 entry route node;
 - legacy v3 `pool-fallback` becomes nested route nodes;
 - existing provider tags are preserved;
 - business tags such as `billing=monthly` are never guessed;
-- endpoint-scoped station groups may warn because v4 provider routing is provider-level by default.
+- endpoint-scoped station groups may warn because provider routing is provider-level by default.
 
-After migration, treat provider and routing graph as the public write surface. The proxy still derives a synthetic `routing` station for legacy runtime state and older APIs, but v4 request execution uses the preserved route graph and request-aware route plan rather than the old v2 flattening path.
+After migration, treat provider and routing graph as the public write surface. Station-shaped inputs are compatibility readers and migration diagnostics, not the runtime routing identity.
 
 ## Design Boundaries
 

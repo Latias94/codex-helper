@@ -5,7 +5,7 @@ use std::time::Instant;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
 
-use crate::lb::{CooldownBackoff, LoadBalancer, SelectedUpstream};
+use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace};
 use crate::state::SessionBinding;
 
@@ -14,6 +14,7 @@ use super::attempt_response::{
     AttemptResponseOutcome, AttemptResponseParams, StreamingAttemptResponseParams,
     handle_attempt_response, handle_streaming_attempt_success,
 };
+use super::attempt_target::AttemptTarget;
 use super::attempt_transport::{
     AttemptReadBodyOutcome, AttemptReadBodyParams, AttemptTransportOutcome, AttemptTransportParams,
     handle_attempt_transport, read_attempt_response_body,
@@ -39,7 +40,7 @@ struct AttemptSelectLogParams<'a> {
     upstream_attempt: u32,
     provider_opt: &'a RetryLayerOptions,
     upstream_opt: &'a RetryLayerOptions,
-    selected: &'a SelectedUpstream,
+    target: &'a AttemptTarget,
     provider_id: Option<&'a str>,
     avoid_set: &'a HashSet<usize>,
     avoided_total: usize,
@@ -49,8 +50,8 @@ struct AttemptSelectLogParams<'a> {
 
 pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) lb: &'a LoadBalancer,
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) legacy_lb: Option<&'a LoadBalancer>,
+    pub(super) target: &'a AttemptTarget,
     pub(super) method: &'a Method,
     pub(super) uri: &'a Uri,
     pub(super) client_headers: &'a HeaderMap,
@@ -99,8 +100,8 @@ pub(super) async fn execute_selected_upstream(
 ) -> SelectedUpstreamExecutionOutcome {
     let ExecuteSelectedUpstreamParams {
         proxy,
-        lb,
-        selected,
+        legacy_lb,
+        target,
         method,
         uri,
         client_headers,
@@ -146,7 +147,7 @@ pub(super) async fn execute_selected_upstream(
 
     let selected_setup = prepare_selected_upstream_request(SelectedUpstreamRequestSetupParams {
         proxy,
-        selected,
+        target,
         body_for_upstream,
         request_model,
         session_binding,
@@ -180,7 +181,7 @@ pub(super) async fn execute_selected_upstream(
             upstream_attempt,
             provider_opt,
             upstream_opt,
-            selected,
+            target,
             provider_id: provider_id.as_deref(),
             avoid_set,
             avoided_total: *avoided_total,
@@ -190,7 +191,7 @@ pub(super) async fn execute_selected_upstream(
         let route_attempt_index = start_selected_route_attempt(
             route_attempts,
             StartRouteAttemptParams {
-                selected,
+                target,
                 provider_id: provider_id.as_deref(),
                 provider_attempt,
                 upstream_attempt,
@@ -205,8 +206,8 @@ pub(super) async fn execute_selected_upstream(
 
         let transport = handle_attempt_transport(AttemptTransportParams {
             proxy,
-            lb,
-            selected,
+            legacy_lb,
+            target,
             method,
             uri,
             client_headers,
@@ -256,8 +257,8 @@ pub(super) async fn execute_selected_upstream(
             return SelectedUpstreamExecutionOutcome::Return(
                 handle_streaming_attempt_success(StreamingAttemptResponseParams {
                     proxy,
-                    lb,
-                    selected,
+                    legacy_lb,
+                    target,
                     response: resp,
                     status,
                     response_headers: resp_headers,
@@ -292,8 +293,8 @@ pub(super) async fn execute_selected_upstream(
 
         let bytes = match read_attempt_response_body(AttemptReadBodyParams {
             proxy,
-            lb,
-            selected,
+            legacy_lb,
+            target,
             response: resp,
             upstream_opt,
             upstream_attempt,
@@ -317,8 +318,8 @@ pub(super) async fn execute_selected_upstream(
         let dur = start.elapsed().as_millis() as u64;
         match handle_attempt_response(AttemptResponseParams {
             proxy,
-            lb,
-            selected,
+            legacy_lb,
+            target,
             method,
             path: uri.path(),
             status,
@@ -370,7 +371,7 @@ fn log_attempt_select(params: AttemptSelectLogParams<'_>) {
         upstream_attempt,
         provider_opt,
         upstream_opt,
-        selected,
+        target,
         provider_id,
         avoid_set,
         avoided_total,
@@ -378,8 +379,21 @@ fn log_attempt_select(params: AttemptSelectLogParams<'_>) {
         model_note,
     } = params;
 
-    let mut avoid_for_station = avoid_set.iter().copied().collect::<Vec<_>>();
-    avoid_for_station.sort_unstable();
+    let mut avoided_indices = avoid_set.iter().copied().collect::<Vec<_>>();
+    avoided_indices.sort_unstable();
+    let avoid_for_station = if target.uses_provider_endpoint_attempt_index() {
+        Vec::new()
+    } else {
+        avoided_indices.clone()
+    };
+    let avoided_candidate_indices = if target.uses_provider_endpoint_attempt_index() {
+        avoided_indices
+    } else {
+        Vec::new()
+    };
+    let endpoint_id = target.endpoint_id();
+    let provider_endpoint_key = target.provider_endpoint_key();
+    let preference_group = target.preference_group();
 
     log_retry_trace(serde_json::json!({
         "event": "attempt_select",
@@ -390,11 +404,17 @@ fn log_attempt_select(params: AttemptSelectLogParams<'_>) {
         "upstream_attempt": upstream_attempt + 1,
         "provider_max_attempts": provider_opt.max_attempts,
         "upstream_max_attempts": upstream_opt.max_attempts,
-        "station_name": selected.station_name.as_str(),
-        "upstream_index": selected.index,
-        "upstream_base_url": selected.upstream.base_url.as_str(),
-        "provider_id": provider_id,
+        "upstream_base_url": target.upstream().base_url.as_str(),
+        "provider_id": provider_id.or_else(|| target.provider_id()),
+        "endpoint_id": endpoint_id,
+        "provider_endpoint_key": provider_endpoint_key,
+        "preference_group": preference_group,
+        "compatibility": {
+            "station_name": target.compatibility_station_name(),
+            "upstream_index": target.compatibility_upstream_index(),
+        },
         "avoid_for_station": avoid_for_station,
+        "avoided_candidate_indices": avoided_candidate_indices,
         "avoided_total": avoided_total,
         "total_upstreams": total_upstreams,
         "model": model_note,

@@ -38,6 +38,9 @@ pub(super) fn control_trace_summary(entry: &ControlTraceLogEntry, lang: Language
             station_name,
             upstream_index,
             provider_id,
+            endpoint_id,
+            provider_endpoint_key,
+            preference_group,
             model,
             ..
         }) => {
@@ -45,11 +48,26 @@ pub(super) fn control_trace_summary(entry: &ControlTraceLogEntry, lang: Language
             let upstream = upstream_index
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let provider = provider_id.unwrap_or_else(|| "-".to_string());
             let model = model.unwrap_or_else(|| "-".to_string());
+            let provider_endpoint = format_route_decision_provider_endpoint(
+                provider_id.as_deref(),
+                endpoint_id.as_deref(),
+            );
+            let endpoint = provider_endpoint_key
+                .or_else(|| provider_endpoint.clone())
+                .unwrap_or_else(|| "-".to_string());
+            let provider = format_route_decision_provider_endpoint(
+                provider_id.as_deref(),
+                endpoint_id.as_deref(),
+            )
+            .or(provider_id)
+            .unwrap_or_else(|| "-".to_string());
+            let group = preference_group
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
             format!(
-                "select station={} upstream#{} provider={} model={}",
-                station, upstream, provider, model
+                "select endpoint={} group={} provider={} model={} compat_station={} upstream#{}",
+                endpoint, group, provider, model, station, upstream
             )
         }
         Some(ControlTraceDetail::RetryOptions {
@@ -143,6 +161,48 @@ pub(super) fn control_trace_summary(entry: &ControlTraceLogEntry, lang: Language
                 executor_station
             )
         }
+        Some(ControlTraceDetail::RouteGraphSelectionExplain {
+            request_model,
+            affinity_policy,
+            affinity_provider_endpoint_key,
+            selected_matches_affinity,
+            selected_provider_id,
+            selected_endpoint_id,
+            selected_provider_endpoint_key,
+            selected_preference_group,
+            skipped_higher_priority_groups,
+            skipped_higher_priority_candidates,
+        }) => {
+            let model = request_model.unwrap_or_else(|| "-".to_string());
+            let policy = affinity_policy.unwrap_or_else(|| "-".to_string());
+            let affinity = affinity_provider_endpoint_key.unwrap_or_else(|| "-".to_string());
+            let selected = selected_provider_endpoint_key
+                .or_else(|| {
+                    format_route_decision_provider_endpoint(
+                        selected_provider_id.as_deref(),
+                        selected_endpoint_id.as_deref(),
+                    )
+                })
+                .unwrap_or_else(|| "-".to_string());
+            let group = selected_preference_group
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let affinity_match = selected_matches_affinity
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "{} model={} selected={} group={} affinity_policy={} affinity={} affinity_match={} skipped_groups={} skipped_candidates={}",
+                pick(lang, "路由图选择解释", "Route graph selection explain"),
+                model,
+                selected,
+                group,
+                policy,
+                affinity,
+                affinity_match,
+                skipped_higher_priority_groups.len(),
+                skipped_higher_priority_candidates.len(),
+            )
+        }
         Some(ControlTraceDetail::RetryEvent {
             event_name,
             station_name,
@@ -222,6 +282,9 @@ mod tests {
                 upstream_index: Some(1),
                 upstream_base_url: None,
                 provider_id: Some("right".to_string()),
+                endpoint_id: Some("default".to_string()),
+                provider_endpoint_key: Some("codex/right/default".to_string()),
+                preference_group: Some(0),
                 model: Some("gpt-5.4-fast".to_string()),
             }),
             payload: serde_json::json!({}),
@@ -229,7 +292,10 @@ mod tests {
 
         let summary = control_trace_summary(&entry, Language::En);
 
-        assert!(summary.contains("station=right"));
+        assert!(summary.contains("endpoint=codex/right/default"));
+        assert!(summary.contains("group=0"));
+        assert!(summary.contains("provider=right/default"));
+        assert!(summary.contains("compat_station=right"));
         assert!(summary.contains("upstream#1"));
         assert!(summary.contains("gpt-5.4-fast"));
     }

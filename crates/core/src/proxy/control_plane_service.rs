@@ -2,6 +2,7 @@ use axum::http::StatusCode;
 
 use crate::config::{
     ProxyConfig, ProxyConfigV2, ProxyConfigV4, ServiceConfigManager, ServiceViewV2, ServiceViewV4,
+    is_supported_route_graph_config_version,
 };
 
 use super::ProxyService;
@@ -134,7 +135,7 @@ pub(super) async fn load_persisted_proxy_settings_document()
             .await
             .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
         match toml_schema_version_or_shape(&text) {
-            Some(4) => {
+            Some(version) if is_supported_route_graph_config_version(version) => {
                 let mut cfg = toml::from_str::<ProxyConfigV4>(&text)
                     .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
                 cfg.sync_routing_compat_from_graph();

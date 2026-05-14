@@ -141,6 +141,7 @@ fn apply_session_overrides(
     model_overrides: &HashMap<String, String>,
     overrides: &HashMap<String, String>,
     station_overrides: &HashMap<String, String>,
+    route_target_overrides: &HashMap<String, String>,
     service_tier_overrides: &HashMap<String, String>,
 ) {
     for (session_id, model) in model_overrides.iter() {
@@ -164,6 +165,13 @@ fn apply_session_overrides(
         entry.override_station = Some(station_name.clone());
     }
 
+    for (session_id, route_target) in route_target_overrides.iter() {
+        let entry = map
+            .entry(Some(session_id.clone()))
+            .or_insert_with(|| empty_observed_session_row(Some(session_id.clone())));
+        entry.override_route_target = Some(route_target.clone());
+    }
+
     for (session_id, service_tier) in service_tier_overrides.iter() {
         let entry = map
             .entry(Some(session_id.clone()))
@@ -179,6 +187,7 @@ pub(super) fn build_session_rows(
     model_overrides: &HashMap<String, String>,
     overrides: &HashMap<String, String>,
     station_overrides: &HashMap<String, String>,
+    route_target_overrides: &HashMap<String, String>,
     service_tier_overrides: &HashMap<String, String>,
     global_station_override: Option<&str>,
     stats: &HashMap<String, SessionStats>,
@@ -214,6 +223,7 @@ pub(super) fn build_session_rows(
         model_overrides,
         overrides,
         station_overrides,
+        route_target_overrides,
         service_tier_overrides,
     );
 

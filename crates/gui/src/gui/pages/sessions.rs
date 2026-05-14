@@ -59,6 +59,7 @@ pub(super) fn render(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
         render_data.selected_row(),
         &profiles,
         default_profile.as_deref(),
+        snapshot.supports_session_route_target_override,
     );
 
     let actions = render_sessions_split_view(

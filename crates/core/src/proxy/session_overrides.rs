@@ -3,7 +3,11 @@ use std::collections::{HashMap, HashSet};
 use axum::Json;
 use axum::http::StatusCode;
 
+use crate::config::is_supported_route_graph_config_version;
+use crate::routing_ir::{RouteRequestContext, compile_v4_route_plan_template_with_request};
+
 use super::ProxyService;
+use super::request_routing::service_view_with_route_target_override;
 
 #[derive(serde::Deserialize)]
 pub(super) struct SessionReasoningEffortOverrideRequest {
@@ -20,6 +24,13 @@ pub(super) struct SessionStationOverrideRequest {
 }
 
 #[derive(serde::Deserialize)]
+pub(super) struct SessionRouteTargetOverrideRequest {
+    session_id: String,
+    #[serde(default, alias = "route_target")]
+    target: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 pub(super) struct SessionModelOverrideRequest {
     session_id: String,
     model: Option<String>,
@@ -31,12 +42,19 @@ pub(super) struct SessionServiceTierOverrideRequest {
     service_tier: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct GlobalRouteTargetOverrideRequest {
+    #[serde(default, alias = "route_target")]
+    target: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum SessionOverrideDimension {
     Model,
     ReasoningEffort,
     StationName,
+    RouteTarget,
     ServiceTier,
     All,
 }
@@ -50,6 +68,8 @@ pub(super) struct SessionManualOverridesPatchRequest {
     reasoning_effort: Option<String>,
     #[serde(default)]
     station_name: Option<String>,
+    #[serde(default)]
+    route_target: Option<String>,
     #[serde(default)]
     service_tier: Option<String>,
     #[serde(default)]
@@ -132,6 +152,49 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+async fn reject_station_override_write_for_route_graph(
+    proxy: &ProxyService,
+) -> Result<(), (StatusCode, String)> {
+    let cfg = proxy.config.snapshot().await;
+    if cfg
+        .version
+        .is_some_and(is_supported_route_graph_config_version)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "route graph configs do not support station overrides; use routing/provider endpoint controls instead"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_route_target_override(
+    proxy: &ProxyService,
+    target: &str,
+) -> Result<(), (StatusCode, String)> {
+    let v4 = proxy.config.v4_snapshot().await;
+    let Some(v4) = v4.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "route target overrides require a route graph config".to_string(),
+        ));
+    };
+    let base_view = match proxy.service_name {
+        "claude" => &v4.claude,
+        _ => &v4.codex,
+    };
+    let view = service_view_with_route_target_override(proxy.service_name, base_view, target)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    compile_v4_route_plan_template_with_request(
+        proxy.service_name,
+        &view,
+        &RouteRequestContext::default(),
+    )
+    .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(())
+}
+
 pub(super) async fn set_session_reasoning_effort_override(
     proxy: ProxyService,
     Json(payload): Json<SessionReasoningEffortOverrideRequest>,
@@ -179,11 +242,13 @@ pub(super) async fn apply_session_manual_overrides(
     let reasoning_effort =
         normalize_session_override_value("reasoning_effort", payload.reasoning_effort)?;
     let station_name = normalize_session_override_value("station_name", payload.station_name)?;
+    let route_target = normalize_session_override_value("route_target", payload.route_target)?;
     let service_tier = normalize_session_override_value("service_tier", payload.service_tier)?;
     let clear: HashSet<_> = payload.clear.into_iter().collect();
     if model.is_none()
         && reasoning_effort.is_none()
         && station_name.is_none()
+        && route_target.is_none()
         && service_tier.is_none()
         && clear.is_empty()
     {
@@ -218,6 +283,12 @@ pub(super) async fn apply_session_manual_overrides(
                 .clear_session_station_override(session_id.as_str())
                 .await;
         }
+        if clear.contains(&SessionOverrideDimension::RouteTarget) {
+            proxy
+                .state
+                .clear_session_route_target_override(session_id.as_str())
+                .await;
+        }
         if clear.contains(&SessionOverrideDimension::ServiceTier) {
             proxy
                 .state
@@ -239,9 +310,17 @@ pub(super) async fn apply_session_manual_overrides(
             .await;
     }
     if let Some(station_name) = station_name {
+        reject_station_override_write_for_route_graph(&proxy).await?;
         proxy
             .state
             .set_session_station_override(session_id.clone(), station_name, now_ms())
+            .await;
+    }
+    if let Some(route_target) = route_target {
+        validate_route_target_override(&proxy, route_target.as_str()).await?;
+        proxy
+            .state
+            .set_session_route_target_override(session_id.clone(), route_target, now_ms())
             .await;
     }
     if let Some(service_tier) = service_tier {
@@ -269,6 +348,7 @@ pub(super) async fn set_session_station_override(
     require_session_id(payload.session_id.as_str())?;
     let station_name = normalize_session_override_value("station_name", payload.station_name)?;
     if let Some(station_name) = station_name {
+        reject_station_override_write_for_route_graph(&proxy).await?;
         proxy
             .state
             .set_session_station_override(payload.session_id, station_name, now_ms())
@@ -286,6 +366,34 @@ pub(super) async fn list_session_station_overrides(
     proxy: ProxyService,
 ) -> Result<Json<HashMap<String, String>>, (StatusCode, String)> {
     let map = proxy.state.list_session_station_overrides().await;
+    Ok(Json(map))
+}
+
+pub(super) async fn set_session_route_target_override(
+    proxy: ProxyService,
+    Json(payload): Json<SessionRouteTargetOverrideRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_session_id(payload.session_id.as_str())?;
+    let route_target = normalize_session_override_value("target", payload.target)?;
+    if let Some(route_target) = route_target {
+        validate_route_target_override(&proxy, route_target.as_str()).await?;
+        proxy
+            .state
+            .set_session_route_target_override(payload.session_id, route_target, now_ms())
+            .await;
+    } else {
+        proxy
+            .state
+            .clear_session_route_target_override(payload.session_id.as_str())
+            .await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn list_session_route_target_overrides(
+    proxy: ProxyService,
+) -> Result<Json<HashMap<String, String>>, (StatusCode, String)> {
+    let map = proxy.state.list_session_route_target_overrides().await;
     Ok(Json(map))
 }
 
@@ -341,6 +449,29 @@ pub(super) async fn list_session_service_tier_overrides(
 ) -> Result<Json<HashMap<String, String>>, (StatusCode, String)> {
     let map = proxy.state.list_session_service_tier_overrides().await;
     Ok(Json(map))
+}
+
+pub(super) async fn get_global_route_target_override(
+    proxy: ProxyService,
+) -> Result<Json<Option<String>>, (StatusCode, String)> {
+    Ok(Json(proxy.state.get_global_route_target_override().await))
+}
+
+pub(super) async fn set_global_route_target_override(
+    proxy: ProxyService,
+    Json(payload): Json<GlobalRouteTargetOverrideRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let route_target = normalize_session_override_value("target", payload.target)?;
+    if let Some(route_target) = route_target {
+        validate_route_target_override(&proxy, route_target.as_str()).await?;
+        proxy
+            .state
+            .set_global_route_target_override(route_target, now_ms())
+            .await;
+    } else {
+        proxy.state.clear_global_route_target_override().await;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(super) async fn reset_session_manual_overrides(

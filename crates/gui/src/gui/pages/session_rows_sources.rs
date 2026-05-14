@@ -35,6 +35,7 @@ pub(in crate::gui::pages) fn empty_observed_session_row(session_id: Option<Strin
         override_model: None,
         override_effort: None,
         override_station: None,
+        override_route_target: None,
         override_service_tier: None,
     }
 }

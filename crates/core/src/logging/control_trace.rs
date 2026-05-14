@@ -23,6 +23,9 @@ pub enum ControlTraceDetail {
         upstream_index: Option<u64>,
         upstream_base_url: Option<String>,
         provider_id: Option<String>,
+        endpoint_id: Option<String>,
+        provider_endpoint_key: Option<String>,
+        preference_group: Option<u64>,
         model: Option<String>,
     },
     LoadBalancerSelection {
@@ -55,6 +58,18 @@ pub enum ControlTraceDetail {
         executor_upstream_index: Option<u64>,
         executor_provider_id: Option<String>,
     },
+    RouteGraphSelectionExplain {
+        request_model: Option<String>,
+        affinity_policy: Option<String>,
+        affinity_provider_endpoint_key: Option<String>,
+        selected_matches_affinity: Option<bool>,
+        selected_provider_id: Option<String>,
+        selected_endpoint_id: Option<String>,
+        selected_provider_endpoint_key: Option<String>,
+        selected_preference_group: Option<u64>,
+        skipped_higher_priority_groups: Vec<u64>,
+        skipped_higher_priority_candidates: Vec<ControlTraceRouteGraphSkippedCandidate>,
+    },
     RetryEvent {
         event_name: String,
         station_name: Option<String>,
@@ -62,6 +77,16 @@ pub enum ControlTraceDetail {
         mode: Option<String>,
         note: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlTraceRouteGraphSkippedCandidate {
+    pub provider_id: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub provider_endpoint_key: Option<String>,
+    pub preference_group: Option<u64>,
+    pub route_path: Vec<String>,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +228,18 @@ fn json_bool_field(value: &JsonValue, key: &str) -> Option<bool> {
     value.get(key).and_then(|value| value.as_bool())
 }
 
+fn json_nested_string_field(value: &JsonValue, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn json_nested_u64_field(value: &JsonValue, path: &[&str]) -> Option<u64> {
     let mut current = value;
     for segment in path {
@@ -226,6 +263,23 @@ fn json_string_vec_field(value: &JsonValue, key: &str) -> Vec<String> {
                 .map(str::trim)
                 .filter(|item| !item.is_empty())
                 .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn json_u64_vec_field(value: &JsonValue, key: &str) -> Vec<u64> {
+    value
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    JsonValue::Number(number) => number.as_u64(),
+                    JsonValue::String(text) => text.trim().parse::<u64>().ok(),
+                    _ => None,
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
@@ -300,10 +354,15 @@ fn infer_retry_control_trace_detail(
 
     match event_name.as_str() {
         "attempt_select" => Some(ControlTraceDetail::AttemptSelect {
-            station_name: json_string_field(payload, "station_name"),
-            upstream_index: json_u64_field(payload, "upstream_index"),
+            station_name: json_nested_string_field(payload, &["compatibility", "station_name"])
+                .or_else(|| json_string_field(payload, "station_name")),
+            upstream_index: json_nested_u64_field(payload, &["compatibility", "upstream_index"])
+                .or_else(|| json_u64_field(payload, "upstream_index")),
             upstream_base_url: json_string_field(payload, "upstream_base_url"),
             provider_id: json_string_field(payload, "provider_id"),
+            endpoint_id: json_string_field(payload, "endpoint_id"),
+            provider_endpoint_key: json_string_field(payload, "provider_endpoint_key"),
+            preference_group: json_u64_field(payload, "preference_group"),
             model: json_string_field(payload, "model"),
         }),
         "retry_options" => Some(ControlTraceDetail::RetryOptions {
@@ -335,6 +394,7 @@ fn infer_retry_control_trace_detail(
             clear_runtime_state: json_bool_field(payload, "clear_runtime_state").unwrap_or(false),
         }),
         "route_executor_shadow_mismatch" => Some(route_executor_shadow_mismatch_detail(payload)),
+        "route_graph_selection_explain" => Some(route_graph_selection_explain_detail(payload)),
         _ => Some(ControlTraceDetail::RetryEvent {
             event_name,
             station_name: json_string_field(payload, "station_name")
@@ -343,6 +403,48 @@ fn infer_retry_control_trace_detail(
             mode: json_string_field(payload, "mode"),
             note: json_string_field(payload, "note"),
         }),
+    }
+}
+
+fn route_graph_selection_explain_detail(payload: &JsonValue) -> ControlTraceDetail {
+    ControlTraceDetail::RouteGraphSelectionExplain {
+        request_model: json_string_field(payload, "request_model"),
+        affinity_policy: json_nested_string_field(payload, &["affinity", "policy"]),
+        affinity_provider_endpoint_key: json_nested_string_field(
+            payload,
+            &["affinity", "provider_endpoint_key"],
+        ),
+        selected_matches_affinity: payload
+            .get("affinity")
+            .and_then(|affinity| json_bool_field(affinity, "selected_matches_affinity")),
+        selected_provider_id: json_nested_string_field(payload, &["selected", "provider_id"]),
+        selected_endpoint_id: json_nested_string_field(payload, &["selected", "endpoint_id"]),
+        selected_provider_endpoint_key: json_nested_string_field(
+            payload,
+            &["selected", "provider_endpoint_key"],
+        ),
+        selected_preference_group: json_nested_u64_field(
+            payload,
+            &["selected", "preference_group"],
+        ),
+        skipped_higher_priority_groups: json_u64_vec_field(
+            payload,
+            "skipped_higher_priority_groups",
+        ),
+        skipped_higher_priority_candidates: json_array_field(
+            payload,
+            "skipped_higher_priority_candidates",
+        )
+        .iter()
+        .map(|candidate| ControlTraceRouteGraphSkippedCandidate {
+            provider_id: json_string_field(candidate, "provider_id"),
+            endpoint_id: json_string_field(candidate, "endpoint_id"),
+            provider_endpoint_key: json_string_field(candidate, "provider_endpoint_key"),
+            preference_group: json_u64_field(candidate, "preference_group"),
+            route_path: json_string_vec_field(candidate, "route_path"),
+            reasons: json_string_vec_field(candidate, "reasons"),
+        })
+        .collect(),
     }
 }
 
@@ -498,6 +600,14 @@ mod tests {
                 "event": "attempt_select",
                 "service": "codex",
                 "request_id": 7,
+                "provider_id": "monthly",
+                "endpoint_id": "default",
+                "provider_endpoint_key": "codex/monthly/default",
+                "preference_group": 0,
+                "compatibility": {
+                    "station_name": "routing",
+                    "upstream_index": 0
+                },
             }),
         );
 
@@ -509,6 +619,13 @@ mod tests {
         assert_eq!(value["service"].as_str(), Some("codex"));
         assert_eq!(value["payload"]["event"].as_str(), Some("attempt_select"));
         assert_eq!(value["detail"]["type"].as_str(), Some("attempt_select"));
+        assert_eq!(
+            value["detail"]["provider_endpoint_key"].as_str(),
+            Some("codex/monthly/default")
+        );
+        assert_eq!(value["detail"]["preference_group"].as_u64(), Some(0));
+        assert_eq!(value["detail"]["station_name"].as_str(), Some("routing"));
+        assert_eq!(value["detail"]["upstream_index"].as_u64(), Some(0));
     }
 
     #[test]
@@ -536,6 +653,9 @@ mod tests {
                 upstream_index: None,
                 upstream_base_url: None,
                 provider_id: None,
+                endpoint_id: None,
+                provider_endpoint_key: None,
+                preference_group: None,
                 model: None,
             })
         );
@@ -630,6 +750,70 @@ mod tests {
                 clear_enabled: false,
                 runtime_state: Some("breaker_open".to_string()),
                 clear_runtime_state: false,
+            })
+        );
+    }
+
+    #[test]
+    fn control_trace_entry_resolved_detail_infers_route_graph_selection_explain() {
+        let entry: ControlTraceLogEntry = serde_json::from_value(serde_json::json!({
+            "ts_ms": 1,
+            "kind": "retry_trace",
+            "service": "codex",
+            "request_id": 42,
+            "event": "route_graph_selection_explain",
+            "payload": {
+                "event": "route_graph_selection_explain",
+                "service": "codex",
+                "request_id": 42,
+                "request_model": "gpt-5.4",
+                "affinity": {
+                    "policy": "preferred_group",
+                    "provider_endpoint_key": "codex/chili/default",
+                    "selected_matches_affinity": false
+                },
+                "selected": {
+                    "provider_id": "chili",
+                    "endpoint_id": "default",
+                    "provider_endpoint_key": "codex/chili/default",
+                    "preference_group": 1,
+                    "route_path": ["entry", "fallback"]
+                },
+                "skipped_higher_priority_groups": [0],
+                "skipped_higher_priority_candidates": [
+                    {
+                        "provider_id": "monthly",
+                        "endpoint_id": "default",
+                        "provider_endpoint_key": "codex/monthly/default",
+                        "preference_group": 0,
+                        "route_path": ["entry", "monthly"],
+                        "reasons": ["usage_exhausted"]
+                    }
+                ]
+            }
+        }))
+        .expect("deserialize route graph selection explain trace");
+
+        assert_eq!(
+            entry.resolved_detail(),
+            Some(ControlTraceDetail::RouteGraphSelectionExplain {
+                request_model: Some("gpt-5.4".to_string()),
+                affinity_policy: Some("preferred_group".to_string()),
+                affinity_provider_endpoint_key: Some("codex/chili/default".to_string()),
+                selected_matches_affinity: Some(false),
+                selected_provider_id: Some("chili".to_string()),
+                selected_endpoint_id: Some("default".to_string()),
+                selected_provider_endpoint_key: Some("codex/chili/default".to_string()),
+                selected_preference_group: Some(1),
+                skipped_higher_priority_groups: vec![0],
+                skipped_higher_priority_candidates: vec![ControlTraceRouteGraphSkippedCandidate {
+                    provider_id: Some("monthly".to_string()),
+                    endpoint_id: Some("default".to_string()),
+                    provider_endpoint_key: Some("codex/monthly/default".to_string()),
+                    preference_group: Some(0),
+                    route_path: vec!["entry".to_string(), "monthly".to_string()],
+                    reasons: vec!["usage_exhausted".to_string()],
+                }],
             })
         );
     }

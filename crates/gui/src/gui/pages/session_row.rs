@@ -106,6 +106,7 @@ pub(super) struct SessionRow {
     pub(super) override_model: Option<String>,
     pub(super) override_effort: Option<String>,
     pub(super) override_station: Option<String>,
+    pub(super) override_route_target: Option<String>,
     pub(super) override_service_tier: Option<String>,
 }
 
@@ -129,5 +130,9 @@ impl SessionRow {
 
     pub(super) fn override_station_name(&self) -> Option<&str> {
         self.override_station.as_deref()
+    }
+
+    pub(super) fn override_route_target(&self) -> Option<&str> {
+        self.override_route_target.as_deref()
     }
 }

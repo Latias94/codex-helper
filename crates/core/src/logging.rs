@@ -283,9 +283,14 @@ pub struct RequestLog<'a> {
     /// - For non-streaming responses: measured to response headers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttfb_ms: Option<u64>,
-    pub station_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub station_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_endpoint_key: Option<String>,
     pub upstream_base_url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -319,6 +324,10 @@ fn route_attempt_avoid_for_station_is_empty(value: &[usize]) -> bool {
     value.is_empty()
 }
 
+fn route_attempt_avoided_candidate_indices_is_empty(value: &[usize]) -> bool {
+    value.is_empty()
+}
+
 fn route_attempt_route_path_is_empty(value: &[String]) -> bool {
     value.is_empty()
 }
@@ -334,6 +343,10 @@ pub struct RouteAttemptLog {
     pub provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_endpoint_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preference_group: Option<u32>,
     #[serde(default, skip_serializing_if = "route_attempt_route_path_is_empty")]
     pub route_path: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -355,6 +368,11 @@ pub struct RouteAttemptLog {
         skip_serializing_if = "route_attempt_avoid_for_station_is_empty"
     )]
     pub avoid_for_station: Vec<usize>,
+    #[serde(
+        default,
+        skip_serializing_if = "route_attempt_avoided_candidate_indices_is_empty"
+    )]
+    pub avoided_candidate_indices: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avoided_total: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -454,6 +472,7 @@ fn parse_route_attempt_from_chain_entry(raw: &str, attempt_index: u32) -> RouteA
         attempt.station_name = station_name;
         attempt.upstream_base_url = upstream_base_url;
     }
+    apply_route_chain_identity_metadata(&mut attempt, raw);
 
     if let Some(status_code) =
         route_chain_value(metadata, "status").and_then(|value| value.parse::<u16>().ok())
@@ -506,6 +525,50 @@ fn parse_route_attempt_from_chain_entry(raw: &str, attempt_index: u32) -> RouteA
     }
 
     attempt
+}
+
+fn apply_route_chain_identity_metadata(attempt: &mut RouteAttemptLog, raw: &str) {
+    if let Some(station) = route_chain_value(raw, "station") {
+        attempt.station_name = non_empty_str(station.as_str()).map(ToOwned::to_owned);
+    }
+    if let Some(provider_endpoint_key) = route_chain_value(raw, "endpoint") {
+        let provider_endpoint_key = provider_endpoint_key.trim().to_string();
+        if !provider_endpoint_key.is_empty() && provider_endpoint_key != "-" {
+            let parts = provider_endpoint_key.split('/').collect::<Vec<_>>();
+            if parts.len() >= 3 {
+                attempt.provider_id = non_empty_str(parts[1]).map(ToOwned::to_owned);
+                attempt.endpoint_id = non_empty_str(parts[2]).map(ToOwned::to_owned);
+            }
+            attempt.provider_endpoint_key = Some(provider_endpoint_key);
+        }
+    }
+    if let Some(group) = route_chain_value(raw, "group").and_then(|value| value.parse::<u32>().ok())
+    {
+        attempt.preference_group = Some(group);
+    }
+    if let Some(station) = route_chain_value(raw, "compat_station") {
+        attempt.station_name = non_empty_str(station.as_str()).map(ToOwned::to_owned);
+    }
+    if let Some(index) =
+        route_chain_value(raw, "upstream_index").and_then(|value| value.parse::<usize>().ok())
+    {
+        attempt.upstream_index = Some(index);
+    }
+    if let Some(url) = route_chain_value(raw, "url") {
+        attempt.upstream_base_url = non_empty_str(url.as_str()).map(ToOwned::to_owned);
+    }
+    if let Some(indices) = route_chain_value(raw, "avoid_candidates") {
+        attempt.avoided_candidate_indices = parse_usize_list(indices.as_str());
+    }
+    if let Some(indices) = route_chain_value(raw, "avoid") {
+        attempt.avoid_for_station = parse_usize_list(indices.as_str());
+    }
+}
+
+fn parse_usize_list(raw: &str) -> Vec<usize> {
+    raw.split(',')
+        .filter_map(|part| part.trim().parse::<usize>().ok())
+        .collect()
 }
 
 fn split_route_chain_entry(raw: &str) -> (Option<&str>, &str, Option<usize>) {
@@ -601,6 +664,14 @@ const ROUTE_CHAIN_KEYS: &[&str] = &[
     "body_too_large",
     "skipped_unsupported_model",
     "total",
+    "station",
+    "endpoint",
+    "group",
+    "compat_station",
+    "upstream_index",
+    "url",
+    "avoid_candidates",
+    "avoid",
 ];
 
 #[derive(Debug, Serialize)]
@@ -618,9 +689,14 @@ struct HttpDebugLogEntry<'a> {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttfb_ms: Option<u64>,
-    pub station_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub station_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_endpoint_key: Option<String>,
     pub upstream_base_url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -757,8 +833,10 @@ pub fn log_request_with_debug(
     status_code: u16,
     duration_ms: u64,
     ttfb_ms: Option<u64>,
-    station_name: &str,
+    station_name: Option<&str>,
     provider_id: Option<String>,
+    endpoint_id: Option<String>,
+    provider_endpoint_key: Option<String>,
     upstream_base_url: &str,
     session_id: Option<String>,
     cwd: Option<String>,
@@ -807,6 +885,8 @@ pub fn log_request_with_debug(
             ttfb_ms,
             station_name,
             provider_id: provider_id.clone(),
+            endpoint_id: endpoint_id.clone(),
+            provider_endpoint_key: provider_endpoint_key.clone(),
             upstream_base_url,
             session_id: session_id.clone(),
             cwd: cwd.clone(),
@@ -848,6 +928,8 @@ pub fn log_request_with_debug(
         ttfb_ms,
         station_name,
         provider_id,
+        endpoint_id,
+        provider_endpoint_key,
         upstream_base_url,
         session_id,
         cwd,

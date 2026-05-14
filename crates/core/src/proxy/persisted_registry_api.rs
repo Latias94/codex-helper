@@ -56,6 +56,20 @@ pub(super) struct PersistedProviderEndpointSpecUpsertRequest {
     tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
+impl From<crate::config::PersistedProviderEndpointSpec>
+    for PersistedProviderEndpointSpecUpsertRequest
+{
+    fn from(endpoint: crate::config::PersistedProviderEndpointSpec) -> Self {
+        Self {
+            name: endpoint.name,
+            base_url: endpoint.base_url,
+            enabled: endpoint.enabled,
+            priority: endpoint.priority,
+            tags: Some(endpoint.tags),
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub(super) struct PersistedProviderSpecUpsertRequest {
     #[serde(default)]
@@ -70,6 +84,19 @@ pub(super) struct PersistedProviderSpecUpsertRequest {
     tags: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     endpoints: Vec<PersistedProviderEndpointSpecUpsertRequest>,
+}
+
+impl From<crate::config::PersistedProviderSpec> for PersistedProviderSpecUpsertRequest {
+    fn from(provider: crate::config::PersistedProviderSpec) -> Self {
+        Self {
+            alias: provider.alias,
+            enabled: provider.enabled,
+            auth_token_env: provider.auth_token_env,
+            api_key_env: provider.api_key_env,
+            tags: Some(provider.tags),
+            endpoints: provider.endpoints.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 struct SanitizedPersistedProviderSpec {
@@ -113,26 +140,32 @@ pub(super) struct PersistedDefaultProfileRequest {
     profile_name: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct PersistedRoutingUpsertRequest {
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct PersistedRoutingUpsertRequest {
     #[serde(default)]
-    entry: Option<String>,
+    pub entry: Option<String>,
     #[serde(default)]
-    routes: Option<std::collections::BTreeMap<String, crate::config::RoutingNodeV4>>,
+    pub affinity_policy: Option<crate::config::RoutingAffinityPolicyV5>,
     #[serde(default)]
-    policy: Option<crate::config::RoutingPolicyV4>,
+    pub fallback_ttl_ms: Option<u64>,
     #[serde(default)]
-    order: Vec<String>,
+    pub reprobe_preferred_after_ms: Option<u64>,
     #[serde(default)]
-    target: Option<String>,
+    pub routes: Option<std::collections::BTreeMap<String, crate::config::RoutingNodeV4>>,
     #[serde(default)]
-    prefer_tags: Option<Vec<std::collections::BTreeMap<String, String>>>,
+    pub policy: Option<crate::config::RoutingPolicyV4>,
     #[serde(default)]
-    chain: Vec<String>,
+    pub order: Vec<String>,
     #[serde(default)]
-    pools: std::collections::BTreeMap<String, crate::config::RoutingPoolV4>,
+    pub target: Option<String>,
+    #[serde(default)]
+    pub prefer_tags: Option<Vec<std::collections::BTreeMap<String, String>>>,
+    #[serde(default)]
+    pub chain: Vec<String>,
+    #[serde(default)]
+    pub pools: std::collections::BTreeMap<String, crate::config::RoutingPoolV4>,
     #[serde(default = "default_persisted_routing_on_exhausted")]
-    on_exhausted: crate::config::RoutingExhaustedActionV4,
+    pub on_exhausted: crate::config::RoutingExhaustedActionV4,
 }
 
 fn sanitize_profile_name(profile_name: &str) -> Result<String, (StatusCode, String)> {
@@ -393,46 +426,6 @@ fn merge_persisted_provider_spec(
     }
 }
 
-fn persisted_provider_spec_from_v4(
-    name: &str,
-    provider: &crate::config::ProviderConfigV4,
-) -> crate::config::PersistedProviderSpec {
-    let mut endpoints = Vec::new();
-    if let Some(base_url) = provider
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        endpoints.push(crate::config::PersistedProviderEndpointSpec {
-            name: "default".to_string(),
-            base_url: base_url.to_string(),
-            enabled: provider.enabled,
-            priority: 0,
-            tags: std::collections::BTreeMap::new(),
-        });
-    }
-    endpoints.extend(provider.endpoints.iter().map(|(endpoint_name, endpoint)| {
-        crate::config::PersistedProviderEndpointSpec {
-            name: endpoint_name.clone(),
-            base_url: endpoint.base_url.clone(),
-            enabled: endpoint.enabled,
-            priority: endpoint.priority,
-            tags: endpoint.tags.clone(),
-        }
-    }));
-
-    crate::config::PersistedProviderSpec {
-        name: name.to_string(),
-        alias: provider.alias.clone(),
-        enabled: provider.enabled,
-        auth_token_env: provider.inline_auth.auth_token_env.clone(),
-        api_key_env: provider.inline_auth.api_key_env.clone(),
-        tags: provider.tags.clone(),
-        endpoints,
-    }
-}
-
 fn persisted_routing_spec_from_v4(
     view: &crate::config::ServiceViewV4,
 ) -> crate::config::PersistedRoutingSpec {
@@ -442,6 +435,9 @@ fn persisted_routing_spec_from_v4(
     let entry_node = routing.entry_node();
     crate::config::PersistedRoutingSpec {
         entry: routing.entry.clone(),
+        affinity_policy: routing.affinity_policy,
+        fallback_ttl_ms: routing.fallback_ttl_ms,
+        reprobe_preferred_after_ms: routing.reprobe_preferred_after_ms,
         routes: routing.routes.clone(),
         policy: entry_node
             .map(|node| node.strategy)
@@ -503,6 +499,15 @@ fn sanitize_routing_spec_request(
             ));
         }
         routing.entry = entry.to_string();
+    }
+    if let Some(affinity_policy) = payload.affinity_policy {
+        routing.affinity_policy = affinity_policy;
+    }
+    if let Some(fallback_ttl_ms) = payload.fallback_ttl_ms {
+        routing.fallback_ttl_ms = Some(fallback_ttl_ms);
+    }
+    if let Some(reprobe_preferred_after_ms) = payload.reprobe_preferred_after_ms {
+        routing.reprobe_preferred_after_ms = Some(reprobe_preferred_after_ms);
     }
     if let Some(routes) = payload.routes {
         routing.routes = sanitize_route_nodes(routes)?;
@@ -785,7 +790,7 @@ fn merge_persisted_provider_spec_v4(
     out
 }
 
-fn runtime_service_manager_for_document<'a>(
+pub(super) fn runtime_service_manager_for_document<'a>(
     runtime: &'a crate::config::ProxyConfig,
     service_name: &str,
 ) -> &'a crate::config::ServiceConfigManager {
@@ -871,7 +876,7 @@ pub(super) async fn list_persisted_station_specs(
         }
         PersistedProxySettingsDocument::V4(_) => Err((
             StatusCode::BAD_REQUEST,
-            "v4 route graph configs do not expose station specs; use the routing and provider specs APIs"
+            "route graph configs do not expose station specs; use the routing and provider specs APIs"
                 .to_string(),
         )),
     }
@@ -880,48 +885,44 @@ pub(super) async fn list_persisted_station_specs(
 pub(super) async fn list_persisted_provider_specs(
     proxy: ProxyService,
 ) -> Result<Json<crate::config::PersistedProvidersCatalog>, (StatusCode, String)> {
-    match load_persisted_proxy_settings_document().await? {
-        PersistedProxySettingsDocument::V2(cfg) => {
-            Ok(Json(crate::config::build_persisted_provider_catalog(
-                service_view_v2(&cfg, proxy.service_name),
-            )))
-        }
-        PersistedProxySettingsDocument::V4(cfg) => {
-            Ok(Json(crate::config::PersistedProvidersCatalog {
-                providers: service_view_v4(&cfg, proxy.service_name)
-                    .providers
-                    .iter()
-                    .map(|(name, provider)| persisted_provider_spec_from_v4(name, provider))
-                    .collect(),
-            }))
-        }
-    }
+    proxy
+        .persisted_provider_specs()
+        .await
+        .map(Json)
+        .map_err(super::ProxyControlError::into_http_error)
 }
 
 pub(super) async fn list_persisted_routing_spec(
     proxy: ProxyService,
 ) -> Result<Json<crate::config::PersistedRoutingSpec>, (StatusCode, String)> {
-    match load_persisted_proxy_settings_document().await? {
-        PersistedProxySettingsDocument::V4(cfg) => Ok(Json(persisted_routing_spec_from_v4(
-            service_view_v4(&cfg, proxy.service_name),
-        ))),
-        PersistedProxySettingsDocument::V2(_) => Err((
-            StatusCode::BAD_REQUEST,
-            "routing API requires a version = 4 route graph config".to_string(),
-        )),
-    }
+    proxy
+        .persisted_routing_spec()
+        .await
+        .map(Json)
+        .map_err(super::ProxyControlError::into_http_error)
 }
 
 pub(super) async fn upsert_persisted_routing_spec(
     proxy: ProxyService,
     Json(payload): Json<PersistedRoutingUpsertRequest>,
 ) -> Result<Json<crate::config::PersistedRoutingSpec>, (StatusCode, String)> {
+    proxy
+        .upsert_persisted_routing_spec(payload)
+        .await
+        .map(Json)
+        .map_err(super::ProxyControlError::into_http_error)
+}
+
+pub(super) async fn upsert_persisted_routing_spec_for_proxy(
+    proxy: &ProxyService,
+    payload: PersistedRoutingUpsertRequest,
+) -> Result<crate::config::PersistedRoutingSpec, (StatusCode, String)> {
     let mut document = match load_persisted_proxy_settings_document().await? {
         PersistedProxySettingsDocument::V4(document) => document,
         PersistedProxySettingsDocument::V2(_) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "routing API requires a version = 4 route graph config".to_string(),
+                "routing API requires a version = 5 route graph config".to_string(),
             ));
         }
     };
@@ -933,7 +934,7 @@ pub(super) async fn upsert_persisted_routing_spec(
     crate::config::compile_v4_to_runtime(&document)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     save_persisted_proxy_settings_document_and_reload(
-        &proxy,
+        proxy,
         PersistedProxySettingsDocument::V4(document),
     )
     .await?;
@@ -941,10 +942,10 @@ pub(super) async fn upsert_persisted_routing_spec(
     if let PersistedProxySettingsDocument::V4(cfg) =
         load_persisted_proxy_settings_document().await?
     {
-        return Ok(Json(persisted_routing_spec_from_v4(service_view_v4(
+        return Ok(persisted_routing_spec_from_v4(service_view_v4(
             &cfg,
             proxy.service_name,
-        ))));
+        )));
     }
 
     unreachable!("saved routing document should reload as v4");
@@ -964,7 +965,7 @@ pub(super) async fn upsert_persisted_profile(
         if has_station_binding {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "v4 route graph profiles do not support station bindings; edit routing instead"
+                "route graph profiles do not support station bindings; edit routing instead"
                     .to_string(),
             ));
         }
@@ -1136,7 +1137,7 @@ pub(super) async fn update_persisted_station(
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "v4 route graph configs do not support station settings writes; edit providers and routing instead"
+            "route graph configs do not support station settings writes; edit providers and routing instead"
                 .to_string(),
         ));
     }
@@ -1173,7 +1174,7 @@ pub(super) async fn set_persisted_active_station(
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "v4 route graph configs do not support station active writes; edit routing instead"
+            "route graph configs do not support station active writes; edit routing instead"
                 .to_string(),
         ));
     }
@@ -1210,7 +1211,7 @@ pub(super) async fn upsert_persisted_station_spec(
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "v4 route graph configs do not support station spec editing; edit providers and routing instead"
+            "route graph configs do not support station spec editing; edit providers and routing instead"
                 .to_string(),
         ));
     }
@@ -1250,7 +1251,7 @@ pub(super) async fn delete_persisted_station_spec(
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "v4 route graph configs do not support station spec editing; edit providers and routing instead"
+            "route graph configs do not support station spec editing; edit providers and routing instead"
                 .to_string(),
         ));
     }
@@ -1297,6 +1298,14 @@ pub(super) async fn upsert_persisted_provider_spec(
     Path(provider_name): Path<String>,
     Json(payload): Json<PersistedProviderSpecUpsertRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    upsert_persisted_provider_spec_for_proxy(&proxy, provider_name, payload).await
+}
+
+pub(super) async fn upsert_persisted_provider_spec_for_proxy(
+    proxy: &ProxyService,
+    provider_name: String,
+    payload: PersistedProviderSpecUpsertRequest,
+) -> Result<StatusCode, (StatusCode, String)> {
     let provider_name = sanitize_provider_name(provider_name.as_str())?;
     let mut provider = sanitize_provider_spec_request(payload)?;
     provider.spec.name = provider_name.clone();
@@ -1324,7 +1333,7 @@ pub(super) async fn upsert_persisted_provider_spec(
         crate::config::compile_v4_to_runtime(&document)
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         save_persisted_proxy_settings_document_and_reload(
-            &proxy,
+            proxy,
             PersistedProxySettingsDocument::V4(document),
         )
         .await?;
@@ -1341,7 +1350,7 @@ pub(super) async fn upsert_persisted_provider_spec(
 
     crate::config::compile_v2_to_runtime(&cfg)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    save_persisted_proxy_settings_v2_and_reload(&proxy, cfg).await?;
+    save_persisted_proxy_settings_v2_and_reload(proxy, cfg).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1422,71 +1431,9 @@ pub(super) async fn set_persisted_default_profile(
     proxy: ProxyService,
     Json(payload): Json<PersistedDefaultProfileRequest>,
 ) -> Result<Json<ProfilesResponse>, (StatusCode, String)> {
-    let profile_name = payload
-        .profile_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string());
-
-    if let PersistedProxySettingsDocument::V4(mut document) =
-        load_persisted_proxy_settings_document().await?
-    {
-        if let Some(profile_name) = profile_name.as_deref() {
-            let view = service_view_v4(&document, proxy.service_name);
-            if !view.profiles.contains_key(profile_name) {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    format!("profile '{}' not found", profile_name),
-                ));
-            }
-            let runtime = crate::config::compile_v4_to_runtime(&document)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-            let mgr = runtime_service_manager_for_document(&runtime, proxy.service_name);
-            let resolved = crate::config::resolve_service_profile(mgr, profile_name)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-            crate::config::validate_profile_station_compatibility(
-                proxy.service_name,
-                mgr,
-                profile_name,
-                &resolved,
-            )
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        }
-        let view = service_view_v4_mut(&mut document, proxy.service_name);
-        view.default_profile = profile_name;
-        save_persisted_proxy_settings_document_and_reload(
-            &proxy,
-            PersistedProxySettingsDocument::V4(document),
-        )
-        .await?;
-        return Ok(Json(make_profiles_response(&proxy).await));
-    }
-
-    let cfg_snapshot = proxy.config.snapshot().await;
-    let mut cfg = cfg_snapshot.as_ref().clone();
-    let mgr = runtime_service_manager_mut(&mut cfg, proxy.service_name);
-
-    if let Some(profile_name) = profile_name.as_deref() {
-        if mgr.profile(profile_name).is_none() {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("profile '{}' not found", profile_name),
-            ));
-        }
-        let resolved = crate::config::resolve_service_profile(mgr, profile_name)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        crate::config::validate_profile_station_compatibility(
-            proxy.service_name,
-            mgr,
-            profile_name,
-            &resolved,
-        )
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    }
-    mgr.default_profile = profile_name;
-
-    Ok(Json(
-        save_runtime_profile_settings_and_reload(&proxy, cfg).await?,
-    ))
+    proxy
+        .set_persisted_default_profile(payload.profile_name)
+        .await
+        .map(Json)
+        .map_err(super::ProxyControlError::into_http_error)
 }

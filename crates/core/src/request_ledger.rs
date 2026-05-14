@@ -335,14 +335,15 @@ pub fn format_request_log_record_lines(record: &JsonValue) -> Vec<String> {
     let method = str_field(record, "method").unwrap_or("-");
     let path = str_field(record, "path").unwrap_or("-");
     let status = u64_field(record, "status_code").unwrap_or(0);
-    let station = station_name(record);
     let provider = str_field(record, "provider_id").unwrap_or("-");
+    let endpoint = provider_endpoint_display(record);
+    let station = station_name(record);
     let model = request_model(record).unwrap_or_else(|| "-".to_string());
     let tier = service_tier_display(record);
 
     let mut lines = vec![format!(
-        "[{}] {} {} {} status={} station={} provider={} model={} tier={}",
-        ts, service, method, path, status, station, provider, model, tier
+        "[{}] {} {} {} status={} endpoint={} provider={} station={} model={} tier={}",
+        ts, service, method, path, status, endpoint, provider, station, model, tier
     )];
 
     let duration_ms = u64_field(record, "duration_ms").unwrap_or(0);
@@ -627,6 +628,17 @@ fn station_name(record: &JsonValue) -> &str {
         .unwrap_or("-")
 }
 
+fn provider_endpoint_display(record: &JsonValue) -> String {
+    str_field(record, "provider_endpoint_key")
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let provider = str_field(record, "provider_id")?;
+            let endpoint = str_field(record, "endpoint_id")?;
+            Some(format!("{provider}.{endpoint}"))
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn non_dash(value: &str) -> Option<&str> {
     (value != "-").then_some(value)
 }
@@ -709,8 +721,9 @@ mod tests {
             "status_code": 200,
             "duration_ms": 2000,
             "ttfb_ms": 500,
-            "station_name": "main",
             "provider_id": "relay",
+            "endpoint_id": "default",
+            "provider_endpoint_key": "codex/relay/default",
             "service_tier": { "effective": "priority" },
             "usage": {
                 "input_tokens": 1000,
@@ -729,6 +742,8 @@ mod tests {
 
         let lines = format_request_log_record_lines(&record);
 
+        assert!(lines[0].contains("endpoint=codex/relay/default"));
+        assert!(lines[0].contains("station=-"));
         assert!(lines[0].contains("model=gpt-5"));
         assert!(lines[0].contains("tier=priority(fast)"));
         assert!(lines[1].contains("output_speed=20.00 tok/s"));

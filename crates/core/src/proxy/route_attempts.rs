@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 
-use crate::lb::SelectedUpstream;
 use crate::logging::RouteAttemptLog;
 
-use super::route_metadata::selected_route_metadata;
+use super::attempt_target::AttemptTarget;
 
 pub(super) struct StartRouteAttemptParams<'a> {
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) target: &'a AttemptTarget,
     pub(super) provider_id: Option<&'a str>,
     pub(super) provider_attempt: u32,
     pub(super) upstream_attempt: u32,
@@ -19,7 +18,7 @@ pub(super) struct StartRouteAttemptParams<'a> {
 }
 
 pub(super) struct UnsupportedModelSkipParams<'a> {
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) target: &'a AttemptTarget,
     pub(super) requested_model: &'a str,
     pub(super) provider_attempt: u32,
     pub(super) provider_max_attempts: u32,
@@ -29,7 +28,7 @@ pub(super) struct UnsupportedModelSkipParams<'a> {
 }
 
 pub(super) struct StatusRouteAttemptParams<'a> {
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) target: &'a AttemptTarget,
     pub(super) route_attempt_index: usize,
     pub(super) status_code: u16,
     pub(super) error_class: Option<&'a str>,
@@ -41,7 +40,7 @@ pub(super) struct StatusRouteAttemptParams<'a> {
 }
 
 pub(super) struct ErrorRouteAttemptParams<'a> {
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) target: &'a AttemptTarget,
     pub(super) route_attempt_index: usize,
     pub(super) kind: RouteAttemptErrorKind,
     pub(super) reason: &'a str,
@@ -93,29 +92,32 @@ pub(super) fn start_selected_route_attempt(
     params: StartRouteAttemptParams<'_>,
 ) -> usize {
     let raw = format!(
-        "{}:{} (idx={}) selected model={}",
-        params.selected.station_name,
-        params.selected.upstream.base_url,
-        params.selected.index,
+        "{} selected model={}",
+        params.target.route_attempt_identity(),
         params.model_note
     );
     let attempt_index = route_attempts.len() as u32;
-    let route_metadata = selected_route_metadata(params.selected);
     route_attempts.push(RouteAttemptLog {
         attempt_index,
         provider_id: non_dash(params.provider_id)
             .map(ToOwned::to_owned)
-            .or(route_metadata.provider_id),
-        endpoint_id: route_metadata.endpoint_id,
-        route_path: route_metadata.route_path,
+            .or_else(|| params.target.provider_id().map(ToOwned::to_owned)),
+        endpoint_id: params.target.endpoint_id(),
+        provider_endpoint_key: params.target.provider_endpoint_key(),
+        preference_group: params.target.preference_group(),
+        route_path: params.target.route_path(),
         provider_attempt: Some(params.provider_attempt + 1),
         upstream_attempt: Some(params.upstream_attempt + 1),
         provider_max_attempts: Some(params.provider_max_attempts),
         upstream_max_attempts: Some(params.upstream_max_attempts),
-        station_name: Some(params.selected.station_name.clone()),
-        upstream_base_url: Some(params.selected.upstream.base_url.clone()),
-        upstream_index: Some(params.selected.index),
-        avoid_for_station: sorted_avoid_set(params.avoid_set),
+        station_name: params
+            .target
+            .compatibility_station_name()
+            .map(ToOwned::to_owned),
+        upstream_base_url: Some(params.target.upstream().base_url.clone()),
+        upstream_index: params.target.compatibility_upstream_index(),
+        avoid_for_station: legacy_avoid_for_station(params.target, params.avoid_set),
+        avoided_candidate_indices: avoided_candidate_indices(params.target, params.avoid_set),
         avoided_total: Some(params.avoided_total),
         total_upstreams: Some(params.total_upstreams),
         decision: "selected".to_string(),
@@ -132,25 +134,28 @@ pub(super) fn record_unsupported_model_skip(
     params: UnsupportedModelSkipParams<'_>,
 ) {
     let raw = format!(
-        "{}:{} (idx={}) skipped_unsupported_model={}",
-        params.selected.station_name,
-        params.selected.upstream.base_url,
-        params.selected.index,
+        "{} skipped_unsupported_model={}",
+        params.target.route_attempt_identity(),
         params.requested_model
     );
-    let route_metadata = selected_route_metadata(params.selected);
     upstream_chain.push(raw.clone());
     route_attempts.push(RouteAttemptLog {
         attempt_index: route_attempts.len() as u32,
-        provider_id: route_metadata.provider_id,
-        endpoint_id: route_metadata.endpoint_id,
-        route_path: route_metadata.route_path,
+        provider_id: params.target.provider_id().map(ToOwned::to_owned),
+        endpoint_id: params.target.endpoint_id(),
+        provider_endpoint_key: params.target.provider_endpoint_key(),
+        preference_group: params.target.preference_group(),
+        route_path: params.target.route_path(),
         provider_attempt: Some(params.provider_attempt + 1),
         provider_max_attempts: Some(params.provider_max_attempts),
-        station_name: Some(params.selected.station_name.clone()),
-        upstream_base_url: Some(params.selected.upstream.base_url.clone()),
-        upstream_index: Some(params.selected.index),
-        avoid_for_station: sorted_avoid_set(params.avoid_set),
+        station_name: params
+            .target
+            .compatibility_station_name()
+            .map(ToOwned::to_owned),
+        upstream_base_url: Some(params.target.upstream().base_url.clone()),
+        upstream_index: params.target.compatibility_upstream_index(),
+        avoid_for_station: legacy_avoid_for_station(params.target, params.avoid_set),
+        avoided_candidate_indices: avoided_candidate_indices(params.target, params.avoid_set),
         avoided_total: Some(params.avoided_total),
         total_upstreams: Some(params.total_upstreams),
         decision: "skipped_capability_mismatch".to_string(),
@@ -169,26 +174,29 @@ pub(super) fn record_status_route_attempt(
 ) {
     let class_for_chain = params.error_class.unwrap_or("-");
     let raw = format!(
-        "{}:{} (idx={}) status={} class={} model={}",
-        params.selected.station_name,
-        params.selected.upstream.base_url,
-        params.selected.index,
+        "{} status={} class={} model={}",
+        params.target.route_attempt_identity(),
         params.status_code,
         class_for_chain,
         params.model_note
     );
     upstream_chain.push(raw.clone());
-    let route_metadata = selected_route_metadata(params.selected);
 
     if let Some(attempt) = route_attempts.get_mut(params.route_attempt_index) {
         if attempt.provider_id.is_none() {
-            attempt.provider_id = route_metadata.provider_id.clone();
+            attempt.provider_id = params.target.provider_id().map(ToOwned::to_owned);
         }
         if attempt.endpoint_id.is_none() {
-            attempt.endpoint_id = route_metadata.endpoint_id.clone();
+            attempt.endpoint_id = params.target.endpoint_id();
+        }
+        if attempt.provider_endpoint_key.is_none() {
+            attempt.provider_endpoint_key = params.target.provider_endpoint_key();
+        }
+        if attempt.preference_group.is_none() {
+            attempt.preference_group = params.target.preference_group();
         }
         if attempt.route_path.is_empty() {
-            attempt.route_path = route_metadata.route_path.clone();
+            attempt.route_path = params.target.route_path();
         }
         attempt.decision = if (200..300).contains(&params.status_code) {
             "completed".to_string()
@@ -209,12 +217,17 @@ pub(super) fn record_status_route_attempt(
 
     route_attempts.push(RouteAttemptLog {
         attempt_index: route_attempts.len() as u32,
-        provider_id: route_metadata.provider_id,
-        endpoint_id: route_metadata.endpoint_id,
-        route_path: route_metadata.route_path,
-        station_name: Some(params.selected.station_name.clone()),
-        upstream_base_url: Some(params.selected.upstream.base_url.clone()),
-        upstream_index: Some(params.selected.index),
+        provider_id: params.target.provider_id().map(ToOwned::to_owned),
+        endpoint_id: params.target.endpoint_id(),
+        provider_endpoint_key: params.target.provider_endpoint_key(),
+        preference_group: params.target.preference_group(),
+        route_path: params.target.route_path(),
+        station_name: params
+            .target
+            .compatibility_station_name()
+            .map(ToOwned::to_owned),
+        upstream_base_url: Some(params.target.upstream().base_url.clone()),
+        upstream_index: params.target.compatibility_upstream_index(),
         decision: if (200..300).contains(&params.status_code) {
             "completed".to_string()
         } else {
@@ -239,26 +252,29 @@ pub(super) fn record_error_route_attempt(
     params: ErrorRouteAttemptParams<'_>,
 ) {
     let raw = format!(
-        "{}:{} (idx={}) {}={} model={}",
-        params.selected.station_name,
-        params.selected.upstream.base_url,
-        params.selected.index,
+        "{} {}={} model={}",
+        params.target.route_attempt_identity(),
         params.kind.chain_key(),
         params.reason,
         params.model_note
     );
     upstream_chain.push(raw.clone());
-    let route_metadata = selected_route_metadata(params.selected);
 
     if let Some(attempt) = route_attempts.get_mut(params.route_attempt_index) {
         if attempt.provider_id.is_none() {
-            attempt.provider_id = route_metadata.provider_id.clone();
+            attempt.provider_id = params.target.provider_id().map(ToOwned::to_owned);
         }
         if attempt.endpoint_id.is_none() {
-            attempt.endpoint_id = route_metadata.endpoint_id.clone();
+            attempt.endpoint_id = params.target.endpoint_id();
+        }
+        if attempt.provider_endpoint_key.is_none() {
+            attempt.provider_endpoint_key = params.target.provider_endpoint_key();
+        }
+        if attempt.preference_group.is_none() {
+            attempt.preference_group = params.target.preference_group();
         }
         if attempt.route_path.is_empty() {
-            attempt.route_path = route_metadata.route_path.clone();
+            attempt.route_path = params.target.route_path();
         }
         attempt.decision = params.kind.decision().to_string();
         attempt.reason = Some(params.reason.to_string());
@@ -274,12 +290,17 @@ pub(super) fn record_error_route_attempt(
 
     route_attempts.push(RouteAttemptLog {
         attempt_index: route_attempts.len() as u32,
-        provider_id: route_metadata.provider_id,
-        endpoint_id: route_metadata.endpoint_id,
-        route_path: route_metadata.route_path,
-        station_name: Some(params.selected.station_name.clone()),
-        upstream_base_url: Some(params.selected.upstream.base_url.clone()),
-        upstream_index: Some(params.selected.index),
+        provider_id: params.target.provider_id().map(ToOwned::to_owned),
+        endpoint_id: params.target.endpoint_id(),
+        provider_endpoint_key: params.target.provider_endpoint_key(),
+        preference_group: params.target.preference_group(),
+        route_path: params.target.route_path(),
+        station_name: params
+            .target
+            .compatibility_station_name()
+            .map(ToOwned::to_owned),
+        upstream_base_url: Some(params.target.upstream().base_url.clone()),
+        upstream_index: params.target.compatibility_upstream_index(),
         decision: params.kind.decision().to_string(),
         reason: Some(params.reason.to_string()),
         error_class: Some(params.kind.error_class().to_string()),
@@ -297,6 +318,22 @@ fn sorted_avoid_set(avoid_set: &HashSet<usize>) -> Vec<usize> {
     let mut values = avoid_set.iter().copied().collect::<Vec<_>>();
     values.sort_unstable();
     values
+}
+
+fn legacy_avoid_for_station(target: &AttemptTarget, avoid_set: &HashSet<usize>) -> Vec<usize> {
+    if target.uses_provider_endpoint_attempt_index() {
+        Vec::new()
+    } else {
+        sorted_avoid_set(avoid_set)
+    }
+}
+
+fn avoided_candidate_indices(target: &AttemptTarget, avoid_set: &HashSet<usize>) -> Vec<usize> {
+    if target.uses_provider_endpoint_attempt_index() {
+        sorted_avoid_set(avoid_set)
+    } else {
+        Vec::new()
+    }
 }
 
 fn non_dash(value: Option<&str>) -> Option<&str> {

@@ -4,9 +4,9 @@ use std::hash::{Hash, Hasher};
 use anyhow::{Context, Result};
 
 use crate::config::{
-    ProviderConfigV4, RoutingConditionV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4,
-    RoutingPolicyV4, ServiceConfig, ServiceViewV4, UpstreamAuth, UpstreamConfig,
-    effective_v4_routing,
+    ProviderConfigV4, RoutingAffinityPolicyV5, RoutingConditionV4, RoutingConfigV4,
+    RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4, ServiceConfig, ServiceViewV4,
+    UpstreamAuth, UpstreamConfig, effective_v4_routing,
 };
 use crate::lb::{FAILURE_THRESHOLD, SelectedUpstream};
 use crate::model_routing;
@@ -18,6 +18,9 @@ const V4_COMPATIBILITY_STATION_NAME: &str = "routing";
 pub struct RoutePlanTemplate {
     pub service_name: String,
     pub entry: String,
+    pub affinity_policy: RoutingAffinityPolicyV5,
+    pub fallback_ttl_ms: Option<u64>,
+    pub reprobe_preferred_after_ms: Option<u64>,
     pub nodes: BTreeMap<String, RouteNodePlan>,
     pub expanded_provider_order: Vec<String>,
     pub candidates: Vec<RouteCandidate>,
@@ -29,6 +32,9 @@ impl RoutePlanTemplate {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.service_name.hash(&mut hasher);
         self.entry.hash(&mut hasher);
+        self.affinity_policy.hash(&mut hasher);
+        self.fallback_ttl_ms.hash(&mut hasher);
+        self.reprobe_preferred_after_ms.hash(&mut hasher);
         self.compatibility_station_name.hash(&mut hasher);
         self.expanded_provider_order.hash(&mut hasher);
         hash_route_nodes(&self.nodes, &mut hasher);
@@ -38,39 +44,26 @@ impl RoutePlanTemplate {
         format!("v4:{:016x}", hasher.finish())
     }
 
-    pub fn compatibility_index_for_provider_endpoint(
-        &self,
-        provider_id: &str,
-        endpoint_id: &str,
-        base_url: &str,
-    ) -> Option<(String, usize)> {
-        self.candidates
-            .iter()
-            .find(|candidate| {
-                candidate.provider_id == provider_id
-                    && candidate.endpoint_id == endpoint_id
+    pub fn contains_provider_endpoint(&self, key: &ProviderEndpointKey, base_url: &str) -> bool {
+        key.service_name == self.service_name
+            && self.candidates.iter().any(|candidate| {
+                candidate.provider_id == key.provider_id
+                    && candidate.endpoint_id == key.endpoint_id
                     && candidate.base_url == base_url
             })
-            .map(|candidate| {
-                (
-                    candidate_compatibility_station_name(self, candidate),
-                    candidate_compatibility_upstream_index(candidate),
-                )
-            })
+    }
+
+    pub fn candidate_provider_endpoint_key(
+        &self,
+        candidate: &RouteCandidate,
+    ) -> ProviderEndpointKey {
+        candidate_provider_endpoint_key(self, candidate)
     }
 
     pub fn candidate_identity(&self, candidate: &RouteCandidate) -> RuntimeUpstreamIdentity {
         RuntimeUpstreamIdentity::new(
-            ProviderEndpointKey::new(
-                self.service_name.clone(),
-                candidate.provider_id.clone(),
-                candidate.endpoint_id.clone(),
-            ),
-            LegacyUpstreamKey::new(
-                self.service_name.clone(),
-                candidate_compatibility_station_name(self, candidate),
-                candidate_compatibility_upstream_index(candidate),
-            ),
+            candidate_provider_endpoint_key(self, candidate),
+            self.candidate_compatibility_key(candidate),
             candidate.base_url.clone(),
         )
     }
@@ -81,6 +74,38 @@ impl RoutePlanTemplate {
             .map(|candidate| self.candidate_identity(candidate))
             .collect()
     }
+
+    pub fn candidate_compatibility_key(
+        &self,
+        candidate: &RouteCandidate,
+    ) -> Option<LegacyUpstreamKey> {
+        candidate
+            .compatibility_station_name
+            .as_ref()
+            .or(self.compatibility_station_name.as_ref())
+            .and_then(|station_name| {
+                candidate
+                    .compatibility_upstream_index
+                    .map(|upstream_index| {
+                        LegacyUpstreamKey::new(
+                            self.service_name.clone(),
+                            station_name.clone(),
+                            upstream_index,
+                        )
+                    })
+            })
+    }
+}
+
+fn candidate_provider_endpoint_key(
+    template: &RoutePlanTemplate,
+    candidate: &RouteCandidate,
+) -> ProviderEndpointKey {
+    ProviderEndpointKey::new(
+        template.service_name.clone(),
+        candidate.provider_id.clone(),
+        candidate.endpoint_id.clone(),
+    )
 }
 
 // Keep the affinity key aligned with selection semantics, not just leaf identity.
@@ -112,6 +137,7 @@ fn hash_route_candidate<H: Hasher>(candidate: &RouteCandidate, hasher: &mut H) {
     candidate.supported_models.hash(hasher);
     candidate.model_mapping.hash(hasher);
     candidate.route_path.hash(hasher);
+    candidate.preference_group.hash(hasher);
     candidate.stable_index.hash(hasher);
     candidate.compatibility_station_name.hash(hasher);
     candidate.compatibility_upstream_index.hash(hasher);
@@ -143,6 +169,10 @@ pub struct RouteNodePlan {
 pub enum RouteRef {
     Route(String),
     Provider(String),
+    ProviderEndpoint {
+        provider_id: String,
+        endpoint_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +186,7 @@ pub struct RouteCandidate {
     pub supported_models: BTreeMap<String, bool>,
     pub model_mapping: BTreeMap<String, String>,
     pub route_path: Vec<String>,
+    pub preference_group: u32,
     pub stable_index: usize,
     pub compatibility_station_name: Option<String>,
     pub compatibility_upstream_index: Option<usize>,
@@ -168,6 +199,10 @@ impl RouteCandidate {
         if let Ok(route_path) = serde_json::to_string(&self.route_path) {
             tags.insert("route_path".to_string(), route_path);
         }
+        tags.insert(
+            "preference_group".to_string(),
+            self.preference_group.to_string(),
+        );
         UpstreamConfig {
             base_url: self.base_url.clone(),
             auth: self.auth.clone(),
@@ -181,18 +216,43 @@ impl RouteCandidate {
 #[derive(Debug, Clone)]
 pub struct SelectedRouteCandidate<'a> {
     pub candidate: &'a RouteCandidate,
-    pub selected_upstream: SelectedUpstream,
+    pub provider_endpoint: ProviderEndpointKey,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoutePlanAttemptState {
+    avoided_provider_endpoints: BTreeSet<ProviderEndpointKey>,
     avoid_by_station: BTreeMap<String, BTreeSet<usize>>,
     avoided_total: usize,
 }
 
 impl RoutePlanAttemptState {
-    pub fn avoid_upstream_index(&mut self, upstream_index: usize) -> bool {
-        self.avoid_upstream(V4_COMPATIBILITY_STATION_NAME, upstream_index)
+    pub fn avoid_provider_endpoint(&mut self, key: ProviderEndpointKey) -> bool {
+        if self.avoided_provider_endpoints.insert(key) {
+            self.avoided_total = self.avoided_total.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    pub fn avoids_provider_endpoint(&self, key: &ProviderEndpointKey) -> bool {
+        self.avoided_provider_endpoints.contains(key)
+    }
+
+    pub fn avoid_candidate(
+        &mut self,
+        template: &RoutePlanTemplate,
+        candidate: &RouteCandidate,
+    ) -> bool {
+        self.avoid_provider_endpoint(candidate_provider_endpoint_key(template, candidate))
+    }
+
+    pub fn avoids_candidate(
+        &self,
+        template: &RoutePlanTemplate,
+        candidate: &RouteCandidate,
+    ) -> bool {
+        self.avoids_provider_endpoint(&candidate_provider_endpoint_key(template, candidate))
     }
 
     pub fn avoid_upstream(&mut self, station_name: &str, upstream_index: usize) -> bool {
@@ -209,25 +269,17 @@ impl RoutePlanAttemptState {
     }
 
     pub fn avoid_selected(&mut self, selected: &SelectedRouteCandidate<'_>) -> bool {
-        self.avoid_selected_upstream(&selected.selected_upstream)
+        self.avoid_provider_endpoint(selected.provider_endpoint.clone())
     }
 
     pub fn avoid_selected_upstream(&mut self, selected: &SelectedUpstream) -> bool {
         self.avoid_upstream(selected.station_name.as_str(), selected.index)
     }
 
-    pub fn avoids_upstream_index(&self, upstream_index: usize) -> bool {
-        self.avoids_upstream(V4_COMPATIBILITY_STATION_NAME, upstream_index)
-    }
-
     pub fn avoids_upstream(&self, station_name: &str, upstream_index: usize) -> bool {
         self.avoid_by_station
             .get(station_name)
             .is_some_and(|indices| indices.contains(&upstream_index))
-    }
-
-    pub fn avoid_for_station(&self) -> Vec<usize> {
-        self.avoid_for_station_name(V4_COMPATIBILITY_STATION_NAME)
     }
 
     pub fn avoid_for_station_name(&self, station_name: &str) -> Vec<usize> {
@@ -241,10 +293,6 @@ impl RoutePlanAttemptState {
         self.avoided_total
     }
 
-    pub fn station_exhausted(&self, upstream_total: usize) -> bool {
-        self.station_exhausted_for(V4_COMPATIBILITY_STATION_NAME, upstream_total)
-    }
-
     pub fn station_exhausted_for(&self, station_name: &str, upstream_total: usize) -> bool {
         upstream_total > 0
             && self
@@ -254,57 +302,90 @@ impl RoutePlanAttemptState {
                 .unwrap_or_default()
                 >= upstream_total
     }
+
+    pub fn route_candidates_exhausted(&self, template: &RoutePlanTemplate) -> bool {
+        !template.candidates.is_empty()
+            && template
+                .candidates
+                .iter()
+                .all(|candidate| self.avoids_candidate(template, candidate))
+    }
+
+    pub fn route_avoid_candidate_indices(&self, template: &RoutePlanTemplate) -> Vec<usize> {
+        template
+            .candidates
+            .iter()
+            .filter(|candidate| self.avoids_candidate(template, candidate))
+            .map(|candidate| candidate.stable_index)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoutePlanRuntimeState {
-    stations: BTreeMap<String, RoutePlanStationRuntimeState>,
+    provider_endpoints: BTreeMap<ProviderEndpointKey, RoutePlanUpstreamRuntimeState>,
+    affinity_provider_endpoint: Option<ProviderEndpointKey>,
+    affinity_last_selected_at_ms: Option<u64>,
+    affinity_last_changed_at_ms: Option<u64>,
 }
 
 impl RoutePlanRuntimeState {
-    pub fn set_station(
+    pub fn set_provider_endpoint(
         &mut self,
-        station_name: impl Into<String>,
-        state: RoutePlanStationRuntimeState,
+        key: ProviderEndpointKey,
+        state: RoutePlanUpstreamRuntimeState,
     ) {
-        self.stations.insert(station_name.into(), state);
+        self.provider_endpoints.insert(key, state);
     }
 
-    pub fn station(&self, station_name: &str) -> Option<&RoutePlanStationRuntimeState> {
-        self.stations.get(station_name)
+    pub fn provider_endpoint(&self, key: &ProviderEndpointKey) -> RoutePlanUpstreamRuntimeState {
+        self.provider_endpoints
+            .get(key)
+            .copied()
+            .unwrap_or_default()
     }
 
-    pub fn clear_last_good_indices(&mut self) {
-        for station in self.stations.values_mut() {
-            station.last_good_index = None;
-        }
+    pub fn set_affinity_provider_endpoint(&mut self, key: Option<ProviderEndpointKey>) {
+        self.affinity_provider_endpoint = key;
+        self.affinity_last_selected_at_ms = None;
+        self.affinity_last_changed_at_ms = None;
     }
 
-    pub fn set_station_last_good_index(
+    pub fn set_affinity_provider_endpoint_with_observed_at(
         &mut self,
-        station_name: impl Into<String>,
-        last_good_index: Option<usize>,
+        key: Option<ProviderEndpointKey>,
+        last_selected_at_ms: Option<u64>,
+        last_changed_at_ms: Option<u64>,
     ) {
-        self.stations
-            .entry(station_name.into())
-            .or_default()
-            .last_good_index = last_good_index;
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RoutePlanStationRuntimeState {
-    pub last_good_index: Option<usize>,
-    pub upstreams: BTreeMap<usize, RoutePlanUpstreamRuntimeState>,
-}
-
-impl RoutePlanStationRuntimeState {
-    pub fn set_upstream(&mut self, index: usize, state: RoutePlanUpstreamRuntimeState) {
-        self.upstreams.insert(index, state);
+        self.affinity_provider_endpoint = key;
+        self.affinity_last_selected_at_ms = last_selected_at_ms;
+        self.affinity_last_changed_at_ms = last_changed_at_ms;
     }
 
-    fn upstream(&self, index: usize) -> RoutePlanUpstreamRuntimeState {
-        self.upstreams.get(&index).copied().unwrap_or_default()
+    pub fn affinity_provider_endpoint(&self) -> Option<&ProviderEndpointKey> {
+        self.affinity_provider_endpoint.as_ref()
+    }
+
+    pub fn affinity_last_selected_at_ms(&self) -> Option<u64> {
+        self.affinity_last_selected_at_ms
+    }
+
+    pub fn affinity_last_changed_at_ms(&self) -> Option<u64> {
+        self.affinity_last_changed_at_ms
+    }
+
+    pub fn clear_affinity_provider_endpoint(&mut self) {
+        self.affinity_provider_endpoint = None;
+        self.affinity_last_selected_at_ms = None;
+        self.affinity_last_changed_at_ms = None;
+    }
+
+    fn runtime_state_for_candidate(
+        &self,
+        template: &RoutePlanTemplate,
+        candidate: &RouteCandidate,
+    ) -> RoutePlanUpstreamRuntimeState {
+        self.provider_endpoint(&candidate_provider_endpoint_key(template, candidate))
     }
 }
 
@@ -353,6 +434,29 @@ impl RoutePlanSkipReason {
 #[derive(Debug, Clone)]
 pub struct SkippedRouteCandidate<'a> {
     pub candidate: &'a RouteCandidate,
+    pub provider_endpoint: ProviderEndpointKey,
+    pub reason: RoutePlanSkipReason,
+    pub avoided_candidate_indices: Vec<usize>,
+    pub avoided_total: usize,
+    pub total_upstreams: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteCandidateSkipExplanation<'a> {
+    pub candidate: &'a RouteCandidate,
+    pub provider_endpoint: ProviderEndpointKey,
+    pub reasons: Vec<RoutePlanSkipReason>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedStationRouteCandidate<'a> {
+    pub candidate: &'a RouteCandidate,
+    pub selected_upstream: SelectedUpstream,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkippedStationRouteCandidate<'a> {
+    pub candidate: &'a RouteCandidate,
     pub selected_upstream: SelectedUpstream,
     pub reason: RoutePlanSkipReason,
     pub avoid_for_station: Vec<usize>,
@@ -361,16 +465,18 @@ pub struct SkippedRouteCandidate<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct RouteCandidateSkipExplanation<'a> {
-    pub candidate: &'a RouteCandidate,
-    pub selected_upstream: SelectedUpstream,
-    pub reasons: Vec<RoutePlanSkipReason>,
-}
-
-#[derive(Debug, Clone)]
 pub struct RoutePlanAttemptSelection<'a> {
     pub selected: Option<SelectedRouteCandidate<'a>>,
     pub skipped: Vec<SkippedRouteCandidate<'a>>,
+    pub avoided_candidate_indices: Vec<usize>,
+    pub avoided_total: usize,
+    pub total_upstreams: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutePlanStationAttemptSelection<'a> {
+    pub selected: Option<SelectedStationRouteCandidate<'a>>,
+    pub skipped: Vec<SkippedStationRouteCandidate<'a>>,
     pub avoid_for_station: Vec<usize>,
     pub avoided_total: usize,
     pub total_upstreams: usize,
@@ -389,14 +495,17 @@ impl<'a> RoutePlanExecutor<'a> {
         self.template.candidates.iter()
     }
 
-    pub fn iter_selected_upstreams(&self) -> impl Iterator<Item = SelectedRouteCandidate<'_>> + '_ {
+    pub fn template(&self) -> &'a RoutePlanTemplate {
+        self.template
+    }
+
+    pub fn iter_selected_upstreams(
+        &self,
+    ) -> impl Iterator<Item = SelectedStationRouteCandidate<'_>> + '_ {
         self.template
             .candidates
             .iter()
-            .map(|candidate| SelectedRouteCandidate {
-                candidate,
-                selected_upstream: self.selected_upstream_for_candidate(candidate),
-            })
+            .map(|candidate| self.selected_station_route_candidate_for_candidate(candidate))
     }
 
     pub fn explain_candidate_skip_reasons_with_runtime_state(
@@ -408,15 +517,12 @@ impl<'a> RoutePlanExecutor<'a> {
             .candidates
             .iter()
             .filter_map(|candidate| {
-                let selected_upstream = self.selected_upstream_for_candidate(candidate);
-                let runtime_state = runtime
-                    .station(selected_upstream.station_name.as_str())
-                    .map(|station| station.upstream(selected_upstream.index))
-                    .unwrap_or_default();
+                let provider_endpoint = candidate_provider_endpoint_key(self.template, candidate);
+                let runtime_state = runtime.runtime_state_for_candidate(self.template, candidate);
                 let reasons = self.candidate_skip_reasons(candidate, runtime_state, request_model);
                 (!reasons.is_empty()).then_some(RouteCandidateSkipExplanation {
                     candidate,
-                    selected_upstream,
+                    provider_endpoint,
                     reasons,
                 })
             })
@@ -449,7 +555,7 @@ impl<'a> RoutePlanExecutor<'a> {
                 return RoutePlanAttemptSelection {
                     selected: None,
                     skipped,
-                    avoid_for_station: state.avoid_for_station(),
+                    avoided_candidate_indices: state.route_avoid_candidate_indices(self.template),
                     avoided_total: state.avoided_total(),
                     total_upstreams,
                 };
@@ -459,41 +565,34 @@ impl<'a> RoutePlanExecutor<'a> {
                 return RoutePlanAttemptSelection {
                     selected: None,
                     skipped,
-                    avoid_for_station: state.avoid_for_station(),
+                    avoided_candidate_indices: state.route_avoid_candidate_indices(self.template),
                     avoided_total: state.avoided_total(),
                     total_upstreams,
                 };
             };
-            let selected_upstream = self.selected_upstream_for_candidate(candidate);
-
             if let Some(requested_model) = request_model
                 && !candidate_supports_model(candidate, requested_model)
             {
-                state.avoid_selected_upstream(&selected_upstream);
-                let avoid_for_station =
-                    state.avoid_for_station_name(selected_upstream.station_name.as_str());
+                state.avoid_candidate(self.template, candidate);
+                let avoided_candidate_indices = state.route_avoid_candidate_indices(self.template);
                 skipped.push(SkippedRouteCandidate {
                     candidate,
-                    selected_upstream,
+                    provider_endpoint: candidate_provider_endpoint_key(self.template, candidate),
                     reason: RoutePlanSkipReason::UnsupportedModel {
                         requested_model: requested_model.to_string(),
                     },
-                    avoid_for_station,
+                    avoided_candidate_indices,
                     avoided_total: state.avoided_total(),
                     total_upstreams,
                 });
                 continue;
             }
 
-            let avoid_for_station =
-                state.avoid_for_station_name(selected_upstream.station_name.as_str());
+            let avoided_candidate_indices = state.route_avoid_candidate_indices(self.template);
             return RoutePlanAttemptSelection {
-                selected: Some(SelectedRouteCandidate {
-                    candidate,
-                    selected_upstream,
-                }),
+                selected: Some(self.selected_route_candidate_for_candidate(candidate)),
                 skipped,
-                avoid_for_station,
+                avoided_candidate_indices,
                 avoided_total: state.avoided_total(),
                 total_upstreams,
             };
@@ -506,14 +605,14 @@ impl<'a> RoutePlanExecutor<'a> {
         runtime: &RoutePlanRuntimeState,
         station_name: &str,
         request_model: Option<&str>,
-    ) -> RoutePlanAttemptSelection<'_> {
+    ) -> RoutePlanStationAttemptSelection<'_> {
         let total_upstreams = self.template.candidates.len();
         let mut skipped = Vec::new();
 
         loop {
             if state.station_exhausted_for(station_name, self.station_candidate_count(station_name))
             {
-                return RoutePlanAttemptSelection {
+                return RoutePlanStationAttemptSelection {
                     selected: None,
                     skipped,
                     avoid_for_station: state.avoid_for_station_name(station_name),
@@ -525,7 +624,7 @@ impl<'a> RoutePlanExecutor<'a> {
             let Some(candidate) =
                 self.next_unavoided_station_candidate(state, runtime, station_name)
             else {
-                return RoutePlanAttemptSelection {
+                return RoutePlanStationAttemptSelection {
                     selected: None,
                     skipped,
                     avoid_for_station: state.avoid_for_station_name(station_name),
@@ -533,7 +632,7 @@ impl<'a> RoutePlanExecutor<'a> {
                     total_upstreams,
                 };
             };
-            let selected_upstream = self.selected_upstream_for_candidate(candidate);
+            let selected_upstream = self.legacy_selected_upstream_for_candidate(candidate);
 
             if let Some(requested_model) = request_model
                 && !candidate_supports_model(candidate, requested_model)
@@ -541,7 +640,7 @@ impl<'a> RoutePlanExecutor<'a> {
                 state.avoid_selected_upstream(&selected_upstream);
                 let avoid_for_station =
                     state.avoid_for_station_name(selected_upstream.station_name.as_str());
-                skipped.push(SkippedRouteCandidate {
+                skipped.push(SkippedStationRouteCandidate {
                     candidate,
                     selected_upstream,
                     reason: RoutePlanSkipReason::UnsupportedModel {
@@ -556,11 +655,8 @@ impl<'a> RoutePlanExecutor<'a> {
 
             let avoid_for_station =
                 state.avoid_for_station_name(selected_upstream.station_name.as_str());
-            return RoutePlanAttemptSelection {
-                selected: Some(SelectedRouteCandidate {
-                    candidate,
-                    selected_upstream,
-                }),
+            return RoutePlanStationAttemptSelection {
+                selected: Some(self.selected_station_route_candidate_for_candidate(candidate)),
                 skipped,
                 avoid_for_station,
                 avoided_total: state.avoided_total(),
@@ -569,11 +665,39 @@ impl<'a> RoutePlanExecutor<'a> {
         }
     }
 
-    pub fn selected_upstream_for_candidate(&self, candidate: &RouteCandidate) -> SelectedUpstream {
+    pub fn legacy_selected_upstream_for_candidate(
+        &self,
+        candidate: &RouteCandidate,
+    ) -> SelectedUpstream {
+        let mut upstream = candidate.to_upstream_config();
+        upstream.tags.insert(
+            "provider_endpoint_key".to_string(),
+            candidate_provider_endpoint_key(self.template, candidate).stable_key(),
+        );
         SelectedUpstream {
             station_name: candidate_compatibility_station_name(self.template, candidate),
             index: candidate_compatibility_upstream_index(candidate),
-            upstream: candidate.to_upstream_config(),
+            upstream,
+        }
+    }
+
+    fn selected_route_candidate_for_candidate(
+        &self,
+        candidate: &'a RouteCandidate,
+    ) -> SelectedRouteCandidate<'a> {
+        SelectedRouteCandidate {
+            candidate,
+            provider_endpoint: candidate_provider_endpoint_key(self.template, candidate),
+        }
+    }
+
+    fn selected_station_route_candidate_for_candidate(
+        &self,
+        candidate: &'a RouteCandidate,
+    ) -> SelectedStationRouteCandidate<'a> {
+        SelectedStationRouteCandidate {
+            candidate,
+            selected_upstream: self.legacy_selected_upstream_for_candidate(candidate),
         }
     }
 
@@ -582,38 +706,24 @@ impl<'a> RoutePlanExecutor<'a> {
         state: &RoutePlanAttemptState,
         runtime: &RoutePlanRuntimeState,
     ) -> Option<&'a RouteCandidate> {
-        let mut seen_stations = BTreeSet::new();
-        for station_name in self.template.candidates.iter().filter_map(|candidate| {
-            let station_name = candidate_compatibility_station_name(self.template, candidate);
-            seen_stations
-                .insert(station_name.clone())
-                .then_some(station_name)
-        }) {
-            if state.station_exhausted_for(
-                station_name.as_str(),
-                self.station_candidate_count(station_name.as_str()),
-            ) {
-                continue;
-            }
-            if let Some(candidate) =
-                self.next_unavoided_station_candidate(state, runtime, station_name.as_str())
-            {
-                return Some(candidate);
-            }
+        let route_candidates = self
+            .template
+            .candidates
+            .iter()
+            .filter(|candidate| !state.avoids_candidate(self.template, candidate))
+            .collect::<Vec<_>>();
+
+        if let Some(candidate) =
+            best_candidate_by_affinity_policy(self.template, runtime, &route_candidates, true)
+        {
+            return Some(candidate);
         }
 
-        None
+        best_candidate_by_affinity_policy(self.template, runtime, &route_candidates, false)
     }
 
     fn candidates_exhausted(&self, state: &RoutePlanAttemptState) -> bool {
-        !self.template.candidates.is_empty()
-            && self.template.candidates.iter().all(|candidate| {
-                let station_name = candidate_compatibility_station_name(self.template, candidate);
-                state.avoids_upstream(
-                    station_name.as_str(),
-                    candidate_compatibility_upstream_index(candidate),
-                )
-            })
+        state.route_candidates_exhausted(self.template)
     }
 
     fn candidate_skip_reasons(
@@ -665,7 +775,6 @@ impl<'a> RoutePlanExecutor<'a> {
         runtime: &RoutePlanRuntimeState,
         station_name: &str,
     ) -> Option<&'a RouteCandidate> {
-        let station_runtime = runtime.station(station_name);
         let station_candidates = self
             .template
             .candidates
@@ -681,35 +790,220 @@ impl<'a> RoutePlanExecutor<'a> {
             })
             .collect::<Vec<_>>();
 
-        if let Some(last_good_index) = station_runtime.and_then(|station| station.last_good_index)
-            && let Some(candidate) = station_candidates.iter().copied().find(|candidate| {
-                candidate_compatibility_upstream_index(candidate) == last_good_index
-                    && station_runtime
-                        .map(|station| station.upstream(last_good_index))
-                        .is_none_or(|upstream| {
-                            !upstream.hard_unavailable() && !upstream.usage_exhausted
-                        })
-            })
+        if let Some(candidate) =
+            best_candidate_by_affinity_policy(self.template, runtime, &station_candidates, true)
         {
             return Some(candidate);
         }
 
-        if let Some(candidate) = station_candidates.iter().copied().find(|candidate| {
-            let index = candidate_compatibility_upstream_index(candidate);
-            station_runtime
-                .map(|station| station.upstream(index))
-                .is_none_or(|upstream| !upstream.hard_unavailable() && !upstream.usage_exhausted)
-        }) {
-            return Some(candidate);
-        }
-
-        station_candidates.iter().copied().find(|candidate| {
-            let index = candidate_compatibility_upstream_index(candidate);
-            station_runtime
-                .map(|station| station.upstream(index))
-                .is_none_or(|upstream| !upstream.hard_unavailable())
-        })
+        best_candidate_by_affinity_policy(self.template, runtime, &station_candidates, false)
     }
+}
+
+fn best_candidate_by_affinity_policy<'a>(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    station_candidates: &[&'a RouteCandidate],
+    require_usage_available: bool,
+) -> Option<&'a RouteCandidate> {
+    match template.affinity_policy {
+        RoutingAffinityPolicyV5::Off => first_candidate_in_best_preference_group(
+            template,
+            runtime,
+            station_candidates,
+            require_usage_available,
+        ),
+        RoutingAffinityPolicyV5::PreferredGroup => best_candidate_in_preference_group(
+            template,
+            runtime,
+            station_candidates,
+            require_usage_available,
+        ),
+        RoutingAffinityPolicyV5::FallbackSticky => affinity_candidate(
+            template,
+            runtime,
+            station_candidates,
+            require_usage_available,
+        )
+        .filter(|candidate| {
+            fallback_affinity_within_configured_window(template, runtime, station_candidates)
+                || first_candidate_in_best_preference_group(
+                    template,
+                    runtime,
+                    station_candidates,
+                    require_usage_available,
+                )
+                .is_none_or(|best| best.preference_group >= candidate.preference_group)
+        })
+        .or_else(|| {
+            first_candidate_in_best_preference_group(
+                template,
+                runtime,
+                station_candidates,
+                require_usage_available,
+            )
+        }),
+        RoutingAffinityPolicyV5::Hard => {
+            if runtime.affinity_provider_endpoint().is_some() {
+                affinity_candidate(
+                    template,
+                    runtime,
+                    station_candidates,
+                    require_usage_available,
+                )
+            } else {
+                first_candidate_in_best_preference_group(
+                    template,
+                    runtime,
+                    station_candidates,
+                    require_usage_available,
+                )
+            }
+        }
+    }
+}
+
+fn first_candidate_in_best_preference_group<'a>(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    station_candidates: &[&'a RouteCandidate],
+    require_usage_available: bool,
+) -> Option<&'a RouteCandidate> {
+    let best_group = station_candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+        })
+        .map(|candidate| candidate.preference_group)
+        .min()?;
+
+    station_candidates.iter().copied().find(|candidate| {
+        candidate.preference_group == best_group
+            && candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+    })
+}
+
+fn best_candidate_in_preference_group<'a>(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    station_candidates: &[&'a RouteCandidate],
+    require_usage_available: bool,
+) -> Option<&'a RouteCandidate> {
+    let best_group = station_candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+        })
+        .map(|candidate| candidate.preference_group)
+        .min()?;
+
+    if let Some(candidate) = affinity_candidate_in_group(
+        template,
+        runtime,
+        station_candidates,
+        best_group,
+        require_usage_available,
+    ) {
+        return Some(candidate);
+    }
+
+    station_candidates.iter().copied().find(|candidate| {
+        candidate.preference_group == best_group
+            && candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+    })
+}
+
+fn affinity_candidate<'a>(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    station_candidates: &[&'a RouteCandidate],
+    require_usage_available: bool,
+) -> Option<&'a RouteCandidate> {
+    let affinity_key = runtime.affinity_provider_endpoint()?;
+    station_candidates.iter().copied().find(|candidate| {
+        candidate_provider_endpoint_key(template, candidate) == *affinity_key
+            && candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+    })
+}
+
+fn affinity_candidate_in_group<'a>(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    station_candidates: &[&'a RouteCandidate],
+    preference_group: u32,
+    require_usage_available: bool,
+) -> Option<&'a RouteCandidate> {
+    let affinity_key = runtime.affinity_provider_endpoint()?;
+    station_candidates.iter().copied().find(|candidate| {
+        candidate.preference_group == preference_group
+            && candidate_provider_endpoint_key(template, candidate) == *affinity_key
+            && candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+    })
+}
+
+fn fallback_affinity_within_configured_window(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    station_candidates: &[&RouteCandidate],
+) -> bool {
+    let Some(affinity_key) = runtime.affinity_provider_endpoint() else {
+        return true;
+    };
+    let Some(affinity_candidate) = station_candidates
+        .iter()
+        .copied()
+        .find(|candidate| candidate_provider_endpoint_key(template, candidate) == *affinity_key)
+    else {
+        return true;
+    };
+    let Some(best_group) = station_candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate_available_in_runtime(template, runtime, candidate, false))
+        .map(|candidate| candidate.preference_group)
+        .min()
+    else {
+        return true;
+    };
+    if affinity_candidate.preference_group <= best_group {
+        return true;
+    }
+
+    fallback_affinity_age_within_window(
+        template.fallback_ttl_ms,
+        runtime.affinity_last_changed_at_ms(),
+    ) && fallback_affinity_age_within_window(
+        template.reprobe_preferred_after_ms,
+        runtime.affinity_last_changed_at_ms(),
+    )
+}
+
+fn fallback_affinity_age_within_window(
+    window_ms: Option<u64>,
+    observed_at_ms: Option<u64>,
+) -> bool {
+    let Some(window_ms) = window_ms else {
+        return true;
+    };
+    if window_ms == 0 {
+        return false;
+    }
+    let Some(observed_at_ms) = observed_at_ms else {
+        return false;
+    };
+    crate::logging::now_ms().saturating_sub(observed_at_ms) < window_ms
+}
+
+fn candidate_available_in_runtime(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    candidate: &RouteCandidate,
+    require_usage_available: bool,
+) -> bool {
+    let upstream = runtime.runtime_state_for_candidate(template, candidate);
+    !upstream.hard_unavailable() && (!require_usage_available || !upstream.usage_exhausted)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -746,7 +1040,9 @@ pub enum RouteDecision {
 #[derive(Debug, Clone)]
 struct RouteLeaf {
     provider_id: String,
+    endpoint_id: Option<String>,
     route_path: Vec<String>,
+    preference_group: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -824,7 +1120,7 @@ fn compile_v4_route_plan_template_with_expansion(
         conditional,
     };
     let leaves = expand_v4_route_leaves(service_name, view, &routing, &expansion)?;
-    ensure_unique_provider_leaves(service_name, &leaves)?;
+    ensure_unique_route_leaves(service_name, &leaves)?;
 
     let expanded_provider_order = leaves
         .iter()
@@ -835,10 +1131,12 @@ fn compile_v4_route_plan_template_with_expansion(
     Ok(RoutePlanTemplate {
         service_name: service_name.to_string(),
         entry: routing.entry,
+        affinity_policy: routing.affinity_policy,
+        fallback_ttl_ms: routing.fallback_ttl_ms,
+        reprobe_preferred_after_ms: routing.reprobe_preferred_after_ms,
         nodes,
         expanded_provider_order,
-        compatibility_station_name: (!leaves.is_empty())
-            .then(|| V4_COMPATIBILITY_STATION_NAME.to_string()),
+        compatibility_station_name: None,
         candidates,
     })
 }
@@ -876,6 +1174,7 @@ pub fn compile_legacy_route_plan_template<'a>(
                 supported_models: hash_bool_map_to_btree(&upstream.supported_models),
                 model_mapping: hash_string_map_to_btree(&upstream.model_mapping),
                 route_path,
+                preference_group: 0,
                 stable_index,
                 compatibility_station_name: Some(service.name.clone()),
                 compatibility_upstream_index: Some(upstream_index),
@@ -886,6 +1185,9 @@ pub fn compile_legacy_route_plan_template<'a>(
     RoutePlanTemplate {
         service_name: service_name.to_string(),
         entry,
+        affinity_policy: RoutingAffinityPolicyV5::FallbackSticky,
+        fallback_ttl_ms: None,
+        reprobe_preferred_after_ms: None,
         nodes: BTreeMap::new(),
         expanded_provider_order: candidates
             .iter()
@@ -1020,7 +1322,55 @@ fn normalize_route_ref(
     if routing.routes.contains_key(name) {
         return Ok(RouteRef::Route(name.to_string()));
     }
+    if let Some((provider_id, endpoint_id)) = split_provider_endpoint_ref(name)
+        && let Some(provider) = view.providers.get(provider_id)
+        && provider_endpoint_exists(provider, endpoint_id)
+    {
+        return Ok(RouteRef::ProviderEndpoint {
+            provider_id: provider_id.to_string(),
+            endpoint_id: endpoint_id.to_string(),
+        });
+    }
     anyhow::bail!("[{service_name}] routing references missing route or provider '{name}'");
+}
+
+fn split_provider_endpoint_ref(name: &str) -> Option<(&str, &str)> {
+    let (provider_id, endpoint_id) = name.split_once('.')?;
+    let provider_id = provider_id.trim();
+    let endpoint_id = endpoint_id.trim();
+    if provider_id.is_empty() || endpoint_id.is_empty() {
+        return None;
+    }
+    Some((provider_id, endpoint_id))
+}
+
+fn provider_endpoint_exists(provider: &ProviderConfigV4, endpoint_id: &str) -> bool {
+    if endpoint_id == "default" {
+        return provider
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || provider.endpoints.contains_key(endpoint_id);
+    }
+    provider.endpoints.contains_key(endpoint_id)
+}
+
+fn provider_endpoint_enabled(provider: &ProviderConfigV4, endpoint_id: &str) -> bool {
+    if endpoint_id == "default" {
+        if provider
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            return true;
+        }
+    }
+    provider
+        .endpoints
+        .get(endpoint_id)
+        .is_some_and(|endpoint| endpoint.enabled)
 }
 
 fn expand_v4_route_leaves(
@@ -1038,7 +1388,9 @@ fn expand_v4_route_leaves(
             .keys()
             .map(|provider_id| RouteLeaf {
                 provider_id: provider_id.clone(),
+                endpoint_id: None,
                 route_path: vec![provider_id.clone()],
+                preference_group: 0,
             })
             .collect());
     }
@@ -1069,7 +1421,35 @@ fn expand_route_ref(
         route_path.push(child_name.to_string());
         return Ok(vec![RouteLeaf {
             provider_id: child_name.to_string(),
+            endpoint_id: None,
             route_path,
+            preference_group: 0,
+        }]);
+    }
+    if routing.routes.contains_key(child_name) {
+        return expand_route_node(
+            service_name,
+            view,
+            routing,
+            child_name,
+            parent_path,
+            expansion,
+            stack,
+        );
+    }
+    if let Some((provider_id, endpoint_id)) = split_provider_endpoint_ref(child_name)
+        && view
+            .providers
+            .get(provider_id)
+            .is_some_and(|provider| provider_endpoint_exists(provider, endpoint_id))
+    {
+        let mut route_path = parent_path.to_vec();
+        route_path.push(child_name.to_string());
+        return Ok(vec![RouteLeaf {
+            provider_id: provider_id.to_string(),
+            endpoint_id: Some(endpoint_id.to_string()),
+            route_path,
+            preference_group: 0,
         }]);
     }
 
@@ -1150,8 +1530,9 @@ fn expand_ordered_route_children(
     }
 
     let mut leaves = Vec::new();
+    let mut next_preference_group = 0;
     for child_name in &frame.node.children {
-        leaves.extend(expand_route_ref(
+        let child_leaves = expand_route_ref(
             service_name,
             view,
             routing,
@@ -1159,7 +1540,8 @@ fn expand_ordered_route_children(
             frame.node_path,
             expansion,
             stack,
-        )?);
+        )?;
+        append_compacted_preference_groups(&mut leaves, &mut next_preference_group, child_leaves);
     }
     Ok(leaves)
 }
@@ -1188,6 +1570,16 @@ fn expand_manual_sticky_route(
     {
         anyhow::bail!(
             "[{service_name}] manual-sticky route '{}' targets disabled provider '{target}'",
+            frame.route_name
+        );
+    }
+    if !routing.routes.contains_key(target)
+        && let Some((provider_id, endpoint_id)) = split_provider_endpoint_ref(target)
+        && let Some(provider) = view.providers.get(provider_id)
+        && (!provider.enabled || !provider_endpoint_enabled(provider, endpoint_id))
+    {
+        anyhow::bail!(
+            "[{service_name}] manual-sticky route '{}' targets disabled provider endpoint '{target}'",
             frame.route_name
         );
     }
@@ -1226,6 +1618,8 @@ fn expand_tag_preferred_route(
 
     let mut preferred = Vec::new();
     let mut fallback = Vec::new();
+    let mut next_preferred_group = 0;
+    let mut next_fallback_group = 0;
     for child_name in &frame.node.children {
         let child_leaves = expand_route_ref(
             service_name,
@@ -1237,9 +1631,17 @@ fn expand_tag_preferred_route(
             stack,
         )?;
         if child_route_matches_any_filter(view, &child_leaves, &frame.node.prefer_tags) {
-            preferred.extend(child_leaves);
+            append_compacted_preference_groups(
+                &mut preferred,
+                &mut next_preferred_group,
+                child_leaves,
+            );
         } else {
-            fallback.extend(child_leaves);
+            append_compacted_preference_groups(
+                &mut fallback,
+                &mut next_fallback_group,
+                child_leaves,
+            );
         }
     }
 
@@ -1253,8 +1655,38 @@ fn expand_tag_preferred_route(
         return Ok(preferred);
     }
 
+    offset_preference_groups(&mut fallback, next_preferred_group);
     preferred.extend(fallback);
     Ok(preferred)
+}
+
+fn append_compacted_preference_groups(
+    out: &mut Vec<RouteLeaf>,
+    next_group: &mut u32,
+    mut leaves: Vec<RouteLeaf>,
+) {
+    let Some(min_group) = leaves.iter().map(|leaf| leaf.preference_group).min() else {
+        return;
+    };
+    for leaf in &mut leaves {
+        leaf.preference_group = leaf
+            .preference_group
+            .saturating_sub(min_group)
+            .saturating_add(*next_group);
+    }
+    let max_group = leaves
+        .iter()
+        .map(|leaf| leaf.preference_group)
+        .max()
+        .unwrap_or(*next_group);
+    *next_group = max_group.saturating_add(1);
+    out.extend(leaves);
+}
+
+fn offset_preference_groups(leaves: &mut [RouteLeaf], offset: u32) {
+    for leaf in leaves {
+        leaf.preference_group = leaf.preference_group.saturating_add(offset);
+    }
 }
 
 fn expand_conditional_route(
@@ -1327,15 +1759,15 @@ fn expand_conditional_route(
                 expansion,
                 stack,
             )?);
-            dedupe_route_leaves_by_provider(&mut leaves);
+            dedupe_route_leaves_by_target(&mut leaves);
             Ok(leaves)
         }
     }
 }
 
-fn dedupe_route_leaves_by_provider(leaves: &mut Vec<RouteLeaf>) {
+fn dedupe_route_leaves_by_target(leaves: &mut Vec<RouteLeaf>) {
     let mut seen = BTreeSet::new();
-    leaves.retain(|leaf| seen.insert(leaf.provider_id.clone()));
+    leaves.retain(|leaf| seen.insert((leaf.provider_id.clone(), leaf.endpoint_id.clone())));
 }
 
 pub(crate) fn request_matches_condition(
@@ -1406,14 +1838,34 @@ fn provider_matches_any_filter(
     })
 }
 
-fn ensure_unique_provider_leaves(service_name: &str, leaves: &[RouteLeaf]) -> Result<()> {
-    let mut seen = BTreeSet::new();
+fn ensure_unique_route_leaves(service_name: &str, leaves: &[RouteLeaf]) -> Result<()> {
+    let mut provider_all_endpoint_refs = BTreeSet::new();
+    let mut provider_endpoint_refs = BTreeSet::new();
     for leaf in leaves {
-        if !seen.insert(leaf.provider_id.as_str()) {
-            anyhow::bail!(
-                "[{service_name}] routing graph expands provider '{}' more than once; duplicate leaves are ambiguous",
-                leaf.provider_id
-            );
+        match leaf.endpoint_id.as_deref() {
+            Some(endpoint_id) => {
+                if provider_all_endpoint_refs.contains(leaf.provider_id.as_str())
+                    || !provider_endpoint_refs.insert((leaf.provider_id.as_str(), endpoint_id))
+                {
+                    anyhow::bail!(
+                        "[{service_name}] routing graph expands provider endpoint '{}.{}' more than once; duplicate leaves are ambiguous",
+                        leaf.provider_id,
+                        endpoint_id
+                    );
+                }
+            }
+            None => {
+                if provider_endpoint_refs
+                    .iter()
+                    .any(|(provider_id, _)| *provider_id == leaf.provider_id.as_str())
+                    || !provider_all_endpoint_refs.insert(leaf.provider_id.as_str())
+                {
+                    anyhow::bail!(
+                        "[{service_name}] routing graph expands provider '{}' more than once; duplicate leaves are ambiguous",
+                        leaf.provider_id
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -1440,6 +1892,13 @@ fn route_candidates_from_leaves(
         for endpoint in
             ordered_provider_endpoints(service_name, leaf.provider_id.as_str(), provider)?
         {
+            if leaf
+                .endpoint_id
+                .as_deref()
+                .is_some_and(|endpoint_id| endpoint_id != endpoint.endpoint_id)
+            {
+                continue;
+            }
             if !endpoint.enabled {
                 continue;
             }
@@ -1461,9 +1920,10 @@ fn route_candidates_from_leaves(
                 ),
                 model_mapping: merge_string_maps(&provider.model_mapping, &endpoint.model_mapping),
                 route_path: leaf.route_path.clone(),
+                preference_group: leaf.preference_group,
                 stable_index,
-                compatibility_station_name: Some(V4_COMPATIBILITY_STATION_NAME.to_string()),
-                compatibility_upstream_index: Some(stable_index),
+                compatibility_station_name: None,
+                compatibility_upstream_index: None,
             });
         }
     }
@@ -1592,7 +2052,7 @@ fn candidate_compatibility_station_name(
         .compatibility_station_name
         .clone()
         .or_else(|| template.compatibility_station_name.clone())
-        .unwrap_or_else(|| template.service_name.clone())
+        .unwrap_or_else(|| V4_COMPATIBILITY_STATION_NAME.to_string())
 }
 
 fn candidate_supports_model(candidate: &RouteCandidate, requested_model: &str) -> bool {
@@ -1635,9 +2095,9 @@ fn btree_bool_map_to_hash_map(values: &BTreeMap<String, bool>) -> HashMap<String
 mod tests {
     use super::*;
     use crate::config::{
-        ProviderEndpointV4, ProxyConfigV4, RoutingConditionV4, RoutingConfigV4,
-        RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4, compile_v4_to_runtime,
-        resolved_v4_provider_order,
+        ProviderEndpointV4, ProxyConfigV4, RoutingAffinityPolicyV5, RoutingConditionV4,
+        RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4,
+        compile_v4_to_runtime, resolved_v4_provider_order,
     };
     use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
     use std::collections::{HashMap, HashSet};
@@ -1666,6 +2126,22 @@ mod tests {
             .collect()
     }
 
+    fn provider_preference_groups(template: &RoutePlanTemplate) -> Vec<(String, u32)> {
+        template
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.provider_id.clone(), candidate.preference_group))
+            .collect()
+    }
+
+    fn endpoint_key(
+        service_name: &str,
+        provider_id: &str,
+        endpoint_id: &str,
+    ) -> ProviderEndpointKey {
+        ProviderEndpointKey::new(service_name, provider_id, endpoint_id)
+    }
+
     fn provider_endpoint_keys(template: &RoutePlanTemplate) -> Vec<String> {
         template
             .candidate_identities()
@@ -1678,7 +2154,12 @@ mod tests {
         template
             .candidate_identities()
             .into_iter()
-            .map(|identity| identity.legacy.stable_key())
+            .filter_map(|identity| {
+                identity
+                    .compatibility
+                    .as_ref()
+                    .map(LegacyUpstreamKey::stable_key)
+            })
             .collect()
     }
 
@@ -1797,7 +2278,12 @@ mod tests {
     fn legacy_parity_tags(values: &HashMap<String, String>) -> BTreeMap<String, String> {
         values
             .iter()
-            .filter(|(key, _)| !matches!(key.as_str(), "endpoint_id" | "route_path"))
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "endpoint_id" | "provider_endpoint_key" | "route_path" | "preference_group"
+                )
+            })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
     }
@@ -1963,8 +2449,10 @@ mod tests {
                     .into_iter()
                     .map(|skipped| AttemptOrderEvent {
                         decision: "skipped_capability_mismatch",
-                        upstream: upstream_signature(&skipped.selected_upstream),
-                        avoid_for_station: skipped.avoid_for_station,
+                        upstream: upstream_signature(
+                            &executor.legacy_selected_upstream_for_candidate(skipped.candidate),
+                        ),
+                        avoid_for_station: skipped.avoided_candidate_indices,
                         avoided_total: skipped.avoided_total,
                         total_upstreams: skipped.total_upstreams,
                         reason: Some(skip_reason(&skipped.reason)),
@@ -1976,8 +2464,10 @@ mod tests {
             };
             events.push(AttemptOrderEvent {
                 decision: "selected",
-                upstream: upstream_signature(&selected.selected_upstream),
-                avoid_for_station: selection.avoid_for_station,
+                upstream: upstream_signature(
+                    &executor.legacy_selected_upstream_for_candidate(selected.candidate),
+                ),
+                avoid_for_station: selection.avoided_candidate_indices,
                 avoided_total: selection.avoided_total,
                 total_upstreams: selection.total_upstreams,
                 reason: None,
@@ -2023,7 +2513,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_ir_v4_candidate_identity_retains_provider_endpoint_and_legacy_key() {
+    fn routing_ir_v4_candidate_identity_retains_provider_endpoint_without_synthetic_legacy_key() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([(
                 "input".to_string(),
@@ -2040,7 +2530,7 @@ mod tests {
             identities[0].provider_endpoint.stable_key(),
             "codex/input/default"
         );
-        assert_eq!(identities[0].legacy.stable_key(), "codex/routing/0");
+        assert!(identities[0].compatibility.is_none());
         assert_eq!(identities[0].base_url, "https://input.example/v1");
     }
 
@@ -2121,6 +2611,14 @@ mod tests {
             template.candidates[2].route_path,
             vec!["monthly_first", "paygo"]
         );
+        assert_eq!(
+            provider_preference_groups(&template),
+            vec![
+                ("input".to_string(), 0),
+                ("input1".to_string(), 1),
+                ("paygo".to_string(), 2),
+            ]
+        );
     }
 
     #[test]
@@ -2175,6 +2673,26 @@ mod tests {
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(provider_ids(&template), vec!["monthly", "paygo"]);
+        assert_eq!(
+            provider_preference_groups(&template),
+            vec![("monthly".to_string(), 0), ("paygo".to_string(), 1)]
+        );
+        assert_eq!(
+            template.candidates[0]
+                .to_upstream_config()
+                .tags
+                .get("preference_group")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            template.candidates[1]
+                .to_upstream_config()
+                .tags
+                .get("preference_group")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
@@ -2205,6 +2723,70 @@ mod tests {
 
         assert_provider_order_parity(&view, &template);
         assert_eq!(provider_ids(&template), vec!["monthly"]);
+    }
+
+    #[test]
+    fn routing_ir_tag_preferred_marks_nested_preference_groups() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly-a".to_string(),
+                    tagged_provider("https://monthly-a.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "monthly-b".to_string(),
+                    tagged_provider("https://monthly-b.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "monthly_first".to_string(),
+                routes: BTreeMap::from([
+                    (
+                        "monthly_pool".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::OrderedFailover,
+                            children: vec!["monthly-a".to_string(), "monthly-b".to_string()],
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                    (
+                        "monthly_first".to_string(),
+                        RoutingNodeV4 {
+                            strategy: RoutingPolicyV4::TagPreferred,
+                            children: vec!["chili".to_string(), "monthly_pool".to_string()],
+                            prefer_tags: vec![BTreeMap::from([(
+                                "billing".to_string(),
+                                "monthly".to_string(),
+                            )])],
+                            on_exhausted: RoutingExhaustedActionV4::Continue,
+                            ..RoutingNodeV4::default()
+                        },
+                    ),
+                ]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+
+        assert_provider_order_parity(&view, &template);
+        assert_eq!(
+            provider_ids(&template),
+            vec!["monthly-a", "monthly-b", "chili"]
+        );
+        assert_eq!(
+            provider_preference_groups(&template),
+            vec![
+                ("monthly-a".to_string(), 0),
+                ("monthly-b".to_string(), 1),
+                ("chili".to_string(), 2),
+            ]
+        );
     }
 
     #[test]
@@ -2531,10 +3113,7 @@ mod tests {
             provider_endpoint_keys(&template),
             vec!["codex/input/fast", "codex/input/slow"]
         );
-        assert_eq!(
-            legacy_upstream_keys(&template),
-            vec!["codex/routing/0", "codex/routing/1"]
-        );
+        assert!(legacy_upstream_keys(&template).is_empty());
         assert_eq!(
             template.candidates[0]
                 .tags
@@ -2567,6 +3146,112 @@ mod tests {
     }
 
     #[test]
+    fn routing_ir_manual_sticky_can_target_provider_endpoint() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfigV4 {
+                    endpoints: BTreeMap::from([
+                        (
+                            "fast".to_string(),
+                            ProviderEndpointV4 {
+                                base_url: "https://fast.example/v1".to_string(),
+                                enabled: true,
+                                priority: 0,
+                                tags: BTreeMap::new(),
+                                supported_models: BTreeMap::new(),
+                                model_mapping: BTreeMap::new(),
+                            },
+                        ),
+                        (
+                            "slow".to_string(),
+                            ProviderEndpointV4 {
+                                base_url: "https://slow.example/v1".to_string(),
+                                enabled: true,
+                                priority: 10,
+                                tags: BTreeMap::new(),
+                                supported_models: BTreeMap::new(),
+                                model_mapping: BTreeMap::new(),
+                            },
+                        ),
+                    ]),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::ManualSticky,
+                        target: Some("input.slow".to_string()),
+                        children: vec!["input".to_string()],
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+
+        assert_eq!(provider_ids(&template), vec!["input"]);
+        assert_eq!(template.candidates[0].endpoint_id, "slow");
+        assert_eq!(template.candidates[0].base_url, "https://slow.example/v1");
+        assert_eq!(provider_endpoint_keys(&template), vec!["codex/input/slow"]);
+        assert_eq!(
+            template.candidates[0].route_path,
+            vec!["root".to_string(), "input.slow".to_string()]
+        );
+    }
+
+    #[test]
+    fn routing_ir_manual_sticky_rejects_disabled_provider_endpoint_target() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfigV4 {
+                    endpoints: BTreeMap::from([(
+                        "fast".to_string(),
+                        ProviderEndpointV4 {
+                            base_url: "https://fast.example/v1".to_string(),
+                            enabled: false,
+                            priority: 0,
+                            tags: BTreeMap::new(),
+                            supported_models: BTreeMap::new(),
+                            model_mapping: BTreeMap::new(),
+                        },
+                    )]),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            routing: Some(RoutingConfigV4 {
+                entry: "root".to_string(),
+                routes: BTreeMap::from([(
+                    "root".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::ManualSticky,
+                        target: Some("input.fast".to_string()),
+                        children: vec!["input".to_string()],
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        };
+
+        let error = compile_v4_route_plan_template("codex", &view).expect_err("disabled endpoint");
+
+        assert!(
+            error
+                .to_string()
+                .contains("targets disabled provider endpoint 'input.fast'")
+        );
+    }
+
+    #[test]
     fn routing_ir_legacy_template_identity_uses_tagged_provider_and_station_index() {
         let service = ServiceConfig {
             name: "legacy-station".to_string(),
@@ -2590,7 +3275,14 @@ mod tests {
             identities[0].provider_endpoint.stable_key(),
             "codex/tagged/0"
         );
-        assert_eq!(identities[0].legacy.stable_key(), "codex/legacy-station/0");
+        assert_eq!(
+            identities[0]
+                .compatibility
+                .as_ref()
+                .map(LegacyUpstreamKey::stable_key)
+                .as_deref(),
+            Some("codex/legacy-station/0")
+        );
         assert_eq!(identities[0].base_url, "https://legacy.example/v1");
     }
 
@@ -2841,8 +3533,8 @@ mod tests {
 
         assert!(selection.selected.is_none());
         assert_eq!(selection.skipped.len(), 2);
-        assert_eq!(selection.avoid_for_station, vec![0, 1]);
-        assert!(state.station_exhausted(selection.total_upstreams));
+        assert_eq!(selection.avoided_candidate_indices, vec![0, 1]);
+        assert!(state.route_candidates_exhausted(&template));
     }
 
     #[test]
@@ -2893,43 +3585,41 @@ mod tests {
         let template = compile_v4_route_plan_template("codex", &view).expect("route template");
         let executor = RoutePlanExecutor::new(&template);
         let mut runtime = RoutePlanRuntimeState::default();
-        let mut station = RoutePlanStationRuntimeState::default();
-        station.set_upstream(
-            1,
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "disabled", "default"),
             RoutePlanUpstreamRuntimeState {
                 runtime_disabled: true,
                 ..RoutePlanUpstreamRuntimeState::default()
             },
         );
-        station.set_upstream(
-            2,
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "cooldown", "default"),
             RoutePlanUpstreamRuntimeState {
                 cooldown_active: true,
                 ..RoutePlanUpstreamRuntimeState::default()
             },
         );
-        station.set_upstream(
-            3,
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "breaker", "default"),
             RoutePlanUpstreamRuntimeState {
                 failure_count: FAILURE_THRESHOLD,
                 ..RoutePlanUpstreamRuntimeState::default()
             },
         );
-        station.set_upstream(
-            4,
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "usage", "default"),
             RoutePlanUpstreamRuntimeState {
                 usage_exhausted: true,
                 ..RoutePlanUpstreamRuntimeState::default()
             },
         );
-        station.set_upstream(
-            5,
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "missing-auth", "default"),
             RoutePlanUpstreamRuntimeState {
                 missing_auth: true,
                 ..RoutePlanUpstreamRuntimeState::default()
             },
         );
-        runtime.set_station("routing", station);
 
         let explanations =
             executor.explain_candidate_skip_reasons_with_runtime_state(&runtime, Some("gpt-5"));
@@ -2984,6 +3674,412 @@ mod tests {
     }
 
     #[test]
+    fn route_plan_executor_keeps_fallback_last_good_inside_lower_preference_group() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::tag_preferred(
+                vec!["chili".to_string(), "monthly".to_string()],
+                vec![BTreeMap::from([(
+                    "billing".to_string(),
+                    "monthly".to_string(),
+                )])],
+                RoutingExhaustedActionV4::Continue,
+            )),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection.selected.expect("preferred candidate selected");
+
+        assert_eq!(
+            provider_preference_groups(&template),
+            vec![("monthly".to_string(), 0), ("chili".to_string(), 1),]
+        );
+        assert_eq!(selected.candidate.provider_id, "monthly");
+        assert_eq!(
+            selected.provider_endpoint,
+            endpoint_key("codex", "monthly", "default")
+        );
+    }
+
+    #[test]
+    fn route_plan_executor_prefers_ordered_primary_over_lower_order_affinity() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "monthly".to_string(),
+                "chili".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection.selected.expect("ordered primary selected");
+
+        assert_eq!(
+            provider_preference_groups(&template),
+            vec![("monthly".to_string(), 0), ("chili".to_string(), 1)]
+        );
+        assert_eq!(selected.candidate.provider_id, "monthly");
+        assert_eq!(
+            selected.provider_endpoint,
+            endpoint_key("codex", "monthly", "default")
+        );
+    }
+
+    #[test]
+    fn route_plan_executor_uses_fallback_group_only_when_preferred_usage_exhausted() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::tag_preferred(
+                vec!["chili".to_string(), "monthly".to_string()],
+                vec![BTreeMap::from([(
+                    "billing".to_string(),
+                    "monthly".to_string(),
+                )])],
+                RoutingExhaustedActionV4::Continue,
+            )),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "monthly", "default"),
+            RoutePlanUpstreamRuntimeState {
+                usage_exhausted: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection.selected.expect("fallback candidate selected");
+
+        assert_eq!(selected.candidate.provider_id, "chili");
+        assert_eq!(
+            selected.provider_endpoint,
+            endpoint_key("codex", "chili", "default")
+        );
+    }
+
+    #[test]
+    fn route_plan_executor_uses_fallback_group_when_preferred_is_hard_unavailable() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::tag_preferred(
+                vec!["chili".to_string(), "monthly".to_string()],
+                vec![BTreeMap::from([(
+                    "billing".to_string(),
+                    "monthly".to_string(),
+                )])],
+                RoutingExhaustedActionV4::Continue,
+            )),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "monthly", "default"),
+            RoutePlanUpstreamRuntimeState {
+                runtime_disabled: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection.selected.expect("fallback candidate selected");
+
+        assert_eq!(selected.candidate.provider_id, "chili");
+        assert_eq!(
+            selected.provider_endpoint,
+            endpoint_key("codex", "chili", "default")
+        );
+    }
+
+    #[test]
+    fn route_plan_executor_fallback_sticky_policy_can_keep_lower_preference_affinity() {
+        let mut routing = RoutingConfigV4::tag_preferred(
+            vec!["chili".to_string(), "monthly".to_string()],
+            vec![BTreeMap::from([(
+                "billing".to_string(),
+                "monthly".to_string(),
+            )])],
+            RoutingExhaustedActionV4::Continue,
+        );
+        routing.affinity_policy = RoutingAffinityPolicyV5::FallbackSticky;
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection
+            .selected
+            .expect("fallback affinity candidate selected");
+
+        assert_eq!(
+            template.affinity_policy,
+            RoutingAffinityPolicyV5::FallbackSticky
+        );
+        assert_eq!(selected.candidate.provider_id, "chili");
+        assert_eq!(
+            selected.provider_endpoint,
+            endpoint_key("codex", "chili", "default")
+        );
+    }
+
+    #[test]
+    fn route_plan_executor_fallback_sticky_reprobes_preferred_after_window() {
+        let mut routing = RoutingConfigV4::tag_preferred(
+            vec!["chili".to_string(), "monthly".to_string()],
+            vec![BTreeMap::from([(
+                "billing".to_string(),
+                "monthly".to_string(),
+            )])],
+            RoutingExhaustedActionV4::Continue,
+        );
+        routing.affinity_policy = RoutingAffinityPolicyV5::FallbackSticky;
+        routing.reprobe_preferred_after_ms = Some(1);
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let now = crate::logging::now_ms();
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint_with_observed_at(
+            Some(endpoint_key("codex", "chili", "default")),
+            Some(now),
+            Some(now.saturating_sub(2)),
+        );
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection
+            .selected
+            .expect("preferred candidate selected after reprobe window");
+
+        assert_eq!(selected.candidate.provider_id, "monthly");
+    }
+
+    #[test]
+    fn route_plan_executor_fallback_sticky_reprobes_preferred_after_fallback_ttl() {
+        let mut routing = RoutingConfigV4::tag_preferred(
+            vec!["chili".to_string(), "monthly".to_string()],
+            vec![BTreeMap::from([(
+                "billing".to_string(),
+                "monthly".to_string(),
+            )])],
+            RoutingExhaustedActionV4::Continue,
+        );
+        routing.affinity_policy = RoutingAffinityPolicyV5::FallbackSticky;
+        routing.fallback_ttl_ms = Some(1);
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let now = crate::logging::now_ms();
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint_with_observed_at(
+            Some(endpoint_key("codex", "chili", "default")),
+            Some(now),
+            Some(now.saturating_sub(2)),
+        );
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection
+            .selected
+            .expect("preferred candidate selected after fallback ttl");
+
+        assert_eq!(selected.candidate.provider_id, "monthly");
+    }
+
+    #[test]
+    fn route_plan_executor_off_policy_ignores_affinity_inside_best_group() {
+        let mut routing = RoutingConfigV4::tag_preferred(
+            vec!["monthly-a".to_string(), "monthly-b".to_string()],
+            vec![BTreeMap::from([(
+                "billing".to_string(),
+                "monthly".to_string(),
+            )])],
+            RoutingExhaustedActionV4::Continue,
+        );
+        routing.affinity_policy = RoutingAffinityPolicyV5::Off;
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly-a".to_string(),
+                    tagged_provider("https://monthly-a.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "monthly-b".to_string(),
+                    tagged_provider("https://monthly-b.example/v1", "billing", "monthly"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "monthly-b", "default")));
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection.selected.expect("first candidate selected");
+
+        assert_eq!(template.affinity_policy, RoutingAffinityPolicyV5::Off);
+        assert_eq!(selected.candidate.provider_id, "monthly-a");
+        assert_eq!(
+            selected.provider_endpoint,
+            endpoint_key("codex", "monthly-a", "default")
+        );
+    }
+
+    #[test]
+    fn route_plan_executor_hard_policy_stops_when_affinity_is_unavailable() {
+        let mut routing = RoutingConfigV4::tag_preferred(
+            vec!["monthly".to_string(), "chili".to_string()],
+            vec![BTreeMap::from([(
+                "billing".to_string(),
+                "monthly".to_string(),
+            )])],
+            RoutingExhaustedActionV4::Continue,
+        );
+        routing.affinity_policy = RoutingAffinityPolicyV5::Hard;
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(routing),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(endpoint_key("codex", "chili", "default")));
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "chili", "default"),
+            RoutePlanUpstreamRuntimeState {
+                runtime_disabled: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+
+        assert_eq!(template.affinity_policy, RoutingAffinityPolicyV5::Hard);
+        assert!(selection.selected.is_none());
+    }
+
+    #[test]
     fn route_plan_executor_shadow_keeps_same_candidate_until_caller_marks_avoidance() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([
@@ -3002,17 +4098,17 @@ mod tests {
 
         let first = executor.select_supported_candidate(&mut state, None);
         let first_selected = first.selected.as_ref().expect("first selected");
-        assert_eq!(first_selected.selected_upstream.index, 0);
+        assert_eq!(first_selected.candidate.provider_id, "first");
 
         let same = executor.select_supported_candidate(&mut state, None);
         let same_selected = same.selected.as_ref().expect("same selected");
-        assert_eq!(same_selected.selected_upstream.index, 0);
+        assert_eq!(same_selected.candidate.provider_id, "first");
 
         assert!(state.avoid_selected(same_selected));
         let next = executor.select_supported_candidate(&mut state, None);
         let next_selected = next.selected.as_ref().expect("next selected");
 
-        assert_eq!(next_selected.selected_upstream.index, 1);
-        assert_eq!(next.avoid_for_station, vec![0]);
+        assert_eq!(next_selected.candidate.provider_id, "second");
+        assert_eq!(next.avoided_candidate_indices, vec![0]);
     }
 }

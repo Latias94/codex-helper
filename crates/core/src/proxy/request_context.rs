@@ -4,9 +4,9 @@ use std::time::Instant;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 
-use crate::lb::{CooldownBackoff, LoadBalancer};
+use crate::lb::CooldownBackoff;
 use crate::logging::{BodyPreview, HeaderEntry, ServiceTierLog};
-use crate::routing_ir::{RoutePlanTemplate, RouteRequestContext};
+use crate::routing_ir::RouteRequestContext;
 use crate::state::SessionBinding;
 
 use super::ProxyService;
@@ -16,6 +16,7 @@ use super::request_failures::{log_client_body_read_error, log_no_routable_statio
 use super::request_preparation::{
     RequestFlavor, build_body_previews, detect_request_flavor, prepare_request_body,
 };
+use super::request_routing::RequestRouteSelection;
 use super::retry::{RetryPlan, retry_plan};
 
 pub(super) struct PreparedProxyRequest {
@@ -26,8 +27,7 @@ pub(super) struct PreparedProxyRequest {
     pub(super) client_headers_entries_cache: OnceLock<Vec<HeaderEntry>>,
     pub(super) session_id: Option<String>,
     pub(super) session_binding: Option<SessionBinding>,
-    pub(super) lbs: Vec<LoadBalancer>,
-    pub(super) route_plan_template: Option<RoutePlanTemplate>,
+    pub(super) route_selection: RequestRouteSelection,
     pub(super) cwd: Option<String>,
     pub(super) session_override_config: Option<String>,
     pub(super) global_station_override: Option<String>,
@@ -70,6 +70,8 @@ pub(super) async fn prepare_proxy_request(
 
     let config_reloaded = proxy.config.maybe_reload_from_disk().await;
     let cfg_snapshot = proxy.config.snapshot().await;
+    let v4_snapshot = proxy.config.v4_snapshot().await;
+    let route_graph_config = v4_snapshot.is_some();
     let mgr = proxy.service_manager(cfg_snapshot.as_ref());
     if config_reloaded {
         proxy
@@ -87,12 +89,16 @@ pub(super) async fn prepare_proxy_request(
     let request_flavor =
         detect_request_flavor(proxy.service_name, &method, &client_headers, uri.path());
     let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
-    let session_override_config = if let Some(id) = session_id.as_deref() {
+    let session_override_config = if !route_graph_config && let Some(id) = session_id.as_deref() {
         proxy.state.get_session_station_override(id).await
     } else {
         None
     };
-    let global_station_override = proxy.state.get_global_station_override().await;
+    let global_station_override = if route_graph_config {
+        None
+    } else {
+        proxy.state.get_global_station_override().await
+    };
 
     let raw_body = match to_bytes(body, 10 * 1024 * 1024).await {
         Ok(body) => body,
@@ -212,7 +218,6 @@ pub(super) async fn prepare_proxy_request(
         effective_effort.clone(),
         effective_service_tier.clone(),
     );
-    let v4_snapshot = proxy.config.v4_snapshot().await;
     let route_selection = proxy
         .lbs_for_request(
             cfg_snapshot.as_ref(),
@@ -221,7 +226,7 @@ pub(super) async fn prepare_proxy_request(
             session_id.as_deref(),
         )
         .await;
-    if route_selection.lbs.is_empty() {
+    if route_selection.is_empty() {
         let dur = start.elapsed().as_millis() as u64;
         let client_headers_entries = client_headers_entries_cache
             .get_or_init(|| header_map_to_entries(&client_headers))
@@ -237,12 +242,14 @@ pub(super) async fn prepare_proxy_request(
         ));
     }
 
-    super::route_executor_shadow::maybe_log_route_executor_shadow_diff(
-        proxy.service_name,
-        request_id,
-        &route_selection.lbs,
-        request_model.as_deref(),
-    );
+    if let Some(lbs) = route_selection.legacy_lbs() {
+        super::route_executor_shadow::maybe_log_route_executor_shadow_diff(
+            proxy.service_name,
+            request_id,
+            lbs,
+            request_model.as_deref(),
+        );
+    }
 
     Ok(PreparedProxyRequest {
         method,
@@ -252,8 +259,7 @@ pub(super) async fn prepare_proxy_request(
         client_headers_entries_cache,
         session_id,
         session_binding,
-        lbs: route_selection.lbs,
-        route_plan_template: route_selection.route_plan_template,
+        route_selection,
         cwd,
         session_override_config,
         global_station_override,
@@ -320,6 +326,10 @@ async fn resolve_and_touch_session_state(
         proxy
             .state
             .touch_session_station_override(id, started_at_ms)
+            .await;
+        proxy
+            .state
+            .touch_session_route_target_override(id, started_at_ms)
             .await;
         proxy
             .state

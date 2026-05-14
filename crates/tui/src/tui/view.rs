@@ -51,8 +51,14 @@ pub(in crate::tui) fn render_app(
         Overlay::SessionTranscript => modals::render_session_transcript_modal(f, p, ui),
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
             let title = match ui.overlay {
+                Overlay::ProviderMenuSession if ui.uses_route_graph_routing() => {
+                    i18n::label(ui.language, "session route target")
+                }
                 Overlay::ProviderMenuSession => {
                     i18n::text(ui.language, msg::OVERLAY_SESSION_PROVIDER_OVERRIDE)
+                }
+                Overlay::ProviderMenuGlobal if ui.uses_route_graph_routing() => {
+                    i18n::label(ui.language, "global route target")
                 }
                 Overlay::ProviderMenuGlobal => {
                     i18n::text(ui.language, msg::OVERLAY_GLOBAL_STATION_PIN)

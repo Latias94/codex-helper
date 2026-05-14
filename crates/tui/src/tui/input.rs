@@ -9,7 +9,7 @@ use reqwest::Url;
 use tokio::sync::{OnceCell, Semaphore, mpsc};
 
 use crate::config::{
-    UpstreamConfig,
+    PersistedProviderSpec, PersistedProvidersCatalog, UpstreamConfig,
     bootstrap::overwrite_codex_config_from_codex_cli_in_place,
     proxy_home_dir,
     storage::{load_config, save_config},
@@ -18,6 +18,8 @@ use crate::dashboard_core::{ControlProfileOption, build_model_options_from_mgr};
 use crate::healthcheck::{
     HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
 };
+use crate::proxy::ProxyService;
+use crate::routing_ir::RouteRequestContext;
 use crate::sessions::{
     SessionSummary, SessionSummarySource, find_codex_session_file_by_id, read_codex_session_meta,
     read_codex_session_transcript,
@@ -41,13 +43,6 @@ use super::state::{
 };
 use super::types::{EffortChoice, Focus, Overlay, Page, ServiceTierChoice, StatsFocus};
 
-#[derive(Debug, serde::Deserialize)]
-struct ProfileControlResponse {
-    configured_default_profile: Option<String>,
-    default_profile: Option<String>,
-    profiles: Vec<ControlProfileOption>,
-}
-
 pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
     matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
@@ -60,6 +55,7 @@ pub(in crate::tui) async fn handle_key_event(
     providers: &mut Vec<ProviderOption>,
     ui: &mut UiState,
     snapshot: &Snapshot,
+    proxy: &ProxyService,
     balance_refresh_tx: BalanceRefreshSender,
     key: KeyEvent,
 ) -> bool {
@@ -69,7 +65,16 @@ pub(in crate::tui) async fn handle_key_event(
 
     match ui.overlay {
         Overlay::None => {
-            handle_key_normal(&state, providers, ui, snapshot, &balance_refresh_tx, key).await
+            handle_key_normal(
+                &state,
+                providers,
+                ui,
+                snapshot,
+                proxy,
+                &balance_refresh_tx,
+                key,
+            )
+            .await
         }
         Overlay::Help => match key.code {
             KeyCode::Esc | KeyCode::Char('?') => {
@@ -232,13 +237,13 @@ pub(in crate::tui) async fn handle_key_event(
         Overlay::ProfileMenuSession
         | Overlay::ProfileMenuDefaultRuntime
         | Overlay::ProfileMenuDefaultPersisted => {
-            handle_key_profile_menu(&state, ui, snapshot, key).await
+            handle_key_profile_menu(&state, ui, snapshot, proxy, key).await
         }
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
-            handle_key_provider_menu(&state, providers, ui, snapshot, key).await
+            handle_key_provider_menu(&state, providers, ui, snapshot, proxy, key).await
         }
         Overlay::RoutingMenu => {
-            handle_key_routing_menu(providers, ui, snapshot, &balance_refresh_tx, key).await
+            handle_key_routing_menu(providers, ui, snapshot, proxy, &balance_refresh_tx, key).await
         }
     }
 }
@@ -302,19 +307,11 @@ fn apply_selected_session(ui: &mut UiState, snapshot: &Snapshot, idx: usize) {
         .select(if req_len == 0 { None } else { Some(0) });
 }
 
-pub(in crate::tui) async fn refresh_profile_control_state(ui: &mut UiState) -> anyhow::Result<()> {
-    let response = reqwest::Client::new()
-        .get(format!(
-            "http://127.0.0.1:{}/__codex_helper/api/v1/profiles",
-            ui.admin_port
-        ))
-        .timeout(Duration::from_millis(1200))
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<ProfileControlResponse>()
-        .await?;
-
+pub(in crate::tui) async fn refresh_profile_control_state(
+    ui: &mut UiState,
+    proxy: &ProxyService,
+) -> anyhow::Result<()> {
+    let response = proxy.profiles().await;
     ui.configured_default_profile = response.configured_default_profile.clone();
     ui.effective_default_profile = response.default_profile.clone();
     ui.runtime_default_profile_override =
@@ -352,40 +349,18 @@ fn runtime_default_profile_menu_idx(
 }
 
 async fn apply_runtime_default_profile(
-    ui: &UiState,
+    proxy: &ProxyService,
     profile_name: Option<String>,
 ) -> anyhow::Result<()> {
-    reqwest::Client::new()
-        .post(format!(
-            "http://127.0.0.1:{}/__codex_helper/api/v1/profiles/default",
-            ui.admin_port
-        ))
-        .timeout(Duration::from_millis(1200))
-        .json(&serde_json::json!({
-            "profile_name": profile_name,
-        }))
-        .send()
-        .await?
-        .error_for_status()?;
+    proxy.set_runtime_default_profile(profile_name).await?;
     Ok(())
 }
 
 async fn apply_persisted_default_profile(
-    ui: &UiState,
+    proxy: &ProxyService,
     profile_name: Option<String>,
 ) -> anyhow::Result<()> {
-    reqwest::Client::new()
-        .post(format!(
-            "http://127.0.0.1:{}/__codex_helper/api/v1/profiles/default/persisted",
-            ui.admin_port
-        ))
-        .timeout(Duration::from_millis(1200))
-        .json(&serde_json::json!({
-            "profile_name": profile_name,
-        }))
-        .send()
-        .await?
-        .error_for_status()?;
+    proxy.set_persisted_default_profile(profile_name).await?;
     Ok(())
 }
 
@@ -762,6 +737,21 @@ async fn apply_session_provider_override(state: &ProxyState, sid: String, cfg: O
     }
 }
 
+async fn apply_session_route_target_override(
+    state: &ProxyState,
+    sid: String,
+    target: Option<String>,
+) {
+    let now = now_ms();
+    if let Some(target) = target {
+        state
+            .set_session_route_target_override(sid, target, now)
+            .await;
+    } else {
+        state.clear_session_route_target_override(&sid).await;
+    }
+}
+
 async fn clear_session_manual_overrides(state: &ProxyState, sid: String) {
     state.clear_session_manual_overrides(&sid).await;
 }
@@ -784,37 +774,33 @@ async fn apply_global_station_pin(
     Ok(())
 }
 
-pub(in crate::tui) async fn refresh_routing_control_state(ui: &mut UiState) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let response = client
-        .get(format!(
-            "http://127.0.0.1:{}/__codex_helper/api/v1/routing",
-            ui.admin_port
-        ))
-        .timeout(Duration::from_millis(1200))
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<RoutingSpecView>()
-        .await?;
-    let routing_explain = client
-        .get(format!(
-            "http://127.0.0.1:{}/__codex_helper/api/v1/routing/explain",
-            ui.admin_port
-        ))
-        .timeout(Duration::from_millis(1200))
-        .send()
-        .await
-        .ok()
-        .and_then(|response| response.error_for_status().ok());
-    ui.routing_explain = if let Some(response) = routing_explain {
-        response
-            .json::<crate::routing_explain::RoutingExplainResponse>()
-            .await
-            .ok()
+async fn apply_global_route_target_pin(
+    state: &ProxyState,
+    providers: &[ProviderOption],
+    target: Option<String>,
+) -> anyhow::Result<()> {
+    if let Some(name) = target.as_deref() {
+        if !providers.iter().any(|provider| provider.name == name) {
+            anyhow::bail!("unknown route target: {name}");
+        }
+        state
+            .set_global_route_target_override(name.to_string(), now_ms())
+            .await;
     } else {
-        None
-    };
+        state.clear_global_route_target_override().await;
+    }
+    Ok(())
+}
+
+pub(in crate::tui) async fn refresh_routing_control_state(
+    ui: &mut UiState,
+    proxy: &ProxyService,
+) -> anyhow::Result<()> {
+    let response = RoutingSpecView::from(proxy.persisted_routing_spec().await?);
+    ui.routing_explain = proxy
+        .routing_explain(RouteRequestContext::default(), None)
+        .await
+        .ok();
     ui.routing_menu_idx = ui
         .routing_menu_idx
         .min(routing_provider_names(&response).len().saturating_sub(1));
@@ -882,19 +868,21 @@ fn should_request_provider_balance_refresh(
 async fn open_routing_editor(
     ui: &mut UiState,
     snapshot: &Snapshot,
+    proxy: &ProxyService,
     reason: &str,
     balance_refresh_tx: &BalanceRefreshSender,
 ) {
     let balance_started = request_provider_balance_refresh(
         ui,
         snapshot,
+        proxy,
         BalanceRefreshMode::Auto,
         balance_refresh_tx,
     );
     if ui.page == Page::Stations {
         ui.routing_menu_idx = ui.selected_station_idx;
     }
-    match refresh_routing_control_state(ui).await {
+    match refresh_routing_control_state(ui, proxy).await {
         Ok(()) => {
             ui.overlay = Overlay::RoutingMenu;
             ui.toast = Some((
@@ -924,6 +912,7 @@ async fn open_routing_editor(
 fn request_provider_balance_refresh(
     ui: &mut UiState,
     snapshot: &Snapshot,
+    proxy: &ProxyService,
     mode: BalanceRefreshMode,
     balance_refresh_tx: &BalanceRefreshSender,
 ) -> bool {
@@ -940,18 +929,12 @@ fn request_provider_balance_refresh(
         return false;
     }
     ui.last_balance_refresh_requested_at = Some(now);
-    let admin_port = ui.admin_port;
+    let proxy = proxy.clone();
     let balance_refresh_tx = balance_refresh_tx.clone();
     tokio::spawn(async move {
-        let result = reqwest::Client::new()
-            .post(format!(
-                "http://127.0.0.1:{admin_port}/__codex_helper/api/v1/providers/balances/refresh"
-            ))
-            .timeout(Duration::from_secs(12))
-            .send()
-            .await;
-        let outcome = result
-            .and_then(|resp| resp.error_for_status())
+        let outcome = proxy
+            .refresh_provider_balances(None, None)
+            .await
             .map(|_| ())
             .map_err(|err| err.to_string());
         let _ = balance_refresh_tx.send(outcome);
@@ -962,11 +945,13 @@ fn request_provider_balance_refresh(
 fn request_provider_balance_refresh_after_control_change(
     ui: &mut UiState,
     snapshot: &Snapshot,
+    proxy: &ProxyService,
     balance_refresh_tx: &BalanceRefreshSender,
 ) -> bool {
     request_provider_balance_refresh(
         ui,
         snapshot,
+        proxy,
         BalanceRefreshMode::ControlChanged,
         balance_refresh_tx,
     )
@@ -975,24 +960,15 @@ fn request_provider_balance_refresh_after_control_change(
 async fn apply_persisted_routing(
     ui: &mut UiState,
     snapshot: &Snapshot,
+    proxy: &ProxyService,
     mut routing: RoutingSpecView,
     balance_refresh_tx: &BalanceRefreshSender,
 ) -> anyhow::Result<()> {
     routing.providers.clear();
     routing.sync_entry_compat_from_graph();
     let payload = RoutingSpecUpsertView::from(&routing);
-    let response = reqwest::Client::new()
-        .put(format!(
-            "http://127.0.0.1:{}/__codex_helper/api/v1/routing",
-            ui.admin_port
-        ))
-        .timeout(Duration::from_millis(1500))
-        .json(&payload)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<RoutingSpecView>()
-        .await?;
+    let response =
+        RoutingSpecView::from(proxy.upsert_persisted_routing_spec(payload.into()).await?);
     ui.routing_menu_idx = ui
         .routing_menu_idx
         .min(routing_provider_names(&response).len().saturating_sub(1));
@@ -1000,59 +976,31 @@ async fn apply_persisted_routing(
     ui.last_routing_control_refresh_at = Some(Instant::now());
     ui.needs_snapshot_refresh = true;
     ui.needs_config_refresh = true;
-    request_provider_balance_refresh_after_control_change(ui, snapshot, balance_refresh_tx);
+    request_provider_balance_refresh_after_control_change(ui, snapshot, proxy, balance_refresh_tx);
     Ok(())
 }
 
-async fn load_provider_specs(ui: &UiState) -> anyhow::Result<ProviderSpecsCatalogResponse> {
-    reqwest::Client::new()
-        .get(format!(
-            "http://127.0.0.1:{}/__codex_helper/api/v1/providers/specs",
-            ui.admin_port
-        ))
-        .timeout(Duration::from_millis(1200))
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<ProviderSpecsCatalogResponse>()
-        .await
-        .map_err(Into::into)
+async fn load_provider_specs(proxy: &ProxyService) -> anyhow::Result<PersistedProvidersCatalog> {
+    proxy.persisted_provider_specs().await.map_err(Into::into)
 }
 
-async fn apply_provider_spec(ui: &UiState, provider: &ProviderSpecPayload) -> anyhow::Result<()> {
-    reqwest::Client::new()
-        .put(format!(
-            "http://127.0.0.1:{}/__codex_helper/api/v1/providers/specs/{}",
-            ui.admin_port,
-            url_path_component(provider.name.as_str())
-        ))
-        .timeout(Duration::from_millis(1500))
-        .json(provider)
-        .send()
-        .await?
-        .error_for_status()?;
+async fn apply_provider_spec(
+    proxy: &ProxyService,
+    provider: PersistedProviderSpec,
+) -> anyhow::Result<()> {
+    proxy
+        .upsert_persisted_provider_spec(provider.name.clone(), provider)
+        .await?;
     Ok(())
-}
-
-fn url_path_component(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(char::from(*byte));
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 async fn set_provider_billing_tag(
     ui: &mut UiState,
+    proxy: &ProxyService,
     provider_name: &str,
     billing: Option<&str>,
 ) -> anyhow::Result<()> {
-    let catalog = load_provider_specs(ui).await?;
+    let catalog = load_provider_specs(proxy).await?;
     let mut provider = catalog
         .providers
         .into_iter()
@@ -1068,8 +1016,8 @@ async fn set_provider_billing_tag(
             provider.tags.remove("billing");
         }
     }
-    apply_provider_spec(ui, &provider).await?;
-    refresh_routing_control_state(ui).await?;
+    apply_provider_spec(proxy, provider).await?;
+    refresh_routing_control_state(ui, proxy).await?;
     ui.needs_snapshot_refresh = true;
     ui.needs_config_refresh = true;
     Ok(())
@@ -1077,55 +1025,22 @@ async fn set_provider_billing_tag(
 
 async fn set_provider_enabled(
     ui: &mut UiState,
+    proxy: &ProxyService,
     provider_name: &str,
     enabled: bool,
 ) -> anyhow::Result<()> {
-    let catalog = load_provider_specs(ui).await?;
+    let catalog = load_provider_specs(proxy).await?;
     let mut provider = catalog
         .providers
         .into_iter()
         .find(|provider| provider.name == provider_name)
         .ok_or_else(|| anyhow::anyhow!("provider '{provider_name}' not found"))?;
     provider.enabled = enabled;
-    apply_provider_spec(ui, &provider).await?;
-    refresh_routing_control_state(ui).await?;
+    apply_provider_spec(proxy, provider).await?;
+    refresh_routing_control_state(ui, proxy).await?;
     ui.needs_snapshot_refresh = true;
     ui.needs_config_refresh = true;
     Ok(())
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct ProviderSpecsCatalogResponse {
-    providers: Vec<ProviderSpecPayload>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct ProviderEndpointSpecPayload {
-    name: String,
-    base_url: String,
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    priority: u32,
-    #[serde(default)]
-    tags: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct ProviderSpecPayload {
-    name: String,
-    #[serde(default)]
-    alias: Option<String>,
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    auth_token_env: Option<String>,
-    #[serde(default)]
-    api_key_env: Option<String>,
-    #[serde(default)]
-    tags: BTreeMap<String, String>,
-    #[serde(default)]
-    endpoints: Vec<ProviderEndpointSpecPayload>,
 }
 
 async fn persist_ui_language(language: Language) -> anyhow::Result<()> {
@@ -1456,6 +1371,7 @@ async fn handle_key_normal(
     providers: &mut Vec<ProviderOption>,
     ui: &mut UiState,
     snapshot: &Snapshot,
+    proxy: &ProxyService,
     balance_refresh_tx: &BalanceRefreshSender,
     key: KeyEvent,
 ) -> bool {
@@ -1529,7 +1445,7 @@ async fn handle_key_normal(
 
                     *providers = crate::tui::build_provider_options(&cfg, ui.service_name);
                     ui.clamp_selection(snapshot, providers.len());
-                    let _ = refresh_profile_control_state(ui).await;
+                    let _ = refresh_profile_control_state(ui, proxy).await;
                     ui.toast = Some((
                         match ui.language {
                             Language::Zh => {
@@ -1557,38 +1473,18 @@ async fn handle_key_normal(
         }
         KeyCode::Char('R') if ui.page == Page::Settings => {
             let now = Instant::now();
-            let url = format!(
-                "http://127.0.0.1:{}/__codex_helper/api/v1/runtime/reload",
-                ui.admin_port
-            );
-            let res = async {
-                let client = reqwest::Client::new();
-                client
-                    .post(&url)
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<serde_json::Value>()
-                    .await
-            }
-            .await;
-            match res {
-                Ok(v) => {
-                    let st = v.get("status");
-                    ui.last_runtime_config_loaded_at_ms = st
-                        .and_then(|x| x.get("loaded_at_ms"))
-                        .and_then(|x| x.as_u64());
-                    ui.last_runtime_config_source_mtime_ms = st
-                        .and_then(|x| x.get("source_mtime_ms"))
-                        .and_then(|x| x.as_u64());
-                    ui.last_runtime_retry = st
-                        .and_then(|x| x.get("retry"))
-                        .and_then(|x| serde_json::from_value(x.clone()).ok());
+            match proxy.reload_runtime_config().await {
+                Ok(result) => {
+                    ui.last_runtime_config_loaded_at_ms = Some(result.status.loaded_at_ms);
+                    ui.last_runtime_config_source_mtime_ms = result.status.source_mtime_ms;
+                    ui.last_runtime_retry = Some(result.status.retry);
                     ui.last_runtime_config_refresh_at = Some(now);
-                    let _ = refresh_profile_control_state(ui).await;
+                    let _ = refresh_profile_control_state(ui, proxy).await;
 
-                    let changed = v.get("reloaded").and_then(|x| x.as_bool()).unwrap_or(false);
-                    ui.toast = Some((i18n::format_config_reloaded(ui.language, changed), now));
+                    ui.toast = Some((
+                        i18n::format_config_reloaded(ui.language, result.reloaded),
+                        now,
+                    ));
                     true
                 }
                 Err(err) => {
@@ -1608,6 +1504,7 @@ async fn handle_key_normal(
                 open_routing_editor(
                     ui,
                     snapshot,
+                    proxy,
                     i18n::label(ui.language, "routing: provider details/edit"),
                     balance_refresh_tx,
                 )
@@ -1812,22 +1709,35 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Enter if ui.page == Page::Stations => {
-            if ui.uses_route_graph_routing() {
-                open_routing_editor(
-                    ui,
-                    snapshot,
-                    i18n::label(ui.language, "routing: edit provider policy/order/tags"),
-                    balance_refresh_tx,
-                )
-                .await;
-                return true;
-            }
             let Some(name) = providers
                 .get(ui.selected_station_idx)
                 .map(|p| p.name.clone())
             else {
                 return true;
             };
+            if ui.uses_route_graph_routing() {
+                match apply_global_route_target_pin(state, providers, Some(name.clone())).await {
+                    Ok(()) => {
+                        ui.toast = Some((
+                            match ui.language {
+                                Language::Zh => format!("全局 route target：{name}"),
+                                Language::En => format!("global route target: {name}"),
+                            },
+                            Instant::now(),
+                        ));
+                    }
+                    Err(err) => {
+                        ui.toast = Some((
+                            match ui.language {
+                                Language::Zh => format!("设置全局 route target 失败：{err}"),
+                                Language::En => format!("set global route target failed: {err}"),
+                            },
+                            Instant::now(),
+                        ));
+                    }
+                }
+                return true;
+            }
             match apply_global_station_pin(state, providers, Some(name.clone())).await {
                 Ok(()) => {
                     ui.toast = Some((
@@ -1854,6 +1764,7 @@ async fn handle_key_normal(
             open_routing_editor(
                 ui,
                 snapshot,
+                proxy,
                 i18n::label(ui.language, "routing: edit persisted policy/order"),
                 balance_refresh_tx,
             )
@@ -1861,22 +1772,35 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
+            if ui.uses_route_graph_routing() {
+                match apply_global_route_target_pin(state, providers, None).await {
+                    Ok(()) => {
+                        ui.toast = Some((
+                            match ui.language {
+                                Language::Zh => "全局 route target：<auto>",
+                                Language::En => "global route target: <auto>",
+                            }
+                            .to_string(),
+                            Instant::now(),
+                        ));
+                    }
+                    Err(err) => {
+                        ui.toast = Some((
+                            match ui.language {
+                                Language::Zh => format!("清除全局 route target 失败：{err}"),
+                                Language::En => format!("clear global route target failed: {err}"),
+                            },
+                            Instant::now(),
+                        ));
+                    }
+                }
+                return true;
+            }
             match apply_global_station_pin(state, providers, None).await {
                 Ok(()) => {
-                    let message = if ui.uses_route_graph_routing() {
-                        match ui.language {
-                            Language::Zh => {
-                                "运行时站点 pin 已清除；v4 provider 选择使用 routing 策略"
-                            }
-                            Language::En => {
-                                "runtime station pin cleared; v4 provider choice uses routing policy"
-                            }
-                        }
-                    } else {
-                        match ui.language {
-                            Language::Zh => "全局站点 pin：<auto>",
-                            Language::En => "global station pin: <auto>",
-                        }
+                    let message = match ui.language {
+                        Language::Zh => "全局站点 pin：<auto>",
+                        Language::En => "global station pin: <auto>",
                     };
                     ui.toast = Some((message.to_string(), Instant::now()));
                 }
@@ -1893,17 +1817,6 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('o') if ui.page == Page::Stations => {
-            if ui.uses_route_graph_routing() {
-                ui.toast = Some((
-                    i18n::label(
-                        ui.language,
-                        "v4 routing owns provider choice; press r to edit routing",
-                    )
-                    .to_string(),
-                    Instant::now(),
-                ));
-                return true;
-            }
             let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
@@ -1912,12 +1825,25 @@ async fn handle_key_normal(
                 .get(ui.selected_session_idx)
                 .and_then(|r| r.session_id.clone())
             else {
+                let label = if ui.uses_route_graph_routing() {
+                    "session route target: <no session>"
+                } else {
+                    "session station override: <no session>"
+                };
+                ui.toast = Some((i18n::label(ui.language, label).to_string(), Instant::now()));
+                return true;
+            };
+            if ui.uses_route_graph_routing() {
+                apply_session_route_target_override(state, sid, Some(pvd.name.clone())).await;
                 ui.toast = Some((
-                    i18n::label(ui.language, "session station override: <no session>").to_string(),
+                    match ui.language {
+                        Language::Zh => format!("会话 route target：{}", pvd.name),
+                        Language::En => format!("session route target: {}", pvd.name),
+                    },
                     Instant::now(),
                 ));
                 return true;
-            };
+            }
             apply_session_provider_override(state, sid, Some(pvd.name.clone())).await;
             ui.toast = Some((
                 format!(
@@ -1935,21 +1861,29 @@ async fn handle_key_normal(
                 .get(ui.selected_session_idx)
                 .and_then(|r| r.session_id.clone())
             else {
+                let label = if ui.uses_route_graph_routing() {
+                    "session route target: <no session>"
+                } else {
+                    "session station override: <no session>"
+                };
+                ui.toast = Some((i18n::label(ui.language, label).to_string(), Instant::now()));
+                return true;
+            };
+            if ui.uses_route_graph_routing() {
+                apply_session_route_target_override(state, sid.clone(), None).await;
+                state.clear_session_station_override(&sid).await;
                 ui.toast = Some((
-                    i18n::label(ui.language, "session station override: <no session>").to_string(),
+                    match ui.language {
+                        Language::Zh => "会话 route target：<清除>",
+                        Language::En => "session route target: <clear>",
+                    }
+                    .to_string(),
                     Instant::now(),
                 ));
                 return true;
-            };
+            }
             apply_session_provider_override(state, sid, None).await;
-            let message = if ui.uses_route_graph_routing() {
-                match ui.language {
-                    Language::Zh => "旧版会话站点覆盖已清除",
-                    Language::En => "legacy session station override cleared",
-                }
-            } else {
-                i18n::label(ui.language, "session station override: <clear>")
-            };
+            let message = i18n::label(ui.language, "session station override: <clear>");
             ui.toast = Some((message.to_string(), Instant::now()));
             true
         }
@@ -1966,7 +1900,7 @@ async fn handle_key_normal(
             if ui.page == Page::Stations && ui.uses_route_graph_routing() =>
         {
             if ui.routing_spec.is_none()
-                && let Err(err) = refresh_routing_control_state(ui).await
+                && let Err(err) = refresh_routing_control_state(ui, proxy).await
             {
                 ui.toast = Some((
                     format!(
@@ -1979,7 +1913,8 @@ async fn handle_key_normal(
             }
             ui.routing_menu_idx = ui.selected_station_idx;
             let handled =
-                handle_key_routing_menu(providers, ui, snapshot, balance_refresh_tx, key).await;
+                handle_key_routing_menu(providers, ui, snapshot, proxy, balance_refresh_tx, key)
+                    .await;
             ui.selected_station_idx = ui.routing_menu_idx;
             handled
         }
@@ -2286,7 +2221,7 @@ async fn handle_key_normal(
                 return true;
             };
 
-            match refresh_profile_control_state(ui).await {
+            match refresh_profile_control_state(ui, proxy).await {
                 Ok(()) if ui.profile_options.is_empty() => {
                     ui.toast = Some((
                         i18n::text(ui.language, msg::PROFILE_NO_OPTIONS).to_string(),
@@ -2326,7 +2261,7 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('p') if ui.page == Page::Settings => {
-            match refresh_profile_control_state(ui).await {
+            match refresh_profile_control_state(ui, proxy).await {
                 Ok(()) if ui.profile_options.is_empty() => {
                     ui.toast = Some((
                         i18n::text(ui.language, msg::DEFAULT_PROFILE_NO_OPTIONS).to_string(),
@@ -2357,7 +2292,7 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('P') if ui.page == Page::Settings => {
-            match refresh_profile_control_state(ui).await {
+            match refresh_profile_control_state(ui, proxy).await {
                 Ok(()) if ui.profile_options.is_empty() => {
                     ui.toast = Some((
                         i18n::text(ui.language, msg::RUNTIME_DEFAULT_PROFILE_NO_OPTIONS)
@@ -3513,19 +3448,6 @@ async fn handle_key_normal(
             if ui.focus != Focus::Sessions {
                 return false;
             }
-            if ui.uses_route_graph_routing() {
-                open_routing_editor(
-                    ui,
-                    snapshot,
-                    i18n::label(
-                        ui.language,
-                        "v4 routing is global; editing persisted routing",
-                    ),
-                    balance_refresh_tx,
-                )
-                .await;
-                return true;
-            }
             let Some(sid) = snapshot
                 .rows
                 .get(ui.selected_session_idx)
@@ -3533,11 +3455,19 @@ async fn handle_key_normal(
             else {
                 return false;
             };
-            let current = snapshot
-                .station_overrides
-                .get(&sid)
-                .map(|s| s.as_str())
-                .unwrap_or("");
+            let current = if ui.uses_route_graph_routing() {
+                snapshot
+                    .route_target_overrides
+                    .get(&sid)
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+            } else {
+                snapshot
+                    .station_overrides
+                    .get(&sid)
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+            };
             ui.provider_menu_idx = providers
                 .iter()
                 .position(|p| p.name == current)
@@ -3546,6 +3476,7 @@ async fn handle_key_normal(
             let balance_started = request_provider_balance_refresh(
                 ui,
                 snapshot,
+                proxy,
                 BalanceRefreshMode::Auto,
                 balance_refresh_tx,
             );
@@ -3559,21 +3490,19 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('P') => {
-            if ui.uses_route_graph_routing() {
-                open_routing_editor(
-                    ui,
-                    snapshot,
-                    i18n::label(ui.language, "routing: edit provider policy/order/tags"),
-                    balance_refresh_tx,
-                )
-                .await;
-                return true;
-            }
-            let current = snapshot
-                .global_station_override
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("");
+            let current = if ui.uses_route_graph_routing() {
+                snapshot
+                    .global_route_target_override
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("")
+            } else {
+                snapshot
+                    .global_station_override
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("")
+            };
             ui.provider_menu_idx = providers
                 .iter()
                 .position(|p| p.name == current)
@@ -3582,6 +3511,7 @@ async fn handle_key_normal(
             let balance_started = request_provider_balance_refresh(
                 ui,
                 snapshot,
+                proxy,
                 BalanceRefreshMode::Auto,
                 balance_refresh_tx,
             );
@@ -3653,6 +3583,7 @@ async fn handle_key_profile_menu(
     state: &ProxyState,
     ui: &mut UiState,
     snapshot: &Snapshot,
+    proxy: &ProxyService,
     key: KeyEvent,
 ) -> bool {
     match key.code {
@@ -3728,8 +3659,8 @@ async fn handle_key_profile_menu(
                     }
                 }
                 Overlay::ProfileMenuDefaultRuntime => {
-                    match apply_runtime_default_profile(ui, chosen.clone()).await {
-                        Ok(()) => match refresh_profile_control_state(ui).await {
+                    match apply_runtime_default_profile(proxy, chosen.clone()).await {
+                        Ok(()) => match refresh_profile_control_state(ui, proxy).await {
                             Ok(()) => {
                                 ui.toast = Some((
                                     format!(
@@ -3771,8 +3702,8 @@ async fn handle_key_profile_menu(
                     }
                 }
                 Overlay::ProfileMenuDefaultPersisted => {
-                    match apply_persisted_default_profile(ui, chosen.clone()).await {
-                        Ok(()) => match refresh_profile_control_state(ui).await {
+                    match apply_persisted_default_profile(proxy, chosen.clone()).await {
+                        Ok(()) => match refresh_profile_control_state(ui, proxy).await {
                             Ok(()) => {
                                 ui.toast = Some((
                                     format!(
@@ -3826,16 +3757,28 @@ async fn handle_key_profile_menu(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        BalanceRefreshMode, default_profile_menu_idx, routing_entry_children,
-        routing_entry_is_flat_provider_list, routing_spec_after_provider_enabled_change,
-        routing_spec_with_order, should_request_provider_balance_refresh,
+        BalanceRefreshMode, default_profile_menu_idx, request_provider_balance_refresh,
+        routing_entry_children, routing_entry_is_flat_provider_list,
+        routing_spec_after_provider_enabled_change, routing_spec_with_order,
+        should_request_provider_balance_refresh,
     };
-    use crate::config::{RoutingExhaustedActionV4, RoutingPolicyV4};
+    use crate::config::{
+        ProxyConfig, ProxyConfigV4, RoutingExhaustedActionV4, RoutingPolicyV4, ServiceConfig,
+        ServiceConfigManager,
+    };
     use crate::dashboard_core::ControlProfileOption;
-    use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
-    use crate::tui::model::{RoutingProviderRef, RoutingSpecView, routing_provider_names};
+    use crate::lb::LbState;
+    use crate::proxy::ProxyService;
+    use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot, ProxyState};
+    use crate::tui::model::{
+        RoutingProviderRef, RoutingSpecView, Snapshot, routing_provider_names,
+    };
+    use crate::tui::state::UiState;
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use std::time::SystemTime;
+    use tokio::sync::mpsc;
 
     fn make_profile(name: &str) -> ControlProfileOption {
         ControlProfileOption {
@@ -3880,6 +3823,79 @@ mod tests {
         snapshot: ProviderBalanceSnapshot,
     ) -> HashMap<String, Vec<ProviderBalanceSnapshot>> {
         HashMap::from([("input".to_string(), vec![snapshot])])
+    }
+
+    async fn empty_snapshot(state: &ProxyState, cfg: Arc<ProxyConfig>) -> Snapshot {
+        crate::tui::model::refresh_snapshot(state, cfg, "codex", 7).await
+    }
+
+    fn proxy_with_single_station_without_upstreams() -> (ProxyService, Arc<ProxyConfig>) {
+        let mut codex = ServiceConfigManager {
+            active: Some("test".to_string()),
+            ..Default::default()
+        };
+        codex.configs.insert(
+            "test".to_string(),
+            ServiceConfig {
+                name: "test".to_string(),
+                alias: None,
+                enabled: true,
+                level: 1,
+                upstreams: Vec::new(),
+            },
+        );
+        let cfg = Arc::new(ProxyConfig {
+            codex,
+            ..Default::default()
+        });
+        let proxy = ProxyService::new(
+            reqwest::Client::new(),
+            cfg.clone(),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        );
+        (proxy, cfg)
+    }
+
+    struct ScopedEnv {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl ScopedEnv {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = self.previous.as_ref() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn make_temp_home(name: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        dir.push(format!(
+            "codex-helper-tui-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp CODEX_HELPER_HOME");
+        dir
     }
 
     #[test]
@@ -4021,6 +4037,39 @@ mod tests {
             1_000,
             Some(Duration::ZERO)
         ));
+    }
+
+    #[tokio::test]
+    async fn balance_refresh_uses_in_process_proxy_not_admin_http() {
+        let temp_home = make_temp_home("balance-refresh-in-process");
+        let _scoped_home = ScopedEnv::set_path("CODEX_HELPER_HOME", temp_home.as_path());
+        let _persisted = ProxyConfigV4::default();
+        std::fs::write(temp_home.join("config.toml"), "version = 5\n")
+            .expect("write empty persisted config");
+
+        let (proxy, cfg) = proxy_with_single_station_without_upstreams();
+        let mut ui = UiState::default();
+        let snapshot = empty_snapshot(proxy.state_handle().as_ref(), cfg).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let started = request_provider_balance_refresh(
+            &mut ui,
+            &snapshot,
+            &proxy,
+            BalanceRefreshMode::Force,
+            &tx,
+        );
+
+        assert!(started);
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("balance refresh should finish")
+            .expect("balance refresh should send outcome");
+        assert!(
+            result.is_ok(),
+            "in-process refresh should not try the invalid admin port: {result:?}"
+        );
+        assert!(ui.last_balance_refresh_requested_at.is_some());
     }
 
     #[test]
@@ -4496,6 +4545,7 @@ async fn handle_key_provider_menu(
     providers: &mut [ProviderOption],
     ui: &mut UiState,
     snapshot: &Snapshot,
+    _proxy: &ProxyService,
     key: KeyEvent,
 ) -> bool {
     match key.code {
@@ -4522,12 +4572,22 @@ async fn handle_key_provider_menu(
 
             match ui.overlay {
                 Overlay::ProviderMenuGlobal => {
-                    match apply_global_station_pin(state, providers, chosen.clone()).await {
+                    let result = if ui.uses_route_graph_routing() {
+                        apply_global_route_target_pin(state, providers, chosen.clone()).await
+                    } else {
+                        apply_global_station_pin(state, providers, chosen.clone()).await
+                    };
+                    match result {
                         Ok(()) => {
+                            let label = if ui.uses_route_graph_routing() {
+                                "global route target"
+                            } else {
+                                "global station pin"
+                            };
                             ui.toast = Some((
                                 format!(
                                     "{}: {}",
-                                    i18n::label(ui.language, "global station pin"),
+                                    i18n::label(ui.language, label),
                                     chosen
                                         .as_deref()
                                         .unwrap_or_else(|| i18n::label(ui.language, "<auto>"))
@@ -4536,11 +4596,13 @@ async fn handle_key_provider_menu(
                             ));
                         }
                         Err(err) => {
+                            let label = if ui.uses_route_graph_routing() {
+                                "set global route target failed"
+                            } else {
+                                "set global pin failed"
+                            };
                             ui.toast = Some((
-                                format!(
-                                    "{}: {err}",
-                                    i18n::label(ui.language, "set global pin failed")
-                                ),
+                                format!("{}: {err}", i18n::label(ui.language, label)),
                                 Instant::now(),
                             ));
                         }
@@ -4555,11 +4617,20 @@ async fn handle_key_provider_menu(
                         ui.overlay = Overlay::None;
                         return true;
                     };
-                    apply_session_provider_override(state, sid, chosen.clone()).await;
+                    if ui.uses_route_graph_routing() {
+                        apply_session_route_target_override(state, sid, chosen.clone()).await;
+                    } else {
+                        apply_session_provider_override(state, sid, chosen.clone()).await;
+                    }
+                    let label = if ui.uses_route_graph_routing() {
+                        "session route target"
+                    } else {
+                        "session station override"
+                    };
                     ui.toast = Some((
                         format!(
                             "{}: {}",
-                            i18n::label(ui.language, "session station override"),
+                            i18n::label(ui.language, label),
                             chosen
                                 .as_deref()
                                 .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
@@ -4659,6 +4730,7 @@ async fn handle_key_routing_menu(
     _providers: &mut [ProviderOption],
     ui: &mut UiState,
     snapshot: &Snapshot,
+    proxy: &ProxyService,
     balance_refresh_tx: &BalanceRefreshSender,
     key: KeyEvent,
 ) -> bool {
@@ -4671,10 +4743,11 @@ async fn handle_key_routing_menu(
             let balance_started = request_provider_balance_refresh(
                 ui,
                 snapshot,
+                proxy,
                 BalanceRefreshMode::Force,
                 balance_refresh_tx,
             );
-            match refresh_routing_control_state(ui).await {
+            match refresh_routing_control_state(ui, proxy).await {
                 Ok(()) => {
                     ui.toast = Some((
                         if balance_started {
@@ -4740,7 +4813,7 @@ async fn handle_key_routing_menu(
                 order,
                 crate::config::RoutingPolicyV4::OrderedFailover,
             );
-            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
+            match apply_persisted_routing(ui, snapshot, proxy, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((
                         i18n::label(ui.language, "routing: moved up").to_string(),
@@ -4785,7 +4858,7 @@ async fn handle_key_routing_menu(
                 order,
                 crate::config::RoutingPolicyV4::OrderedFailover,
             );
-            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
+            match apply_persisted_routing(ui, snapshot, proxy, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((
                         i18n::label(ui.language, "routing: moved down").to_string(),
@@ -4824,7 +4897,7 @@ async fn handle_key_routing_menu(
                 node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
             }
             next.sync_entry_compat_from_graph();
-            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
+            match apply_persisted_routing(ui, snapshot, proxy, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((
                         format!("{} {target}", i18n::label(ui.language, "routing: pinned")),
@@ -4850,7 +4923,7 @@ async fn handle_key_routing_menu(
                 order,
                 crate::config::RoutingPolicyV4::OrderedFailover,
             );
-            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
+            match apply_persisted_routing(ui, snapshot, proxy, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((
                         i18n::label(ui.language, "routing: ordered-failover").to_string(),
@@ -4886,7 +4959,7 @@ async fn handle_key_routing_menu(
                 node.on_exhausted = crate::config::RoutingExhaustedActionV4::Continue;
             }
             next.sync_entry_compat_from_graph();
-            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
+            match apply_persisted_routing(ui, snapshot, proxy, next, balance_refresh_tx).await {
                 Ok(()) => {
                     ui.toast = Some((
                         i18n::label(ui.language, "routing: prefer billing=monthly").to_string(),
@@ -4922,7 +4995,7 @@ async fn handle_key_routing_menu(
             };
             let next_enabled = !enabled;
             let original_spec = ui.routing_spec.clone();
-            match set_provider_enabled(ui, provider_name.as_str(), next_enabled).await {
+            match set_provider_enabled(ui, proxy, provider_name.as_str(), next_enabled).await {
                 Ok(()) => {
                     let mut suffix = String::new();
                     let mut balance_refresh_requested = false;
@@ -4936,6 +5009,7 @@ async fn handle_key_routing_menu(
                         match apply_persisted_routing(
                             ui,
                             snapshot,
+                            proxy,
                             next_routing,
                             balance_refresh_tx,
                         )
@@ -4957,6 +5031,7 @@ async fn handle_key_routing_menu(
                         request_provider_balance_refresh_after_control_change(
                             ui,
                             snapshot,
+                            proxy,
                             balance_refresh_tx,
                         );
                     }
@@ -5000,7 +5075,7 @@ async fn handle_key_routing_menu(
             };
             next.entry_node_mut().on_exhausted = on_exhausted;
             next.sync_entry_compat_from_graph();
-            match apply_persisted_routing(ui, snapshot, next, balance_refresh_tx).await {
+            match apply_persisted_routing(ui, snapshot, proxy, next, balance_refresh_tx).await {
                 Ok(()) => {
                     let label = match ui.routing_spec.as_ref().map(|spec| spec.on_exhausted) {
                         Some(crate::config::RoutingExhaustedActionV4::Continue) => "continue",
@@ -5037,11 +5112,12 @@ async fn handle_key_routing_menu(
                 KeyCode::Char('0') => None,
                 _ => unreachable!(),
             };
-            match set_provider_billing_tag(ui, provider_name.as_str(), value).await {
+            match set_provider_billing_tag(ui, proxy, provider_name.as_str(), value).await {
                 Ok(()) => {
                     request_provider_balance_refresh_after_control_change(
                         ui,
                         snapshot,
+                        proxy,
                         balance_refresh_tx,
                     );
                     let label = value.unwrap_or_else(|| i18n::label(ui.language, "<clear>"));

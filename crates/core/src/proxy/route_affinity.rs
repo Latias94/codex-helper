@@ -1,10 +1,9 @@
-use crate::lb::SelectedUpstream;
 use crate::logging::{RouteAttemptLog, now_ms};
 use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanTemplate};
 use crate::state::SessionRouteAffinityTarget;
 
 use super::ProxyService;
-use super::route_metadata::selected_route_metadata;
+use super::attempt_target::AttemptTarget;
 
 pub(super) async fn apply_session_route_affinity_to_runtime(
     proxy: &ProxyService,
@@ -13,9 +12,9 @@ pub(super) async fn apply_session_route_affinity_to_runtime(
     route_graph_key: &str,
     runtime: &mut RoutePlanRuntimeState,
 ) {
-    // V4 route graphs must not inherit the compatibility load balancer's global
-    // last_good_index. Session stickiness is isolated by session_id below.
-    runtime.clear_last_good_indices();
+    // V4 route graphs must not inherit any previously cached affinity.
+    // Session stickiness is isolated by session_id below.
+    runtime.clear_affinity_provider_endpoint();
 
     let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
         return;
@@ -26,28 +25,25 @@ pub(super) async fn apply_session_route_affinity_to_runtime(
     if affinity.route_graph_key != route_graph_key {
         return;
     }
-    let (Some(provider_id), Some(endpoint_id)) = (
-        affinity.provider_id.as_deref(),
-        affinity.endpoint_id.as_deref(),
-    ) else {
-        return;
-    };
-    let Some((station_name, upstream_index)) = template.compatibility_index_for_provider_endpoint(
-        provider_id,
-        endpoint_id,
+    if !template.contains_provider_endpoint(
+        &affinity.provider_endpoint,
         affinity.upstream_base_url.as_str(),
-    ) else {
+    ) {
         return;
-    };
+    }
 
-    runtime.set_station_last_good_index(station_name, Some(upstream_index));
+    runtime.set_affinity_provider_endpoint_with_observed_at(
+        Some(affinity.provider_endpoint),
+        Some(affinity.last_selected_at_ms),
+        Some(affinity.last_changed_at_ms),
+    );
 }
 
 pub(super) async fn record_session_route_affinity_success(
     proxy: &ProxyService,
     session_id: Option<&str>,
     route_graph_key: Option<&str>,
-    selected: &SelectedUpstream,
+    target: &AttemptTarget,
     route_attempts: &[RouteAttemptLog],
     route_attempt_index: usize,
 ) {
@@ -57,15 +53,14 @@ pub(super) async fn record_session_route_affinity_success(
     let Some(route_graph_key) = route_graph_key else {
         return;
     };
-    let metadata = selected_route_metadata(selected);
+    let Some(provider_endpoint) = target.provider_endpoint_ref().cloned() else {
+        return;
+    };
     let target = SessionRouteAffinityTarget {
         route_graph_key: route_graph_key.to_string(),
-        station_name: selected.station_name.clone(),
-        upstream_index: selected.index,
-        provider_id: metadata.provider_id,
-        endpoint_id: metadata.endpoint_id,
-        upstream_base_url: selected.upstream.base_url.clone(),
-        route_path: metadata.route_path,
+        provider_endpoint,
+        upstream_base_url: target.upstream().base_url.clone(),
+        route_path: target.route_path(),
     };
     let reason_hint = route_affinity_change_reason(route_attempts, route_attempt_index);
     proxy

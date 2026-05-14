@@ -610,6 +610,7 @@ mod tests {
                 configured_active_station: Some("right".to_string()),
                 effective_active_station: Some("vibe".to_string()),
                 global_station_override: None,
+                global_route_target_override: None,
                 configured_default_profile: Some("balanced".to_string()),
                 default_profile: Some("fast".to_string()),
                 default_profile_summary: None,

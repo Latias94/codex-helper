@@ -10,11 +10,15 @@ pub(super) fn override_routes(proxy: ProxyService) -> Router {
     let session_effort_set_proxy = proxy.clone();
     let session_station_list_proxy = proxy.clone();
     let session_station_set_proxy = proxy.clone();
+    let session_route_list_proxy = proxy.clone();
+    let session_route_set_proxy = proxy.clone();
     let session_service_tier_list_proxy = proxy.clone();
     let session_service_tier_set_proxy = proxy.clone();
     let session_reset_proxy = proxy.clone();
     let global_station_get_proxy = proxy.clone();
     let global_station_set_proxy = proxy.clone();
+    let global_route_get_proxy = proxy.clone();
+    let global_route_set_proxy = proxy.clone();
 
     Router::new()
         .route(
@@ -51,6 +55,13 @@ pub(super) fn override_routes(proxy: ProxyService) -> Router {
             ),
         )
         .route(
+            API_V1_SESSION_OVERRIDE_ROUTE,
+            get(move || list_session_route_target_overrides(session_route_list_proxy.clone()))
+                .post(move |payload| {
+                    set_session_route_target_override(session_route_set_proxy.clone(), payload)
+                }),
+        )
+        .route(
             API_V1_SESSION_OVERRIDE_SERVICE_TIER,
             get(move || {
                 list_session_service_tier_overrides(session_service_tier_list_proxy.clone())
@@ -70,6 +81,14 @@ pub(super) fn override_routes(proxy: ProxyService) -> Router {
             get(move || get_global_station_override(global_station_get_proxy.clone())).post(
                 move |payload| {
                     set_global_station_override(global_station_set_proxy.clone(), payload)
+                },
+            ),
+        )
+        .route(
+            API_V1_GLOBAL_ROUTE_OVERRIDE,
+            get(move || get_global_route_target_override(global_route_get_proxy.clone())).post(
+                move |payload| {
+                    set_global_route_target_override(global_route_set_proxy.clone(), payload)
                 },
             ),
         )

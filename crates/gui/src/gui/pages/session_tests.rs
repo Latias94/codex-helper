@@ -37,6 +37,7 @@ fn sample_session_row() -> SessionRow {
         override_model: None,
         override_effort: None,
         override_station: None,
+        override_route_target: None,
         override_service_tier: None,
     }
 }
@@ -175,11 +176,13 @@ fn session_effective_route_inline_summary_marks_priority_as_fast_mode() {
 fn session_manual_override_summary_marks_priority_as_fast_mode() {
     let mut row = sample_session_row();
     row.override_station = Some("right".to_string());
+    row.override_route_target = Some("paygo.default".to_string());
     row.override_service_tier = Some("priority".to_string());
 
     let summary = session_manual_override_summary(&row, Language::En);
 
     assert!(summary.contains("station=right"));
+    assert!(summary.contains("route_target=paygo.default"));
     assert!(summary.contains("priority (fast mode)"));
 }
 
@@ -299,10 +302,9 @@ fn session_current_target_summary_prefers_session_affinity() {
     });
     row.route_affinity = Some(SessionRouteAffinity {
         route_graph_key: "v4:deadbeef".to_string(),
-        station_name: "monthly_first".to_string(),
-        upstream_index: 2,
-        provider_id: Some("right".to_string()),
-        endpoint_id: Some("default".to_string()),
+        provider_endpoint: codex_helper_core::runtime_identity::ProviderEndpointKey::new(
+            "codex", "right", "default",
+        ),
         upstream_base_url: "https://api.right.example/v1".to_string(),
         route_path: vec!["monthly_first".to_string(), "right".to_string()],
         last_selected_at_ms: 1_000,
@@ -441,6 +443,7 @@ fn build_session_rows_skips_sessionless_runtime_buckets() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
         None,
         &HashMap::new(),
     );
@@ -456,6 +459,14 @@ fn session_list_control_label_prefers_profile_binding() {
     row.override_station = Some("right".to_string());
 
     assert_eq!(session_list_control_label(&row), "pf:fast");
+}
+
+#[test]
+fn session_list_control_label_reports_route_target_override() {
+    let mut row = sample_session_row();
+    row.override_route_target = Some("paygo.default".to_string());
+
+    assert_eq!(session_list_control_label(&row), "rt:paygo.defa…");
 }
 
 #[test]

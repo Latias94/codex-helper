@@ -73,7 +73,9 @@ define_messages! {
     STATUS_CURRENT_SHORT => { zh: "当前 ", en: "cur " },
     STATUS_HEALTH_CHECK_SHORT => { zh: "健康检查 ", en: "hc " },
     STATUS_OVERRIDES_SHORT => { zh: "覆盖(M/E/C/T) ", en: "overrides(M/E/C/T) " },
+    STATUS_OVERRIDES_ROUTE_SHORT => { zh: "覆盖(M/E/R/T) ", en: "overrides(M/E/R/T) " },
     STATUS_GLOBAL_STATION_OVERRIDE_SHORT => { zh: "覆盖(全局站点) ", en: "override(global station) " },
+    STATUS_GLOBAL_ROUTE_TARGET_SHORT => { zh: "覆盖(全局路由) ", en: "override(global route) " },
     STATUS_UPDATED_SHORT => { zh: "刷新 ", en: "updated " },
     STATUS_ACTIVE_TINY => { zh: "活 ", en: "act " },
     STATUS_ERRORS_TINY => { zh: "错 ", en: "err " },
@@ -93,6 +95,7 @@ define_messages! {
     OVERLAY_MANAGE_SESSION_PROFILE => { zh: "管理 Session Profile Binding", en: "Manage session profile binding" },
 
     FOOTER_DASHBOARD => { zh: "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话站点  P 全局 pin  O/H(会话) o/h(请求) 跳转  ? 帮助", en: "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session station  P global pin  O/H(session) o/h(request) jump  ? help" },
+    FOOTER_DASHBOARD_ROUTE_GRAPH => { zh: "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话 route target  P 全局 route target  O/H(会话) o/h(请求) 跳转  ? 帮助", en: "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session route target  P global route target  O/H(session) o/h(request) jump  ? help" },
     FOOTER_ROUTING => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ provider  r/Enter routing编辑  e 启停  f 包月优先  1/2/0 billing  s 耗尽策略  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ provider  r/Enter routing editor  e enable  f monthly-first  1/2/0 billing  s exhausted action  ? help" },
     FOOTER_STATIONS => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r routing  i 详情  Enter 全局 pin  Backspace 清除  o 会话站点 override  O 清除  h/H 检查  c/C 取消  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ select  r routing  i details  Enter global pin  Backspace clear  o session station override  O clear  h/H check  c/C cancel  ? help" },
     FOOTER_REQUESTS => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  x 清除聚焦  o 打开到 Sessions  h 打开到 History  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  x clear focus  o open Sessions  h open History  ? help" },
@@ -377,6 +380,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "generation" => "生成",
         "global override" => "全局覆盖",
         "global station pin" => "全局站点 pin",
+        "global route target" => "全局 route target",
         "global_station" => "全局站点",
         "health_check" => "健康检查",
         "health" => "健康",
@@ -523,6 +527,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "selected window starts before loaded log data" => "所选窗口早于已加载日志数据",
         "selected session has no session id" => "所选会话没有 session id",
         "set global pin failed" => "设置全局 pin 失败",
+        "set global route target failed" => "设置全局 route target 失败",
         "session" => "会话",
         "session-controlled route" => "会话控制路由",
         "session manual overrides reset" => "会话手动覆盖已重置",
@@ -531,6 +536,9 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "session station override" => "会话站点覆盖",
         "session station override: <clear>" => "会话站点覆盖：<清除>",
         "session station override: <no session>" => "会话站点覆盖：<无会话>",
+        "session route target" => "会话 route target",
+        "session route target: <no session>" => "会话 route target：<无会话>",
+        "route_target" => "路由目标",
         "sessions filter" => "sessions 筛选",
         "sessions filter: reset" => "sessions 筛选：已重置",
         "sessions: focused" => "sessions: 已聚焦",
@@ -613,6 +621,9 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         }
         "Effective route comes from request payloads, station defaults, and runtime fallback." => {
             "生效路由来自请求负载、站点默认值和运行时回退。"
+        }
+        "Effective route comes from request payloads, route graph defaults, route target overrides, and runtime fallback." => {
+            "生效路由来自请求负载、路由图默认值、route target 覆盖和运行时回退。"
         }
         _ => return None,
     })

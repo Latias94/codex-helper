@@ -90,7 +90,9 @@ pub(super) struct ResolvedApiV1Surface {
     pub(super) station_runtime: bool,
     pub(super) session_override_aggregate: bool,
     pub(super) global_station_override: bool,
+    pub(super) global_route_override: bool,
     pub(super) session_station: bool,
+    pub(super) session_route: bool,
     pub(super) session_reasoning_effort: bool,
     pub(super) session_model: bool,
     pub(super) session_service_tier: bool,
@@ -121,8 +123,11 @@ const API_V1_STATION_PROBE_ENDPOINT: &str = "/__codex_helper/api/v1/stations/pro
 const API_V1_SESSION_OVERRIDES_ENDPOINT: &str = "/__codex_helper/api/v1/overrides/session";
 const API_V1_GLOBAL_STATION_OVERRIDE_ENDPOINT: &str =
     "/__codex_helper/api/v1/overrides/global-station";
+const API_V1_GLOBAL_ROUTE_OVERRIDE_ENDPOINT: &str = "/__codex_helper/api/v1/overrides/global-route";
 const API_V1_SESSION_STATION_OVERRIDE_ENDPOINT: &str =
     "/__codex_helper/api/v1/overrides/session/station";
+const API_V1_SESSION_ROUTE_OVERRIDE_ENDPOINT: &str =
+    "/__codex_helper/api/v1/overrides/session/route";
 const API_V1_SESSION_REASONING_EFFORT_OVERRIDE_ENDPOINT: &str =
     "/__codex_helper/api/v1/overrides/session/effort";
 const API_V1_SESSION_MODEL_OVERRIDE_ENDPOINT: &str =
@@ -244,10 +249,20 @@ pub(super) fn resolve_api_v1_surface(
             endpoints,
             API_V1_GLOBAL_STATION_OVERRIDE_ENDPOINT,
         ),
+        global_route_override: supports_capability_flag(
+            surface.global_route_override,
+            endpoints,
+            API_V1_GLOBAL_ROUTE_OVERRIDE_ENDPOINT,
+        ),
         session_station: supports_capability_flag(
             surface.session_station_override,
             endpoints,
             API_V1_SESSION_STATION_OVERRIDE_ENDPOINT,
+        ),
+        session_route: supports_capability_flag(
+            surface.session_route_override,
+            endpoints,
+            API_V1_SESSION_ROUTE_OVERRIDE_ENDPOINT,
         ),
         session_reasoning_effort: supports_capability_flag(
             surface.session_reasoning_effort_override,
@@ -276,6 +291,8 @@ fn apply_resolved_surface(attached: &mut AttachedStatus, resolved_surface: Resol
     attached.supports_station_spec_api = resolved_surface.station_specs;
     attached.supports_default_profile_override = resolved_surface.default_profile_override;
     attached.supports_station_runtime_override = resolved_surface.station_runtime;
+    attached.supports_session_route_target_override = resolved_surface.session_route;
+    attached.supports_global_route_target_override = resolved_surface.global_route_override;
     attached.supports_session_override_reset = resolved_surface.session_override_reset;
     attached.supports_control_trace_api = resolved_surface.control_trace;
     attached.supports_request_ledger_api = resolved_surface.request_ledger_recent;
@@ -301,6 +318,7 @@ fn apply_discovered_proxy(attached: &mut AttachedStatus, discovered: &Discovered
         attached.configured_active_station = runtime.configured_active_station.clone();
         attached.effective_active_station = runtime.effective_active_station.clone();
         attached.global_station_override = runtime.global_station_override.clone();
+        attached.global_route_target_override = runtime.global_route_target_override.clone();
         attached.configured_default_profile = runtime.configured_default_profile.clone();
         attached.default_profile = runtime.default_profile.clone();
     }
@@ -330,9 +348,11 @@ fn discovery_surface_score(surface: &ControlPlaneSurfaceCapabilities) -> u32 {
         surface.session_model_override,
         surface.session_reasoning_effort_override,
         surface.session_station_override,
+        surface.session_route_override,
         surface.session_service_tier_override,
         surface.session_override_reset,
         surface.global_station_override,
+        surface.global_route_override,
         surface.control_trace,
         surface.request_ledger_recent,
         surface.request_ledger_summary,
@@ -703,6 +723,7 @@ mod tests {
             configured_active_station: None,
             effective_active_station: None,
             global_station_override: None,
+            global_route_target_override: None,
             configured_default_profile: None,
             default_profile: None,
             default_profile_summary: None,

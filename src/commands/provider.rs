@@ -4,7 +4,8 @@ use super::config_doc::{
 };
 use crate::cli_types::ProviderCommand;
 use crate::config::{
-    ProviderConfigV4, ProviderEndpointV4, ServiceViewV4, UpstreamAuth, storage::save_config_v4,
+    CURRENT_ROUTE_GRAPH_CONFIG_VERSION, ProviderConfigV4, ProviderEndpointV4, ServiceViewV4,
+    UpstreamAuth, storage::save_config_v4,
 };
 use crate::{CliError, CliResult};
 use serde::Serialize;
@@ -62,7 +63,7 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
 
             if json {
                 let payload = ProviderCatalogPayload {
-                    schema_version: 4,
+                    schema_version: CURRENT_ROUTE_GRAPH_CONFIG_VERSION,
                     service: service.to_string(),
                     providers: build_provider_views(view),
                 };
@@ -89,7 +90,7 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
 
             if json {
                 let payload = ProviderShowPayload {
-                    schema_version: 4,
+                    schema_version: CURRENT_ROUTE_GRAPH_CONFIG_VERSION,
                     service: service.to_string(),
                     provider,
                 };
@@ -322,7 +323,7 @@ fn endpoint_view_from_config(name: &str, endpoint: &ProviderEndpointV4) -> Provi
 }
 
 fn print_provider_detail(label: &str, provider: &ProviderView) {
-    println!("Schema version: v4");
+    println!("Schema version: v{CURRENT_ROUTE_GRAPH_CONFIG_VERSION}");
     println!("Service: {label}");
     println!("Provider: {}", provider.name);
     if let Some(alias) = provider.alias.as_deref() {

@@ -74,19 +74,20 @@ impl fmt::Display for LegacyUpstreamKey {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeUpstreamIdentity {
     pub provider_endpoint: ProviderEndpointKey,
-    pub legacy: LegacyUpstreamKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<LegacyUpstreamKey>,
     pub base_url: String,
 }
 
 impl RuntimeUpstreamIdentity {
     pub fn new(
         provider_endpoint: ProviderEndpointKey,
-        legacy: LegacyUpstreamKey,
+        compatibility: Option<LegacyUpstreamKey>,
         base_url: impl Into<String>,
     ) -> Self {
         Self {
             provider_endpoint,
-            legacy,
+            compatibility,
             base_url: base_url.into(),
         }
     }
@@ -95,8 +96,8 @@ impl RuntimeUpstreamIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeUpstreamCompatibilityChange {
     pub provider_endpoint: ProviderEndpointKey,
-    pub previous_legacy: LegacyUpstreamKey,
-    pub current_legacy: LegacyUpstreamKey,
+    pub previous_compatibility: Option<LegacyUpstreamKey>,
+    pub current_compatibility: Option<LegacyUpstreamKey>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,12 +120,12 @@ pub fn plan_runtime_upstream_identity_migration(
         match previous_by_endpoint.get(&current_identity.provider_endpoint) {
             Some(previous_identity) if previous_identity.base_url == current_identity.base_url => {
                 plan.retained.push(current_identity.clone());
-                if previous_identity.legacy != current_identity.legacy {
+                if previous_identity.compatibility != current_identity.compatibility {
                     plan.compatibility_changed
                         .push(RuntimeUpstreamCompatibilityChange {
                             provider_endpoint: current_identity.provider_endpoint.clone(),
-                            previous_legacy: previous_identity.legacy.clone(),
-                            current_legacy: current_identity.legacy.clone(),
+                            previous_compatibility: previous_identity.compatibility.clone(),
+                            current_compatibility: current_identity.compatibility.clone(),
                         });
                 }
             }
@@ -175,7 +176,7 @@ mod tests {
     fn runtime_identity_serializes_both_target_and_compatibility_keys() {
         let identity = RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "openai", "default"),
-            LegacyUpstreamKey::new("codex", "routing", 0),
+            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://api.openai.com/v1",
         );
 
@@ -185,8 +186,11 @@ mod tests {
             value["provider_endpoint"]["provider_id"].as_str(),
             Some("openai")
         );
-        assert_eq!(value["legacy"]["station_name"].as_str(), Some("routing"));
-        assert_eq!(value["legacy"]["upstream_index"].as_u64(), Some(0));
+        assert_eq!(
+            value["compatibility"]["station_name"].as_str(),
+            Some("routing")
+        );
+        assert_eq!(value["compatibility"]["upstream_index"].as_u64(), Some(0));
         assert_eq!(
             value["base_url"].as_str(),
             Some("https://api.openai.com/v1")
@@ -197,12 +201,12 @@ mod tests {
     fn migration_plan_retains_provider_endpoint_state_across_legacy_index_changes() {
         let previous = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "input", "default"),
-            LegacyUpstreamKey::new("codex", "routing", 1),
+            Some(LegacyUpstreamKey::new("codex", "routing", 1)),
             "https://api.example/v1",
         )];
         let current = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "input", "default"),
-            LegacyUpstreamKey::new("codex", "routing", 0),
+            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://api.example/v1",
         )];
 
@@ -217,12 +221,20 @@ mod tests {
             "codex/input/default"
         );
         assert_eq!(
-            plan.compatibility_changed[0].previous_legacy.stable_key(),
-            "codex/routing/1"
+            plan.compatibility_changed[0]
+                .previous_compatibility
+                .as_ref()
+                .map(LegacyUpstreamKey::stable_key)
+                .as_deref(),
+            Some("codex/routing/1")
         );
         assert_eq!(
-            plan.compatibility_changed[0].current_legacy.stable_key(),
-            "codex/routing/0"
+            plan.compatibility_changed[0]
+                .current_compatibility
+                .as_ref()
+                .map(LegacyUpstreamKey::stable_key)
+                .as_deref(),
+            Some("codex/routing/0")
         );
     }
 
@@ -230,12 +242,12 @@ mod tests {
     fn migration_plan_replaces_provider_endpoint_state_when_base_url_changes() {
         let previous = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "input", "default"),
-            LegacyUpstreamKey::new("codex", "routing", 0),
+            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://old.example/v1",
         )];
         let current = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "input", "default"),
-            LegacyUpstreamKey::new("codex", "routing", 0),
+            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://new.example/v1",
         )];
 
@@ -251,12 +263,12 @@ mod tests {
     fn migration_plan_classifies_added_and_removed_provider_endpoints() {
         let previous = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "old", "default"),
-            LegacyUpstreamKey::new("codex", "routing", 0),
+            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://old.example/v1",
         )];
         let current = vec![RuntimeUpstreamIdentity::new(
             ProviderEndpointKey::new("codex", "new", "default"),
-            LegacyUpstreamKey::new("codex", "routing", 0),
+            Some(LegacyUpstreamKey::new("codex", "routing", 0)),
             "https://new.example/v1",
         )];
 

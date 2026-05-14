@@ -70,9 +70,10 @@ pub use v2_impl::{
 };
 pub(crate) use v4_impl::compact_v4_config_for_write;
 pub use v4_impl::{
-    ConfigV4MigrationReport, compile_v4_to_runtime, compile_v4_to_v2, effective_v4_routing,
-    migrate_legacy_to_v4, migrate_legacy_to_v4_with_report, migrate_v2_to_v4,
-    migrate_v2_to_v4_with_report, resolved_v4_provider_order,
+    ConfigV4MigrationReport, collect_route_graph_affinity_migration_warnings,
+    compile_v4_to_runtime, compile_v4_to_v2, effective_v4_routing, migrate_legacy_to_v4,
+    migrate_legacy_to_v4_with_report, migrate_v2_to_v4, migrate_v2_to_v4_with_report,
+    resolved_v4_provider_order,
 };
 
 pub mod legacy {
@@ -436,8 +437,18 @@ fn default_proxy_config_v2_version() -> u32 {
     2
 }
 
+pub const LEGACY_ROUTE_GRAPH_CONFIG_VERSION: u32 = 4;
+pub const CURRENT_ROUTE_GRAPH_CONFIG_VERSION: u32 = 5;
+
+pub fn is_supported_route_graph_config_version(version: u32) -> bool {
+    matches!(
+        version,
+        LEGACY_ROUTE_GRAPH_CONFIG_VERSION | CURRENT_ROUTE_GRAPH_CONFIG_VERSION
+    )
+}
+
 fn default_proxy_config_v4_version() -> u32 {
-    4
+    CURRENT_ROUTE_GRAPH_CONFIG_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -598,6 +609,15 @@ pub struct ProviderEndpointV4 {
 pub struct RoutingConfigV4 {
     #[serde(default = "default_routing_entry_v4")]
     pub entry: String,
+    #[serde(
+        default = "default_routing_affinity_policy_v5",
+        skip_serializing_if = "is_default_routing_affinity_policy_v5"
+    )]
+    pub affinity_policy: RoutingAffinityPolicyV5,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_preferred_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub routes: BTreeMap<String, RoutingNodeV4>,
     #[serde(skip, default = "default_routing_policy_v4")]
@@ -620,6 +640,9 @@ impl Default for RoutingConfigV4 {
     fn default() -> Self {
         Self {
             entry: default_routing_entry_v4(),
+            affinity_policy: default_routing_affinity_policy_v5(),
+            fallback_ttl_ms: None,
+            reprobe_preferred_after_ms: None,
             routes: BTreeMap::new(),
             policy: default_routing_policy_v4(),
             order: Vec::new(),
@@ -680,6 +703,9 @@ impl RoutingConfigV4 {
         let mut out = Self {
             routes: BTreeMap::from([(entry.clone(), node)]),
             entry,
+            affinity_policy: default_routing_affinity_policy_v5(),
+            fallback_ttl_ms: None,
+            reprobe_preferred_after_ms: None,
             policy: default_routing_policy_v4(),
             order: Vec::new(),
             target: None,
@@ -955,6 +981,23 @@ fn default_routing_on_exhausted_v4() -> RoutingExhaustedActionV4 {
     RoutingExhaustedActionV4::Continue
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoutingAffinityPolicyV5 {
+    Off,
+    PreferredGroup,
+    FallbackSticky,
+    Hard,
+}
+
+fn default_routing_affinity_policy_v5() -> RoutingAffinityPolicyV5 {
+    RoutingAffinityPolicyV5::PreferredGroup
+}
+
+fn is_default_routing_affinity_policy_v5(policy: &RoutingAffinityPolicyV5) -> bool {
+    *policy == default_routing_affinity_policy_v5()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct RoutingPoolV4 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -975,6 +1018,12 @@ pub struct PersistedRoutingProviderRef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedRoutingSpec {
     pub entry: String,
+    #[serde(default = "default_routing_affinity_policy_v5")]
+    pub affinity_policy: RoutingAffinityPolicyV5,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_preferred_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub routes: BTreeMap<String, RoutingNodeV4>,
     #[serde(default = "default_routing_policy_v4")]

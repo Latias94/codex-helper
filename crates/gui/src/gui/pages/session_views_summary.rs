@@ -19,10 +19,10 @@ pub(super) fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
         row.last_station_name(),
         row.route_affinity
             .as_ref()
-            .and_then(|affinity| affinity.provider_id.as_deref()),
+            .map(|affinity| affinity.provider_endpoint.provider_id.as_str()),
         row.route_affinity
             .as_ref()
-            .and_then(|affinity| affinity.endpoint_id.as_deref()),
+            .map(|affinity| affinity.provider_endpoint.endpoint_id.as_str()),
         row.route_affinity
             .as_ref()
             .map(|affinity| affinity.upstream_base_url.as_str()),
@@ -45,6 +45,7 @@ pub(super) fn session_row_matches_query(row: &SessionRow, q: &str) -> bool {
         row.override_model.as_deref(),
         row.override_effort.as_deref(),
         row.override_station_name(),
+        row.override_route_target(),
         row.override_service_tier.as_deref(),
     ]
     .into_iter()
@@ -107,8 +108,8 @@ pub(super) fn session_current_target_summary(row: &SessionRow, lang: Language) -
     let current_upstream = resolved_route_value_text(row.effective_upstream_base_url.as_ref());
     let provider = if let Some(affinity) = row.route_affinity.as_ref() {
         format_route_decision_provider_endpoint(
-            affinity.provider_id.as_deref(),
-            affinity.endpoint_id.as_deref(),
+            Some(affinity.provider_endpoint.provider_id.as_str()),
+            Some(affinity.provider_endpoint.endpoint_id.as_str()),
         )
         .map(|provider| {
             format!(
@@ -156,13 +157,13 @@ pub(super) fn session_current_target_summary(row: &SessionRow, lang: Language) -
 pub(super) fn session_route_affinity_summary(row: &SessionRow, lang: Language) -> Option<String> {
     let affinity = row.route_affinity.as_ref()?;
     let provider = format_route_decision_provider_endpoint(
-        affinity.provider_id.as_deref(),
-        affinity.endpoint_id.as_deref(),
+        Some(affinity.provider_endpoint.provider_id.as_str()),
+        Some(affinity.provider_endpoint.endpoint_id.as_str()),
     )
     .unwrap_or_else(|| "-".to_string());
     Some(format!(
         "{} / {} / {} [{}] {}",
-        affinity.station_name,
+        affinity.provider_endpoint.stable_key(),
         provider,
         shorten_middle(&affinity.upstream_base_url, 56),
         pick(lang, "路由图", "route graph"),
@@ -216,8 +217,12 @@ pub(super) fn session_list_control_label(row: &SessionRow) -> String {
     if let Some(station_name) = row.override_station_name() {
         return format!("pin:{}", shorten(station_name, 10));
     }
+    if let Some(route_target) = row.override_route_target() {
+        return format!("rt:{}", shorten(route_target, 10));
+    }
     let override_count = usize::from(row.override_model.is_some())
         + usize::from(row.override_effort.is_some())
+        + usize::from(row.override_route_target().is_some())
         + usize::from(row.override_service_tier.is_some());
     if override_count > 0 {
         return format!("ovr:{override_count}");

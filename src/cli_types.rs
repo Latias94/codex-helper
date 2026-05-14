@@ -217,7 +217,7 @@ pub enum ConfigCommand {
         yes: bool,
     },
 
-    /// Preview or write migration output for the v4 route graph schema
+    /// Preview or write migration output for the current route graph schema
     Migrate {
         /// Preview only; print migrated TOML to stdout
         #[arg(long, conflicts_with = "write")]
@@ -233,7 +233,7 @@ pub enum ConfigCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum RoutingCommand {
-    /// Show the v4 route graph recipe for Codex or Claude
+    /// Show the current route graph recipe for Codex or Claude
     Show {
         /// Target Codex routing (default if neither flag is set)
         #[arg(long)]
@@ -292,7 +292,7 @@ pub enum RoutingCommand {
         /// Routing policy
         #[arg(long, value_enum)]
         policy: Option<RoutingPolicy>,
-        /// Manual-sticky target provider; implies manual-sticky when policy is omitted
+        /// Manual-sticky target route, provider, or provider endpoint; implies manual-sticky when policy is omitted
         #[arg(long)]
         target: Option<String>,
         /// Clear manual target; switches manual-sticky back to ordered-failover
@@ -321,9 +321,9 @@ pub enum RoutingCommand {
         #[arg(long)]
         claude: bool,
     },
-    /// Pin routing to one provider
+    /// Pin routing to one route, provider, or provider endpoint
     Pin {
-        provider: String,
+        target: String,
         /// Target Codex routing (default if neither flag is set)
         #[arg(long)]
         codex: bool,

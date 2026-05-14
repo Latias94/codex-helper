@@ -246,8 +246,7 @@ async fn proxy_api_v1_station_settings_rejects_persisted_writes_after_v2_auto_mi
     assert_eq!(update_station.status(), StatusCode::BAD_REQUEST);
     let update_station_body = update_station.text().await.expect("update station body");
     assert!(
-        update_station_body
-            .contains("v4 route graph configs do not support station settings writes"),
+        update_station_body.contains("route graph configs do not support station settings writes"),
         "{update_station_body}"
     );
 
@@ -265,13 +264,13 @@ async fn proxy_api_v1_station_settings_rejects_persisted_writes_after_v2_auto_mi
     assert_eq!(set_active.status(), StatusCode::BAD_REQUEST);
     let set_active_body = set_active.text().await.expect("set active body");
     assert!(
-        set_active_body.contains("v4 route graph configs do not support station active writes"),
+        set_active_body.contains("route graph configs do not support station active writes"),
         "{set_active_body}"
     );
 
     let config_text =
         std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted config.toml");
-    assert!(config_text.contains("version = 4"));
+    assert!(config_text.contains("version = 5"));
     assert!(!config_text.contains("[codex.stations."));
 
     proxy_handle.abort();
@@ -347,13 +346,18 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
     crate::config::save_config_v4(&cfg)
         .await
         .expect("write initial v4 config");
-    let loaded = crate::config::load_config()
+    let loaded = crate::config::load_config_with_v4_source()
         .await
         .expect("load initial runtime config");
+    let v4_source = loaded
+        .v4
+        .clone()
+        .expect("v4 config source should be available for route graph runtime");
 
-    let proxy = ProxyService::new(
+    let proxy = ProxyService::new_with_v4_source(
         Client::new(),
-        Arc::new(loaded),
+        Arc::new(loaded.runtime),
+        Some(Arc::new(v4_source)),
         "codex",
         Arc::new(std::sync::Mutex::new(HashMap::new())),
     );
@@ -432,6 +436,198 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
     assert_eq!(
         capabilities["surface_capabilities"]["station_persisted_settings"].as_bool(),
         Some(false)
+    );
+    assert_eq!(
+        capabilities["surface_capabilities"]["session_station_override"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        capabilities["surface_capabilities"]["global_station_override"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        capabilities["surface_capabilities"]["session_route_override"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        capabilities["surface_capabilities"]["global_route_override"].as_bool(),
+        Some(true)
+    );
+
+    let station_session_override_rejected = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/station",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "session_id": "s1", "station_name": "routing" }))
+        .send()
+        .await
+        .expect("set v4 session station override send");
+    assert_eq!(
+        station_session_override_rejected.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let station_global_override_rejected = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/global-station",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "station_name": "routing" }))
+        .send()
+        .await
+        .expect("set v4 global station override send");
+    assert_eq!(
+        station_global_override_rejected.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let disabled_route_override_rejected = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/route",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "session_id": "s1", "target": "input.default" }))
+        .send()
+        .await
+        .expect("set disabled v4 session route override send");
+    assert_eq!(
+        disabled_route_override_rejected.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let set_session_route_override = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/route",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "session_id": "s1", "target": "backup.default" }))
+        .send()
+        .await
+        .expect("set v4 session route override send");
+    let set_session_route_override_status = set_session_route_override.status();
+    let set_session_route_override_body = set_session_route_override
+        .text()
+        .await
+        .expect("set v4 session route override body");
+    assert_eq!(
+        set_session_route_override_status,
+        StatusCode::NO_CONTENT,
+        "{set_session_route_override_body}"
+    );
+
+    let route_override_map = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/route",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v4 session route overrides send")
+        .error_for_status()
+        .expect("get v4 session route overrides status")
+        .json::<HashMap<String, String>>()
+        .await
+        .expect("get v4 session route overrides json");
+    assert_eq!(
+        route_override_map.get("s1").map(String::as_str),
+        Some("backup.default")
+    );
+
+    let manual_overrides = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v4 session manual overrides send")
+        .error_for_status()
+        .expect("get v4 session manual overrides status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v4 session manual overrides json");
+    assert_eq!(
+        manual_overrides["sessions"]["s1"]["route_target"].as_str(),
+        Some("backup.default")
+    );
+
+    let set_global_route_override = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/global-route",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "target": "paygo.default" }))
+        .send()
+        .await
+        .expect("set v4 global route override send");
+    assert_eq!(set_global_route_override.status(), StatusCode::NO_CONTENT);
+
+    let global_route_override = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/overrides/global-route",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v4 global route override send")
+        .error_for_status()
+        .expect("get v4 global route override status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v4 global route override json");
+    assert_eq!(global_route_override.as_str(), Some("paygo.default"));
+
+    let session_route_explain = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/routing/explain?session=s1",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v4 session route explain send")
+        .error_for_status()
+        .expect("get v4 session route explain status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v4 session route explain json");
+    assert_eq!(
+        session_route_explain["selected_route"]["provider_id"].as_str(),
+        Some("backup")
+    );
+    assert_eq!(
+        session_route_explain["selected_route"]["endpoint_id"].as_str(),
+        Some("default")
+    );
+    assert_eq!(
+        session_route_explain["selected_route"]["provider_endpoint_key"].as_str(),
+        Some("codex/backup/default")
+    );
+
+    let global_route_explain = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/routing/explain?session=s2",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get v4 global route explain send")
+        .error_for_status()
+        .expect("get v4 global route explain status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get v4 global route explain json");
+    assert_eq!(
+        global_route_explain["selected_route"]["provider_id"].as_str(),
+        Some("paygo")
+    );
+    assert_eq!(
+        global_route_explain["selected_route"]["endpoint_id"].as_str(),
+        Some("default")
+    );
+    assert_eq!(
+        global_route_explain["selected_route"]["provider_endpoint_key"].as_str(),
+        Some("codex/paygo/default")
     );
 
     let routing_spec = client
@@ -536,6 +732,85 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
         .expect("set v4 routing target json");
     assert_eq!(set_routing_target["policy"].as_str(), Some("manual-sticky"));
     assert_eq!(set_routing_target["target"].as_str(), Some("input"));
+
+    let session_overrides_manual_explain = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/routing/explain?session=s1",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get session override over manual-sticky explain send")
+        .error_for_status()
+        .expect("get session override over manual-sticky explain status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get session override over manual-sticky explain json");
+    assert_eq!(
+        session_overrides_manual_explain["selected_route"]["provider_endpoint_key"].as_str(),
+        Some("codex/backup/default")
+    );
+
+    let global_overrides_manual_explain = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/routing/explain?session=s2",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get global override over manual-sticky explain send")
+        .error_for_status()
+        .expect("get global override over manual-sticky explain status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get global override over manual-sticky explain json");
+    assert_eq!(
+        global_overrides_manual_explain["selected_route"]["provider_endpoint_key"].as_str(),
+        Some("codex/paygo/default")
+    );
+
+    let clear_session_route_override = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/session/route",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "session_id": "s1", "target": null }))
+        .send()
+        .await
+        .expect("clear v4 session route override send");
+    assert_eq!(
+        clear_session_route_override.status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let clear_global_route_override = client
+        .post(format!(
+            "http://{}/__codex_helper/api/v1/overrides/global-route",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({ "target": null }))
+        .send()
+        .await
+        .expect("clear v4 global route override send");
+    assert_eq!(clear_global_route_override.status(), StatusCode::NO_CONTENT);
+
+    let persisted_manual_explain = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/routing/explain?session=s3",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("get persisted manual-sticky explain send")
+        .error_for_status()
+        .expect("get persisted manual-sticky explain status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get persisted manual-sticky explain json");
+    assert_eq!(
+        persisted_manual_explain["selected_route"]["provider_endpoint_key"].as_str(),
+        Some("codex/input/default")
+    );
 
     let set_nested_graph = client
         .put(format!(
@@ -668,8 +943,7 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
         .await
         .expect("station-bound profile error body");
     assert!(
-        station_bound_profile_body
-            .contains("v4 route graph profiles do not support station bindings"),
+        station_bound_profile_body.contains("route graph profiles do not support station bindings"),
         "{station_bound_profile_body}"
     );
 
@@ -700,7 +974,7 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
 
     let config_text =
         std::fs::read_to_string(temp_dir.join("config.toml")).expect("read persisted v4 config");
-    assert!(config_text.contains("version = 4"));
+    assert!(config_text.contains("version = 5"));
     assert!(!config_text.contains("[codex.stations."));
     let persisted_cfg: crate::config::ProxyConfigV4 =
         toml::from_str(&config_text).expect("parse persisted v4 config");
@@ -999,7 +1273,7 @@ async fn proxy_api_v1_station_specs_rejects_crud_after_v2_auto_migration() {
     assert_eq!(initial.status(), StatusCode::BAD_REQUEST);
     let initial_body = initial.text().await.expect("get station specs body");
     assert!(
-        initial_body.contains("v4 route graph configs do not expose station specs"),
+        initial_body.contains("route graph configs do not expose station specs"),
         "{initial_body}"
     );
 

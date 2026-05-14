@@ -26,13 +26,23 @@ pub(super) fn render_running_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<
         pick(ctx.lang, "最近请求(<=200)", "Recent (<=200)"),
         running.recent.len()
     ));
+    let route_graph_routing = running
+        .cfg
+        .version
+        .is_some_and(crate::config::is_supported_route_graph_config_version);
     ui.label(format!(
         "{}: {}",
-        pick(ctx.lang, "全局覆盖(Pinned)", "Global override (pinned)"),
-        running
-            .global_station_override
-            .as_deref()
-            .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
+        if route_graph_routing {
+            pick(ctx.lang, "全局 route target", "Global route target")
+        } else {
+            pick(ctx.lang, "全局覆盖(Pinned)", "Global override (pinned)")
+        },
+        if route_graph_routing {
+            running.global_route_target_override.as_deref()
+        } else {
+            running.global_station_override.as_deref()
+        }
+        .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
     ));
 
     let active_name = match running.service_name {
@@ -78,8 +88,8 @@ pub(super) fn render_running_proxy_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<
             egui::Color32::from_rgb(120, 120, 120),
             pick(
                 ctx.lang,
-                "默认 active_station / global pin / drain / breaker 已移到 Stations 页集中操作。",
-                "Default active_station / global pin / drain / breaker now live in the Stations page.",
+                "运行时 route target / 兼容 active_station / drain / breaker 已移到 Stations 页集中操作。",
+                "Runtime route target / compatible active_station / drain / breaker now live in the Stations page.",
             ),
         );
         if ui
@@ -117,17 +127,22 @@ fn format_running_route_summary(explain: &RoutingExplainResponse) -> Option<Stri
     } else {
         selected.route_path.join(" > ")
     };
-    let compat_station = if selected.compatibility.station_name.is_empty() {
-        "-"
-    } else {
-        selected.compatibility.station_name.as_str()
-    };
+    let compatibility = selected
+        .compatibility
+        .as_ref()
+        .map(|compatibility| {
+            format!(
+                "compat_station={} upstream#{}",
+                compatibility.station_name, compatibility.upstream_index
+            )
+        })
+        .unwrap_or_else(|| "compatibility=-".to_string());
     Some(format!(
-        "provider={}/{} path={} compat_station={}",
+        "provider={}/{} path={} {}",
         selected.provider_id.as_str(),
         selected.endpoint_id.as_str(),
         path,
-        compat_station
+        compatibility
     ))
 }
 
@@ -148,18 +163,20 @@ mod tests {
                 provider_id: "alpha".to_string(),
                 provider_alias: Some("Alpha".to_string()),
                 endpoint_id: "default".to_string(),
+                provider_endpoint_key: "codex/alpha/default".to_string(),
                 route_path: vec!["entry".to_string(), "alpha".to_string()],
-                compatibility: crate::routing_explain::RoutingExplainCompatibility {
+                preference_group: 0,
+                compatibility: Some(crate::routing_explain::RoutingExplainCompatibility {
                     station_name: "routing".to_string(),
                     upstream_index: 0,
-                },
-                station_name: "routing".to_string(),
-                upstream_index: 0,
+                }),
                 upstream_base_url: "https://alpha.example/v1".to_string(),
                 selected: true,
                 skip_reasons: Vec::new(),
             }),
             candidates: Vec::new(),
+            affinity_policy: "none".to_string(),
+            affinity: None,
             conditional_routes: Vec::new(),
         };
 
@@ -167,6 +184,40 @@ mod tests {
 
         assert!(summary.contains("provider=alpha/default"));
         assert!(summary.contains("path=entry > alpha"));
-        assert!(summary.contains("compat_station=routing"));
+        assert!(summary.contains("compat_station=routing upstream#0"));
+    }
+
+    #[test]
+    fn format_running_route_summary_marks_absent_legacy_compatibility() {
+        let explain = RoutingExplainResponse {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            runtime_loaded_at_ms: Some(123),
+            request_model: Some("gpt-5.4".to_string()),
+            session_id: Some("sid-1".to_string()),
+            request_context: Default::default(),
+            selected_route: Some(crate::routing_explain::RoutingExplainCandidate {
+                provider_id: "alpha".to_string(),
+                provider_alias: Some("Alpha".to_string()),
+                endpoint_id: "default".to_string(),
+                provider_endpoint_key: "codex/alpha/default".to_string(),
+                route_path: vec!["entry".to_string(), "alpha".to_string()],
+                preference_group: 0,
+                compatibility: None,
+                upstream_base_url: "https://alpha.example/v1".to_string(),
+                selected: true,
+                skip_reasons: Vec::new(),
+            }),
+            candidates: Vec::new(),
+            affinity_policy: "none".to_string(),
+            affinity: None,
+            conditional_routes: Vec::new(),
+        };
+
+        let summary = format_running_route_summary(&explain).expect("route summary");
+
+        assert!(summary.contains("provider=alpha/default"));
+        assert!(summary.contains("compatibility=-"));
+        assert!(!summary.contains("compat_station=-"));
     }
 }

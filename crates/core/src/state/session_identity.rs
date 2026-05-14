@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ServiceConfigManager;
 use crate::pricing::CostBreakdown;
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
 use crate::usage::{CacheInputAccounting, UsageMetrics};
 
@@ -397,12 +398,7 @@ pub struct RouteDecisionProvenance {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRouteAffinity {
     pub route_graph_key: String,
-    pub station_name: String,
-    pub upstream_index: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint_id: Option<String>,
+    pub provider_endpoint: ProviderEndpointKey,
     pub upstream_base_url: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_path: Vec<String>,
@@ -414,10 +410,7 @@ pub struct SessionRouteAffinity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRouteAffinityTarget {
     pub route_graph_key: String,
-    pub station_name: String,
-    pub upstream_index: usize,
-    pub provider_id: Option<String>,
-    pub endpoint_id: Option<String>,
+    pub provider_endpoint: ProviderEndpointKey,
     pub upstream_base_url: String,
     pub route_path: Vec<String>,
 }
@@ -425,10 +418,7 @@ pub struct SessionRouteAffinityTarget {
 impl SessionRouteAffinityTarget {
     pub(crate) fn same_target(&self, affinity: &SessionRouteAffinity) -> bool {
         self.route_graph_key == affinity.route_graph_key
-            && self.station_name == affinity.station_name
-            && self.upstream_index == affinity.upstream_index
-            && self.provider_id == affinity.provider_id
-            && self.endpoint_id == affinity.endpoint_id
+            && self.provider_endpoint == affinity.provider_endpoint
             && self.upstream_base_url == affinity.upstream_base_url
             && self.route_path == affinity.route_path
     }
@@ -511,6 +501,8 @@ pub struct SessionManualOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub station_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
@@ -520,6 +512,7 @@ impl SessionManualOverrides {
     pub fn is_empty(&self) -> bool {
         self.reasoning_effort.is_none()
             && self.station_name.is_none()
+            && self.route_target.is_none()
             && self.model.is_none()
             && self.service_tier.is_none()
     }
@@ -536,6 +529,14 @@ pub(super) struct SessionEffortOverride {
 #[derive(Debug, Clone)]
 pub(super) struct SessionStationOverride {
     pub(super) station_name: String,
+    #[allow(dead_code)]
+    pub(super) updated_at_ms: u64,
+    pub(super) last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SessionRouteTargetOverride {
+    pub(super) target: String,
     #[allow(dead_code)]
     pub(super) updated_at_ms: u64,
     pub(super) last_seen_ms: u64,

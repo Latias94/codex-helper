@@ -107,14 +107,14 @@ auth_token_env = "RIGHTCODE_API_KEY"
         let cfg = super::load_config()
             .await
             .expect("load unversioned legacy config");
-        assert_eq!(cfg.version, Some(4));
+        assert_eq!(cfg.version, Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION));
         assert_eq!(
             cfg.codex.active_station().map(|svc| svc.name.as_str()),
             Some("right")
         );
 
         let saved = std::fs::read_to_string(&toml_path).expect("read migrated config.toml");
-        assert!(saved.contains("version = 4"));
+        assert!(saved.contains("version = 5"));
         assert!(saved.contains("[codex.providers.rightcode]"));
         assert!(saved.contains("[codex.routing]"));
         assert!(!saved.contains("[codex.configs.right]"));
@@ -190,7 +190,7 @@ env_key = "RIGHTCODE_API_KEY"
             .await
             .expect("init_config_toml");
         let text = std::fs::read_to_string(&path).expect("read config.toml");
-        assert!(text.contains("version = 4"), "expected v4 template");
+        assert!(text.contains("version = 5"), "expected v5 template");
         assert!(
             text.contains("[codex.providers.right]"),
             "expected imported provider block to be present"
@@ -241,7 +241,7 @@ env_key = "RIGHTCODE_API_KEY"
             .await
             .expect("init_config_toml");
         let text = std::fs::read_to_string(&path).expect("read config.toml");
-        assert!(text.contains("version = 4"), "expected v4 template");
+        assert!(text.contains("version = 5"), "expected v5 template");
         assert!(
             !text.contains("\n[codex]\n"),
             "expected no_import to skip inserting a real [codex] block"
@@ -413,7 +413,7 @@ env_key = "RIGHTCODE_API_KEY"
             .join("\n");
         let loaded: ProxyConfigV4 =
             toml::from_str(&text).expect("config.toml should be valid ProxyConfigV4");
-        assert_eq!(loaded.version, 4);
+        assert_eq!(loaded.version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION);
         let runtime = super::compile_v4_to_runtime(&loaded).expect("compile v4 runtime");
         let svc2 = runtime
             .codex

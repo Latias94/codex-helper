@@ -54,6 +54,32 @@ fn compact_service_view_v4_for_write(view: &mut ServiceViewV4) {
     }
 }
 
+pub fn collect_route_graph_affinity_migration_warnings(
+    service_name: &str,
+    view: &ServiceViewV4,
+    warnings: &mut Vec<String>,
+) {
+    let Some(routing) = view.routing.as_ref() else {
+        return;
+    };
+
+    if routing.affinity_policy == RoutingAffinityPolicyV5::PreferredGroup
+        && route_graph_has_fallback_choices(routing)
+    {
+        warnings.push(format!(
+            "[{service_name}] route graph affinity now defaults to preferred-group; if you relied on old fallback-sticky behavior, set affinity_policy = \"fallback-sticky\" explicitly."
+        ));
+    }
+}
+
+fn route_graph_has_fallback_choices(routing: &RoutingConfigV4) -> bool {
+    routing.order.len() > 1
+        || routing.chain.len() > 1
+        || routing.routes.values().any(|node| {
+            node.children.len() > 1 || (node.target.is_some() && !node.children.is_empty())
+        })
+}
+
 pub fn compact_v4_config_for_write(cfg: &mut ProxyConfigV4) {
     compact_service_view_v4_for_write(&mut cfg.codex);
     compact_service_view_v4_for_write(&mut cfg.claude);
@@ -82,7 +108,7 @@ fn provider_v4_to_v2(
                 base_url: base_url.to_string(),
                 enabled: true,
                 priority: default_provider_endpoint_priority(),
-                tags: BTreeMap::new(),
+                tags: BTreeMap::from([("endpoint_id".to_string(), "default".to_string())]),
                 supported_models: BTreeMap::new(),
                 model_mapping: BTreeMap::new(),
             },
@@ -101,7 +127,11 @@ fn provider_v4_to_v2(
                 base_url: endpoint.base_url.trim().to_string(),
                 enabled: endpoint.enabled,
                 priority: endpoint.priority,
-                tags: endpoint.tags.clone(),
+                tags: {
+                    let mut tags = endpoint.tags.clone();
+                    tags.insert("endpoint_id".to_string(), endpoint_name.clone());
+                    tags
+                },
                 supported_models: endpoint.supported_models.clone(),
                 model_mapping: endpoint.model_mapping.clone(),
             },
@@ -184,10 +214,13 @@ fn validate_service_view_v4_runtime_shape(service_name: &str, view: &ServiceView
 }
 
 fn route_candidate_to_compat_upstream(candidate: &RouteCandidate) -> UpstreamConfig {
+    let mut tags = btree_string_map_to_hash_map(&candidate.tags);
+    tags.insert("endpoint_id".to_string(), candidate.endpoint_id.clone());
+
     UpstreamConfig {
         base_url: candidate.base_url.clone(),
         auth: candidate.auth.clone(),
-        tags: btree_string_map_to_hash_map(&candidate.tags),
+        tags,
         supported_models: btree_bool_map_to_hash_map(&candidate.supported_models),
         model_mapping: btree_string_map_to_hash_map(&candidate.model_mapping),
     }
@@ -566,8 +599,8 @@ fn compile_service_view_v4_runtime(
 }
 
 pub fn compile_v4_to_v2(v4: &ProxyConfigV4) -> Result<ProxyConfigV2> {
-    if v4.version != 4 {
-        anyhow::bail!("unsupported v4 config version: {}", v4.version);
+    if !is_supported_route_graph_config_version(v4.version) {
+        anyhow::bail!("unsupported route graph config version: {}", v4.version);
     }
 
     Ok(ProxyConfigV2 {
@@ -582,8 +615,8 @@ pub fn compile_v4_to_v2(v4: &ProxyConfigV4) -> Result<ProxyConfigV2> {
 }
 
 pub fn compile_v4_to_runtime(v4: &ProxyConfigV4) -> Result<ProxyConfig> {
-    if v4.version != 4 {
-        anyhow::bail!("unsupported v4 config version: {}", v4.version);
+    if !is_supported_route_graph_config_version(v4.version) {
+        anyhow::bail!("unsupported route graph config version: {}", v4.version);
     }
 
     Ok(ProxyConfig {
@@ -768,7 +801,7 @@ fn collect_service_v2_to_v4_warnings(
             .collect::<Vec<_>>();
         if !omitted_disabled.is_empty() {
             warnings.push(format!(
-                "[{service_name}] disabled inactive v2 stations/groups are omitted from the v4 route graph: {}.",
+                "[{service_name}] disabled inactive v2 stations/groups are omitted from the route graph: {}.",
                 omitted_disabled.join(", ")
             ));
         }
@@ -784,7 +817,7 @@ fn collect_service_v2_to_v4_warnings(
             .collect::<Vec<_>>();
         if !included_disabled_active.is_empty() {
             warnings.push(format!(
-                "[{service_name}] disabled active v2 stations/groups remain routeable in v4 to match current runtime fallback behavior: {}.",
+                "[{service_name}] disabled active v2 stations/groups remain routeable in the route graph to match current runtime fallback behavior: {}.",
                 included_disabled_active.join(", ")
             ));
         }
@@ -812,7 +845,7 @@ fn collect_service_v2_to_v4_warnings(
                         .collect::<Vec<_>>()
                         .join(", ");
                     warnings.push(format!(
-                        "[{service_name}] v2 group '{group_name}' scopes provider '{}' to endpoint(s) [{}], but v4 route graph leaves are provider-level; provider '{}' keeps all enabled endpoint(s) [{}].",
+                        "[{service_name}] v2 group '{group_name}' scopes provider '{}' to endpoint(s) [{}], but route graph leaves are provider-level; provider '{}' keeps all enabled endpoint(s) [{}].",
                         member.provider, selected, member.provider, available
                     ));
                 }
@@ -826,11 +859,14 @@ fn collect_service_v2_to_v4_warnings(
             .collect::<Vec<_>>();
         if !repeated.is_empty() {
             warnings.push(format!(
-                "[{service_name}] providers referenced multiple times in selected v2 groups are de-duplicated in the v4 route graph: {}.",
+                "[{service_name}] providers referenced multiple times in selected v2 groups are de-duplicated in the route graph: {}.",
                 repeated.join(", ")
             ));
         }
     }
+
+    let migrated_view = migrate_service_v2_to_v4(view);
+    collect_route_graph_affinity_migration_warnings(service_name, &migrated_view, warnings);
 
     let cleared_profiles = view
         .profiles
@@ -852,7 +888,7 @@ fn collect_service_v2_to_v4_warnings(
         .collect::<Vec<_>>();
     if !cleared_profiles.is_empty() {
         warnings.push(format!(
-            "[{service_name}] profile station bindings are cleared because v4 routing owns active provider selection: {}.",
+            "[{service_name}] profile station bindings are cleared because route graph routing owns active provider selection: {}.",
             cleared_profiles.join(", ")
         ));
     }
@@ -903,7 +939,7 @@ pub fn migrate_v2_to_v4_with_report(v2: &ProxyConfigV2) -> Result<ConfigV4Migrat
     collect_service_v2_to_v4_warnings("claude", &compact.claude, &mut warnings);
 
     let config = ProxyConfigV4 {
-        version: 4,
+        version: CURRENT_ROUTE_GRAPH_CONFIG_VERSION,
         codex: migrate_service_v2_to_v4(&compact.codex),
         claude: migrate_service_v2_to_v4(&compact.claude),
         retry: compact.retry,
@@ -1208,7 +1244,7 @@ pub mod legacy {
     ) -> Result<ConfigV4MigrationReport> {
         let mut warnings = Vec::new();
         let mut config = ProxyConfigV4 {
-            version: 4,
+            version: CURRENT_ROUTE_GRAPH_CONFIG_VERSION,
             codex: migrate_service_view("codex", &legacy.codex, &mut warnings)?,
             claude: migrate_service_view("claude", &legacy.claude, &mut warnings)?,
             retry: legacy.retry.clone(),

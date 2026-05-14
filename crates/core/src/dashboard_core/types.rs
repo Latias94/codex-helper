@@ -105,11 +105,15 @@ pub struct ControlPlaneSurfaceCapabilities {
     #[serde(default)]
     pub session_station_override: bool,
     #[serde(default)]
+    pub session_route_override: bool,
+    #[serde(default)]
     pub session_service_tier_override: bool,
     #[serde(default)]
     pub session_override_reset: bool,
     #[serde(default)]
     pub global_station_override: bool,
+    #[serde(default)]
+    pub global_route_override: bool,
     #[serde(default)]
     pub healthcheck_start: bool,
     #[serde(default)]

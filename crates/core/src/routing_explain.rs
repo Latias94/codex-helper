@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::config::RoutingConditionV4;
-use crate::lb::SelectedUpstream;
+use crate::config::{RoutingAffinityPolicyV5, RoutingConditionV4};
 use crate::routing_ir::{
     RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState,
     RoutePlanSkipReason, RoutePlanTemplate, RouteRef, RouteRequestContext,
@@ -22,6 +21,9 @@ pub struct RoutingExplainResponse {
     pub request_context: RoutingExplainRequestContext,
     pub selected_route: Option<RoutingExplainCandidate>,
     pub candidates: Vec<RoutingExplainCandidate>,
+    pub affinity_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<RoutingExplainAffinity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditional_routes: Vec<RoutingExplainConditionalRoute>,
 }
@@ -83,6 +85,7 @@ pub struct RoutingExplainRouteRef {
 pub enum RoutingExplainRouteRefKind {
     Route,
     Provider,
+    ProviderEndpoint,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -106,14 +109,28 @@ pub struct RoutingExplainCandidate {
     pub provider_id: String,
     pub provider_alias: Option<String>,
     pub endpoint_id: String,
+    pub provider_endpoint_key: String,
     pub route_path: Vec<String>,
-    #[serde(default)]
-    pub compatibility: RoutingExplainCompatibility,
-    pub station_name: String,
-    pub upstream_index: usize,
+    pub preference_group: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<RoutingExplainCompatibility>,
     pub upstream_base_url: String,
     pub selected: bool,
     pub skip_reasons: Vec<RoutingExplainSkipReason>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RoutingExplainAffinity {
+    pub mode: String,
+    pub provider_endpoint_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_selected_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_changed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_preferred_after_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -172,13 +189,13 @@ pub fn build_routing_explain_response_with_request(
     let selected_key = selection
         .selected
         .as_ref()
-        .map(|selected| candidate_key(&selected.selected_upstream));
+        .map(|selected| selected.provider_endpoint.stable_key());
     let skip_reasons_by_candidate = executor
         .explain_candidate_skip_reasons_with_runtime_state(runtime, request.model.as_deref())
         .into_iter()
         .map(|explanation| {
             (
-                candidate_key(&explanation.selected_upstream),
+                explanation.provider_endpoint.stable_key(),
                 explanation
                     .reasons
                     .iter()
@@ -189,13 +206,15 @@ pub fn build_routing_explain_response_with_request(
         .collect::<BTreeMap<_, _>>();
 
     let candidates = executor
-        .iter_selected_upstreams()
-        .map(|selected| {
-            let key = candidate_key(&selected.selected_upstream);
+        .iter_candidates()
+        .map(|candidate| {
+            let key = template
+                .candidate_provider_endpoint_key(candidate)
+                .stable_key();
             routing_explain_candidate(
-                selected.candidate,
-                &selected.selected_upstream,
-                selected_key.as_ref() == Some(&key),
+                template,
+                candidate,
+                selected_key.as_deref() == Some(key.as_str()),
                 skip_reasons_by_candidate
                     .get(&key)
                     .cloned()
@@ -217,7 +236,27 @@ pub fn build_routing_explain_response_with_request(
         request_context: RoutingExplainRequestContext::from(&request),
         selected_route,
         candidates,
+        affinity_policy: routing_affinity_policy_label(template.affinity_policy).to_string(),
+        affinity: runtime
+            .affinity_provider_endpoint()
+            .map(|key| RoutingExplainAffinity {
+                mode: routing_affinity_policy_label(template.affinity_policy).to_string(),
+                provider_endpoint_key: key.stable_key(),
+                last_selected_at_ms: runtime.affinity_last_selected_at_ms(),
+                last_changed_at_ms: runtime.affinity_last_changed_at_ms(),
+                fallback_ttl_ms: template.fallback_ttl_ms,
+                reprobe_preferred_after_ms: template.reprobe_preferred_after_ms,
+            }),
         conditional_routes: routing_explain_conditional_routes(template, &request),
+    }
+}
+
+fn routing_affinity_policy_label(policy: RoutingAffinityPolicyV5) -> &'static str {
+    match policy {
+        RoutingAffinityPolicyV5::Off => "off",
+        RoutingAffinityPolicyV5::PreferredGroup => "preferred_group",
+        RoutingAffinityPolicyV5::FallbackSticky => "fallback_sticky",
+        RoutingAffinityPolicyV5::Hard => "hard",
     }
 }
 
@@ -272,28 +311,35 @@ impl RoutingExplainSkipReason {
     }
 }
 
-fn candidate_key(selected: &SelectedUpstream) -> (String, usize) {
-    (selected.station_name.clone(), selected.index)
-}
-
 fn routing_explain_candidate(
+    template: &RoutePlanTemplate,
     candidate: &RouteCandidate,
-    selected_upstream: &SelectedUpstream,
     selected: bool,
     skip_reasons: Vec<RoutingExplainSkipReason>,
 ) -> RoutingExplainCandidate {
+    let provider_endpoint_key = template
+        .candidate_provider_endpoint_key(candidate)
+        .stable_key();
+    let compatibility = candidate
+        .compatibility_station_name
+        .as_ref()
+        .and_then(|station_name| {
+            candidate
+                .compatibility_upstream_index
+                .map(|upstream_index| RoutingExplainCompatibility {
+                    station_name: station_name.clone(),
+                    upstream_index,
+                })
+        });
     RoutingExplainCandidate {
         provider_id: candidate.provider_id.clone(),
         provider_alias: candidate.provider_alias.clone(),
         endpoint_id: candidate.endpoint_id.clone(),
+        provider_endpoint_key,
         route_path: candidate.route_path.clone(),
-        compatibility: RoutingExplainCompatibility {
-            station_name: selected_upstream.station_name.clone(),
-            upstream_index: selected_upstream.index,
-        },
-        station_name: selected_upstream.station_name.clone(),
-        upstream_index: selected_upstream.index,
-        upstream_base_url: selected_upstream.upstream.base_url.clone(),
+        preference_group: candidate.preference_group,
+        compatibility,
+        upstream_base_url: candidate.base_url.clone(),
         selected,
         skip_reasons,
     }
@@ -373,6 +419,13 @@ impl From<&RouteRef> for RoutingExplainRouteRef {
                 kind: RoutingExplainRouteRefKind::Provider,
                 name: name.clone(),
             },
+            RouteRef::ProviderEndpoint {
+                provider_id,
+                endpoint_id,
+            } => Self {
+                kind: RoutingExplainRouteRefKind::ProviderEndpoint,
+                name: format!("{provider_id}.{endpoint_id}"),
+            },
         }
     }
 }
@@ -385,10 +438,11 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        ProviderConfigV4, RoutingConditionV4, RoutingConfigV4, RoutingNodeV4, RoutingPolicyV4,
-        ServiceViewV4, UpstreamAuth,
+        ProviderConfigV4, RoutingConditionV4, RoutingConfigV4, RoutingExhaustedActionV4,
+        RoutingNodeV4, RoutingPolicyV4, ServiceViewV4, UpstreamAuth,
     };
     use crate::routing_ir::compile_v4_route_plan_template_with_request;
+    use crate::runtime_identity::ProviderEndpointKey;
 
     fn provider(base_url: &str) -> ProviderConfigV4 {
         ProviderConfigV4 {
@@ -473,5 +527,70 @@ mod tests {
 
         let text = serde_json::to_string(&value).expect("serialize value");
         assert!(!text.contains("secret-token"));
+    }
+
+    #[test]
+    fn routing_explain_reports_affinity_and_preference_group() {
+        let request = RouteRequestContext::default();
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://monthly.example/v1".to_string()),
+                        tags: BTreeMap::from([("billing".to_string(), "monthly".to_string())]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "chili".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://chili.example/v1".to_string()),
+                        tags: BTreeMap::from([("billing".to_string(), "paygo".to_string())]),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::tag_preferred(
+                vec!["chili".to_string(), "monthly".to_string()],
+                vec![BTreeMap::from([(
+                    "billing".to_string(),
+                    "monthly".to_string(),
+                )])],
+                RoutingExhaustedActionV4::Continue,
+            )),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template_with_request("codex", &view, &request)
+            .expect("route template");
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_affinity_provider_endpoint(Some(ProviderEndpointKey::new(
+            "codex", "chili", "default",
+        )));
+
+        let explain = build_routing_explain_response_with_request(
+            "codex", None, request, None, &template, &runtime,
+        );
+        let value = serde_json::to_value(&explain).expect("serialize explain");
+
+        assert_eq!(
+            value["affinity"]["provider_endpoint_key"].as_str(),
+            Some("codex/chili/default")
+        );
+        assert_eq!(value["affinity_policy"].as_str(), Some("preferred_group"));
+        assert_eq!(value["affinity"]["mode"].as_str(), Some("preferred_group"));
+        assert_eq!(
+            value["selected_route"]["provider_endpoint_key"].as_str(),
+            Some("codex/monthly/default")
+        );
+        assert_eq!(
+            value["selected_route"]["preference_group"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            value["candidates"][1]["provider_endpoint_key"].as_str(),
+            Some("codex/chili/default")
+        );
+        assert_eq!(value["candidates"][1]["preference_group"].as_u64(), Some(1));
     }
 }

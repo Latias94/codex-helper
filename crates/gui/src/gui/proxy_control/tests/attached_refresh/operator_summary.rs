@@ -590,7 +590,9 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
                         "provider_id": "right",
                         "provider_alias": null,
                         "endpoint_id": "primary",
+                        "provider_endpoint_key": "codex/right/primary",
                         "route_path": ["legacy", "linked-station", "right"],
+                        "preference_group": 0,
                         "station_name": "linked-station",
                         "upstream_index": 0,
                         "upstream_base_url": "https://right.example.com/v1",
@@ -602,14 +604,17 @@ fn refresh_attached_uses_operator_summary_links_for_follow_up_reads() {
                             "provider_id": "right",
                             "provider_alias": null,
                             "endpoint_id": "primary",
+                            "provider_endpoint_key": "codex/right/primary",
                             "route_path": ["legacy", "linked-station", "right"],
+                            "preference_group": 0,
                             "station_name": "linked-station",
                             "upstream_index": 0,
                             "upstream_base_url": "https://right.example.com/v1",
                             "selected": true,
                             "skip_reasons": []
                         }
-                    ]
+                    ],
+                    "affinity_policy": "none"
                 }))
             }),
         )

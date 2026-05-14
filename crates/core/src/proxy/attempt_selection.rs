@@ -8,6 +8,8 @@ use crate::logging::RouteAttemptLog;
 use crate::model_routing;
 
 #[cfg(test)]
+use super::attempt_target::AttemptTarget;
+#[cfg(test)]
 use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
 
 #[cfg(test)]
@@ -79,11 +81,12 @@ pub(super) fn select_supported_upstream(
                 if avoid_set.insert(selected.index) {
                     *avoided_total = avoided_total.saturating_add(1);
                 }
+                let target = AttemptTarget::legacy(selected.clone());
                 record_unsupported_model_skip(
                     upstream_chain,
                     route_attempts,
                     UnsupportedModelSkipParams {
-                        selected: &selected,
+                        target: &target,
                         requested_model,
                         provider_attempt,
                         provider_max_attempts,

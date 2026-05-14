@@ -1,12 +1,12 @@
 use axum::body::Bytes;
 
-use crate::lb::SelectedUpstream;
 use crate::logging::BodyPreview;
 use crate::logging::now_ms;
 use crate::model_routing;
 use crate::state::{RouteDecisionProvenance, SessionBinding};
 
 use super::ProxyService;
+use super::attempt_target::AttemptTarget;
 use super::request_body::apply_model_override_value;
 use super::request_preparation::build_body_previews;
 use super::route_provenance::{RouteDecisionProvenanceParams, build_route_decision_provenance};
@@ -23,7 +23,7 @@ pub(super) struct SelectedUpstreamRequestSetup {
 
 pub(super) struct SelectedUpstreamRequestSetupParams<'a> {
     pub(super) proxy: &'a ProxyService,
-    pub(super) selected: &'a SelectedUpstream,
+    pub(super) target: &'a AttemptTarget,
     pub(super) body_for_upstream: &'a Bytes,
     pub(super) request_model: Option<&'a str>,
     pub(super) session_binding: Option<&'a SessionBinding>,
@@ -45,7 +45,7 @@ pub(super) fn prepare_selected_upstream_request(
 ) -> SelectedUpstreamRequestSetup {
     let SelectedUpstreamRequestSetupParams {
         proxy,
-        selected,
+        target,
         body_for_upstream,
         request_model,
         session_binding,
@@ -63,8 +63,8 @@ pub(super) fn prepare_selected_upstream_request(
     } = params;
 
     let (model_note, body_for_selected) =
-        apply_selected_model_mapping(selected, body_for_upstream, request_model);
-    let provider_id = selected.upstream.tags.get("provider_id").cloned();
+        apply_selected_model_mapping(target, body_for_upstream, request_model);
+    let provider_id = target.provider_id().map(ToOwned::to_owned);
     let route_decision = build_route_decision_provenance(RouteDecisionProvenanceParams {
         decided_at_ms: now_ms(),
         session_binding,
@@ -76,7 +76,7 @@ pub(super) fn prepare_selected_upstream_request(
         request_model,
         effective_effort,
         effective_service_tier,
-        selected,
+        target,
         provider_id: provider_id.as_deref(),
     });
 
@@ -102,7 +102,7 @@ pub(super) fn prepare_selected_upstream_request(
 }
 
 fn apply_selected_model_mapping(
-    selected: &SelectedUpstream,
+    target: &AttemptTarget,
     body_for_upstream: &Bytes,
     request_model: Option<&str>,
 ) -> (String, Bytes) {
@@ -111,7 +111,7 @@ fn apply_selected_model_mapping(
     };
 
     let effective_model =
-        model_routing::effective_model(&selected.upstream.model_mapping, requested_model);
+        model_routing::effective_model(&target.upstream().model_mapping, requested_model);
     if effective_model != requested_model {
         let body = serde_json::from_slice::<serde_json::Value>(body_for_upstream.as_ref())
             .ok()
@@ -185,12 +185,13 @@ mod tests {
     async fn prepare_selected_upstream_request_applies_mapping_and_route_provenance() {
         let proxy = test_proxy_service();
         let selected = test_selected_upstream();
+        let target = AttemptTarget::legacy(selected.clone());
         let body = Bytes::from_static(br#"{"model":"gpt-5"}"#);
         let binding = test_binding();
 
         let setup = prepare_selected_upstream_request(SelectedUpstreamRequestSetupParams {
             proxy: &proxy,
-            selected: &selected,
+            target: &target,
             body_for_upstream: &body,
             request_model: Some("gpt-5"),
             session_binding: Some(&binding),
@@ -226,10 +227,11 @@ mod tests {
     #[test]
     fn apply_selected_model_mapping_keeps_original_when_mapping_missing() {
         let selected = test_selected_upstream();
+        let target = AttemptTarget::legacy(selected);
         let body = Bytes::from_static(br#"{"model":"gpt-4.1"}"#);
 
         let (model_note, mapped_body) =
-            apply_selected_model_mapping(&selected, &body, Some("gpt-4.1"));
+            apply_selected_model_mapping(&target, &body, Some("gpt-4.1"));
 
         assert_eq!(model_note, "gpt-4.1");
         assert_eq!(mapped_body, body);

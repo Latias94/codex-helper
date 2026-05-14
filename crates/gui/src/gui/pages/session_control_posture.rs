@@ -17,6 +17,7 @@ pub(super) struct SessionControlPosture {
 pub(super) fn session_has_manual_overrides(row: &SessionRow) -> bool {
     row.override_model.is_some()
         || row.override_station_name().is_some()
+        || row.override_route_target().is_some()
         || row.override_effort.is_some()
         || row.override_service_tier.is_some()
 }
@@ -25,6 +26,9 @@ pub(super) fn session_override_field_labels(row: &SessionRow, lang: Language) ->
     let mut fields = Vec::new();
     if row.override_station_name().is_some() {
         fields.push(pick(lang, "station", "station").to_string());
+    }
+    if row.override_route_target().is_some() {
+        fields.push("route_target".to_string());
     }
     if row.override_model.is_some() {
         fields.push("model".to_string());
@@ -40,8 +44,9 @@ pub(super) fn session_override_field_labels(row: &SessionRow, lang: Language) ->
 
 pub(super) fn session_manual_override_summary(row: &SessionRow, lang: Language) -> String {
     format!(
-        "station={}, model={}, reasoning={}, service_tier={}",
+        "station={}, route_target={}, model={}, reasoning={}, service_tier={}",
         row.override_station_name().unwrap_or("-"),
+        row.override_route_target().unwrap_or("-"),
         row.override_model.as_deref().unwrap_or("-"),
         row.override_effort.as_deref().unwrap_or("-"),
         format_service_tier_display(row.override_service_tier.as_deref(), lang, "-"),
@@ -205,8 +210,8 @@ pub(super) fn session_control_posture(
                 override_summary,
                 pick(
                     lang,
-                    "这些字段优先于 profile 默认、global pin 和请求默认。",
-                    "Those fields take priority over profile defaults, the global pin, and request defaults.",
+                    "这些字段优先于 profile 默认、全局运行时覆盖和请求默认。",
+                    "Those fields take priority over profile defaults, the global runtime override, and request defaults.",
                 )
             ),
             tone: SessionControlTone::Neutral,
@@ -223,14 +228,14 @@ pub(super) fn session_control_posture(
                 "{} {station}",
                 pick(
                     lang,
-                    "当前没有 profile binding，站点跟随全局 pin:",
-                    "There is no profile binding; station follows the global pin:",
+                    "当前没有 profile binding，站点跟随全局运行时覆盖:",
+                    "There is no profile binding; station follows the global runtime override:",
                 )
             ),
             detail: pick(
                 lang,
-                "如果全局 pin 切换，这个 session 的 effective station 也会一起变化。",
-                "If the global pin changes, this session's effective station changes with it.",
+                "如果全局运行时覆盖切换，这个 session 的 effective station 也会一起变化。",
+                "If the global runtime override changes, this session's effective station changes with it.",
             )
             .to_string(),
             tone: SessionControlTone::Neutral,

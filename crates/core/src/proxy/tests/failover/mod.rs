@@ -146,6 +146,16 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
         Arc::new(std::sync::Mutex::new(HashMap::new())),
     );
     let state = proxy.state.clone();
+    state
+        .set_global_station_override("stale-station-pin".to_string(), 1)
+        .await;
+    state
+        .set_session_station_override(
+            "sid-input".to_string(),
+            "stale-session-station-pin".to_string(),
+            1,
+        )
+        .await;
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
@@ -176,6 +186,22 @@ async fn run_failover_retries_502_then_uses_second_upstream() {
             .map(|attempt| attempt.endpoint_id.as_deref())
             .collect::<Vec<_>>(),
         vec![Some("0"), Some("0"), Some("1")]
+    );
+    assert_eq!(
+        retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.provider_endpoint_key.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("codex/u1/0"), Some("codex/u1/0"), Some("codex/u2/1")]
+    );
+    assert_eq!(
+        retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.preference_group)
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(0), Some(0)]
     );
     assert_eq!(
         retry
@@ -375,6 +401,110 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
 
     let fallback = send_responses_json(&client, proxy_addr, Some("sid-right")).await;
     assert_eq!(fallback["provider"].as_str(), Some("right"));
+    assert_eq!(input_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(input1_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(right_hits.load(Ordering::SeqCst), 1);
+    let finished_after_fallback = state.list_recent_finished(10).await;
+    let fallback_request = finished_after_fallback
+        .iter()
+        .find(|request| {
+            request.session_id.as_deref() == Some("sid-right")
+                && request.provider_id.as_deref() == Some("right")
+        })
+        .expect("fallback finished request");
+    assert_eq!(fallback_request.station_name, None);
+    assert_eq!(
+        fallback_request
+            .route_decision
+            .as_ref()
+            .and_then(|decision| {
+                decision
+                    .effective_station
+                    .as_ref()
+                    .map(|station| station.value.as_str())
+            }),
+        None
+    );
+    assert_eq!(
+        fallback_request
+            .route_decision
+            .as_ref()
+            .and_then(|decision| decision.endpoint_id.as_deref()),
+        Some("default")
+    );
+    let fallback_retry = fallback_request
+        .retry
+        .as_ref()
+        .expect("fallback request retry trace");
+    assert_eq!(
+        fallback_retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.provider_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("input"), Some("input1"), Some("right")]
+    );
+    assert_eq!(
+        fallback_retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.provider_endpoint_key.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some("codex/input/default"),
+            Some("codex/input1/default"),
+            Some("codex/right/default"),
+        ]
+    );
+    assert_eq!(
+        fallback_retry
+            .route_attempts
+            .iter()
+            .map(|attempt| (attempt.provider_max_attempts, attempt.upstream_max_attempts))
+            .collect::<Vec<_>>(),
+        vec![(Some(4), Some(1)), (Some(4), Some(1)), (Some(4), Some(1))]
+    );
+    assert_eq!(
+        fallback_retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.avoided_candidate_indices.clone())
+            .collect::<Vec<_>>(),
+        vec![Vec::<usize>::new(), vec![0], vec![0, 1]]
+    );
+    assert!(
+        fallback_retry
+            .route_attempts
+            .iter()
+            .all(|attempt| attempt.avoid_for_station.is_empty()),
+        "route graph attempts should track candidate avoids, not station upstream avoids"
+    );
+    assert!(
+        fallback_retry
+            .route_attempts
+            .iter()
+            .all(|attempt| attempt.station_name.is_none() && attempt.upstream_index.is_none()),
+        "route graph attempts should not serialize compatibility station/index as primary identity"
+    );
+    let fallback_affinity_snapshot = state
+        .get_session_route_affinity("sid-right")
+        .await
+        .expect("right affinity after fallback");
+    assert_eq!(
+        fallback_affinity_snapshot
+            .provider_endpoint
+            .provider_id
+            .as_str(),
+        "right"
+    );
+    assert_eq!(
+        fallback_affinity_snapshot.change_reason.as_str(),
+        "failover_after_status_502"
+    );
+
+    let preferred_after_fallback =
+        send_responses_json(&client, proxy_addr, Some("sid-right")).await;
+    assert_eq!(preferred_after_fallback["provider"].as_str(), Some("input"));
 
     let sticky = send_responses_json(&client, proxy_addr, Some("sid-input")).await;
     assert_eq!(sticky["provider"].as_str(), Some("input"));
@@ -382,7 +512,7 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
     let new_session = send_responses_json(&client, proxy_addr, Some("sid-new")).await;
     assert_eq!(new_session["provider"].as_str(), Some("input"));
 
-    assert_eq!(input_hits.load(Ordering::SeqCst), 4);
+    assert_eq!(input_hits.load(Ordering::SeqCst), 5);
     assert_eq!(input1_hits.load(Ordering::SeqCst), 1);
     assert_eq!(right_hits.load(Ordering::SeqCst), 1);
 
@@ -390,15 +520,19 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
     assert_eq!(
         affinities
             .get("sid-input")
-            .and_then(|affinity| affinity.provider_id.as_deref()),
+            .map(|affinity| affinity.provider_endpoint.provider_id.as_str()),
         Some("input")
     );
     let fallback_affinity = affinities.get("sid-right").expect("right affinity");
-    assert_eq!(fallback_affinity.provider_id.as_deref(), Some("right"));
     assert_eq!(
-        fallback_affinity.change_reason.as_str(),
-        "failover_after_status_502"
+        fallback_affinity.provider_endpoint.provider_id.as_str(),
+        "input"
     );
+    assert_eq!(
+        fallback_affinity.provider_endpoint.stable_key(),
+        "codex/input/default"
+    );
+    assert_eq!(fallback_affinity.change_reason.as_str(), "target_changed");
 
     let cards = state.list_session_identity_cards(20).await;
     let right_card = cards
@@ -409,14 +543,151 @@ async fn proxy_v4_route_graph_affinity_is_session_scoped() {
         right_card
             .route_affinity
             .as_ref()
-            .and_then(|affinity| affinity.provider_id.as_deref()),
-        Some("right")
+            .map(|affinity| affinity.provider_endpoint.provider_id.as_str()),
+        Some("input")
     );
 
     proxy_handle.abort();
     input_handle.abort();
     input1_handle.abort();
     right_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_v4_route_graph_health_does_not_write_synthetic_routing_lb_state() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+
+    let primary_counter = primary_hits.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            async move {
+                let hit = primary_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit == 1 {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "provider": "primary", "err": "first" })),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "provider": "primary" })),
+                    )
+                }
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "502",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        allow_cross_station_before_first_output: Some(true),
+        transport_cooldown_secs: Some(0),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{primary_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{backup_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "monthly_first".to_string(),
+                routes: std::collections::BTreeMap::from([(
+                    "monthly_first".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::OrderedFailover,
+                        children: vec!["primary".to_string(), "backup".to_string()],
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compat runtime");
+    let lb_states = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        lb_states.clone(),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let fallback = send_responses_json(&client, proxy_addr, Some("sid-failover")).await;
+    assert_eq!(fallback["provider"].as_str(), Some("backup"));
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    {
+        let guard = lb_states.lock().expect("lb states");
+        assert!(
+            guard
+                .get("routing")
+                .is_none_or(|entry| entry.failure_counts.iter().all(|count| *count == 0)),
+            "route graph branch should not write provider health into synthetic routing LB state"
+        );
+    }
+
+    let preferred = send_responses_json(&client, proxy_addr, Some("sid-failover")).await;
+    assert_eq!(preferred["provider"].as_str(), Some("primary"));
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
 }
 
 #[tokio::test]

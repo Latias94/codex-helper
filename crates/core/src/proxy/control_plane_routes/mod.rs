@@ -11,19 +11,19 @@ use super::control_plane::{
     set_global_station_override,
 };
 use super::control_plane_manifest::{
-    API_V1_CAPABILITIES, API_V1_CONTROL_TRACE, API_V1_GLOBAL_STATION_OVERRIDE,
-    API_V1_HEALTHCHECK_CANCEL, API_V1_HEALTHCHECK_START, API_V1_OPERATOR_SUMMARY,
-    API_V1_PRICING_CATALOG, API_V1_PROFILE_BY_NAME, API_V1_PROFILES, API_V1_PROFILES_DEFAULT,
-    API_V1_PROFILES_DEFAULT_PERSISTED, API_V1_PROVIDER_SPEC_BY_NAME, API_V1_PROVIDER_SPECS,
-    API_V1_PROVIDERS, API_V1_PROVIDERS_BALANCES_REFRESH, API_V1_PROVIDERS_RUNTIME,
-    API_V1_REQUEST_LEDGER_RECENT, API_V1_REQUEST_LEDGER_SUMMARY, API_V1_RETRY_CONFIG,
-    API_V1_ROUTING, API_V1_ROUTING_EXPLAIN, API_V1_RUNTIME_RELOAD, API_V1_RUNTIME_STATUS,
-    API_V1_SESSION_BY_ID, API_V1_SESSION_OVERRIDE_EFFORT, API_V1_SESSION_OVERRIDE_MODEL,
-    API_V1_SESSION_OVERRIDE_PROFILE, API_V1_SESSION_OVERRIDE_RESET,
-    API_V1_SESSION_OVERRIDE_SERVICE_TIER, API_V1_SESSION_OVERRIDE_STATION,
-    API_V1_SESSION_OVERRIDES, API_V1_SESSIONS, API_V1_SNAPSHOT, API_V1_STATION_BY_NAME,
-    API_V1_STATION_SPEC_BY_NAME, API_V1_STATION_SPECS, API_V1_STATIONS, API_V1_STATIONS_ACTIVE,
-    API_V1_STATIONS_PROBE, API_V1_STATIONS_RUNTIME, API_V1_STATUS_ACTIVE,
+    API_V1_CAPABILITIES, API_V1_CONTROL_TRACE, API_V1_GLOBAL_ROUTE_OVERRIDE,
+    API_V1_GLOBAL_STATION_OVERRIDE, API_V1_HEALTHCHECK_CANCEL, API_V1_HEALTHCHECK_START,
+    API_V1_OPERATOR_SUMMARY, API_V1_PRICING_CATALOG, API_V1_PROFILE_BY_NAME, API_V1_PROFILES,
+    API_V1_PROFILES_DEFAULT, API_V1_PROFILES_DEFAULT_PERSISTED, API_V1_PROVIDER_SPEC_BY_NAME,
+    API_V1_PROVIDER_SPECS, API_V1_PROVIDERS, API_V1_PROVIDERS_BALANCES_REFRESH,
+    API_V1_PROVIDERS_RUNTIME, API_V1_REQUEST_LEDGER_RECENT, API_V1_REQUEST_LEDGER_SUMMARY,
+    API_V1_RETRY_CONFIG, API_V1_ROUTING, API_V1_ROUTING_EXPLAIN, API_V1_RUNTIME_RELOAD,
+    API_V1_RUNTIME_STATUS, API_V1_SESSION_BY_ID, API_V1_SESSION_OVERRIDE_EFFORT,
+    API_V1_SESSION_OVERRIDE_MODEL, API_V1_SESSION_OVERRIDE_PROFILE, API_V1_SESSION_OVERRIDE_RESET,
+    API_V1_SESSION_OVERRIDE_ROUTE, API_V1_SESSION_OVERRIDE_SERVICE_TIER,
+    API_V1_SESSION_OVERRIDE_STATION, API_V1_SESSION_OVERRIDES, API_V1_SESSIONS, API_V1_SNAPSHOT,
+    API_V1_STATION_BY_NAME, API_V1_STATION_SPEC_BY_NAME, API_V1_STATION_SPECS, API_V1_STATIONS,
+    API_V1_STATIONS_ACTIVE, API_V1_STATIONS_PROBE, API_V1_STATIONS_RUNTIME, API_V1_STATUS_ACTIVE,
     API_V1_STATUS_HEALTH_CHECKS, API_V1_STATUS_RECENT, API_V1_STATUS_SESSION_STATS,
     API_V1_STATUS_STATION_HEALTH,
 };
@@ -47,11 +47,13 @@ use super::runtime_admin_api::{
     set_retry_config,
 };
 use super::session_overrides::{
-    apply_session_manual_overrides, list_session_manual_overrides, list_session_model_overrides,
-    list_session_reasoning_effort_overrides, list_session_service_tier_overrides,
-    list_session_station_overrides, reset_session_manual_overrides, set_session_model_override,
-    set_session_reasoning_effort_override, set_session_service_tier_override,
-    set_session_station_override,
+    apply_session_manual_overrides, get_global_route_target_override,
+    list_session_manual_overrides, list_session_model_overrides,
+    list_session_reasoning_effort_overrides, list_session_route_target_overrides,
+    list_session_service_tier_overrides, list_session_station_overrides,
+    reset_session_manual_overrides, set_global_route_target_override, set_session_model_override,
+    set_session_reasoning_effort_override, set_session_route_target_override,
+    set_session_service_tier_override, set_session_station_override,
 };
 use super::stations_api::{apply_station_runtime_meta, list_stations};
 

@@ -16,11 +16,21 @@ pub(super) fn render_session_detail_controls(
 ) {
     let override_model = row.override_model.as_deref().unwrap_or("-");
     let override_cfg = row.override_station_name().unwrap_or("-");
+    let override_route_target = row.override_route_target().unwrap_or("-");
     let override_eff = row.override_effort.as_deref().unwrap_or("-");
     let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
     let global_cfg = global_station_override.unwrap_or("-");
+    let global_route_target = snapshot
+        .global_route_target_override
+        .as_deref()
+        .unwrap_or("-");
+    let global_label = if snapshot.supports_global_route_target_override {
+        format!("global_route_target={global_route_target}")
+    } else {
+        format!("global_station={global_cfg}")
+    };
     ui.label(format!(
-        "{}: model={override_model}, effort={override_eff}, station={override_cfg}, tier={override_service_tier}, global_station={global_cfg}",
+        "{}: model={override_model}, effort={override_eff}, station={override_cfg}, route_target={override_route_target}, tier={override_service_tier}, {global_label}",
         pick(ctx.lang, "覆盖", "Overrides")
     ));
 
@@ -36,6 +46,7 @@ pub(super) fn render_session_detail_controls(
     let cfg_options = station_options_from_gui_stations(&snapshot.stations);
     let has_session_manual_overrides = row.override_model.is_some()
         || row.override_station_name().is_some()
+        || row.override_route_target().is_some()
         || row.override_effort.is_some()
         || row.override_service_tier.is_some();
 
@@ -56,8 +67,8 @@ pub(super) fn render_session_detail_controls(
             )
             .on_hover_text(pick(
                 ctx.lang,
-                "清除当前会话的 model / station / effort / service_tier 覆盖，不影响已绑定的 profile。",
-                "Clear the current session model / station / effort / service_tier overrides without touching the bound profile.",
+                "清除当前会话的 model / station / route_target / effort / service_tier 覆盖，不影响已绑定的 profile。",
+                "Clear the current session model / station / route_target / effort / service_tier overrides without touching the bound profile.",
             ));
         if reset_overrides.clicked() {
             *action_clear_session_manual_overrides = Some(sid.clone());

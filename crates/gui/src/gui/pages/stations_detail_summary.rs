@@ -23,7 +23,13 @@ pub(super) fn render_station_identity_summary(
     ui.label(format!(
         "{}: {}",
         pick(ctx.lang, "路由角色", "Routing role"),
-        if effective_active_station == Some(cfg.name.as_str()) {
+        if snapshot.global_route_target_override.as_deref() == Some(cfg.name.as_str()) {
+            pick(
+                ctx.lang,
+                "当前全局 route target",
+                "current global route target",
+            )
+        } else if effective_active_station == Some(cfg.name.as_str()) {
             pick(ctx.lang, "当前 active_station", "current active_station")
         } else if snapshot.global_station_override.as_deref() == Some(cfg.name.as_str()) {
             pick(ctx.lang, "当前 global pin", "current global pin")

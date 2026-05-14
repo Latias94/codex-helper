@@ -6,7 +6,7 @@ pub(super) fn build_session_rows_for_snapshot(
     snapshot: &GuiRuntimeSnapshot,
 ) -> (bool, Vec<SessionRow>) {
     let has_session_cards = !snapshot.session_cards.is_empty();
-    let rows = if has_session_cards {
+    let mut rows = if has_session_cards {
         build_session_rows_from_cards(&snapshot.session_cards)
     } else {
         build_session_rows(
@@ -15,11 +15,19 @@ pub(super) fn build_session_rows_for_snapshot(
             &snapshot.session_model_overrides,
             &snapshot.session_effort_overrides,
             &snapshot.session_station_overrides,
+            &snapshot.session_route_target_overrides,
             &snapshot.session_service_tier_overrides,
             snapshot.global_station_override.as_deref(),
             &snapshot.session_stats,
         )
     };
+    for row in &mut rows {
+        if let Some(session_id) = row.session_id.as_deref()
+            && let Some(route_target) = snapshot.session_route_target_overrides.get(session_id)
+        {
+            row.override_route_target = Some(route_target.clone());
+        }
+    }
     (has_session_cards, rows)
 }
 
@@ -67,6 +75,7 @@ pub(super) fn build_session_render_data(
                 && row.override_model.is_none()
                 && row.override_effort.is_none()
                 && row.override_station_name().is_none()
+                && row.override_route_target().is_none()
                 && row.override_service_tier.is_none()
             {
                 return false;
@@ -108,6 +117,7 @@ pub(super) fn sync_session_editor_from_selection(
     selected: Option<&SessionRow>,
     profiles: &[ControlProfileOption],
     default_profile: Option<&str>,
+    use_route_target_overrides: bool,
 ) {
     let selected_sid = selected.and_then(|row| row.session_id.clone());
     if state.editor.sid == selected_sid {
@@ -123,8 +133,13 @@ pub(super) fn sync_session_editor_from_selection(
     state.editor.model_override = selected
         .and_then(|row| row.override_model.clone())
         .unwrap_or_default();
-    state.editor.config_override =
-        selected.and_then(|row| row.override_station_name().map(str::to_owned));
+    state.editor.config_override = selected.and_then(|row| {
+        if use_route_target_overrides {
+            row.override_route_target().map(str::to_owned)
+        } else {
+            row.override_station_name().map(str::to_owned)
+        }
+    });
     state.editor.effort_override = selected.and_then(|row| row.override_effort.clone());
     state.editor.custom_effort = selected
         .and_then(|row| row.override_effort.clone())

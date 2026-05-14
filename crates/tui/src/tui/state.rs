@@ -1,8 +1,7 @@
 use ratatui::widgets::{ListState, TableState};
 
-use crate::config::ResolvedRetryConfig;
+use crate::config::{ResolvedRetryConfig, is_supported_route_graph_config_version};
 use crate::dashboard_core::ControlProfileOption;
-use crate::proxy::admin_port_for_proxy_port;
 use crate::routing_explain::RoutingExplainResponse;
 use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
@@ -38,7 +37,6 @@ pub(in crate::tui) struct CodexHistoryExternalFocus {
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
-    pub(in crate::tui) admin_port: u16,
     pub(in crate::tui) language: Language,
     pub(in crate::tui) refresh_ms: u64,
     pub(in crate::tui) config_version: Option<u32>,
@@ -134,7 +132,6 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             service_name: "codex",
-            admin_port: admin_port_for_proxy_port(3211),
             language: Language::En,
             refresh_ms: 500,
             config_version: None,
@@ -230,7 +227,8 @@ impl Default for UiState {
 
 impl UiState {
     pub(in crate::tui) fn uses_route_graph_routing(&self) -> bool {
-        matches!(self.config_version, Some(3 | 4))
+        self.config_version
+            .is_some_and(|version| version == 3 || is_supported_route_graph_config_version(version))
     }
 
     pub(in crate::tui) fn station_page_rows_len(&self, legacy_len: usize) -> usize {
@@ -573,6 +571,18 @@ mod tests {
         assert_eq!(selected, Some(7));
         assert_eq!(table.selected(), Some(7));
         assert_eq!(table.offset(), 3);
+    }
+
+    #[test]
+    fn route_graph_routing_detection_includes_current_v5_schema() {
+        let mut ui = UiState {
+            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+            ..UiState::default()
+        };
+        assert!(ui.uses_route_graph_routing());
+
+        ui.config_version = Some(2);
+        assert!(!ui.uses_route_graph_routing());
     }
 
     #[test]

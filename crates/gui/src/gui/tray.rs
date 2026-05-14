@@ -16,7 +16,7 @@ pub enum TrayAction {
     ReloadSettings,
     SwitchOn,
     SwitchOff,
-    /// Apply API v1 global override (pinned). `None` means <auto>.
+    /// Apply API v1 global override. In route-graph mode this targets route target.
     ApplyPinnedStation {
         name: Option<String>,
     },
@@ -32,9 +32,11 @@ pub struct TrayMenuModel {
     pub service_name: Option<String>,
     pub port: Option<u16>,
     pub supports_v1: bool,
+    pub supports_global_route_target_override: bool,
     pub active_display: Option<String>,
     pub stations: Vec<crate::dashboard_core::StationOption>,
     pub global_station_override: Option<String>,
+    pub global_route_target_override: Option<String>,
 }
 
 pub struct TrayController {
@@ -206,10 +208,22 @@ fn compute_menu_sig(m: &TrayMenuModel) -> String {
     s.push_str(m.base_url.as_deref().unwrap_or("-"));
     s.push_str("|v1=");
     s.push_str(if m.supports_v1 { "1" } else { "0" });
+    s.push_str("|route_target=");
+    s.push_str(if m.supports_global_route_target_override {
+        "1"
+    } else {
+        "0"
+    });
     s.push_str("|active=");
     s.push_str(m.active_display.as_deref().unwrap_or("-"));
     s.push_str("|pinned=");
     s.push_str(m.global_station_override.as_deref().unwrap_or("<auto>"));
+    s.push_str("|global_route=");
+    s.push_str(
+        m.global_route_target_override
+            .as_deref()
+            .unwrap_or("<auto>"),
+    );
     s.push_str("|cfgs=");
     for c in m.stations.iter() {
         s.push_str(&c.name);
@@ -291,14 +305,25 @@ fn build_menu_base(
         }
 
         if model.proxy_kind != super::proxy_control::ProxyModeKind::Stopped {
-            let pinned = model
-                .global_station_override
-                .as_deref()
-                .unwrap_or_else(|| pick(lang, "<自动>", "<auto>"));
+            let pinned = if model.supports_global_route_target_override {
+                model
+                    .global_route_target_override
+                    .as_deref()
+                    .unwrap_or_else(|| pick(lang, "<自动>", "<auto>"))
+            } else {
+                model
+                    .global_station_override
+                    .as_deref()
+                    .unwrap_or_else(|| pick(lang, "<自动>", "<auto>"))
+            };
             menu.append(&MenuItem::new(
                 format!(
                     "{}: {pinned}",
-                    pick(lang, "Pinned station", "Pinned station")
+                    if model.supports_global_route_target_override {
+                        pick(lang, "Global route target", "Global route target")
+                    } else {
+                        pick(lang, "Pinned station", "Pinned station")
+                    }
                 ),
                 false,
                 None,
@@ -309,7 +334,7 @@ fn build_menu_base(
 
         let quick = Submenu::new(pick(lang, "快速切换", "Quick switch"), true);
 
-        // Pinned station (runtime-only).
+        // Runtime-only global station/route target override.
         let can_pinned = (matches!(
             model.proxy_kind,
             super::proxy_control::ProxyModeKind::Running
@@ -317,15 +342,23 @@ fn build_menu_base(
         )) && model.supports_v1
             && !model.stations.is_empty();
         let pinned_menu = Submenu::new(
-            pick(
-                lang,
-                "全局站点覆盖(Pinned)",
-                "Global station override (pinned)",
-            ),
+            if model.supports_global_route_target_override {
+                pick(lang, "全局 route target", "Global route target")
+            } else {
+                pick(
+                    lang,
+                    "全局站点覆盖(Pinned)",
+                    "Global station override (pinned)",
+                )
+            },
             can_pinned,
         );
         if can_pinned {
-            let cur = model.global_station_override.as_deref();
+            let cur = if model.supports_global_route_target_override {
+                model.global_route_target_override.as_deref()
+            } else {
+                model.global_station_override.as_deref()
+            };
             let id_auto = MenuId::new("codex-helper-gui.tray.pinned.auto");
             let auto_item = CheckMenuItem::with_id(
                 id_auto.clone(),

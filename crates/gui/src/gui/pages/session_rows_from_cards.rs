@@ -40,6 +40,7 @@ pub(super) fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Ve
                 override_model: card.override_model.clone(),
                 override_effort: card.override_effort.clone(),
                 override_station: card.override_station_name.clone(),
+                override_route_target: None,
                 override_service_tier: card.override_service_tier.clone(),
             })
         })

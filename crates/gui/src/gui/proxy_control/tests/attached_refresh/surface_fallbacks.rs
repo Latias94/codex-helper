@@ -30,6 +30,7 @@ fn request_attach_with_discovered_proxy_preloads_surface_capabilities() {
             configured_active_station: Some("alpha".to_string()),
             effective_active_station: Some("beta".to_string()),
             global_station_override: Some("gamma".to_string()),
+            global_route_target_override: None,
             configured_default_profile: Some("steady".to_string()),
             default_profile: Some("fast".to_string()),
             default_profile_summary: None,
@@ -478,7 +479,9 @@ fn refresh_attached_prefers_typed_surface_capabilities_over_endpoint_strings() {
             "stations": true,
             "station_runtime": true,
             "global_station_override": true,
+            "global_route_override": true,
             "session_station_override": true,
+            "session_route_override": true,
             "session_reasoning_effort_override": true,
             "session_model_override": true
         },
@@ -549,11 +552,24 @@ fn refresh_attached_prefers_typed_surface_capabilities_over_endpoint_strings() {
             get(|| async { Json(Some("typed-surface".to_string())) }),
         )
         .route(
+            "/__codex_helper/api/v1/overrides/global-route",
+            get(|| async { Json(Some("typed-route".to_string())) }),
+        )
+        .route(
             "/__codex_helper/api/v1/overrides/session/station",
             get(|| async {
                 Json(HashMap::from([(
                     "sid-typed".to_string(),
                     "typed-surface".to_string(),
+                )]))
+            }),
+        )
+        .route(
+            "/__codex_helper/api/v1/overrides/session/route",
+            get(|| async {
+                Json(HashMap::from([(
+                    "sid-typed".to_string(),
+                    "typed-route".to_string(),
                 )]))
             }),
         )
@@ -593,6 +609,17 @@ fn refresh_attached_prefers_typed_surface_capabilities_over_endpoint_strings() {
         Some("typed-surface")
     );
     assert_eq!(
+        snapshot.global_route_target_override.as_deref(),
+        Some("typed-route")
+    );
+    assert_eq!(
+        snapshot
+            .session_route_target_overrides
+            .get("sid-typed")
+            .map(String::as_str),
+        Some("typed-route")
+    );
+    assert_eq!(
         snapshot
             .session_effort_overrides
             .get("sid-typed")
@@ -609,6 +636,8 @@ fn refresh_attached_prefers_typed_surface_capabilities_over_endpoint_strings() {
     let attached = controller.attached().expect("typed attached status");
     assert!(attached.supports_station_api);
     assert!(attached.supports_station_runtime_override);
+    assert!(attached.supports_global_route_target_override);
+    assert!(attached.supports_session_route_target_override);
     assert!(!attached.supports_default_profile_override);
 
     handle.abort();

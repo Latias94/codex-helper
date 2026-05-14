@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-core"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-gui"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-tui"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "codex-helper-core",

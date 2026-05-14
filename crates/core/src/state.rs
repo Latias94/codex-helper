@@ -14,10 +14,11 @@ pub use crate::balance::{
     BalanceSnapshotStatus, ProviderBalanceSnapshot, StationRoutingBalanceSummary,
 };
 use crate::config::ServiceConfigManager;
-use crate::lb::LbState;
+use crate::lb::{COOLDOWN_SECS, CooldownBackoff, FAILURE_THRESHOLD, LbState};
 #[cfg(test)]
 use crate::pricing::CostBreakdown;
 use crate::pricing::{CostAdjustments, estimate_request_cost_from_operator_catalog_for_service};
+use crate::routing_ir::{RoutePlanRuntimeState, RoutePlanUpstreamRuntimeState};
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions;
 use crate::usage::UsageMetrics;
@@ -43,7 +44,7 @@ pub use self::session_identity::{
 };
 use self::session_identity::{
     SessionBindingEntry, SessionCwdCacheEntry, SessionEffortOverride, SessionModelOverride,
-    SessionServiceTierOverride, SessionStationOverride,
+    SessionRouteTargetOverride, SessionServiceTierOverride, SessionStationOverride,
 };
 
 type PassiveStationHealthMap =
@@ -52,6 +53,15 @@ type ProviderBalanceMap =
     HashMap<String, HashMap<String, HashMap<usize, HashMap<String, ProviderBalanceSnapshot>>>>;
 type ProviderBalanceSummaryMap = HashMap<String, HashMap<String, StationRoutingBalanceSummary>>;
 type ServiceLayoutSignature = Vec<(String, Vec<String>)>;
+
+#[derive(Debug, Clone, Default)]
+struct ProviderEndpointRuntimeHealth {
+    failure_count: u32,
+    cooldown_until: Option<std::time::Instant>,
+    usage_exhausted: bool,
+    penalty_streak: u32,
+    last_good_at_ms: Option<u64>,
+}
 
 #[derive(Debug, Clone)]
 struct SessionTranscriptPathCacheEntry {
@@ -195,11 +205,13 @@ pub struct ProxyState {
     session_transcript_path_cache_max_entries: usize,
     session_effort_overrides: RwLock<HashMap<String, SessionEffortOverride>>,
     session_station_overrides: RwLock<HashMap<String, SessionStationOverride>>,
+    session_route_target_overrides: RwLock<HashMap<String, SessionRouteTargetOverride>>,
     session_model_overrides: RwLock<HashMap<String, SessionModelOverride>>,
     session_service_tier_overrides: RwLock<HashMap<String, SessionServiceTierOverride>>,
     session_bindings: RwLock<HashMap<String, SessionBindingEntry>>,
     session_route_affinities: RwLock<HashMap<String, SessionRouteAffinity>>,
     global_station_override: RwLock<Option<String>>,
+    global_route_target_override: RwLock<Option<String>>,
     runtime_default_profiles: RwLock<HashMap<String, RuntimeDefaultProfileOverride>>,
     station_meta_overrides: RwLock<HashMap<String, HashMap<String, ConfigMetaOverride>>>,
     // Primary provider-endpoint overrides keyed by stable provider identity.
@@ -217,6 +229,8 @@ pub struct ProxyState {
     passive_station_health: RwLock<PassiveStationHealthMap>,
     provider_balances: RwLock<ProviderBalanceMap>,
     provider_balance_summaries: RwLock<ProviderBalanceSummaryMap>,
+    provider_endpoint_runtime_health:
+        RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
     station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
     service_layout_signatures: RwLock<HashMap<String, ServiceLayoutSignature>>,
     lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
@@ -314,11 +328,13 @@ impl ProxyState {
                 .session_transcript_path_cache_max_entries,
             session_effort_overrides: RwLock::new(HashMap::new()),
             session_station_overrides: RwLock::new(HashMap::new()),
+            session_route_target_overrides: RwLock::new(HashMap::new()),
             session_model_overrides: RwLock::new(HashMap::new()),
             session_service_tier_overrides: RwLock::new(HashMap::new()),
             session_bindings: RwLock::new(HashMap::new()),
             session_route_affinities: RwLock::new(HashMap::new()),
             global_station_override: RwLock::new(None),
+            global_route_target_override: RwLock::new(None),
             runtime_default_profiles: RwLock::new(HashMap::new()),
             station_meta_overrides: RwLock::new(HashMap::new()),
             provider_endpoint_meta_overrides: RwLock::new(HashMap::new()),
@@ -333,6 +349,7 @@ impl ProxyState {
             passive_station_health: RwLock::new(HashMap::new()),
             provider_balances: RwLock::new(HashMap::new()),
             provider_balance_summaries: RwLock::new(HashMap::new()),
+            provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
             station_health_checks: RwLock::new(HashMap::new()),
             service_layout_signatures: RwLock::new(HashMap::new()),
             lb_states,
@@ -410,6 +427,11 @@ impl ProxyState {
     pub async fn get_session_station_override(&self, session_id: &str) -> Option<String> {
         let guard = self.session_station_overrides.read().await;
         guard.get(session_id).map(|v| v.station_name.clone())
+    }
+
+    pub async fn get_session_route_target_override(&self, session_id: &str) -> Option<String> {
+        let guard = self.session_route_target_overrides.read().await;
+        guard.get(session_id).map(|v| v.target.clone())
     }
 
     pub async fn get_session_model_override(&self, session_id: &str) -> Option<String> {
@@ -508,12 +530,21 @@ impl ProxyState {
         &self,
         session_id: &str,
     ) -> Option<SessionRouteAffinity> {
-        let guard = self.session_route_affinities.read().await;
-        guard.get(session_id).cloned()
+        let mut guard = self.session_route_affinities.write().await;
+        let Some(affinity) = guard.get(session_id).cloned() else {
+            return None;
+        };
+        if self.session_route_affinity_is_expired(&affinity, unix_now_ms()) {
+            guard.remove(session_id);
+            return None;
+        }
+        Some(affinity)
     }
 
     pub async fn list_session_route_affinities(&self) -> HashMap<String, SessionRouteAffinity> {
-        let guard = self.session_route_affinities.read().await;
+        let mut guard = self.session_route_affinities.write().await;
+        let now_ms = unix_now_ms();
+        guard.retain(|_, affinity| !self.session_route_affinity_is_expired(affinity, now_ms));
         guard.clone()
     }
 
@@ -536,10 +567,7 @@ impl ProxyState {
 
         let affinity = SessionRouteAffinity {
             route_graph_key: target.route_graph_key,
-            station_name: target.station_name,
-            upstream_index: target.upstream_index,
-            provider_id: target.provider_id,
-            endpoint_id: target.endpoint_id,
+            provider_endpoint: target.provider_endpoint,
             upstream_base_url: target.upstream_base_url,
             route_path: target.route_path,
             last_selected_at_ms: now_ms,
@@ -553,6 +581,16 @@ impl ProxyState {
             |entry| entry.last_selected_at_ms,
         );
         affinity
+    }
+
+    fn session_route_affinity_is_expired(
+        &self,
+        affinity: &SessionRouteAffinity,
+        now_ms: u64,
+    ) -> bool {
+        self.session_route_affinity_ttl_ms > 0
+            && now_ms.saturating_sub(affinity.last_selected_at_ms)
+                >= self.session_route_affinity_ttl_ms
     }
 
     pub async fn set_session_binding(&self, binding: SessionBinding) {
@@ -575,15 +613,17 @@ impl ProxyState {
 
     pub async fn clear_session_manual_overrides(&self, session_id: &str) {
         self.clear_session_station_override(session_id).await;
+        self.clear_session_route_target_override(session_id).await;
         self.clear_session_model_override(session_id).await;
         self.clear_session_effort_override(session_id).await;
         self.clear_session_service_tier_override(session_id).await;
     }
 
     pub async fn get_session_manual_overrides(&self, session_id: &str) -> SessionManualOverrides {
-        let (reasoning_effort, station_name, model, service_tier) = tokio::join!(
+        let (reasoning_effort, station_name, route_target, model, service_tier) = tokio::join!(
             self.get_session_reasoning_effort_override(session_id),
             self.get_session_station_override(session_id),
+            self.get_session_route_target_override(session_id),
             self.get_session_model_override(session_id),
             self.get_session_service_tier_override(session_id),
         );
@@ -591,15 +631,17 @@ impl ProxyState {
         SessionManualOverrides {
             reasoning_effort,
             station_name,
+            route_target,
             model,
             service_tier,
         }
     }
 
     pub async fn list_session_manual_overrides(&self) -> HashMap<String, SessionManualOverrides> {
-        let (reasoning_effort_map, station_map, model_map, service_tier_map) = tokio::join!(
+        let (reasoning_effort_map, station_map, route_target_map, model_map, service_tier_map) = tokio::join!(
             self.list_session_reasoning_effort_overrides(),
             self.list_session_station_overrides(),
+            self.list_session_route_target_overrides(),
             self.list_session_model_overrides(),
             self.list_session_service_tier_overrides(),
         );
@@ -610,6 +652,9 @@ impl ProxyState {
         }
         for (session_id, station_name) in station_map {
             merged.entry(session_id).or_default().station_name = Some(station_name);
+        }
+        for (session_id, route_target) in route_target_map {
+            merged.entry(session_id).or_default().route_target = Some(route_target);
         }
         for (session_id, model) in model_map {
             merged.entry(session_id).or_default().model = Some(model);
@@ -679,8 +724,30 @@ impl ProxyState {
         );
     }
 
+    pub async fn set_session_route_target_override(
+        &self,
+        session_id: String,
+        target: String,
+        now_ms: u64,
+    ) {
+        let mut guard = self.session_route_target_overrides.write().await;
+        guard.insert(
+            session_id,
+            SessionRouteTargetOverride {
+                target,
+                updated_at_ms: now_ms,
+                last_seen_ms: now_ms,
+            },
+        );
+    }
+
     pub async fn clear_session_station_override(&self, session_id: &str) {
         let mut guard = self.session_station_overrides.write().await;
+        guard.remove(session_id);
+    }
+
+    pub async fn clear_session_route_target_override(&self, session_id: &str) {
+        let mut guard = self.session_route_target_overrides.write().await;
         guard.remove(session_id);
     }
 
@@ -692,8 +759,23 @@ impl ProxyState {
             .collect()
     }
 
+    pub async fn list_session_route_target_overrides(&self) -> HashMap<String, String> {
+        let guard = self.session_route_target_overrides.read().await;
+        guard
+            .iter()
+            .map(|(k, v)| (k.clone(), v.target.clone()))
+            .collect()
+    }
+
     pub async fn touch_session_station_override(&self, session_id: &str, now_ms: u64) {
         let mut guard = self.session_station_overrides.write().await;
+        if let Some(v) = guard.get_mut(session_id) {
+            v.last_seen_ms = now_ms;
+        }
+    }
+
+    pub async fn touch_session_route_target_override(&self, session_id: &str, now_ms: u64) {
+        let mut guard = self.session_route_target_overrides.write().await;
         if let Some(v) = guard.get_mut(session_id) {
             v.last_seen_ms = now_ms;
         }
@@ -704,13 +786,28 @@ impl ProxyState {
         guard.clone()
     }
 
+    pub async fn get_global_route_target_override(&self) -> Option<String> {
+        let guard = self.global_route_target_override.read().await;
+        guard.clone()
+    }
+
     pub async fn set_global_station_override(&self, station_name: String, _now_ms: u64) {
         let mut guard = self.global_station_override.write().await;
         *guard = Some(station_name);
     }
 
+    pub async fn set_global_route_target_override(&self, target: String, _now_ms: u64) {
+        let mut guard = self.global_route_target_override.write().await;
+        *guard = Some(target);
+    }
+
     pub async fn clear_global_station_override(&self) {
         let mut guard = self.global_station_override.write().await;
+        *guard = None;
+    }
+
+    pub async fn clear_global_route_target_override(&self) {
+        let mut guard = self.global_route_target_override.write().await;
         *guard = None;
     }
 
@@ -1032,6 +1129,158 @@ impl ProxyState {
         overrides
     }
 
+    pub async fn route_plan_runtime_state_for_provider_endpoints(
+        &self,
+        service_name: &str,
+    ) -> RoutePlanRuntimeState {
+        let mut runtime = RoutePlanRuntimeState::default();
+        let now = std::time::Instant::now();
+
+        {
+            let mut guard = self.provider_endpoint_runtime_health.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                let mut affinity: Option<(ProviderEndpointKey, u64)> = None;
+                for (endpoint_key, health) in per_service.iter_mut() {
+                    if health.cooldown_until.is_some_and(|until| now >= until) {
+                        health.failure_count = 0;
+                        health.cooldown_until = None;
+                    }
+                    let cooldown_active = health.cooldown_until.is_some_and(|until| now < until);
+                    runtime.set_provider_endpoint(
+                        endpoint_key.clone(),
+                        RoutePlanUpstreamRuntimeState {
+                            runtime_disabled: false,
+                            failure_count: health.failure_count,
+                            cooldown_active,
+                            usage_exhausted: health.usage_exhausted,
+                            missing_auth: false,
+                        },
+                    );
+                    if let Some(last_good_at_ms) = health.last_good_at_ms
+                        && affinity
+                            .as_ref()
+                            .is_none_or(|(_, current)| last_good_at_ms > *current)
+                    {
+                        affinity = Some((endpoint_key.clone(), last_good_at_ms));
+                    }
+                }
+                if let Some((endpoint_key, _)) = affinity {
+                    runtime.set_affinity_provider_endpoint(Some(endpoint_key));
+                }
+            }
+        }
+
+        {
+            let guard = self.provider_endpoint_meta_overrides.read().await;
+            if let Some(per_service) = guard.get(service_name) {
+                for (endpoint_key, meta) in per_service {
+                    let mut upstream_state = runtime.provider_endpoint(endpoint_key);
+                    if meta.enabled == Some(false)
+                        || meta
+                            .state
+                            .is_some_and(|state| state != RuntimeConfigState::Normal)
+                    {
+                        upstream_state.runtime_disabled = true;
+                    }
+                    runtime.set_provider_endpoint(endpoint_key.clone(), upstream_state);
+                }
+            }
+        }
+
+        runtime
+    }
+
+    pub async fn record_provider_endpoint_attempt_success(
+        &self,
+        service_name: &str,
+        endpoint_key: ProviderEndpointKey,
+        now_ms: u64,
+    ) {
+        let mut guard = self.provider_endpoint_runtime_health.write().await;
+        let entry = guard
+            .entry(service_name.to_string())
+            .or_default()
+            .entry(endpoint_key)
+            .or_default();
+        entry.failure_count = 0;
+        entry.cooldown_until = None;
+        entry.penalty_streak = 0;
+        entry.last_good_at_ms = Some(now_ms);
+    }
+
+    pub async fn record_provider_endpoint_attempt_failure(
+        &self,
+        service_name: &str,
+        endpoint_key: ProviderEndpointKey,
+        failure_threshold_cooldown_secs: u64,
+        cooldown_backoff: CooldownBackoff,
+    ) {
+        let mut guard = self.provider_endpoint_runtime_health.write().await;
+        let entry = guard
+            .entry(service_name.to_string())
+            .or_default()
+            .entry(endpoint_key)
+            .or_default();
+
+        entry.failure_count = entry.failure_count.saturating_add(1);
+        if entry.failure_count >= FAILURE_THRESHOLD {
+            let base_secs = if failure_threshold_cooldown_secs == 0 {
+                COOLDOWN_SECS
+            } else {
+                failure_threshold_cooldown_secs
+            };
+            let effective_secs =
+                cooldown_backoff.effective_cooldown_secs(base_secs, entry.penalty_streak);
+            let now = std::time::Instant::now();
+            let new_until = now + std::time::Duration::from_secs(effective_secs);
+            if entry
+                .cooldown_until
+                .is_none_or(|existing| new_until > existing)
+            {
+                entry.cooldown_until = Some(new_until);
+            }
+            entry.penalty_streak = entry.penalty_streak.saturating_add(1);
+            entry.last_good_at_ms = None;
+        }
+    }
+
+    pub async fn penalize_provider_endpoint_attempt(
+        &self,
+        service_name: &str,
+        endpoint_key: ProviderEndpointKey,
+        cooldown_secs: u64,
+        cooldown_backoff: CooldownBackoff,
+    ) {
+        let mut guard = self.provider_endpoint_runtime_health.write().await;
+        let entry = guard
+            .entry(service_name.to_string())
+            .or_default()
+            .entry(endpoint_key)
+            .or_default();
+        let effective_secs =
+            cooldown_backoff.effective_cooldown_secs(cooldown_secs, entry.penalty_streak);
+        entry.failure_count = FAILURE_THRESHOLD;
+        entry.cooldown_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(effective_secs));
+        entry.penalty_streak = entry.penalty_streak.saturating_add(1);
+        entry.last_good_at_ms = None;
+    }
+
+    pub async fn set_provider_endpoint_usage_exhausted(
+        &self,
+        service_name: &str,
+        endpoint_key: ProviderEndpointKey,
+        exhausted: bool,
+    ) {
+        let mut guard = self.provider_endpoint_runtime_health.write().await;
+        let entry = guard
+            .entry(service_name.to_string())
+            .or_default()
+            .entry(endpoint_key)
+            .or_default();
+        entry.usage_exhausted = exhausted;
+    }
+
     pub async fn prune_runtime_observability_for_service(
         &self,
         service_name: &str,
@@ -1055,6 +1304,20 @@ impl ProxyState {
         let active_base_urls = active_upstreams
             .values()
             .flat_map(|upstreams| upstreams.iter().cloned())
+            .collect::<HashSet<_>>();
+        let active_provider_endpoint_keys = mgr
+            .stations()
+            .iter()
+            .flat_map(|(station_name, service)| {
+                service.upstreams.iter().enumerate().map(|(idx, upstream)| {
+                    Self::active_provider_endpoint_key_for_upstream(
+                        service_name,
+                        station_name.as_str(),
+                        idx,
+                        upstream,
+                    )
+                })
+            })
             .collect::<HashSet<_>>();
         let mut active_provider_ids = HashSet::from(["-".to_string()]);
         for service in mgr.stations().values() {
@@ -1130,9 +1393,26 @@ impl ProxyState {
             }
         }
 
-        if active_stations.is_empty() {
+        {
             let mut guard = self.provider_endpoint_meta_overrides.write().await;
-            guard.remove(service_name);
+            if let Some(per_service) = guard.get_mut(service_name) {
+                per_service
+                    .retain(|endpoint_key, _| active_provider_endpoint_keys.contains(endpoint_key));
+                if per_service.is_empty() {
+                    guard.remove(service_name);
+                }
+            }
+        }
+
+        {
+            let mut guard = self.provider_endpoint_runtime_health.write().await;
+            if let Some(per_service) = guard.get_mut(service_name) {
+                per_service
+                    .retain(|endpoint_key, _| active_provider_endpoint_keys.contains(endpoint_key));
+                if per_service.is_empty() {
+                    guard.remove(service_name);
+                }
+            }
         }
 
         {
@@ -1206,6 +1486,26 @@ impl ProxyState {
                 });
             }
         }
+    }
+
+    fn active_provider_endpoint_key_for_upstream(
+        service_name: &str,
+        station_name: &str,
+        upstream_index: usize,
+        upstream: &crate::config::UpstreamConfig,
+    ) -> ProviderEndpointKey {
+        let provider_id = upstream
+            .tags
+            .get("provider_id")
+            .cloned()
+            .unwrap_or_else(|| format!("{station_name}#{upstream_index}"));
+        let endpoint_id = upstream
+            .tags
+            .get("endpoint_id")
+            .cloned()
+            .unwrap_or_else(|| upstream_index.to_string());
+
+        ProviderEndpointKey::new(service_name, provider_id, endpoint_id)
     }
 
     pub async fn record_station_health(
@@ -2015,7 +2315,7 @@ impl ProxyState {
     pub async fn update_request_route(
         &self,
         request_id: u64,
-        station_name: String,
+        station_name: Option<String>,
         provider_id: Option<String>,
         upstream_base_url: String,
         route_decision: Option<RouteDecisionProvenance>,
@@ -2024,7 +2324,7 @@ impl ProxyState {
         let Some(req) = guard.get_mut(&request_id) else {
             return;
         };
-        req.station_name = Some(station_name);
+        req.station_name = station_name;
         req.provider_id = provider_id;
         req.upstream_base_url = Some(upstream_base_url);
         req.route_decision = route_decision;
@@ -2424,6 +2724,17 @@ impl ProxyState {
 
         if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
             let cutoff_override = now_ms - self.session_override_ttl_ms;
+            let mut overrides = self.session_route_target_overrides.write().await;
+            overrides.retain(|sid, v| {
+                if active_sessions.contains_key(sid) {
+                    return true;
+                }
+                v.last_seen_ms >= cutoff_override
+            });
+        }
+
+        if self.session_override_ttl_ms > 0 && now_ms >= self.session_override_ttl_ms {
+            let cutoff_override = now_ms - self.session_override_ttl_ms;
             let mut overrides = self.session_model_overrides.write().await;
             overrides.retain(|sid, v| {
                 if active_sessions.contains_key(sid) {
@@ -2737,7 +3048,7 @@ mod tests {
             state
                 .update_request_route(
                     old_id,
-                    "old-station".to_string(),
+                    Some("old-station".to_string()),
                     Some("old-provider".to_string()),
                     "https://old.example/v1".to_string(),
                     None,
@@ -2778,7 +3089,7 @@ mod tests {
             state
                 .update_request_route(
                     fresh_id,
-                    "fresh-station".to_string(),
+                    Some("fresh-station".to_string()),
                     Some("fresh-provider".to_string()),
                     "https://fresh.example/v1".to_string(),
                     None,
@@ -3648,6 +3959,22 @@ mod tests {
                 )
                 .await;
             state
+                .set_provider_endpoint_enabled_override(
+                    "codex",
+                    ProviderEndpointKey::new("codex", "provider-old", "default"),
+                    false,
+                    1,
+                )
+                .await;
+            state
+                .set_provider_endpoint_runtime_state_override(
+                    "codex",
+                    ProviderEndpointKey::new("codex", "provider-old", "default"),
+                    RuntimeConfigState::BreakerOpen,
+                    1,
+                )
+                .await;
+            state
                 .record_station_health(
                     "codex",
                     "old".to_string(),
@@ -3729,7 +4056,7 @@ mod tests {
             state
                 .update_request_route(
                     request_id,
-                    "old".to_string(),
+                    Some("old".to_string()),
                     Some("provider-old".to_string()),
                     "https://old.example/v1".to_string(),
                     None,
@@ -3834,6 +4161,78 @@ mod tests {
                 overrides.get("https://legacy.example/v1"),
                 Some(&(Some(true), Some(RuntimeConfigState::Draining)))
             );
+        });
+    }
+
+    #[test]
+    fn provider_endpoint_runtime_health_is_keyed_by_provider_endpoint() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let monthly = ProviderEndpointKey::new("codex", "monthly", "default");
+            let fallback = ProviderEndpointKey::new("codex", "fallback", "default");
+
+            state
+                .record_provider_endpoint_attempt_success("codex", fallback.clone(), 10)
+                .await;
+            state
+                .set_provider_endpoint_usage_exhausted("codex", monthly.clone(), true)
+                .await;
+            state
+                .record_provider_endpoint_attempt_failure(
+                    "codex",
+                    monthly.clone(),
+                    0,
+                    crate::lb::CooldownBackoff {
+                        factor: 1,
+                        max_secs: 0,
+                    },
+                )
+                .await;
+            state
+                .record_provider_endpoint_attempt_failure(
+                    "codex",
+                    monthly.clone(),
+                    0,
+                    crate::lb::CooldownBackoff {
+                        factor: 1,
+                        max_secs: 0,
+                    },
+                )
+                .await;
+            state
+                .record_provider_endpoint_attempt_failure(
+                    "codex",
+                    monthly.clone(),
+                    30,
+                    crate::lb::CooldownBackoff {
+                        factor: 1,
+                        max_secs: 0,
+                    },
+                )
+                .await;
+
+            let runtime = state
+                .route_plan_runtime_state_for_provider_endpoints("codex")
+                .await;
+            let monthly_state = runtime.provider_endpoint(&monthly);
+            assert_eq!(monthly_state.failure_count, crate::lb::FAILURE_THRESHOLD);
+            assert!(monthly_state.cooldown_active);
+            assert!(monthly_state.usage_exhausted);
+            assert_eq!(runtime.affinity_provider_endpoint(), Some(&fallback));
+
+            state
+                .set_provider_endpoint_runtime_state_override(
+                    "codex",
+                    fallback.clone(),
+                    RuntimeConfigState::BreakerOpen,
+                    20,
+                )
+                .await;
+            let runtime = state
+                .route_plan_runtime_state_for_provider_endpoints("codex")
+                .await;
+            assert!(runtime.provider_endpoint(&fallback).runtime_disabled);
         });
     }
 
@@ -4080,6 +4479,37 @@ mod tests {
             state.prune_periodic().await;
 
             assert!(state.get_session_binding("sid-expire").await.is_none());
+        });
+    }
+
+    #[test]
+    fn session_route_affinity_ttl_is_enforced_on_read() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let mut policy = test_runtime_policy(0, 0, 2_000);
+            policy.session_route_affinity_ttl_ms = 1;
+            let state = ProxyState::new_with_runtime_policy(None, policy);
+            state
+                .record_session_route_affinity_success(
+                    "sid-expire",
+                    SessionRouteAffinityTarget {
+                        route_graph_key: "graph".to_string(),
+                        provider_endpoint: ProviderEndpointKey::new("codex", "monthly", "default"),
+                        upstream_base_url: "https://monthly.example/v1".to_string(),
+                        route_path: vec!["monthly_first".to_string(), "monthly".to_string()],
+                    },
+                    Some("first_success".to_string()),
+                    0,
+                )
+                .await;
+
+            assert!(
+                state
+                    .get_session_route_affinity("sid-expire")
+                    .await
+                    .is_none()
+            );
+            assert!(state.list_session_route_affinities().await.is_empty());
         });
     }
 

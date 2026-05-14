@@ -13,6 +13,7 @@ pub(in crate::gui::proxy_control) fn apply_refresh_result(
     att.recent = result.recent;
     att.session_cards = result.session_cards;
     att.global_station_override = result.global_station_override;
+    att.global_route_target_override = result.global_route_target_override;
     att.configured_active_station = result.configured_active_station;
     att.effective_active_station = result.effective_active_station;
     att.configured_default_profile = result.configured_default_profile;
@@ -21,6 +22,7 @@ pub(in crate::gui::proxy_control) fn apply_refresh_result(
     att.providers = result.providers;
     att.session_model_overrides = result.session_model;
     att.session_station_overrides = result.session_station;
+    att.session_route_target_overrides = result.session_route_target;
     att.session_effort_overrides = result.session_effort;
     att.session_service_tier_overrides = result.session_service_tier;
     att.session_stats = result.session_stats;
@@ -55,6 +57,8 @@ pub(in crate::gui::proxy_control) fn apply_refresh_result(
     att.supports_station_spec_api = result.supports_station_spec_api;
     att.supports_default_profile_override = result.supports_default_profile_override;
     att.supports_station_runtime_override = result.supports_station_runtime_override;
+    att.supports_session_route_target_override = result.supports_session_route_target_override;
+    att.supports_global_route_target_override = result.supports_global_route_target_override;
     att.supports_session_override_reset = result.supports_session_override_reset;
     att.supports_control_trace_api = result.supports_control_trace_api;
     att.supports_request_ledger_api = result.supports_request_ledger_api;

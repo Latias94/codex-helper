@@ -32,12 +32,22 @@ pub(super) fn render_stations_runtime_summary(
             }
         });
         ui.horizontal(|ui| {
+            let global_runtime_override = if snapshot.supports_global_route_target_override {
+                (
+                    pick(ctx.lang, "全局 route target", "Global route target"),
+                    snapshot.global_route_target_override.as_deref(),
+                )
+            } else {
+                (
+                    pick(ctx.lang, "全局站点覆盖", "Global pinned station"),
+                    snapshot.global_station_override.as_deref(),
+                )
+            };
             ui.label(format!(
                 "{}: {}",
-                pick(ctx.lang, "全局站点覆盖", "Global pinned station"),
-                snapshot
-                    .global_station_override
-                    .as_deref()
+                global_runtime_override.0,
+                global_runtime_override
+                    .1
                     .unwrap_or_else(|| pick(ctx.lang, "<自动>", "<auto>"))
             ));
             ui.label(format!(
@@ -108,14 +118,14 @@ pub(super) fn render_stations_runtime_summary(
             if matches!(snapshot.kind, ProxyModeKind::Attached) {
                 pick(
                     ctx.lang,
-                    "附着模式下，global pin / runtime 覆盖会直接作用到远端代理；这里不再提供旧的持久化站点写回入口。",
-                    "In attached mode, global pin and runtime overrides act on the remote proxy directly; the old persisted station write-back entrypoint is no longer shown here.",
+                    "附着模式下，route target / 运行时覆盖会直接作用到远端代理；这里不再提供旧的持久化站点写回入口。",
+                    "In attached mode, route targets and runtime overrides act on the remote proxy directly; the old persisted station write-back entrypoint is no longer shown here.",
                 )
             } else {
                 pick(
                     ctx.lang,
-                    "这里的 global pin 是运行时覆盖；配置文件编辑请走代理设置页的原始视图。",
-                    "Global pin here is runtime-only; edit the config file through the Proxy Settings raw view.",
+                    "这里的 route target / global pin 是运行时覆盖；配置文件编辑请走代理设置页的原始视图。",
+                    "Route targets / global pins here are runtime-only; edit the config file through the Proxy Settings raw view.",
                 )
             },
         );

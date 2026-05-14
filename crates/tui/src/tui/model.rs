@@ -11,8 +11,9 @@ pub(in crate::tui) use crate::dashboard_core::window_stats::compute_window_stats
 use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
 use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, HealthCheckStatus, LbConfigView,
-    ProviderBalanceSnapshot, ProxyState, ResolvedRouteValue, SessionIdentityCard,
-    SessionObservationScope, SessionRouteAffinity, StationHealth, UsageRollupView,
+    ProviderBalanceSnapshot, ProxyState, ResolvedRouteValue, RouteDecisionProvenance,
+    SessionIdentityCard, SessionObservationScope, SessionRouteAffinity, StationHealth,
+    UsageRollupView,
 };
 use crate::tui::Language;
 use crate::tui::i18n;
@@ -85,6 +86,37 @@ pub(in crate::tui) struct RoutingSpecView {
     pub(in crate::tui) entry_target: Option<String>,
     #[serde(default)]
     pub(in crate::tui) providers: Vec<RoutingProviderRef>,
+}
+
+impl From<crate::config::PersistedRoutingProviderRef> for RoutingProviderRef {
+    fn from(provider: crate::config::PersistedRoutingProviderRef) -> Self {
+        Self {
+            name: provider.name,
+            alias: provider.alias,
+            enabled: provider.enabled,
+            tags: provider.tags,
+        }
+    }
+}
+
+impl From<crate::config::PersistedRoutingSpec> for RoutingSpecView {
+    fn from(spec: crate::config::PersistedRoutingSpec) -> Self {
+        Self {
+            entry: spec.entry,
+            routes: spec.routes,
+            policy: spec.policy,
+            order: spec.order,
+            target: spec.target,
+            prefer_tags: spec.prefer_tags,
+            chain: Vec::new(),
+            pools: BTreeMap::new(),
+            on_exhausted: spec.on_exhausted,
+            entry_strategy: spec.entry_strategy,
+            expanded_order: spec.expanded_order,
+            entry_target: spec.entry_target,
+            providers: spec.providers.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 fn default_tui_routing_entry() -> String {
@@ -204,6 +236,25 @@ impl From<&RoutingSpecView> for RoutingSpecUpsertView {
     }
 }
 
+impl From<RoutingSpecUpsertView> for crate::proxy::PersistedRoutingUpsertRequest {
+    fn from(spec: RoutingSpecUpsertView) -> Self {
+        Self {
+            entry: Some(spec.entry),
+            affinity_policy: None,
+            fallback_ttl_ms: None,
+            reprobe_preferred_after_ms: None,
+            routes: Some(spec.routes),
+            policy: Some(spec.policy),
+            order: spec.order,
+            target: spec.target,
+            prefer_tags: Some(spec.prefer_tags),
+            chain: Vec::new(),
+            pools: BTreeMap::new(),
+            on_exhausted: spec.on_exhausted,
+        }
+    }
+}
+
 pub(in crate::tui) fn routing_leaf_provider_names(spec: &RoutingSpecView) -> Vec<String> {
     let mut names = if spec.order.is_empty() {
         spec.providers
@@ -248,6 +299,7 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) turns_with_usage: Option<u64>,
     pub(in crate::tui) binding_profile_name: Option<String>,
     pub(in crate::tui) binding_continuity_mode: Option<crate::state::SessionContinuityMode>,
+    pub(in crate::tui) last_route_decision: Option<RouteDecisionProvenance>,
     pub(in crate::tui) route_affinity: Option<SessionRouteAffinity>,
     pub(in crate::tui) effective_model: Option<ResolvedRouteValue>,
     pub(in crate::tui) effective_reasoning_effort: Option<ResolvedRouteValue>,
@@ -257,6 +309,7 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) override_model: Option<String>,
     pub(in crate::tui) override_effort: Option<String>,
     pub(in crate::tui) override_station_name: Option<String>,
+    pub(in crate::tui) override_route_target: Option<String>,
     pub(in crate::tui) override_service_tier: Option<String>,
 }
 
@@ -267,8 +320,10 @@ pub(in crate::tui) struct Snapshot {
     pub(in crate::tui) model_overrides: HashMap<String, String>,
     pub(in crate::tui) overrides: HashMap<String, String>,
     pub(in crate::tui) station_overrides: HashMap<String, String>,
+    pub(in crate::tui) route_target_overrides: HashMap<String, String>,
     pub(in crate::tui) service_tier_overrides: HashMap<String, String>,
     pub(in crate::tui) global_station_override: Option<String>,
+    pub(in crate::tui) global_route_target_override: Option<String>,
     pub(in crate::tui) station_meta_overrides: HashMap<String, (Option<bool>, Option<u8>)>,
     pub(in crate::tui) usage_rollup: UsageRollupView,
     pub(in crate::tui) provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
@@ -1011,6 +1066,7 @@ fn row_station_candidates(row: &SessionRow) -> impl Iterator<Item = &str> {
             .as_ref()
             .map(|value| value.value.as_str()),
         row.override_station_name.as_deref(),
+        row.override_route_target.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -1272,6 +1328,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
                 turns_with_usage: card.turns_with_usage,
                 binding_profile_name: card.binding_profile_name.clone(),
                 binding_continuity_mode: card.binding_continuity_mode,
+                last_route_decision: card.last_route_decision.clone(),
                 route_affinity: card.route_affinity.clone(),
                 effective_model: card.effective_model.clone(),
                 effective_reasoning_effort: card.effective_reasoning_effort.clone(),
@@ -1281,6 +1338,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
                 override_model: card.override_model.clone(),
                 override_effort: card.override_effort.clone(),
                 override_station_name: card.override_station_name.clone(),
+                override_route_target: None,
                 override_service_tier: card.override_service_tier.clone(),
             })
         })
@@ -1293,6 +1351,7 @@ pub(in crate::tui) fn session_row_has_any_override(row: &SessionRow) -> bool {
     row.override_model.is_some()
         || row.override_effort.is_some()
         || row.override_station_name.is_some()
+        || row.override_route_target.is_some()
         || row.override_service_tier.is_some()
 }
 
@@ -1350,6 +1409,9 @@ pub(in crate::tui) fn session_override_fields(row: &SessionRow) -> Vec<&'static 
     if row.override_station_name.is_some() {
         fields.push("station");
     }
+    if row.override_route_target.is_some() {
+        fields.push("route_target");
+    }
     if row.override_service_tier.is_some() {
         fields.push("service_tier");
     }
@@ -1360,13 +1422,23 @@ pub(in crate::tui) fn session_override_fields(row: &SessionRow) -> Vec<&'static 
 pub(in crate::tui) fn session_control_posture(
     row: &SessionRow,
     global_station: Option<&str>,
+    global_route_target: Option<&str>,
+    route_graph_routing: bool,
 ) -> SessionControlPosture {
-    session_control_posture_lang(row, global_station, Language::En)
+    session_control_posture_lang(
+        row,
+        global_station,
+        global_route_target,
+        route_graph_routing,
+        Language::En,
+    )
 }
 
 pub(in crate::tui) fn session_control_posture_lang(
     row: &SessionRow,
     global_station: Option<&str>,
+    global_route_target: Option<&str>,
+    route_graph_routing: bool,
     lang: Language,
 ) -> SessionControlPosture {
     let override_fields = session_override_fields(row);
@@ -1426,6 +1498,25 @@ pub(in crate::tui) fn session_control_posture_lang(
         };
     }
 
+    if route_graph_routing {
+        if let Some(route_target) = global_route_target.filter(|target| !target.trim().is_empty()) {
+            return SessionControlPosture {
+                headline: match lang {
+                    Language::Zh => format!("无绑定；全局 route target {route_target} 仍会影响路由"),
+                    Language::En => {
+                        format!("no binding; global route target {route_target} may still influence routing")
+                    }
+                },
+                detail: i18n::label(
+                    lang,
+                    "Without a stored profile or session override, route graph defaults and runtime/global routing explain the effective route.",
+                )
+                .to_string(),
+                color: Color::Rgb(210, 153, 34),
+            };
+        }
+    }
+
     if let Some(station) = global_station.filter(|station| !station.trim().is_empty()) {
         return SessionControlPosture {
             headline: match lang {
@@ -1447,7 +1538,11 @@ pub(in crate::tui) fn session_control_posture_lang(
         headline: i18n::label(lang, "no stored binding or session override").to_string(),
         detail: i18n::label(
             lang,
-            "Effective route comes from request payloads, station defaults, and runtime fallback.",
+            if route_graph_routing {
+                "Effective route comes from request payloads, route graph defaults, route target overrides, and runtime fallback."
+            } else {
+                "Effective route comes from request payloads, station defaults, and runtime fallback."
+            },
         )
         .to_string(),
         color: Color::Rgb(144, 154, 164),
@@ -1471,16 +1566,27 @@ pub(in crate::tui) async fn refresh_snapshot(
     crate::state::enrich_session_identity_cards_with_runtime(&mut snap.session_cards, mgr);
 
     let global_station_override = snap.effective_global_station_override().map(str::to_owned);
+    let global_route_target_override = snap
+        .effective_global_route_target_override()
+        .map(str::to_owned);
     let station_health = snap.effective_station_health().clone();
-    let rows = build_session_rows_from_cards(&snap.session_cards);
+    let mut rows = build_session_rows_from_cards(&snap.session_cards);
+    for row in &mut rows {
+        if let Some(session_id) = row.session_id.as_deref() {
+            row.override_route_target =
+                snap.session_route_target_overrides.get(session_id).cloned();
+        }
+    }
     Snapshot {
         rows,
         recent: snap.recent,
         model_overrides: snap.session_model_overrides,
         overrides: snap.session_effort_overrides,
         station_overrides: snap.session_station_overrides,
+        route_target_overrides: snap.session_route_target_overrides,
         service_tier_overrides: snap.session_service_tier_overrides,
         global_station_override,
+        global_route_target_override,
         station_meta_overrides: config_meta,
         usage_rollup: snap.usage_rollup,
         provider_balances: snap.provider_balances,
@@ -1610,6 +1716,7 @@ mod tests {
             turns_with_usage: None,
             binding_profile_name: None,
             binding_continuity_mode: None,
+            last_route_decision: None,
             route_affinity: None,
             effective_model: None,
             effective_reasoning_effort: None,
@@ -1619,6 +1726,7 @@ mod tests {
             override_model: None,
             override_effort: None,
             override_station_name: None,
+            override_route_target: None,
             override_service_tier: None,
         }
     }
@@ -1658,6 +1766,15 @@ mod tests {
             provider_balance_compact(&snapshot, 80),
             "CodeX Air left $165.08"
         );
+    }
+
+    #[test]
+    fn session_route_target_counts_as_manual_override() {
+        let mut row = empty_session_row();
+        row.override_route_target = Some("monthly.default".to_string());
+
+        assert!(session_row_has_any_override(&row));
+        assert_eq!(session_override_fields(&row), vec!["route_target"]);
     }
 
     #[test]
@@ -1848,6 +1965,7 @@ mod tests {
                 turns_with_usage: None,
                 binding_profile_name: None,
                 binding_continuity_mode: None,
+                last_route_decision: None,
                 route_affinity: None,
                 effective_model: None,
                 effective_reasoning_effort: None,
@@ -1857,14 +1975,17 @@ mod tests {
                 override_model: None,
                 override_effort: None,
                 override_station_name: None,
+                override_route_target: None,
                 override_service_tier: None,
             }],
             recent: Vec::new(),
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
             service_tier_overrides: HashMap::new(),
             global_station_override: None,
+            global_route_target_override: None,
             station_meta_overrides: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
@@ -1911,6 +2032,7 @@ mod tests {
                 turns_with_usage: None,
                 binding_profile_name: None,
                 binding_continuity_mode: None,
+                last_route_decision: None,
                 route_affinity: None,
                 effective_model: None,
                 effective_reasoning_effort: None,
@@ -1920,6 +2042,7 @@ mod tests {
                 override_model: None,
                 override_effort: None,
                 override_station_name: None,
+                override_route_target: None,
                 override_service_tier: None,
             }],
             recent: vec![
@@ -1981,8 +2104,10 @@ mod tests {
             model_overrides: HashMap::new(),
             overrides: HashMap::new(),
             station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
             service_tier_overrides: HashMap::new(),
             global_station_override: None,
+            global_route_target_override: None,
             station_meta_overrides: HashMap::new(),
             usage_rollup: UsageRollupView::default(),
             provider_balances: HashMap::new(),
@@ -2023,10 +2148,9 @@ mod tests {
             session_id: Some("sid-1".to_string()),
             route_affinity: Some(SessionRouteAffinity {
                 route_graph_key: "v4:deadbeef".to_string(),
-                station_name: "monthly_first".to_string(),
-                upstream_index: 2,
-                provider_id: Some("right".to_string()),
-                endpoint_id: Some("default".to_string()),
+                provider_endpoint: codex_helper_core::runtime_identity::ProviderEndpointKey::new(
+                    "codex", "right", "default",
+                ),
                 upstream_base_url: "https://right.example/v1".to_string(),
                 route_path: vec!["monthly_first".to_string(), "right".to_string()],
                 last_selected_at_ms: 1_000,
@@ -2041,7 +2165,7 @@ mod tests {
             rows[0]
                 .route_affinity
                 .as_ref()
-                .and_then(|affinity| affinity.provider_id.as_deref()),
+                .map(|affinity| affinity.provider_endpoint.provider_id.as_str()),
             Some("right")
         );
         assert_eq!(
@@ -2081,6 +2205,7 @@ mod tests {
             turns_with_usage: None,
             binding_profile_name: Some("fast".to_string()),
             binding_continuity_mode: None,
+            last_route_decision: None,
             route_affinity: None,
             effective_model: None,
             effective_reasoning_effort: None,
@@ -2090,12 +2215,34 @@ mod tests {
             override_model: Some("gpt-5.4".to_string()),
             override_effort: None,
             override_station_name: None,
+            override_route_target: None,
             override_service_tier: None,
         };
 
-        let posture = session_control_posture(&row, None);
+        let posture = session_control_posture(&row, None, None, false);
 
         assert!(posture.headline.contains("profile fast"));
         assert!(posture.detail.contains("model"));
+    }
+
+    #[test]
+    fn session_control_posture_reports_route_graph_override_context() {
+        let mut row = empty_session_row();
+        row.override_route_target = Some("monthly.default".to_string());
+
+        let posture = session_control_posture(&row, None, Some("input.fast"), true);
+
+        assert!(posture.headline.contains("session-controlled route"));
+        assert!(posture.detail.contains("route_target"));
+    }
+
+    #[test]
+    fn session_control_posture_reports_global_route_target_context() {
+        let row = empty_session_row();
+
+        let posture = session_control_posture(&row, None, Some("input.fast"), true);
+
+        assert!(posture.headline.contains("global route target input.fast"));
+        assert!(posture.detail.contains("route graph defaults"));
     }
 }

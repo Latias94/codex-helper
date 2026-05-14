@@ -48,7 +48,7 @@ pub fn config_file_path() -> PathBuf {
     }
 }
 
-const CONFIG_VERSION: u32 = 4;
+const CONFIG_VERSION: u32 = CURRENT_ROUTE_GRAPH_CONFIG_VERSION;
 
 #[derive(Debug, Clone)]
 pub struct LoadedProxyConfig {
@@ -91,7 +91,7 @@ const CONFIG_TOML_TEMPLATE: &str = r#"# codex-helper config.toml
 # - 生成/覆盖本模板：`codex-helper config init [--force]`
 # - 新安装时：首次写入配置默认会写 TOML。
 
-version = 4
+version = 5
 
 # 省略 --codex/--claude 时默认使用哪个服务。
 # default_service = "codex"
@@ -105,7 +105,7 @@ version = 4
 # 如果你只想生成纯模板（不导入），请使用：
 #   codex-helper config init --no-import
 
-# --- 推荐：provider / routing 配置（v4 route graph） ---
+# --- 推荐：provider / routing 配置（v5 route graph） ---
 #
 # 大部分用户只需要改这一段。
 #
@@ -128,6 +128,9 @@ version = 4
 #
 # [codex.routing]
 # entry = "main"
+# affinity_policy = "preferred-group"
+# fallback_ttl_ms = 120000
+# reprobe_preferred_after_ms = 30000
 #
 # [codex.routing.routes.main]
 # strategy = "ordered-failover"
@@ -141,16 +144,13 @@ version = 4
 # default_profile = "daily"
 #
 # [codex.profiles.daily]
-# station = "routing"
 # reasoning_effort = "medium"
 #
 # [codex.profiles.fast]
-# station = "routing"
 # service_tier = "priority"
 # reasoning_effort = "low"
 #
 # [codex.profiles.deep]
-# station = "routing"
 # model = "gpt-5.4"
 # reasoning_effort = "high"
 #
@@ -262,7 +262,7 @@ profile = "balanced"
 "#;
 
 fn insert_after_version_block(template: &str, insert: &str) -> String {
-    let needle = "version = 4\n\n";
+    let needle = "version = 5\n\n";
     if let Some(idx) = template.find(needle) {
         let insert_pos = idx + needle.len();
         let mut out = String::with_capacity(template.len() + insert.len() + 2);
@@ -367,7 +367,7 @@ pub async fn load_config_with_v4_source() -> Result<LoadedProxyConfig> {
         let version = toml_schema_version_or_shape(&text);
 
         let mut loaded_v4 = None;
-        let mut cfg = if version == Some(4) {
+        let mut cfg = if version.is_some_and(is_supported_route_graph_config_version) {
             let cfg_v4 = toml::from_str::<ProxyConfigV4>(&text)?;
             let runtime = compile_v4_to_runtime(&cfg_v4)?;
             loaded_v4 = Some(cfg_v4);
@@ -388,9 +388,11 @@ pub async fn load_config_with_v4_source() -> Result<LoadedProxyConfig> {
         };
         normalize_proxy_config(&mut cfg);
         validate_proxy_config(&cfg)?;
-        if version != Some(4) {
-            if let Some(cfg_v4) = loaded_v4.as_ref() {
+        if version != Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION) {
+            if let Some(cfg_v4) = loaded_v4.as_mut() {
                 auto_migrate_loaded_v4_config(cfg_v4, "config.toml", version).await;
+                cfg_v4.version = CURRENT_ROUTE_GRAPH_CONFIG_VERSION;
+                cfg.version = Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION);
             } else {
                 auto_migrate_loaded_config(&mut cfg, "config.toml", version).await;
             }
@@ -435,16 +437,16 @@ async fn auto_migrate_loaded_config(
 ) {
     match save_config(cfg).await {
         Ok(()) => {
-            cfg.version = Some(4);
+            cfg.version = Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION);
             info!(
-                "auto-migrated {} from version {:?} to version 4",
-                source, source_version
+                "auto-migrated {} from version {:?} to version {}",
+                source, source_version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION
             );
         }
         Err(err) => {
             warn!(
-                "failed to auto-migrate {} from version {:?} to version 4: {}",
-                source, source_version, err
+                "failed to auto-migrate {} from version {:?} to version {}: {}",
+                source, source_version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION, err
             );
         }
     }
@@ -458,14 +460,14 @@ async fn auto_migrate_loaded_v4_config(
     match save_config_v4(cfg).await {
         Ok(_) => {
             info!(
-                "auto-migrated {} from version {:?} to version 4",
-                source, source_version
+                "auto-migrated {} from version {:?} to version {}",
+                source, source_version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION
             );
         }
         Err(err) => {
             warn!(
-                "failed to auto-migrate {} from version {:?} to version 4: {}",
-                source, source_version, err
+                "failed to auto-migrate {} from version {:?} to version {}: {}",
+                source, source_version, CURRENT_ROUTE_GRAPH_CONFIG_VERSION, err
             );
         }
     }
@@ -524,7 +526,7 @@ async fn save_existing_v4_if_only_runtime_metadata_changed(
     }
 
     let text = fs::read_to_string(&path).await?;
-    if toml_schema_version_or_shape(&text) != Some(4) {
+    if !toml_schema_version_or_shape(&text).is_some_and(is_supported_route_graph_config_version) {
         return Ok(None);
     }
 
@@ -552,7 +554,10 @@ async fn save_existing_v4_if_only_runtime_metadata_changed(
 }
 
 pub async fn save_config(cfg: &ProxyConfig) -> Result<()> {
-    if cfg.version == Some(4) {
+    if cfg
+        .version
+        .is_some_and(is_supported_route_graph_config_version)
+    {
         if save_existing_v4_if_only_runtime_metadata_changed(cfg)
             .await?
             .is_some()
@@ -602,7 +607,7 @@ pub async fn save_config_v2(cfg: &ProxyConfigV2) -> Result<PathBuf> {
 
 pub async fn save_config_v4(cfg: &ProxyConfigV4) -> Result<PathBuf> {
     let mut normalized = cfg.clone();
-    normalized.version = 4;
+    normalized.version = CURRENT_ROUTE_GRAPH_CONFIG_VERSION;
     compact_v4_config_for_write(&mut normalized);
     let mut runtime = compile_v4_to_runtime(&normalized)?;
     normalize_proxy_config(&mut runtime);

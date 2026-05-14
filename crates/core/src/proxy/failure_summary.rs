@@ -78,8 +78,16 @@ pub(super) fn failed_proxy_client_message(
 
 fn route_attempt_client_line(attempt: &RouteAttemptLog) -> String {
     let mut parts = Vec::new();
+    if let Some(provider_endpoint_key) =
+        clean_optional_component(attempt.provider_endpoint_key.as_deref())
+    {
+        parts.push(format!("endpoint={provider_endpoint_key}"));
+    }
     if let Some(provider_id) = clean_optional_component(attempt.provider_id.as_deref()) {
         parts.push(format!("provider={provider_id}"));
+    }
+    if let Some(preference_group) = attempt.preference_group {
+        parts.push(format!("group={preference_group}"));
     }
     if let Some(station_name) = clean_optional_component(attempt.station_name.as_deref()) {
         parts.push(format!("station={station_name}"));
@@ -357,5 +365,20 @@ mod tests {
         );
 
         assert_eq!(message, "plain error token=[REDACTED]");
+    }
+
+    #[test]
+    fn failed_proxy_client_message_prefers_provider_endpoint_identity() {
+        let mut failed = attempt("failed_transport");
+        failed.provider_endpoint_key = Some("codex/input/default".to_string());
+        failed.preference_group = Some(0);
+        failed.reason = Some("operation timed out".to_string());
+
+        let message =
+            failed_proxy_client_message(StatusCode::BAD_GATEWAY, "bad gateway", 2, None, &[failed]);
+
+        assert!(message.contains("endpoint=codex/input/default"));
+        assert!(message.contains("group=0"));
+        assert!(message.contains("provider=alpha"));
     }
 }

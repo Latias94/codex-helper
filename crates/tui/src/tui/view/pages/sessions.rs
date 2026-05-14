@@ -141,8 +141,9 @@ pub(super) fn render_sessions_page(
                 .map(|u| tokens_short(u.total_tokens))
                 .unwrap_or_else(|| "-".to_string());
             let pin = row
-                .override_station_name
+                .override_route_target
                 .as_deref()
+                .or(row.override_station_name.as_deref())
                 .map(|s| shorten(s, 12))
                 .unwrap_or_else(|| "-".to_string());
 
@@ -173,11 +174,15 @@ pub(super) fn render_sessions_page(
                 Cell::from(Span::styled(tok, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(
                     pin,
-                    Style::default().fg(if row.override_station_name.is_some() {
-                        p.accent
-                    } else {
-                        p.muted
-                    }),
+                    Style::default().fg(
+                        if row.override_route_target.is_some()
+                            || row.override_station_name.is_some()
+                        {
+                            p.accent
+                        } else {
+                            p.muted
+                        },
+                    ),
                 )),
             ])
             .style(style)
@@ -228,6 +233,23 @@ pub(super) fn render_sessions_page(
         .unwrap_or_else(|| "-".to_string());
         let observed_model = row.last_model.as_deref().unwrap_or("-");
         let provider = row.last_provider_id.as_deref().unwrap_or("-");
+        let observed_endpoint = row
+            .last_route_decision
+            .as_ref()
+            .and_then(|decision| {
+                decision
+                    .provider_id
+                    .as_ref()
+                    .zip(decision.endpoint_id.as_ref())
+            })
+            .map(|(provider_id, endpoint_id)| format!("{provider_id}/{endpoint_id}"))
+            .unwrap_or_else(|| "-".to_string());
+        let observed_route_path = row
+            .last_route_decision
+            .as_ref()
+            .map(|decision| decision.route_path.join(" / "))
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| "-".to_string());
         let balance = session_balance_brief_lang(row, &snapshot.provider_balances, 64, lang)
             .unwrap_or_else(|| "-".to_string());
         let balance_style = session_primary_balance_snapshot(row, &snapshot.provider_balances)
@@ -253,14 +275,26 @@ pub(super) fn render_sessions_page(
         let override_model = row.override_model.as_deref().unwrap_or("-");
         let override_effort = row.override_effort.as_deref().unwrap_or("-");
         let override_cfg = row.override_station_name.as_deref().unwrap_or("-");
+        let override_route_target = row.override_route_target.as_deref().unwrap_or("-");
         let override_service_tier = row.override_service_tier.as_deref().unwrap_or("-");
         let global_cfg = snapshot.global_station_override.as_deref().unwrap_or("-");
-        let posture =
-            session_control_posture_lang(row, snapshot.global_station_override.as_deref(), lang);
+        let global_route_target = snapshot
+            .global_route_target_override
+            .as_deref()
+            .unwrap_or("-");
+        let posture = session_control_posture_lang(
+            row,
+            snapshot.global_station_override.as_deref(),
+            snapshot.global_route_target_override.as_deref(),
+            ui.uses_route_graph_routing(),
+            lang,
+        );
         let routing = if session_row_has_any_override(row) {
             format!(
-                "session(model={override_model}, station={override_cfg}, tier={override_service_tier})"
+                "session(model={override_model}, station={override_cfg}, route={override_route_target}, tier={override_service_tier})"
             )
+        } else if global_route_target != "-" {
+            format!("pinned(global-route)={global_route_target}")
         } else if global_cfg != "-" {
             format!("pinned(global-station)={global_cfg}")
         } else {
@@ -270,19 +304,9 @@ pub(super) fn render_sessions_page(
             .route_affinity
             .as_ref()
             .map(|affinity| {
-                let provider = match (
-                    affinity.provider_id.as_deref(),
-                    affinity.endpoint_id.as_deref(),
-                ) {
-                    (Some(provider), Some(endpoint)) => format!("{provider}/{endpoint}"),
-                    (Some(provider), None) => provider.to_string(),
-                    (None, Some(endpoint)) => endpoint.to_string(),
-                    (None, None) => "-".to_string(),
-                };
                 format!(
-                    "station={} provider={} upstream={} reason={}",
-                    affinity.station_name,
-                    provider,
+                    "endpoint={} upstream={} reason={}",
+                    affinity.provider_endpoint.stable_key(),
                     shorten_middle(&affinity.upstream_base_url, 64),
                     affinity.change_reason
                 )
@@ -356,16 +380,28 @@ pub(super) fn render_sessions_page(
             provider.to_string(),
             Style::default().fg(p.text),
         ));
+        lines.push(kv_line(
+            p,
+            "endpoint",
+            observed_endpoint,
+            Style::default().fg(p.text),
+        ));
+        lines.push(kv_line(
+            p,
+            "route_path",
+            observed_route_path,
+            Style::default().fg(p.muted),
+        ));
         lines.push(kv_line(p, "balance", balance, balance_style));
         lines.push(kv_line(
             p,
-            "station(last)",
+            "station(last legacy)",
             observed_cfg.to_string(),
             Style::default().fg(p.text),
         ));
         lines.push(kv_line(
             p,
-            "upstream(last)",
+            "upstream(last legacy)",
             observed_upstream.to_string(),
             Style::default().fg(p.text),
         ));
@@ -420,9 +456,12 @@ pub(super) fn render_sessions_page(
             p,
             l("override"),
             format!(
-                "model={override_model}, effort={override_effort}, station={override_cfg}, tier={override_service_tier}, global_station={global_cfg}"
+                "model={override_model}, effort={override_effort}, station={override_cfg}, route={override_route_target}, tier={override_service_tier}, global_station={global_cfg}, global_route={global_route_target}"
             ),
-            Style::default().fg(if session_row_has_any_override(row) || global_cfg != "-" {
+            Style::default().fg(if session_row_has_any_override(row)
+                || global_cfg != "-"
+                || global_route_target != "-"
+            {
                 p.accent
             } else {
                 p.muted

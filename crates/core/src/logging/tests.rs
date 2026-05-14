@@ -12,8 +12,10 @@ fn request_log_serializes_request_id_when_present() {
         status_code: 200,
         duration_ms: 123,
         ttfb_ms: Some(10),
-        station_name: "right",
+        station_name: Some("right"),
         provider_id: Some("right".to_string()),
+        endpoint_id: None,
+        provider_endpoint_key: None,
         upstream_base_url: "https://example.com/v1",
         session_id: Some("sid-1".to_string()),
         cwd: Some("/workdir".to_string()),
@@ -32,6 +34,43 @@ fn request_log_serializes_request_id_when_present() {
 
     assert_eq!(value["request_id"].as_u64(), Some(42));
     assert_eq!(value["trace_id"].as_str(), Some("codex-42"));
+}
+
+#[test]
+fn request_log_can_serialize_provider_endpoint_without_station_identity() {
+    let value = serde_json::to_value(RequestLog {
+        timestamp_ms: 1,
+        request_id: Some(42),
+        trace_id: Some(request_trace_id("codex", 42)),
+        service: "codex",
+        method: "POST",
+        path: "/v1/responses",
+        status_code: 200,
+        duration_ms: 123,
+        ttfb_ms: Some(10),
+        station_name: None,
+        provider_id: Some("input".to_string()),
+        endpoint_id: Some("default".to_string()),
+        provider_endpoint_key: Some("codex/input/default".to_string()),
+        upstream_base_url: "https://input.example/v1",
+        session_id: Some("sid-1".to_string()),
+        cwd: Some("/workdir".to_string()),
+        reasoning_effort: Some("medium".to_string()),
+        service_tier: ServiceTierLog::default(),
+        usage: None,
+        http_debug: None,
+        http_debug_ref: None,
+        retry: None,
+    })
+    .expect("serialize request log");
+
+    assert!(value["station_name"].is_null());
+    assert_eq!(value["provider_id"].as_str(), Some("input"));
+    assert_eq!(value["endpoint_id"].as_str(), Some("default"));
+    assert_eq!(
+        value["provider_endpoint_key"].as_str(),
+        Some("codex/input/default")
+    );
 }
 
 #[test]
@@ -77,6 +116,41 @@ fn route_attempts_are_derived_from_legacy_retry_chain() {
     assert_eq!(attempts[3].decision, "all_upstreams_avoided");
     assert_eq!(attempts[3].reason.as_deref(), Some("total=3"));
     assert!(attempts[3].skipped);
+}
+
+#[test]
+fn route_attempts_are_derived_from_provider_endpoint_retry_chain() {
+    let chain = vec![
+        "endpoint=codex/input/default group=0 compat_station=routing upstream_index=0 url=https://input.example/v1 status=502 class=server_error model=gpt-5".to_string(),
+        "endpoint=codex/right/default group=1 compat_station=routing upstream_index=2 url=https://right.example/v1 skipped_unsupported_model=gpt-5".to_string(),
+    ];
+
+    let attempts = parse_route_attempts_from_chain(&chain);
+
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].provider_endpoint_key.as_deref(),
+        Some("codex/input/default")
+    );
+    assert_eq!(attempts[0].provider_id.as_deref(), Some("input"));
+    assert_eq!(attempts[0].endpoint_id.as_deref(), Some("default"));
+    assert_eq!(attempts[0].preference_group, Some(0));
+    assert_eq!(attempts[0].station_name.as_deref(), Some("routing"));
+    assert_eq!(attempts[0].upstream_index, Some(0));
+    assert_eq!(
+        attempts[0].upstream_base_url.as_deref(),
+        Some("https://input.example/v1")
+    );
+    assert_eq!(attempts[0].decision, "failed_status");
+
+    assert_eq!(
+        attempts[1].provider_endpoint_key.as_deref(),
+        Some("codex/right/default")
+    );
+    assert_eq!(attempts[1].provider_id.as_deref(), Some("right"));
+    assert_eq!(attempts[1].preference_group, Some(1));
+    assert_eq!(attempts[1].decision, "skipped_capability_mismatch");
+    assert!(attempts[1].skipped);
 }
 
 #[test]

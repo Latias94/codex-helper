@@ -22,11 +22,19 @@ pub(super) fn render_stations_routing_preview(
             "自动切换解释",
             "Auto-switch explanation",
         ));
-        ui.small(pick(
-            ctx.lang,
-            "按当前运行态解释新请求会如何选择 route/provider、哪些候选被排除，以及 legacy station 兼容状态如何影响 pin / retry。",
-            "Explain how new requests choose routes/providers under the current runtime, which candidates are excluded, and how legacy station compatibility affects pins and retry.",
-        ));
+        ui.small(if snapshot.supports_global_route_target_override {
+            pick(
+                ctx.lang,
+                "按当前运行态解释新请求会如何选择 route/provider、哪些候选被排除，以及 route target 覆盖如何影响运行时选择。",
+                "Explain how new requests choose routes/providers under the current runtime, which candidates are excluded, and how route target overrides affect runtime routing.",
+            )
+        } else {
+            pick(
+                ctx.lang,
+                "按当前运行态解释新请求会如何选择 route/provider、哪些候选被排除，以及 legacy station 兼容状态如何影响 pin / retry。",
+                "Explain how new requests choose routes/providers under the current runtime, which candidates are excluded, and how legacy station compatibility affects pins and retry.",
+            )
+        });
         if let Some(explain) = snapshot.routing_explain.as_ref() {
             ui.add_space(4.0);
             ui.label(pick(ctx.lang, "运行态选路", "Runtime route"));
@@ -58,7 +66,16 @@ pub(super) fn render_stations_routing_preview(
         if let Some(summary) = format_recent_switch_observations(ctx.lang, snapshot) {
             ui.small(summary);
         }
-        if let Some(note) = session_pin_note(ctx.lang, posture.session_pin_count) {
+        let manual_target_count = if snapshot.supports_session_route_target_override {
+            snapshot.session_route_target_overrides.len()
+        } else {
+            posture.session_pin_count
+        };
+        if let Some(note) = session_pin_note(
+            ctx.lang,
+            manual_target_count,
+            snapshot.supports_session_route_target_override,
+        ) {
             ui.colored_label(egui::Color32::from_rgb(200, 120, 40), note);
         }
 
@@ -132,7 +149,11 @@ fn build_gui_station_routing_posture(
         session_station_override: None,
         global_station_override: snapshot.global_station_override.as_deref(),
         configured_active_station,
-        session_pin_count: snapshot.session_station_overrides.len(),
+        session_pin_count: if snapshot.supports_session_route_target_override {
+            snapshot.session_route_target_overrides.len()
+        } else {
+            snapshot.session_station_overrides.len()
+        },
         retry: snapshot.resolved_retry.as_ref(),
     })
 }
@@ -353,40 +374,54 @@ fn format_runtime_selected_route(
     explain: &crate::routing_explain::RoutingExplainResponse,
 ) -> String {
     match explain.selected_route.as_ref() {
-        Some(selected) => match lang {
-            Language::Zh => format!(
-                "selected={} endpoint={} path={} compat_station={} upstream#{}",
-                selected.provider_id,
-                selected.endpoint_id,
-                selected.route_path.join(" > "),
-                selected.compatibility.station_name,
-                selected.compatibility.upstream_index
-            ),
-            Language::En => format!(
-                "selected={} endpoint={} path={} compat_station={} upstream#{}",
-                selected.provider_id,
-                selected.endpoint_id,
-                selected.route_path.join(" > "),
-                selected.compatibility.station_name,
-                selected.compatibility.upstream_index
-            ),
-        },
+        Some(selected) => {
+            let compatibility = format_runtime_compatibility(selected.compatibility.as_ref());
+            match lang {
+                Language::Zh => format!(
+                    "selected={} endpoint={} path={} {}",
+                    selected.provider_id,
+                    selected.endpoint_id,
+                    selected.route_path.join(" > "),
+                    compatibility
+                ),
+                Language::En => format!(
+                    "selected={} endpoint={} path={} {}",
+                    selected.provider_id,
+                    selected.endpoint_id,
+                    selected.route_path.join(" > "),
+                    compatibility
+                ),
+            }
+        }
         None => pick(lang, "selected=<none>", "selected=<none>").to_string(),
     }
 }
 
 fn format_runtime_candidate(candidate: &crate::routing_explain::RoutingExplainCandidate) -> String {
     let marker = if candidate.selected { "*" } else { " " };
+    let compatibility = format_runtime_compatibility(candidate.compatibility.as_ref());
     format!(
-        "{} {} endpoint={} path={} skip={} compat_station={} upstream#{}",
+        "{} {} endpoint={} path={} skip={} {}",
         marker,
         candidate.provider_id,
         candidate.endpoint_id,
         candidate.route_path.join(" > "),
         format_runtime_skip_reasons(&candidate.skip_reasons),
-        candidate.compatibility.station_name,
-        candidate.compatibility.upstream_index
+        compatibility
     )
+}
+
+fn format_runtime_compatibility(
+    compatibility: Option<&crate::routing_explain::RoutingExplainCompatibility>,
+) -> String {
+    compatibility
+        .map(|compatibility| {
+            format!(
+                "compat_station={} upstream#{}",
+                compatibility.station_name, compatibility.upstream_index
+            )
+        })
+        .unwrap_or_else(|| "compatibility=-".to_string())
 }
 
 fn format_runtime_skip_reasons(
@@ -402,8 +437,18 @@ fn format_runtime_skip_reasons(
         .join(",")
 }
 
-fn session_pin_note(lang: Language, session_pin_count: usize) -> Option<String> {
+fn session_pin_note(
+    lang: Language,
+    session_pin_count: usize,
+    route_target_mode: bool,
+) -> Option<String> {
     (session_pin_count > 0).then(|| match lang {
+        Language::Zh if route_target_mode => {
+            format!("{session_pin_count} 个会话有 route target 覆盖；这些会话会优先使用自己的 target。")
+        }
+        Language::En if route_target_mode => {
+            format!("{session_pin_count} sessions have route target overrides; those sessions use their own targets first.")
+        }
         Language::Zh => format!(
             "{session_pin_count} 个会话有 station pin；这些会话会先使用自己的 pin，再看 global/auto 策略。"
         ),

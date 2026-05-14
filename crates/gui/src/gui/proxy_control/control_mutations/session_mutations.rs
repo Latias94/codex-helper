@@ -2,8 +2,17 @@ use std::time::Duration;
 
 use anyhow::bail;
 
+use crate::config::is_supported_route_graph_config_version;
+use crate::proxy::local_proxy_base_url;
+
 use super::super::{ProxyController, ProxyMode, now_ms, send_admin_request};
 use super::{attached_child_control_url, attached_control_url};
+
+fn running_supports_route_target_overrides(r: &super::super::RunningProxy) -> bool {
+    r.cfg
+        .version
+        .is_some_and(is_supported_route_graph_config_version)
+}
 
 impl ProxyController {
     pub fn apply_session_effort_override(
@@ -294,6 +303,62 @@ impl ProxyController {
         }
     }
 
+    pub fn apply_session_route_target_override(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        session_id: String,
+        route_target: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                if !running_supports_route_target_overrides(r) {
+                    bail!("running proxy does not support route target overrides");
+                }
+                let url = format!(
+                    "{}/__codex_helper/api/v1/overrides/session/route",
+                    local_proxy_base_url(r.admin_port)
+                );
+                let client = self.http_client.clone();
+                let fut = async move {
+                    send_admin_request(client.post(url).timeout(Duration::from_millis(800)).json(
+                        &serde_json::json!({
+                            "session_id": session_id,
+                            "target": route_target,
+                        }),
+                    ))
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                let url = attached_child_control_url(
+                    att,
+                    att.api_version == Some(1) && att.supports_session_route_target_override,
+                    "attached proxy does not support session route target overrides (need api v1 route graph)",
+                    |links| Some(links.session_overrides.as_str()),
+                    "/__codex_helper/api/v1/overrides/session",
+                    "route",
+                )?;
+                let client = self.http_client.clone();
+                let fut = async move {
+                    send_admin_request(client.post(url).timeout(Duration::from_millis(800)).json(
+                        &serde_json::json!({
+                            "session_id": session_id,
+                            "target": route_target,
+                        }),
+                    ))
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
     pub fn apply_session_service_tier_override(
         &mut self,
         rt: &tokio::runtime::Runtime,
@@ -375,6 +440,60 @@ impl ProxyController {
                             .post(url)
                             .timeout(Duration::from_millis(800))
                             .json(&serde_json::json!({ "station_name": station_name })),
+                    )
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            _ => bail!("proxy is not running/attached"),
+        }
+    }
+
+    pub fn apply_global_route_target_override(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        route_target: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &mut self.mode {
+            ProxyMode::Running(r) => {
+                if !running_supports_route_target_overrides(r) {
+                    bail!("running proxy does not support global route target overrides");
+                }
+                let url = format!(
+                    "{}/__codex_helper/api/v1/overrides/global-route",
+                    local_proxy_base_url(r.admin_port)
+                );
+                let client = self.http_client.clone();
+                let fut = async move {
+                    send_admin_request(
+                        client
+                            .post(url)
+                            .timeout(Duration::from_millis(800))
+                            .json(&serde_json::json!({ "target": route_target })),
+                    )
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                rt.block_on(fut)?;
+                Ok(())
+            }
+            ProxyMode::Attached(att) => {
+                let url = attached_control_url(
+                    att,
+                    att.api_version == Some(1) && att.supports_global_route_target_override,
+                    "attached proxy does not support global route target overrides (need api v1 route graph)",
+                    |links| Some(links.global_route_override.as_str()),
+                    "/__codex_helper/api/v1/overrides/global-route",
+                )?;
+                let client = self.http_client.clone();
+                let fut = async move {
+                    send_admin_request(
+                        client
+                            .post(url)
+                            .timeout(Duration::from_millis(800))
+                            .json(&serde_json::json!({ "target": route_target })),
                     )
                     .await?;
                     Ok::<(), anyhow::Error>(())

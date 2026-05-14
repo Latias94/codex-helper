@@ -50,12 +50,16 @@ pub(super) const API_V1_SESSION_OVERRIDE_EFFORT: &str =
     "/__codex_helper/api/v1/overrides/session/effort";
 pub(super) const API_V1_SESSION_OVERRIDE_STATION: &str =
     "/__codex_helper/api/v1/overrides/session/station";
+pub(super) const API_V1_SESSION_OVERRIDE_ROUTE: &str =
+    "/__codex_helper/api/v1/overrides/session/route";
 pub(super) const API_V1_SESSION_OVERRIDE_SERVICE_TIER: &str =
     "/__codex_helper/api/v1/overrides/session/service-tier";
 pub(super) const API_V1_SESSION_OVERRIDE_RESET: &str =
     "/__codex_helper/api/v1/overrides/session/reset";
 pub(super) const API_V1_GLOBAL_STATION_OVERRIDE: &str =
     "/__codex_helper/api/v1/overrides/global-station";
+pub(super) const API_V1_GLOBAL_ROUTE_OVERRIDE: &str =
+    "/__codex_helper/api/v1/overrides/global-route";
 pub(super) const API_V1_HEALTHCHECK_START: &str = "/__codex_helper/api/v1/healthcheck/start";
 pub(super) const API_V1_HEALTHCHECK_CANCEL: &str = "/__codex_helper/api/v1/healthcheck/cancel";
 
@@ -100,9 +104,11 @@ const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_SESSION_OVERRIDE_MODEL,
     API_V1_SESSION_OVERRIDE_EFFORT,
     API_V1_SESSION_OVERRIDE_STATION,
+    API_V1_SESSION_OVERRIDE_ROUTE,
     API_V1_SESSION_OVERRIDE_SERVICE_TIER,
     API_V1_SESSION_OVERRIDE_RESET,
     API_V1_GLOBAL_STATION_OVERRIDE,
+    API_V1_GLOBAL_ROUTE_OVERRIDE,
     API_V1_HEALTHCHECK_START,
     API_V1_HEALTHCHECK_CANCEL,
 ];
@@ -151,9 +157,11 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
         session_model_override: true,
         session_reasoning_effort_override: true,
         session_station_override: true,
+        session_route_override: true,
         session_service_tier_override: true,
         session_override_reset: true,
         global_station_override: true,
+        global_route_override: true,
         healthcheck_start: true,
         healthcheck_cancel: true,
     }
@@ -180,6 +188,7 @@ pub(super) fn api_v1_operator_summary_links() -> OperatorSummaryLinks {
         session_by_id_template: API_V1_SESSION_BY_ID.to_string(),
         session_overrides: API_V1_SESSION_OVERRIDES.to_string(),
         global_station_override: API_V1_GLOBAL_STATION_OVERRIDE.to_string(),
+        global_route_override: API_V1_GLOBAL_ROUTE_OVERRIDE.to_string(),
         stations: API_V1_STATIONS.to_string(),
         station_by_name_template: API_V1_STATION_BY_NAME.to_string(),
         station_specs: API_V1_STATION_SPECS.to_string(),
