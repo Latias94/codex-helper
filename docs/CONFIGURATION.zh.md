@@ -606,7 +606,7 @@ RightCode account summary：
 }
 ```
 
-普通场景可以省略这段配置：默认 adapter 已内置，会优先读取 `RIGHTCODE_API_KEY`，没有设置时再 fallback 到 upstream 的 model API key。只有当你希望自定义 endpoint 或调整 routing trust policy 时才需要显式添加。默认情况下，RightCode 的 daily package quota 只作为 routing 的展示信号，因为账户 `balance` 可能仍然可用，而且 daily subscription windows 可能是 lazy reset。
+普通场景可以省略这段配置：默认 adapter 已内置，会按 upstream URL 匹配 RightCode，并使用该 upstream 配置里的 model API key。只有当你希望使用独立的余额 key（例如 `RIGHTCODE_API_KEY`）、自定义 endpoint，或调整 routing trust policy 时才需要显式添加。默认情况下，RightCode 的 daily package quota 只作为 routing 的展示信号，因为账户 `balance` 可能仍然可用，而且 daily subscription windows 可能是 lazy reset。
 
 New API dashboard-style quota：
 

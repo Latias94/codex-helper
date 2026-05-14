@@ -354,7 +354,6 @@ fn default_rightcode_provider_config(id: &str) -> UsageProviderConfig {
     // RightCode subscription windows are daily capacity signals. A zero daily
     // remainder can coexist with account balance or be reset lazily, so the
     // built-in adapter displays it without demoting routes by default.
-    provider.token_env = Some("RIGHTCODE_API_KEY".to_string());
     provider.trust_exhaustion_for_routing = false;
     provider
 }
@@ -431,7 +430,6 @@ fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> Usag
         extract: UsageProviderExtractConfig::default(),
     };
     if matches!(kind, ProviderKind::RightCodeAccountSummary) {
-        provider.token_env = Some("RIGHTCODE_API_KEY".to_string());
         provider.trust_exhaustion_for_routing = false;
     }
     provider
@@ -3111,7 +3109,7 @@ mod tests {
             auto_usage_provider(&target, ProviderKind::RightCodeAccountSummary)
                 .token_env
                 .as_deref(),
-            Some("RIGHTCODE_API_KEY")
+            None
         );
     }
 

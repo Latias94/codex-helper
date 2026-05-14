@@ -608,7 +608,7 @@ RightCode account summary:
 }
 ```
 
-You can omit this block for the normal case: the default adapter is built in, reads `RIGHTCODE_API_KEY` when it is set, and otherwise falls back to the upstream model API key. Add it only when you want a custom endpoint or a different routing trust policy. By default, RightCode daily package quota is display-only for routing because the account `balance` may still be available and daily subscription windows can reset lazily.
+You can omit this block for the normal case: the default adapter is built in, matches RightCode by upstream URL, and uses that upstream's configured model API key. Add it only when you want a separate balance key such as `RIGHTCODE_API_KEY`, a custom endpoint, or a different routing trust policy. By default, RightCode daily package quota is display-only for routing because the account `balance` may still be available and daily subscription windows can reset lazily.
 
 New API dashboard-style quota:
 
