@@ -37,6 +37,8 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -62,8 +64,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
@@ -76,8 +80,13 @@ jobs:
             libayatana-appindicator3-dev \
             libxdo-dev
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Verify Rust tools
+        run: |
+          cargo --version
+          cargo nextest --version
 
       - name: Test (nextest)
         run: cargo nextest run --locked --workspace --features gui --no-fail-fast
