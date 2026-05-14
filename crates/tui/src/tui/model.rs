@@ -848,6 +848,38 @@ fn balance_amount_terse_lang(snapshot: &ProviderBalanceSnapshot, lang: Language)
     }
 }
 
+fn balance_amount_tiny(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
+    if let Some(amount) = quota_amount_tiny(snapshot) {
+        return Some(amount);
+    }
+
+    let total = snapshot
+        .total_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(total) = total {
+        return Some(usd_brief(total));
+    }
+
+    let subscription = snapshot
+        .subscription_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let paygo = snapshot
+        .paygo_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (subscription, paygo) {
+        (Some(sub), None) => Some(usd_brief(sub)),
+        (None, Some(paygo)) => Some(usd_brief(paygo)),
+        _ => None,
+    }
+}
+
 fn quota_amount_terse(snapshot: &ProviderBalanceSnapshot, lang: Language) -> Option<String> {
     let period = snapshot
         .quota_period
@@ -876,6 +908,26 @@ fn quota_amount_terse(snapshot: &ProviderBalanceSnapshot, lang: Language) -> Opt
                 usd_brief(remaining),
                 usd_brief(limit)
             ))
+        }
+        _ => None,
+    }
+}
+
+fn quota_amount_tiny(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
+    let remaining = snapshot
+        .quota_remaining_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let limit = snapshot
+        .quota_limit_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (remaining, limit) {
+        (Some(remaining), Some(limit)) => {
+            Some(format!("{}/{}", usd_brief(remaining), usd_brief(limit)))
         }
         _ => None,
     }
@@ -991,6 +1043,7 @@ pub(in crate::tui) fn provider_balance_compact_lang(
         .map(ToOwned::to_owned);
     let amount = balance_amount_brief_lang(snapshot, lang);
     let terse_amount = balance_amount_terse_lang(snapshot, lang);
+    let tiny_amount = balance_amount_tiny(snapshot);
 
     let mut candidates = Vec::new();
     let full = [status.as_deref(), plan.as_deref(), amount.as_deref()]
@@ -1020,6 +1073,9 @@ pub(in crate::tui) fn provider_balance_compact_lang(
     if let Some(terse_amount) = terse_amount.clone() {
         push_balance_candidate(&mut candidates, terse_amount);
     }
+    if let Some(tiny_amount) = tiny_amount.clone() {
+        push_balance_candidate(&mut candidates, tiny_amount);
+    }
     if let Some(status) = status.clone() {
         push_balance_candidate(&mut candidates, status);
     }
@@ -1037,8 +1093,10 @@ pub(in crate::tui) fn provider_balance_compact_lang(
         return candidate.clone();
     }
 
-    let fallback = amount
+    let fallback = tiny_amount
         .as_deref()
+        .or(terse_amount.as_deref())
+        .or(amount.as_deref())
         .or_else(|| candidates.first().map(String::as_str))
         .unwrap_or_else(|| balance_snapshot_status_brief_lang(snapshot, lang));
     shorten_middle(fallback, max_width)
@@ -1141,6 +1199,7 @@ pub(in crate::tui) fn station_balance_brief_lang(
     let primary_amount = primary.and_then(|snapshot| balance_amount_brief_lang(snapshot, lang));
     let primary_terse_amount =
         primary.and_then(|snapshot| balance_amount_terse_lang(snapshot, lang));
+    let primary_tiny_amount = primary.and_then(balance_amount_tiny);
 
     let mut parts = Vec::new();
     let mut amount_index = None;
@@ -1185,6 +1244,7 @@ pub(in crate::tui) fn station_balance_brief_lang(
             &parts,
             amount_index,
             primary_terse_amount.as_deref(),
+            primary_tiny_amount.as_deref(),
             max_width,
         )
     }
@@ -1194,6 +1254,7 @@ fn compact_balance_parts(
     parts: &[String],
     amount_index: Option<usize>,
     terse_amount: Option<&str>,
+    tiny_amount: Option<&str>,
     max_width: usize,
 ) -> String {
     let full = parts.join(" ");
@@ -1225,6 +1286,12 @@ fn compact_balance_parts(
             && display_width(terse_amount) <= max_width
         {
             return terse_amount.to_string();
+        }
+
+        if let Some(tiny_amount) = tiny_amount
+            && display_width(tiny_amount) <= max_width
+        {
+            return tiny_amount.to_string();
         }
     }
 
@@ -1994,6 +2061,7 @@ mod tests {
             provider_balance_compact(&snapshot, 120),
             "exh CodeX Lite 年度 daily left $0 / $100.00"
         );
+        assert_eq!(provider_balance_compact(&snapshot, 14), "$0/$100.00");
     }
 
     #[test]
@@ -2094,6 +2162,10 @@ mod tests {
         assert!(!brief.contains('…'), "{brief}");
         assert!(brief.contains("$100.00"), "{brief}");
         assert!(UnicodeWidthStr::width(brief.as_str()) <= 42, "{brief}");
+
+        let narrow = station_balance_brief_lang(&balances, "routing", 14, Language::Zh);
+        assert_eq!(narrow, "$93.83/$100.00");
+        assert!(UnicodeWidthStr::width(narrow.as_str()) <= 14, "{narrow}");
     }
 
     #[test]

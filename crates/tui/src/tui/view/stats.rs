@@ -19,6 +19,8 @@ use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
 use crate::usage::UsageMetrics;
 
+const STATS_BALANCE_COLUMN_WIDTH: u16 = 14;
+
 fn stats_window_label(days: usize, lang: Language) -> String {
     match days {
         0 => i18n::label(lang, "loaded").to_string(),
@@ -238,10 +240,18 @@ fn table_balance_brief(
     lang: Language,
 ) -> String {
     match focus {
-        StatsFocus::Stations => {
-            station_balance_brief_lang(&snapshot.provider_balances, name, 18, lang)
-        }
-        StatsFocus::Providers => provider_balance_brief(snapshot, name, 18, lang),
+        StatsFocus::Stations => station_balance_brief_lang(
+            &snapshot.provider_balances,
+            name,
+            usize::from(STATS_BALANCE_COLUMN_WIDTH),
+            lang,
+        ),
+        StatsFocus::Providers => provider_balance_brief(
+            snapshot,
+            name,
+            usize::from(STATS_BALANCE_COLUMN_WIDTH),
+            lang,
+        ),
     }
 }
 
@@ -540,7 +550,7 @@ fn render_bucket_table_stateful(
         rows,
         [
             Constraint::Min(14),
-            Constraint::Length(14),
+            Constraint::Length(STATS_BALANCE_COLUMN_WIDTH),
             Constraint::Length(6),
             Constraint::Length(6),
             Constraint::Length(7),
