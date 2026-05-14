@@ -1357,15 +1357,14 @@ fn provider_endpoint_exists(provider: &ProviderConfigV4, endpoint_id: &str) -> b
 }
 
 fn provider_endpoint_enabled(provider: &ProviderConfigV4, endpoint_id: &str) -> bool {
-    if endpoint_id == "default" {
-        if provider
+    if endpoint_id == "default"
+        && provider
             .base_url
             .as_deref()
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
-        {
-            return true;
-        }
+    {
+        return true;
     }
     provider
         .endpoints

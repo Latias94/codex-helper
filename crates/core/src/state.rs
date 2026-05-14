@@ -531,9 +531,7 @@ impl ProxyState {
         session_id: &str,
     ) -> Option<SessionRouteAffinity> {
         let mut guard = self.session_route_affinities.write().await;
-        let Some(affinity) = guard.get(session_id).cloned() else {
-            return None;
-        };
+        let affinity = guard.get(session_id).cloned()?;
         if self.session_route_affinity_is_expired(&affinity, unix_now_ms()) {
             guard.remove(session_id);
             return None;

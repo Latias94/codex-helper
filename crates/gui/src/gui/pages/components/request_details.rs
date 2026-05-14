@@ -626,31 +626,6 @@ fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> Stri
     format!("{target}  {}", parts.join(" "))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn request_route_attempt_line_prefers_provider_endpoint_identity() {
-        let attempt = crate::logging::RouteAttemptLog {
-            decision: "failed_status".to_string(),
-            provider_endpoint_key: Some("codex/input/default".to_string()),
-            provider_id: Some("input".to_string()),
-            preference_group: Some(0),
-            provider_attempt: Some(1),
-            upstream_attempt: Some(1),
-            upstream_base_url: Some("https://input.example/v1".to_string()),
-            ..Default::default()
-        };
-
-        let line = request_route_attempt_line(&attempt);
-
-        assert!(line.starts_with("endpoint=codex/input/default"));
-        assert!(line.contains("group=0"));
-        assert!(line.contains("provider=input"));
-    }
-}
-
 fn request_upstream_host(request: &FinishedRequest) -> Option<String> {
     let raw = request.upstream_base_url.as_deref()?.trim();
     if raw.is_empty() {
@@ -896,4 +871,29 @@ fn request_fast_mode_note(
                 )
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_route_attempt_line_prefers_provider_endpoint_identity() {
+        let attempt = crate::logging::RouteAttemptLog {
+            decision: "failed_status".to_string(),
+            provider_endpoint_key: Some("codex/input/default".to_string()),
+            provider_id: Some("input".to_string()),
+            preference_group: Some(0),
+            provider_attempt: Some(1),
+            upstream_attempt: Some(1),
+            upstream_base_url: Some("https://input.example/v1".to_string()),
+            ..Default::default()
+        };
+
+        let line = request_route_attempt_line(&attempt);
+
+        assert!(line.starts_with("endpoint=codex/input/default"));
+        assert!(line.contains("group=0"));
+        assert!(line.contains("provider=input"));
+    }
 }

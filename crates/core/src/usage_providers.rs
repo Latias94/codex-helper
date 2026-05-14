@@ -2364,7 +2364,7 @@ pub async fn refresh_balances_for_service(
     let mut refreshed_provider_ids = HashSet::new();
     if !configured_jobs.is_empty() {
         for (provider_id, outcome) in run_configured_refresh_jobs(
-            &client,
+            client,
             configured_jobs,
             &cfg,
             &lb_states,
@@ -2398,7 +2398,7 @@ pub async fn refresh_balances_for_service(
 
         if !auto_jobs.is_empty() {
             for outcome in
-                run_auto_refresh_jobs(&client, auto_jobs, &cfg, &lb_states, &state, service_name)
+                run_auto_refresh_jobs(client, auto_jobs, &cfg, &lb_states, &state, service_name)
                     .await
             {
                 match outcome {

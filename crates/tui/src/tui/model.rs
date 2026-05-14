@@ -1498,23 +1498,25 @@ pub(in crate::tui) fn session_control_posture_lang(
         };
     }
 
-    if route_graph_routing {
-        if let Some(route_target) = global_route_target.filter(|target| !target.trim().is_empty()) {
-            return SessionControlPosture {
-                headline: match lang {
-                    Language::Zh => format!("无绑定；全局 route target {route_target} 仍会影响路由"),
-                    Language::En => {
-                        format!("no binding; global route target {route_target} may still influence routing")
-                    }
-                },
-                detail: i18n::label(
-                    lang,
-                    "Without a stored profile or session override, route graph defaults and runtime/global routing explain the effective route.",
-                )
-                .to_string(),
-                color: Color::Rgb(210, 153, 34),
-            };
-        }
+    if route_graph_routing
+        && let Some(route_target) = global_route_target.filter(|target| !target.trim().is_empty())
+    {
+        return SessionControlPosture {
+            headline: match lang {
+                Language::Zh => format!("无绑定；全局 route target {route_target} 仍会影响路由"),
+                Language::En => {
+                    format!(
+                        "no binding; global route target {route_target} may still influence routing"
+                    )
+                }
+            },
+            detail: i18n::label(
+                lang,
+                "Without a stored profile or session override, route graph defaults and runtime/global routing explain the effective route.",
+            )
+            .to_string(),
+            color: Color::Rgb(210, 153, 34),
+        };
     }
 
     if let Some(station) = global_station.filter(|station| !station.trim().is_empty()) {

@@ -579,11 +579,11 @@ fn normalize_complete_order(
         Ok(())
     };
 
-    if let Some(target) = target {
-        if !routing_target_is_route(view, target) {
-            let provider_name = routing_order_provider_name(view, target);
-            push_name(provider_name)?;
-        }
+    if let Some(target) = target
+        && !routing_target_is_route(view, target)
+    {
+        let provider_name = routing_order_provider_name(view, target);
+        push_name(provider_name)?;
     }
     for name in raw_order {
         let provider_name = routing_order_provider_name(view, name.as_str());

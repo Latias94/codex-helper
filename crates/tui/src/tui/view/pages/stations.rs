@@ -841,9 +841,9 @@ fn render_route_graph_routing_page(
                 Style::default().fg(p.muted)
             } else if session_route_target == Some(name.as_str()) {
                 Style::default().fg(p.focus).add_modifier(Modifier::BOLD)
-            } else if global_route_target == Some(name.as_str()) {
-                Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
-            } else if spec.target.as_deref() == Some(name.as_str()) {
+            } else if global_route_target == Some(name.as_str())
+                || spec.target.as_deref() == Some(name.as_str())
+            {
                 Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
             } else if provider
                 .is_some_and(|provider| routing_provider_matches_preference(&spec, provider))
