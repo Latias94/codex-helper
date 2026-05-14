@@ -957,6 +957,46 @@ fn request_provider_balance_refresh_after_control_change(
     )
 }
 
+async fn refresh_route_graph_balances(
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    proxy: &ProxyService,
+    balance_refresh_tx: &BalanceRefreshSender,
+) {
+    let balance_started = request_provider_balance_refresh(
+        ui,
+        snapshot,
+        proxy,
+        BalanceRefreshMode::Force,
+        balance_refresh_tx,
+    );
+    match refresh_routing_control_state(ui, proxy).await {
+        Ok(()) => {
+            ui.toast = Some((
+                if balance_started {
+                    match ui.language {
+                        Language::Zh => "routing: 已刷新；余额刷新已开始",
+                        Language::En => "routing: refreshed; balance refresh started",
+                    }
+                } else {
+                    i18n::label(ui.language, "balance refresh already requested")
+                }
+                .to_string(),
+                Instant::now(),
+            ));
+        }
+        Err(err) => {
+            ui.toast = Some((
+                format!(
+                    "{}: {err}",
+                    i18n::label(ui.language, "routing: refresh failed")
+                ),
+                Instant::now(),
+            ));
+        }
+    }
+}
+
 async fn apply_persisted_routing(
     ui: &mut UiState,
     snapshot: &Snapshot,
@@ -1769,6 +1809,10 @@ async fn handle_key_normal(
                 balance_refresh_tx,
             )
             .await;
+            true
+        }
+        KeyCode::Char('g') if ui.page == Page::Stations && ui.uses_route_graph_routing() => {
+            refresh_route_graph_balances(ui, snapshot, proxy, balance_refresh_tx).await;
             true
         }
         KeyCode::Backspace | KeyCode::Delete if ui.page == Page::Stations => {
@@ -3763,17 +3807,19 @@ mod tests {
         should_request_provider_balance_refresh,
     };
     use crate::config::{
-        ProxyConfig, ProxyConfigV4, RoutingExhaustedActionV4, RoutingPolicyV4, ServiceConfig,
-        ServiceConfigManager,
+        ProviderConfigV4, ProxyConfig, ProxyConfigV4, RoutingConfigV4, RoutingExhaustedActionV4,
+        RoutingPolicyV4, ServiceConfig, ServiceConfigManager, ServiceViewV4, UpstreamAuth,
     };
     use crate::dashboard_core::ControlProfileOption;
     use crate::lb::LbState;
     use crate::proxy::ProxyService;
     use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot, ProxyState};
     use crate::tui::model::{
-        RoutingProviderRef, RoutingSpecView, Snapshot, routing_provider_names,
+        ProviderOption, RoutingProviderRef, RoutingSpecView, Snapshot, routing_provider_names,
     };
     use crate::tui::state::UiState;
+    use crate::tui::types::Page;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -4070,6 +4116,83 @@ mod tests {
             "in-process refresh should not try the invalid admin port: {result:?}"
         );
         assert!(ui.last_balance_refresh_requested_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn routing_page_g_refreshes_balances() {
+        let temp_home = make_temp_home("routing-page-g-refreshes-balances");
+        let _scoped_home = ScopedEnv::set_path("CODEX_HELPER_HOME", temp_home.as_path());
+        let persisted = ProxyConfigV4 {
+            codex: ServiceViewV4 {
+                providers: BTreeMap::from([(
+                    "input".to_string(),
+                    ProviderConfigV4 {
+                        enabled: true,
+                        base_url: Some("https://input.example.com/v1".to_string()),
+                        inline_auth: UpstreamAuth {
+                            auth_token_env: Some("INPUT_KEY".to_string()),
+                            ..UpstreamAuth::default()
+                        },
+                        ..ProviderConfigV4::default()
+                    },
+                )]),
+                routing: Some(RoutingConfigV4::ordered_failover(vec!["input".to_string()])),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+        crate::config::save_config_v4(&persisted)
+            .await
+            .expect("write route graph config");
+        let loaded = crate::config::load_config_with_v4_source()
+            .await
+            .expect("load route graph config");
+        let proxy = ProxyService::new_with_v4_source(
+            reqwest::Client::new(),
+            Arc::new(loaded.runtime),
+            loaded.v4.map(Arc::new),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        );
+        let mut providers = vec![ProviderOption {
+            name: "input".to_string(),
+            enabled: true,
+            active: true,
+            ..ProviderOption::default()
+        }];
+        let mut ui = UiState {
+            page: Page::Stations,
+            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+            ..UiState::default()
+        };
+        let snapshot = empty_snapshot(
+            proxy.state_handle().as_ref(),
+            Arc::new(ProxyConfig {
+                version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+                ..ProxyConfig::default()
+            }),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let handled = super::handle_key_event(
+            proxy.state_handle(),
+            &mut providers,
+            &mut ui,
+            &snapshot,
+            &proxy,
+            tx,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        )
+        .await;
+
+        assert!(handled);
+        assert!(ui.last_balance_refresh_requested_at.is_some());
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("balance refresh should finish")
+            .expect("balance refresh should send outcome");
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -4740,38 +4863,7 @@ async fn handle_key_routing_menu(
             true
         }
         KeyCode::Char('g') => {
-            let balance_started = request_provider_balance_refresh(
-                ui,
-                snapshot,
-                proxy,
-                BalanceRefreshMode::Force,
-                balance_refresh_tx,
-            );
-            match refresh_routing_control_state(ui, proxy).await {
-                Ok(()) => {
-                    ui.toast = Some((
-                        if balance_started {
-                            match ui.language {
-                                Language::Zh => "routing: 已刷新；余额刷新已开始",
-                                Language::En => "routing: refreshed; balance refresh started",
-                            }
-                        } else {
-                            i18n::label(ui.language, "routing: refreshed")
-                        }
-                        .to_string(),
-                        Instant::now(),
-                    ));
-                }
-                Err(err) => {
-                    ui.toast = Some((
-                        format!(
-                            "{}: {err}",
-                            i18n::label(ui.language, "routing: refresh failed")
-                        ),
-                        Instant::now(),
-                    ));
-                }
-            }
+            refresh_route_graph_balances(ui, snapshot, proxy, balance_refresh_tx).await;
             true
         }
         KeyCode::Up | KeyCode::Char('k') => {

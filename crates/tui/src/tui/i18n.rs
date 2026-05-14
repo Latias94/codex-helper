@@ -96,7 +96,7 @@ define_messages! {
 
     FOOTER_DASHBOARD => { zh: "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话站点  P 全局 pin  O/H(会话) o/h(请求) 跳转  ? 帮助", en: "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session station  P global pin  O/H(session) o/h(request) jump  ? help" },
     FOOTER_DASHBOARD_ROUTE_GRAPH => { zh: "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 或 j/k 移动  b profile绑定  M model  f fast/tier  R 重置覆盖  Enter effort  l/m/h/X 设置  x 清除  p 会话 route target  P 全局 route target  O/H(会话) o/h(请求) 跳转  ? 帮助", en: "1-8 pages  q quit  L language  Tab focus  ↑/↓ or j/k move  b profile binding  M model  f fast/tier  R reset overrides  Enter effort  l/m/h/X set  x clear  p session route target  P global route target  O/H(session) o/h(request) jump  ? help" },
-    FOOTER_ROUTING => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ provider  r/Enter routing编辑  e 启停  f 包月优先  1/2/0 billing  s 耗尽策略  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ provider  r/Enter routing editor  e enable  f monthly-first  1/2/0 billing  s exhausted action  ? help" },
+    FOOTER_ROUTING => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ provider  g 刷新余额  r/Enter routing编辑  e 启停  f 包月优先  1/2/0 billing  s 耗尽策略  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ provider  g refresh balance  r/Enter routing editor  e enable  f monthly-first  1/2/0 billing  s exhausted action  ? help" },
     FOOTER_STATIONS => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r routing  i 详情  Enter 全局 pin  Backspace 清除  o 会话站点 override  O 清除  h/H 检查  c/C 取消  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ select  r routing  i details  Enter global pin  Backspace clear  o session station override  O clear  h/H check  c/C cancel  ? help" },
     FOOTER_REQUESTS => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ 选择  e 仅看错误  s scope(会话/全部)  x 清除聚焦  o 打开到 Sessions  h 打开到 History  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ select  e errors_only  s scope(session/all)  x clear focus  o open Sessions  h open History  ? help" },
     FOOTER_SESSIONS => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ 选择  b profile绑定  M model  f fast/tier  R 重置覆盖  a 仅看活跃  e 仅看错误  v 仅看覆盖  r 重置  t 对话记录  o 打开到 Requests  H 打开到 History  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ select  b profile binding  M model  f fast/tier  R reset overrides  a active_only  e errors_only  v overrides_only  r reset  t transcript  o open Requests  H open History  ? help" },
@@ -114,7 +114,7 @@ define_messages! {
     FOOTER_PROFILE_SESSION => { zh: "↑/↓ 选择 profile 操作  Enter 应用/清除绑定  Esc 取消", en: "↑/↓ select profile action  Enter apply/clear binding  Esc cancel" },
     FOOTER_PROFILE_RUNTIME => { zh: "↑/↓ 选择运行时默认 profile  Enter 应用/清除覆盖  Esc 取消", en: "↑/↓ select runtime default profile  Enter apply/clear override  Esc cancel" },
     FOOTER_PROFILE_CONFIGURED => { zh: "↑/↓ 选择配置默认 profile  Enter 应用/清除默认值  Esc 取消", en: "↑/↓ select configured default profile  Enter apply/clear default  Esc cancel" },
-    FOOTER_ROUTING_MENU => { zh: "↑/↓ 选择  Enter pin  a 顺序  f 包月优先  e 启停  s 耗尽策略  []/u/d 重排  1/2/0 billing tag  g 刷新  Esc 关闭", en: "↑/↓ select  Enter pin  a ordered  f monthly-first  e enable  s exhausted action  []/u/d reorder  1/2/0 billing tag  g refresh  Esc close" },
+    FOOTER_ROUTING_MENU => { zh: "↑/↓ 选择  Enter pin  a 顺序  f 包月优先  e 启停  s 耗尽策略  []/u/d 重排  1/2/0 billing tag  g 刷新路由/余额  Esc 关闭", en: "↑/↓ select  Enter pin  a ordered  f monthly-first  e enable  s exhausted action  []/u/d reorder  1/2/0 billing tag  g refresh routing/balance  Esc close" },
     FOOTER_STATION_INFO => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  Esc close  L language" },
     FOOTER_SESSION_TRANSCRIPT => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  A 全量/尾部  y 复制  t/Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  A all/tail  y copy  t/Esc close  L language" },
 
@@ -322,6 +322,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "auto(single-level fallback)" => "自动（同级回退）",
         "avg" => "平均",
         "balance" => "余额",
+        "balance refresh already requested" => "余额刷新已在进行中",
         "balance lookup failed" => "余额查询失败",
         "balance refresh started" => "余额刷新已开始",
         "balance/quota" => "余额/配额",

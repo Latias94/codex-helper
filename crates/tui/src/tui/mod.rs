@@ -258,6 +258,7 @@ pub async fn run_dashboard(
             }
             maybe_balance_refresh = balance_refresh_rx.recv() => {
                 if let Some(result) = maybe_balance_refresh {
+                    let balance_refresh_ok = result.is_ok();
                     if let Err(err) = result {
                         ui.toast = Some((format!("balance refresh failed: {err}"), Instant::now()));
                     }
@@ -265,6 +266,31 @@ pub async fn run_dashboard(
                     if let Ok(new_snapshot) = tokio::time::timeout(io_timeout, refresh).await {
                         snapshot = new_snapshot;
                         ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
+                    }
+                    if ui.uses_route_graph_routing()
+                        && ui.page == crate::tui::types::Page::Stations
+                    {
+                        let refresh = input::refresh_routing_control_state(&mut ui, &proxy);
+                        match tokio::time::timeout(io_timeout, refresh).await {
+                            Ok(Ok(())) => {
+                                ui.clamp_selection(
+                                    &snapshot,
+                                    ui.station_page_rows_len(providers.len()),
+                                );
+                            }
+                            Ok(Err(err)) => {
+                                ui.last_routing_control_refresh_at = Some(Instant::now());
+                                if balance_refresh_ok {
+                                    ui.toast = Some((
+                                        format!("routing refresh failed: {err}"),
+                                        Instant::now(),
+                                    ));
+                                }
+                            }
+                            Err(_) => {
+                                ui.last_routing_control_refresh_at = Some(Instant::now());
+                            }
+                        }
                     }
                     request_redraw(&mut render_invalidation);
                 }
