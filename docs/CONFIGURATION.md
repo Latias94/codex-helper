@@ -1,5 +1,7 @@
 # Configuration Guide
 
+中文指南: [CONFIGURATION.zh.md](CONFIGURATION.zh.md)
+
 This guide documents the public `version = 5` route graph config format.
 
 The short version: define providers once, then point `routing.entry` at a named route node under `routing.routes`. Most users only need `[codex.providers.*]`, `[codex.routing]`, `[codex.routing.routes.*]`, and `[retry]`.
@@ -13,6 +15,15 @@ The short version: define providers once, then point `routing.entry` at a named 
 - `retry` controls how hard the proxy retries before returning an error.
 
 Legacy `station` data is migration input. Hand-written config should think in `provider`, `endpoint`, and `route graph`.
+
+## Local Proxy Vs Outbound Proxy
+
+There are two different proxy layers:
+
+- Local proxy: Codex connects to codex-helper, usually at `127.0.0.1:3211`. This still happens when you do not configure an outbound network proxy.
+- Outbound proxy: codex-helper connects to provider endpoints, relay dashboards, or balance APIs through a network proxy.
+
+Current outbound proxy support comes from the underlying HTTP client's system/environment proxy behavior. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` may affect provider and balance requests. There is not yet a first-class `config.toml` outbound proxy section. See [Outbound Proxy](#outbound-proxy) for the current behavior and the intended future model.
 
 ## File Locations
 
@@ -104,6 +115,15 @@ Rules:
 - Cycles are rejected.
 - Duplicate provider leaves are rejected because they make fallback behavior ambiguous.
 - Runtime health, cooldown, balance exhaustion, and reprobe state are not stored in static config.
+- Provider names do not imply business class. Use tags such as `billing = "monthly"` or `billing = "paygo"` when route policy should care about billing.
+
+Common strategies:
+
+- `ordered-failover`: try children from left to right. Children can be providers or nested route nodes.
+- `tag-preferred`: split children into preferred groups by `prefer_tags`, then fallback to the rest. `on_exhausted = "continue"` allows paid fallback after trusted exhaustion; `on_exhausted = "stop"` prevents automatic spillover.
+- `manual-sticky`: use one explicit `target`. The target can be a route node, provider, or provider endpoint.
+
+Most users should prefer `ordered-failover` for fixed priority and `tag-preferred` for "monthly first" business intent.
 
 ## Session Affinity
 
@@ -127,7 +147,20 @@ This means monthly pools such as `monthly_pool -> paygo` normally keep a convers
 
 ## Recipes
 
-Pick one recipe first. You can refine fields later.
+Pick one recipe first. You can refine fields later. For Claude, replace `codex` with `claude`.
+
+| User Goal | Start With | Why |
+| --- | --- | --- |
+| I only have one upstream and want the dashboard/logs | [One Provider](#one-provider) | Smallest config; no accidental fallback |
+| I have several relays and want the first working one | [Ordered Fallback](#ordered-fallback) | Simple left-to-right fallback |
+| I have several monthly relays and one pay-as-you-go backup | [Monthly Pool With Paygo Fallback](#monthly-pool-with-paygo-fallback) | Preserves the monthly pool as one preferred group |
+| I have several monthly relays and several paid relay backups | [Monthly Pool With Relay Fallback Pool](#monthly-pool-with-relay-fallback-pool) | Keeps monthly and paid fallback pools explicit |
+| I want all monthly-tagged providers before anything paid | [Monthly First By Tag](#monthly-first-by-tag) | Uses metadata instead of hard-coding a named pool |
+| I would rather fail than spend pay-as-you-go money | [Monthly Only](#monthly-only) | Stops after trusted monthly exhaustion |
+| I need to force one provider temporarily | [Manual Pin](#manual-pin) | Explicit and easy to undo |
+| One provider account has multiple upstream endpoints | [Multiple Endpoints For One Provider](#multiple-endpoints-for-one-provider) | Keeps one provider identity with endpoint-level routing |
+
+Routing decisions use runtime provider endpoints. `compatibility` station/upstream fields in diagnostics are migration context, not the new identity.
 
 ### One Provider
 
@@ -179,6 +212,9 @@ entry = "main"
 [codex.routing.routes.main]
 strategy = "ordered-failover"
 children = ["monthly", "backup", "openai"]
+
+[retry]
+profile = "balanced"
 ```
 
 This is the most direct replacement for old priority or level-based setups.
@@ -220,6 +256,9 @@ children = ["input", "input1", "input2"]
 [codex.routing.routes.monthly_first]
 strategy = "ordered-failover"
 children = ["monthly_pool", "codex_for"]
+
+[retry]
+profile = "balanced"
 ```
 
 This keeps the monthly pool as a first-class route node. Temporary 502/429-style failures recover through cooldown and later reprobe. `unknown` balance is not treated as exhausted. Confirmed exhaustion is the only balance signal that can demote a monthly candidate.
@@ -267,17 +306,17 @@ entry = "monthly_first"
 [codex.routing.routes.monthly_pool]
 strategy = "ordered-failover"
 children = ["monthly_a", "monthly_b", "monthly_c"]
-on_exhausted = "continue"
 
 [codex.routing.routes.fallback_pool]
 strategy = "ordered-failover"
 children = ["right", "cch", "codex_for"]
-on_exhausted = "continue"
 
 [codex.routing.routes.monthly_first]
 strategy = "ordered-failover"
 children = ["monthly_pool", "fallback_pool"]
-on_exhausted = "continue"
+
+[retry]
+profile = "balanced"
 ```
 
 This is the clearest shape for "monthly first, several relays as backup". Session affinity still applies: a conversation keeps using the last successful provider while the route graph stays the same, then moves forward only after that provider fails, cools down, no longer supports the request, or is confirmed exhausted.
@@ -312,6 +351,9 @@ strategy = "tag-preferred"
 prefer_tags = [{ billing = "monthly" }]
 children = ["monthly_a", "monthly_b", "paygo"]
 on_exhausted = "continue"
+
+[retry]
+profile = "balanced"
 ```
 
 Only known fully exhausted monthly candidates are demoted. A balance lookup failure is shown as `unknown` and does not mean exhausted.
@@ -321,11 +363,38 @@ Only known fully exhausted monthly candidates are demoted. A balance lookup fail
 Use this when you would rather fail than spill into a paid fallback.
 
 ```toml
+version = 5
+
+[codex.providers.monthly_a]
+base_url = "https://monthly-a.example/v1"
+auth_token_env = "MONTHLY_A_API_KEY"
+tags = { billing = "monthly" }
+
+[codex.providers.monthly_b]
+base_url = "https://monthly-b.example/v1"
+auth_token_env = "MONTHLY_B_API_KEY"
+tags = { billing = "monthly" }
+
+[codex.providers.paygo]
+base_url = "https://paygo.example/v1"
+auth_token_env = "PAYGO_API_KEY"
+tags = { billing = "paygo" }
+
+[codex.routing]
+entry = "monthly_first"
+
+[codex.routing.routes.monthly_pool]
+strategy = "ordered-failover"
+children = ["monthly_a", "monthly_b"]
+
 [codex.routing.routes.monthly_first]
 strategy = "tag-preferred"
 prefer_tags = [{ billing = "monthly" }]
-children = ["monthly_a", "monthly_b", "paygo"]
+children = ["monthly_pool", "paygo"]
 on_exhausted = "stop"
+
+[retry]
+profile = "balanced"
 ```
 
 `paygo` can stay in the file for later use, but the stop rule prevents automatic spillover after the preferred set is exhausted.
@@ -335,6 +404,16 @@ on_exhausted = "stop"
 Use this for debugging, strict vendor selection, or temporary steering.
 
 ```toml
+version = 5
+
+[codex.providers.input]
+base_url = "https://ai.input.im/v1"
+auth_token_env = "INPUT_API_KEY"
+
+[codex.providers.openai]
+base_url = "https://api.openai.com/v1"
+auth_token_env = "OPENAI_API_KEY"
+
 [codex.routing]
 entry = "debug_pin"
 
@@ -342,6 +421,9 @@ entry = "debug_pin"
 strategy = "manual-sticky"
 target = "input"
 children = ["input", "openai"]
+
+[retry]
+profile = "balanced"
 ```
 
 A pinned target is explicit. It can name a route node, a provider, or a
@@ -353,6 +435,8 @@ the route instead of silently selecting a different provider.
 Use explicit endpoints only when one account really has several upstream targets.
 
 ```toml
+version = 5
+
 [codex.providers.relay]
 alias = "Relay account"
 auth_token_env = "RELAY_API_KEY"
@@ -367,6 +451,16 @@ tags = { region = "hk" }
 base_url = "https://us.relay.example/v1"
 priority = 1
 tags = { region = "us" }
+
+[codex.routing]
+entry = "relay_route"
+
+[codex.routing.routes.relay_route]
+strategy = "ordered-failover"
+children = ["relay.hk", "relay.us"]
+
+[retry]
+profile = "balanced"
 ```
 
 Do not use endpoints just to model unrelated providers. Put unrelated accounts under separate provider names.

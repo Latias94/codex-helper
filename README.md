@@ -4,7 +4,7 @@ Codex CLI 的本地中转代理与控制台。
 
 它把 Codex 请求先送到本机代理，再按你配置的 provider / routing 转发到 OpenAI 官方或各类中转站。这样你可以在不中断 Codex 使用体验的情况下集中管理多个中转、多个 key、余额/套餐、请求日志、成本估算和 fallback 策略。
 
-当前发布版本：`v0.14.0`
+当前发布版本：`v0.15.0`
 
 English: [README_EN.md](README_EN.md)
 
@@ -37,9 +37,10 @@ English: [README_EN.md](README_EN.md)
 
 - **本地代理**：默认监听 `127.0.0.1:3211`，Codex 继续按原方式使用。
 - **安全 Codex 局部修改**：只改本地代理片段，不影响 Codex 运行中写入的其他配置。
-- **provider / routing 配置**：`version = 4` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
+- **provider / routing 配置**：`version = 5` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
 - **会话粘性与自动兜底**：同一 Codex 会话会尽量粘住已选 provider，请求失败、上游不可用或可信余额显示耗尽时再按策略切换候选 provider/upstream。
 - **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
+- **出站代理兼容**：本地代理和出站网络代理是两层概念；当前出站请求受系统/环境代理变量影响，还没有 `config.toml` 专用代理段。
 - **请求可观测**：记录 provider、model、token、cache token、缓存命中率、TTFB、总耗时、输出速度、重试链和估算成本。
 - **TUI/GUI**：TUI 内置在命令行里；GUI 可作为本地控制台或 attached 控制台使用。
 
@@ -114,7 +115,7 @@ codex-helper config set-retry-profile balanced
 对应的 `~/.codex-helper/config.toml` 很薄：
 
 ```toml
-version = 4
+version = 5
 
 [codex.providers.input]
 base_url = "https://ai.input.im/v1"
@@ -147,7 +148,16 @@ profile = "balanced"
 | 包月止损 | 同上但 `--on-exhausted stop` | 不自动切到按量 provider |
 | 月包池 + paygo 兜底 | 在 TOML 中用嵌套 route nodes | `monthly_pool -> paygo` 保留清晰分组 |
 
-完整配置、迁移、余额适配、价格覆盖和 GUI/TUI 编辑说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
+新用户建议先看 [中文配置指南](docs/CONFIGURATION.zh.md)，里面按使用场景给了可复制模板。需要完整字段、迁移细节和高级说明时，再查 [English configuration reference](docs/CONFIGURATION.md)。
+
+## 代理说明
+
+codex-helper 有两层“代理”：
+
+- **本地代理**：Codex 连接 `127.0.0.1:3211`，请求先进入 codex-helper，再由 routing 选择 provider。只要启用了 codex-helper 的 Codex patch，即使没有配置外部网络代理，请求也会经过这个本地 proxy server。
+- **出站网络代理**：codex-helper 访问 provider、relay 或 balance API 时是否经过网络代理。当前版本还没有 `config.toml` 专用配置段，但底层 HTTP client 会受 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 等系统/环境变量影响。
+
+更详细的边界和未来配置方向见 [配置指南的代理支持章节](docs/CONFIGURATION.zh.md#代理支持)。
 
 ## 常用命令
 
@@ -237,7 +247,8 @@ codex-helper 刻意避免这些做法：
 
 ## 更多文档
 
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：配置、routing、余额适配、价格目录、迁移。
+- [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md)：中文配置指南，包含常用 routing 模板和代理说明。
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：English configuration reference, routing, balance adapters, pricing, migration.
 - [CHANGELOG.md](CHANGELOG.md)：版本变更和升级注意事项。
 - [docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md](docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md)：与 cc-switch、aio-coding-hub、all-api-hub 的差距分析。
 - [docs/workstreams/codex-control-plane-refactor/README.md](docs/workstreams/codex-control-plane-refactor/README.md)：控制平面设计记录。

@@ -1,7 +1,7 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
-> Starting from `0.5.0`, changelog entries are bilingual: **Chinese first, then English**.
+> Recent entries use **Chinese first, then an English summary**. Older entries keep the previous inline bilingual style.
 
 ## [未发布 / Unreleased]
 
@@ -10,43 +10,44 @@ All notable changes to this project will be documented in this file.
 
 ## [0.15.0] - 2026-05-14
 
-### 重要变化 / Highlights
+### 中文
+
+#### 重要变化
 
 - 配置格式升级到 `version = 5`。旧的 v2/v3/v4 和 legacy JSON 配置会自动迁移；迁移前仍会保留 `.bak` 备份。
-  Config format is now `version = 5`. Existing v2/v3/v4 and legacy JSON configs migrate automatically, with `.bak` backups kept before writing.
 - Route graph 现在是真正的运行时路由模型。月包优先、月包池、付费兜底和多 endpoint provider 都按 provider endpoint 选择，不再依赖 legacy station 状态。
-  Route graph is now the real runtime routing model. Monthly-first pools, paid fallback, and multi-endpoint providers are selected by provider endpoint instead of legacy station state.
 - 默认会话粘性改为 `preferred-group`：临时 fallback 后，只要高优先级月包 provider 恢复可用，后续请求会回到月包组。旧的 fallback 粘性需要显式设置 `affinity_policy = "fallback-sticky"`。
-  Session affinity now defaults to `preferred-group`: after temporary fallback, sessions return to the preferred monthly group once it is viable again. The old fallback-sticky behavior must be enabled explicitly with `affinity_policy = "fallback-sticky"`.
+- 新路由模型支持 `ordered-failover`、`tag-preferred`、`manual-sticky` 和多 endpoint provider。常见可复制模板见中文配置指南 `docs/CONFIGURATION.zh.md` 和英文参考 `docs/CONFIGURATION.md`。
 
-### 用户可见改进 / Improved
+#### 用户可见改进
 
 - TUI、GUI、`routing explain`、请求详情和日志统一显示 provider endpoint、preference group、跳过原因和兼容 station 信息，排查“为什么走了 fallback”更直接。
-  TUI, GUI, `routing explain`, request details, and logs now show provider endpoint, preference group, skip reasons, and compatibility station context, making fallback decisions easier to diagnose.
 - GUI/TUI 的路由和 provider 视图保留嵌套 route graph，不再把复杂配置意外压平成简单顺序。
-  GUI/TUI routing and provider views preserve nested route graphs instead of flattening complex configs.
 - 请求 usage 的缓存读数改为单一口径，详情页和统计视图现在展示一致的读缓存/新缓存值。
-  Request usage cache accounting now uses a single read-cache total, so detail and stats views show consistent read-cache/new-cache values.
-- 文档更新为 v5 route graph 示例，覆盖月包优先、fallback 恢复、余额未知和 trusted exhaustion 行为。
-  Documentation now uses v5 route graph examples for monthly-first routing, fallback recovery, unknown balances, and trusted exhaustion behavior.
+- 文档更新为 v5 route graph 示例，覆盖单 provider、顺序兜底、月包池、月包止损、手动固定、多 endpoint provider、fallback 恢复、余额未知和 trusted exhaustion 行为。
 
-### 修复 / Fixed
+#### 修复
 
 - 余额刷新失败不会被当作耗尽，也不会中断其他 provider 的刷新；刷新请求现在有超时、复用代理运行态 HTTP client，并在日志中显示探测的 origin 和 adapter kind。
-  Balance refresh failures are not treated as exhaustion and do not stop other provider refreshes; refresh calls now have a timeout, reuse the proxy runtime HTTP client, and log the probed origin plus adapter kind.
 - TUI 按 `q` 退出时仍会优雅关停 proxy/admin server，但现在有短超时保护，避免被后台请求或长连接拖住太久。
-  Pressing `q` in the TUI still gracefully shuts down the proxy/admin server, but now has a short timeout guard to avoid long waits behind background requests or long-lived connections.
 - Sub2API 懒刷新零额度、余额查询失败、冷却和真实耗尽在 UI/路由预览中区分更清楚，降低误切到 fallback 的概率。
-  Sub2API lazy zero balances, lookup failures, cooldown, and real exhaustion are clearer in UI/routing previews, reducing accidental fallback decisions.
 
-### 升级说明 / Upgrade Notes
+#### 升级说明
 
 - 正常升级无需手动重写配置；启动 CLI、TUI、GUI 或 proxy 时会自动迁移。
-  Normal upgrades do not require manual config rewrites; CLI, TUI, GUI, and proxy startup migrate configs automatically.
+- 如果你只是想按“单 provider / 顺序兜底 / 月包优先 / 月包止损 / 手动固定”来选，优先看 `docs/CONFIGURATION.zh.md` 的常用配置模板。
 - 外部脚本如果还在写 legacy station/active 字段，应迁移到 provider、route target、routing 命令/API 或 v5 TOML。
-  External scripts that still write legacy station/active fields should move to provider, route target, routing commands/APIs, or v5 TOML.
 - 当前版本仍使用系统/环境变量形式的 outbound proxy 支持；一等 `config.toml` outbound proxy 配置会在后续版本设计。
-  This version still relies on system/environment outbound proxy support; first-class `config.toml` outbound proxy settings are planned for a later version.
+
+### English Summary
+
+- Config format is now `version = 5`. Existing v2/v3/v4 and legacy JSON configs migrate automatically, with `.bak` backups kept before writing.
+- Route graph is now the real runtime routing model. Monthly-first pools, paid fallback, and multi-endpoint providers are selected by provider endpoint instead of legacy station state.
+- Session affinity now defaults to `preferred-group`: after temporary fallback, sessions return to the preferred monthly group once it is viable again. The old fallback-sticky behavior must be enabled explicitly with `affinity_policy = "fallback-sticky"`.
+- TUI, GUI, `routing explain`, request details, and logs now show provider endpoint, preference group, skip reasons, and compatibility station context, making fallback decisions easier to diagnose.
+- Balance refresh failures are not treated as exhaustion and do not stop other provider refreshes. Refresh calls now have a timeout, reuse the proxy runtime HTTP client, and log the probed origin plus adapter kind.
+- Pressing `q` in the TUI still gracefully shuts down the proxy/admin server, but now has a short timeout guard to avoid long waits behind background requests or long-lived connections.
+- Copyable v5 routing recipes for single-provider, ordered fallback, monthly-first, monthly-only, manual pin, and multi-endpoint setups are documented in `docs/CONFIGURATION.md`; the Chinese user guide is `docs/CONFIGURATION.zh.md`.
 
 ## [0.13.0] - 2026-05-09
 
