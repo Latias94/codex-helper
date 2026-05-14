@@ -642,6 +642,22 @@ New API dashboard-style quota：
 - UI 展示的是 cached balance snapshots；手动刷新使用 `POST /__codex_helper/api/v1/providers/balances/refresh`。
 - Balance HTTP 调用有边界，并且复用和 proxy runtime calls 相同的 outbound client。查询失败时，日志应该显示被探测的 origin 和 adapter kind，例如 `sub2api_usage` 或 `openai_balance_http_json` 返回了非 JSON。
 
+## Usage / Balance 页面
+
+TUI 第 5 页现在显示为 `Usage`，GUI 的统计页标题为 `Usage / Balance`。两者读取同一个 core `UsageBalanceView`，所以 provider、endpoint、余额状态和路由影响的口径应该一致。
+
+如何阅读：
+
+- 顶部汇总显示当前窗口的请求数、token、估算成本、余额状态计数和最近刷新状态。
+- Provider 行显示该 provider 的请求量、成功率、token、成本、主余额/配额摘要、余额状态和 routing 影响。
+- Endpoint 行显示最近样本里的 provider endpoint、请求数、错误数、token、绑定的 balance snapshot 和 route skip reason。
+- `unknown` 表示没有可信余额数据或查询失败，不能当作健康余额。
+- `stale` 表示 snapshot 已过期；它和 `exhausted`、`error`、`unlimited` 是不同状态。
+- `unlimited` 是已知不限量/无限 quota，不是 unknown。
+- TUI `Usage` 页面按 `g` 刷新余额；GUI 统计页使用“刷新余额”按钮。
+- 单个 provider 的余额刷新失败只更新该 provider 的错误/unknown 状态，不会打断其他 provider 刷新、TUI redraw 或 snapshot 刷新。
+- `Routing` 页面只保留紧凑余额上下文；如果要判断谁用得最多、谁快耗尽、哪个 endpoint 报错，应看 `Usage / Balance`。
+
 ## 出站代理
 
 codex-helper 本身是一个本地代理，但它可能仍然需要出站代理才能访问某些 relays 或 dashboard balance APIs。

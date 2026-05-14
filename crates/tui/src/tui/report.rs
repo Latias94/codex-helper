@@ -7,6 +7,7 @@ use super::state::UiState;
 use super::types::StatsFocus;
 use crate::state::UsageBucket;
 use crate::usage::UsageMetrics;
+use crate::usage_balance::{UsageBalanceBuildInput, UsageBalanceRefreshInput, UsageBalanceView};
 
 #[derive(Debug, Clone)]
 pub(in crate::tui) enum StatsTarget {
@@ -185,6 +186,16 @@ pub(in crate::tui) fn build_stats_report(
 
     let window_bucket = sum_buckets(&window_series);
     let recent = compute_recent_breakdown(ui, snapshot, &target);
+    let usage_balance = UsageBalanceView::build(UsageBalanceBuildInput {
+        service_name: ui.service_name,
+        window_days: ui.stats_days,
+        generated_at_ms: now_ms,
+        usage_rollup: &snapshot.usage_rollup,
+        provider_balances: &snapshot.provider_balances,
+        recent: &snapshot.recent,
+        routing_explain: ui.routing_explain.as_ref(),
+        refresh: UsageBalanceRefreshInput::default(),
+    });
 
     let (kind, name) = match &target {
         StatsTarget::Station(n) => (i18n::label(ui.language, "station"), n.as_str()),
@@ -249,6 +260,95 @@ pub(in crate::tui) fn build_stats_report(
         "{}\n",
         fmt_usage_line(&window_bucket.usage, ui.language)
     ));
+    if let StatsTarget::Provider(provider_id) = &target
+        && let Some(row) = usage_balance
+            .provider_rows
+            .iter()
+            .find(|row| row.provider_id == *provider_id)
+    {
+        out.push_str(&format!(
+            "{}: {}  balance_status={}  route={}  endpoints={}  latest_error={}\n",
+            i18n::label(ui.language, "Usage / Balance"),
+            row.provider_id,
+            row.balance_status.as_str(),
+            if row.routing.selected {
+                row.routing
+                    .selected_endpoint_id
+                    .as_deref()
+                    .unwrap_or("selected")
+                    .to_string()
+            } else if row.routing.skip_reasons.is_empty() {
+                "-".to_string()
+            } else {
+                row.routing.skip_reasons.join(",")
+            },
+            row.endpoint_count,
+            row.latest_balance_error.as_deref().unwrap_or("-")
+        ));
+    }
+    out.push('\n');
+
+    out.push_str(match ui.language {
+        Language::Zh => "[Usage / Balance providers]\n",
+        Language::En => "[Usage / Balance providers]\n",
+    });
+    for row in usage_balance.provider_rows.iter().take(30) {
+        let route = if row.routing.selected {
+            row.routing
+                .selected_endpoint_id
+                .as_deref()
+                .unwrap_or("selected")
+                .to_string()
+        } else if row.routing.skip_reasons.is_empty() {
+            "-".to_string()
+        } else {
+            row.routing.skip_reasons.join(",")
+        };
+        out.push_str(&format!(
+            "  - {}: req={} err={} tok={} cost={} balance={} endpoints={} route={} latest_error={}\n",
+            row.provider_id,
+            row.usage.requests_total,
+            row.usage.requests_error,
+            tokens_short(row.usage.usage.total_tokens),
+            row.cost_display,
+            row.balance_status.as_str(),
+            row.endpoint_count,
+            route,
+            row.latest_balance_error.as_deref().unwrap_or("-")
+        ));
+    }
+    if let StatsTarget::Provider(provider_id) = &target {
+        let endpoint_rows = usage_balance
+            .endpoint_rows
+            .iter()
+            .filter(|row| row.provider_id == *provider_id)
+            .take(30)
+            .collect::<Vec<_>>();
+        if !endpoint_rows.is_empty() {
+            out.push_str(match ui.language {
+                Language::Zh => "[Usage / Balance endpoints]\n",
+                Language::En => "[Usage / Balance endpoints]\n",
+            });
+            for row in endpoint_rows {
+                let route = if row.route_selected {
+                    "selected".to_string()
+                } else if row.route_skip_reasons.is_empty() {
+                    "-".to_string()
+                } else {
+                    row.route_skip_reasons.join(",")
+                };
+                out.push_str(&format!(
+                    "  - {}: req={} err={} tok={} balance={} route={}\n",
+                    row.endpoint_id,
+                    row.usage.requests_total,
+                    row.usage.requests_error,
+                    tokens_short(row.usage.usage.total_tokens),
+                    row.balance_status.as_str(),
+                    route
+                ));
+            }
+        }
+    }
     out.push('\n');
 
     out.push_str(match ui.language {

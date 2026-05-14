@@ -21,4 +21,5 @@ pub mod runtime_identity;
 pub mod sessions;
 pub mod state;
 pub mod usage;
+pub mod usage_balance;
 pub mod usage_providers;

@@ -14,10 +14,10 @@ Acceptance:
 
 ## P1 - Core View Model
 
-- [ ] Add a canonical `UsageBalanceView` or equivalent core read model.
-- [ ] Move provider and endpoint usage/balance aggregation into core.
-- [ ] Add routing impact summaries.
-- [ ] Add tests for balance state semantics and row sorting.
+- [x] Add a canonical `UsageBalanceView` or equivalent core read model.
+- [x] Move provider and endpoint usage/balance aggregation into core.
+- [x] Add routing impact summaries.
+- [x] Add tests for balance state semantics and row sorting.
 
 Acceptance:
 
@@ -26,9 +26,9 @@ Acceptance:
 
 ## P2 - TUI Usage / Balance
 
-- [ ] Upgrade the existing Stats page into Usage / Balance.
-- [ ] Add balance refresh shortcut and status display.
-- [ ] Add provider table and selected provider detail panel.
+- [x] Upgrade the existing Stats page into Usage / Balance.
+- [x] Add balance refresh shortcut and status display.
+- [x] Add provider table and selected provider detail panel.
 - [ ] Add narrow-width rendering tests for long provider names and balance
   summaries.
 
@@ -40,9 +40,9 @@ Acceptance:
 
 ## P3 - GUI Parity
 
-- [ ] Render the same core rows in GUI.
-- [ ] Keep refresh controls and status semantics aligned with TUI.
-- [ ] Add endpoint detail display.
+- [x] Render the same core rows in GUI.
+- [x] Keep refresh controls and status semantics aligned with TUI.
+- [x] Add endpoint detail display.
 
 Acceptance:
 
@@ -63,9 +63,9 @@ Acceptance:
 
 ## P5 - Documentation And Release Readiness
 
-- [ ] Update user configuration/operation docs.
-- [ ] Update changelog with clear user-facing wording.
-- [ ] Run targeted tests and workspace clippy with GUI feature.
+- [x] Update user configuration/operation docs.
+- [x] Update changelog with clear user-facing wording.
+- [x] Run targeted tests and workspace clippy with GUI feature.
 - [ ] Record any deferred work in TODO.
 
 Acceptance:
@@ -83,4 +83,3 @@ Acceptance:
 - Route impact is explainable without opening raw logs.
 - Existing Stats behavior is either preserved through the new page or replaced
   with documented equivalent behavior.
-

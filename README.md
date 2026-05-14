@@ -203,9 +203,10 @@ codex-helper --version
 - `Overview`：代理状态、当前会话和最近请求。
 - `Routing` / `Stations`：route graph、provider 顺序、余额/套餐、tags、健康状态和 routing 预览。
 - `Sessions`：session identity、effective route、route affinity、单会话覆盖。
-- `Stats` / `Requests`：token、cache token、缓存命中率、耗时、重试、成本和请求日志。
+- `Usage` / `Requests`：provider 用量、endpoint 最近样本、余额/配额状态、token、cache token、耗时、重试、成本和请求日志。
 
 常用快捷键会显示在底部。TUI 的持久化 provider/routing 编辑优先使用 routing 页面，手动改配置后可用 `R` 重新加载运行态配置。
+在 `Usage` 页面按 `g` 可以刷新余额；单个 provider 查询失败只会显示为错误/未知状态，不会打断页面刷新或其他 provider 的刷新。
 
 ### GUI
 

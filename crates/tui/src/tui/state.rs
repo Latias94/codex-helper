@@ -6,6 +6,7 @@ use crate::routing_explain::RoutingExplainResponse;
 use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
 };
+use crate::usage_balance::{UsageBalanceBuildInput, UsageBalanceRefreshInput, UsageBalanceView};
 use std::collections::HashMap;
 
 use super::Language;
@@ -114,6 +115,10 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) last_runtime_retry: Option<ResolvedRetryConfig>,
     pub(in crate::tui) last_runtime_config_refresh_at: Option<std::time::Instant>,
     pub(in crate::tui) last_balance_refresh_requested_at: Option<std::time::Instant>,
+    pub(in crate::tui) balance_refresh_in_flight: bool,
+    pub(in crate::tui) last_balance_refresh_finished_at: Option<std::time::Instant>,
+    pub(in crate::tui) last_balance_refresh_message: Option<String>,
+    pub(in crate::tui) last_balance_refresh_error: Option<String>,
     pub(in crate::tui) should_exit: bool,
     pub(in crate::tui) stations_table: TableState,
     pub(in crate::tui) sessions_table: TableState,
@@ -209,6 +214,10 @@ impl Default for UiState {
             last_runtime_retry: None,
             last_runtime_config_refresh_at: None,
             last_balance_refresh_requested_at: None,
+            balance_refresh_in_flight: false,
+            last_balance_refresh_finished_at: None,
+            last_balance_refresh_message: None,
+            last_balance_refresh_error: None,
             should_exit: false,
             stations_table: TableState::default(),
             sessions_table: TableState::default(),
@@ -294,7 +303,7 @@ impl UiState {
         )
         .unwrap_or(0);
 
-        let stats_providers_len = snapshot.usage_rollup.by_provider.len();
+        let stats_providers_len = self.usage_balance_provider_rows_len(snapshot);
         self.selected_stats_provider_idx = clamp_table_selection(
             &mut self.stats_providers_table,
             Some(self.selected_stats_provider_idx),
@@ -371,6 +380,12 @@ impl UiState {
         self.selected_codex_history_idx = 0;
         self.selected_codex_history_id = Some(sid);
         self.sync_codex_history_selection();
+    }
+
+    pub(in crate::tui) fn usage_balance_provider_rows_len(&self, snapshot: &Snapshot) -> usize {
+        usage_balance_view_for_selection(self, snapshot)
+            .provider_rows
+            .len()
     }
 }
 
@@ -453,6 +468,19 @@ pub(in crate::tui) fn adjust_table_selection(
         (cur + delta as usize).min(len - 1)
     };
     clamp_table_selection(table, Some(next), len)
+}
+
+fn usage_balance_view_for_selection(ui: &UiState, snapshot: &Snapshot) -> UsageBalanceView {
+    UsageBalanceView::build(UsageBalanceBuildInput {
+        service_name: ui.service_name,
+        window_days: ui.stats_days,
+        generated_at_ms: crate::tui::model::now_ms(),
+        usage_rollup: &snapshot.usage_rollup,
+        provider_balances: &snapshot.provider_balances,
+        recent: &snapshot.recent,
+        routing_explain: ui.routing_explain.as_ref(),
+        refresh: UsageBalanceRefreshInput::default(),
+    })
 }
 
 #[cfg(test)]

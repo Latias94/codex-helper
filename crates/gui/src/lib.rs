@@ -1,7 +1,7 @@
 pub use codex_helper_core::{
     codex_integration, config, dashboard_core, doctor, filter, healthcheck, lb, logging,
     model_routing, notify, pricing, proxy, request_ledger, routing_explain, sessions, state, usage,
-    usage_providers,
+    usage_balance, usage_providers,
 };
 
 pub mod gui;

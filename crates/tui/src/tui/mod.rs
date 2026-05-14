@@ -259,8 +259,20 @@ pub async fn run_dashboard(
             maybe_balance_refresh = balance_refresh_rx.recv() => {
                 if let Some(result) = maybe_balance_refresh {
                     let balance_refresh_ok = result.is_ok();
+                    ui.balance_refresh_in_flight = false;
+                    ui.last_balance_refresh_finished_at = Some(Instant::now());
                     if let Err(err) = result {
+                        ui.last_balance_refresh_message = None;
+                        ui.last_balance_refresh_error = Some(err.clone());
                         ui.toast = Some((format!("balance refresh failed: {err}"), Instant::now()));
+                    } else {
+                        ui.last_balance_refresh_error = None;
+                        ui.last_balance_refresh_message = Some(
+                            match ui.language {
+                                Language::Zh => "余额刷新完成".to_string(),
+                                Language::En => "balance refresh finished".to_string(),
+                            },
+                        );
                     }
                     let refresh = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days);
                     if let Ok(new_snapshot) = tokio::time::timeout(io_timeout, refresh).await {

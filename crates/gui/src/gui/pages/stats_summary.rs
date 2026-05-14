@@ -1,12 +1,17 @@
 use super::*;
 
-pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
-    let Some(snapshot) = ctx.proxy.snapshot() else {
+pub(super) fn render_stats_summary(
+    ui: &mut egui::Ui,
+    ctx: &mut PageCtx<'_>,
+    snapshot: Option<&crate::gui::proxy_control::GuiRuntimeSnapshot>,
+    usage_balance: Option<&crate::usage_balance::UsageBalanceView>,
+) {
+    let Some(snapshot) = snapshot else {
         ui.separator();
         ui.label(pick(
             ctx.lang,
-            "当前未运行代理，也未附着到现有代理。请在“总览”里启动或附着后再查看统计。",
-            "No proxy is running or attached. Start or attach on Overview to view stats.",
+            "当前未运行代理，也未附着到现有代理。请在“总览”里启动或附着后再查看用量。",
+            "No proxy is running or attached. Start or attach on Overview to view usage.",
         ));
         return;
     };
@@ -34,46 +39,91 @@ pub(super) fn render_stats_summary(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>) {
     egui::Grid::new("stats_kpis_grid")
         .striped(true)
         .show(ui, |ui| {
-            let window = &rollup.window;
+            let window = usage_balance.map(|view| &view.totals).map(|totals| {
+                (
+                    totals.requests_total,
+                    totals.requests_error,
+                    totals.success_per_mille,
+                    totals.input_tokens,
+                    totals.output_tokens,
+                    totals.reasoning_output_tokens,
+                    totals.total_tokens,
+                    totals.cached_input_tokens,
+                    totals.cost_display.clone(),
+                )
+            });
+            let window_bucket = &rollup.window;
+            let (
+                requests_total,
+                requests_error,
+                success_per_mille,
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+                cached_input_tokens,
+                cost_display,
+            ) = window.unwrap_or_else(|| {
+                (
+                    window_bucket.requests_total,
+                    window_bucket.requests_error,
+                    window_bucket
+                        .requests_total
+                        .saturating_sub(window_bucket.requests_error)
+                        .saturating_mul(1000)
+                        .checked_div(window_bucket.requests_total)
+                        .map(|value| value.min(1000) as u16),
+                    window_bucket.usage.input_tokens,
+                    window_bucket.usage.output_tokens,
+                    window_bucket.usage.reasoning_output_tokens_total(),
+                    window_bucket.usage.total_tokens,
+                    window_bucket.usage.cache_read_tokens_total(),
+                    window_bucket.cost.display_total_with_confidence(),
+                )
+            });
             ui.label(pick(ctx.lang, "请求(窗口)", "Requests (window)"));
             ui.label(format!(
-                "total={}  errors={}  err%={}",
-                window.requests_total,
-                window.requests_error,
-                if window.requests_total == 0 {
-                    "-".to_string()
-                } else {
-                    format!(
-                        "{:.1}%",
-                        (window.requests_error as f64) * 100.0 / (window.requests_total as f64)
-                    )
-                }
+                "total={}  errors={}  ok%={}",
+                requests_total,
+                requests_error,
+                success_per_mille
+                    .map(|value| format!("{:.1}%", f64::from(value) / 10.0))
+                    .unwrap_or_else(|| "-".to_string())
             ));
             ui.end_row();
 
             ui.label(pick(ctx.lang, "Tokens(窗口)", "Tokens (window)"));
             ui.label(format!(
                 "in={}  out={}  rsn={}  ttl={}",
-                tokens_short(window.usage.input_tokens),
-                tokens_short(window.usage.output_tokens),
-                tokens_short(window.usage.reasoning_output_tokens_total()),
-                tokens_short(window.usage.total_tokens)
+                tokens_short(input_tokens),
+                tokens_short(output_tokens),
+                tokens_short(reasoning_tokens),
+                tokens_short(total_tokens)
             ));
             ui.end_row();
 
-            if window.usage.has_cache_tokens() {
+            if cached_input_tokens > 0 {
                 ui.label(pick(ctx.lang, "Cache Tokens", "Cache tokens"));
                 ui.label(format!(
                     "read={}  create={}",
-                    tokens_short(window.usage.cache_read_tokens_total()),
-                    tokens_short(window.usage.cache_creation_tokens_total())
+                    tokens_short(cached_input_tokens),
+                    tokens_short(window_bucket.usage.cache_creation_tokens_total())
                 ));
                 ui.end_row();
             }
 
             ui.label(pick(ctx.lang, "成本", "Cost"));
-            ui.label(window.cost.display_total_with_confidence());
+            ui.label(cost_display);
             ui.end_row();
+
+            if let Some(view) = usage_balance {
+                ui.label(pick(ctx.lang, "余额状态", "Balance states"));
+                ui.label(format_balance_status_counts(
+                    ctx.lang,
+                    &view.totals.balance_status_counts,
+                ));
+                ui.end_row();
+            }
 
             ui.label(pick(ctx.lang, "窗口(5m)", "Window (5m)"));
             ui.label(format!(
@@ -223,4 +273,46 @@ fn fmt_pct(ok: usize, total: usize) -> String {
         return "-".to_string();
     }
     format!("{:.0}%", (ok as f64) * 100.0 / (total as f64))
+}
+
+fn format_balance_status_counts(
+    lang: Language,
+    counts: &crate::usage_balance::UsageBalanceStatusCounts,
+) -> String {
+    let mut parts = Vec::new();
+    if counts.ok > 0 {
+        parts.push(format!("ok={}", counts.ok));
+    }
+    if counts.unlimited > 0 {
+        parts.push(format!(
+            "{}={}",
+            pick(lang, "不限量", "unlimited"),
+            counts.unlimited
+        ));
+    }
+    if counts.exhausted > 0 {
+        parts.push(format!(
+            "{}={}",
+            pick(lang, "耗尽", "exhausted"),
+            counts.exhausted
+        ));
+    }
+    if counts.stale > 0 {
+        parts.push(format!("{}={}", pick(lang, "过期", "stale"), counts.stale));
+    }
+    if counts.error > 0 {
+        parts.push(format!("{}={}", pick(lang, "错误", "error"), counts.error));
+    }
+    if counts.unknown > 0 {
+        parts.push(format!(
+            "{}={}",
+            pick(lang, "未知", "unknown"),
+            counts.unknown
+        ));
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join("  ")
+    }
 }

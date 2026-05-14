@@ -929,6 +929,12 @@ fn request_provider_balance_refresh(
         return false;
     }
     ui.last_balance_refresh_requested_at = Some(now);
+    ui.balance_refresh_in_flight = true;
+    ui.last_balance_refresh_message = Some(match ui.language {
+        Language::Zh => "余额刷新中".to_string(),
+        Language::En => "balance refresh in progress".to_string(),
+    });
+    ui.last_balance_refresh_error = None;
     let proxy = proxy.clone();
     let balance_refresh_tx = balance_refresh_tx.clone();
     tokio::spawn(async move {
@@ -1600,42 +1606,47 @@ async fn handle_key_normal(
             false
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stats => {
-            let (table, len) = match ui.stats_focus {
-                StatsFocus::Stations => (
-                    &mut ui.stats_stations_table,
-                    snapshot.usage_rollup.by_config.len(),
-                ),
-                StatsFocus::Providers => (
-                    &mut ui.stats_providers_table,
-                    snapshot.usage_rollup.by_provider.len(),
-                ),
-            };
-            if let Some(next) = adjust_table_selection(table, -1, len) {
-                match ui.stats_focus {
-                    StatsFocus::Stations => ui.selected_stats_station_idx = next,
-                    StatsFocus::Providers => ui.selected_stats_provider_idx = next,
+            match ui.stats_focus {
+                StatsFocus::Stations => {
+                    let len = snapshot.usage_rollup.by_config.len();
+                    if let Some(next) =
+                        adjust_table_selection(&mut ui.stats_stations_table, -1, len)
+                    {
+                        ui.selected_stats_station_idx = next;
+                        return true;
+                    }
                 }
-                return true;
+                StatsFocus::Providers => {
+                    let len = ui.usage_balance_provider_rows_len(snapshot);
+                    if let Some(next) =
+                        adjust_table_selection(&mut ui.stats_providers_table, -1, len)
+                    {
+                        ui.selected_stats_provider_idx = next;
+                        return true;
+                    }
+                }
             }
             false
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Stats => {
-            let (table, len) = match ui.stats_focus {
-                StatsFocus::Stations => (
-                    &mut ui.stats_stations_table,
-                    snapshot.usage_rollup.by_config.len(),
-                ),
-                StatsFocus::Providers => (
-                    &mut ui.stats_providers_table,
-                    snapshot.usage_rollup.by_provider.len(),
-                ),
-            };
-            if let Some(next) = adjust_table_selection(table, 1, len) {
-                match ui.stats_focus {
-                    StatsFocus::Stations => ui.selected_stats_station_idx = next,
-                    StatsFocus::Providers => ui.selected_stats_provider_idx = next,
+            match ui.stats_focus {
+                StatsFocus::Stations => {
+                    let len = snapshot.usage_rollup.by_config.len();
+                    if let Some(next) = adjust_table_selection(&mut ui.stats_stations_table, 1, len)
+                    {
+                        ui.selected_stats_station_idx = next;
+                        return true;
+                    }
                 }
-                return true;
+                StatsFocus::Providers => {
+                    let len = ui.usage_balance_provider_rows_len(snapshot);
+                    if let Some(next) =
+                        adjust_table_selection(&mut ui.stats_providers_table, 1, len)
+                    {
+                        ui.selected_stats_provider_idx = next;
+                        return true;
+                    }
+                }
             }
             false
         }
@@ -1670,6 +1681,28 @@ async fn handle_key_normal(
                     i18n::label(ui.language, "errors_only"),
                     ui.stats_errors_only
                 ),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('g') if ui.page == Page::Stats => {
+            let balance_started = request_provider_balance_refresh(
+                ui,
+                snapshot,
+                proxy,
+                BalanceRefreshMode::Force,
+                balance_refresh_tx,
+            );
+            ui.toast = Some((
+                if balance_started {
+                    match ui.language {
+                        Language::Zh => "usage/balance: 余额刷新已开始",
+                        Language::En => "usage/balance: balance refresh started",
+                    }
+                } else {
+                    i18n::label(ui.language, "balance refresh already requested")
+                }
+                .to_string(),
                 Instant::now(),
             ));
             true
