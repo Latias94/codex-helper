@@ -291,10 +291,10 @@ pub(super) fn render_sessions_page(
         );
         let routing = if session_row_has_any_override(row) {
             format!(
-                "session(model={override_model}, station={override_cfg}, route={override_route_target}, tier={override_service_tier})"
+                "session(model={override_model}, station={override_cfg}, route_target={override_route_target}, tier={override_service_tier})"
             )
         } else if global_route_target != "-" {
-            format!("pinned(global-route)={global_route_target}")
+            format!("global_route_target={global_route_target}")
         } else if global_cfg != "-" {
             format!("pinned(global-station)={global_cfg}")
         } else {
@@ -456,7 +456,7 @@ pub(super) fn render_sessions_page(
             p,
             l("override"),
             format!(
-                "model={override_model}, effort={override_effort}, station={override_cfg}, route={override_route_target}, tier={override_service_tier}, global_station={global_cfg}, global_route={global_route_target}"
+                "model={override_model}, effort={override_effort}, station={override_cfg}, route_target={override_route_target}, tier={override_service_tier}, global_station={global_cfg}, global_route_target={global_route_target}"
             ),
             Style::default().fg(if session_row_has_any_override(row)
                 || global_cfg != "-"

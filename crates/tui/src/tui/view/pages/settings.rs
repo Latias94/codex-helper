@@ -379,15 +379,22 @@ fn format_primary_balance_lang(
     snapshot: &crate::state::ProviderBalanceSnapshot,
     lang: Language,
 ) -> String {
+    let provider_id = if snapshot.provider_id.trim().is_empty() {
+        "-".to_string()
+    } else {
+        shorten_middle(&snapshot.provider_id, 20)
+    };
+    let amount =
+        balance_amount_brief_lang(snapshot, lang).unwrap_or_else(|| snapshot.amount_summary());
     let mut line = format!(
-        "{}  #{}  {}  {}",
-        shorten_middle(&snapshot.provider_id, 20),
+        "{}  {}  #{}  {}",
+        amount,
+        provider_id,
         snapshot
             .upstream_index
             .map(|idx| idx.to_string())
             .unwrap_or_else(|| "-".to_string()),
-        balance_snapshot_status_label_lang(snapshot, lang),
-        balance_amount_brief_lang(snapshot, lang).unwrap_or_else(|| snapshot.amount_summary())
+        balance_snapshot_status_label_lang(snapshot, lang)
     );
     if let Some(err) = snapshot.error.as_deref()
         && !err.trim().is_empty()
@@ -509,7 +516,7 @@ pub(super) fn render_settings_page(
     for line in balance_overview_lines_lang(snapshot, 6, ui.language) {
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default().fg(p.muted)),
-            Span::styled(shorten_middle(&line, 110), Style::default().fg(p.muted)),
+            Span::styled(line, Style::default().fg(p.muted)),
         ]));
     }
 
@@ -809,5 +816,23 @@ mod tests {
         assert!(lines[2].contains("cross-station failover allowed before first output"));
         assert!(lines[3].contains("never_status=[400,401,403]"));
         assert!(lines[4].contains("transport=45s"));
+    }
+
+    #[test]
+    fn primary_balance_summary_puts_amount_before_provider_identity() {
+        let snapshot = crate::state::ProviderBalanceSnapshot {
+            provider_id: "input".to_string(),
+            upstream_index: Some(1),
+            status: crate::state::BalanceSnapshotStatus::Ok,
+            plan_name: Some("CodeX Pro Annual".to_string()),
+            subscription_balance_usd: Some("165.08".to_string()),
+            ..crate::state::ProviderBalanceSnapshot::default()
+        };
+
+        let line = format_primary_balance_lang(&snapshot, Language::En);
+        let amount_pos = line.find("$165.08").expect(&line);
+        let provider_pos = line.find("input").expect(&line);
+
+        assert!(amount_pos < provider_pos, "{line}");
     }
 }

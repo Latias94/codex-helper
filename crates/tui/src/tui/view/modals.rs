@@ -1581,15 +1581,15 @@ pub(super) fn render_provider_modal(
                         Style::default().fg(p.muted),
                     ),
                     Span::styled(balance, balance_style),
-                    Span::raw("  "),
+                ]),
+                Line::from(vec![
                     Span::styled(format!("{}: ", l("tags")), Style::default().fg(p.muted)),
                     Span::styled(tags, Style::default().fg(p.muted)),
-                    Span::raw("  "),
-                    Span::styled(
-                        format!("upstreams={}", pvd.upstreams.len()),
-                        Style::default().fg(p.muted),
-                    ),
                 ]),
+                Line::from(vec![Span::styled(
+                    format!("upstreams={}", pvd.upstreams.len()),
+                    Style::default().fg(p.muted),
+                )]),
             ]))
             .style(style),
         );
@@ -1649,9 +1649,13 @@ fn routing_provider_balance_line<'a>(
 ) -> Option<(&'a crate::state::ProviderBalanceSnapshot, String)> {
     let mut matches = snapshot
         .provider_balances
-        .values()
-        .flat_map(|balances| balances.iter())
-        .filter(|balance| balance.provider_id == provider_name)
+        .iter()
+        .flat_map(|(key, balances)| {
+            balances.iter().filter(move |balance| {
+                balance.provider_id == provider_name
+                    || (balance.provider_id.trim().is_empty() && key == provider_name)
+            })
+        })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
         left.upstream_index
@@ -1820,7 +1824,8 @@ pub(super) fn render_routing_modal(
                         Style::default().fg(p.muted),
                     ),
                     Span::styled(balance_text, balance_style),
-                    Span::raw("  "),
+                ]),
+                Line::from(vec![
                     Span::styled(format!("{}: ", l("tags")), Style::default().fg(p.muted)),
                     Span::styled(tags, Style::default().fg(p.muted)),
                 ]),
@@ -1907,5 +1912,43 @@ mod tests {
         assert!(failed);
         assert!(summary.contains("resolve failed:"));
         assert!(summary.contains("profile inheritance cycle"));
+    }
+
+    #[test]
+    fn routing_provider_balance_line_falls_back_for_legacy_snapshot_keys() {
+        let snapshot = crate::tui::model::Snapshot {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            model_overrides: std::collections::HashMap::new(),
+            overrides: std::collections::HashMap::new(),
+            station_overrides: std::collections::HashMap::new(),
+            route_target_overrides: std::collections::HashMap::new(),
+            service_tier_overrides: std::collections::HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: std::collections::HashMap::new(),
+            usage_rollup: crate::state::UsageRollupView::default(),
+            provider_balances: std::collections::HashMap::from([(
+                "input".to_string(),
+                vec![crate::state::ProviderBalanceSnapshot {
+                    provider_id: String::new(),
+                    status: crate::state::BalanceSnapshotStatus::Ok,
+                    total_balance_usd: Some("9.00".to_string()),
+                    ..crate::state::ProviderBalanceSnapshot::default()
+                }],
+            )]),
+            station_health: std::collections::HashMap::new(),
+            health_checks: std::collections::HashMap::new(),
+            lb_view: std::collections::HashMap::new(),
+            stats_5m: crate::dashboard_core::WindowStats::default(),
+            stats_1h: crate::dashboard_core::WindowStats::default(),
+            pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
+            refreshed_at: std::time::Instant::now(),
+        };
+
+        let (_, text) = super::routing_provider_balance_line(&snapshot, "input", Language::En)
+            .expect("legacy snapshot should still resolve");
+
+        assert!(text.contains("$9.00"), "{text}");
     }
 }

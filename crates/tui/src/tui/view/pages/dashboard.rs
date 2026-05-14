@@ -410,7 +410,7 @@ fn render_session_details(
             p,
             l("override"),
             format!(
-                "model={override_model}, effort={override_effort}, station={override_cfg}, route={override_route_target}, tier={override_service_tier}"
+                "model={override_model}, effort={override_effort}, station={override_cfg}, route_target={override_route_target}, tier={override_service_tier}"
             ),
             Style::default().fg(
                 if override_model != "-"

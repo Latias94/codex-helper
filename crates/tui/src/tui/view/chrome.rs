@@ -26,6 +26,22 @@ fn push_header_metric(
     spans.push(Span::styled(value.into(), value_style));
 }
 
+fn route_summary_full(provider: &str, station: &str, attempts: impl std::fmt::Display) -> String {
+    format!("{provider} -> {station} x{attempts}")
+}
+
+fn route_summary_medium(provider: &str, station: &str, attempts: impl std::fmt::Display) -> String {
+    format!(
+        "{} -> {} x{attempts}",
+        shorten_middle(provider, 18),
+        shorten_middle(station, 18)
+    )
+}
+
+fn route_summary_compact(station: &str, attempts: impl std::fmt::Display) -> String {
+    format!("{} x{attempts}", shorten_middle(station, 18))
+}
+
 fn text_prefix_by_width(text: &str, max_width: usize) -> String {
     let mut out = String::new();
     let mut width = 0usize;
@@ -349,13 +365,9 @@ pub(super) fn render_header(
     } else {
         "-".to_string()
     };
-    let route_full = format!("{last_provider}/{last_station}×{last_attempts}");
-    let route_medium = format!(
-        "{}/{}×{last_attempts}",
-        shorten_middle(last_provider, 18),
-        shorten_middle(last_station, 18)
-    );
-    let route_compact = format!("{}×{last_attempts}", shorten_middle(last_station, 18));
+    let route_full = route_summary_full(last_provider, last_station, last_attempts);
+    let route_medium = route_summary_medium(last_provider, last_station, last_attempts);
+    let route_compact = route_summary_compact(last_station, last_attempts);
     let overrides_total = overrides_model
         .saturating_add(overrides_effort)
         .saturating_add(overrides_route)
@@ -561,7 +573,7 @@ pub(super) fn render_header(
                 } else {
                     "global "
                 },
-                shorten_middle(global_route_control, 18),
+                shorten_middle(global_route_control, 24),
                 Style::default().fg(p.muted),
                 Style::default().fg(p.accent),
             );
@@ -756,6 +768,14 @@ mod tests {
         assert!(UnicodeWidthStr::width(first.as_str()) <= 26);
         assert!(!second.is_empty());
         assert!(second.contains("Tab focus"));
+    }
+
+    #[test]
+    fn route_summary_full_uses_directional_separator() {
+        assert_eq!(
+            route_summary_full("provider-a", "station-b", 3),
+            "provider-a -> station-b x3"
+        );
     }
 
     #[test]

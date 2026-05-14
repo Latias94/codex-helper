@@ -906,26 +906,55 @@ pub(in crate::tui) fn provider_balance_compact_lang(
     max_width: usize,
     lang: Language,
 ) -> String {
-    let mut parts = Vec::new();
-    if snapshot.status != BalanceSnapshotStatus::Ok {
-        parts.push(balance_snapshot_status_brief_lang(snapshot, lang).to_string());
-    }
-    if let Some(plan) = snapshot
+    let status = (snapshot.status != BalanceSnapshotStatus::Ok)
+        .then(|| balance_snapshot_status_brief_lang(snapshot, lang).to_string());
+    let plan = snapshot
         .plan_name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        parts.push(plan.to_string());
+        .map(ToOwned::to_owned);
+    let amount = balance_amount_brief_lang(snapshot, lang);
+
+    let mut candidates = Vec::new();
+    let full = [status.as_deref(), plan.as_deref(), amount.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !full.is_empty() {
+        candidates.push(full);
     }
-    if let Some(amount) = balance_amount_brief_lang(snapshot, lang) {
-        parts.push(amount);
+    if amount.is_some() {
+        let without_plan = [status.as_deref(), amount.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !without_plan.is_empty() {
+            candidates.push(without_plan);
+        }
+        candidates.push(amount.clone().unwrap_or_default());
     }
-    if parts.is_empty() {
-        parts.push(balance_snapshot_status_brief_lang(snapshot, lang).to_string());
+    if let Some(status) = status.clone() {
+        candidates.push(status);
+    }
+    if candidates.is_empty() {
+        candidates.push(balance_snapshot_status_brief_lang(snapshot, lang).to_string());
     }
 
-    shorten_middle(&parts.join(" "), max_width)
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| display_width(candidate) <= max_width)
+    {
+        return candidate.clone();
+    }
+
+    let fallback = amount
+        .as_deref()
+        .or_else(|| candidates.first().map(String::as_str))
+        .unwrap_or_else(|| balance_snapshot_status_brief_lang(snapshot, lang));
+    shorten_middle(fallback, max_width)
 }
 
 fn balance_snapshot_rank(snapshot: &ProviderBalanceSnapshot) -> u8 {
@@ -1410,7 +1439,7 @@ pub(in crate::tui) fn session_override_fields(row: &SessionRow) -> Vec<&'static 
         fields.push("station");
     }
     if row.override_route_target.is_some() {
-        fields.push("route_target");
+        fields.push("route target");
     }
     if row.override_service_tier.is_some() {
         fields.push("service_tier");
@@ -1503,7 +1532,7 @@ pub(in crate::tui) fn session_control_posture_lang(
     {
         return SessionControlPosture {
             headline: match lang {
-                Language::Zh => format!("无绑定；全局 route target {route_target} 仍会影响路由"),
+                Language::Zh => format!("无绑定；全局路由目标 {route_target} 仍会影响路由"),
                 Language::En => {
                     format!(
                         "no binding; global route target {route_target} may still influence routing"
@@ -1776,7 +1805,7 @@ mod tests {
         row.override_route_target = Some("monthly.default".to_string());
 
         assert!(session_row_has_any_override(&row));
-        assert_eq!(session_override_fields(&row), vec!["route_target"]);
+        assert_eq!(session_override_fields(&row), vec!["route target"]);
     }
 
     #[test]
@@ -2235,7 +2264,7 @@ mod tests {
         let posture = session_control_posture(&row, None, Some("input.fast"), true);
 
         assert!(posture.headline.contains("session-controlled route"));
-        assert!(posture.detail.contains("route_target"));
+        assert!(posture.detail.contains("route target"));
     }
 
     #[test]

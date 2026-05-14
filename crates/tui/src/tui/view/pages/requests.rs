@@ -2,6 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::i18n;
 use crate::tui::model::{
@@ -88,9 +89,7 @@ pub(super) fn render_requests_page(
         l("Dur"),
         "Att",
         l("Hit%"),
-        l("Model"),
-        "Stn",
-        "Pid",
+        l("Route"),
         l("Path"),
     ])
     .style(Style::default().fg(p.muted))
@@ -111,9 +110,7 @@ pub(super) fn render_requests_page(
             let cache_hit = request_cache_hit_rate_label(r);
             let cache_hit_style =
                 Style::default().fg(if cache_hit != "-" { p.accent } else { p.muted });
-            let model = r.model.as_deref().unwrap_or("-").to_string();
-            let cfg = r.station_name.as_deref().unwrap_or("-").to_string();
-            let pid = r.provider_id.as_deref().unwrap_or("-").to_string();
+            let route = request_route_table_label(r, 28);
             let path = shorten_middle(&r.path, 48);
 
             Row::new(vec![
@@ -125,9 +122,7 @@ pub(super) fn render_requests_page(
                     Style::default().fg(if attempts_n > 1 { p.warn } else { p.muted }),
                 )),
                 Cell::from(Span::styled(cache_hit, cache_hit_style)),
-                Cell::from(shorten(&model, 14)),
-                Cell::from(shorten(&cfg, 12)),
-                Cell::from(shorten(&pid, 10)),
+                Cell::from(route),
                 Cell::from(path),
             ])
             .style(Style::default().bg(p.panel).fg(p.text))
@@ -142,9 +137,7 @@ pub(super) fn render_requests_page(
             Constraint::Length(8),
             Constraint::Length(4),
             Constraint::Length(6),
-            Constraint::Length(14),
-            Constraint::Length(12),
-            Constraint::Length(10),
+            Constraint::Length(28),
             Constraint::Min(14),
         ],
     )
@@ -452,6 +445,56 @@ fn request_cost_parts_line(request: &crate::state::FinishedRequest) -> Option<St
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+fn clean_route_part(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn request_route_table_label(request: &crate::state::FinishedRequest, max_width: usize) -> String {
+    let provider = clean_route_part(request.provider_id.as_deref());
+    let station = clean_route_part(request.station_name.as_deref());
+    let full = match (provider, station) {
+        (Some(provider), Some(station)) => format!("{provider} -> {station}"),
+        (Some(provider), None) => provider.to_string(),
+        (None, Some(station)) => station.to_string(),
+        (None, None) => "-".to_string(),
+    };
+    if UnicodeWidthStr::width(full.as_str()) <= max_width {
+        return full;
+    }
+
+    let Some(provider) = provider else {
+        return shorten_middle(full.as_str(), max_width);
+    };
+    let Some(station) = station else {
+        return shorten_middle(provider, max_width);
+    };
+    let sep_width = UnicodeWidthStr::width(" -> ");
+    if max_width <= sep_width + 3 {
+        return shorten_middle(provider, max_width);
+    }
+
+    let budget = max_width.saturating_sub(sep_width);
+    let station_width = UnicodeWidthStr::width(station);
+    if station_width < budget.saturating_sub(3) {
+        let provider_width = budget.saturating_sub(station_width);
+        return format!("{} -> {station}", shorten_middle(provider, provider_width));
+    }
+
+    let provider_width = UnicodeWidthStr::width(provider);
+    if provider_width < budget.saturating_sub(3) {
+        let station_width = budget.saturating_sub(provider_width);
+        return format!("{provider} -> {}", shorten_middle(station, station_width));
+    }
+
+    let provider_width = ((budget * 2) / 3).max(3);
+    let station_width = budget.saturating_sub(provider_width).max(3);
+    format!(
+        "{} -> {}",
+        shorten_middle(provider, provider_width),
+        shorten_middle(station, station_width)
+    )
+}
+
 fn request_route_attempt_line(attempt: &crate::logging::RouteAttemptLog) -> String {
     let target = attempt
         .provider_endpoint_key
@@ -563,5 +606,42 @@ mod tests {
         assert!(line.starts_with("endpoint=codex/right/default"));
         assert!(line.contains("group=1"));
         assert!(line.contains("prov=right"));
+    }
+
+    #[test]
+    fn request_route_table_label_preserves_provider_identity() {
+        let request = crate::state::FinishedRequest {
+            id: 1,
+            trace_id: None,
+            session_id: None,
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            upstream_base_url: None,
+            route_decision: None,
+            usage: None,
+            cost: crate::pricing::CostBreakdown::default(),
+            retry: None,
+            observability: crate::state::RequestObservability::default(),
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 120,
+            ttfb_ms: None,
+            streaming: false,
+            ended_at_ms: 1,
+            provider_id: Some("very-long-provider-name".to_string()),
+            station_name: Some("input-light".to_string()),
+        };
+
+        let label = request_route_table_label(&request, 24);
+
+        assert!(label.contains("input-light"), "{label}");
+        assert!(label.contains("->"), "{label}");
+        assert!(UnicodeWidthStr::width(label.as_str()) <= 24);
     }
 }

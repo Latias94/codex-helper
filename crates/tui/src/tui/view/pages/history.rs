@@ -59,7 +59,7 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
             let msg = s
                 .first_user_message
                 .as_deref()
-                .map(|m| shorten_middle(m, 80))
+                .map(history_message_preview)
                 .unwrap_or_else(|| "-".to_string());
 
             Row::new(vec![
@@ -251,5 +251,28 @@ fn history_focus_origin_label(
         CodexHistoryExternalFocusOrigin::Sessions => i18n::label(lang, "Sessions"),
         CodexHistoryExternalFocusOrigin::Requests => i18n::label(lang, "Requests"),
         CodexHistoryExternalFocusOrigin::Recent => i18n::label(lang, "Recent"),
+    }
+}
+
+fn history_message_preview(message: &str) -> String {
+    let first_line = message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("-");
+    shorten(first_line, 80)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::history_message_preview;
+
+    #[test]
+    fn history_message_preview_preserves_opening_words() {
+        let preview = history_message_preview(
+            "请帮我检查这次路由策略为什么会切换到 chili，然后看看余额展示是否清楚",
+        );
+
+        assert!(preview.starts_with("请帮我检查"), "{preview}");
     }
 }

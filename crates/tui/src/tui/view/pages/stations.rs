@@ -702,9 +702,13 @@ fn routing_provider_balance_snapshots<'a>(
 ) -> Vec<&'a crate::state::ProviderBalanceSnapshot> {
     let mut matches = snapshot
         .provider_balances
-        .values()
-        .flat_map(|balances| balances.iter())
-        .filter(|balance| balance.provider_id == provider_name)
+        .iter()
+        .flat_map(|(key, balances)| {
+            balances.iter().filter(move |balance| {
+                balance.provider_id == provider_name
+                    || (balance.provider_id.trim().is_empty() && key == provider_name)
+            })
+        })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
         left.upstream_index
@@ -721,8 +725,89 @@ fn routing_provider_balance_brief_lang(
 ) -> String {
     routing_provider_balance_snapshots(snapshot, provider_name)
         .first()
-        .map(|balance| provider_balance_compact_lang(balance, 24, lang))
+        .map(|balance| provider_balance_compact_lang(balance, 32, lang))
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn routing_provider_display_label(
+    provider: Option<&crate::tui::model::RoutingProviderRef>,
+    provider_name: &str,
+) -> String {
+    let mut label = provider_name.to_string();
+    if let Some(alias) = provider
+        .and_then(|provider| provider.alias.as_deref())
+        .filter(|alias| !alias.trim().is_empty() && *alias != provider_name)
+    {
+        label = format!("{label} ({alias})");
+    }
+    label
+}
+
+fn route_target_summary_line(
+    snapshot: &Snapshot,
+    target: Option<&str>,
+    provider_by_name: &HashMap<&str, &crate::tui::model::RoutingProviderRef>,
+    lang: Language,
+) -> String {
+    let Some(target) = target.filter(|target| !target.trim().is_empty()) else {
+        return "-".to_string();
+    };
+    let provider = provider_by_name.get(target).copied();
+    let mut parts = vec![routing_provider_display_label(provider, target)];
+    let balance = routing_provider_balance_brief_lang(snapshot, target, lang);
+    if balance != "-" {
+        parts.push(balance);
+    }
+    if provider.is_none() {
+        parts.push(i18n::label(lang, "not in catalog").to_string());
+    }
+    parts.join(" | ")
+}
+
+fn push_wrapped_segments<'a>(
+    lines: &mut Vec<Line<'a>>,
+    p: Palette,
+    label: &str,
+    segments: &[String],
+    separator: &str,
+    max_width: usize,
+) {
+    lines.push(Line::from(vec![Span::styled(
+        format!("{label}: "),
+        Style::default().fg(p.muted),
+    )]));
+    let mut line = String::new();
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+        let candidate = if line.is_empty() {
+            segment.clone()
+        } else {
+            format!("{line}{separator}{segment}")
+        };
+        if line.is_empty() || unicode_width::UnicodeWidthStr::width(candidate.as_str()) <= max_width
+        {
+            line = candidate;
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(p.text)),
+            ]));
+            line = segment.clone();
+        }
+    }
+    if line.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("-", Style::default().fg(p.muted)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(line, Style::default().fg(p.text)),
+        ]));
+    }
 }
 
 fn routing_provider_marker(
@@ -829,13 +914,7 @@ fn render_route_graph_routing_page(
             let provider = provider_by_name.get(name.as_str()).copied();
             let enabled = provider.map(|provider| provider.enabled).unwrap_or(false);
             let marker = routing_provider_marker(&spec, name, provider);
-            let mut label = name.clone();
-            if let Some(alias) = provider
-                .and_then(|provider| provider.alias.as_deref())
-                .filter(|alias| !alias.trim().is_empty() && *alias != name)
-            {
-                label = format!("{label} ({alias})");
-            }
+            let label = routing_provider_display_label(provider, name);
             let balance = routing_provider_balance_brief_lang(snapshot, name, lang);
             let style = if !enabled {
                 Style::default().fg(p.muted)
@@ -870,10 +949,10 @@ fn render_route_graph_routing_page(
         rows,
         [
             Constraint::Length(4),
-            Constraint::Min(12),
+            Constraint::Min(10),
             Constraint::Length(3),
             Constraint::Length(5),
-            Constraint::Length(12),
+            Constraint::Length(24),
         ],
     )
     .header(header)
@@ -890,6 +969,14 @@ fn render_route_graph_routing_page(
         .unwrap_or_else(|| l("Provider routing").to_string());
 
     let mut lines = Vec::new();
+    let active_route_target = session_route_target.or(global_route_target);
+    let route_target_source = if session_route_target.is_some() {
+        i18n::label(lang, "session")
+    } else if global_route_target.is_some() {
+        "global"
+    } else {
+        "-"
+    };
     lines.push(Line::from(vec![
         Span::styled(format!("{}: ", l("session")), Style::default().fg(p.muted)),
         Span::styled(
@@ -897,15 +984,25 @@ fn render_route_graph_routing_page(
             Style::default().fg(p.text),
         ),
         Span::raw("   "),
+        Span::styled(format!("{}: ", l("source")), Style::default().fg(p.muted)),
+        Span::styled(
+            route_target_source.to_string(),
+            Style::default().fg(if session_route_target.is_some() {
+                p.focus
+            } else if global_route_target.is_some() {
+                p.accent
+            } else {
+                p.muted
+            }),
+        ),
+    ]));
+    lines.push(Line::from(vec![
         Span::styled(
             format!("{}: ", l("route_target")),
             Style::default().fg(p.muted),
         ),
         Span::styled(
-            session_route_target
-                .or(global_route_target)
-                .unwrap_or("-")
-                .to_string(),
+            route_target_summary_line(snapshot, active_route_target, &provider_by_name, lang),
             Style::default().fg(if session_route_target.is_some() {
                 p.focus
             } else if global_route_target.is_some() {
@@ -955,13 +1052,7 @@ fn render_route_graph_routing_page(
             }),
         ),
     ]));
-    lines.push(Line::from(vec![
-        Span::styled(format!("{}: ", l("order")), Style::default().fg(p.muted)),
-        Span::styled(
-            shorten_middle(&order.join(" > "), 96),
-            Style::default().fg(p.text),
-        ),
-    ]));
+    push_wrapped_segments(&mut lines, p, l("order"), &order, " > ", 96);
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
@@ -2029,6 +2120,73 @@ mod tests {
             station_balance_brief(&provider_balances, "alpha", 18),
             "left $3.50"
         );
+    }
+
+    #[test]
+    fn routing_provider_balance_brief_preserves_subscription_amount_in_narrow_table() {
+        let snapshot = Snapshot {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            model_overrides: HashMap::new(),
+            overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: HashMap::new(),
+            usage_rollup: crate::state::UsageRollupView::default(),
+            provider_balances: HashMap::from([(
+                "input".to_string(),
+                vec![crate::state::ProviderBalanceSnapshot {
+                    provider_id: "input".to_string(),
+                    status: BalanceSnapshotStatus::Ok,
+                    plan_name: Some("CodeX Pro Annual".to_string()),
+                    subscription_balance_usd: Some("165.08".to_string()),
+                    ..crate::state::ProviderBalanceSnapshot::default()
+                }],
+            )]),
+            station_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: crate::dashboard_core::WindowStats::default(),
+            stats_1h: crate::dashboard_core::WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+            refreshed_at: std::time::Instant::now(),
+        };
+
+        let brief = routing_provider_balance_brief_lang(&snapshot, "input", Language::En);
+
+        assert!(brief.contains("$165.08"), "{brief}");
+        assert!(!brief.contains('…'), "{brief}");
+    }
+
+    #[test]
+    fn wrapped_route_order_keeps_provider_names_intact() {
+        let mut lines = Vec::new();
+        let order = [
+            "input",
+            "input1",
+            "input2",
+            "input3",
+            "input4",
+            "input-light",
+            "centos",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        push_wrapped_segments(&mut lines, Palette::default(), "order", &order, " > ", 36);
+
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("input4"), "{text}");
+        assert!(text.contains("input-light"), "{text}");
+        assert!(!text.contains('…'), "{text}");
     }
 
     #[test]
