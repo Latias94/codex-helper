@@ -11,10 +11,10 @@ use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, basename, duration_short, format_age,
     format_observed_client_identity, now_ms, request_cache_hit_rate_label,
-    session_balance_brief_lang, session_control_posture_lang, session_observation_scope_label_lang,
-    session_primary_balance_snapshot, session_row_has_any_override,
-    session_transcript_host_status_lang, short_sid, shorten, shorten_middle, status_style,
-    tokens_short, usage_line_lang,
+    session_control_posture_lang, session_observation_scope_label_lang,
+    session_observed_provider_balance_brief_lang, session_observed_provider_balance_snapshot,
+    session_row_has_any_override, session_transcript_host_status_lang, short_sid, shorten,
+    shorten_middle, status_style, tokens_short, usage_line_lang,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -259,10 +259,11 @@ fn render_session_details(
     let provider = selected
         .and_then(|r| r.last_provider_id.as_deref())
         .unwrap_or("-");
-    let balance =
-        selected.and_then(|r| session_balance_brief_lang(r, &snapshot.provider_balances, 56, lang));
-    let balance_snapshot =
-        selected.and_then(|r| session_primary_balance_snapshot(r, &snapshot.provider_balances));
+    let balance = selected.and_then(|r| {
+        session_observed_provider_balance_brief_lang(r, &snapshot.provider_balances, 56, lang)
+    });
+    let balance_snapshot = selected
+        .and_then(|r| session_observed_provider_balance_snapshot(r, &snapshot.provider_balances));
     let provider_line = match balance.as_deref() {
         Some(balance) if provider != "-" => format!("{provider} | {balance}"),
         Some(balance) => balance.to_string(),

@@ -806,6 +806,81 @@ fn quota_amount_brief(snapshot: &ProviderBalanceSnapshot, lang: Language) -> Opt
     Some(format!("{quota_label} {amount}"))
 }
 
+fn balance_amount_terse_lang(snapshot: &ProviderBalanceSnapshot, lang: Language) -> Option<String> {
+    if snapshot.unlimited_quota == Some(true) {
+        return Some(i18n::label(lang, "unlimited").to_string());
+    }
+
+    if let Some(amount) = quota_amount_terse(snapshot, lang) {
+        return Some(amount);
+    }
+
+    let subscription = snapshot
+        .subscription_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let paygo = snapshot
+        .paygo_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (subscription, paygo) {
+        (Some(sub), Some(paygo)) => Some(format!(
+            "{} {} + {} {}",
+            i18n::label(lang, "subscription"),
+            usd_brief(sub),
+            i18n::label(lang, "paygo"),
+            usd_brief(paygo)
+        )),
+        (Some(sub), None) => Some(format!(
+            "{} {}",
+            i18n::label(lang, "subscription"),
+            usd_brief(sub)
+        )),
+        (None, Some(paygo)) => Some(format!(
+            "{} {}",
+            i18n::label(lang, "paygo"),
+            usd_brief(paygo)
+        )),
+        (None, None) => None,
+    }
+}
+
+fn quota_amount_terse(snapshot: &ProviderBalanceSnapshot, lang: Language) -> Option<String> {
+    let period = snapshot
+        .quota_period
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let remaining = snapshot
+        .quota_remaining_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let limit = snapshot
+        .quota_limit_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (remaining, limit) {
+        (Some(remaining), Some(limit)) => {
+            let quota_label = match period {
+                Some("quota") | None => i18n::label(lang, "quota").to_string(),
+                Some(period) => period.to_string(),
+            };
+            Some(format!(
+                "{quota_label} {}/{}",
+                usd_brief(remaining),
+                usd_brief(limit)
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn usd_brief(raw: &str) -> String {
     format!("${}", decimal_brief(raw))
 }
@@ -915,6 +990,7 @@ pub(in crate::tui) fn provider_balance_compact_lang(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
     let amount = balance_amount_brief_lang(snapshot, lang);
+    let terse_amount = balance_amount_terse_lang(snapshot, lang);
 
     let mut candidates = Vec::new();
     let full = [status.as_deref(), plan.as_deref(), amount.as_deref()]
@@ -923,7 +999,7 @@ pub(in crate::tui) fn provider_balance_compact_lang(
         .collect::<Vec<_>>()
         .join(" ");
     if !full.is_empty() {
-        candidates.push(full);
+        push_balance_candidate(&mut candidates, full);
     }
     if amount.is_some() {
         let without_plan = [status.as_deref(), amount.as_deref()]
@@ -932,15 +1008,26 @@ pub(in crate::tui) fn provider_balance_compact_lang(
             .collect::<Vec<_>>()
             .join(" ");
         if !without_plan.is_empty() {
-            candidates.push(without_plan);
+            push_balance_candidate(&mut candidates, without_plan);
         }
-        candidates.push(amount.clone().unwrap_or_default());
+    }
+    if let (Some(status), Some(terse_amount)) = (status.as_deref(), terse_amount.as_deref()) {
+        push_balance_candidate(&mut candidates, format!("{status} {terse_amount}"));
+    }
+    if let Some(amount) = amount.clone() {
+        push_balance_candidate(&mut candidates, amount);
+    }
+    if let Some(terse_amount) = terse_amount.clone() {
+        push_balance_candidate(&mut candidates, terse_amount);
     }
     if let Some(status) = status.clone() {
-        candidates.push(status);
+        push_balance_candidate(&mut candidates, status);
     }
     if candidates.is_empty() {
-        candidates.push(balance_snapshot_status_brief_lang(snapshot, lang).to_string());
+        push_balance_candidate(
+            &mut candidates,
+            balance_snapshot_status_brief_lang(snapshot, lang).to_string(),
+        );
     }
 
     if let Some(candidate) = candidates
@@ -955,6 +1042,12 @@ pub(in crate::tui) fn provider_balance_compact_lang(
         .or_else(|| candidates.first().map(String::as_str))
         .unwrap_or_else(|| balance_snapshot_status_brief_lang(snapshot, lang));
     shorten_middle(fallback, max_width)
+}
+
+fn push_balance_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn balance_snapshot_rank(snapshot: &ProviderBalanceSnapshot) -> u8 {
@@ -1088,6 +1181,7 @@ pub(in crate::tui) fn station_balance_brief_lang(
     }
 }
 
+#[cfg(test)]
 fn row_station_candidates(row: &SessionRow) -> impl Iterator<Item = &str> {
     [
         row.last_station_name.as_deref(),
@@ -1112,7 +1206,10 @@ fn balance_by_provider_id<'a>(
         .flat_map(|(station_name, balances)| {
             balances
                 .iter()
-                .filter(move |snapshot| snapshot.provider_id == provider_id)
+                .filter(move |snapshot| {
+                    snapshot.provider_id == provider_id
+                        || (snapshot.provider_id.trim().is_empty() && station_name == provider_id)
+                })
                 .map(move |snapshot| (station_name.as_str(), snapshot))
         })
         .collect::<Vec<_>>();
@@ -1137,7 +1234,8 @@ pub(in crate::tui) fn session_balance_brief(
     session_balance_brief_lang(row, provider_balances, max_width, Language::En)
 }
 
-pub(in crate::tui) fn session_balance_brief_lang(
+#[cfg(test)]
+fn session_balance_brief_lang(
     row: &SessionRow,
     provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
     max_width: usize,
@@ -1171,22 +1269,31 @@ pub(in crate::tui) fn session_balance_brief_lang(
         })
 }
 
-pub(in crate::tui) fn session_primary_balance_snapshot<'a>(
+pub(in crate::tui) fn session_observed_provider_balance_brief_lang(
+    row: &SessionRow,
+    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    max_width: usize,
+    lang: Language,
+) -> Option<String> {
+    let provider_id = row
+        .last_provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty() && *provider_id != "-")?;
+    balance_by_provider_id(provider_balances, provider_id)
+        .map(|(_, snapshot)| provider_balance_compact_lang(snapshot, max_width, lang))
+}
+
+pub(in crate::tui) fn session_observed_provider_balance_snapshot<'a>(
     row: &SessionRow,
     provider_balances: &'a HashMap<String, Vec<ProviderBalanceSnapshot>>,
 ) -> Option<&'a ProviderBalanceSnapshot> {
-    for station_name in row_station_candidates(row) {
-        if let Some(snapshot) = station_primary_balance_snapshot(provider_balances, station_name) {
-            return Some(snapshot);
-        }
-    }
-
-    row.last_provider_id
+    let provider_id = row
+        .last_provider_id
         .as_deref()
         .map(str::trim)
-        .filter(|provider_id| !provider_id.is_empty())
-        .and_then(|provider_id| balance_by_provider_id(provider_balances, provider_id))
-        .map(|(_, snapshot)| snapshot)
+        .filter(|provider_id| !provider_id.is_empty() && *provider_id != "-")?;
+    balance_by_provider_id(provider_balances, provider_id).map(|(_, snapshot)| snapshot)
 }
 
 pub(in crate::tui) fn provider_tags_brief(
@@ -1933,6 +2040,43 @@ mod tests {
         assert_eq!(
             session_balance_brief(&row, &balances, 80).as_deref(),
             Some("input Monthly left $8.00")
+        );
+    }
+
+    #[test]
+    fn session_observed_provider_balance_follows_provider_not_station_summary() {
+        let balances = HashMap::from([(
+            "input".to_string(),
+            vec![
+                ProviderBalanceSnapshot {
+                    provider_id: "input".to_string(),
+                    status: BalanceSnapshotStatus::Ok,
+                    unlimited_quota: Some(true),
+                    ..ProviderBalanceSnapshot::default()
+                },
+                ProviderBalanceSnapshot {
+                    provider_id: "centos".to_string(),
+                    status: BalanceSnapshotStatus::Exhausted,
+                    exhausted: Some(true),
+                    exhaustion_affects_routing: false,
+                    quota_period: Some("daily".to_string()),
+                    quota_remaining_usd: Some("0".to_string()),
+                    quota_limit_usd: Some("100".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                },
+            ],
+        )]);
+        let mut row = empty_session_row();
+        row.last_station_name = Some("input".to_string());
+        row.last_provider_id = Some("centos".to_string());
+
+        let brief = session_observed_provider_balance_brief_lang(&row, &balances, 80, Language::En);
+
+        assert_eq!(brief.as_deref(), Some("lazy daily left $0 / $100.00"));
+        assert_eq!(
+            session_observed_provider_balance_snapshot(&row, &balances)
+                .map(|snapshot| snapshot.provider_id.as_str()),
+            Some("centos")
         );
     }
 

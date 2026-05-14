@@ -7,9 +7,9 @@ use crate::state::{ResolvedRouteValue, RouteValueSource};
 use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, basename, format_age,
-    format_observed_client_identity, now_ms, session_balance_brief_lang,
-    session_control_posture_lang, session_observation_scope_label_lang,
-    session_primary_balance_snapshot, session_row_has_any_override,
+    format_observed_client_identity, now_ms, session_control_posture_lang,
+    session_observation_scope_label_lang, session_observed_provider_balance_brief_lang,
+    session_observed_provider_balance_snapshot, session_row_has_any_override,
     session_transcript_host_status_lang, short_sid, shorten, shorten_middle, status_style,
     tokens_short, usage_line_lang,
 };
@@ -250,11 +250,17 @@ pub(super) fn render_sessions_page(
             .map(|decision| decision.route_path.join(" / "))
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| "-".to_string());
-        let balance = session_balance_brief_lang(row, &snapshot.provider_balances, 64, lang)
-            .unwrap_or_else(|| "-".to_string());
-        let balance_style = session_primary_balance_snapshot(row, &snapshot.provider_balances)
-            .map(|snapshot| balance_snapshot_status_style(p, snapshot))
-            .unwrap_or_else(|| Style::default().fg(p.muted));
+        let balance = session_observed_provider_balance_brief_lang(
+            row,
+            &snapshot.provider_balances,
+            64,
+            lang,
+        )
+        .unwrap_or_else(|| "-".to_string());
+        let balance_style =
+            session_observed_provider_balance_snapshot(row, &snapshot.provider_balances)
+                .map(|snapshot| balance_snapshot_status_style(p, snapshot))
+                .unwrap_or_else(|| Style::default().fg(p.muted));
         let observed_cfg = row.last_station_name.as_deref().unwrap_or("-");
         let observed_upstream = row.last_upstream_base_url.as_deref().unwrap_or("-");
         let observed_effort = row.last_reasoning_effort.as_deref().unwrap_or("-");

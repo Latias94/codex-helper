@@ -203,9 +203,13 @@ fn provider_primary_balance<'a>(
     provider_id: &str,
 ) -> Option<&'a ProviderBalanceSnapshot> {
     let mut matches = provider_balances
-        .values()
-        .flat_map(|balances| balances.iter())
-        .filter(|snapshot| snapshot.provider_id == provider_id)
+        .iter()
+        .flat_map(|(key, balances)| {
+            balances.iter().filter(move |snapshot| {
+                snapshot.provider_id == provider_id
+                    || (snapshot.provider_id.trim().is_empty() && key == provider_id)
+            })
+        })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
         balance_status_rank(left.status)

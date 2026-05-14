@@ -19,6 +19,9 @@ use crate::tui::model::{
 use crate::tui::state::UiState;
 use crate::tui::{Language, ProviderOption};
 
+const ROUTING_BALANCE_COLUMN_WIDTH: u16 = 24;
+const ROUTING_BALANCE_SUMMARY_WIDTH: usize = 32;
+
 fn station_routing_posture(
     providers: &[ProviderOption],
     station_meta_overrides: &HashMap<String, (Option<bool>, Option<u8>)>,
@@ -721,11 +724,12 @@ fn routing_provider_balance_snapshots<'a>(
 fn routing_provider_balance_brief_lang(
     snapshot: &Snapshot,
     provider_name: &str,
+    max_width: usize,
     lang: Language,
 ) -> String {
     routing_provider_balance_snapshots(snapshot, provider_name)
         .first()
-        .map(|balance| provider_balance_compact_lang(balance, 32, lang))
+        .map(|balance| provider_balance_compact_lang(balance, max_width, lang))
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -754,7 +758,8 @@ fn route_target_summary_line(
     };
     let provider = provider_by_name.get(target).copied();
     let mut parts = vec![routing_provider_display_label(provider, target)];
-    let balance = routing_provider_balance_brief_lang(snapshot, target, lang);
+    let balance =
+        routing_provider_balance_brief_lang(snapshot, target, ROUTING_BALANCE_SUMMARY_WIDTH, lang);
     if balance != "-" {
         parts.push(balance);
     }
@@ -915,7 +920,12 @@ fn render_route_graph_routing_page(
             let enabled = provider.map(|provider| provider.enabled).unwrap_or(false);
             let marker = routing_provider_marker(&spec, name, provider);
             let label = routing_provider_display_label(provider, name);
-            let balance = routing_provider_balance_brief_lang(snapshot, name, lang);
+            let balance = routing_provider_balance_brief_lang(
+                snapshot,
+                name,
+                usize::from(ROUTING_BALANCE_COLUMN_WIDTH),
+                lang,
+            );
             let style = if !enabled {
                 Style::default().fg(p.muted)
             } else if session_route_target == Some(name.as_str()) {
@@ -952,7 +962,7 @@ fn render_route_graph_routing_page(
             Constraint::Min(10),
             Constraint::Length(3),
             Constraint::Length(5),
-            Constraint::Length(24),
+            Constraint::Length(ROUTING_BALANCE_COLUMN_WIDTH),
         ],
     )
     .header(header)
@@ -2155,10 +2165,67 @@ mod tests {
             refreshed_at: std::time::Instant::now(),
         };
 
-        let brief = routing_provider_balance_brief_lang(&snapshot, "input", Language::En);
+        let brief = routing_provider_balance_brief_lang(
+            &snapshot,
+            "input",
+            usize::from(ROUTING_BALANCE_COLUMN_WIDTH),
+            Language::En,
+        );
 
         assert!(brief.contains("$165.08"), "{brief}");
         assert!(!brief.contains('…'), "{brief}");
+    }
+
+    #[test]
+    fn routing_provider_balance_brief_fits_lazy_quota_in_zh_table_cell() {
+        let snapshot = Snapshot {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            model_overrides: HashMap::new(),
+            overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: HashMap::new(),
+            usage_rollup: crate::state::UsageRollupView::default(),
+            provider_balances: HashMap::from([(
+                "input".to_string(),
+                vec![crate::state::ProviderBalanceSnapshot {
+                    provider_id: "input".to_string(),
+                    status: BalanceSnapshotStatus::Exhausted,
+                    exhausted: Some(true),
+                    exhaustion_affects_routing: false,
+                    quota_period: Some("daily".to_string()),
+                    quota_remaining_usd: Some("0".to_string()),
+                    quota_limit_usd: Some("300".to_string()),
+                    ..crate::state::ProviderBalanceSnapshot::default()
+                }],
+            )]),
+            station_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: crate::dashboard_core::WindowStats::default(),
+            stats_1h: crate::dashboard_core::WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+            refreshed_at: std::time::Instant::now(),
+        };
+
+        let brief = routing_provider_balance_brief_lang(
+            &snapshot,
+            "input",
+            usize::from(ROUTING_BALANCE_COLUMN_WIDTH),
+            Language::Zh,
+        );
+
+        assert!(
+            unicode_width::UnicodeWidthStr::width(brief.as_str())
+                <= usize::from(ROUTING_BALANCE_COLUMN_WIDTH),
+            "{brief}"
+        );
+        assert_eq!(brief, "不降级 daily $0/$300.00");
+        assert!(!brief.ends_with(" / $"), "{brief}");
     }
 
     #[test]
