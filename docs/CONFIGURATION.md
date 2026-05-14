@@ -542,6 +542,8 @@ Most relay users do not need to write `usage_providers.json` just to see balance
 3. `new_api_user_self`: `GET {{base_url}}/api/user/self` with dashboard-style auth.
 4. `openai_balance_http_json`: `GET {{base_url}}/user/balance` with the model API key.
 
+RightCode hosts (`www.right.codes` / `right.codes`) are special-cased before the generic relay probes. The built-in `rightcode_account_summary` adapter calls `GET https://www.right.codes/account/summary`, uses bearer auth, reads wallet `balance`, and matches subscription daily quota by the upstream path prefix such as `/codex`.
+
 Explicit adapters are still useful when a relay needs dashboard credentials, custom headers, a custom endpoint, or safer exhaustion handling.
 
 For `api.openai.com`, codex-helper skips relay-style `/user/balance` probing. If `OPENAI_ADMIN_KEY` is set, it can auto-read `openai_organization_costs`; otherwise the official OpenAI provider remains unknown instead of being treated as exhausted.
@@ -587,6 +589,27 @@ Sub2API API-key telemetry:
 }
 ```
 
+RightCode account summary:
+
+```json
+{
+  "providers": [
+    {
+      "id": "rightcode",
+      "kind": "rightcode_account_summary",
+      "domains": ["www.right.codes", "right.codes"],
+      "endpoint": "https://www.right.codes/account/summary",
+      "token_env": "RIGHTCODE_API_KEY",
+      "poll_interval_secs": 60,
+      "refresh_on_request": true,
+      "trust_exhaustion_for_routing": false
+    }
+  ]
+}
+```
+
+You can omit this block for the normal case: the default adapter is built in, reads `RIGHTCODE_API_KEY` when it is set, and otherwise falls back to the upstream model API key. Add it only when you want a custom endpoint or a different routing trust policy. By default, RightCode daily package quota is display-only for routing because the account `balance` may still be available and daily subscription windows can reset lazily.
+
 New API dashboard-style quota:
 
 ```json
@@ -616,6 +639,7 @@ Important balance behavior:
 - Sub2API lazy subscription-window zeros are displayed as lazy reset state before a real request refreshes the period; they should not be confused with a durable package design choice.
 - Sub2API subscription-mode `remaining` is a period-limit capacity signal, not a wallet balance. A zero `remaining` means at least one configured subscription window is currently exhausted and may demote routing once trusted.
 - New API quota values are quota units converted with `QuotaPerUnit = 500000`; token usage snapshots with `unlimited_quota = true` are never treated as exhausted.
+- RightCode `balance` is shown as wallet balance. Matched `subscriptions[*].total_quota` and `remaining_quota` are shown as daily quota; `reset_today = false` means codex-helper includes today's fresh daily quota before displaying remaining quota.
 - If a provider reports misleading zero balances for active subscriptions, set `trust_exhaustion_for_routing = false`.
 - UI surfaces cached balance snapshots; manual refresh uses `POST /__codex_helper/api/v1/providers/balances/refresh`.
 - Balance HTTP calls are bounded and reuse the same outbound client as proxy runtime calls. A failed lookup should surface the probed origin and adapter kind in logs, for example whether `sub2api_usage` or `openai_balance_http_json` returned non-JSON.
@@ -642,6 +666,7 @@ Common adapter kinds:
 - `sub2api_auth_me`
 - `new_api_token_usage`
 - `new_api_user_self`
+- `rightcode_account_summary`
 - `openai_organization_costs`
 - `openai_balance_http_json`
 - `relay_balance_http_json`

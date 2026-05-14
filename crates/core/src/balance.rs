@@ -210,11 +210,12 @@ impl ProviderBalanceSnapshot {
         }
         if self.unlimited_quota == Some(true) {
             parts.push("unlimited".to_string());
-        } else if let Some(quota) = self.quota_summary() {
-            parts.push(quota);
         } else {
             if let Some(total) = self.total_balance_usd.as_deref() {
                 parts.push(format!("total=${total}"));
+            }
+            if let Some(quota) = self.quota_summary() {
+                parts.push(quota);
             }
             match (
                 self.monthly_budget_usd.as_deref(),
@@ -426,6 +427,24 @@ mod tests {
         assert_eq!(
             snapshot.amount_summary(),
             "plan=monthly total=$3.5 left=$3.75 budget=$5 spent=$1.25 used=$7 today=$0.5 sub=$2 paygo=$1.5 req=42 tok=1234"
+        );
+    }
+
+    #[test]
+    fn provider_balance_amount_summary_keeps_wallet_with_quota() {
+        let snapshot = ProviderBalanceSnapshot {
+            plan_name: Some("rightcode".to_string()),
+            total_balance_usd: Some("3.25".to_string()),
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("7.5".to_string()),
+            quota_limit_usd: Some("20".to_string()),
+            quota_used_usd: Some("12.5".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            snapshot.amount_summary(),
+            "plan=rightcode total=$3.25 daily quota left=$7.5 limit=$20 used=$12.5"
         );
     }
 

@@ -608,21 +608,29 @@ pub(in crate::tui) fn balance_amount_brief_lang(
         return Some(i18n::label(lang, "unlimited").to_string());
     }
 
-    if let Some(amount) = quota_amount_brief(snapshot, lang) {
-        return Some(amount);
-    }
-
     if let Some(total) = snapshot
         .total_balance_usd
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        if let Some(quota) = quota_amount_brief(snapshot, lang) {
+            return Some(format!(
+                "{} {} | {}",
+                i18n::label(lang, "left"),
+                usd_brief(total),
+                quota
+            ));
+        }
         return Some(format!(
             "{} {}",
             i18n::label(lang, "left"),
             usd_brief(total)
         ));
+    }
+
+    if let Some(amount) = quota_amount_brief(snapshot, lang) {
+        return Some(amount);
     }
 
     let subscription = snapshot
@@ -811,10 +819,6 @@ fn balance_amount_terse_lang(snapshot: &ProviderBalanceSnapshot, lang: Language)
         return Some(i18n::label(lang, "unlimited").to_string());
     }
 
-    if let Some(amount) = quota_amount_terse(snapshot, lang) {
-        return Some(amount);
-    }
-
     let subscription = snapshot
         .subscription_balance_usd
         .as_deref()
@@ -825,6 +829,19 @@ fn balance_amount_terse_lang(snapshot: &ProviderBalanceSnapshot, lang: Language)
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+
+    let total = snapshot
+        .total_balance_usd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(total) = total {
+        return Some(usd_brief(total));
+    }
+
+    if let Some(amount) = quota_amount_terse(snapshot, lang) {
+        return Some(amount);
+    }
 
     match (subscription, paygo) {
         (Some(sub), Some(paygo)) => Some(format!(
@@ -849,10 +866,6 @@ fn balance_amount_terse_lang(snapshot: &ProviderBalanceSnapshot, lang: Language)
 }
 
 fn balance_amount_tiny(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
-    if let Some(amount) = quota_amount_tiny(snapshot) {
-        return Some(amount);
-    }
-
     let total = snapshot
         .total_balance_usd
         .as_deref()
@@ -860,6 +873,10 @@ fn balance_amount_tiny(snapshot: &ProviderBalanceSnapshot) -> Option<String> {
         .filter(|value| !value.is_empty());
     if let Some(total) = total {
         return Some(usd_brief(total));
+    }
+
+    if let Some(amount) = quota_amount_tiny(snapshot) {
+        return Some(amount);
     }
 
     let subscription = snapshot
@@ -2021,6 +2038,25 @@ mod tests {
             provider_balance_compact(&snapshot, 80),
             "CodeX Air left $165.08"
         );
+    }
+
+    #[test]
+    fn provider_balance_compact_prefers_wallet_when_quota_is_also_present() {
+        let snapshot = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Ok,
+            plan_name: Some("RightCode Daily".to_string()),
+            total_balance_usd: Some("3.25".to_string()),
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("7.5".to_string()),
+            quota_limit_usd: Some("20".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+
+        assert_eq!(
+            provider_balance_compact(&snapshot, 120),
+            "RightCode Daily left $3.25 | daily left $7.50 / $20.00"
+        );
+        assert_eq!(provider_balance_compact(&snapshot, 18), "$3.25");
     }
 
     #[test]

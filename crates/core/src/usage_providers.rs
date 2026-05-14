@@ -43,6 +43,13 @@ enum ProviderKind {
     NewApiTokenUsage,
     /// New API-style user quota endpoint, defaulting to /api/user/self.
     NewApiUserSelf,
+    /// RightCode account summary endpoint, defaulting to /account/summary.
+    #[serde(
+        rename = "rightcode_account_summary",
+        alias = "right_code_account_summary",
+        alias = "rightcode"
+    )]
+    RightCodeAccountSummary,
     /// OpenAI official organization Costs API, defaulting to a rolling 30-day cost window.
     #[serde(
         rename = "openai_organization_costs",
@@ -62,6 +69,7 @@ impl ProviderKind {
             ProviderKind::Sub2ApiAuthMe => "usage_provider:sub2api_auth_me",
             ProviderKind::NewApiTokenUsage => "usage_provider:new_api_token_usage",
             ProviderKind::NewApiUserSelf => "usage_provider:new_api_user_self",
+            ProviderKind::RightCodeAccountSummary => "usage_provider:rightcode_account_summary",
             ProviderKind::OpenAiOrganizationCosts => "usage_provider:openai_organization_costs",
         }
     }
@@ -73,6 +81,9 @@ impl ProviderKind {
             ProviderKind::Sub2ApiAuthMe => Some("{{base_url}}/api/v1/auth/me"),
             ProviderKind::NewApiTokenUsage => Some("{{base_url}}/api/usage/token/"),
             ProviderKind::NewApiUserSelf => Some("{{base_url}}/api/user/self"),
+            ProviderKind::RightCodeAccountSummary => {
+                Some("https://www.right.codes/account/summary")
+            }
             ProviderKind::OpenAiOrganizationCosts => {
                 Some("{{base_url}}/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30")
             }
@@ -227,7 +238,8 @@ const MIN_POLL_INTERVAL_SECS: u64 = 20;
 const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const BALANCE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
-const AUTO_PROBE_KINDS: [ProviderKind; 4] = [
+const AUTO_PROBE_KINDS: [ProviderKind; 5] = [
+    ProviderKind::RightCodeAccountSummary,
     ProviderKind::Sub2ApiUsage,
     ProviderKind::NewApiTokenUsage,
     ProviderKind::NewApiUserSelf,
@@ -331,6 +343,22 @@ fn default_provider_config(
     }
 }
 
+fn default_rightcode_provider_config(id: &str) -> UsageProviderConfig {
+    let mut provider = default_provider_config(
+        id,
+        ProviderKind::RightCodeAccountSummary,
+        vec!["www.right.codes", "right.codes"],
+        "https://www.right.codes/account/summary",
+        UsageProviderExtractConfig::default(),
+    );
+    // RightCode subscription windows are daily capacity signals. A zero daily
+    // remainder can coexist with account balance or be reset lazily, so the
+    // built-in adapter displays it without demoting routes by default.
+    provider.token_env = Some("RIGHTCODE_API_KEY".to_string());
+    provider.trust_exhaustion_for_routing = false;
+    provider
+}
+
 fn host_from_base_url(base_url: &str) -> Option<String> {
     reqwest::Url::parse(base_url)
         .ok()
@@ -339,6 +367,13 @@ fn host_from_base_url(base_url: &str) -> Option<String> {
 
 fn is_official_openai_base_url(base_url: &str) -> bool {
     host_from_base_url(base_url).as_deref() == Some("api.openai.com")
+}
+
+fn is_rightcode_base_url(base_url: &str) -> bool {
+    matches!(
+        host_from_base_url(base_url).as_deref(),
+        Some("www.right.codes" | "right.codes")
+    )
 }
 
 fn provider_id_component(value: &str) -> String {
@@ -379,7 +414,7 @@ fn auto_provider_id(target: &UsageProviderTarget) -> String {
 }
 
 fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> UsageProviderConfig {
-    UsageProviderConfig {
+    let mut provider = UsageProviderConfig {
         id: auto_provider_id(target),
         kind,
         domains: host_from_base_url(&target.base_url)
@@ -394,6 +429,19 @@ fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> Usag
         headers: BTreeMap::new(),
         variables: BTreeMap::new(),
         extract: UsageProviderExtractConfig::default(),
+    };
+    if matches!(kind, ProviderKind::RightCodeAccountSummary) {
+        provider.token_env = Some("RIGHTCODE_API_KEY".to_string());
+        provider.trust_exhaustion_for_routing = false;
+    }
+    provider
+}
+
+fn first_auto_probe_kind(target: &UsageProviderTarget) -> ProviderKind {
+    if is_rightcode_base_url(&target.base_url) {
+        ProviderKind::RightCodeAccountSummary
+    } else {
+        ProviderKind::Sub2ApiUsage
     }
 }
 
@@ -434,6 +482,7 @@ fn default_providers() -> UsageProvidersFile {
 
     UsageProvidersFile {
         providers: vec![
+            default_rightcode_provider_config("rightcode"),
             default_provider_config(
                 "packycode",
                 ProviderKind::BudgetHttpJson,
@@ -517,8 +566,10 @@ fn domain_matches(base_url: &str, domains: &[String]) -> bool {
         Some(h) => h,
         None => return false,
     };
+    let host = host.to_ascii_lowercase();
     for d in domains {
-        if host == d || host.ends_with(&format!(".{}", d)) {
+        let domain = d.trim().to_ascii_lowercase();
+        if host == domain || host.ends_with(&format!(".{}", domain)) {
             return true;
         }
     }
@@ -730,6 +781,45 @@ fn normalized_balance_base_url(base_url: &str) -> Option<String> {
         url.set_path(if new_path.is_empty() { "/" } else { new_path });
     }
     Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn base_path_prefixes(base_url: &str) -> Vec<String> {
+    let Some(normalized) = normalized_balance_base_url(base_url) else {
+        return Vec::new();
+    };
+    let Ok(url) = reqwest::Url::parse(&normalized) else {
+        return Vec::new();
+    };
+    let parts = url
+        .path_segments()
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut prefixes = Vec::new();
+    for len in (1..=parts.len()).rev() {
+        prefixes.push(format!("/{}", parts[..len].join("/")));
+    }
+    if prefixes.is_empty() {
+        prefixes.push("/".to_string());
+    }
+    prefixes
+}
+
+fn path_prefixes_match(provider_prefixes: &[String], available_prefixes: &[String]) -> bool {
+    if provider_prefixes.is_empty() || available_prefixes.is_empty() {
+        return false;
+    }
+    provider_prefixes.iter().any(|provider_prefix| {
+        available_prefixes.iter().any(|available_prefix| {
+            provider_prefix == available_prefix
+                || provider_prefix
+                    .strip_prefix(available_prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    })
 }
 
 fn render_provider_template(
@@ -1051,6 +1141,13 @@ fn first_u64_from_paths(value: &serde_json::Value, default_paths: &[&str]) -> Op
         .find_map(|path| json_value_at_path(value, path).and_then(u64_from_json))
 }
 
+fn array_from_json_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a Vec<serde_json::Value>> {
+    json_value_at_path(value, path).and_then(|value| value.as_array())
+}
+
 fn amount_to_string(amount: UsdAmount) -> String {
     amount.format_usd()
 }
@@ -1079,6 +1176,16 @@ fn base_snapshot(
     );
     snapshot.exhaustion_affects_routing = provider.trust_exhaustion_for_routing;
     snapshot
+}
+
+fn snapshot_error(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+    message: impl Into<String>,
+) -> ProviderBalanceSnapshot {
+    base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms).with_error(message)
 }
 
 fn budget_snapshot_from_json(
@@ -1553,6 +1660,108 @@ fn sub2api_auth_me_snapshot_from_json(
     balance_http_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
 }
 
+fn rightcode_available_prefixes(value: &serde_json::Value) -> Vec<String> {
+    array_from_json_path(value, "available_prefixes")
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn rightcode_subscription_window(value: &serde_json::Value) -> Option<QuotaWindowSnapshot> {
+    let limit = json_value_at_path(value, "total_quota").and_then(amount_from_json)?;
+    if limit < UsdAmount::from_decimal_str("10").unwrap_or(UsdAmount::ZERO) {
+        return None;
+    }
+    let raw_remaining = json_value_at_path(value, "remaining_quota").and_then(amount_from_json)?;
+    let reset_today = json_value_at_path(value, "reset_today").and_then(bool_from_json);
+    let remaining = if reset_today == Some(true) {
+        raw_remaining
+    } else {
+        raw_remaining.saturating_add(limit)
+    };
+    let used = limit.saturating_sub(remaining);
+    Some(QuotaWindowSnapshot {
+        period: "daily",
+        remaining,
+        used,
+        limit,
+    })
+}
+
+fn rightcode_account_summary_snapshot_from_json(
+    provider: &UsageProviderConfig,
+    upstream: &UpstreamRef,
+    value: &serde_json::Value,
+    upstream_base_url: &str,
+    fetched_at_ms: u64,
+    stale_after_ms: Option<u64>,
+) -> ProviderBalanceSnapshot {
+    let balance = json_value_at_path(value, "balance").and_then(amount_from_json);
+    let provider_prefixes = base_path_prefixes(upstream_base_url);
+    let mut matched_windows = Vec::new();
+    let mut matched_plan_names = Vec::new();
+
+    if let Some(subscriptions) = array_from_json_path(value, "subscriptions") {
+        for subscription in subscriptions {
+            let available_prefixes = rightcode_available_prefixes(subscription);
+            if !path_prefixes_match(&provider_prefixes, &available_prefixes) {
+                continue;
+            }
+            let Some(window) = rightcode_subscription_window(subscription) else {
+                continue;
+            };
+            matched_windows.push(window);
+            if let Some(name) = json_value_at_path(subscription, "name").and_then(string_from_json)
+            {
+                matched_plan_names.push(name);
+            }
+        }
+    }
+
+    if balance.is_none() && matched_windows.is_empty() {
+        return snapshot_error(
+            provider,
+            upstream,
+            fetched_at_ms,
+            stale_after_ms,
+            "rightcode account summary missing balance and matching subscription quota fields",
+        );
+    }
+
+    let mut snapshot = base_snapshot(provider, upstream, fetched_at_ms, stale_after_ms);
+    snapshot.total_balance_usd = balance.map(amount_to_string);
+
+    if !matched_windows.is_empty() {
+        let mut remaining = UsdAmount::ZERO;
+        let mut used = UsdAmount::ZERO;
+        let mut limit = UsdAmount::ZERO;
+        for window in matched_windows {
+            remaining = remaining.saturating_add(window.remaining);
+            used = used.saturating_add(window.used);
+            limit = limit.saturating_add(window.limit);
+        }
+        snapshot.quota_period = Some("daily".to_string());
+        snapshot.quota_remaining_usd = Some(amount_to_string(remaining));
+        snapshot.quota_used_usd = Some(amount_to_string(used));
+        snapshot.quota_limit_usd = Some(amount_to_string(limit));
+        if !matched_plan_names.is_empty() {
+            matched_plan_names.sort();
+            matched_plan_names.dedup();
+            snapshot.plan_name = Some(matched_plan_names.join(", "));
+        }
+        snapshot.exhausted = Some(remaining.is_zero() && balance.is_none_or(UsdAmount::is_zero));
+    } else {
+        snapshot.exhausted = balance.map(UsdAmount::is_zero);
+    }
+
+    snapshot.refresh_status(fetched_at_ms);
+    snapshot
+}
+
 fn new_api_token_usage_snapshot_from_json(
     provider: &UsageProviderConfig,
     upstream: &UpstreamRef,
@@ -1858,6 +2067,7 @@ fn snapshot_from_provider_json(
     provider: &UsageProviderConfig,
     upstream: &UpstreamRef,
     value: &serde_json::Value,
+    upstream_base_url: &str,
     fetched_at_ms: u64,
     stale_after_ms: Option<u64>,
 ) -> ProviderBalanceSnapshot {
@@ -1899,6 +2109,14 @@ fn snapshot_from_provider_json(
         ProviderKind::NewApiUserSelf => {
             new_api_snapshot_from_json(provider, upstream, value, fetched_at_ms, stale_after_ms)
         }
+        ProviderKind::RightCodeAccountSummary => rightcode_account_summary_snapshot_from_json(
+            provider,
+            upstream,
+            value,
+            upstream_base_url,
+            fetched_at_ms,
+            stale_after_ms,
+        ),
         ProviderKind::OpenAiOrganizationCosts => openai_organization_costs_snapshot_from_json(
             provider,
             upstream,
@@ -1959,6 +2177,7 @@ async fn refresh_provider_target(
                 provider,
                 &upstreams[0],
                 &value,
+                &target.base_url,
                 fetched_at_ms,
                 stale_after_ms,
             );
@@ -2179,6 +2398,7 @@ async fn auto_probe_provider_target(
                     &provider,
                     &upstreams[0],
                     &value,
+                    &target.base_url,
                     fetched_at_ms,
                     stale_after_ms,
                 );
@@ -2208,7 +2428,7 @@ async fn auto_probe_provider_target(
         };
     }
 
-    let first_provider = auto_usage_provider(target, AUTO_PROBE_KINDS[0]);
+    let first_provider = auto_usage_provider(target, first_auto_probe_kind(target));
 
     let Some(token) = resolve_token(&first_provider, &upstreams, cfg, service_name) else {
         state
@@ -2229,6 +2449,10 @@ async fn auto_probe_provider_target(
 
     let mut last_error: Option<String> = None;
     for kind in AUTO_PROBE_KINDS {
+        if kind == ProviderKind::RightCodeAccountSummary && !is_rightcode_base_url(&target.base_url)
+        {
+            continue;
+        }
         let provider = auto_usage_provider(target, kind);
         match poll_provider_http_json(client, &provider, &target.base_url, &token).await {
             Ok(value) => {
@@ -2236,6 +2460,7 @@ async fn auto_probe_provider_target(
                     &provider,
                     &upstreams[0],
                     &value,
+                    &target.base_url,
                     fetched_at_ms,
                     stale_after_ms,
                 );
@@ -2536,7 +2761,7 @@ async fn poll_for_codex_target(
     let auto_provider = if is_official_openai_base_url(&current_target.base_url) {
         auto_openai_official_provider(&current_target)
     } else {
-        auto_usage_provider(&current_target, AUTO_PROBE_KINDS[0])
+        auto_usage_provider(&current_target, first_auto_probe_kind(&current_target))
     };
     let Some(interval_secs) = effective_poll_interval_secs(&auto_provider) else {
         return;
@@ -2854,6 +3079,39 @@ mod tests {
         assert_eq!(
             resolve_endpoint(&newapi_token, &target.base_url, "token").unwrap(),
             "https://ai.input.im/api/usage/token/"
+        );
+    }
+
+    #[test]
+    fn auto_probe_prefers_rightcode_adapter_for_rightcode_hosts() {
+        let target = UsageProviderTarget {
+            upstream: UpstreamRef {
+                station_name: "right".to_string(),
+                index: 0,
+                provider_endpoint: None,
+            },
+            base_url: "https://www.right.codes/codex/v1".to_string(),
+            provider_id: Some("right".to_string()),
+        };
+
+        assert_eq!(
+            first_auto_probe_kind(&target),
+            ProviderKind::RightCodeAccountSummary
+        );
+        assert_eq!(
+            resolve_endpoint(
+                &auto_usage_provider(&target, ProviderKind::RightCodeAccountSummary),
+                &target.base_url,
+                "token"
+            )
+            .unwrap(),
+            "https://www.right.codes/account/summary"
+        );
+        assert_eq!(
+            auto_usage_provider(&target, ProviderKind::RightCodeAccountSummary)
+                .token_env
+                .as_deref(),
+            Some("RIGHTCODE_API_KEY")
         );
     }
 
@@ -3222,6 +3480,130 @@ mod tests {
         assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
         assert_eq!(snapshot.exhausted, Some(false));
         assert_eq!(snapshot.total_balance_usd.as_deref(), Some("12.5"));
+    }
+
+    #[test]
+    fn rightcode_endpoint_defaults_to_account_summary() {
+        let mut provider = provider("rightcode", ProviderKind::RightCodeAccountSummary);
+        provider.endpoint.clear();
+
+        let endpoint = resolve_endpoint(&provider, "https://www.right.codes/codex/v1", "token")
+            .expect("endpoint");
+
+        assert_eq!(endpoint, "https://www.right.codes/account/summary");
+    }
+
+    #[test]
+    fn rightcode_account_summary_reads_matching_subscription_and_balance() {
+        let mut provider = provider("rightcode", ProviderKind::RightCodeAccountSummary);
+        provider.trust_exhaustion_for_routing = false;
+
+        let snapshot = rightcode_account_summary_snapshot_from_json(
+            &provider,
+            &upstream(),
+            &serde_json::json!({
+                "balance": 3.25,
+                "subscriptions": [
+                    {
+                        "name": "Daily",
+                        "total_quota": 20,
+                        "remaining_quota": 7.5,
+                        "reset_today": true,
+                        "available_prefixes": ["/codex"]
+                    },
+                    {
+                        "name": "Other",
+                        "total_quota": 99,
+                        "remaining_quota": 99,
+                        "reset_today": true,
+                        "available_prefixes": ["/claude"]
+                    },
+                    {
+                        "name": "Badge",
+                        "total_quota": 5,
+                        "remaining_quota": 5,
+                        "reset_today": true,
+                        "available_prefixes": ["/codex"]
+                    }
+                ]
+            }),
+            "https://www.right.codes/codex/v1",
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert!(!snapshot.routing_exhausted());
+        assert_eq!(snapshot.plan_name.as_deref(), Some("Daily"));
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("3.25"));
+        assert_eq!(snapshot.paygo_balance_usd, None);
+        assert_eq!(snapshot.quota_period.as_deref(), Some("daily"));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("7.5"));
+        assert_eq!(snapshot.quota_limit_usd.as_deref(), Some("20"));
+        assert_eq!(snapshot.quota_used_usd.as_deref(), Some("12.5"));
+    }
+
+    #[test]
+    fn rightcode_account_summary_accounts_for_not_reset_today() {
+        let provider = provider("rightcode", ProviderKind::RightCodeAccountSummary);
+
+        let snapshot = rightcode_account_summary_snapshot_from_json(
+            &provider,
+            &upstream(),
+            &serde_json::json!({
+                "subscriptions": [
+                    {
+                        "name": "Daily",
+                        "total_quota": 20,
+                        "remaining_quota": 7.5,
+                        "reset_today": false,
+                        "available_prefixes": ["/codex"]
+                    }
+                ]
+            }),
+            "https://www.right.codes/codex/v1",
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Ok);
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("27.5"));
+        assert_eq!(snapshot.quota_limit_usd.as_deref(), Some("20"));
+        assert_eq!(snapshot.quota_used_usd.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn rightcode_zero_daily_quota_without_balance_is_display_only_exhaustion_by_default() {
+        let mut provider = provider("rightcode", ProviderKind::RightCodeAccountSummary);
+        provider.trust_exhaustion_for_routing = false;
+
+        let snapshot = rightcode_account_summary_snapshot_from_json(
+            &provider,
+            &upstream(),
+            &serde_json::json!({
+                "balance": 0,
+                "subscriptions": [
+                    {
+                        "name": "Daily",
+                        "total_quota": 20,
+                        "remaining_quota": 0,
+                        "reset_today": true,
+                        "available_prefixes": ["/codex"]
+                    }
+                ]
+            }),
+            "https://www.right.codes/codex/v1",
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(snapshot.status, BalanceSnapshotStatus::Exhausted);
+        assert_eq!(snapshot.exhausted, Some(true));
+        assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("0"));
+        assert!(!snapshot.routing_exhausted());
+        assert!(snapshot.routing_ignored_exhaustion());
     }
 
     #[test]
