@@ -1137,10 +1137,13 @@ pub(in crate::tui) fn station_balance_brief_lang(
         .count();
     let displayed_unknown = unknown + error;
 
-    let primary_amount = primary_balance_snapshot(balances)
-        .and_then(|snapshot| balance_amount_brief_lang(snapshot, lang));
+    let primary = primary_balance_snapshot(balances);
+    let primary_amount = primary.and_then(|snapshot| balance_amount_brief_lang(snapshot, lang));
+    let primary_terse_amount =
+        primary.and_then(|snapshot| balance_amount_terse_lang(snapshot, lang));
 
     let mut parts = Vec::new();
+    let mut amount_index = None;
     if primary_amount.is_none() || ok == 0 {
         if ok > 0 {
             parts.push(format!("{} {ok}/{total}", i18n::label(lang, "ok")));
@@ -1162,6 +1165,7 @@ pub(in crate::tui) fn station_balance_brief_lang(
     }
 
     if let Some(amount) = primary_amount {
+        amount_index = Some(parts.len());
         parts.push(amount);
     }
     if exhausted > 0 && ok > 0 {
@@ -1177,8 +1181,54 @@ pub(in crate::tui) fn station_balance_brief_lang(
     if parts.is_empty() {
         "-".to_string()
     } else {
-        shorten_middle(&parts.join(" "), max_width)
+        compact_balance_parts(
+            &parts,
+            amount_index,
+            primary_terse_amount.as_deref(),
+            max_width,
+        )
     }
+}
+
+fn compact_balance_parts(
+    parts: &[String],
+    amount_index: Option<usize>,
+    terse_amount: Option<&str>,
+    max_width: usize,
+) -> String {
+    let full = parts.join(" ");
+    if display_width(&full) <= max_width {
+        return full;
+    }
+
+    if let Some(amount_index) = amount_index {
+        let mut candidate = parts[amount_index].clone();
+        for part in parts.iter().skip(amount_index.saturating_add(1)) {
+            let next = format!("{candidate} {part}");
+            if display_width(&next) <= max_width {
+                candidate = next;
+            }
+        }
+
+        for part in parts[..amount_index].iter().rev() {
+            let next = format!("{part} {candidate}");
+            if display_width(&next) <= max_width {
+                candidate = next;
+            }
+        }
+
+        if display_width(&candidate) <= max_width {
+            return candidate;
+        }
+
+        if let Some(terse_amount) = terse_amount
+            && display_width(terse_amount) <= max_width
+        {
+            return terse_amount.to_string();
+        }
+    }
+
+    shorten_middle(&full, max_width)
 }
 
 #[cfg(test)]
@@ -2012,6 +2062,38 @@ mod tests {
             station_balance_brief(&balances, "input", 80),
             "lazy daily left $0 / $100.00"
         );
+    }
+
+    #[test]
+    fn station_balance_brief_keeps_quota_amount_complete_when_counts_overflow() {
+        let mut snapshots = vec![ProviderBalanceSnapshot {
+            provider_id: "routing".to_string(),
+            status: BalanceSnapshotStatus::Ok,
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("93.83".to_string()),
+            quota_limit_usd: Some("100".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        }];
+        snapshots.extend((0..4).map(|_| ProviderBalanceSnapshot {
+            provider_id: "routing".to_string(),
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            exhaustion_affects_routing: false,
+            ..ProviderBalanceSnapshot::default()
+        }));
+        snapshots.push(ProviderBalanceSnapshot {
+            provider_id: "routing".to_string(),
+            status: BalanceSnapshotStatus::Error,
+            ..ProviderBalanceSnapshot::default()
+        });
+        let balances = HashMap::from([("routing".to_string(), snapshots)]);
+
+        let brief = station_balance_brief_lang(&balances, "routing", 42, Language::Zh);
+
+        assert_eq!(brief, "daily 剩余 $93.83 / $100.00 不降级 4");
+        assert!(!brief.contains('…'), "{brief}");
+        assert!(brief.contains("$100.00"), "{brief}");
+        assert!(UnicodeWidthStr::width(brief.as_str()) <= 42, "{brief}");
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use ratatui::Frame;
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::dashboard_core::ControlProfileOption;
 use crate::tui::Language;
@@ -1541,6 +1542,11 @@ pub(super) fn render_provider_modal(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.focus))
         .style(Style::default().bg(p.panel));
+    let inner_width = usize::from(block.inner(area).width);
+    let balance_prefix = format!("{}: ", l("balance/quota"));
+    let tags_prefix = format!("{}: ", l("tags"));
+    let balance_width = modal_value_width(inner_width, &balance_prefix);
+    let tags_width = modal_value_width(inner_width, &tags_prefix);
 
     let mut items = Vec::with_capacity(providers.len() + 1);
     items.push(ListItem::new(Line::from(format!(
@@ -1561,8 +1567,12 @@ pub(super) fn render_provider_modal(
         {
             label.push_str(&format!(" ({alias})"));
         }
-        let balance =
-            station_balance_brief_lang(&snapshot.provider_balances, pvd.name.as_str(), 42, lang);
+        let balance = station_balance_brief_lang(
+            &snapshot.provider_balances,
+            pvd.name.as_str(),
+            balance_width,
+            lang,
+        );
         let balance_style = if pvd.enabled {
             station_primary_balance_snapshot(&snapshot.provider_balances, pvd.name.as_str())
                 .map(|snapshot| balance_snapshot_status_style(p, snapshot))
@@ -1570,20 +1580,17 @@ pub(super) fn render_provider_modal(
         } else {
             Style::default().fg(p.muted)
         };
-        let tags = provider_tags_brief(pvd, 46).unwrap_or_else(|| "-".to_string());
+        let tags = provider_tags_brief(pvd, tags_width).unwrap_or_else(|| "-".to_string());
         let style = Style::default().fg(if pvd.enabled { p.text } else { p.muted });
         items.push(
             ListItem::new(Text::from(vec![
                 Line::from(Span::styled(label, style)),
                 Line::from(vec![
-                    Span::styled(
-                        format!("{}: ", l("balance/quota")),
-                        Style::default().fg(p.muted),
-                    ),
+                    Span::styled(balance_prefix.clone(), Style::default().fg(p.muted)),
                     Span::styled(balance, balance_style),
                 ]),
                 Line::from(vec![
-                    Span::styled(format!("{}: ", l("tags")), Style::default().fg(p.muted)),
+                    Span::styled(tags_prefix.clone(), Style::default().fg(p.muted)),
                     Span::styled(tags, Style::default().fg(p.muted)),
                 ]),
                 Line::from(vec![Span::styled(
@@ -1640,6 +1647,13 @@ fn routing_prefer_tags_label(filters: &[BTreeMap<String, String>], max_width: us
         .map(|tags| routing_tags_label(tags, max_width))
         .collect::<Vec<_>>();
     shorten_middle(&parts.join(" OR "), max_width)
+}
+
+fn modal_value_width(inner_width: usize, prefix: &str) -> usize {
+    inner_width
+        .saturating_sub(UnicodeWidthStr::width(prefix))
+        .saturating_sub(2)
+        .clamp(24, 72)
 }
 
 fn routing_provider_balance_line<'a>(
