@@ -17,7 +17,7 @@ All notable changes to this project will be documented in this file.
 - 配置格式升级到 `version = 5`。旧的 v2/v3/v4 和 legacy JSON 配置会自动迁移；迁移前仍会保留 `.bak` 备份。
 - Route graph 现在是真正的运行时路由模型。月包优先、月包池、付费兜底和多 endpoint provider 都按 provider endpoint 选择，不再依赖 legacy station 状态。
 - 默认会话粘性改为 `preferred-group`：临时 fallback 后，只要高优先级月包 provider 恢复可用，后续请求会回到月包组。旧的 fallback 粘性需要显式设置 `affinity_policy = "fallback-sticky"`。
-- 新路由模型支持 `ordered-failover`、`tag-preferred`、`manual-sticky` 和多 endpoint provider。常见可复制模板见中文配置指南 `docs/CONFIGURATION.zh.md` 和英文参考 `docs/CONFIGURATION.md`。
+- 新路由模型支持 `ordered-failover`、`tag-preferred`、`manual-sticky` 和多 endpoint provider。常见可复制模板见中文配置参考 `docs/CONFIGURATION.zh.md` 和英文参考 `docs/CONFIGURATION.md`。
 
 #### 用户可见改进
 
@@ -47,7 +47,7 @@ All notable changes to this project will be documented in this file.
 - TUI, GUI, `routing explain`, request details, and logs now show provider endpoint, preference group, skip reasons, and compatibility station context, making fallback decisions easier to diagnose.
 - Balance refresh failures are not treated as exhaustion and do not stop other provider refreshes. Refresh calls now have a timeout, reuse the proxy runtime HTTP client, and log the probed origin plus adapter kind.
 - Pressing `q` in the TUI still gracefully shuts down the proxy/admin server, but now has a short timeout guard to avoid long waits behind background requests or long-lived connections.
-- Copyable v5 routing recipes for single-provider, ordered fallback, monthly-first, monthly-only, manual pin, and multi-endpoint setups are documented in `docs/CONFIGURATION.md`; the Chinese user guide is `docs/CONFIGURATION.zh.md`.
+- Copyable v5 routing recipes for single-provider, ordered fallback, monthly-first, monthly-only, manual pin, and multi-endpoint setups are documented in `docs/CONFIGURATION.md`; the equivalent Chinese reference is `docs/CONFIGURATION.zh.md`.
 
 ## [0.13.0] - 2026-05-09
 

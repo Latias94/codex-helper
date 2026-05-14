@@ -1,6 +1,6 @@
 # Configuration Guide
 
-中文指南: [CONFIGURATION.zh.md](CONFIGURATION.zh.md)
+中文参考: [CONFIGURATION.zh.md](CONFIGURATION.zh.md)
 
 This guide documents the public `version = 5` route graph config format.
 
@@ -679,7 +679,9 @@ Use pricing overrides for local corrections or relay-specific multipliers. Do no
 
 ## CLI Editing
 
-Initialize or migrate:
+Initialize or inspect migration:
+
+Normal startup, including the default TUI path, performs config migration automatically. Use the migration commands only when you want to preview or diagnose the migration explicitly.
 
 ```bash
 codex-helper config init
@@ -806,11 +808,11 @@ Advanced multi-endpoint providers, model mappings, custom balance extraction rul
 
 The current route graph schema writes `version = 5`. Existing `version = 4` route graph configs still load as migration input.
 
-On load, legacy `version = 4`, `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json` are migrated to `config.toml` with `version = 5`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
+Normal users usually do not need to run migration commands by hand. Starting codex-helper, including the default TUI startup path, loads legacy `version = 4`, `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json`, then migrates them to `config.toml` with `version = 5`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
 
 During migration, codex-helper warns when the resulting route graph would use the new `preferred-group` default instead of old fallback stickiness. If you want the old behavior back, set `affinity_policy = "fallback-sticky"` explicitly before or after migration.
 
-Preview migration before starting the proxy:
+Manual migration commands are mainly for previewing or diagnosing a migration without going through the normal TUI/proxy startup path:
 
 ```bash
 codex-helper config migrate --dry-run

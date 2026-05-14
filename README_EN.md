@@ -137,7 +137,7 @@ Common routing policies:
 | Monthly stop-loss | Same command with `--on-exhausted stop` | Avoids silent pay-as-you-go spillover |
 | Monthly pool + paygo fallback | Use nested route nodes in TOML | Keeps `monthly_pool -> paygo` explicit |
 
-For complete config, migration, balance adapters, pricing, and GUI/TUI editing notes, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). Chinese readers can start with the user-oriented guide at [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md).
+For complete config, migration, balance adapters, pricing, and GUI/TUI editing notes, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The equivalent Chinese reference is [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md).
 
 ## Proxy Notes
 
@@ -236,7 +236,7 @@ codex-helper intentionally avoids:
 ## More Docs
 
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md): English configuration reference, routing, balance adapters, pricing, migration.
-- [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md): Chinese configuration guide with copyable routing recipes and proxy notes.
+- [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md): Chinese configuration reference with routing recipes, balance adapters, proxy notes, and migration.
 - [CHANGELOG.md](CHANGELOG.md): release notes and upgrade notes.
 - [docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md](docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md): comparison against cc-switch, aio-coding-hub, and all-api-hub.
 - [docs/workstreams/codex-control-plane-refactor/README.md](docs/workstreams/codex-control-plane-refactor/README.md): control-plane design notes.

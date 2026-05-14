@@ -148,7 +148,7 @@ profile = "balanced"
 | 包月止损 | 同上但 `--on-exhausted stop` | 不自动切到按量 provider |
 | 月包池 + paygo 兜底 | 在 TOML 中用嵌套 route nodes | `monthly_pool -> paygo` 保留清晰分组 |
 
-新用户建议先看 [中文配置指南](docs/CONFIGURATION.zh.md)，里面按使用场景给了可复制模板。需要完整字段、迁移细节和高级说明时，再查 [English configuration reference](docs/CONFIGURATION.md)。
+[中文配置参考](docs/CONFIGURATION.zh.md) 和 [English configuration reference](docs/CONFIGURATION.md) 内容对齐，任选一种语言阅读即可；常用 route graph 模板在配置文档的“配置模板 / Recipes”章节。
 
 ## 代理说明
 
@@ -157,7 +157,7 @@ codex-helper 有两层“代理”：
 - **本地代理**：Codex 连接 `127.0.0.1:3211`，请求先进入 codex-helper，再由 routing 选择 provider。只要启用了 codex-helper 的 Codex patch，即使没有配置外部网络代理，请求也会经过这个本地 proxy server。
 - **出站网络代理**：codex-helper 访问 provider、relay 或 balance API 时是否经过网络代理。当前版本还没有 `config.toml` 专用配置段，但底层 HTTP client 会受 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 等系统/环境变量影响。
 
-更详细的边界和未来配置方向见 [配置指南的代理支持章节](docs/CONFIGURATION.zh.md#代理支持)。
+更详细的边界和未来配置方向见 [配置参考的本地代理和出站代理章节](docs/CONFIGURATION.zh.md#本地代理和出站代理)。
 
 ## 常用命令
 
@@ -247,7 +247,7 @@ codex-helper 刻意避免这些做法：
 
 ## 更多文档
 
-- [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md)：中文配置指南，包含常用 routing 模板和代理说明。
+- [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md)：中文完整配置参考，包含 routing 模板、余额适配、代理说明和迁移。
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：English configuration reference, routing, balance adapters, pricing, migration.
 - [CHANGELOG.md](CHANGELOG.md)：版本变更和升级注意事项。
 - [docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md](docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md)：与 cc-switch、aio-coding-hub、all-api-hub 的差距分析。
