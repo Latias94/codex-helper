@@ -137,9 +137,10 @@
 - [ ] TUI-504 Manually smoke test normal-width and narrow terminal operation.
   - Not completed in the agent shell because the built-in dashboard only starts
     when stdin/stdout are interactive TTYs. Automated coverage currently covers
-    normal and narrow render paths via `TestBackend`, including route graph
-    routing and Usage balance layouts. A real terminal smoke test is still
-    needed before treating the workstream as fully closed.
+    normal and narrow render paths via `TestBackend`, including full-app
+    header/body/footer composition, route graph routing, and Usage balance
+    layouts. Run `SMOKE.md` in a real terminal before treating the workstream as
+    fully closed.
 
 ## Candidate First Slice
 
