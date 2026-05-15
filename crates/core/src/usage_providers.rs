@@ -259,6 +259,20 @@ enum RequestBalanceQueueKey {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestBalanceQueueDue {
+    Due,
+    NotDue(Duration),
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestBalancePollOutcome {
+    Attempted,
+    Deferred(Duration),
+    Skipped,
+}
+
 fn bool_is_false(value: &bool) -> bool {
     !*value
 }
@@ -320,6 +334,12 @@ fn effective_poll_interval_secs(provider: &UsageProviderConfig) -> Option<u64> {
         return None;
     }
     Some(interval_secs.max(MIN_POLL_INTERVAL_SECS))
+}
+
+fn remaining_poll_cooldown(last: Instant, interval_secs: u64, now: Instant) -> Option<Duration> {
+    let interval = Duration::from_secs(interval_secs);
+    let elapsed = now.saturating_duration_since(last);
+    (elapsed < interval).then_some(interval - elapsed)
 }
 
 fn usage_providers_path() -> std::path::PathBuf {
@@ -679,20 +699,28 @@ fn enqueue_request_balance_refresh(key: RequestBalanceQueueKey) -> bool {
     true
 }
 
-fn take_request_balance_refresh_if_due(key: &RequestBalanceQueueKey) -> bool {
+fn schedule_request_balance_refresh_at(key: RequestBalanceQueueKey, due_at: Instant) {
+    let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut queue) = queue.lock() {
+        queue.insert(key, due_at);
+    }
+}
+
+fn take_request_balance_refresh_if_due(key: &RequestBalanceQueueKey) -> RequestBalanceQueueDue {
     let now = Instant::now();
     let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut queue = match queue.lock() {
         Ok(queue) => queue,
-        Err(_) => return false,
+        Err(_) => return RequestBalanceQueueDue::Missing,
     };
 
     match queue.get(key).copied() {
         Some(due_at) if due_at <= now => {
             queue.remove(key);
-            true
+            RequestBalanceQueueDue::Due
         }
-        _ => false,
+        Some(due_at) => RequestBalanceQueueDue::NotDue(due_at.saturating_duration_since(now)),
+        None => RequestBalanceQueueDue::Missing,
     }
 }
 
@@ -2724,26 +2752,43 @@ pub fn enqueue_poll_for_codex_upstream(
     let service_name = service_name.to_string();
     let station_name = station_name.to_string();
     tokio::spawn(async move {
-        tokio::time::sleep(REQUEST_BALANCE_REFRESH_DELAY).await;
-        if !take_request_balance_refresh_if_due(&key) {
-            return;
-        }
+        let mut sleep_for = REQUEST_BALANCE_REFRESH_DELAY;
+        loop {
+            tokio::time::sleep(sleep_for).await;
+            match take_request_balance_refresh_if_due(&key) {
+                RequestBalanceQueueDue::Due => {}
+                RequestBalanceQueueDue::NotDue(delay) => {
+                    sleep_for = delay;
+                    continue;
+                }
+                RequestBalanceQueueDue::Missing => return,
+            }
 
-        let current_target = usage_provider_target_for_legacy_upstream(
-            &cfg,
-            service_name.as_str(),
-            &station_name,
-            upstream_index,
-        );
-        poll_for_codex_target(
-            client,
-            cfg,
-            lb_states,
-            state,
-            service_name.as_str(),
-            current_target,
-        )
-        .await;
+            let current_target = usage_provider_target_for_legacy_upstream(
+                &cfg,
+                service_name.as_str(),
+                &station_name,
+                upstream_index,
+            );
+            match poll_for_codex_target(
+                client.clone(),
+                cfg.clone(),
+                lb_states.clone(),
+                state.clone(),
+                service_name.as_str(),
+                current_target,
+            )
+            .await
+            {
+                RequestBalancePollOutcome::Attempted | RequestBalancePollOutcome::Skipped => {
+                    return;
+                }
+                RequestBalancePollOutcome::Deferred(delay) => {
+                    schedule_request_balance_refresh_at(key.clone(), Instant::now() + delay);
+                    sleep_for = delay;
+                }
+            }
+        }
     });
 }
 
@@ -2765,25 +2810,42 @@ pub fn enqueue_poll_for_codex_provider_endpoint(
 
     let service_name = service_name.to_string();
     tokio::spawn(async move {
-        tokio::time::sleep(REQUEST_BALANCE_REFRESH_DELAY).await;
-        if !take_request_balance_refresh_if_due(&key) {
-            return;
-        }
+        let mut sleep_for = REQUEST_BALANCE_REFRESH_DELAY;
+        loop {
+            tokio::time::sleep(sleep_for).await;
+            match take_request_balance_refresh_if_due(&key) {
+                RequestBalanceQueueDue::Due => {}
+                RequestBalanceQueueDue::NotDue(delay) => {
+                    sleep_for = delay;
+                    continue;
+                }
+                RequestBalanceQueueDue::Missing => return,
+            }
 
-        let current_target = usage_provider_target_for_provider_endpoint(
-            &cfg,
-            service_name.as_str(),
-            &provider_endpoint,
-        );
-        poll_for_codex_target(
-            client,
-            cfg,
-            lb_states,
-            state,
-            service_name.as_str(),
-            current_target,
-        )
-        .await;
+            let current_target = usage_provider_target_for_provider_endpoint(
+                &cfg,
+                service_name.as_str(),
+                &provider_endpoint,
+            );
+            match poll_for_codex_target(
+                client.clone(),
+                cfg.clone(),
+                lb_states.clone(),
+                state.clone(),
+                service_name.as_str(),
+                current_target,
+            )
+            .await
+            {
+                RequestBalancePollOutcome::Attempted | RequestBalancePollOutcome::Skipped => {
+                    return;
+                }
+                RequestBalancePollOutcome::Deferred(delay) => {
+                    schedule_request_balance_refresh_at(key.clone(), Instant::now() + delay);
+                    sleep_for = delay;
+                }
+            }
+        }
     });
 }
 
@@ -2794,22 +2856,23 @@ async fn poll_for_codex_target(
     state: Arc<ProxyState>,
     service_name: &str,
     current_target: Option<UsageProviderTarget>,
-) {
+) -> RequestBalancePollOutcome {
     // Tests should be hermetic and should not depend on any real user `usage_providers.json` on
     // the machine running the suite. Disable provider polling during tests to avoid flakiness.
     if cfg!(test) {
-        return;
+        return RequestBalancePollOutcome::Skipped;
     }
 
     let providers_file = load_providers();
     let Some(current_target) = current_target else {
-        return;
+        return RequestBalancePollOutcome::Skipped;
     };
 
     let now = Instant::now();
     let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
     let mut matched_configured_provider = false;
     let mut configured_jobs = Vec::new();
+    let mut next_cooldown = None::<Duration>;
 
     for provider in &providers_file.providers {
         if !domain_matches(&current_target.base_url, &provider.domains) {
@@ -2827,8 +2890,10 @@ async fn poll_for_codex_target(
                 Err(_) => continue,
             };
             if let Some(last) = map.get(&provider.id)
-                && now.duration_since(*last) < Duration::from_secs(interval_secs)
+                && let Some(cooldown) = remaining_poll_cooldown(*last, interval_secs, now)
             {
+                next_cooldown =
+                    Some(next_cooldown.map_or(cooldown, |existing| existing.min(cooldown)));
                 continue;
             }
             map.insert(provider.id.clone(), now);
@@ -2852,10 +2917,13 @@ async fn poll_for_codex_target(
             service_name,
         )
         .await;
+        return RequestBalancePollOutcome::Attempted;
     }
 
     if matched_configured_provider {
-        return;
+        return next_cooldown
+            .map(RequestBalancePollOutcome::Deferred)
+            .unwrap_or(RequestBalancePollOutcome::Skipped);
     }
 
     let auto_provider = if is_official_openai_base_url(&current_target.base_url) {
@@ -2864,18 +2932,18 @@ async fn poll_for_codex_target(
         auto_usage_provider(&current_target, first_auto_probe_kind(&current_target))
     };
     let Some(interval_secs) = effective_poll_interval_secs(&auto_provider) else {
-        return;
+        return RequestBalancePollOutcome::Skipped;
     };
 
     {
         let mut map = match poll_map.lock() {
             Ok(m) => m,
-            Err(_) => return,
+            Err(_) => return RequestBalancePollOutcome::Skipped,
         };
         if let Some(last) = map.get(&auto_provider.id)
-            && now.duration_since(*last) < Duration::from_secs(interval_secs)
+            && let Some(cooldown) = remaining_poll_cooldown(*last, interval_secs, now)
         {
-            return;
+            return RequestBalancePollOutcome::Deferred(cooldown);
         }
         map.insert(auto_provider.id.clone(), now);
     }
@@ -2889,6 +2957,7 @@ async fn poll_for_codex_target(
         service_name,
     )
     .await;
+    RequestBalancePollOutcome::Attempted
 }
 
 #[cfg(test)]
@@ -3277,18 +3346,40 @@ mod tests {
 
         assert!(enqueue_request_balance_refresh(key.clone()));
         assert!(!enqueue_request_balance_refresh(key.clone()));
-        assert!(!take_request_balance_refresh_if_due(&key));
+        assert!(matches!(
+            take_request_balance_refresh_if_due(&key),
+            RequestBalanceQueueDue::NotDue(_)
+        ));
 
         {
             let mut queue = queue.lock().expect("queue");
             queue.insert(key.clone(), Instant::now() - Duration::from_secs(1));
         }
 
-        assert!(take_request_balance_refresh_if_due(&key));
-        assert!(!take_request_balance_refresh_if_due(&key));
+        assert_eq!(
+            take_request_balance_refresh_if_due(&key),
+            RequestBalanceQueueDue::Due
+        );
+        assert_eq!(
+            take_request_balance_refresh_if_due(&key),
+            RequestBalanceQueueDue::Missing
+        );
         assert!(enqueue_request_balance_refresh(key.clone()));
 
         queue.lock().expect("queue").remove(&key);
+    }
+
+    #[test]
+    fn remaining_poll_cooldown_returns_only_unexpired_window() {
+        let now = Instant::now();
+        assert_eq!(
+            remaining_poll_cooldown(now - Duration::from_secs(30), 60, now),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            remaining_poll_cooldown(now - Duration::from_secs(60), 60, now),
+            None
+        );
     }
 
     #[test]

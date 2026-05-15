@@ -251,6 +251,15 @@ pub async fn run_dashboard(
                 request_full_clear(&mut render_invalidation);
                 ui.reset_table_viewports();
                 last_drawn_page = ui.page;
+                if ui.uses_route_graph_routing() && ui.page == types::Page::Stations {
+                    let _ = input::request_provider_balance_refresh(
+                        &mut ui,
+                        &snapshot,
+                        &proxy,
+                        input::BalanceRefreshMode::Auto,
+                        &balance_refresh_tx,
+                    );
+                }
             }
             if matches!(render_invalidation, RenderInvalidation::FullClear) {
                 terminal.clear()?;

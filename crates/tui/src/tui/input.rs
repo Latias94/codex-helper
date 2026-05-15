@@ -818,7 +818,7 @@ fn invalidate_route_target_preview(ui: &mut UiState) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BalanceRefreshMode {
+pub(in crate::tui) enum BalanceRefreshMode {
     Auto,
     Force,
     ControlChanged,
@@ -917,7 +917,7 @@ async fn open_routing_editor(
     }
 }
 
-fn request_provider_balance_refresh(
+pub(in crate::tui) fn request_provider_balance_refresh(
     ui: &mut UiState,
     snapshot: &Snapshot,
     proxy: &ProxyService,
