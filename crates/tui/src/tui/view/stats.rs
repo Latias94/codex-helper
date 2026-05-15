@@ -4,6 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::dashboard_core::WindowStats;
 use crate::pricing::CostConfidence;
@@ -24,6 +25,7 @@ use crate::usage_balance::{
 };
 
 const STATS_BALANCE_COLUMN_WIDTH: u16 = 14;
+const STATS_ENDPOINT_BALANCE_COLUMN_WIDTH: u16 = 28;
 
 fn build_usage_balance_view(ui: &UiState, snapshot: &Snapshot) -> UsageBalanceView {
     UsageBalanceView::build(UsageBalanceBuildInput {
@@ -329,6 +331,40 @@ fn provider_balance_brief(
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn filtered_provider_rows(
+    rows: &[UsageBalanceProviderRow],
+    attention_only: bool,
+) -> Vec<&UsageBalanceProviderRow> {
+    rows.iter()
+        .filter(|row| !attention_only || row.needs_attention())
+        .collect()
+}
+
+fn filter_suffix(attention_only: bool, lang: Language) -> String {
+    if attention_only {
+        format!(" · {}", i18n::label(lang, "attention only"))
+    } else {
+        String::new()
+    }
+}
+
+fn atomic_summary_or_status(
+    summary: &str,
+    status: UsageBalanceStatus,
+    max_width: usize,
+    lang: Language,
+) -> String {
+    let summary = summary.trim();
+    if !summary.is_empty() && UnicodeWidthStr::width(summary) <= max_width {
+        return summary.to_string();
+    }
+    let status = usage_balance_status_label(status, lang);
+    if UnicodeWidthStr::width(status) <= max_width {
+        return status.to_string();
+    }
+    shorten_middle(status, max_width)
+}
+
 fn table_balance_brief(
     snapshot: &Snapshot,
     focus: StatsFocus,
@@ -576,6 +612,8 @@ fn render_tables(
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(cols[0]);
+    let provider_rows =
+        filtered_provider_rows(&usage_balance.provider_rows, ui.stats_attention_only);
 
     render_bucket_table_stateful(
         f,
@@ -597,11 +635,12 @@ fn render_tables(
         p,
         ui.stats_focus == StatsFocus::Providers,
         &format!(
-            "{} / {} ({window_label})",
+            "{} / {} ({window_label}){}",
             i18n::label(lang, "Provider"),
-            i18n::label(lang, "Balance")
+            i18n::label(lang, "Balance"),
+            filter_suffix(ui.stats_attention_only, lang)
         ),
-        &usage_balance.provider_rows,
+        &provider_rows,
         snapshot,
         left[1],
         &mut ui.stats_providers_table,
@@ -614,6 +653,7 @@ fn render_tables(
         ui,
         snapshot,
         usage_balance,
+        &provider_rows,
         window_label,
         cols[1],
         lang,
@@ -703,52 +743,85 @@ fn render_provider_usage_balance_table_stateful(
     p: Palette,
     focused: bool,
     title: &str,
-    rows: &[UsageBalanceProviderRow],
+    rows: &[&UsageBalanceProviderRow],
     snapshot: &Snapshot,
     area: Rect,
     state: &mut ratatui::widgets::TableState,
     lang: Language,
 ) {
     let l = |text| i18n::label(lang, text);
-    let header = Row::new(vec![
-        Cell::from(Span::styled(l("provider"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("status"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(
-            l("balance/quota"),
-            Style::default().fg(p.muted),
-        )),
-        Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled("ok%", Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("tok"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("usd"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("route"), Style::default().fg(p.muted))),
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    let compact = area.width < 72;
+    let header_cells = if compact {
+        vec![
+            Cell::from(Span::styled(l("provider"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("status"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(
+                l("balance/quota"),
+                Style::default().fg(p.muted),
+            )),
+            Cell::from(Span::styled(l("route"), Style::default().fg(p.muted))),
+        ]
+    } else {
+        vec![
+            Cell::from(Span::styled(l("provider"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("status"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(
+                l("balance/quota"),
+                Style::default().fg(p.muted),
+            )),
+            Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled("ok%", Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("tok"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("usd"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("route"), Style::default().fg(p.muted))),
+        ]
+    };
+    let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
 
     let table_rows = rows
         .iter()
         .map(|row| {
-            Row::new(vec![
-                Cell::from(shorten_middle(&row.provider_id, 22)),
-                Cell::from(usage_balance_status_label(row.balance_status, lang)),
-                Cell::from(provider_balance_brief(
-                    snapshot,
-                    &row.provider_id,
-                    usize::from(STATS_BALANCE_COLUMN_WIDTH),
-                    lang,
-                )),
-                Cell::from(row.usage.requests_total.to_string()),
-                Cell::from(fmt_per_mille(row.success_per_mille)),
-                Cell::from(tokens_short(row.usage.usage.total_tokens)),
-                Cell::from(row.cost_display.clone()),
-                Cell::from(shorten(&provider_route_brief(row, lang), 18)),
-            ])
+            let balance = provider_balance_brief(
+                snapshot,
+                &row.provider_id,
+                usize::from(STATS_BALANCE_COLUMN_WIDTH),
+                lang,
+            );
+            let route = shorten(
+                &provider_route_brief(row, lang),
+                if compact { 10 } else { 18 },
+            );
+            let cells = if compact {
+                vec![
+                    Cell::from(shorten_middle(&row.provider_id, 18)),
+                    Cell::from(usage_balance_status_label(row.balance_status, lang)),
+                    Cell::from(balance),
+                    Cell::from(route),
+                ]
+            } else {
+                vec![
+                    Cell::from(shorten_middle(&row.provider_id, 22)),
+                    Cell::from(usage_balance_status_label(row.balance_status, lang)),
+                    Cell::from(balance),
+                    Cell::from(row.usage.requests_total.to_string()),
+                    Cell::from(fmt_per_mille(row.success_per_mille)),
+                    Cell::from(tokens_short(row.usage.usage.total_tokens)),
+                    Cell::from(row.cost_display.clone()),
+                    Cell::from(route),
+                ]
+            };
+            Row::new(cells)
         })
         .collect::<Vec<_>>();
-
-    let table = Table::new(
-        table_rows,
-        [
+    let widths = if compact {
+        vec![
+            Constraint::Min(10),
+            Constraint::Length(8),
+            Constraint::Length(STATS_BALANCE_COLUMN_WIDTH),
+            Constraint::Length(8),
+        ]
+    } else {
+        vec![
             Constraint::Min(12),
             Constraint::Length(10),
             Constraint::Length(STATS_BALANCE_COLUMN_WIDTH),
@@ -757,17 +830,19 @@ fn render_provider_usage_balance_table_stateful(
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(10),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if focused { p.focus } else { p.border })),
-    )
-    .row_highlight_style(Style::default().bg(p.panel).fg(p.text))
-    .highlight_symbol("  ");
+        ]
+    };
+
+    let table = Table::new(table_rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if focused { p.focus } else { p.border })),
+        )
+        .row_highlight_style(Style::default().bg(p.panel).fg(p.text))
+        .highlight_symbol("  ");
 
     f.render_stateful_widget(table, area, state);
 }
@@ -794,7 +869,7 @@ fn provider_route_brief(row: &UsageBalanceProviderRow, lang: Language) -> String
 fn render_provider_usage_detail(
     f: &mut Frame<'_>,
     p: Palette,
-    _ui: &UiState,
+    ui: &mut UiState,
     usage_balance: &UsageBalanceView,
     row: Option<&UsageBalanceProviderRow>,
     window_label: &str,
@@ -891,7 +966,7 @@ fn render_provider_usage_detail(
                 }),
             ),
             Span::raw("  "),
-            Span::styled(shorten(balance_summary, 72), Style::default().fg(p.text)),
+            Span::styled(balance_summary.to_string(), Style::default().fg(p.text)),
         ]),
         Line::from(vec![
             Span::styled(format!("{} ", l("counts")), Style::default().fg(p.muted)),
@@ -909,7 +984,7 @@ fn render_provider_usage_detail(
                 format!("{} ", l("latest error")),
                 Style::default().fg(p.muted),
             ),
-            Span::styled(shorten(latest_error, 72), Style::default().fg(p.warn)),
+            Span::styled(latest_error.to_string(), Style::default().fg(p.warn)),
         ]),
     ];
 
@@ -920,14 +995,20 @@ fn render_provider_usage_detail(
         inner[0],
     );
 
+    let endpoints = usage_balance
+        .endpoint_rows
+        .iter()
+        .filter(|endpoint| endpoint.provider_id == row.provider_id)
+        .collect::<Vec<_>>();
+    let visible_rows = endpoint_visible_rows(inner[1]);
+    let max_scroll = endpoints.len().saturating_sub(visible_rows) as u16;
+    ui.stats_provider_detail_scroll = ui.stats_provider_detail_scroll.min(max_scroll);
     render_endpoint_rows(
         f,
         p,
-        usage_balance
-            .endpoint_rows
-            .iter()
-            .filter(|endpoint| endpoint.provider_id == row.provider_id)
-            .collect::<Vec<_>>(),
+        &endpoints,
+        ui.stats_provider_detail_scroll,
+        visible_rows,
         inner[1],
         lang,
     );
@@ -936,24 +1017,44 @@ fn render_provider_usage_detail(
 fn render_endpoint_rows(
     f: &mut Frame<'_>,
     p: Palette,
-    endpoints: Vec<&UsageBalanceEndpointRow>,
+    endpoints: &[&UsageBalanceEndpointRow],
+    scroll: u16,
+    visible_rows: usize,
     area: Rect,
     lang: Language,
 ) {
     let l = |text| i18n::label(lang, text);
-    let header = Row::new(vec![
-        Cell::from(Span::styled(l("endpoint"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("balance"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("err"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("tok"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("route"), Style::default().fg(p.muted))),
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    let compact = area.width < 70;
+    let header_cells = if compact {
+        vec![
+            Cell::from(Span::styled(l("endpoint"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("balance"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
+        ]
+    } else {
+        vec![
+            Cell::from(Span::styled(l("endpoint"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("balance"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("req"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("err"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("tok"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("route"), Style::default().fg(p.muted))),
+        ]
+    };
+    let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
 
+    let scroll = usize::from(scroll).min(endpoints.len().saturating_sub(visible_rows));
+    let balance_width = if compact {
+        STATS_BALANCE_COLUMN_WIDTH
+    } else {
+        STATS_ENDPOINT_BALANCE_COLUMN_WIDTH
+    };
     let rows = endpoints
-        .into_iter()
+        .iter()
+        .skip(scroll)
+        .take(visible_rows)
         .map(|endpoint| {
+            let endpoint = *endpoint;
             let endpoint_label = endpoint
                 .base_url
                 .as_deref()
@@ -961,7 +1062,14 @@ fn render_endpoint_rows(
             let balance = endpoint
                 .balance
                 .as_ref()
-                .map(|balance| shorten(&balance.amount_summary, 28))
+                .map(|balance| {
+                    atomic_summary_or_status(
+                        &balance.amount_summary,
+                        endpoint.balance_status,
+                        usize::from(balance_width),
+                        lang,
+                    )
+                })
                 .unwrap_or_else(|| {
                     usage_balance_status_label(endpoint.balance_status, lang).to_string()
                 });
@@ -972,45 +1080,86 @@ fn render_endpoint_rows(
             } else {
                 endpoint.route_skip_reasons.join(",")
             };
-            Row::new(vec![
-                Cell::from(shorten_middle(endpoint_label, 30)),
-                Cell::from(balance),
-                Cell::from(endpoint.usage.requests_total.to_string()),
-                Cell::from(endpoint.usage.requests_error.to_string()),
-                Cell::from(tokens_short(endpoint.usage.usage.total_tokens)),
-                Cell::from(shorten(&route, 24)),
-            ])
+            let cells = if compact {
+                vec![
+                    Cell::from(shorten_middle(endpoint_label, 14)),
+                    Cell::from(balance),
+                    Cell::from(endpoint.usage.requests_total.to_string()),
+                ]
+            } else {
+                vec![
+                    Cell::from(shorten_middle(endpoint_label, 30)),
+                    Cell::from(balance),
+                    Cell::from(endpoint.usage.requests_total.to_string()),
+                    Cell::from(endpoint.usage.requests_error.to_string()),
+                    Cell::from(tokens_short(endpoint.usage.usage.total_tokens)),
+                    Cell::from(shorten(&route, 24)),
+                ]
+            };
+            Row::new(cells)
         })
         .collect::<Vec<_>>();
-
-    let table = Table::new(
-        rows,
-        [
+    let widths = if compact {
+        vec![
+            Constraint::Min(10),
+            Constraint::Length(STATS_BALANCE_COLUMN_WIDTH),
+            Constraint::Length(4),
+        ]
+    } else {
+        vec![
             Constraint::Min(16),
-            Constraint::Length(28),
+            Constraint::Length(STATS_ENDPOINT_BALANCE_COLUMN_WIDTH),
             Constraint::Length(6),
             Constraint::Length(5),
             Constraint::Length(7),
             Constraint::Length(12),
-        ],
-    )
-    .header(header)
-    .block(
+        ]
+    };
+
+    let table = Table::new(rows, widths).header(header).block(
         Block::default()
-            .title(l("Endpoints / recent sample"))
+            .title(endpoint_table_title(
+                endpoints.len(),
+                scroll,
+                visible_rows,
+                lang,
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(p.border)),
     );
     f.render_widget(table, area);
 }
 
+fn endpoint_visible_rows(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(3))
+}
+
+fn endpoint_table_title(
+    total: usize,
+    scroll: usize,
+    visible_rows: usize,
+    lang: Language,
+) -> String {
+    let base = i18n::label(lang, "Endpoints / recent sample");
+    if total > visible_rows && visible_rows > 0 {
+        format!(
+            "{base}  PgUp/PgDn {}-{} / {total}",
+            scroll.saturating_add(1),
+            scroll.saturating_add(visible_rows).min(total)
+        )
+    } else {
+        base.to_string()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_detail_panel(
     f: &mut Frame<'_>,
     p: Palette,
-    ui: &UiState,
+    ui: &mut UiState,
     snapshot: &Snapshot,
     usage_balance: &UsageBalanceView,
+    provider_rows: &[&UsageBalanceProviderRow],
     window_label: &str,
     area: Rect,
     lang: Language,
@@ -1022,9 +1171,7 @@ fn render_detail_panel(
             p,
             ui,
             usage_balance,
-            usage_balance
-                .provider_rows
-                .get(ui.selected_stats_provider_idx),
+            provider_rows.get(ui.selected_stats_provider_idx).copied(),
             window_label,
             area,
             lang,
@@ -1258,6 +1405,12 @@ fn render_recent_breakdown(
                 format!(" {}(recent)", l("errors_only")),
                 Style::default().fg(p.muted),
             ),
+            Span::raw("  "),
+            Span::styled("a", Style::default().fg(p.text)),
+            Span::styled(
+                format!(" {}", l("attention only")),
+                Style::default().fg(p.muted),
+            ),
         ]),
         Line::from(vec![
             Span::styled("↑/↓", Style::default().fg(p.text)),
@@ -1273,6 +1426,15 @@ fn render_recent_breakdown(
                 match lang {
                     Language::Zh => " 导出报告",
                     Language::En => " export report",
+                },
+                Style::default().fg(p.muted),
+            ),
+            Span::raw("  "),
+            Span::styled("PgUp/PgDn", Style::default().fg(p.text)),
+            Span::styled(
+                match lang {
+                    Language::Zh => " 详情滚动",
+                    Language::En => " detail scroll",
                 },
                 Style::default().fg(p.muted),
             ),
@@ -1411,4 +1573,212 @@ fn render_recent_breakdown(
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    use crate::state::UsageRollupView;
+
+    fn sample_snapshot(
+        provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    ) -> Snapshot {
+        Snapshot {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            model_overrides: HashMap::new(),
+            overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: HashMap::new(),
+            usage_rollup: UsageRollupView {
+                by_provider: vec![
+                    (
+                        "ok-provider".to_string(),
+                        UsageBucket {
+                            requests_total: 1,
+                            ..UsageBucket::default()
+                        },
+                    ),
+                    (
+                        "超级中转套餐年度输入提供商".to_string(),
+                        UsageBucket {
+                            requests_total: 2,
+                            requests_error: 1,
+                            ..UsageBucket::default()
+                        },
+                    ),
+                ],
+                ..UsageRollupView::default()
+            },
+            provider_balances,
+            station_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: WindowStats::default(),
+            stats_1h: WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let mut out = String::new();
+        for y in buffer.area.y..buffer.area.y.saturating_add(buffer.area.height) {
+            for x in buffer.area.x..buffer.area.x.saturating_add(buffer.area.width) {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render_stats_text(width: u16, height: u16, ui: &mut UiState, snapshot: &Snapshot) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let frame = terminal
+            .draw(|frame| {
+                render_stats_page(frame, Palette::default(), ui, snapshot, &[], frame.area());
+            })
+            .expect("draw");
+        buffer_text(frame.buffer)
+    }
+
+    #[test]
+    fn stats_attention_filter_keeps_balance_and_error_rows() {
+        let snapshot = sample_snapshot(HashMap::from([
+            (
+                "ok-provider".to_string(),
+                vec![ProviderBalanceSnapshot {
+                    provider_id: "ok-provider".to_string(),
+                    status: BalanceSnapshotStatus::Ok,
+                    total_balance_usd: Some("12.50".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                }],
+            ),
+            (
+                "input".to_string(),
+                vec![ProviderBalanceSnapshot {
+                    provider_id: "超级中转套餐年度输入提供商".to_string(),
+                    status: BalanceSnapshotStatus::Stale,
+                    error: Some("refresh balance failed".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                }],
+            ),
+        ]));
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            stats_attention_only: true,
+            ..UiState::default()
+        };
+        let view = build_usage_balance_view(&ui, &snapshot);
+
+        let rows = filtered_provider_rows(&view.provider_rows, ui.stats_attention_only);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_id, "超级中转套餐年度输入提供商");
+        ui.stats_attention_only = false;
+        assert_eq!(
+            filtered_provider_rows(&view.provider_rows, ui.stats_attention_only).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn stats_narrow_render_keeps_cjk_provider_and_complete_balance_amount() {
+        let snapshot = sample_snapshot(HashMap::from([
+            (
+                "ok-provider".to_string(),
+                vec![ProviderBalanceSnapshot {
+                    provider_id: "ok-provider".to_string(),
+                    status: BalanceSnapshotStatus::Ok,
+                    total_balance_usd: Some("12.50".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                }],
+            ),
+            (
+                "input".to_string(),
+                vec![ProviderBalanceSnapshot {
+                    provider_id: "超级中转套餐年度输入提供商".to_string(),
+                    status: BalanceSnapshotStatus::Exhausted,
+                    exhausted: Some(true),
+                    exhaustion_affects_routing: false,
+                    quota_period: Some("daily".to_string()),
+                    quota_remaining_usd: Some("0".to_string()),
+                    quota_limit_usd: Some("300".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                }],
+            ),
+        ]));
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            stats_focus: StatsFocus::Providers,
+            stats_attention_only: true,
+            language: Language::Zh,
+            ..UiState::default()
+        };
+
+        let text = render_stats_text(84, 28, &mut ui, &snapshot);
+
+        assert!(text.contains("超") && text.contains("级"), "{text}");
+        assert!(text.contains("$0/$300.00"), "{text}");
+    }
+
+    #[test]
+    fn provider_detail_scrolls_endpoint_rows_independently() {
+        let balances = (0..8)
+            .map(|idx| ProviderBalanceSnapshot {
+                provider_id: "scroll-provider".to_string(),
+                upstream_index: Some(idx),
+                status: BalanceSnapshotStatus::Ok,
+                total_balance_usd: Some(format!("{}", 100 - idx)),
+                ..ProviderBalanceSnapshot::default()
+            })
+            .collect::<Vec<_>>();
+        let snapshot = sample_snapshot(HashMap::from([("scroll".to_string(), balances)]));
+        let mut ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            stats_focus: StatsFocus::Providers,
+            stats_provider_detail_scroll: 3,
+            ..UiState::default()
+        };
+        let view = build_usage_balance_view(&ui, &snapshot);
+        let row = view
+            .provider_rows
+            .iter()
+            .find(|row| row.provider_id == "scroll-provider")
+            .expect("provider row");
+        let backend = TestBackend::new(100, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let frame = terminal
+            .draw(|frame| {
+                render_provider_usage_detail(
+                    frame,
+                    Palette::default(),
+                    &mut ui,
+                    &view,
+                    Some(row),
+                    "7d",
+                    frame.area(),
+                    Language::En,
+                );
+            })
+            .expect("draw");
+
+        let text = buffer_text(frame.buffer);
+        assert!(text.contains("upstream#3"), "{text}");
+        assert!(text.contains("upstream#6"), "{text}");
+        assert!(!text.contains("upstream#0"), "{text}");
+        assert_eq!(ui.stats_provider_detail_scroll, 3);
+    }
 }

@@ -145,6 +145,17 @@ pub struct UsageBalanceProviderRow {
     pub recent_endpoint_requests: u64,
 }
 
+impl UsageBalanceProviderRow {
+    pub fn needs_attention(&self) -> bool {
+        self.balance_status.is_attention()
+            || self
+                .latest_balance_error
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self.usage.requests_error > 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageBalanceEndpointRow {
     pub provider_id: String,

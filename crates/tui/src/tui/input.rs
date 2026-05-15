@@ -1575,6 +1575,7 @@ async fn handle_key_normal(
                     StatsFocus::Stations => StatsFocus::Providers,
                     StatsFocus::Providers => StatsFocus::Stations,
                 };
+                ui.stats_provider_detail_scroll = 0;
                 ui.toast = Some((
                     format!(
                         "{}: {}",
@@ -1622,6 +1623,7 @@ async fn handle_key_normal(
                         adjust_table_selection(&mut ui.stats_providers_table, -1, len)
                     {
                         ui.selected_stats_provider_idx = next;
+                        ui.stats_provider_detail_scroll = 0;
                         return true;
                     }
                 }
@@ -1644,11 +1646,20 @@ async fn handle_key_normal(
                         adjust_table_selection(&mut ui.stats_providers_table, 1, len)
                     {
                         ui.selected_stats_provider_idx = next;
+                        ui.stats_provider_detail_scroll = 0;
                         return true;
                     }
                 }
             }
             false
+        }
+        KeyCode::PageUp if ui.page == Page::Stats && ui.stats_focus == StatsFocus::Providers => {
+            ui.stats_provider_detail_scroll = ui.stats_provider_detail_scroll.saturating_sub(5);
+            true
+        }
+        KeyCode::PageDown if ui.page == Page::Stats && ui.stats_focus == StatsFocus::Providers => {
+            ui.stats_provider_detail_scroll = ui.stats_provider_detail_scroll.saturating_add(5);
+            true
         }
         KeyCode::Char('d') if ui.page == Page::Stats => {
             let options = [1usize, 7usize, 30usize, 0usize];
@@ -1658,6 +1669,7 @@ async fn handle_key_normal(
                 .unwrap_or(1);
             let next = options[(idx + 1) % options.len()];
             ui.stats_days = next;
+            ui.stats_provider_detail_scroll = 0;
             ui.needs_snapshot_refresh = true;
             let label = if next == 0 {
                 i18n::label(ui.language, "loaded").to_string()
@@ -1668,6 +1680,25 @@ async fn handle_key_normal(
             };
             ui.toast = Some((
                 format!("{}: {label}", i18n::label(ui.language, "window")),
+                Instant::now(),
+            ));
+            true
+        }
+        KeyCode::Char('a') if ui.page == Page::Stats => {
+            ui.stats_attention_only = !ui.stats_attention_only;
+            ui.selected_stats_provider_idx = 0;
+            ui.stats_provider_detail_scroll = 0;
+            let len = ui.usage_balance_provider_rows_len(snapshot);
+            ui.stats_providers_table
+                .select((len > 0).then_some(ui.selected_stats_provider_idx));
+            *ui.stats_providers_table.offset_mut() = 0;
+            ui.toast = Some((
+                format!(
+                    "{}: {}={}",
+                    i18n::label(ui.language, "Stats page"),
+                    i18n::label(ui.language, "attention only"),
+                    ui.stats_attention_only
+                ),
                 Instant::now(),
             ));
             true

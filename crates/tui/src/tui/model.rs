@@ -1110,13 +1110,7 @@ pub(in crate::tui) fn provider_balance_compact_lang(
         return candidate.clone();
     }
 
-    let fallback = tiny_amount
-        .as_deref()
-        .or(terse_amount.as_deref())
-        .or(amount.as_deref())
-        .or_else(|| candidates.first().map(String::as_str))
-        .unwrap_or_else(|| balance_snapshot_status_brief_lang(snapshot, lang));
-    shorten_middle(fallback, max_width)
+    balance_atomic_fallback(snapshot, max_width, lang)
 }
 
 fn push_balance_candidate(candidates: &mut Vec<String>, candidate: String) {
@@ -1257,14 +1251,43 @@ pub(in crate::tui) fn station_balance_brief_lang(
     if parts.is_empty() {
         "-".to_string()
     } else {
+        let fallback_label = if ok > 0 {
+            i18n::label(lang, "ok").to_string()
+        } else if stale > 0 {
+            format!("{} {stale}/{total}", i18n::label(lang, "stale"))
+        } else if displayed_unknown > 0 {
+            format!(
+                "{} {displayed_unknown}/{total}",
+                i18n::label(lang, "unknown")
+            )
+        } else if lazy_exhausted > 0 {
+            format!("{} {lazy_exhausted}/{total}", i18n::label(lang, "lazy"))
+        } else if exhausted > 0 {
+            format!("{} {exhausted}/{total}", i18n::label(lang, "exh"))
+        } else {
+            "-".to_string()
+        };
         compact_balance_parts(
             &parts,
             amount_index,
             primary_terse_amount.as_deref(),
             primary_tiny_amount.as_deref(),
             max_width,
+            &fallback_label,
         )
     }
+}
+
+fn balance_atomic_fallback(
+    snapshot: &ProviderBalanceSnapshot,
+    max_width: usize,
+    lang: Language,
+) -> String {
+    let label = balance_snapshot_status_brief_lang(snapshot, lang);
+    if display_width(label) <= max_width {
+        return label.to_string();
+    }
+    shorten_middle(label, max_width)
 }
 
 fn compact_balance_parts(
@@ -1273,6 +1296,7 @@ fn compact_balance_parts(
     terse_amount: Option<&str>,
     tiny_amount: Option<&str>,
     max_width: usize,
+    fallback_label: &str,
 ) -> String {
     let full = parts.join(" ");
     if display_width(&full) <= max_width {
@@ -1312,7 +1336,21 @@ fn compact_balance_parts(
         }
     }
 
-    shorten_middle(&full, max_width)
+    let non_amount = parts
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| Some(*idx) != amount_index)
+        .map(|(_, part)| part.as_str())
+        .find(|part| display_width(part) <= max_width);
+    if let Some(part) = non_amount {
+        return part.to_string();
+    }
+
+    if display_width(fallback_label) <= max_width {
+        return fallback_label.to_string();
+    }
+
+    shorten_middle(fallback_label, max_width)
 }
 
 #[cfg(test)]
@@ -2098,6 +2136,29 @@ mod tests {
             "exh CodeX Lite 年度 daily left $0 / $100.00"
         );
         assert_eq!(provider_balance_compact(&snapshot, 14), "$0/$100.00");
+    }
+
+    #[test]
+    fn provider_balance_compact_falls_back_to_status_in_too_narrow_cells() {
+        let snapshot = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            exhaustion_affects_routing: false,
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("0".to_string()),
+            quota_limit_usd: Some("300".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+
+        let en = provider_balance_compact(&snapshot, 4);
+        assert_eq!(en, "lazy");
+        assert!(!en.contains('$'), "{en}");
+        assert!(!en.contains('…'), "{en}");
+
+        let zh = provider_balance_compact_lang(&snapshot, 6, Language::Zh);
+        assert_eq!(zh, "不降级");
+        assert!(!zh.contains('$'), "{zh}");
+        assert!(!zh.contains('…'), "{zh}");
     }
 
     #[test]

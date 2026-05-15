@@ -895,7 +895,10 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             )]),
             Line::from("  Tab        切换焦点（station vs provider）"),
             Line::from("  d          切换窗口（today/7d/30d/loaded）"),
+            Line::from("  a          provider 仅看余额/错误关注项"),
             Line::from("  e          recent 仅看错误"),
+            Line::from("  PgUp/PgDn  provider 详情滚动"),
+            Line::from("  g          刷新余额"),
             Line::from("  y          复制 + 导出报告（当前选中项）"),
             Line::from(""),
             Line::from(vec![Span::styled(
@@ -1056,7 +1059,10 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             )]),
             Line::from("  Tab        switch focus (station vs provider)"),
             Line::from("  d          cycle time window (today/7d/30d/loaded)"),
+            Line::from("  a          provider attention-only balance/error rows"),
             Line::from("  e          toggle errors-only (recent breakdown)"),
+            Line::from("  PgUp/PgDn  scroll provider details"),
+            Line::from("  g          refresh balances"),
             Line::from("  y          copy + export report (selected item)"),
             Line::from(""),
             Line::from(vec![Span::styled(

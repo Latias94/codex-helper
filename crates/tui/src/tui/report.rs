@@ -154,11 +154,24 @@ pub(in crate::tui) fn selected_stats_target(
             .by_config
             .get(ui.selected_stats_station_idx)
             .map(|(k, _)| StatsTarget::Station(k.clone())),
-        StatsFocus::Providers => snapshot
-            .usage_rollup
-            .by_provider
-            .get(ui.selected_stats_provider_idx)
-            .map(|(k, _)| StatsTarget::Provider(k.clone())),
+        StatsFocus::Providers => {
+            let usage_balance = UsageBalanceView::build(UsageBalanceBuildInput {
+                service_name: ui.service_name,
+                window_days: ui.stats_days,
+                generated_at_ms: crate::tui::model::now_ms(),
+                usage_rollup: &snapshot.usage_rollup,
+                provider_balances: &snapshot.provider_balances,
+                recent: &snapshot.recent,
+                routing_explain: ui.routing_explain.as_ref(),
+                refresh: UsageBalanceRefreshInput::default(),
+            });
+            usage_balance
+                .provider_rows
+                .iter()
+                .filter(|row| !ui.stats_attention_only || row.needs_attention())
+                .nth(ui.selected_stats_provider_idx)
+                .map(|row| StatsTarget::Provider(row.provider_id.clone()))
+        }
     }
 }
 

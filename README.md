@@ -251,6 +251,7 @@ codex-helper 刻意避免这些做法：
 - [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md)：中文完整配置参考，包含 routing 模板、余额适配、代理说明和迁移。
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：English configuration reference, routing, balance adapters, pricing, migration.
 - [CHANGELOG.md](CHANGELOG.md)：版本变更和升级注意事项。
+- [docs/workstreams/codex-tui-operator-polish/README.md](docs/workstreams/codex-tui-operator-polish/README.md)：TUI 用量、路由、窄终端和快捷键操作体验优化计划。
 - [docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md](docs/workstreams/codex-operator-experience-refactor/GAP_MATRIX.md)：与 cc-switch、aio-coding-hub、all-api-hub 的差距分析。
 - [docs/workstreams/codex-control-plane-refactor/README.md](docs/workstreams/codex-control-plane-refactor/README.md)：控制平面设计记录。
 

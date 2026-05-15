@@ -77,8 +77,10 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) stats_focus: StatsFocus,
     pub(in crate::tui) stats_days: usize,
     pub(in crate::tui) stats_errors_only: bool,
+    pub(in crate::tui) stats_attention_only: bool,
     pub(in crate::tui) selected_stats_station_idx: usize,
     pub(in crate::tui) selected_stats_provider_idx: usize,
+    pub(in crate::tui) stats_provider_detail_scroll: u16,
     pub(in crate::tui) needs_snapshot_refresh: bool,
     pub(in crate::tui) needs_config_refresh: bool,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
@@ -176,8 +178,10 @@ impl Default for UiState {
             stats_focus: StatsFocus::Stations,
             stats_days: 7,
             stats_errors_only: false,
+            stats_attention_only: false,
             selected_stats_station_idx: 0,
             selected_stats_provider_idx: 0,
+            stats_provider_detail_scroll: 0,
             needs_snapshot_refresh: false,
             needs_config_refresh: false,
             toast: None,
@@ -310,6 +314,9 @@ impl UiState {
             stats_providers_len,
         )
         .unwrap_or(0);
+        if stats_providers_len == 0 {
+            self.stats_provider_detail_scroll = 0;
+        }
     }
 
     pub(in crate::tui) fn reset_table_viewports(&mut self) {
@@ -326,6 +333,7 @@ impl UiState {
         ] {
             *table.offset_mut() = 0;
         }
+        self.stats_provider_detail_scroll = 0;
     }
 
     pub(in crate::tui) fn sync_stations_table_viewport(
@@ -385,7 +393,9 @@ impl UiState {
     pub(in crate::tui) fn usage_balance_provider_rows_len(&self, snapshot: &Snapshot) -> usize {
         usage_balance_view_for_selection(self, snapshot)
             .provider_rows
-            .len()
+            .iter()
+            .filter(|row| !self.stats_attention_only || row.needs_attention())
+            .count()
     }
 }
 
