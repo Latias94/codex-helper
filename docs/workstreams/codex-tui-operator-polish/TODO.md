@@ -90,7 +90,7 @@
 
 ## WS4 - Page State And View Models
 
-- [~] TUI-400 Introduce or tighten page view models for Usage and Routing.
+- [x] TUI-400 Introduce or tighten page view models for Usage and Routing.
   - First slice centralizes Usage / Balance view construction and filtered
     provider row selection in `UiState`; render, detail, and report paths now
     consume the same provider-row model.
@@ -100,7 +100,7 @@
   - Route graph provider rows now include catalog status, enabled state, alias,
     and tags in one `UiState` row model consumed by the table, details, menu,
     and reorder paths.
-- [~] TUI-401 Keep selection, viewport, and detail state synchronized after
+- [x] TUI-401 Keep selection, viewport, and detail state synchronized after
   refresh, resize, and page switch.
   - Usage provider detail and report target now resolve through the same
     filtered selection helper used for table length.
@@ -109,13 +109,12 @@
     and clamping table viewport.
   - Added coverage for route graph selection after provider-list shrink,
     viewport clamp, and reorder helper movement.
-- [~] TUI-402 Remove duplicated row derivation between render, selection, and
+- [x] TUI-402 Remove duplicated row derivation between render, selection, and
   report/export paths.
   - Usage / Balance provider row derivation is deduplicated. Routing row
     derivation is centralized for route graph provider rows, selection,
-    detail lookup, menu status, and reorder order generation. Broader
-    non-provider Routing view-model cleanup remains open.
-- [~] TUI-403 Add tests proving selected row and detail pane remain aligned
+    detail lookup, menu status, and reorder order generation.
+- [x] TUI-403 Add tests proving selected row and detail pane remain aligned
   after filtering and refresh.
   - Added state-level tests for filtered Usage provider selection and endpoint
     detail alignment.
@@ -127,10 +126,14 @@
 
 ## WS5 - Validation
 
-- [ ] TUI-500 Run `cargo fmt`.
-- [ ] TUI-501 Run `cargo nextest run -p codex-helper-tui`.
-- [ ] TUI-502 Run workspace nextest when shared core view models change.
-- [ ] TUI-503 Run clippy with GUI feature before release.
+- [x] TUI-500 Run `cargo fmt`.
+  - Verified with `cargo fmt --all --check`.
+- [x] TUI-501 Run `cargo nextest run -p codex-helper-tui`.
+  - Latest TUI package run passed: 100 tests.
+- [x] TUI-502 Run workspace nextest when shared core view models change.
+  - Verified with `cargo nextest run --locked --workspace --features gui --no-fail-fast`: 665 passed.
+- [x] TUI-503 Run clippy with GUI feature before release.
+  - Verified with `cargo clippy --locked --workspace --all-targets --features gui -- -D warnings`.
 - [ ] TUI-504 Manually smoke test normal-width and narrow terminal operation.
 
 ## Candidate First Slice
