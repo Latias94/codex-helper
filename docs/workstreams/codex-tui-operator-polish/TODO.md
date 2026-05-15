@@ -94,18 +94,28 @@
   - First slice centralizes Usage / Balance view construction and filtered
     provider row selection in `UiState`; render, detail, and report paths now
     consume the same provider-row model.
+  - Route graph provider order, count, table selection, menu selection, and
+    selected provider name now resolve through `UiState` helpers instead of
+    each caller deriving them independently.
 - [~] TUI-401 Keep selection, viewport, and detail state synchronized after
   refresh, resize, and page switch.
   - Usage provider detail and report target now resolve through the same
     filtered selection helper used for table length.
-- [ ] TUI-402 Remove duplicated row derivation between render, selection, and
+  - Route graph table selection and routing menu selection are synchronized by
+    routing order after opening the editor, moving providers, refreshing specs,
+    and clamping table viewport.
+- [~] TUI-402 Remove duplicated row derivation between render, selection, and
   report/export paths.
   - Usage / Balance provider row derivation is deduplicated. Routing row
-    derivation remains open.
-- [ ] TUI-403 Add tests proving selected row and detail pane remain aligned
+    derivation is partially centralized for route graph provider order and
+    selection; broader Routing row models remain open.
+- [~] TUI-403 Add tests proving selected row and detail pane remain aligned
   after filtering and refresh.
   - Added state-level tests for filtered Usage provider selection and endpoint
     detail alignment.
+  - Added a route graph state test proving provider selection follows routing
+    order and stays synchronized with the routing menu when config provider
+    order differs.
 
 ## WS5 - Validation
 

@@ -14,8 +14,8 @@ use crate::dashboard_core::{
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     Palette, Snapshot, balance_amount_brief_lang, balance_snapshot_status_label_lang,
-    balance_snapshot_status_style, format_age, now_ms, provider_balance_compact_lang,
-    routing_provider_names, shorten, shorten_middle, station_balance_brief_lang,
+    balance_snapshot_status_style, format_age, now_ms, provider_balance_compact_lang, shorten,
+    shorten_middle, station_balance_brief_lang,
 };
 use crate::tui::state::UiState;
 use crate::tui::{Language, ProviderOption};
@@ -1030,7 +1030,7 @@ fn render_route_graph_routing_page(
         return;
     };
 
-    let order = routing_provider_names(&spec);
+    let order = ui.routing_provider_order().unwrap_or_default();
     let selected_session = snapshot
         .rows
         .get(ui.selected_session_idx)
@@ -1141,7 +1141,7 @@ fn render_route_graph_routing_page(
         .collect::<Vec<_>>();
 
     let table_visible_rows = usize::from(left_block.inner(columns[0]).height.saturating_sub(1));
-    ui.sync_stations_table_viewport(order.len(), table_visible_rows);
+    ui.sync_route_graph_table_viewport(table_visible_rows);
     let table_constraints = if compact_provider_table {
         vec![
             Constraint::Length(4),
@@ -1166,7 +1166,8 @@ fn render_route_graph_routing_page(
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, columns[0], &mut ui.stations_table);
 
-    let selected_name = order.get(ui.selected_station_idx).map(String::as_str);
+    let selected_name = ui.selected_route_graph_provider_name();
+    let selected_name = selected_name.as_deref();
     let selected_provider = selected_name.and_then(|name| provider_by_name.get(name).copied());
     let right_title = selected_name
         .map(|name| format!("{}: {name}", l("Provider routing")))

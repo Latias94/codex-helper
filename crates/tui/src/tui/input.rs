@@ -36,7 +36,7 @@ use super::model::{
     Snapshot, codex_recent_window_label, codex_recent_window_threshold_ms,
     filtered_request_page_len, filtered_requests_len, find_session_idx, format_age, now_ms,
     request_matches_page_filters, request_page_focus_session_id, routing_leaf_provider_names,
-    routing_provider_names, session_row_has_any_override, short_sid,
+    session_row_has_any_override, short_sid,
 };
 use super::report::build_stats_report;
 use super::state::{
@@ -802,10 +802,8 @@ pub(in crate::tui) async fn refresh_routing_control_state(
         .routing_explain(RouteRequestContext::default(), None)
         .await
         .ok();
-    ui.routing_menu_idx = ui
-        .routing_menu_idx
-        .min(routing_provider_names(&response).len().saturating_sub(1));
     ui.routing_spec = Some(response);
+    ui.clamp_routing_menu_selection();
     ui.last_routing_control_refresh_at = Some(Instant::now());
     Ok(())
 }
@@ -890,7 +888,7 @@ async fn open_routing_editor(
         balance_refresh_tx,
     );
     if ui.page == Page::Stations {
-        ui.routing_menu_idx = ui.selected_station_idx;
+        ui.sync_routing_menu_with_station_selection();
     }
     match refresh_routing_control_state(ui, proxy).await {
         Ok(()) => {
@@ -1026,10 +1024,8 @@ async fn apply_persisted_routing(
     let payload = RoutingSpecUpsertView::from(&routing);
     let response =
         RoutingSpecView::from(proxy.upsert_persisted_routing_spec(payload.into()).await?);
-    ui.routing_menu_idx = ui
-        .routing_menu_idx
-        .min(routing_provider_names(&response).len().saturating_sub(1));
     ui.routing_spec = Some(response);
+    ui.clamp_routing_menu_selection();
     ui.last_routing_control_refresh_at = Some(Instant::now());
     ui.needs_snapshot_refresh = true;
     ui.needs_config_refresh = true;
@@ -1824,13 +1820,10 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Enter if ui.page == Page::Stations => {
-            let Some(name) = providers
-                .get(ui.selected_station_idx)
-                .map(|p| p.name.clone())
-            else {
-                return true;
-            };
             if ui.uses_route_graph_routing() {
+                let Some(name) = ui.selected_route_graph_provider_name() else {
+                    return true;
+                };
                 match apply_global_route_target_pin(state, providers, Some(name.clone())).await {
                     Ok(()) => {
                         invalidate_route_target_preview(ui);
@@ -1854,6 +1847,12 @@ async fn handle_key_normal(
                 }
                 return true;
             }
+            let Some(name) = providers
+                .get(ui.selected_station_idx)
+                .map(|p| p.name.clone())
+            else {
+                return true;
+            };
             match apply_global_station_pin(state, providers, Some(name.clone())).await {
                 Ok(()) => {
                     ui.toast = Some((
@@ -1938,9 +1937,6 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('o') if ui.page == Page::Stations => {
-            let Some(pvd) = providers.get(ui.selected_station_idx) else {
-                return true;
-            };
             let Some(sid) = snapshot
                 .rows
                 .get(ui.selected_session_idx)
@@ -1955,17 +1951,23 @@ async fn handle_key_normal(
                 return true;
             };
             if ui.uses_route_graph_routing() {
-                apply_session_route_target_override(state, sid, Some(pvd.name.clone())).await;
+                let Some(name) = ui.selected_route_graph_provider_name() else {
+                    return true;
+                };
+                apply_session_route_target_override(state, sid, Some(name.clone())).await;
                 invalidate_route_target_preview(ui);
                 ui.toast = Some((
                     match ui.language {
-                        Language::Zh => format!("会话 route target：{}", pvd.name),
-                        Language::En => format!("session route target: {}", pvd.name),
+                        Language::Zh => format!("会话 route target：{name}"),
+                        Language::En => format!("session route target: {name}"),
                     },
                     Instant::now(),
                 ));
                 return true;
             }
+            let Some(pvd) = providers.get(ui.selected_station_idx) else {
+                return true;
+            };
             apply_session_provider_override(state, sid, Some(pvd.name.clone())).await;
             ui.toast = Some((
                 format!(
@@ -2034,14 +2036,21 @@ async fn handle_key_normal(
                 ));
                 return true;
             }
-            ui.routing_menu_idx = ui.selected_station_idx;
+            ui.sync_routing_menu_with_station_selection();
             let handled =
                 handle_key_routing_menu(providers, ui, snapshot, proxy, balance_refresh_tx, key)
                     .await;
-            ui.selected_station_idx = ui.routing_menu_idx;
+            ui.sync_station_selection_with_routing_menu();
             handled
         }
         KeyCode::Char('h') if ui.page == Page::Stations => {
+            if ui.uses_route_graph_routing() {
+                ui.toast = Some((
+                    i18n::label(ui.language, "routing: use g to refresh balances").to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            }
             let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
@@ -2110,6 +2119,13 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('H') if ui.page == Page::Stations => {
+            if ui.uses_route_graph_routing() {
+                ui.toast = Some((
+                    i18n::label(ui.language, "routing: use g to refresh balances").to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            }
             let service_name = ui.service_name;
             let stations = providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
             let state = Arc::clone(state);
@@ -2211,6 +2227,13 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('c') if ui.page == Page::Stations => {
+            if ui.uses_route_graph_routing() {
+                ui.toast = Some((
+                    i18n::label(ui.language, "routing: no health check is running").to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            }
             let Some(pvd) = providers.get(ui.selected_station_idx) else {
                 return true;
             };
@@ -2240,6 +2263,13 @@ async fn handle_key_normal(
             true
         }
         KeyCode::Char('C') if ui.page == Page::Stations => {
+            if ui.uses_route_graph_routing() {
+                ui.toast = Some((
+                    i18n::label(ui.language, "routing: no health check is running").to_string(),
+                    Instant::now(),
+                ));
+                return true;
+            }
             let now = now_ms();
             let mut count = 0usize;
             for p in providers {
@@ -4295,19 +4325,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_graph_global_route_target_key_invalidates_preview() {
+    async fn route_graph_global_route_target_key_uses_routing_order_and_invalidates_preview() {
         let (proxy, cfg) = proxy_with_single_station_without_upstreams();
         let state = ProxyState::new();
-        let mut providers = vec![ProviderOption {
-            name: "input".to_string(),
-            enabled: true,
-            active: true,
-            ..ProviderOption::default()
-        }];
+        let mut providers = vec![
+            ProviderOption {
+                name: "input".to_string(),
+                enabled: true,
+                active: true,
+                ..ProviderOption::default()
+            },
+            ProviderOption {
+                name: "backup".to_string(),
+                enabled: true,
+                active: false,
+                ..ProviderOption::default()
+            },
+        ];
         let snapshot = empty_snapshot(state.as_ref(), cfg).await;
         let mut ui = UiState {
             page: Page::Stations,
             config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+            routing_spec: Some(RoutingSpecView {
+                entry: "main".to_string(),
+                routes: BTreeMap::new(),
+                policy: RoutingPolicyV4::OrderedFailover,
+                order: vec!["backup".to_string()],
+                target: None,
+                prefer_tags: Vec::new(),
+                chain: Vec::new(),
+                pools: BTreeMap::new(),
+                on_exhausted: RoutingExhaustedActionV4::Continue,
+                entry_strategy: RoutingPolicyV4::OrderedFailover,
+                expanded_order: vec!["backup".to_string(), "input".to_string()],
+                entry_target: None,
+                providers: vec![
+                    RoutingProviderRef {
+                        name: "input".to_string(),
+                        alias: None,
+                        enabled: true,
+                        tags: BTreeMap::new(),
+                    },
+                    RoutingProviderRef {
+                        name: "backup".to_string(),
+                        alias: None,
+                        enabled: true,
+                        tags: BTreeMap::new(),
+                    },
+                ],
+            }),
             routing_explain: Some(stale_routing_explain()),
             last_routing_control_refresh_at: Some(Instant::now()),
             ..UiState::default()
@@ -4328,7 +4394,7 @@ mod tests {
         assert!(handled);
         assert_eq!(
             state.get_global_route_target_override().await.as_deref(),
-            Some("input")
+            Some("backup")
         );
         assert!(ui.routing_explain.is_none());
         assert!(ui.last_routing_control_refresh_at.is_none());
@@ -4914,9 +4980,7 @@ async fn handle_key_provider_menu(
 }
 
 fn selected_routing_provider_name(ui: &UiState) -> Option<String> {
-    let spec = ui.routing_spec.as_ref()?;
-    let names = routing_provider_names(spec);
-    names.get(ui.routing_menu_idx).cloned()
+    ui.selected_routing_menu_provider_name()
 }
 
 fn selected_routing_provider_enabled(ui: &UiState) -> Option<bool> {
@@ -5014,9 +5078,8 @@ async fn handle_key_routing_menu(
         }
         KeyCode::Down | KeyCode::Char('j') => {
             let max = ui
-                .routing_spec
-                .as_ref()
-                .map(|spec| routing_provider_names(spec).len().saturating_sub(1))
+                .routing_provider_count()
+                .map(|len| len.saturating_sub(1))
                 .unwrap_or(0);
             ui.routing_menu_idx = (ui.routing_menu_idx + 1).min(max);
             true
@@ -5036,7 +5099,9 @@ async fn handle_key_routing_menu(
                 ));
                 return true;
             }
-            let mut order = routing_provider_names(&spec);
+            let Some(mut order) = ui.routing_provider_order() else {
+                return true;
+            };
             if ui.routing_menu_idx == 0 || ui.routing_menu_idx >= order.len() {
                 return true;
             }
@@ -5081,7 +5146,9 @@ async fn handle_key_routing_menu(
                 ));
                 return true;
             }
-            let mut order = routing_provider_names(&spec);
+            let Some(mut order) = ui.routing_provider_order() else {
+                return true;
+            };
             if ui.routing_menu_idx + 1 >= order.len() {
                 return true;
             }

@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - TUI `Usage` 页面现在会显示本次余额刷新 summary，包括成功/失败/缺 key/自动刷新数量，并会带出最新错误所属 provider。
 - TUI `Routing` 页面优化了窄终端显示：长 provider 顺序会折叠但保留选中项，目标 provider 和余额分行展示，避免全局 route target 的金额被截断。
 - TUI 设置或清除全局/会话 route target 后，会立即清掉旧路由预览并刷新快照，避免短时间显示过期 provider 或余额信息。
+- TUI `Routing` 的 route graph 模式现在按实际 routing order 解析 provider 选中项，避免表格、详情、Enter 固定目标、会话 override 和 provider 重排在配置顺序不一致时错位。
 - TUI 底部快捷键栏改为只保留当前页面的关键操作，`?` 帮助会先显示当前页面完整快捷键，窄终端下隐藏的动作仍可发现。
 - TUI `Usage` 页面支持按 `g` 直接刷新余额；刷新失败会显示为错误状态，但不会阻塞页面刷新或其他 provider 的余额刷新。
 - TUI `Usage` 页面的 provider 表格、详情面板和报告导出现在共用同一套筛选后的行模型，降低关注项筛选后详情或导出目标错位的风险。
@@ -29,6 +30,7 @@ All notable changes to this project will be documented in this file.
 - The TUI `Usage` page now surfaces the latest balance refresh summary, including success/failure counts, missing-token counts, auto-refresh counts, and the provider behind the latest error.
 - The TUI `Routing` page now behaves better in narrow terminals: long provider order chains are folded while keeping the selected provider visible, and route target balances are shown on their own line to avoid truncated amounts.
 - After setting or clearing a global/session route target in the TUI, stale routing previews are invalidated immediately and a snapshot refresh is queued, avoiding short-lived stale provider or balance text.
+- TUI `Routing` route graph mode now resolves provider selection from the actual routing order, keeping the table, detail pane, Enter target pinning, session overrides, and provider reordering aligned when config order differs.
 - The TUI footer now keeps only page-critical actions. Press `?` to open page-aware help first, so actions hidden from narrow footers remain discoverable.
 - Press `g` on the TUI `Usage` page to refresh balances. Failures stay visible as state/errors without blocking UI redraws or other provider refreshes.
 - The TUI `Usage` provider table, detail pane, and report export now share the same filtered row model, reducing the risk of detail/export target drift after attention filtering.

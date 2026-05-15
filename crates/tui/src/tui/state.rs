@@ -252,20 +252,17 @@ impl UiState {
 
     pub(in crate::tui) fn station_page_rows_len(&self, legacy_len: usize) -> usize {
         if self.uses_route_graph_routing() {
-            return self
-                .routing_spec
-                .as_ref()
-                .map(|spec| routing_provider_names(spec).len())
-                .unwrap_or(legacy_len);
+            return self.routing_provider_count().unwrap_or(legacy_len);
         }
         legacy_len
     }
 
     pub(in crate::tui) fn clamp_selection(&mut self, snapshot: &Snapshot, providers_len: usize) {
+        let station_page_rows_len = self.station_page_rows_len(providers_len);
         self.selected_station_idx = clamp_table_selection(
             &mut self.stations_table,
             Some(self.selected_station_idx),
-            providers_len,
+            station_page_rows_len,
         )
         .unwrap_or(0);
 
@@ -351,6 +348,59 @@ impl UiState {
             &mut self.stations_table,
             Some(self.selected_station_idx),
             providers_len,
+            visible_rows,
+        )
+        .unwrap_or(0);
+    }
+
+    pub(in crate::tui) fn routing_provider_order(&self) -> Option<Vec<String>> {
+        self.routing_spec.as_ref().map(routing_provider_names)
+    }
+
+    pub(in crate::tui) fn routing_provider_count(&self) -> Option<usize> {
+        self.routing_provider_order().map(|order| order.len())
+    }
+
+    pub(in crate::tui) fn selected_route_graph_provider_name(&self) -> Option<String> {
+        self.routing_provider_order()?
+            .get(self.selected_station_idx)
+            .cloned()
+    }
+
+    pub(in crate::tui) fn selected_routing_menu_provider_name(&self) -> Option<String> {
+        self.routing_provider_order()?
+            .get(self.routing_menu_idx)
+            .cloned()
+    }
+
+    pub(in crate::tui) fn clamp_routing_menu_selection(&mut self) {
+        self.routing_menu_idx = self
+            .routing_provider_count()
+            .map(|len| self.routing_menu_idx.min(len.saturating_sub(1)))
+            .unwrap_or(0);
+    }
+
+    pub(in crate::tui) fn sync_routing_menu_with_station_selection(&mut self) {
+        self.routing_menu_idx = self.selected_station_idx;
+        if self.routing_provider_count().is_some() {
+            self.clamp_routing_menu_selection();
+        }
+    }
+
+    pub(in crate::tui) fn sync_station_selection_with_routing_menu(&mut self) {
+        self.selected_station_idx = self.routing_menu_idx;
+        self.selected_station_idx = self
+            .routing_provider_count()
+            .map(|len| self.selected_station_idx.min(len.saturating_sub(1)))
+            .unwrap_or(0);
+    }
+
+    pub(in crate::tui) fn sync_route_graph_table_viewport(&mut self, visible_rows: usize) {
+        let len = self.routing_provider_count().unwrap_or(0);
+        self.selected_station_idx = clamp_table_viewport(
+            &mut self.stations_table,
+            Some(self.selected_station_idx),
+            len,
             visible_rows,
         )
         .unwrap_or(0);
@@ -563,6 +613,7 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -570,6 +621,7 @@ mod tests {
     use crate::state::{
         BalanceSnapshotStatus, ProviderBalanceSnapshot, UsageBucket, UsageRollupView,
     };
+    use crate::tui::model::RoutingProviderRef;
     use crate::tui::types::StatsFocus;
 
     fn sample_summary(id: &str, path: &str, source: SessionSummarySource) -> SessionSummary {
@@ -736,6 +788,69 @@ mod tests {
 
         ui.config_version = Some(2);
         assert!(!ui.uses_route_graph_routing());
+    }
+
+    #[test]
+    fn route_graph_selection_tracks_provider_order_and_menu_sync() {
+        let spec = RoutingSpecView {
+            entry: "main".to_string(),
+            routes: BTreeMap::new(),
+            policy: crate::config::RoutingPolicyV4::OrderedFailover,
+            order: vec!["backup".to_string()],
+            target: None,
+            prefer_tags: Vec::new(),
+            chain: Vec::new(),
+            pools: BTreeMap::new(),
+            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
+            entry_strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+            expanded_order: vec!["backup".to_string(), "input".to_string()],
+            entry_target: None,
+            providers: vec![
+                RoutingProviderRef {
+                    name: "input".to_string(),
+                    alias: None,
+                    enabled: true,
+                    tags: BTreeMap::new(),
+                },
+                RoutingProviderRef {
+                    name: "backup".to_string(),
+                    alias: None,
+                    enabled: true,
+                    tags: BTreeMap::new(),
+                },
+            ],
+        };
+        let mut ui = UiState {
+            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+            routing_spec: Some(spec),
+            selected_station_idx: 1,
+            routing_menu_idx: 0,
+            ..UiState::default()
+        };
+
+        assert_eq!(
+            ui.routing_provider_order(),
+            Some(vec!["backup".to_string(), "input".to_string()])
+        );
+        assert_eq!(
+            ui.selected_route_graph_provider_name().as_deref(),
+            Some("input")
+        );
+
+        ui.sync_routing_menu_with_station_selection();
+        assert_eq!(ui.routing_menu_idx, 1);
+        assert_eq!(
+            ui.selected_routing_menu_provider_name().as_deref(),
+            Some("input")
+        );
+
+        ui.routing_menu_idx = 0;
+        ui.sync_station_selection_with_routing_menu();
+        assert_eq!(ui.selected_station_idx, 0);
+        assert_eq!(
+            ui.selected_route_graph_provider_name().as_deref(),
+            Some("backup")
+        );
     }
 
     #[test]
