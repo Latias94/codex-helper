@@ -810,6 +810,15 @@ pub(in crate::tui) async fn refresh_routing_control_state(
     Ok(())
 }
 
+fn invalidate_route_target_preview(ui: &mut UiState) {
+    if !ui.uses_route_graph_routing() {
+        return;
+    }
+    ui.routing_explain = None;
+    ui.last_routing_control_refresh_at = None;
+    ui.needs_snapshot_refresh = true;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BalanceRefreshMode {
     Auto,
@@ -1824,6 +1833,7 @@ async fn handle_key_normal(
             if ui.uses_route_graph_routing() {
                 match apply_global_route_target_pin(state, providers, Some(name.clone())).await {
                     Ok(()) => {
+                        invalidate_route_target_preview(ui);
                         ui.toast = Some((
                             match ui.language {
                                 Language::Zh => format!("全局 route target：{name}"),
@@ -1885,6 +1895,7 @@ async fn handle_key_normal(
             if ui.uses_route_graph_routing() {
                 match apply_global_route_target_pin(state, providers, None).await {
                     Ok(()) => {
+                        invalidate_route_target_preview(ui);
                         ui.toast = Some((
                             match ui.language {
                                 Language::Zh => "全局 route target：<auto>",
@@ -1945,6 +1956,7 @@ async fn handle_key_normal(
             };
             if ui.uses_route_graph_routing() {
                 apply_session_route_target_override(state, sid, Some(pvd.name.clone())).await;
+                invalidate_route_target_preview(ui);
                 ui.toast = Some((
                     match ui.language {
                         Language::Zh => format!("会话 route target：{}", pvd.name),
@@ -1982,6 +1994,7 @@ async fn handle_key_normal(
             if ui.uses_route_graph_routing() {
                 apply_session_route_target_override(state, sid.clone(), None).await;
                 state.clear_session_station_override(&sid).await;
+                invalidate_route_target_preview(ui);
                 ui.toast = Some((
                     match ui.language {
                         Language::Zh => "会话 route target：<清除>",
@@ -2574,6 +2587,9 @@ async fn handle_key_normal(
 
             clear_session_manual_overrides(state, sid).await;
             ui.needs_snapshot_refresh = true;
+            if ui.uses_route_graph_routing() && row.override_route_target.is_some() {
+                invalidate_route_target_preview(ui);
+            }
             ui.toast = Some((
                 i18n::label(ui.language, "session manual overrides reset").to_string(),
                 Instant::now(),
@@ -3889,6 +3905,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use std::time::Instant;
     use std::time::SystemTime;
     use tokio::sync::mpsc;
 
@@ -3935,6 +3952,22 @@ mod tests {
         snapshot: ProviderBalanceSnapshot,
     ) -> HashMap<String, Vec<ProviderBalanceSnapshot>> {
         HashMap::from([("input".to_string(), vec![snapshot])])
+    }
+
+    fn stale_routing_explain() -> crate::routing_explain::RoutingExplainResponse {
+        crate::routing_explain::RoutingExplainResponse {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            runtime_loaded_at_ms: Some(1),
+            request_model: None,
+            session_id: None,
+            request_context: crate::routing_explain::RoutingExplainRequestContext::default(),
+            selected_route: None,
+            candidates: Vec::new(),
+            affinity_policy: "preferred-group".to_string(),
+            affinity: None,
+            conditional_routes: Vec::new(),
+        }
     }
 
     async fn empty_snapshot(state: &ProxyState, cfg: Arc<ProxyConfig>) -> Snapshot {
@@ -4259,6 +4292,47 @@ mod tests {
             .expect("balance refresh should finish")
             .expect("balance refresh should send outcome");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn route_graph_global_route_target_key_invalidates_preview() {
+        let (proxy, cfg) = proxy_with_single_station_without_upstreams();
+        let state = ProxyState::new();
+        let mut providers = vec![ProviderOption {
+            name: "input".to_string(),
+            enabled: true,
+            active: true,
+            ..ProviderOption::default()
+        }];
+        let snapshot = empty_snapshot(state.as_ref(), cfg).await;
+        let mut ui = UiState {
+            page: Page::Stations,
+            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+            routing_explain: Some(stale_routing_explain()),
+            last_routing_control_refresh_at: Some(Instant::now()),
+            ..UiState::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let handled = super::handle_key_event(
+            state.clone(),
+            &mut providers,
+            &mut ui,
+            &snapshot,
+            &proxy,
+            tx,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await;
+
+        assert!(handled);
+        assert_eq!(
+            state.get_global_route_target_override().await.as_deref(),
+            Some("input")
+        );
+        assert!(ui.routing_explain.is_none());
+        assert!(ui.last_routing_control_refresh_at.is_none());
+        assert!(ui.needs_snapshot_refresh);
     }
 
     #[test]
@@ -4769,6 +4843,7 @@ async fn handle_key_provider_menu(
                     match result {
                         Ok(()) => {
                             let label = if ui.uses_route_graph_routing() {
+                                invalidate_route_target_preview(ui);
                                 "global route target"
                             } else {
                                 "global station pin"
@@ -4808,6 +4883,7 @@ async fn handle_key_provider_menu(
                     };
                     if ui.uses_route_graph_routing() {
                         apply_session_route_target_override(state, sid, chosen.clone()).await;
+                        invalidate_route_target_preview(ui);
                     } else {
                         apply_session_provider_override(state, sid, chosen.clone()).await;
                     }

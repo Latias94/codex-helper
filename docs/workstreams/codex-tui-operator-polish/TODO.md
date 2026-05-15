@@ -66,8 +66,11 @@
   - Route graph routing details now separate target and balance lines, fold long
     provider order chains, and use compact provider table columns under narrow
     widths.
-- [ ] TUI-203 Invalidate route preview immediately after global/session
+- [x] TUI-203 Invalidate route preview immediately after global/session
   override changes.
+  - Route target override paths now clear stale routing explain data, queue a
+    snapshot refresh, and allow the next routing control tick to refresh explain
+    data without blocking the key handler.
 - [x] TUI-204 Add render tests for long route chains, many providers, and CJK
   station/provider labels.
 
