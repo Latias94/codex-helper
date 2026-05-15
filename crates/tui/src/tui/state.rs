@@ -11,11 +11,30 @@ use crate::usage_balance::{
     UsageBalanceRefreshInput, UsageBalanceView,
 };
 use crate::usage_providers::UsageProviderRefreshSummary;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::Language;
 use super::model::{RoutingSpecView, Snapshot, filtered_requests_len, routing_provider_names};
 use super::types::{Focus, Overlay, Page, StatsFocus};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tui) struct RoutingProviderRow {
+    pub(in crate::tui) name: String,
+    pub(in crate::tui) alias: Option<String>,
+    pub(in crate::tui) enabled: bool,
+    pub(in crate::tui) tags: BTreeMap<String, String>,
+    pub(in crate::tui) in_catalog: bool,
+}
+
+impl RoutingProviderRow {
+    pub(in crate::tui) fn display_label(&self) -> String {
+        self.alias
+            .as_deref()
+            .filter(|alias| !alias.trim().is_empty() && *alias != self.name)
+            .map(|alias| format!("{} ({alias})", self.name))
+            .unwrap_or_else(|| self.name.clone())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(in crate::tui) struct RecentCodexRow {
@@ -354,23 +373,72 @@ impl UiState {
     }
 
     pub(in crate::tui) fn routing_provider_order(&self) -> Option<Vec<String>> {
-        self.routing_spec.as_ref().map(routing_provider_names)
+        self.routing_provider_rows()
+            .map(|rows| rows.into_iter().map(|row| row.name).collect())
     }
 
     pub(in crate::tui) fn routing_provider_count(&self) -> Option<usize> {
-        self.routing_provider_order().map(|order| order.len())
+        self.routing_provider_rows().map(|rows| rows.len())
+    }
+
+    pub(in crate::tui) fn routing_provider_rows(&self) -> Option<Vec<RoutingProviderRow>> {
+        let spec = self.routing_spec.as_ref()?;
+        let catalog = spec
+            .providers
+            .iter()
+            .map(|provider| (provider.name.as_str(), provider))
+            .collect::<HashMap<_, _>>();
+        Some(
+            routing_provider_names(spec)
+                .into_iter()
+                .map(|name| {
+                    let provider = catalog.get(name.as_str()).copied();
+                    RoutingProviderRow {
+                        name,
+                        alias: provider.and_then(|provider| provider.alias.clone()),
+                        enabled: provider.map(|provider| provider.enabled).unwrap_or(false),
+                        tags: provider
+                            .map(|provider| provider.tags.clone())
+                            .unwrap_or_default(),
+                        in_catalog: provider.is_some(),
+                    }
+                })
+                .collect(),
+        )
     }
 
     pub(in crate::tui) fn selected_route_graph_provider_name(&self) -> Option<String> {
-        self.routing_provider_order()?
+        self.selected_route_graph_provider_row()
+            .map(|row| row.name.clone())
+    }
+
+    pub(in crate::tui) fn selected_route_graph_provider_row(&self) -> Option<RoutingProviderRow> {
+        self.routing_provider_rows()?
             .get(self.selected_station_idx)
             .cloned()
     }
 
-    pub(in crate::tui) fn selected_routing_menu_provider_name(&self) -> Option<String> {
-        self.routing_provider_order()?
+    pub(in crate::tui) fn selected_routing_menu_provider_row(&self) -> Option<RoutingProviderRow> {
+        self.routing_provider_rows()?
             .get(self.routing_menu_idx)
             .cloned()
+    }
+
+    pub(in crate::tui) fn reordered_routing_provider_order(
+        &self,
+        direction: isize,
+    ) -> Option<(Vec<String>, usize)> {
+        let mut order = self.routing_provider_order()?;
+        if order.is_empty() {
+            return None;
+        }
+        let current_idx = self.routing_menu_idx.min(order.len().saturating_sub(1));
+        let next_idx = current_idx.checked_add_signed(direction)?;
+        if next_idx >= order.len() {
+            return None;
+        }
+        order.swap(current_idx, next_idx);
+        Some((order, next_idx))
     }
 
     pub(in crate::tui) fn clamp_routing_menu_selection(&mut self) {
@@ -790,9 +858,8 @@ mod tests {
         assert!(!ui.uses_route_graph_routing());
     }
 
-    #[test]
-    fn route_graph_selection_tracks_provider_order_and_menu_sync() {
-        let spec = RoutingSpecView {
+    fn sample_route_graph_spec() -> RoutingSpecView {
+        RoutingSpecView {
             entry: "main".to_string(),
             routes: BTreeMap::new(),
             policy: crate::config::RoutingPolicyV4::OrderedFailover,
@@ -819,7 +886,12 @@ mod tests {
                     tags: BTreeMap::new(),
                 },
             ],
-        };
+        }
+    }
+
+    #[test]
+    fn route_graph_selection_tracks_provider_order_and_menu_sync() {
+        let spec = sample_route_graph_spec();
         let mut ui = UiState {
             config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
             routing_spec: Some(spec),
@@ -832,6 +904,12 @@ mod tests {
             ui.routing_provider_order(),
             Some(vec!["backup".to_string(), "input".to_string()])
         );
+        let rows = ui.routing_provider_rows().expect("routing rows");
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["backup", "input"]
+        );
+        assert_eq!(rows[1].display_label(), "input");
         assert_eq!(
             ui.selected_route_graph_provider_name().as_deref(),
             Some("input")
@@ -840,8 +918,8 @@ mod tests {
         ui.sync_routing_menu_with_station_selection();
         assert_eq!(ui.routing_menu_idx, 1);
         assert_eq!(
-            ui.selected_routing_menu_provider_name().as_deref(),
-            Some("input")
+            ui.selected_routing_menu_provider_row().map(|row| row.name),
+            Some("input".to_string())
         );
 
         ui.routing_menu_idx = 0;
@@ -850,6 +928,78 @@ mod tests {
         assert_eq!(
             ui.selected_route_graph_provider_name().as_deref(),
             Some("backup")
+        );
+    }
+
+    #[test]
+    fn route_graph_selection_clamps_after_refresh_and_stays_on_row_model() {
+        let mut spec = sample_route_graph_spec();
+        spec.expanded_order = vec!["backup".to_string()];
+        spec.providers
+            .retain(|provider| provider.name.as_str() == "backup");
+        let mut ui = UiState {
+            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+            routing_spec: Some(spec),
+            selected_station_idx: 9,
+            routing_menu_idx: 9,
+            ..UiState::default()
+        };
+        let snapshot = sample_usage_snapshot();
+
+        ui.clamp_selection(&snapshot, 2);
+        ui.clamp_routing_menu_selection();
+
+        assert_eq!(ui.selected_station_idx, 0);
+        assert_eq!(ui.routing_menu_idx, 0);
+        assert_eq!(
+            ui.selected_route_graph_provider_row()
+                .map(|row| (row.name, row.in_catalog)),
+            Some(("backup".to_string(), true))
+        );
+        assert_eq!(
+            ui.selected_routing_menu_provider_row()
+                .map(|row| (row.name, row.in_catalog)),
+            Some(("backup".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn route_graph_reorder_helper_returns_order_and_new_menu_selection() {
+        let spec = sample_route_graph_spec();
+        let ui = UiState {
+            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+            routing_spec: Some(spec),
+            routing_menu_idx: 1,
+            ..UiState::default()
+        };
+
+        let (order, next_idx) = ui
+            .reordered_routing_provider_order(-1)
+            .expect("selected row can move up");
+
+        assert_eq!(order, vec!["input".to_string(), "backup".to_string()]);
+        assert_eq!(next_idx, 0);
+        assert!(ui.reordered_routing_provider_order(1).is_none());
+    }
+
+    #[test]
+    fn route_graph_viewport_clamp_keeps_selected_detail_row_aligned() {
+        let spec = sample_route_graph_spec();
+        let mut ui = UiState {
+            config_version: Some(crate::config::CURRENT_ROUTE_GRAPH_CONFIG_VERSION),
+            routing_spec: Some(spec),
+            selected_station_idx: 8,
+            stations_table: TableState::default().with_offset(8).with_selected(Some(8)),
+            ..UiState::default()
+        };
+
+        ui.sync_route_graph_table_viewport(1);
+
+        assert_eq!(ui.selected_station_idx, 1);
+        assert_eq!(ui.stations_table.selected(), Some(1));
+        assert_eq!(
+            ui.selected_route_graph_provider_row().map(|row| row.name),
+            Some("input".to_string())
         );
     }
 

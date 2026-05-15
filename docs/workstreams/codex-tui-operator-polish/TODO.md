@@ -97,6 +97,9 @@
   - Route graph provider order, count, table selection, menu selection, and
     selected provider name now resolve through `UiState` helpers instead of
     each caller deriving them independently.
+  - Route graph provider rows now include catalog status, enabled state, alias,
+    and tags in one `UiState` row model consumed by the table, details, menu,
+    and reorder paths.
 - [~] TUI-401 Keep selection, viewport, and detail state synchronized after
   refresh, resize, and page switch.
   - Usage provider detail and report target now resolve through the same
@@ -104,11 +107,14 @@
   - Route graph table selection and routing menu selection are synchronized by
     routing order after opening the editor, moving providers, refreshing specs,
     and clamping table viewport.
+  - Added coverage for route graph selection after provider-list shrink,
+    viewport clamp, and reorder helper movement.
 - [~] TUI-402 Remove duplicated row derivation between render, selection, and
   report/export paths.
   - Usage / Balance provider row derivation is deduplicated. Routing row
-    derivation is partially centralized for route graph provider order and
-    selection; broader Routing row models remain open.
+    derivation is centralized for route graph provider rows, selection,
+    detail lookup, menu status, and reorder order generation. Broader
+    non-provider Routing view-model cleanup remains open.
 - [~] TUI-403 Add tests proving selected row and detail pane remain aligned
   after filtering and refresh.
   - Added state-level tests for filtered Usage provider selection and endpoint
@@ -116,6 +122,8 @@
   - Added a route graph state test proving provider selection follows routing
     order and stays synchronized with the routing menu when config provider
     order differs.
+  - Added route graph row-model tests for refresh shrink, reorder movement,
+    and viewport clamp keeping selected detail rows aligned.
 
 ## WS5 - Validation
 

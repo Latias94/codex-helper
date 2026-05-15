@@ -689,7 +689,7 @@ fn route_graph_condition_label(condition: Option<&crate::config::RoutingConditio
 
 fn routing_provider_matches_preference(
     spec: &crate::tui::model::RoutingSpecView,
-    provider: &crate::tui::model::RoutingProviderRef,
+    provider: &crate::tui::state::RoutingProviderRow,
 ) -> bool {
     matches!(spec.policy, crate::config::RoutingPolicyV4::TagPreferred)
         && spec.prefer_tags.iter().any(|filter| {
@@ -735,30 +735,25 @@ fn routing_provider_balance_brief_lang(
 }
 
 fn routing_provider_display_label(
-    provider: Option<&crate::tui::model::RoutingProviderRef>,
+    provider: Option<&crate::tui::state::RoutingProviderRow>,
     provider_name: &str,
 ) -> String {
-    let mut label = provider_name.to_string();
-    if let Some(alias) = provider
-        .and_then(|provider| provider.alias.as_deref())
-        .filter(|alias| !alias.trim().is_empty() && *alias != provider_name)
-    {
-        label = format!("{label} ({alias})");
-    }
-    label
+    provider
+        .map(crate::tui::state::RoutingProviderRow::display_label)
+        .unwrap_or_else(|| provider_name.to_string())
 }
 
 fn route_target_summary_line(
     snapshot: &Snapshot,
     target: Option<&str>,
-    provider_by_name: &HashMap<&str, &crate::tui::model::RoutingProviderRef>,
+    provider_by_name: &HashMap<&str, crate::tui::state::RoutingProviderRow>,
     max_width: usize,
     lang: Language,
 ) -> String {
     let Some(target) = target.filter(|target| !target.trim().is_empty()) else {
         return "-".to_string();
     };
-    let provider = provider_by_name.get(target).copied();
+    let provider = provider_by_name.get(target);
     let label = routing_provider_display_label(provider, target);
     let balance_width = max_width
         .saturating_div(2)
@@ -973,7 +968,7 @@ fn push_route_chain<'a>(
 fn routing_provider_marker(
     spec: &crate::tui::model::RoutingSpecView,
     provider_name: &str,
-    provider: Option<&crate::tui::model::RoutingProviderRef>,
+    provider: Option<&crate::tui::state::RoutingProviderRow>,
 ) -> &'static str {
     if spec.target.as_deref() == Some(provider_name) {
         "PIN"
@@ -1030,7 +1025,8 @@ fn render_route_graph_routing_page(
         return;
     };
 
-    let order = ui.routing_provider_order().unwrap_or_default();
+    let rows = ui.routing_provider_rows().unwrap_or_default();
+    let order = rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
     let selected_session = snapshot
         .rows
         .get(ui.selected_session_idx)
@@ -1041,10 +1037,9 @@ fn render_route_graph_routing_page(
         .get(ui.selected_session_idx)
         .and_then(|row| row.override_route_target.as_deref());
     let global_route_target = snapshot.global_route_target_override.as_deref();
-    let provider_by_name = spec
-        .providers
+    let provider_by_name = rows
         .iter()
-        .map(|provider| (provider.name.as_str(), provider))
+        .map(|row| (row.name.as_str(), row.clone()))
         .collect::<HashMap<_, _>>();
 
     let left_block = Block::default()
@@ -1091,31 +1086,26 @@ fn render_route_graph_routing_page(
     }
     .style(Style::default().fg(p.muted))
     .height(1);
-    let rows = order
+    let table_rows = rows
         .iter()
         .enumerate()
-        .map(|(idx, name)| {
-            let provider = provider_by_name.get(name.as_str()).copied();
-            let enabled = provider.map(|provider| provider.enabled).unwrap_or(false);
-            let marker = routing_provider_marker(&spec, name, provider);
-            let label = routing_provider_display_label(provider, name);
+        .map(|(idx, row)| {
+            let name = row.name.as_str();
+            let marker = routing_provider_marker(&spec, name, Some(row));
+            let label = row.display_label();
             let balance = routing_provider_balance_brief_lang(
                 snapshot,
                 name,
                 usize::from(balance_column_width),
                 lang,
             );
-            let style = if !enabled {
+            let style = if !row.enabled {
                 Style::default().fg(p.muted)
-            } else if session_route_target == Some(name.as_str()) {
+            } else if session_route_target == Some(name) {
                 Style::default().fg(p.focus).add_modifier(Modifier::BOLD)
-            } else if global_route_target == Some(name.as_str())
-                || spec.target.as_deref() == Some(name.as_str())
-            {
+            } else if global_route_target == Some(name) || spec.target.as_deref() == Some(name) {
                 Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
-            } else if provider
-                .is_some_and(|provider| routing_provider_matches_preference(&spec, provider))
-            {
+            } else if routing_provider_matches_preference(&spec, row) {
                 Style::default().fg(p.good)
             } else {
                 Style::default().fg(p.text)
@@ -1124,14 +1114,14 @@ fn render_route_graph_routing_page(
                 vec![
                     (idx + 1).to_string(),
                     shorten_middle(&label, 28),
-                    if enabled { l("on") } else { l("off") }.to_string(),
+                    if row.enabled { l("on") } else { l("off") }.to_string(),
                     balance,
                 ]
             } else {
                 vec![
                     (idx + 1).to_string(),
                     shorten_middle(&label, 28),
-                    if enabled { l("on") } else { l("off") }.to_string(),
+                    if row.enabled { l("on") } else { l("off") }.to_string(),
                     marker.to_string(),
                     balance,
                 ]
@@ -1158,7 +1148,7 @@ fn render_route_graph_routing_page(
             Constraint::Length(balance_column_width),
         ]
     };
-    let table = Table::new(rows, table_constraints)
+    let table = Table::new(table_rows, table_constraints)
         .header(header)
         .block(left_block)
         .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
@@ -1166,9 +1156,8 @@ fn render_route_graph_routing_page(
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, columns[0], &mut ui.stations_table);
 
-    let selected_name = ui.selected_route_graph_provider_name();
-    let selected_name = selected_name.as_deref();
-    let selected_provider = selected_name.and_then(|name| provider_by_name.get(name).copied());
+    let selected_row = ui.selected_route_graph_provider_row();
+    let selected_name = selected_row.as_ref().map(|row| row.name.as_str());
     let right_title = selected_name
         .map(|name| format!("{}: {name}", l("Provider routing")))
         .unwrap_or_else(|| l("Provider routing").to_string());
@@ -1211,7 +1200,7 @@ fn render_route_graph_routing_page(
     );
     let active_route_target_label = active_route_target
         .filter(|target| !target.trim().is_empty())
-        .map(|target| routing_provider_display_label(provider_by_name.get(target).copied(), target))
+        .map(|target| routing_provider_display_label(provider_by_name.get(target), target))
         .unwrap_or_else(|| "-".to_string());
     let target_style = if session_route_target.is_some() {
         p.focus
@@ -1320,7 +1309,7 @@ fn render_route_graph_routing_page(
 
     if let Some(name) = selected_name {
         lines.push(Line::from(""));
-        if let Some(provider) = selected_provider {
+        if let Some(provider) = selected_row.as_ref().filter(|row| row.in_catalog) {
             if let Some(alias) = provider
                 .alias
                 .as_deref()

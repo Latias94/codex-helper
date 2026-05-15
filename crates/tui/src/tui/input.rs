@@ -4980,16 +4980,13 @@ async fn handle_key_provider_menu(
 }
 
 fn selected_routing_provider_name(ui: &UiState) -> Option<String> {
-    ui.selected_routing_menu_provider_name()
+    ui.selected_routing_menu_provider_row().map(|row| row.name)
 }
 
 fn selected_routing_provider_enabled(ui: &UiState) -> Option<bool> {
-    let spec = ui.routing_spec.as_ref()?;
-    let name = selected_routing_provider_name(ui)?;
-    spec.providers
-        .iter()
-        .find(|provider| provider.name == name)
-        .map(|provider| provider.enabled)
+    ui.selected_routing_menu_provider_row()
+        .filter(|row| row.in_catalog)
+        .map(|row| row.enabled)
 }
 
 fn routing_spec_with_order(
@@ -5099,14 +5096,10 @@ async fn handle_key_routing_menu(
                 ));
                 return true;
             }
-            let Some(mut order) = ui.routing_provider_order() else {
+            let Some((order, next_idx)) = ui.reordered_routing_provider_order(-1) else {
                 return true;
             };
-            if ui.routing_menu_idx == 0 || ui.routing_menu_idx >= order.len() {
-                return true;
-            }
-            order.swap(ui.routing_menu_idx, ui.routing_menu_idx - 1);
-            ui.routing_menu_idx = ui.routing_menu_idx.saturating_sub(1);
+            ui.routing_menu_idx = next_idx;
             let next = routing_spec_with_order(
                 &spec,
                 order,
@@ -5146,14 +5139,10 @@ async fn handle_key_routing_menu(
                 ));
                 return true;
             }
-            let Some(mut order) = ui.routing_provider_order() else {
+            let Some((order, next_idx)) = ui.reordered_routing_provider_order(1) else {
                 return true;
             };
-            if ui.routing_menu_idx + 1 >= order.len() {
-                return true;
-            }
-            order.swap(ui.routing_menu_idx, ui.routing_menu_idx + 1);
-            ui.routing_menu_idx += 1;
+            ui.routing_menu_idx = next_idx;
             let next = routing_spec_with_order(
                 &spec,
                 order,
