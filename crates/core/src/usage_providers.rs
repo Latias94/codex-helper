@@ -231,10 +231,13 @@ struct RefreshProviderTargetParams<'a> {
 
 // 全局节流状态：按 provider.id 记录最近一次查询时间，避免高频请求。
 static LAST_USAGE_POLL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+static REQUEST_BALANCE_QUEUE: OnceLock<Mutex<HashMap<RequestBalanceQueueKey, Instant>>> =
+    OnceLock::new();
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 // Minimal poll interval per provider to avoid hammering usage APIs.
 const MIN_POLL_INTERVAL_SECS: u64 = 20;
+const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(8);
 const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const BALANCE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
@@ -245,6 +248,16 @@ const AUTO_PROBE_KINDS: [ProviderKind; 5] = [
     ProviderKind::NewApiUserSelf,
     ProviderKind::OpenAiBalanceHttpJson,
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum RequestBalanceQueueKey {
+    ProviderEndpoint(ProviderEndpointKey),
+    LegacyUpstream {
+        service_name: String,
+        station_name: String,
+        upstream_index: usize,
+    },
+}
 
 fn bool_is_false(value: &bool) -> bool {
     !*value
@@ -645,6 +658,41 @@ fn target_key(target: &UsageProviderTarget) -> UsageProviderTargetKey {
     UsageProviderTargetKey {
         station_name: target.upstream.station_name.clone(),
         upstream_index: target.upstream.index,
+    }
+}
+
+fn enqueue_request_balance_refresh(key: RequestBalanceQueueKey) -> bool {
+    let now = Instant::now();
+    let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut queue = match queue.lock() {
+        Ok(queue) => queue,
+        Err(_) => return false,
+    };
+
+    if let Some(due_at) = queue.get(&key)
+        && *due_at > now
+    {
+        return false;
+    }
+
+    queue.insert(key, now + REQUEST_BALANCE_REFRESH_DELAY);
+    true
+}
+
+fn take_request_balance_refresh_if_due(key: &RequestBalanceQueueKey) -> bool {
+    let now = Instant::now();
+    let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut queue = match queue.lock() {
+        Ok(queue) => queue,
+        Err(_) => return false,
+    };
+
+    match queue.get(key).copied() {
+        Some(due_at) if due_at <= now => {
+            queue.remove(key);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2654,8 +2702,8 @@ pub async fn refresh_balances_for_service(
 }
 
 /// 在特定 Codex upstream 请求结束后，按需查询一次用量并更新 LB 状态。
-/// 设计为轻量的“按需刷新”，而非后台定时轮询。
-pub async fn poll_for_codex_upstream(
+/// 设计为轻量的请求驱动延迟队列，而非全量后台定时轮询。
+pub fn enqueue_poll_for_codex_upstream(
     client: Client,
     cfg: Arc<ProxyConfig>,
     lb_states: Arc<Mutex<HashMap<String, LbState>>>,
@@ -2664,15 +2712,45 @@ pub async fn poll_for_codex_upstream(
     station_name: &str,
     upstream_index: usize,
 ) {
-    let current_target =
-        usage_provider_target_for_legacy_upstream(&cfg, service_name, station_name, upstream_index);
-    poll_for_codex_target(client, cfg, lb_states, state, service_name, current_target).await;
+    let key = RequestBalanceQueueKey::LegacyUpstream {
+        service_name: service_name.to_string(),
+        station_name: station_name.to_string(),
+        upstream_index,
+    };
+    if !enqueue_request_balance_refresh(key.clone()) {
+        return;
+    }
+
+    let service_name = service_name.to_string();
+    let station_name = station_name.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(REQUEST_BALANCE_REFRESH_DELAY).await;
+        if !take_request_balance_refresh_if_due(&key) {
+            return;
+        }
+
+        let current_target = usage_provider_target_for_legacy_upstream(
+            &cfg,
+            service_name.as_str(),
+            &station_name,
+            upstream_index,
+        );
+        poll_for_codex_target(
+            client,
+            cfg,
+            lb_states,
+            state,
+            service_name.as_str(),
+            current_target,
+        )
+        .await;
+    });
 }
 
 /// Provider-endpoint keyed variant used by the route graph executor.
 /// Station/upstream are still updated inside the usage provider as a compatibility projection
 /// when the current runtime config can map the endpoint back to one legacy upstream.
-pub async fn poll_for_codex_provider_endpoint(
+pub fn enqueue_poll_for_codex_provider_endpoint(
     client: Client,
     cfg: Arc<ProxyConfig>,
     lb_states: Arc<Mutex<HashMap<String, LbState>>>,
@@ -2680,9 +2758,33 @@ pub async fn poll_for_codex_provider_endpoint(
     service_name: &str,
     provider_endpoint: ProviderEndpointKey,
 ) {
-    let current_target =
-        usage_provider_target_for_provider_endpoint(&cfg, service_name, &provider_endpoint);
-    poll_for_codex_target(client, cfg, lb_states, state, service_name, current_target).await;
+    let key = RequestBalanceQueueKey::ProviderEndpoint(provider_endpoint.clone());
+    if !enqueue_request_balance_refresh(key.clone()) {
+        return;
+    }
+
+    let service_name = service_name.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(REQUEST_BALANCE_REFRESH_DELAY).await;
+        if !take_request_balance_refresh_if_due(&key) {
+            return;
+        }
+
+        let current_target = usage_provider_target_for_provider_endpoint(
+            &cfg,
+            service_name.as_str(),
+            &provider_endpoint,
+        );
+        poll_for_codex_target(
+            client,
+            cfg,
+            lb_states,
+            state,
+            service_name.as_str(),
+            current_target,
+        )
+        .await;
+    });
 }
 
 async fn poll_for_codex_target(
@@ -3160,6 +3262,55 @@ mod tests {
         );
         assert_eq!(target.base_url, "https://right.example/v1");
         assert_eq!(target.provider_id.as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn request_balance_queue_deduplicates_until_due() {
+        let key = RequestBalanceQueueKey::ProviderEndpoint(ProviderEndpointKey::new(
+            "codex", "input", "default",
+        ));
+        let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let mut queue = queue.lock().expect("queue");
+            queue.remove(&key);
+        }
+
+        assert!(enqueue_request_balance_refresh(key.clone()));
+        assert!(!enqueue_request_balance_refresh(key.clone()));
+        assert!(!take_request_balance_refresh_if_due(&key));
+
+        {
+            let mut queue = queue.lock().expect("queue");
+            queue.insert(key.clone(), Instant::now() - Duration::from_secs(1));
+        }
+
+        assert!(take_request_balance_refresh_if_due(&key));
+        assert!(!take_request_balance_refresh_if_due(&key));
+        assert!(enqueue_request_balance_refresh(key.clone()));
+
+        queue.lock().expect("queue").remove(&key);
+    }
+
+    #[test]
+    fn request_balance_queue_distinguishes_legacy_upstreams() {
+        let key = RequestBalanceQueueKey::LegacyUpstream {
+            service_name: "codex".to_string(),
+            station_name: "routing".to_string(),
+            upstream_index: 2,
+        };
+        let same_key = RequestBalanceQueueKey::LegacyUpstream {
+            service_name: "codex".to_string(),
+            station_name: "routing".to_string(),
+            upstream_index: 2,
+        };
+        let other_key = RequestBalanceQueueKey::LegacyUpstream {
+            service_name: "codex".to_string(),
+            station_name: "routing".to_string(),
+            upstream_index: 3,
+        };
+
+        assert_eq!(key, same_key);
+        assert_ne!(key, other_key);
     }
 
     #[test]

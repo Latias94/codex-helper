@@ -506,42 +506,33 @@ pub(super) async fn build_sse_success_response(
 
     if is_user_turn && is_codex_service {
         let cfg_snapshot = proxy.config.snapshot().await;
-        tokio::spawn({
-            let cfg = cfg_snapshot;
-            let lb_states = proxy.lb_states.clone();
-            let state = proxy.state.clone();
-            let client = proxy.client.clone();
-            let service_name = proxy.service_name.to_string();
-            let provider_endpoint = target.provider_endpoint_ref().cloned();
-            let compatibility_station = target.compatibility_station_name().map(ToOwned::to_owned);
-            let compatibility_upstream_index = target.compatibility_upstream_index();
-            async move {
-                if let Some(provider_endpoint) = provider_endpoint {
-                    usage_providers::poll_for_codex_provider_endpoint(
-                        client,
-                        cfg,
-                        lb_states,
-                        state,
-                        service_name.as_str(),
-                        provider_endpoint,
-                    )
-                    .await;
-                } else if let (Some(station_name), Some(upstream_index)) =
-                    (compatibility_station, compatibility_upstream_index)
-                {
-                    usage_providers::poll_for_codex_upstream(
-                        client,
-                        cfg,
-                        lb_states,
-                        state,
-                        service_name.as_str(),
-                        &station_name,
-                        upstream_index,
-                    )
-                    .await;
-                }
-            }
-        });
+        let lb_states = proxy.lb_states.clone();
+        let state = proxy.state.clone();
+        let client = proxy.client.clone();
+        let service_name = proxy.service_name.to_string();
+        if let Some(provider_endpoint) = target.provider_endpoint_ref().cloned() {
+            usage_providers::enqueue_poll_for_codex_provider_endpoint(
+                client,
+                cfg_snapshot,
+                lb_states,
+                state,
+                service_name.as_str(),
+                provider_endpoint,
+            );
+        } else if let (Some(station_name), Some(upstream_index)) = (
+            target.compatibility_station_name().map(ToOwned::to_owned),
+            target.compatibility_upstream_index(),
+        ) {
+            usage_providers::enqueue_poll_for_codex_upstream(
+                client,
+                cfg_snapshot,
+                lb_states,
+                state,
+                service_name.as_str(),
+                &station_name,
+                upstream_index,
+            );
+        }
     }
 
     let stream = resp.bytes_stream().map(move |item| {
