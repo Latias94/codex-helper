@@ -339,7 +339,7 @@ fn effective_poll_interval_secs(provider: &UsageProviderConfig) -> Option<u64> {
 fn remaining_poll_cooldown(last: Instant, interval_secs: u64, now: Instant) -> Option<Duration> {
     let interval = Duration::from_secs(interval_secs);
     let elapsed = now.saturating_duration_since(last);
-    (elapsed < interval).then_some(interval - elapsed)
+    interval.checked_sub(elapsed).filter(|d| !d.is_zero())
 }
 
 fn usage_providers_path() -> std::path::PathBuf {
@@ -3378,6 +3378,10 @@ mod tests {
         );
         assert_eq!(
             remaining_poll_cooldown(now - Duration::from_secs(60), 60, now),
+            None
+        );
+        assert_eq!(
+            remaining_poll_cooldown(now - Duration::from_secs(61), 60, now),
             None
         );
     }
