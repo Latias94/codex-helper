@@ -7,7 +7,7 @@ use super::state::UiState;
 use super::types::StatsFocus;
 use crate::state::UsageBucket;
 use crate::usage::UsageMetrics;
-use crate::usage_balance::{UsageBalanceBuildInput, UsageBalanceRefreshInput, UsageBalanceView};
+use crate::usage_balance::UsageBalanceView;
 
 #[derive(Debug, Clone)]
 pub(in crate::tui) enum StatsTarget {
@@ -144,9 +144,10 @@ fn fmt_usage_line(u: &UsageMetrics, lang: Language) -> String {
     line
 }
 
-pub(in crate::tui) fn selected_stats_target(
+fn selected_stats_target_from_view(
     ui: &UiState,
     snapshot: &super::model::Snapshot,
+    usage_balance: &UsageBalanceView,
 ) -> Option<StatsTarget> {
     match ui.stats_focus {
         StatsFocus::Stations => snapshot
@@ -154,24 +155,9 @@ pub(in crate::tui) fn selected_stats_target(
             .by_config
             .get(ui.selected_stats_station_idx)
             .map(|(k, _)| StatsTarget::Station(k.clone())),
-        StatsFocus::Providers => {
-            let usage_balance = UsageBalanceView::build(UsageBalanceBuildInput {
-                service_name: ui.service_name,
-                window_days: ui.stats_days,
-                generated_at_ms: crate::tui::model::now_ms(),
-                usage_rollup: &snapshot.usage_rollup,
-                provider_balances: &snapshot.provider_balances,
-                recent: &snapshot.recent,
-                routing_explain: ui.routing_explain.as_ref(),
-                refresh: UsageBalanceRefreshInput::default(),
-            });
-            usage_balance
-                .provider_rows
-                .iter()
-                .filter(|row| !ui.stats_attention_only || row.needs_attention())
-                .nth(ui.selected_stats_provider_idx)
-                .map(|row| StatsTarget::Provider(row.provider_id.clone()))
-        }
+        StatsFocus::Providers => ui
+            .selected_usage_balance_provider_row(usage_balance)
+            .map(|row| StatsTarget::Provider(row.provider_id.clone())),
     }
 }
 
@@ -180,7 +166,8 @@ pub(in crate::tui) fn build_stats_report(
     snapshot: &super::model::Snapshot,
     now_ms: u64,
 ) -> Option<String> {
-    let target = selected_stats_target(ui, snapshot)?;
+    let usage_balance = ui.usage_balance_view_for_report(snapshot, now_ms);
+    let target = selected_stats_target_from_view(ui, snapshot, &usage_balance)?;
 
     let window_series = match &target {
         StatsTarget::Station(name) => snapshot
@@ -199,16 +186,6 @@ pub(in crate::tui) fn build_stats_report(
 
     let window_bucket = sum_buckets(&window_series);
     let recent = compute_recent_breakdown(ui, snapshot, &target);
-    let usage_balance = UsageBalanceView::build(UsageBalanceBuildInput {
-        service_name: ui.service_name,
-        window_days: ui.stats_days,
-        generated_at_ms: now_ms,
-        usage_rollup: &snapshot.usage_rollup,
-        provider_balances: &snapshot.provider_balances,
-        recent: &snapshot.recent,
-        routing_explain: ui.routing_explain.as_ref(),
-        refresh: UsageBalanceRefreshInput::default(),
-    });
 
     let (kind, name) = match &target {
         StatsTarget::Station(n) => (i18n::label(ui.language, "station"), n.as_str()),

@@ -6,7 +6,10 @@ use crate::routing_explain::RoutingExplainResponse;
 use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
 };
-use crate::usage_balance::{UsageBalanceBuildInput, UsageBalanceRefreshInput, UsageBalanceView};
+use crate::usage_balance::{
+    UsageBalanceBuildInput, UsageBalanceEndpointRow, UsageBalanceProviderRow,
+    UsageBalanceRefreshInput, UsageBalanceView,
+};
 use crate::usage_providers::UsageProviderRefreshSummary;
 use std::collections::HashMap;
 
@@ -394,11 +397,66 @@ impl UiState {
     }
 
     pub(in crate::tui) fn usage_balance_provider_rows_len(&self, snapshot: &Snapshot) -> usize {
-        usage_balance_view_for_selection(self, snapshot)
-            .provider_rows
+        let view = self.usage_balance_view_for_selection(snapshot);
+        self.filtered_usage_balance_provider_rows(&view).len()
+    }
+
+    pub(in crate::tui) fn usage_balance_view_for_selection(
+        &self,
+        snapshot: &Snapshot,
+    ) -> UsageBalanceView {
+        self.usage_balance_view_with_refresh(snapshot, crate::tui::model::now_ms(), {
+            UsageBalanceRefreshInput {
+                refreshing: self.balance_refresh_in_flight,
+                last_message: self.last_balance_refresh_message.clone(),
+                last_error: self.last_balance_refresh_error.clone(),
+                last_provider_refresh: self.last_balance_refresh_summary.clone(),
+            }
+        })
+    }
+
+    pub(in crate::tui) fn usage_balance_view_for_report(
+        &self,
+        snapshot: &Snapshot,
+        generated_at_ms: u64,
+    ) -> UsageBalanceView {
+        self.usage_balance_view_with_refresh(
+            snapshot,
+            generated_at_ms,
+            UsageBalanceRefreshInput::default(),
+        )
+    }
+
+    pub(in crate::tui) fn filtered_usage_balance_provider_rows<'a>(
+        &self,
+        view: &'a UsageBalanceView,
+    ) -> Vec<&'a UsageBalanceProviderRow> {
+        view.provider_rows
             .iter()
             .filter(|row| !self.stats_attention_only || row.needs_attention())
-            .count()
+            .collect()
+    }
+
+    pub(in crate::tui) fn selected_usage_balance_provider_row<'a>(
+        &self,
+        view: &'a UsageBalanceView,
+    ) -> Option<&'a UsageBalanceProviderRow> {
+        self.filtered_usage_balance_provider_rows(view)
+            .into_iter()
+            .nth(self.selected_stats_provider_idx)
+    }
+
+    pub(in crate::tui) fn selected_usage_balance_provider_endpoints<'a>(
+        &self,
+        view: &'a UsageBalanceView,
+    ) -> Vec<&'a UsageBalanceEndpointRow> {
+        let Some(provider) = self.selected_usage_balance_provider_row(view) else {
+            return Vec::new();
+        };
+        view.endpoint_rows
+            .iter()
+            .filter(|row| row.provider_id == provider.provider_id)
+            .collect()
     }
 }
 
@@ -483,24 +541,36 @@ pub(in crate::tui) fn adjust_table_selection(
     clamp_table_selection(table, Some(next), len)
 }
 
-fn usage_balance_view_for_selection(ui: &UiState, snapshot: &Snapshot) -> UsageBalanceView {
-    UsageBalanceView::build(UsageBalanceBuildInput {
-        service_name: ui.service_name,
-        window_days: ui.stats_days,
-        generated_at_ms: crate::tui::model::now_ms(),
-        usage_rollup: &snapshot.usage_rollup,
-        provider_balances: &snapshot.provider_balances,
-        recent: &snapshot.recent,
-        routing_explain: ui.routing_explain.as_ref(),
-        refresh: UsageBalanceRefreshInput::default(),
-    })
+impl UiState {
+    fn usage_balance_view_with_refresh(
+        &self,
+        snapshot: &Snapshot,
+        generated_at_ms: u64,
+        refresh: UsageBalanceRefreshInput,
+    ) -> UsageBalanceView {
+        UsageBalanceView::build(UsageBalanceBuildInput {
+            service_name: self.service_name,
+            window_days: self.stats_days,
+            generated_at_ms,
+            usage_rollup: &snapshot.usage_rollup,
+            provider_balances: &snapshot.provider_balances,
+            recent: &snapshot.recent,
+            routing_explain: self.routing_explain.as_ref(),
+            refresh,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use super::*;
+    use crate::state::{
+        BalanceSnapshotStatus, ProviderBalanceSnapshot, UsageBucket, UsageRollupView,
+    };
+    use crate::tui::types::StatsFocus;
 
     fn sample_summary(id: &str, path: &str, source: SessionSummarySource) -> SessionSummary {
         SessionSummary {
@@ -516,6 +586,48 @@ mod tests {
             first_user_message: None,
             source,
             sort_hint_ms: None,
+        }
+    }
+
+    fn sample_usage_snapshot() -> Snapshot {
+        Snapshot {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            model_overrides: HashMap::new(),
+            overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: HashMap::new(),
+            usage_rollup: UsageRollupView {
+                by_provider: vec![(
+                    "stale-provider".to_string(),
+                    UsageBucket {
+                        requests_total: 2,
+                        ..UsageBucket::default()
+                    },
+                )],
+                ..UsageRollupView::default()
+            },
+            provider_balances: HashMap::from([(
+                "stale-provider".to_string(),
+                vec![ProviderBalanceSnapshot {
+                    provider_id: "stale-provider".to_string(),
+                    upstream_index: Some(7),
+                    status: BalanceSnapshotStatus::Stale,
+                    error: Some("refresh failed".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                }],
+            )]),
+            station_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: crate::dashboard_core::WindowStats::default(),
+            stats_1h: crate::dashboard_core::WindowStats::default(),
+            pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
+            refreshed_at: std::time::Instant::now(),
         }
     }
 
@@ -640,5 +752,45 @@ mod tests {
         assert_eq!(ui.stations_table.offset(), 0);
         assert_eq!(ui.sessions_table.selected(), Some(4));
         assert_eq!(ui.sessions_table.offset(), 0);
+    }
+
+    #[test]
+    fn usage_balance_selection_uses_same_filtered_provider_rows_as_table() {
+        let snapshot = sample_usage_snapshot();
+        let ui = UiState {
+            stats_focus: StatsFocus::Providers,
+            stats_attention_only: true,
+            selected_stats_provider_idx: 0,
+            ..UiState::default()
+        };
+
+        let view = ui.usage_balance_view_for_report(&snapshot, 123);
+        let rows = ui.filtered_usage_balance_provider_rows(&view);
+        let selected = ui
+            .selected_usage_balance_provider_row(&view)
+            .expect("selected provider");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_id, "stale-provider");
+        assert_eq!(selected.provider_id, "stale-provider");
+        assert_eq!(ui.usage_balance_provider_rows_len(&snapshot), 1);
+    }
+
+    #[test]
+    fn usage_balance_selected_endpoints_follow_filtered_provider_selection() {
+        let snapshot = sample_usage_snapshot();
+        let ui = UiState {
+            stats_focus: StatsFocus::Providers,
+            stats_attention_only: true,
+            selected_stats_provider_idx: 0,
+            ..UiState::default()
+        };
+
+        let view = ui.usage_balance_view_for_report(&snapshot, 123);
+        let endpoints = ui.selected_usage_balance_provider_endpoints(&view);
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].provider_id, "stale-provider");
+        assert_eq!(endpoints[0].endpoint_id, "upstream#7");
     }
 }

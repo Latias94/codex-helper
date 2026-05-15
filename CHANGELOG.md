@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 - TUI 设置或清除全局/会话 route target 后，会立即清掉旧路由预览并刷新快照，避免短时间显示过期 provider 或余额信息。
 - TUI 底部快捷键栏改为只保留当前页面的关键操作，`?` 帮助会先显示当前页面完整快捷键，窄终端下隐藏的动作仍可发现。
 - TUI `Usage` 页面支持按 `g` 直接刷新余额；刷新失败会显示为错误状态，但不会阻塞页面刷新或其他 provider 的余额刷新。
+- TUI `Usage` 页面的 provider 表格、详情面板和报告导出现在共用同一套筛选后的行模型，降低关注项筛选后详情或导出目标错位的风险。
 - GUI 统计页和余额概览迁移到同一套 core `UsageBalanceView` 语义，`unknown`、`stale`、`exhausted`、`error` 和 `unlimited` 不再由各 UI 自行混算。
 - 路由页继续只保留紧凑余额上下文，详细用量、余额和 endpoint 分析统一到 `Usage / Balance`。
 
@@ -30,6 +31,7 @@ All notable changes to this project will be documented in this file.
 - After setting or clearing a global/session route target in the TUI, stale routing previews are invalidated immediately and a snapshot refresh is queued, avoiding short-lived stale provider or balance text.
 - The TUI footer now keeps only page-critical actions. Press `?` to open page-aware help first, so actions hidden from narrow footers remain discoverable.
 - Press `g` on the TUI `Usage` page to refresh balances. Failures stay visible as state/errors without blocking UI redraws or other provider refreshes.
+- The TUI `Usage` provider table, detail pane, and report export now share the same filtered row model, reducing the risk of detail/export target drift after attention filtering.
 - The GUI stats and balance views now consume the shared core `UsageBalanceView`, so `unknown`, `stale`, `exhausted`, `error`, and `unlimited` stay distinct across UI surfaces.
 - Routing pages keep compact balance context; detailed usage, balance, and endpoint inspection lives in `Usage / Balance`.
 

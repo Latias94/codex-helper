@@ -13,37 +13,19 @@ use crate::tui::Language;
 use crate::tui::ProviderOption;
 use crate::tui::i18n;
 use crate::tui::model::{
-    Palette, Snapshot, duration_short, now_ms, provider_balance_compact_lang, shorten,
-    shorten_middle, station_balance_brief_lang, tokens_short,
+    Palette, Snapshot, duration_short, provider_balance_compact_lang, shorten, shorten_middle,
+    station_balance_brief_lang, tokens_short,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
 use crate::usage::UsageMetrics;
 use crate::usage_balance::{
-    UsageBalanceBuildInput, UsageBalanceEndpointRow, UsageBalanceProviderRow,
-    UsageBalanceRefreshInput, UsageBalanceStatus, UsageBalanceStatusCounts, UsageBalanceView,
+    UsageBalanceEndpointRow, UsageBalanceProviderRow, UsageBalanceStatus, UsageBalanceStatusCounts,
+    UsageBalanceView,
 };
 
 const STATS_BALANCE_COLUMN_WIDTH: u16 = 14;
 const STATS_ENDPOINT_BALANCE_COLUMN_WIDTH: u16 = 28;
-
-fn build_usage_balance_view(ui: &UiState, snapshot: &Snapshot) -> UsageBalanceView {
-    UsageBalanceView::build(UsageBalanceBuildInput {
-        service_name: ui.service_name,
-        window_days: ui.stats_days,
-        generated_at_ms: now_ms(),
-        usage_rollup: &snapshot.usage_rollup,
-        provider_balances: &snapshot.provider_balances,
-        recent: &snapshot.recent,
-        routing_explain: ui.routing_explain.as_ref(),
-        refresh: UsageBalanceRefreshInput {
-            refreshing: ui.balance_refresh_in_flight,
-            last_message: ui.last_balance_refresh_message.clone(),
-            last_error: ui.last_balance_refresh_error.clone(),
-            last_provider_refresh: ui.last_balance_refresh_summary.clone(),
-        },
-    })
-}
 
 fn stats_window_label(days: usize, lang: Language) -> String {
     match days {
@@ -400,15 +382,6 @@ fn provider_balance_brief(
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn filtered_provider_rows(
-    rows: &[UsageBalanceProviderRow],
-    attention_only: bool,
-) -> Vec<&UsageBalanceProviderRow> {
-    rows.iter()
-        .filter(|row| !attention_only || row.needs_attention())
-        .collect()
-}
-
 fn filter_suffix(attention_only: bool, lang: Language) -> String {
     if attention_only {
         format!(" · {}", i18n::label(lang, "attention only"))
@@ -464,7 +437,7 @@ pub(super) fn render_stats_page(
     _providers: &[ProviderOption],
     area: Rect,
 ) {
-    let usage_balance = build_usage_balance_view(ui, snapshot);
+    let usage_balance = ui.usage_balance_view_for_selection(snapshot);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -681,8 +654,7 @@ fn render_tables(
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(cols[0]);
-    let provider_rows =
-        filtered_provider_rows(&usage_balance.provider_rows, ui.stats_attention_only);
+    let provider_rows = ui.filtered_usage_balance_provider_rows(usage_balance);
 
     render_bucket_table_stateful(
         f,
@@ -1064,11 +1036,7 @@ fn render_provider_usage_detail(
         inner[0],
     );
 
-    let endpoints = usage_balance
-        .endpoint_rows
-        .iter()
-        .filter(|endpoint| endpoint.provider_id == row.provider_id)
-        .collect::<Vec<_>>();
+    let endpoints = ui.selected_usage_balance_provider_endpoints(usage_balance);
     let visible_rows = endpoint_visible_rows(inner[1]);
     let max_scroll = endpoints.len().saturating_sub(visible_rows) as u16;
     ui.stats_provider_detail_scroll = ui.stats_provider_detail_scroll.min(max_scroll);
@@ -1228,7 +1196,7 @@ fn render_detail_panel(
     ui: &mut UiState,
     snapshot: &Snapshot,
     usage_balance: &UsageBalanceView,
-    provider_rows: &[&UsageBalanceProviderRow],
+    _provider_rows: &[&UsageBalanceProviderRow],
     window_label: &str,
     area: Rect,
     lang: Language,
@@ -1240,7 +1208,7 @@ fn render_detail_panel(
             p,
             ui,
             usage_balance,
-            provider_rows.get(ui.selected_stats_provider_idx).copied(),
+            ui.selected_usage_balance_provider_row(usage_balance),
             window_label,
             area,
             lang,
@@ -1751,17 +1719,14 @@ mod tests {
             stats_attention_only: true,
             ..UiState::default()
         };
-        let view = build_usage_balance_view(&ui, &snapshot);
+        let view = ui.usage_balance_view_for_selection(&snapshot);
 
-        let rows = filtered_provider_rows(&view.provider_rows, ui.stats_attention_only);
+        let rows = ui.filtered_usage_balance_provider_rows(&view);
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].provider_id, "超级中转套餐年度输入提供商");
         ui.stats_attention_only = false;
-        assert_eq!(
-            filtered_provider_rows(&view.provider_rows, ui.stats_attention_only).len(),
-            2
-        );
+        assert_eq!(ui.filtered_usage_balance_provider_rows(&view).len(), 2);
     }
 
     #[test]
@@ -1789,7 +1754,7 @@ mod tests {
             }),
             ..UiState::default()
         };
-        let view = build_usage_balance_view(&ui, &snapshot);
+        let view = ui.usage_balance_view_for_selection(&snapshot);
         let line = usage_refresh_line(&view, Language::En);
 
         assert!(line.contains("ok 3/4"), "{line}");
@@ -1858,12 +1823,15 @@ mod tests {
             stats_provider_detail_scroll: 3,
             ..UiState::default()
         };
-        let view = build_usage_balance_view(&ui, &snapshot);
-        let row = view
+        let view = ui.usage_balance_view_for_selection(&snapshot);
+        ui.selected_stats_provider_idx = view
             .provider_rows
             .iter()
-            .find(|row| row.provider_id == "scroll-provider")
+            .position(|row| row.provider_id == "scroll-provider")
             .expect("provider row");
+        let row = ui
+            .selected_usage_balance_provider_row(&view)
+            .expect("selected provider row");
         let backend = TestBackend::new(100, 16);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let frame = terminal

@@ -90,13 +90,22 @@
 
 ## WS4 - Page State And View Models
 
-- [ ] TUI-400 Introduce or tighten page view models for Usage and Routing.
-- [ ] TUI-401 Keep selection, viewport, and detail state synchronized after
+- [~] TUI-400 Introduce or tighten page view models for Usage and Routing.
+  - First slice centralizes Usage / Balance view construction and filtered
+    provider row selection in `UiState`; render, detail, and report paths now
+    consume the same provider-row model.
+- [~] TUI-401 Keep selection, viewport, and detail state synchronized after
   refresh, resize, and page switch.
+  - Usage provider detail and report target now resolve through the same
+    filtered selection helper used for table length.
 - [ ] TUI-402 Remove duplicated row derivation between render, selection, and
   report/export paths.
+  - Usage / Balance provider row derivation is deduplicated. Routing row
+    derivation remains open.
 - [ ] TUI-403 Add tests proving selected row and detail pane remain aligned
   after filtering and refresh.
+  - Added state-level tests for filtered Usage provider selection and endpoint
+    detail alignment.
 
 ## WS5 - Validation
 
