@@ -58,14 +58,17 @@
 
 ## WS2 - Routing Page Polish
 
-- [ ] TUI-200 Rename or shorten repeated route-target labels where page context
+- [x] TUI-200 Rename or shorten repeated route-target labels where page context
   already carries the meaning.
-- [ ] TUI-201 Fold long candidate chains into a count plus selected/full detail.
-- [ ] TUI-202 Keep override source, selected target, and balance warnings
+- [x] TUI-201 Fold long candidate chains into a count plus selected/full detail.
+- [x] TUI-202 Keep override source, selected target, and balance warnings
   visible under narrow widths.
+  - Route graph routing details now separate target and balance lines, fold long
+    provider order chains, and use compact provider table columns under narrow
+    widths.
 - [ ] TUI-203 Invalidate route preview immediately after global/session
   override changes.
-- [ ] TUI-204 Add render tests for long route chains, many providers, and CJK
+- [x] TUI-204 Add render tests for long route chains, many providers, and CJK
   station/provider labels.
 
 ## WS3 - Footer And Help

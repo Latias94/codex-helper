@@ -380,6 +380,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "focus" => "焦点",
         "focused from" => "聚焦来源",
         "generation" => "生成",
+        "global" => "全局",
         "global override" => "全局覆盖",
         "global station pin" => "全局站点 pin",
         "global route target" => "全局 route target",

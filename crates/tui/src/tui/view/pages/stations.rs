@@ -4,6 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::dashboard_core::{
     StationRetryBoundary, StationRoutingCandidate, StationRoutingMode, StationRoutingPosture,
@@ -751,22 +752,44 @@ fn route_target_summary_line(
     snapshot: &Snapshot,
     target: Option<&str>,
     provider_by_name: &HashMap<&str, &crate::tui::model::RoutingProviderRef>,
+    max_width: usize,
     lang: Language,
 ) -> String {
     let Some(target) = target.filter(|target| !target.trim().is_empty()) else {
         return "-".to_string();
     };
     let provider = provider_by_name.get(target).copied();
-    let mut parts = vec![routing_provider_display_label(provider, target)];
-    let balance =
-        routing_provider_balance_brief_lang(snapshot, target, ROUTING_BALANCE_SUMMARY_WIDTH, lang);
-    if balance != "-" {
-        parts.push(balance);
+    let label = routing_provider_display_label(provider, target);
+    let balance_width = max_width
+        .saturating_div(2)
+        .clamp(10, ROUTING_BALANCE_SUMMARY_WIDTH);
+    let balance = routing_provider_balance_brief_lang(snapshot, target, balance_width, lang);
+    let mut parts = vec![label.clone()];
+    let has_balance = balance != "-";
+    if has_balance {
+        parts.push(balance.clone());
     }
     if provider.is_none() {
         parts.push(i18n::label(lang, "not in catalog").to_string());
     }
-    parts.join(" | ")
+    let full = parts.join(" | ");
+    if UnicodeWidthStr::width(full.as_str()) <= max_width {
+        return full;
+    }
+
+    if has_balance {
+        let suffix = format!(" | {balance}");
+        let suffix_width = UnicodeWidthStr::width(suffix.as_str());
+        if suffix_width < max_width {
+            let label_width = max_width.saturating_sub(suffix_width);
+            let compact = format!("{}{}", shorten_middle(&label, label_width), suffix);
+            if UnicodeWidthStr::width(compact.as_str()) <= max_width {
+                return compact;
+            }
+        }
+    }
+
+    shorten_middle(&label, max_width)
 }
 
 fn push_wrapped_segments<'a>(
@@ -813,6 +836,138 @@ fn push_wrapped_segments<'a>(
             Span::styled(line, Style::default().fg(p.text)),
         ]));
     }
+}
+
+fn push_wrapped_segment_body<'a>(
+    lines: &mut Vec<Line<'a>>,
+    p: Palette,
+    segments: &[String],
+    separator: &str,
+    max_width: usize,
+) {
+    let mut line = String::new();
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+        let candidate = if line.is_empty() {
+            segment.clone()
+        } else {
+            format!("{line}{separator}{segment}")
+        };
+        if line.is_empty() || UnicodeWidthStr::width(candidate.as_str()) <= max_width {
+            line = candidate;
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(p.text)),
+            ]));
+            line = segment.clone();
+        }
+    }
+    if line.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("-", Style::default().fg(p.muted)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(line, Style::default().fg(p.text)),
+        ]));
+    }
+}
+
+fn folded_route_chain_segments(
+    segments: &[String],
+    selected: Option<&str>,
+    max_items: usize,
+) -> Vec<String> {
+    if segments.len() <= max_items.max(1) {
+        return segments.to_vec();
+    }
+
+    let mut keep = BTreeSet::new();
+    keep.insert(0usize);
+    if max_items >= 5 && segments.len() > 1 {
+        keep.insert(1);
+    }
+    if segments.len() > 1 {
+        keep.insert(segments.len() - 1);
+    }
+    if max_items >= 6 && segments.len() > 2 {
+        keep.insert(segments.len() - 2);
+    }
+    if let Some(selected_idx) =
+        selected.and_then(|selected| segments.iter().position(|segment| segment == selected))
+    {
+        keep.insert(selected_idx);
+    }
+
+    let mut out = Vec::new();
+    let mut last_idx = None;
+    for idx in keep {
+        if let Some(prev) = last_idx {
+            let gap = idx.saturating_sub(prev + 1);
+            if gap > 0 {
+                out.push(format!("... +{gap}"));
+            }
+        }
+        let mut item = segments[idx].clone();
+        if selected.is_some_and(|selected| selected == segments[idx]) {
+            item = format!("*{item}");
+        }
+        out.push(item);
+        last_idx = Some(idx);
+    }
+    out
+}
+
+fn route_chain_summary(segments: &[String], selected: Option<&str>, lang: Language) -> String {
+    let total = segments.len();
+    let selected = selected
+        .and_then(|selected| {
+            segments
+                .iter()
+                .position(|segment| segment == selected)
+                .map(|idx| (idx, selected))
+        })
+        .map(|(idx, selected)| match lang {
+            Language::Zh => format!("选中 {selected} #{}/{}", idx + 1, total),
+            Language::En => format!("selected {selected} #{}/{}", idx + 1, total),
+        });
+    match (lang, selected) {
+        (Language::Zh, Some(selected)) => format!("{total} 个 provider · {selected}"),
+        (Language::Zh, None) => format!("{total} 个 provider"),
+        (Language::En, Some(selected)) => format!("{total} providers · {selected}"),
+        (Language::En, None) => format!("{total} providers"),
+    }
+}
+
+fn push_route_chain<'a>(
+    lines: &mut Vec<Line<'a>>,
+    p: Palette,
+    label: &str,
+    segments: &[String],
+    selected: Option<&str>,
+    max_width: usize,
+    lang: Language,
+) {
+    const SEPARATOR: &str = " > ";
+    if segments.len() <= 6 {
+        push_wrapped_segments(lines, p, label, segments, SEPARATOR, max_width);
+        return;
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(p.muted)),
+        Span::styled(
+            route_chain_summary(segments, selected, lang),
+            Style::default().fg(p.muted),
+        ),
+    ]));
+    let folded = folded_route_chain_segments(segments, selected, 6);
+    push_wrapped_segment_body(lines, p, &folded, SEPARATOR, max_width);
 }
 
 fn routing_provider_marker(
@@ -909,9 +1064,33 @@ fn render_route_graph_routing_page(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new(["#", l("Provider"), l("On"), l("Route"), l("Balance/Quota")])
-        .style(Style::default().fg(p.muted))
-        .height(1);
+    let left_inner_width = left_block.inner(columns[0]).width;
+    let compact_provider_table = left_inner_width < 52;
+    let balance_column_width = if compact_provider_table {
+        left_inner_width
+            .saturating_sub(19)
+            .clamp(10, ROUTING_BALANCE_COLUMN_WIDTH)
+    } else {
+        ROUTING_BALANCE_COLUMN_WIDTH
+    };
+    let header = if compact_provider_table {
+        Row::new(vec![
+            "#".to_string(),
+            l("Provider").to_string(),
+            l("On").to_string(),
+            l("Balance/Quota").to_string(),
+        ])
+    } else {
+        Row::new(vec![
+            "#".to_string(),
+            l("Provider").to_string(),
+            l("On").to_string(),
+            l("Route").to_string(),
+            l("Balance/Quota").to_string(),
+        ])
+    }
+    .style(Style::default().fg(p.muted))
+    .height(1);
     let rows = order
         .iter()
         .enumerate()
@@ -923,7 +1102,7 @@ fn render_route_graph_routing_page(
             let balance = routing_provider_balance_brief_lang(
                 snapshot,
                 name,
-                usize::from(ROUTING_BALANCE_COLUMN_WIDTH),
+                usize::from(balance_column_width),
                 lang,
             );
             let style = if !enabled {
@@ -941,35 +1120,50 @@ fn render_route_graph_routing_page(
             } else {
                 Style::default().fg(p.text)
             };
-            Row::new([
-                (idx + 1).to_string(),
-                shorten_middle(&label, 28),
-                if enabled { l("on") } else { l("off") }.to_string(),
-                marker.to_string(),
-                balance,
-            ])
-            .style(style)
-            .height(1)
+            let cells = if compact_provider_table {
+                vec![
+                    (idx + 1).to_string(),
+                    shorten_middle(&label, 28),
+                    if enabled { l("on") } else { l("off") }.to_string(),
+                    balance,
+                ]
+            } else {
+                vec![
+                    (idx + 1).to_string(),
+                    shorten_middle(&label, 28),
+                    if enabled { l("on") } else { l("off") }.to_string(),
+                    marker.to_string(),
+                    balance,
+                ]
+            };
+            Row::new(cells).style(style).height(1)
         })
         .collect::<Vec<_>>();
 
     let table_visible_rows = usize::from(left_block.inner(columns[0]).height.saturating_sub(1));
     ui.sync_stations_table_viewport(order.len(), table_visible_rows);
-    let table = Table::new(
-        rows,
-        [
+    let table_constraints = if compact_provider_table {
+        vec![
+            Constraint::Length(4),
+            Constraint::Min(10),
+            Constraint::Length(3),
+            Constraint::Length(balance_column_width),
+        ]
+    } else {
+        vec![
             Constraint::Length(4),
             Constraint::Min(10),
             Constraint::Length(3),
             Constraint::Length(5),
-            Constraint::Length(ROUTING_BALANCE_COLUMN_WIDTH),
-        ],
-    )
-    .header(header)
-    .block(left_block)
-    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
-    .highlight_symbol("  ")
-    .highlight_spacing(HighlightSpacing::Always);
+            Constraint::Length(balance_column_width),
+        ]
+    };
+    let table = Table::new(rows, table_constraints)
+        .header(header)
+        .block(left_block)
+        .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)).fg(p.text))
+        .highlight_symbol("  ")
+        .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, columns[0], &mut ui.stations_table);
 
     let selected_name = order.get(ui.selected_station_idx).map(String::as_str);
@@ -977,13 +1171,14 @@ fn render_route_graph_routing_page(
     let right_title = selected_name
         .map(|name| format!("{}: {name}", l("Provider routing")))
         .unwrap_or_else(|| l("Provider routing").to_string());
+    let right_detail_width = usize::from(columns[1].width.saturating_sub(2)).clamp(24, 96);
 
     let mut lines = Vec::new();
     let active_route_target = session_route_target.or(global_route_target);
     let route_target_source = if session_route_target.is_some() {
         i18n::label(lang, "session")
     } else if global_route_target.is_some() {
-        "global"
+        i18n::label(lang, "global")
     } else {
         "-"
     };
@@ -1006,22 +1201,42 @@ fn render_route_graph_routing_page(
             }),
         ),
     ]));
+    let active_route_target_summary = route_target_summary_line(
+        snapshot,
+        active_route_target,
+        &provider_by_name,
+        right_detail_width,
+        lang,
+    );
+    let active_route_target_label = active_route_target
+        .filter(|target| !target.trim().is_empty())
+        .map(|target| routing_provider_display_label(provider_by_name.get(target).copied(), target))
+        .unwrap_or_else(|| "-".to_string());
+    let target_style = if session_route_target.is_some() {
+        p.focus
+    } else if global_route_target.is_some() {
+        p.accent
+    } else {
+        p.muted
+    };
     lines.push(Line::from(vec![
+        Span::styled(format!("{}: ", l("target")), Style::default().fg(p.muted)),
         Span::styled(
-            format!("{}: ", l("route_target")),
-            Style::default().fg(p.muted),
-        ),
-        Span::styled(
-            route_target_summary_line(snapshot, active_route_target, &provider_by_name, lang),
-            Style::default().fg(if session_route_target.is_some() {
-                p.focus
-            } else if global_route_target.is_some() {
-                p.accent
-            } else {
-                p.muted
-            }),
+            shorten_middle(&active_route_target_label, right_detail_width),
+            Style::default().fg(target_style),
         ),
     ]));
+    if active_route_target_summary != active_route_target_label
+        && active_route_target_summary != "-"
+    {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}: ", l("balance")), Style::default().fg(p.muted)),
+            Span::styled(
+                shorten_middle(&active_route_target_summary, right_detail_width),
+                Style::default().fg(target_style),
+            ),
+        ]));
+    }
     lines.push(Line::from(vec![
         Span::styled(format!("{}: ", l("policy")), Style::default().fg(p.muted)),
         Span::styled(
@@ -1029,9 +1244,12 @@ fn render_route_graph_routing_page(
             Style::default().fg(p.text),
         ),
         Span::raw("   "),
-        Span::styled(format!("{}: ", l("target")), Style::default().fg(p.muted)),
+        Span::styled(format!("{}: ", l("pinned")), Style::default().fg(p.muted)),
         Span::styled(
-            spec.target.as_deref().unwrap_or("-"),
+            shorten_middle(
+                spec.target.as_deref().unwrap_or("-"),
+                right_detail_width / 3,
+            ),
             Style::default().fg(if spec.target.is_some() {
                 p.accent
             } else {
@@ -1054,7 +1272,7 @@ fn render_route_graph_routing_page(
             Style::default().fg(p.muted),
         ),
         Span::styled(
-            routing_prefer_tags_label(&spec.prefer_tags, 80),
+            routing_prefer_tags_label(&spec.prefer_tags, right_detail_width),
             Style::default().fg(if spec.prefer_tags.is_empty() {
                 p.muted
             } else {
@@ -1062,7 +1280,15 @@ fn render_route_graph_routing_page(
             }),
         ),
     ]));
-    push_wrapped_segments(&mut lines, p, l("order"), &order, " > ", 96);
+    push_route_chain(
+        &mut lines,
+        p,
+        l("order"),
+        &order,
+        selected_name,
+        right_detail_width,
+        lang,
+    );
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
@@ -1079,7 +1305,10 @@ fn render_route_graph_routing_page(
         } else {
             Style::default().fg(p.muted)
         };
-        lines.push(Line::from(Span::styled(line.clone(), style)));
+        lines.push(Line::from(Span::styled(
+            shorten_middle(line, right_detail_width),
+            style,
+        )));
     }
     if graph_lines.len() > graph_limit {
         lines.push(Line::from(Span::styled(
@@ -1117,7 +1346,7 @@ fn render_route_graph_routing_page(
             lines.push(Line::from(vec![
                 Span::styled(format!("{}: ", l("tags")), Style::default().fg(p.muted)),
                 Span::styled(
-                    routing_tags_label(&provider.tags, 96),
+                    routing_tags_label(&provider.tags, right_detail_width),
                     Style::default().fg(p.text),
                 ),
             ]));
@@ -1153,7 +1382,7 @@ fn render_route_graph_routing_page(
                     ),
                     Span::raw("  "),
                     Span::styled(
-                        provider_balance_compact_lang(balance, 72, lang),
+                        provider_balance_compact_lang(balance, right_detail_width, lang),
                         Style::default().fg(p.text),
                     ),
                 ]));
@@ -1165,7 +1394,11 @@ fn render_route_graph_routing_page(
                     lines.push(Line::from(vec![
                         Span::raw("     "),
                         Span::styled(
-                            format!("{}: {}", l("balance lookup failed"), shorten(err, 56)),
+                            format!(
+                                "{}: {}",
+                                l("balance lookup failed"),
+                                shorten(err, right_detail_width.saturating_sub(24))
+                            ),
                             Style::default().fg(p.muted),
                         ),
                     ]));
@@ -1814,9 +2047,16 @@ pub(super) fn render_stations_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
     use crate::state::BalanceSnapshotStatus;
     use crate::tui::UpstreamSummary;
     use crate::tui::model::station_balance_brief;
+    use crate::tui::types::Page;
 
     fn provider(
         name: &str,
@@ -1838,6 +2078,69 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn empty_snapshot(
+        provider_balances: HashMap<String, Vec<crate::state::ProviderBalanceSnapshot>>,
+        global_route_target_override: Option<String>,
+    ) -> Snapshot {
+        Snapshot {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            model_overrides: HashMap::new(),
+            overrides: HashMap::new(),
+            station_overrides: HashMap::new(),
+            route_target_overrides: HashMap::new(),
+            service_tier_overrides: HashMap::new(),
+            global_station_override: None,
+            global_route_target_override,
+            station_meta_overrides: HashMap::new(),
+            usage_rollup: crate::state::UsageRollupView::default(),
+            provider_balances,
+            station_health: HashMap::new(),
+            health_checks: HashMap::new(),
+            lb_view: HashMap::new(),
+            stats_5m: crate::dashboard_core::WindowStats::default(),
+            stats_1h: crate::dashboard_core::WindowStats::default(),
+            pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    fn routing_provider(name: &str) -> crate::tui::model::RoutingProviderRef {
+        crate::tui::model::RoutingProviderRef {
+            name: name.to_string(),
+            alias: None,
+            enabled: true,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let mut out = String::new();
+        for y in buffer.area.y..buffer.area.y.saturating_add(buffer.area.height) {
+            for x in buffer.area.x..buffer.area.x.saturating_add(buffer.area.width) {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render_stations_text(
+        width: u16,
+        height: u16,
+        ui: &mut UiState,
+        snapshot: &Snapshot,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let frame = terminal
+            .draw(|frame| {
+                render_stations_page(frame, Palette::default(), ui, snapshot, &[], frame.area());
+            })
+            .expect("draw");
+        buffer_text(frame.buffer)
     }
 
     #[test]
@@ -2256,6 +2559,107 @@ mod tests {
         assert!(text.contains("input4"), "{text}");
         assert!(text.contains("input-light"), "{text}");
         assert!(!text.contains('…'), "{text}");
+    }
+
+    #[test]
+    fn folded_route_order_keeps_selected_provider_visible() {
+        let order = [
+            "input",
+            "input1",
+            "input2",
+            "input3",
+            "input4",
+            "input-light",
+            "centos",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        let folded = folded_route_chain_segments(&order, Some("input-light"), 6);
+        let text = folded.join(" > ");
+
+        assert!(text.contains("*input-light"), "{text}");
+        assert!(text.contains("input"), "{text}");
+        assert!(text.contains("centos"), "{text}");
+        assert!(text.contains("... +"), "{text}");
+        assert!(!text.contains("inp…ght"), "{text}");
+    }
+
+    #[test]
+    fn route_graph_routing_render_folds_long_order_and_keeps_target_balance_visible() {
+        let order = [
+            "input",
+            "input1",
+            "input2",
+            "input3",
+            "input4",
+            "input-light",
+            "centos",
+            "超级中转套餐年度输入提供商",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let spec = crate::tui::model::RoutingSpecView {
+            entry: "main".to_string(),
+            routes: BTreeMap::from([(
+                "main".to_string(),
+                crate::config::RoutingNodeV4 {
+                    strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+                    children: order.clone(),
+                    ..crate::config::RoutingNodeV4::default()
+                },
+            )]),
+            policy: crate::config::RoutingPolicyV4::OrderedFailover,
+            order: Vec::new(),
+            target: None,
+            prefer_tags: Vec::new(),
+            chain: Vec::new(),
+            pools: BTreeMap::new(),
+            on_exhausted: crate::config::RoutingExhaustedActionV4::Continue,
+            entry_strategy: crate::config::RoutingPolicyV4::OrderedFailover,
+            expanded_order: order.clone(),
+            entry_target: None,
+            providers: order.iter().map(|name| routing_provider(name)).collect(),
+        };
+        let snapshot = empty_snapshot(
+            HashMap::from([(
+                "input-light".to_string(),
+                vec![crate::state::ProviderBalanceSnapshot {
+                    provider_id: "input-light".to_string(),
+                    status: BalanceSnapshotStatus::Exhausted,
+                    exhausted: Some(true),
+                    exhaustion_affects_routing: false,
+                    quota_period: Some("daily".to_string()),
+                    quota_remaining_usd: Some("0".to_string()),
+                    quota_limit_usd: Some("300".to_string()),
+                    ..crate::state::ProviderBalanceSnapshot::default()
+                }],
+            )]),
+            Some("input-light".to_string()),
+        );
+        let mut ui = UiState {
+            page: Page::Stations,
+            config_version: Some(5),
+            routing_spec: Some(spec),
+            selected_station_idx: 5,
+            language: Language::Zh,
+            ..UiState::default()
+        };
+
+        let text = render_stations_text(84, 28, &mut ui, &snapshot);
+
+        assert!(text.contains("provider") && text.contains("#6/8"), "{text}");
+        assert!(text.contains("*input-light"), "{text}");
+        assert!(text.contains("$0/$300.00"), "{text}");
+        assert!(
+            text.contains("不") && text.contains("降") && text.contains("级"),
+            "{text}"
+        );
+        assert!(text.contains("超") && text.contains("级"), "{text}");
+        assert!(!text.contains("inp…ght"), "{text}");
+        assert!(!text.contains("$0/$│"), "{text}");
     }
 
     #[test]
