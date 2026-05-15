@@ -20,9 +20,9 @@
 
 - [x] Should attention filters be global across TUI pages or scoped to
   Usage / Balance first?
-- [ ] Should the help overlay become page-aware before or after footer cleanup?
+- [x] Should the help overlay become page-aware before or after footer cleanup?
 - [ ] What is the minimum supported terminal width for full-page operation?
-- [ ] Should route candidate chains use horizontal scrolling, folded summaries,
+- [x] Should route candidate chains use horizontal scrolling, folded summaries,
   or both?
 
 ## WS0 - Baseline And Test Fixtures
@@ -76,11 +76,17 @@
 
 ## WS3 - Footer And Help
 
-- [~] TUI-300 Define page-critical footer actions for each page.
-- [ ] TUI-301 Move secondary actions into a page-aware help overlay.
-- [~] TUI-302 Add display-width compaction for footer segments.
-- [~] TUI-303 Ensure hidden footer actions remain discoverable in help.
-- [ ] TUI-304 Add tests for footer overflow and page-specific help text.
+- [x] TUI-300 Define page-critical footer actions for each page.
+  - Footer copy now keeps only navigation, primary page actions, and `? help`.
+- [x] TUI-301 Move secondary actions into a page-aware help overlay.
+  - Help opens with a current-page section before the full key reference.
+- [x] TUI-302 Add display-width compaction for footer segments.
+  - Footer splitting now bounds both lines by display width and keeps the help
+    entry visible when secondary actions are hidden.
+- [x] TUI-303 Ensure hidden footer actions remain discoverable in help.
+  - Routing policy edits, billing tags, reorder keys, Usage detail scrolling,
+    export, and page jumps are listed in page-aware help.
+- [x] TUI-304 Add tests for footer overflow and page-specific help text.
 
 ## WS4 - Page State And View Models
 

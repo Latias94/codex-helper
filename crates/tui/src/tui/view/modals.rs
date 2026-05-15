@@ -15,9 +15,209 @@ use crate::tui::model::{
     station_balance_brief_lang, station_primary_balance_snapshot,
 };
 use crate::tui::state::UiState;
-use crate::tui::types::{EffortChoice, Overlay, ServiceTierChoice};
+use crate::tui::types::{EffortChoice, Overlay, Page, ServiceTierChoice};
 
 use super::widgets::centered_rect;
+
+fn help_heading(text: impl Into<String>, p: Palette) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        text.into(),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )])
+}
+
+fn help_current_page_title(lang: Language, page: Page, is_route_graph: bool) -> &'static str {
+    match (lang, page, is_route_graph) {
+        (Language::Zh, Page::Dashboard, _) => "当前页面：总览",
+        (Language::Zh, Page::Stations, true) => "当前页面：路由",
+        (Language::Zh, Page::Stations, false) => "当前页面：站点",
+        (Language::Zh, Page::Sessions, _) => "当前页面：会话",
+        (Language::Zh, Page::Requests, _) => "当前页面：请求",
+        (Language::Zh, Page::Stats, _) => "当前页面：用量",
+        (Language::Zh, Page::Settings, _) => "当前页面：设置",
+        (Language::Zh, Page::History, _) => "当前页面：历史",
+        (Language::Zh, Page::Recent, _) => "当前页面：最近",
+        (Language::En, Page::Dashboard, _) => "Current page: Dashboard",
+        (Language::En, Page::Stations, true) => "Current page: Routing",
+        (Language::En, Page::Stations, false) => "Current page: Stations",
+        (Language::En, Page::Sessions, _) => "Current page: Sessions",
+        (Language::En, Page::Requests, _) => "Current page: Requests",
+        (Language::En, Page::Stats, _) => "Current page: Usage",
+        (Language::En, Page::Settings, _) => "Current page: Settings",
+        (Language::En, Page::History, _) => "Current page: History",
+        (Language::En, Page::Recent, _) => "Current page: Recent",
+    }
+}
+
+fn current_page_help_lines(
+    lang: Language,
+    page: Page,
+    is_route_graph: bool,
+    is_codex_service: bool,
+    p: Palette,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![help_heading(
+        help_current_page_title(lang, page, is_route_graph),
+        p,
+    )];
+
+    let entries = match (lang, page, is_route_graph, is_codex_service) {
+        (Language::Zh, Page::Dashboard, true, _) => vec![
+            "  Tab        切换会话/请求焦点",
+            "  b/M/f      会话 profile、model、fast/service tier 覆盖",
+            "  Enter      打开 effort 菜单；l/m/h/X 快速设置；x 清除",
+            "  p/P        打开会话/全局 route target 编辑",
+            "  O/H o/h    从会话或请求面板跳到关联页面",
+        ],
+        (Language::Zh, Page::Dashboard, false, _) => vec![
+            "  Tab        切换会话/请求焦点",
+            "  b/M/f      会话 profile、model、fast/service tier 覆盖",
+            "  Enter      打开 effort 菜单；l/m/h/X 快速设置；x 清除",
+            "  p/P        设置会话站点覆盖 / 全局站点 pin",
+            "  O/H o/h    从会话或请求面板跳到关联页面",
+        ],
+        (Language::Zh, Page::Stations, true, _) => vec![
+            "  r/Enter    打开 routing 编辑器",
+            "  g          刷新路由预览与余额",
+            "  e/f/s      启停、包月优先、耗尽策略",
+            "  1/2/0      设置 monthly/paygo/unknown billing tag",
+            "  Backspace  清除全局 route target；o/O 设置或清除会话 route target",
+            "  []/u/d     调整 provider 顺序",
+        ],
+        (Language::Zh, Page::Stations, false, _) => vec![
+            "  Enter      设置全局站点 pin；Backspace 清除",
+            "  o/O        设置或清除当前会话站点覆盖",
+            "  i          查看站点详情",
+            "  h/H        检查当前/全部站点；c/C 取消检查",
+        ],
+        (Language::Zh, Page::Sessions, _, _) => vec![
+            "  b/M/f      会话 profile、model、fast/service tier 覆盖",
+            "  R          重置当前会话 manual overrides",
+            "  a/e/v      活跃、错误、覆盖筛选；r 重置筛选",
+            "  t          打开全屏对话记录",
+            "  o/H        跳到 Requests / History",
+        ],
+        (Language::Zh, Page::Requests, _, _) => vec![
+            "  e          仅看错误",
+            "  s          切换当前会话 / 全部请求",
+            "  x          清除显式 session 聚焦",
+            "  o/h        跳到 Sessions / History",
+        ],
+        (Language::Zh, Page::Stats, _, _) => vec![
+            "  Tab        切换站点汇总 / provider 用量",
+            "  a          仅看余额或刷新需要关注的 provider",
+            "  g          刷新 provider 余额",
+            "  d          切换 today / 7d / 30d / loaded 窗口",
+            "  PgUp/PgDn  滚动 provider endpoint 详情；y 复制并导出报告",
+        ],
+        (Language::Zh, Page::Settings, _, true) => vec![
+            "  p/P        管理配置默认 profile / 运行时默认 profile",
+            "  R          重载运行时配置",
+            "  O          从 ~/.codex 覆盖导入站点，需要二次确认",
+        ],
+        (Language::Zh, Page::Settings, _, false) => vec![
+            "  p/P        管理配置默认 profile / 运行时默认 profile",
+            "  R          重载运行时配置",
+        ],
+        (Language::Zh, Page::History, _, _) => vec![
+            "  r          刷新历史会话列表",
+            "  t/Enter    打开全屏对话记录",
+            "  s/f        跳到 Sessions / Requests",
+        ],
+        (Language::Zh, Page::Recent, _, _) => vec![
+            "  [ / ]      切换时间窗口",
+            "  Enter/y    复制选中项 / 复制可见列表",
+            "  t          打开全屏对话记录",
+            "  s/f/h      跳到 Sessions / Requests / History",
+        ],
+        (Language::En, Page::Dashboard, true, _) => vec![
+            "  Tab        switch Sessions / Requests focus",
+            "  b/M/f      session profile, model, fast/service tier overrides",
+            "  Enter      open effort menu; l/m/h/X quick set; x clear",
+            "  p/P        open session/global route target editor",
+            "  O/H o/h    jump from session or request panels",
+        ],
+        (Language::En, Page::Dashboard, false, _) => vec![
+            "  Tab        switch Sessions / Requests focus",
+            "  b/M/f      session profile, model, fast/service tier overrides",
+            "  Enter      open effort menu; l/m/h/X quick set; x clear",
+            "  p/P        set session station override / global station pin",
+            "  O/H o/h    jump from session or request panels",
+        ],
+        (Language::En, Page::Stations, true, _) => vec![
+            "  r/Enter    open routing editor",
+            "  g          refresh routing preview and balances",
+            "  e/f/s      enable, monthly-first, exhausted action",
+            "  1/2/0      set monthly/paygo/unknown billing tag",
+            "  Backspace  clear global route target; o/O set or clear session route target",
+            "  []/u/d     reorder providers",
+        ],
+        (Language::En, Page::Stations, false, _) => vec![
+            "  Enter      set global station pin; Backspace clears it",
+            "  o/O        set or clear current session station override",
+            "  i          open station details",
+            "  h/H        check selected/all stations; c/C cancel checks",
+        ],
+        (Language::En, Page::Sessions, _, _) => vec![
+            "  b/M/f      session profile, model, fast/service tier overrides",
+            "  R          reset current session manual overrides",
+            "  a/e/v      active, error, override filters; r resets filters",
+            "  t          open full-screen transcript",
+            "  o/H        jump to Requests / History",
+        ],
+        (Language::En, Page::Requests, _, _) => vec![
+            "  e          toggle errors-only",
+            "  s          switch current session / all requests",
+            "  x          clear explicit session focus",
+            "  o/h        jump to Sessions / History",
+        ],
+        (Language::En, Page::Stats, _, _) => vec![
+            "  Tab        switch station rollup / provider usage",
+            "  a          show providers needing balance or refresh attention",
+            "  g          refresh provider balances",
+            "  d          cycle today / 7d / 30d / loaded window",
+            "  PgUp/PgDn  scroll provider endpoint details; y copies and exports a report",
+        ],
+        (Language::En, Page::Settings, _, true) => vec![
+            "  p/P        manage configured default profile / runtime default profile",
+            "  R          reload runtime config",
+            "  O          overwrite-import stations from ~/.codex, with confirmation",
+        ],
+        (Language::En, Page::Settings, _, false) => vec![
+            "  p/P        manage configured default profile / runtime default profile",
+            "  R          reload runtime config",
+        ],
+        (Language::En, Page::History, _, _) => vec![
+            "  r          refresh history session list",
+            "  t/Enter    open full-screen transcript",
+            "  s/f        jump to Sessions / Requests",
+        ],
+        (Language::En, Page::Recent, _, _) => vec![
+            "  [ / ]      switch time window",
+            "  Enter/y    copy selected item / visible list",
+            "  t          open full-screen transcript",
+            "  s/f/h      jump to Sessions / Requests / History",
+        ],
+    };
+
+    lines.extend(entries.into_iter().map(Line::from));
+    lines.push(Line::from(""));
+    lines
+}
+
+#[cfg(test)]
+fn help_text_for_tests(lines: &[Line<'_>]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn profile_option_to_service_profile(
     profile: &ControlProfileOption,
@@ -746,7 +946,9 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
         .border_style(Style::default().fg(p.focus))
         .style(Style::default().bg(p.panel));
 
-    let lines = if lang == crate::tui::Language::Zh {
+    let mut lines =
+        current_page_help_lines(lang, ui.page, is_route_graph, ui.service_name == "codex", p);
+    lines.extend(if lang == crate::tui::Language::Zh {
         vec![
             Line::from(vec![Span::styled(
                 "导航",
@@ -755,7 +957,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  ↑/↓, j/k   移动选中项"),
             Line::from("  1-8        切换页面"),
             Line::from(
-                "            1 总览  2 站点  3 会话  4 请求  5 统计  6 设置  7 历史  8 最近",
+                "            1 总览  2 站点/路由  3 会话  4 请求  5 用量  6 设置  7 历史  8 最近",
             ),
             Line::from("  L          切换语言（中/英，自动落盘）"),
             Line::from("  6 设置     查看运行态与关键配置入口"),
@@ -890,7 +1092,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  s/f/h      打开到 Sessions / Requests / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "统计页（Stats）",
+                "用量页（Usage）",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from("  Tab        切换焦点（station vs provider）"),
@@ -918,7 +1120,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  ↑/↓, j/k   move selection"),
             Line::from("  1-8        switch page"),
             Line::from(
-                "            1 Dashboard  2 Stations  3 Sessions  4 Requests  5 Stats  6 Settings  7 History  8 Recent",
+                "            1 Dashboard  2 Stations/Routing  3 Sessions  4 Requests  5 Usage  6 Settings  7 History  8 Recent",
             ),
             Line::from("  L          toggle language (zh/en, persisted)"),
             Line::from("  6 Settings show runtime + station overview"),
@@ -1054,7 +1256,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  s/f/h      open in Sessions / Requests / History"),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "Stats page",
+                "Usage page",
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )]),
             Line::from("  Tab        switch focus (station vs provider)"),
@@ -1072,7 +1274,7 @@ pub(super) fn render_help_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
             Line::from("  q          quit and request shutdown"),
             Line::from("  Esc/?      close this modal"),
         ]
-    };
+    });
 
     let content = Paragraph::new(Text::from(lines))
         .block(block)
@@ -1869,9 +2071,14 @@ pub(super) fn render_routing_modal(
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_declared_summary, profile_resolved_summary};
+    use super::{
+        current_page_help_lines, help_text_for_tests, profile_declared_summary,
+        profile_resolved_summary,
+    };
     use crate::dashboard_core::ControlProfileOption;
     use crate::tui::Language;
+    use crate::tui::model::Palette;
+    use crate::tui::types::Page;
 
     fn make_profile(name: &str) -> ControlProfileOption {
         ControlProfileOption {
@@ -1970,5 +2177,28 @@ mod tests {
             .expect("legacy snapshot should still resolve");
 
         assert!(text.contains("$9.00"), "{text}");
+    }
+
+    #[test]
+    fn current_page_help_includes_hidden_routing_actions() {
+        let lines =
+            current_page_help_lines(Language::En, Page::Stations, true, true, Palette::default());
+        let text = help_text_for_tests(&lines);
+
+        assert!(text.contains("Current page: Routing"), "{text}");
+        assert!(text.contains("1/2/0"), "{text}");
+        assert!(text.contains("Backspace"), "{text}");
+        assert!(text.contains("[]/u/d"), "{text}");
+    }
+
+    #[test]
+    fn current_page_help_includes_usage_detail_actions() {
+        let lines =
+            current_page_help_lines(Language::En, Page::Stats, true, true, Palette::default());
+        let text = help_text_for_tests(&lines);
+
+        assert!(text.contains("Current page: Usage"), "{text}");
+        assert!(text.contains("PgUp/PgDn"), "{text}");
+        assert!(text.contains("refresh provider balances"), "{text}");
     }
 }

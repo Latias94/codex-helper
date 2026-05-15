@@ -116,28 +116,102 @@ fn split_footer_help(text: &str, max_width: u16) -> (String, String) {
         return (String::new(), String::new());
     }
 
-    let mut first = String::new();
+    let help_part = parts
+        .iter()
+        .copied()
+        .find(|part| part.starts_with('?') || part.contains("help") || part.contains("帮助"));
+
+    let mut first_parts = Vec::new();
     let mut split_at = parts.len();
     for (idx, part) in parts.iter().enumerate() {
-        let candidate = if first.is_empty() {
-            (*part).to_string()
-        } else {
-            format!("{first}  {part}")
-        };
-        if UnicodeWidthStr::width(candidate.as_str()) <= max_width || first.is_empty() {
-            first = candidate;
+        if footer_parts_fit(&first_parts, part, max_width) || first_parts.is_empty() {
+            first_parts.push(*part);
         } else {
             split_at = idx;
             break;
         }
     }
 
-    let second = if split_at < parts.len() {
-        parts[split_at..].join("  ")
-    } else {
-        String::new()
-    };
-    (first, second)
+    let mut second_parts = Vec::new();
+    let mut hidden_parts = false;
+    if split_at < parts.len() {
+        for part in &parts[split_at..] {
+            if footer_parts_fit(&second_parts, part, max_width) || second_parts.is_empty() {
+                second_parts.push(*part);
+            } else {
+                hidden_parts = true;
+                break;
+            }
+        }
+    }
+
+    if hidden_parts
+        && let Some(help_part) = help_part
+        && !first_parts.contains(&help_part)
+        && !second_parts.contains(&help_part)
+    {
+        while !second_parts.is_empty() && !footer_parts_fit(&second_parts, help_part, max_width) {
+            second_parts.pop();
+        }
+        if footer_parts_fit(&second_parts, help_part, max_width) || second_parts.is_empty() {
+            second_parts.push(help_part);
+        }
+    }
+
+    (first_parts.join("  "), second_parts.join("  "))
+}
+
+fn footer_parts_fit(parts: &[&str], next: &str, max_width: usize) -> bool {
+    let current_width = parts
+        .iter()
+        .map(|part| UnicodeWidthStr::width(*part))
+        .sum::<usize>();
+    let separators = parts.len().saturating_mul(2);
+    current_width
+        .saturating_add(separators)
+        .saturating_add(UnicodeWidthStr::width(next))
+        <= max_width
+}
+
+fn footer_help_text(ui: &UiState) -> &'static str {
+    match ui.overlay {
+        Overlay::None => match ui.page {
+            Page::Dashboard if ui.uses_route_graph_routing() => {
+                i18n::text(ui.language, msg::FOOTER_DASHBOARD_ROUTE_GRAPH)
+            }
+            Page::Dashboard => i18n::text(ui.language, msg::FOOTER_DASHBOARD),
+            Page::Stations if ui.uses_route_graph_routing() => {
+                i18n::text(ui.language, msg::FOOTER_ROUTING)
+            }
+            Page::Stations => i18n::text(ui.language, msg::FOOTER_STATIONS),
+            Page::Requests => i18n::text(ui.language, msg::FOOTER_REQUESTS),
+            Page::Sessions => i18n::text(ui.language, msg::FOOTER_SESSIONS),
+            Page::Stats => i18n::text(ui.language, msg::FOOTER_STATS),
+            Page::Settings if ui.service_name == "codex" => {
+                i18n::text(ui.language, msg::FOOTER_SETTINGS_CODEX)
+            }
+            Page::Settings => i18n::text(ui.language, msg::FOOTER_SETTINGS_OTHER),
+            Page::History => i18n::text(ui.language, msg::FOOTER_HISTORY),
+            Page::Recent => i18n::text(ui.language, msg::FOOTER_RECENT),
+        },
+        Overlay::Help => i18n::text(ui.language, msg::FOOTER_HELP),
+        Overlay::EffortMenu => i18n::text(ui.language, msg::FOOTER_SELECT_APPLY),
+        Overlay::ModelMenuSession => i18n::text(ui.language, msg::FOOTER_MODEL_MENU),
+        Overlay::ModelInputSession => i18n::text(ui.language, msg::FOOTER_MODEL_INPUT),
+        Overlay::ServiceTierMenuSession => i18n::text(ui.language, msg::FOOTER_SERVICE_TIER_MENU),
+        Overlay::ServiceTierInputSession => i18n::text(ui.language, msg::FOOTER_SERVICE_TIER_INPUT),
+        Overlay::ProfileMenuSession => i18n::text(ui.language, msg::FOOTER_PROFILE_SESSION),
+        Overlay::ProfileMenuDefaultRuntime => i18n::text(ui.language, msg::FOOTER_PROFILE_RUNTIME),
+        Overlay::ProfileMenuDefaultPersisted => {
+            i18n::text(ui.language, msg::FOOTER_PROFILE_CONFIGURED)
+        }
+        Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
+            i18n::text(ui.language, msg::FOOTER_SELECT_APPLY)
+        }
+        Overlay::RoutingMenu => i18n::text(ui.language, msg::FOOTER_ROUTING_MENU),
+        Overlay::StationInfo => i18n::text(ui.language, msg::FOOTER_STATION_INFO),
+        Overlay::SessionTranscript => i18n::text(ui.language, msg::FOOTER_SESSION_TRANSCRIPT),
+    }
 }
 
 fn fit_line_to_width(line: Line<'static>, max_width: u16) -> Line<'static> {
@@ -652,44 +726,7 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
         ui.toast = None;
     }
 
-    let left = match ui.overlay {
-        Overlay::None => match ui.page {
-            Page::Dashboard if ui.uses_route_graph_routing() => {
-                i18n::text(ui.language, msg::FOOTER_DASHBOARD_ROUTE_GRAPH)
-            }
-            Page::Dashboard => i18n::text(ui.language, msg::FOOTER_DASHBOARD),
-            Page::Stations if ui.uses_route_graph_routing() => {
-                i18n::text(ui.language, msg::FOOTER_ROUTING)
-            }
-            Page::Stations => i18n::text(ui.language, msg::FOOTER_STATIONS),
-            Page::Requests => i18n::text(ui.language, msg::FOOTER_REQUESTS),
-            Page::Sessions => i18n::text(ui.language, msg::FOOTER_SESSIONS),
-            Page::Stats => i18n::text(ui.language, msg::FOOTER_STATS),
-            Page::Settings if ui.service_name == "codex" => {
-                i18n::text(ui.language, msg::FOOTER_SETTINGS_CODEX)
-            }
-            Page::Settings => i18n::text(ui.language, msg::FOOTER_SETTINGS_OTHER),
-            Page::History => i18n::text(ui.language, msg::FOOTER_HISTORY),
-            Page::Recent => i18n::text(ui.language, msg::FOOTER_RECENT),
-        },
-        Overlay::Help => i18n::text(ui.language, msg::FOOTER_HELP),
-        Overlay::EffortMenu => i18n::text(ui.language, msg::FOOTER_SELECT_APPLY),
-        Overlay::ModelMenuSession => i18n::text(ui.language, msg::FOOTER_MODEL_MENU),
-        Overlay::ModelInputSession => i18n::text(ui.language, msg::FOOTER_MODEL_INPUT),
-        Overlay::ServiceTierMenuSession => i18n::text(ui.language, msg::FOOTER_SERVICE_TIER_MENU),
-        Overlay::ServiceTierInputSession => i18n::text(ui.language, msg::FOOTER_SERVICE_TIER_INPUT),
-        Overlay::ProfileMenuSession => i18n::text(ui.language, msg::FOOTER_PROFILE_SESSION),
-        Overlay::ProfileMenuDefaultRuntime => i18n::text(ui.language, msg::FOOTER_PROFILE_RUNTIME),
-        Overlay::ProfileMenuDefaultPersisted => {
-            i18n::text(ui.language, msg::FOOTER_PROFILE_CONFIGURED)
-        }
-        Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
-            i18n::text(ui.language, msg::FOOTER_SELECT_APPLY)
-        }
-        Overlay::RoutingMenu => i18n::text(ui.language, msg::FOOTER_ROUTING_MENU),
-        Overlay::StationInfo => i18n::text(ui.language, msg::FOOTER_STATION_INFO),
-        Overlay::SessionTranscript => i18n::text(ui.language, msg::FOOTER_SESSION_TRANSCRIPT),
-    };
+    let left = footer_help_text(ui);
     let right = ui.toast.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
 
     let (first, second) = split_footer_help(left, area.width);
@@ -768,6 +805,34 @@ mod tests {
         assert!(UnicodeWidthStr::width(first.as_str()) <= 26);
         assert!(!second.is_empty());
         assert!(second.contains("Tab focus"));
+    }
+
+    #[test]
+    fn split_footer_help_keeps_lines_bounded_and_help_discoverable() {
+        let text = i18n::text(crate::tui::Language::En, msg::FOOTER_STATS);
+        let (first, second) = split_footer_help(text, 38);
+
+        assert!(UnicodeWidthStr::width(first.as_str()) <= 38, "{first}");
+        assert!(UnicodeWidthStr::width(second.as_str()) <= 38, "{second}");
+        assert!(
+            first.contains("? help") || second.contains("? help"),
+            "{first}\n{second}"
+        );
+    }
+
+    #[test]
+    fn footer_help_text_uses_page_specific_routing_copy() {
+        let ui = UiState {
+            page: Page::Stations,
+            language: crate::tui::Language::En,
+            config_version: Some(5),
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("r/Enter edit"), "{text}");
+        assert!(text.contains("g refresh balances"), "{text}");
     }
 
     #[test]
