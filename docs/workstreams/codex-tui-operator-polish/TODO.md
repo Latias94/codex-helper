@@ -135,6 +135,11 @@
 - [x] TUI-503 Run clippy with GUI feature before release.
   - Verified with `cargo clippy --locked --workspace --all-targets --features gui -- -D warnings`.
 - [ ] TUI-504 Manually smoke test normal-width and narrow terminal operation.
+  - Not completed in the agent shell because the built-in dashboard only starts
+    when stdin/stdout are interactive TTYs. Automated coverage currently covers
+    normal and narrow render paths via `TestBackend`, including route graph
+    routing and Usage balance layouts. A real terminal smoke test is still
+    needed before treating the workstream as fully closed.
 
 ## Candidate First Slice
 
