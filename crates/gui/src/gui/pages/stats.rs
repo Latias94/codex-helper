@@ -23,6 +23,7 @@ pub(super) fn build_usage_balance_view(
             refreshing: refresh.refreshing,
             last_message: refresh.last_message.clone(),
             last_error: refresh.last_error.clone(),
+            last_provider_refresh: None,
         },
     })
 }

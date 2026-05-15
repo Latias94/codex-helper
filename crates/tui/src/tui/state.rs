@@ -7,6 +7,7 @@ use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
 };
 use crate::usage_balance::{UsageBalanceBuildInput, UsageBalanceRefreshInput, UsageBalanceView};
+use crate::usage_providers::UsageProviderRefreshSummary;
 use std::collections::HashMap;
 
 use super::Language;
@@ -121,6 +122,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) last_balance_refresh_finished_at: Option<std::time::Instant>,
     pub(in crate::tui) last_balance_refresh_message: Option<String>,
     pub(in crate::tui) last_balance_refresh_error: Option<String>,
+    pub(in crate::tui) last_balance_refresh_summary: Option<UsageProviderRefreshSummary>,
     pub(in crate::tui) should_exit: bool,
     pub(in crate::tui) stations_table: TableState,
     pub(in crate::tui) sessions_table: TableState,
@@ -222,6 +224,7 @@ impl Default for UiState {
             last_balance_refresh_finished_at: None,
             last_balance_refresh_message: None,
             last_balance_refresh_error: None,
+            last_balance_refresh_summary: None,
             should_exit: false,
             stations_table: TableState::default(),
             sessions_table: TableState::default(),

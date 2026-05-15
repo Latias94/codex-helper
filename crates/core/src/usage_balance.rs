@@ -7,6 +7,7 @@ use crate::routing_explain::{RoutingExplainCandidate, RoutingExplainResponse};
 use crate::state::{
     BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, UsageBucket, UsageRollupView,
 };
+use crate::usage_providers::UsageProviderRefreshSummary;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -204,8 +205,12 @@ pub struct UsageBalanceRefreshStatus {
     pub total_snapshots: usize,
     pub latest_fetched_at_ms: Option<u64>,
     pub latest_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_error_provider_id: Option<String>,
     pub last_message: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_provider_refresh: Option<UsageProviderRefreshSummary>,
     pub status_counts: UsageBalanceStatusCounts,
 }
 
@@ -214,6 +219,7 @@ pub struct UsageBalanceRefreshInput {
     pub refreshing: bool,
     pub last_message: Option<String>,
     pub last_error: Option<String>,
+    pub last_provider_refresh: Option<UsageProviderRefreshSummary>,
 }
 
 pub struct UsageBalanceBuildInput<'a> {
@@ -415,8 +421,10 @@ fn build_refresh_status(
         refreshing: input.refreshing,
         last_message: input.last_message,
         last_error: input.last_error,
+        last_provider_refresh: input.last_provider_refresh,
         ..UsageBalanceRefreshStatus::default()
     };
+    let mut latest_error_fetched_at_ms: Option<u64> = None;
 
     for snapshot in provider_balances.values().flatten() {
         out.total_snapshots += 1;
@@ -432,11 +440,12 @@ fn build_refresh_status(
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            && out
-                .latest_fetched_at_ms
-                .is_none_or(|latest| snapshot.fetched_at_ms >= latest)
+            && latest_error_fetched_at_ms.is_none_or(|latest| snapshot.fetched_at_ms >= latest)
         {
             out.latest_error = Some(error.to_string());
+            out.latest_error_provider_id = non_empty(snapshot.provider_id.clone())
+                .or_else(|| non_empty(snapshot.station_name.clone().unwrap_or_default()));
+            latest_error_fetched_at_ms = Some(snapshot.fetched_at_ms);
         }
     }
 

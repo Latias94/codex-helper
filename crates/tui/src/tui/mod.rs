@@ -31,6 +31,7 @@ use crate::config::ProxyConfig;
 use crate::config::storage::load_config;
 use crate::proxy::ProxyService;
 use crate::state::ProxyState;
+use crate::usage_providers::UsageProviderRefreshSummary;
 
 use self::model::{Palette, now_ms, refresh_snapshot};
 use self::state::{RecentCodexRow, UiState, merge_codex_history_external_focus};
@@ -51,6 +52,59 @@ fn request_redraw(invalidation: &mut RenderInvalidation) {
 
 fn request_full_clear(invalidation: &mut RenderInvalidation) {
     *invalidation = RenderInvalidation::FullClear;
+}
+
+fn balance_refresh_summary_message(
+    lang: Language,
+    summary: &UsageProviderRefreshSummary,
+) -> String {
+    if summary.deduplicated > 0 && summary.attempted == 0 {
+        return match lang {
+            Language::Zh => "余额刷新已在进行中".to_string(),
+            Language::En => "balance refresh already requested".to_string(),
+        };
+    }
+
+    let mut parts = Vec::new();
+    match lang {
+        Language::Zh => {
+            parts.push(format!("成功 {}/{}", summary.refreshed, summary.attempted));
+            if summary.failed > 0 {
+                parts.push(format!("失败 {}", summary.failed));
+            }
+            if summary.missing_token > 0 {
+                parts.push(format!("缺 key {}", summary.missing_token));
+            }
+            if summary.auto_attempted > 0 {
+                parts.push(format!(
+                    "自动 {}/{}",
+                    summary.auto_refreshed, summary.auto_attempted
+                ));
+            }
+            if summary.deduplicated > 0 {
+                parts.push(format!("去重 {}", summary.deduplicated));
+            }
+        }
+        Language::En => {
+            parts.push(format!("ok {}/{}", summary.refreshed, summary.attempted));
+            if summary.failed > 0 {
+                parts.push(format!("failed {}", summary.failed));
+            }
+            if summary.missing_token > 0 {
+                parts.push(format!("missing key {}", summary.missing_token));
+            }
+            if summary.auto_attempted > 0 {
+                parts.push(format!(
+                    "auto {}/{}",
+                    summary.auto_refreshed, summary.auto_attempted
+                ));
+            }
+            if summary.deduplicated > 0 {
+                parts.push(format!("dedup {}", summary.deduplicated));
+            }
+        }
+    }
+    parts.join(" · ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,21 +318,22 @@ pub async fn run_dashboard(
             }
             maybe_balance_refresh = balance_refresh_rx.recv() => {
                 if let Some(result) = maybe_balance_refresh {
-                    let balance_refresh_ok = result.is_ok();
                     ui.balance_refresh_in_flight = false;
                     ui.last_balance_refresh_finished_at = Some(Instant::now());
-                    if let Err(err) = result {
-                        ui.last_balance_refresh_message = None;
-                        ui.last_balance_refresh_error = Some(err.clone());
-                        ui.toast = Some((format!("balance refresh failed: {err}"), Instant::now()));
-                    } else {
-                        ui.last_balance_refresh_error = None;
-                        ui.last_balance_refresh_message = Some(
-                            match ui.language {
-                                Language::Zh => "余额刷新完成".to_string(),
-                                Language::En => "balance refresh finished".to_string(),
-                            },
-                        );
+                    match result {
+                        Ok(summary) => {
+                            ui.last_balance_refresh_summary = Some(summary.clone());
+                            ui.last_balance_refresh_error = None;
+                            ui.last_balance_refresh_message =
+                                Some(balance_refresh_summary_message(ui.language, &summary));
+                        }
+                        Err(err) => {
+                            ui.last_balance_refresh_summary = None;
+                            ui.last_balance_refresh_message = None;
+                            ui.last_balance_refresh_error = Some(err.clone());
+                            ui.toast =
+                                Some((format!("balance refresh failed: {err}"), Instant::now()));
+                        }
                     }
                     let refresh = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days);
                     if let Ok(new_snapshot) = tokio::time::timeout(io_timeout, refresh).await {
@@ -298,7 +353,7 @@ pub async fn run_dashboard(
                             }
                             Ok(Err(err)) => {
                                 ui.last_routing_control_refresh_at = Some(Instant::now());
-                                if balance_refresh_ok {
+                                if ui.last_balance_refresh_error.is_none() {
                                     ui.toast = Some((
                                         format!("routing refresh failed: {err}"),
                                         Instant::now(),

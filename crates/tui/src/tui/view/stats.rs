@@ -40,6 +40,7 @@ fn build_usage_balance_view(ui: &UiState, snapshot: &Snapshot) -> UsageBalanceVi
             refreshing: ui.balance_refresh_in_flight,
             last_message: ui.last_balance_refresh_message.clone(),
             last_error: ui.last_balance_refresh_error.clone(),
+            last_provider_refresh: ui.last_balance_refresh_summary.clone(),
         },
     })
 }
@@ -128,17 +129,85 @@ fn usage_refresh_line(view: &UsageBalanceView, lang: Language) -> String {
     if let Some(err) = view.refresh_status.last_error.as_deref() {
         return format!("{}: {err}", i18n::label(lang, "error"));
     }
+    let mut parts = Vec::new();
+    if let Some(summary) = view.refresh_status.last_provider_refresh.as_ref() {
+        parts.push(balance_refresh_summary_line(summary, lang));
+    }
     if let Some(err) = view.refresh_status.latest_error.as_deref() {
-        return format!("{}: {err}", i18n::label(lang, "latest error"));
+        let source = view
+            .refresh_status
+            .latest_error_provider_id
+            .as_deref()
+            .unwrap_or("-");
+        parts.push(format!(
+            "{} {}: {err}",
+            i18n::label(lang, "latest error"),
+            source
+        ));
+    } else if let Some(msg) = view.refresh_status.last_message.as_deref() {
+        parts.push(msg.to_string());
     }
-    if let Some(msg) = view.refresh_status.last_message.as_deref() {
-        return msg.to_string();
+    if parts.is_empty() {
+        format!(
+            "{}={}",
+            i18n::label(lang, "snapshots"),
+            view.refresh_status.total_snapshots
+        )
+    } else {
+        parts.join(" · ")
     }
-    format!(
-        "{}={}",
-        i18n::label(lang, "snapshots"),
-        view.refresh_status.total_snapshots
-    )
+}
+
+fn balance_refresh_summary_line(
+    summary: &crate::usage_providers::UsageProviderRefreshSummary,
+    lang: Language,
+) -> String {
+    if summary.deduplicated > 0 && summary.attempted == 0 {
+        return match lang {
+            Language::Zh => "余额刷新已在进行中".to_string(),
+            Language::En => "balance refresh already requested".to_string(),
+        };
+    }
+    match lang {
+        Language::Zh => {
+            let mut parts = vec![format!("成功 {}/{}", summary.refreshed, summary.attempted)];
+            if summary.failed > 0 {
+                parts.push(format!("失败 {}", summary.failed));
+            }
+            if summary.missing_token > 0 {
+                parts.push(format!("缺 key {}", summary.missing_token));
+            }
+            if summary.auto_attempted > 0 {
+                parts.push(format!(
+                    "自动 {}/{}",
+                    summary.auto_refreshed, summary.auto_attempted
+                ));
+            }
+            if summary.deduplicated > 0 {
+                parts.push(format!("去重 {}", summary.deduplicated));
+            }
+            parts.join(" · ")
+        }
+        Language::En => {
+            let mut parts = vec![format!("ok {}/{}", summary.refreshed, summary.attempted)];
+            if summary.failed > 0 {
+                parts.push(format!("failed {}", summary.failed));
+            }
+            if summary.missing_token > 0 {
+                parts.push(format!("missing key {}", summary.missing_token));
+            }
+            if summary.auto_attempted > 0 {
+                parts.push(format!(
+                    "auto {}/{}",
+                    summary.auto_refreshed, summary.auto_attempted
+                ));
+            }
+            if summary.deduplicated > 0 {
+                parts.push(format!("dedup {}", summary.deduplicated));
+            }
+            parts.join(" · ")
+        }
+    }
 }
 
 fn fmt_avg_ms(total_ms: u64, n: u64) -> String {
@@ -1586,6 +1655,7 @@ mod tests {
     use ratatui::buffer::Buffer;
 
     use crate::state::UsageRollupView;
+    use crate::usage_providers::UsageProviderRefreshSummary;
 
     fn sample_snapshot(
         provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>,
@@ -1692,6 +1762,42 @@ mod tests {
             filtered_provider_rows(&view.provider_rows, ui.stats_attention_only).len(),
             2
         );
+    }
+
+    #[test]
+    fn stats_refresh_line_shows_summary_counts_and_latest_provider_error() {
+        let snapshot = sample_snapshot(HashMap::from([(
+            "bad".to_string(),
+            vec![ProviderBalanceSnapshot {
+                provider_id: "bad-provider".to_string(),
+                status: BalanceSnapshotStatus::Error,
+                error: Some("lookup failed".to_string()),
+                fetched_at_ms: 100,
+                ..ProviderBalanceSnapshot::default()
+            }],
+        )]));
+        let ui = UiState {
+            page: crate::tui::types::Page::Stats,
+            last_balance_refresh_summary: Some(UsageProviderRefreshSummary {
+                attempted: 4,
+                refreshed: 3,
+                failed: 1,
+                missing_token: 1,
+                auto_attempted: 2,
+                auto_refreshed: 1,
+                ..UsageProviderRefreshSummary::default()
+            }),
+            ..UiState::default()
+        };
+        let view = build_usage_balance_view(&ui, &snapshot);
+        let line = usage_refresh_line(&view, Language::En);
+
+        assert!(line.contains("ok 3/4"), "{line}");
+        assert!(line.contains("failed 1"), "{line}");
+        assert!(line.contains("missing key 1"), "{line}");
+        assert!(line.contains("bad-provider"), "{line}");
+        assert!(line.contains("lookup failed"), "{line}");
+        assert!(line.contains("latest error"), "{line}");
     }
 
     #[test]

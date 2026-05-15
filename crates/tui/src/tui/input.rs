@@ -27,6 +27,7 @@ use crate::sessions::{
 use crate::state::{
     FinishedRequest, ProviderBalanceSnapshot, ProxyState, StationHealth, UpstreamHealth,
 };
+use crate::usage_providers::UsageProviderRefreshSummary;
 
 use super::Language;
 use super::i18n::{self, msg};
@@ -47,7 +48,7 @@ pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
     matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-pub(in crate::tui) type BalanceRefreshOutcome = Result<(), String>;
+pub(in crate::tui) type BalanceRefreshOutcome = Result<UsageProviderRefreshSummary, String>;
 pub(in crate::tui) type BalanceRefreshSender = mpsc::UnboundedSender<BalanceRefreshOutcome>;
 
 pub(in crate::tui) async fn handle_key_event(
@@ -935,13 +936,14 @@ fn request_provider_balance_refresh(
         Language::En => "balance refresh in progress".to_string(),
     });
     ui.last_balance_refresh_error = None;
+    ui.last_balance_refresh_summary = None;
     let proxy = proxy.clone();
     let balance_refresh_tx = balance_refresh_tx.clone();
     tokio::spawn(async move {
         let outcome = proxy
             .refresh_provider_balances(None, None)
             .await
-            .map(|_| ())
+            .map(|response| response.refresh)
             .map_err(|err| err.to_string());
         let _ = balance_refresh_tx.send(outcome);
     });

@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - TUI `Usage` 页面新增关注项筛选：按 `a` 只看余额异常、刷新失败、用量异常或状态需要处理的 provider。
 - TUI `Usage` 页面 provider 详情支持 `PgUp` / `PgDn` 滚动 endpoint 列表，provider 很多或 endpoint 很多时更容易查看余额和最近请求。
 - 窄终端和中英文混排下，余额/配额会保持金额原子显示；空间不足时退回状态标签，避免出现 `$0/$` 这类半截金额。
+- TUI `Usage` 页面现在会显示本次余额刷新 summary，包括成功/失败/缺 key/自动刷新数量，并会带出最新错误所属 provider。
 - TUI `Usage` 页面支持按 `g` 直接刷新余额；刷新失败会显示为错误状态，但不会阻塞页面刷新或其他 provider 的余额刷新。
 - GUI 统计页和余额概览迁移到同一套 core `UsageBalanceView` 语义，`unknown`、`stale`、`exhausted`、`error` 和 `unlimited` 不再由各 UI 自行混算。
 - 路由页继续只保留紧凑余额上下文，详细用量、余额和 endpoint 分析统一到 `Usage / Balance`。
@@ -21,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - Press `a` on the TUI `Usage` page to filter providers that need attention, including balance issues, refresh failures, usage errors, and actionable states.
 - Provider details on the TUI `Usage` page now support `PgUp` / `PgDn` endpoint scrolling, making large provider and endpoint sets easier to inspect.
 - Narrow terminals and mixed CJK/English layouts now keep balance/quota amounts atomic. When there is not enough room, the UI falls back to a status label instead of showing partial amounts such as `$0/$`.
+- The TUI `Usage` page now surfaces the latest balance refresh summary, including success/failure counts, missing-token counts, auto-refresh counts, and the provider behind the latest error.
 - Press `g` on the TUI `Usage` page to refresh balances. Failures stay visible as state/errors without blocking UI redraws or other provider refreshes.
 - The GUI stats and balance views now consume the shared core `UsageBalanceView`, so `unknown`, `stale`, `exhausted`, `error`, and `unlimited` stay distinct across UI surfaces.
 - Routing pages keep compact balance context; detailed usage, balance, and endpoint inspection lives in `Usage / Balance`.

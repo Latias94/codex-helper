@@ -49,8 +49,11 @@
   clear state, never a misleading partial currency string.
 - [x] TUI-103 Keep provider identity, balance status, and route impact visible
   under narrow widths.
-- [ ] TUI-104 Show last refresh success/failure counts and the latest relevant
+- [x] TUI-104 Show last refresh success/failure counts and the latest relevant
   provider error without blocking other refreshes.
+  - Balance refresh now carries refresh summary counts back into the Usage
+    header line. Latest provider error text is shown alongside its source
+    provider id.
 - [x] TUI-105 Add render tests for long provider names and balance strings.
 
 ## WS2 - Routing Page Polish
