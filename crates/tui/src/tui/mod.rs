@@ -109,6 +109,34 @@ fn start_snapshot_refresh(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn request_snapshot_refresh(
+    generation: &mut u64,
+    in_flight: &mut Option<u64>,
+    pending: &mut bool,
+    tx: &mpsc::UnboundedSender<SnapshotRefreshResult>,
+    state: Arc<ProxyState>,
+    cfg: Arc<ProxyConfig>,
+    service_name: &'static str,
+    stats_days: usize,
+) {
+    if in_flight.is_some() {
+        *pending = true;
+        return;
+    }
+
+    *pending = false;
+    start_snapshot_refresh(
+        generation,
+        in_flight,
+        tx,
+        state,
+        cfg,
+        service_name,
+        stats_days,
+    );
+}
+
 fn balance_refresh_summary_message(
     lang: Language,
     summary: &UsageProviderRefreshSummary,
@@ -256,10 +284,18 @@ pub async fn run_dashboard(
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(500)
-        .clamp(100, 5_000);
+        .unwrap_or(1_000)
+        .clamp(250, 5_000);
 
     let io_timeout = Duration::from_millis((refresh_ms / 2).clamp(50, 250));
+    let snapshot_fallback_interval = Duration::from_secs(
+        std::env::var("CODEX_HELPER_TUI_SNAPSHOT_FALLBACK_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(10)
+            .clamp(2, 300),
+    );
 
     let mut term_guard = TerminalGuard::enter()?;
     let stdout = io::stdout();
@@ -281,6 +317,7 @@ pub async fn run_dashboard(
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(refresh_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut state_changes = state.subscribe_state_changes();
 
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
 
@@ -298,6 +335,7 @@ pub async fn run_dashboard(
         mpsc::unbounded_channel::<CodexRecentRefreshResult>();
     let mut snapshot_refresh_generation = 0_u64;
     let mut snapshot_refresh_in_flight = None;
+    let mut snapshot_refresh_pending = false;
 
     let mut render_invalidation = RenderInvalidation::FullClear;
     let mut last_drawn_page = ui.page;
@@ -344,19 +382,22 @@ pub async fn run_dashboard(
 
         tokio::select! {
             _ = ticker.tick() => {
-                start_snapshot_refresh(
-                    &mut snapshot_refresh_generation,
-                    &mut snapshot_refresh_in_flight,
-                    &snapshot_refresh_tx,
-                    state.clone(),
-                    cfg.clone(),
-                    service_name,
-                    ui.stats_days,
-                );
+                if snapshot.refreshed_at.elapsed() >= snapshot_fallback_interval {
+                    request_snapshot_refresh(
+                        &mut snapshot_refresh_generation,
+                        &mut snapshot_refresh_in_flight,
+                        &mut snapshot_refresh_pending,
+                        &snapshot_refresh_tx,
+                        state.clone(),
+                        cfg.clone(),
+                        service_name,
+                        ui.stats_days,
+                    );
+                }
                 if ui.page == crate::tui::types::Page::Settings
                     && ui
                         .last_runtime_config_refresh_at
-                        .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+                        .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
                 {
                     if let Ok(status) = tokio::time::timeout(io_timeout, proxy.runtime_status()).await {
                         ui.last_runtime_config_loaded_at_ms = Some(status.loaded_at_ms);
@@ -369,7 +410,7 @@ pub async fn run_dashboard(
                     && ui.page == crate::tui::types::Page::Stations
                     && ui
                         .last_routing_control_refresh_at
-                        .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+                        .is_none_or(|t| t.elapsed() > Duration::from_secs(5))
                 {
                     let refresh = input::refresh_routing_control_state(&mut ui, &proxy);
                     match tokio::time::timeout(io_timeout, refresh).await {
@@ -388,6 +429,20 @@ pub async fn run_dashboard(
                 }
                 request_redraw(&mut render_invalidation);
             }
+            changed = state_changes.changed() => {
+                if changed.is_ok() {
+                    request_snapshot_refresh(
+                        &mut snapshot_refresh_generation,
+                        &mut snapshot_refresh_in_flight,
+                        &mut snapshot_refresh_pending,
+                        &snapshot_refresh_tx,
+                        state.clone(),
+                        cfg.clone(),
+                        service_name,
+                        ui.stats_days,
+                    );
+                }
+            }
             maybe_snapshot_refresh = snapshot_refresh_rx.recv() => {
                 if let Some(result) = maybe_snapshot_refresh {
                     if snapshot_refresh_in_flight == Some(result.generation) {
@@ -404,6 +459,18 @@ pub async fn run_dashboard(
                         snapshot = result.snapshot;
                         ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
                         request_redraw(&mut render_invalidation);
+                    }
+                    if snapshot_refresh_pending && snapshot_refresh_in_flight.is_none() {
+                        request_snapshot_refresh(
+                            &mut snapshot_refresh_generation,
+                            &mut snapshot_refresh_in_flight,
+                            &mut snapshot_refresh_pending,
+                            &snapshot_refresh_tx,
+                            state.clone(),
+                            cfg.clone(),
+                            service_name,
+                            ui.stats_days,
+                        );
                     }
                 }
             }
@@ -426,9 +493,10 @@ pub async fn run_dashboard(
                                 Some((format!("balance refresh failed: {err}"), Instant::now()));
                         }
                     }
-                    start_snapshot_refresh(
+                    request_snapshot_refresh(
                         &mut snapshot_refresh_generation,
                         &mut snapshot_refresh_in_flight,
+                        &mut snapshot_refresh_pending,
                         &snapshot_refresh_tx,
                         state.clone(),
                         cfg.clone(),
@@ -513,7 +581,18 @@ pub async fn run_dashboard(
                                             &mut snapshot_refresh_generation,
                                             &mut snapshot_refresh_in_flight,
                                         );
+                                        snapshot_refresh_pending = false;
                                         providers = build_provider_options(&cfg, service_name);
+                                        request_snapshot_refresh(
+                                            &mut snapshot_refresh_generation,
+                                            &mut snapshot_refresh_in_flight,
+                                            &mut snapshot_refresh_pending,
+                                            &snapshot_refresh_tx,
+                                            state.clone(),
+                                            cfg.clone(),
+                                            service_name,
+                                            ui.stats_days,
+                                        );
                                         ui.clamp_selection(
                                             &snapshot,
                                             ui.station_page_rows_len(providers.len()),
@@ -533,10 +612,16 @@ pub async fn run_dashboard(
                                     &mut snapshot_refresh_generation,
                                     &mut snapshot_refresh_in_flight,
                                 );
-                                snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
-                                ui.clamp_selection(
-                                    &snapshot,
-                                    ui.station_page_rows_len(providers.len()),
+                                snapshot_refresh_pending = false;
+                                request_snapshot_refresh(
+                                    &mut snapshot_refresh_generation,
+                                    &mut snapshot_refresh_in_flight,
+                                    &mut snapshot_refresh_pending,
+                                    &snapshot_refresh_tx,
+                                    state.clone(),
+                                    cfg.clone(),
+                                    service_name,
+                                    ui.stats_days,
                                 );
                                 ui.needs_snapshot_refresh = false;
                             }
@@ -786,7 +871,13 @@ async fn read_git_branch_shallow(workdir: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{invalidate_snapshot_refresh, snapshot_refresh_result_is_current};
+    use std::sync::Arc;
+
+    use super::{
+        invalidate_snapshot_refresh, request_snapshot_refresh, snapshot_refresh_result_is_current,
+    };
+    use crate::config::ProxyConfig;
+    use crate::state::ProxyState;
 
     #[test]
     fn snapshot_refresh_result_guard_rejects_stale_results() {
@@ -833,5 +924,28 @@ mod tests {
 
         assert_eq!(generation, 42);
         assert_eq!(in_flight, None);
+    }
+
+    #[test]
+    fn snapshot_refresh_request_marks_pending_without_invalidating_in_flight() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut generation = 7;
+        let mut in_flight = Some(7);
+        let mut pending = false;
+
+        request_snapshot_refresh(
+            &mut generation,
+            &mut in_flight,
+            &mut pending,
+            &tx,
+            ProxyState::new(),
+            Arc::new(ProxyConfig::default()),
+            "codex",
+            7,
+        );
+
+        assert_eq!(generation, 7);
+        assert_eq!(in_flight, Some(7));
+        assert!(pending);
     }
 }

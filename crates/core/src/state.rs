@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value as JsonValue;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tokio::time::{Duration, interval};
 
 pub use crate::balance::{
@@ -233,6 +233,7 @@ pub struct ProxyState {
         RwLock<HashMap<String, HashMap<ProviderEndpointKey, ProviderEndpointRuntimeHealth>>>,
     station_health_checks: RwLock<HashMap<String, HashMap<String, HealthCheckStatus>>>,
     service_layout_signatures: RwLock<HashMap<String, ServiceLayoutSignature>>,
+    state_version_tx: watch::Sender<u64>,
     lb_states: Option<Arc<Mutex<HashMap<String, LbState>>>>,
 }
 
@@ -352,8 +353,19 @@ impl ProxyState {
             provider_endpoint_runtime_health: RwLock::new(HashMap::new()),
             station_health_checks: RwLock::new(HashMap::new()),
             service_layout_signatures: RwLock::new(HashMap::new()),
+            state_version_tx: watch::channel(0).0,
             lb_states,
         })
+    }
+
+    pub fn subscribe_state_changes(&self) -> watch::Receiver<u64> {
+        self.state_version_tx.subscribe()
+    }
+
+    fn notify_state_changed(&self) {
+        self.state_version_tx.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
     }
 
     pub async fn get_session_effort_override(&self, session_id: &str) -> Option<String> {
@@ -380,6 +392,7 @@ impl ProxyState {
                 last_seen_ms: now_ms,
             },
         );
+        self.notify_state_changed();
     }
 
     pub async fn set_session_reasoning_effort_override(
@@ -394,7 +407,9 @@ impl ProxyState {
 
     pub async fn clear_session_effort_override(&self, session_id: &str) {
         let mut guard = self.session_effort_overrides.write().await;
-        guard.remove(session_id);
+        if guard.remove(session_id).is_some() {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn clear_session_reasoning_effort_override(&self, session_id: &str) {
@@ -449,11 +464,14 @@ impl ProxyState {
                 last_seen_ms: now_ms,
             },
         );
+        self.notify_state_changed();
     }
 
     pub async fn clear_session_model_override(&self, session_id: &str) {
         let mut guard = self.session_model_overrides.write().await;
-        guard.remove(session_id);
+        if guard.remove(session_id).is_some() {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn list_session_model_overrides(&self) -> HashMap<String, String> {
@@ -491,11 +509,14 @@ impl ProxyState {
                 last_seen_ms: now_ms,
             },
         );
+        self.notify_state_changed();
     }
 
     pub async fn clear_session_service_tier_override(&self, session_id: &str) {
         let mut guard = self.session_service_tier_overrides.write().await;
-        guard.remove(session_id);
+        if guard.remove(session_id).is_some() {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn list_session_service_tier_overrides(&self) -> HashMap<String, String> {
@@ -578,6 +599,7 @@ impl ProxyState {
             self.session_route_affinity_max_entries,
             |entry| entry.last_selected_at_ms,
         );
+        self.notify_state_changed();
         affinity
     }
 
@@ -602,11 +624,14 @@ impl ProxyState {
             binding
         };
         guard.insert(binding.session_id.clone(), SessionBindingEntry { binding });
+        self.notify_state_changed();
     }
 
     pub async fn clear_session_binding(&self, session_id: &str) {
         let mut guard = self.session_bindings.write().await;
-        guard.remove(session_id);
+        if guard.remove(session_id).is_some() {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn clear_session_manual_overrides(&self, session_id: &str) {
@@ -720,6 +745,7 @@ impl ProxyState {
                 last_seen_ms: now_ms,
             },
         );
+        self.notify_state_changed();
     }
 
     pub async fn set_session_route_target_override(
@@ -737,16 +763,21 @@ impl ProxyState {
                 last_seen_ms: now_ms,
             },
         );
+        self.notify_state_changed();
     }
 
     pub async fn clear_session_station_override(&self, session_id: &str) {
         let mut guard = self.session_station_overrides.write().await;
-        guard.remove(session_id);
+        if guard.remove(session_id).is_some() {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn clear_session_route_target_override(&self, session_id: &str) {
         let mut guard = self.session_route_target_overrides.write().await;
-        guard.remove(session_id);
+        if guard.remove(session_id).is_some() {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn list_session_station_overrides(&self) -> HashMap<String, String> {
@@ -792,21 +823,27 @@ impl ProxyState {
     pub async fn set_global_station_override(&self, station_name: String, _now_ms: u64) {
         let mut guard = self.global_station_override.write().await;
         *guard = Some(station_name);
+        self.notify_state_changed();
     }
 
     pub async fn set_global_route_target_override(&self, target: String, _now_ms: u64) {
         let mut guard = self.global_route_target_override.write().await;
         *guard = Some(target);
+        self.notify_state_changed();
     }
 
     pub async fn clear_global_station_override(&self) {
         let mut guard = self.global_station_override.write().await;
-        *guard = None;
+        if guard.take().is_some() {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn clear_global_route_target_override(&self) {
         let mut guard = self.global_route_target_override.write().await;
-        *guard = None;
+        if guard.take().is_some() {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn get_runtime_default_profile_override(&self, service_name: &str) -> Option<String> {
@@ -830,11 +867,14 @@ impl ProxyState {
                 updated_at_ms: now_ms,
             },
         );
+        self.notify_state_changed();
     }
 
     pub async fn clear_runtime_default_profile_override(&self, service_name: &str) {
         let mut guard = self.runtime_default_profiles.write().await;
-        guard.remove(service_name);
+        if guard.remove(service_name).is_some() {
+            self.notify_state_changed();
+        }
     }
 
     pub async fn set_station_enabled_override(
@@ -849,6 +889,7 @@ impl ProxyState {
         let entry = per_service.entry(station_name).or_default();
         entry.enabled = Some(enabled);
         entry.updated_at_ms = now_ms;
+        self.notify_state_changed();
     }
 
     pub async fn set_station_level_override(
@@ -863,6 +904,7 @@ impl ProxyState {
         let entry = per_service.entry(station_name).or_default();
         entry.level = Some(level.clamp(1, 10));
         entry.updated_at_ms = now_ms;
+        self.notify_state_changed();
     }
 
     pub async fn set_station_runtime_state_override(
@@ -877,6 +919,7 @@ impl ProxyState {
         let entry = per_service.entry(station_name).or_default();
         entry.state = Some(state);
         entry.updated_at_ms = now_ms;
+        self.notify_state_changed();
     }
 
     pub async fn clear_station_enabled_override(&self, service_name: &str, station_name: &str) {
@@ -887,13 +930,16 @@ impl ProxyState {
         let Some(entry) = per_service.get_mut(station_name) else {
             return;
         };
-        entry.enabled = None;
+        if entry.enabled.take().is_none() {
+            return;
+        }
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
             per_service.remove(station_name);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
+        self.notify_state_changed();
     }
 
     pub async fn clear_station_level_override(&self, service_name: &str, station_name: &str) {
@@ -904,13 +950,16 @@ impl ProxyState {
         let Some(entry) = per_service.get_mut(station_name) else {
             return;
         };
-        entry.level = None;
+        if entry.level.take().is_none() {
+            return;
+        }
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
             per_service.remove(station_name);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
+        self.notify_state_changed();
     }
 
     pub async fn clear_station_runtime_state_override(
@@ -925,13 +974,16 @@ impl ProxyState {
         let Some(entry) = per_service.get_mut(station_name) else {
             return;
         };
-        entry.state = None;
+        if entry.state.take().is_none() {
+            return;
+        }
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
             per_service.remove(station_name);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
+        self.notify_state_changed();
     }
 
     pub async fn get_station_meta_overrides(
@@ -976,6 +1028,7 @@ impl ProxyState {
         let entry = per_service.entry(endpoint_key).or_default();
         entry.enabled = Some(enabled);
         entry.updated_at_ms = now_ms;
+        self.notify_state_changed();
     }
 
     pub async fn clear_provider_endpoint_enabled_override(
@@ -990,13 +1043,16 @@ impl ProxyState {
         let Some(entry) = per_service.get_mut(endpoint_key) else {
             return;
         };
-        entry.enabled = None;
+        if entry.enabled.take().is_none() {
+            return;
+        }
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
             per_service.remove(endpoint_key);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
+        self.notify_state_changed();
     }
 
     pub async fn set_provider_endpoint_runtime_state_override(
@@ -1011,6 +1067,7 @@ impl ProxyState {
         let entry = per_service.entry(endpoint_key).or_default();
         entry.state = Some(state);
         entry.updated_at_ms = now_ms;
+        self.notify_state_changed();
     }
 
     pub async fn clear_provider_endpoint_runtime_state_override(
@@ -1025,13 +1082,16 @@ impl ProxyState {
         let Some(entry) = per_service.get_mut(endpoint_key) else {
             return;
         };
-        entry.state = None;
+        if entry.state.take().is_none() {
+            return;
+        }
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
             per_service.remove(endpoint_key);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
+        self.notify_state_changed();
     }
 
     pub async fn set_upstream_enabled_override(
@@ -1046,6 +1106,7 @@ impl ProxyState {
         let entry = per_service.entry(base_url).or_default();
         entry.enabled = Some(enabled);
         entry.updated_at_ms = now_ms;
+        self.notify_state_changed();
     }
 
     pub async fn clear_upstream_enabled_override(&self, service_name: &str, base_url: &str) {
@@ -1056,13 +1117,16 @@ impl ProxyState {
         let Some(entry) = per_service.get_mut(base_url) else {
             return;
         };
-        entry.enabled = None;
+        if entry.enabled.take().is_none() {
+            return;
+        }
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
             per_service.remove(base_url);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
+        self.notify_state_changed();
     }
 
     pub async fn set_upstream_runtime_state_override(
@@ -1077,6 +1141,7 @@ impl ProxyState {
         let entry = per_service.entry(base_url).or_default();
         entry.state = Some(state);
         entry.updated_at_ms = now_ms;
+        self.notify_state_changed();
     }
 
     pub async fn clear_upstream_runtime_state_override(&self, service_name: &str, base_url: &str) {
@@ -1087,13 +1152,16 @@ impl ProxyState {
         let Some(entry) = per_service.get_mut(base_url) else {
             return;
         };
-        entry.state = None;
+        if entry.state.take().is_none() {
+            return;
+        }
         if entry.enabled.is_none() && entry.level.is_none() && entry.state.is_none() {
             per_service.remove(base_url);
         }
         if per_service.is_empty() {
             guard.remove(service_name);
         }
+        self.notify_state_changed();
     }
 
     pub async fn get_upstream_meta_overrides(
@@ -1133,7 +1201,6 @@ impl ProxyState {
     ) -> RoutePlanRuntimeState {
         let mut runtime = RoutePlanRuntimeState::default();
         let now = std::time::Instant::now();
-
         {
             let mut guard = self.provider_endpoint_runtime_health.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
@@ -1276,6 +1343,9 @@ impl ProxyState {
             .or_default()
             .entry(endpoint_key)
             .or_default();
+        if entry.usage_exhausted == exhausted {
+            return;
+        }
         entry.usage_exhausted = exhausted;
     }
 
@@ -1284,6 +1354,7 @@ impl ProxyState {
         service_name: &str,
         mgr: &ServiceConfigManager,
     ) {
+        let mut changed = false;
         let active_stations = mgr.stations().keys().cloned().collect::<HashSet<_>>();
         let active_upstreams = mgr
             .stations()
@@ -1347,16 +1418,20 @@ impl ProxyState {
             Some(changed_layout_stations) if !changed_layout_stations.is_empty() => {
                 let mut provider_balances = self.provider_balances.write().await;
                 if let Some(per_service) = provider_balances.get_mut(service_name) {
+                    let before = per_service.len();
                     per_service
                         .retain(|station_name, _| !changed_layout_stations.contains(station_name));
+                    changed |= per_service.len() != before;
                     if per_service.is_empty() {
                         provider_balances.remove(service_name);
                     }
                 }
                 let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
                 if let Some(per_service) = provider_balance_summaries.get_mut(service_name) {
+                    let before = per_service.len();
                     per_service
                         .retain(|station_name, _| !changed_layout_stations.contains(station_name));
+                    changed |= per_service.len() != before;
                     if per_service.is_empty() {
                         provider_balance_summaries.remove(service_name);
                     }
@@ -1364,9 +1439,9 @@ impl ProxyState {
             }
             None => {
                 let mut provider_balances = self.provider_balances.write().await;
-                provider_balances.remove(service_name);
+                changed |= provider_balances.remove(service_name).is_some();
                 let mut provider_balance_summaries = self.provider_balance_summaries.write().await;
-                provider_balance_summaries.remove(service_name);
+                changed |= provider_balance_summaries.remove(service_name).is_some();
             }
             Some(_) => {}
         }
@@ -1374,7 +1449,9 @@ impl ProxyState {
         {
             let mut guard = self.station_meta_overrides.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
+                let before = per_service.len();
                 per_service.retain(|station_name, _| active_stations.contains(station_name));
+                changed |= per_service.len() != before;
                 if per_service.is_empty() {
                     guard.remove(service_name);
                 }
@@ -1384,7 +1461,9 @@ impl ProxyState {
         {
             let mut guard = self.upstream_meta_overrides.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
+                let before = per_service.len();
                 per_service.retain(|base_url, _| active_base_urls.contains(base_url));
+                changed |= per_service.len() != before;
                 if per_service.is_empty() {
                     guard.remove(service_name);
                 }
@@ -1394,8 +1473,10 @@ impl ProxyState {
         {
             let mut guard = self.provider_endpoint_meta_overrides.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
+                let before = per_service.len();
                 per_service
                     .retain(|endpoint_key, _| active_provider_endpoint_keys.contains(endpoint_key));
+                changed |= per_service.len() != before;
                 if per_service.is_empty() {
                     guard.remove(service_name);
                 }
@@ -1416,6 +1497,11 @@ impl ProxyState {
         {
             let mut guard = self.station_health.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
+                let before_stations = per_service.len();
+                let before_upstreams = per_service
+                    .values()
+                    .map(|station_health| station_health.upstreams.len())
+                    .sum::<usize>();
                 per_service.retain(|station_name, station_health| {
                     if !active_stations.contains(station_name) {
                         return false;
@@ -1427,6 +1513,12 @@ impl ProxyState {
                     }
                     !station_health.upstreams.is_empty()
                 });
+                let after_upstreams = per_service
+                    .values()
+                    .map(|station_health| station_health.upstreams.len())
+                    .sum::<usize>();
+                changed |=
+                    per_service.len() != before_stations || after_upstreams != before_upstreams;
                 if per_service.is_empty() {
                     guard.remove(service_name);
                 }
@@ -1436,6 +1528,8 @@ impl ProxyState {
         {
             let mut guard = self.passive_station_health.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
+                let before_stations = per_service.len();
+                let before_upstreams = per_service.values().map(HashMap::len).sum::<usize>();
                 per_service.retain(|station_name, station_health| {
                     if !active_stations.contains(station_name) {
                         return false;
@@ -1445,6 +1539,9 @@ impl ProxyState {
                     }
                     !station_health.is_empty()
                 });
+                let after_upstreams = per_service.values().map(HashMap::len).sum::<usize>();
+                changed |=
+                    per_service.len() != before_stations || after_upstreams != before_upstreams;
                 if per_service.is_empty() {
                     guard.remove(service_name);
                 }
@@ -1454,7 +1551,9 @@ impl ProxyState {
         {
             let mut guard = self.station_health_checks.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
+                let before = per_service.len();
                 per_service.retain(|station_name, _| active_stations.contains(station_name));
+                changed |= per_service.len() != before;
                 if per_service.is_empty() {
                     guard.remove(service_name);
                 }
@@ -1464,25 +1563,36 @@ impl ProxyState {
         {
             let mut guard = self.usage_rollups.write().await;
             if let Some(rollup) = guard.get_mut(service_name) {
+                let before_by_config = rollup.by_config.len();
                 rollup
                     .by_config
                     .retain(|station_name, _| active_stations.contains(station_name));
+                changed |= rollup.by_config.len() != before_by_config;
+                let before_by_config_day = rollup.by_config_day.len();
                 rollup.by_config_day.retain(|station_name, _day_map| {
                     if !active_stations.contains(station_name) {
                         return false;
                     }
                     true
                 });
+                changed |= rollup.by_config_day.len() != before_by_config_day;
+                let before_by_provider = rollup.by_provider.len();
                 rollup
                     .by_provider
                     .retain(|provider_id, _| active_provider_ids.contains(provider_id));
+                changed |= rollup.by_provider.len() != before_by_provider;
+                let before_by_provider_day = rollup.by_provider_day.len();
                 rollup.by_provider_day.retain(|provider_id, _day_map| {
                     if !active_provider_ids.contains(provider_id) {
                         return false;
                     }
                     true
                 });
+                changed |= rollup.by_provider_day.len() != before_by_provider_day;
             }
+        }
+        if changed {
+            self.notify_state_changed();
         }
     }
 
@@ -1515,6 +1625,7 @@ impl ProxyState {
         let mut guard = self.station_health.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
         per_service.insert(station_name, health);
+        self.notify_state_changed();
     }
 
     pub async fn get_station_health(&self, service_name: &str) -> HashMap<String, StationHealth> {
@@ -1566,6 +1677,7 @@ impl ProxyState {
             .entry(service_name.to_string())
             .or_default()
             .insert(station_name, station_summary);
+        self.notify_state_changed();
     }
 
     pub async fn get_provider_balance_view(
@@ -1627,6 +1739,7 @@ impl ProxyState {
             .entry(base_url.to_string())
             .or_default();
         entry.record_success(now_ms, status_code);
+        self.notify_state_changed();
     }
 
     pub async fn record_passive_upstream_failure(&self, params: PassiveUpstreamFailureRecord) {
@@ -1649,6 +1762,7 @@ impl ProxyState {
             .entry(base_url)
             .or_default();
         entry.record_failure(now_ms, status_code, error_class, error);
+        self.notify_state_changed();
     }
 
     pub async fn get_lb_view(&self) -> HashMap<String, LbConfigView> {
@@ -1748,6 +1862,7 @@ impl ProxyState {
                 last_error: None,
             },
         );
+        self.notify_state_changed();
         true
     }
 
@@ -1769,6 +1884,7 @@ impl ProxyState {
         }
         st.cancel_requested = true;
         st.updated_at_ms = now_ms;
+        self.notify_state_changed();
         true
     }
 
@@ -1828,6 +1944,7 @@ impl ProxyState {
             }
             None => {}
         }
+        self.notify_state_changed();
     }
 
     pub async fn finish_station_health_check(
@@ -1843,6 +1960,7 @@ impl ProxyState {
         st.updated_at_ms = now_ms;
         st.canceled = canceled;
         st.done = true;
+        self.notify_state_changed();
     }
 
     pub async fn get_usage_rollup_view(
@@ -2222,7 +2340,9 @@ impl ProxyState {
                 .record(*status_code, *duration_ms, usage.as_ref(), None, *ttfb_ms);
         }
 
-        events.len()
+        let replayed = events.len();
+        self.notify_state_changed();
+        replayed
     }
 
     pub async fn resolve_session_cwd(&self, session_id: &str) -> Option<String> {
@@ -2307,6 +2427,7 @@ impl ProxyState {
         };
         let mut guard = self.active_requests.write().await;
         guard.insert(id, req);
+        self.notify_state_changed();
         id
     }
 
@@ -2326,6 +2447,7 @@ impl ProxyState {
         req.provider_id = provider_id;
         req.upstream_base_url = Some(upstream_base_url);
         req.route_decision = route_decision;
+        self.notify_state_changed();
     }
 
     pub async fn finish_request(&self, params: FinishRequestParams) {
@@ -2333,6 +2455,7 @@ impl ProxyState {
         let Some(req) = active.remove(&params.id) else {
             return;
         };
+        drop(active);
 
         let pricing_model = req
             .route_decision
@@ -2498,6 +2621,7 @@ impl ProxyState {
         while recent.len() > recent_finished_max() {
             recent.pop_back();
         }
+        self.notify_state_changed();
     }
 
     pub async fn list_active_requests(&self) -> Vec<ActiveRequest> {
@@ -2960,6 +3084,87 @@ mod tests {
             assert_eq!(recent[0].observability.trace_id.as_deref(), Some("codex-1"));
             assert!(recent[0].observability.fast_mode);
             assert_eq!(recent[0].observability.generation_ms, Some(6));
+        });
+    }
+
+    #[test]
+    fn state_change_subscription_tracks_dashboard_mutations() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let mut changes = state.subscribe_state_changes();
+
+            state
+                .record_provider_balance_snapshot(
+                    "codex",
+                    ProviderBalanceSnapshot {
+                        provider_id: "input6".to_string(),
+                        station_name: Some("routing".to_string()),
+                        upstream_index: Some(0),
+                        fetched_at_ms: 100,
+                        stale_after_ms: Some(1_000),
+                        status: BalanceSnapshotStatus::Ok,
+                        total_balance_usd: Some("12.50".to_string()),
+                        ..ProviderBalanceSnapshot::default()
+                    },
+                )
+                .await;
+            changes.changed().await.expect("balance change");
+            let balance_version = *changes.borrow();
+            assert!(balance_version > 0);
+
+            let request_id = state
+                .begin_request(
+                    "codex",
+                    "POST",
+                    "/v1/responses",
+                    Some("sid-1".to_string()),
+                    None,
+                    None,
+                    None,
+                    Some("gpt-5".to_string()),
+                    None,
+                    None,
+                    200,
+                )
+                .await;
+            changes.changed().await.expect("begin request change");
+            let active_version = *changes.borrow();
+            assert!(active_version > balance_version);
+
+            state
+                .finish_request(FinishRequestParams {
+                    id: request_id,
+                    status_code: 200,
+                    duration_ms: 25,
+                    ended_at_ms: 250,
+                    observed_service_tier: None,
+                    usage: None,
+                    retry: None,
+                    ttfb_ms: Some(5),
+                    streaming: false,
+                })
+                .await;
+            changes.changed().await.expect("finish request change");
+            assert!(*changes.borrow() > active_version);
+        });
+    }
+
+    #[test]
+    fn state_change_subscription_ignores_session_touch_only_updates() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let mut changes = state.subscribe_state_changes();
+
+            state
+                .set_session_model_override("sid-1".to_string(), "gpt-5".to_string(), 100)
+                .await;
+            changes.changed().await.expect("model override change");
+            let version = *changes.borrow();
+
+            state.touch_session_model_override("sid-1", 200).await;
+            assert_eq!(*changes.borrow(), version);
         });
     }
 
