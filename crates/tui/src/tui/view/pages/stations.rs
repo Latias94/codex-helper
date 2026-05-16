@@ -14,8 +14,8 @@ use crate::dashboard_core::{
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     Palette, Snapshot, balance_amount_brief_lang, balance_snapshot_status_label_lang,
-    balance_snapshot_status_style, format_age, now_ms, provider_balance_compact_lang, shorten,
-    shorten_middle, station_balance_brief_lang,
+    balance_snapshot_status_style, format_age, now_ms, provider_balance_compact_lang,
+    routing_context_balance_rank, shorten, shorten_middle, station_balance_brief_lang,
 };
 use crate::tui::state::UiState;
 use crate::tui::{Language, ProviderOption};
@@ -708,18 +708,27 @@ fn routing_provider_balance_snapshots<'a>(
         .provider_balances
         .iter()
         .flat_map(|(key, balances)| {
-            balances.iter().filter(move |balance| {
-                balance.provider_id == provider_name
+            balances.iter().filter_map(move |balance| {
+                if balance.provider_id == provider_name
                     || (balance.provider_id.trim().is_empty() && key == provider_name)
+                {
+                    Some((
+                        routing_context_balance_rank(key, balance, provider_name),
+                        balance,
+                    ))
+                } else {
+                    None
+                }
             })
         })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
-        left.upstream_index
-            .cmp(&right.upstream_index)
-            .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.upstream_index.cmp(&right.1.upstream_index))
+            .then_with(|| right.1.fetched_at_ms.cmp(&left.1.fetched_at_ms))
     });
-    matches
+    matches.into_iter().map(|(_, balance)| balance).collect()
 }
 
 fn routing_provider_balance_brief_lang(
@@ -2557,6 +2566,56 @@ mod tests {
         );
         assert_eq!(brief, "不降级 daily $0/$300.00");
         assert!(!brief.ends_with(" / $"), "{brief}");
+    }
+
+    #[test]
+    fn routing_provider_balance_prefers_routing_context_over_same_named_station() {
+        let snapshot = empty_snapshot(
+            HashMap::from([
+                (
+                    "input6".to_string(),
+                    vec![crate::state::ProviderBalanceSnapshot {
+                        provider_id: "input6".to_string(),
+                        station_name: Some("input6".to_string()),
+                        upstream_index: Some(0),
+                        status: BalanceSnapshotStatus::Ok,
+                        total_balance_usd: Some("99.00".to_string()),
+                        fetched_at_ms: 2_000,
+                        ..crate::state::ProviderBalanceSnapshot::default()
+                    }],
+                ),
+                (
+                    "routing".to_string(),
+                    vec![crate::state::ProviderBalanceSnapshot {
+                        provider_id: "input6".to_string(),
+                        station_name: Some("routing".to_string()),
+                        upstream_index: Some(6),
+                        status: BalanceSnapshotStatus::Exhausted,
+                        exhausted: Some(true),
+                        exhaustion_affects_routing: false,
+                        quota_period: Some("daily".to_string()),
+                        quota_remaining_usd: Some("0".to_string()),
+                        quota_limit_usd: Some("300".to_string()),
+                        fetched_at_ms: 1_000,
+                        ..crate::state::ProviderBalanceSnapshot::default()
+                    }],
+                ),
+            ]),
+            None,
+        );
+
+        let balances = routing_provider_balance_snapshots(&snapshot, "input6");
+        assert_eq!(
+            balances
+                .first()
+                .and_then(|balance| balance.station_name.as_deref()),
+            Some("routing")
+        );
+
+        let brief = routing_provider_balance_brief_lang(&snapshot, "input6", 80, Language::En);
+
+        assert!(brief.contains("$0") && brief.contains("$300.00"), "{brief}");
+        assert!(!brief.contains("$99.00"), "{brief}");
     }
 
     #[test]

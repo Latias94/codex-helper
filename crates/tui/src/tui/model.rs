@@ -1129,6 +1129,21 @@ fn balance_snapshot_rank(snapshot: &ProviderBalanceSnapshot) -> u8 {
     }
 }
 
+pub(in crate::tui) fn routing_context_balance_rank(
+    station_key: &str,
+    snapshot: &ProviderBalanceSnapshot,
+    provider_name: &str,
+) -> u8 {
+    let station_name = snapshot.station_name.as_deref().unwrap_or(station_key);
+    if station_name == "routing" || station_key == "routing" {
+        0
+    } else if station_name == provider_name || station_key == provider_name {
+        1
+    } else {
+        2
+    }
+}
+
 fn primary_balance_snapshot(
     balances: &[ProviderBalanceSnapshot],
 ) -> Option<&ProviderBalanceSnapshot> {

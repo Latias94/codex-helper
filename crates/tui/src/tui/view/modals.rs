@@ -11,8 +11,8 @@ use crate::tui::ProviderOption;
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, compute_window_stats, now_ms,
-    provider_balance_compact_lang, provider_tags_brief, shorten, shorten_middle,
-    station_balance_brief_lang, station_primary_balance_snapshot,
+    provider_balance_compact_lang, provider_tags_brief, routing_context_balance_rank, shorten,
+    shorten_middle, station_balance_brief_lang, station_primary_balance_snapshot,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{EffortChoice, Overlay, Page, ServiceTierChoice};
@@ -1873,18 +1873,27 @@ fn routing_provider_balance_line<'a>(
         .provider_balances
         .iter()
         .flat_map(|(key, balances)| {
-            balances.iter().filter(move |balance| {
-                balance.provider_id == provider_name
+            balances.iter().filter_map(move |balance| {
+                if balance.provider_id == provider_name
                     || (balance.provider_id.trim().is_empty() && key == provider_name)
+                {
+                    Some((
+                        routing_context_balance_rank(key, balance, provider_name),
+                        balance,
+                    ))
+                } else {
+                    None
+                }
             })
         })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
-        left.upstream_index
-            .cmp(&right.upstream_index)
-            .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.upstream_index.cmp(&right.1.upstream_index))
+            .then_with(|| right.1.fetched_at_ms.cmp(&left.1.fetched_at_ms))
     });
-    let balance = matches.into_iter().next()?;
+    let (_, balance) = matches.into_iter().next()?;
     Some((balance, provider_balance_compact_lang(balance, 38, lang)))
 }
 
@@ -2177,6 +2186,68 @@ mod tests {
             .expect("legacy snapshot should still resolve");
 
         assert!(text.contains("$9.00"), "{text}");
+    }
+
+    #[test]
+    fn routing_provider_balance_line_prefers_routing_context() {
+        let snapshot = crate::tui::model::Snapshot {
+            rows: Vec::new(),
+            recent: Vec::new(),
+            model_overrides: std::collections::HashMap::new(),
+            overrides: std::collections::HashMap::new(),
+            station_overrides: std::collections::HashMap::new(),
+            route_target_overrides: std::collections::HashMap::new(),
+            service_tier_overrides: std::collections::HashMap::new(),
+            global_station_override: None,
+            global_route_target_override: None,
+            station_meta_overrides: std::collections::HashMap::new(),
+            usage_rollup: crate::state::UsageRollupView::default(),
+            provider_balances: std::collections::HashMap::from([
+                (
+                    "input6".to_string(),
+                    vec![crate::state::ProviderBalanceSnapshot {
+                        provider_id: "input6".to_string(),
+                        station_name: Some("input6".to_string()),
+                        upstream_index: Some(0),
+                        status: crate::state::BalanceSnapshotStatus::Ok,
+                        total_balance_usd: Some("99.00".to_string()),
+                        fetched_at_ms: 2_000,
+                        ..crate::state::ProviderBalanceSnapshot::default()
+                    }],
+                ),
+                (
+                    "routing".to_string(),
+                    vec![crate::state::ProviderBalanceSnapshot {
+                        provider_id: "input6".to_string(),
+                        station_name: Some("routing".to_string()),
+                        upstream_index: Some(6),
+                        status: crate::state::BalanceSnapshotStatus::Exhausted,
+                        exhausted: Some(true),
+                        exhaustion_affects_routing: false,
+                        quota_period: Some("daily".to_string()),
+                        quota_remaining_usd: Some("0".to_string()),
+                        quota_limit_usd: Some("300".to_string()),
+                        fetched_at_ms: 1_000,
+                        ..crate::state::ProviderBalanceSnapshot::default()
+                    }],
+                ),
+            ]),
+            station_health: std::collections::HashMap::new(),
+            health_checks: std::collections::HashMap::new(),
+            lb_view: std::collections::HashMap::new(),
+            stats_5m: crate::dashboard_core::WindowStats::default(),
+            stats_1h: crate::dashboard_core::WindowStats::default(),
+            pricing_catalog: crate::pricing::ModelPriceCatalogSnapshot::default(),
+            refreshed_at: std::time::Instant::now(),
+        };
+
+        let (balance, text) =
+            super::routing_provider_balance_line(&snapshot, "input6", Language::En)
+                .expect("routing snapshot should resolve");
+
+        assert_eq!(balance.station_name.as_deref(), Some("routing"));
+        assert!(text.contains("$0") && text.contains("$300.00"), "{text}");
+        assert!(!text.contains("$99.00"), "{text}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - Codex 请求触发的余额刷新如果撞上 provider 冷却窗口，现在会延后到冷却结束补刷一次，避免高频请求停止后余额长期停在旧快照；进入 TUI `Routing` 页面时也会对空、过期、未知或错误余额做一次懒刷新。
 - 手动余额刷新现在也能用 `provider_id` 命中自动探测的 provider，例如 `provider_id=input6` 会刷新 sub2api 网关层余额，而不是因为没有显式 `usage_providers.json` 条目而跳过。
 - TUI 快照刷新改为后台完成后应用，避免请求很多或日志很大时因为短超时丢弃余额快照，导致 `Routing` / `Usage` 页面看起来不自动刷新。
+- TUI `Routing` 页面和路由编辑弹窗在同名 provider 同时存在 `routing` 与独立站点余额时，优先显示路由层余额，避免请求后刷新了网关层余额但路由页仍显示旧站点余额。
 - TUI `Usage` provider 余额状态会把“不参与路由降级的耗尽”显示为 `lazy reset` / `不降级耗尽`，避免和普通耗尽或可路由降级状态混淆。
 - TUI `Usage` 页面的 provider 表格、详情面板和报告导出现在共用同一套筛选后的行模型，降低关注项筛选后详情或导出目标错位的风险。
 - GUI 统计页和余额概览迁移到同一套 core `UsageBalanceView` 语义，`unknown`、`stale`、`exhausted`、`error` 和 `unlimited` 不再由各 UI 自行混算。
@@ -44,6 +45,7 @@ All notable changes to this project will be documented in this file.
 - If request-driven balance refresh lands inside a provider cooldown window, it now schedules a trailing refresh after the cooldown instead of dropping the update; entering the TUI `Routing` page also lazily refreshes empty, stale, unknown, or errored balances.
 - Manual balance refresh now matches auto-discovered providers by `provider_id`, so requests such as `provider_id=input6` refresh the sub2api gateway balance instead of being skipped when no explicit `usage_providers.json` entry exists.
 - TUI snapshot refreshes now apply after the background build finishes, avoiding dropped balance snapshots when request/log volume makes a refresh exceed the short UI timeout.
+- The TUI `Routing` page and routing editor now prefer route-context balances over same-named standalone station balances, so routed provider rows show the gateway balance refreshed by requests.
 - The TUI `Usage` provider balance state now labels exhaustion that is ignored for routing demotion as `lazy reset` / `不降级耗尽`, making it distinct from ordinary exhaustion or demotion-triggering states.
 - The TUI `Usage` provider table, detail pane, and report export now share the same filtered row model, reducing the risk of detail/export target drift after attention filtering.
 - The GUI stats and balance views now consume the shared core `UsageBalanceView`, so `unknown`, `stale`, `exhausted`, `error`, and `unlimited` stay distinct across UI surfaces.
