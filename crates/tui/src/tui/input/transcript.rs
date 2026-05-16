@@ -61,7 +61,7 @@ pub(super) async fn handle_key_session_transcript(ui: &mut UiState, key: KeyEven
         }
         KeyCode::Char('y') => {
             let text = format_session_transcript_text(ui);
-            match super::try_copy_to_clipboard(&text) {
+            match super::normal::try_copy_to_clipboard(&text) {
                 Ok(()) => {
                     ui.toast = Some((
                         i18n::label(ui.language, "transcript: copied to clipboard").to_string(),
@@ -105,7 +105,7 @@ pub(super) async fn handle_key_session_transcript(ui: &mut UiState, key: KeyEven
             true
         }
         KeyCode::Char('L') => {
-            super::toggle_language(ui).await;
+            super::normal::toggle_language(ui).await;
             true
         }
         _ => false,
