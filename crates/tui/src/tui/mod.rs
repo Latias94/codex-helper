@@ -75,66 +75,103 @@ fn snapshot_refresh_result_is_current(
         && result_stats_days == current_stats_days
 }
 
-fn invalidate_snapshot_refresh(generation: &mut u64, in_flight: &mut Option<u64>) {
-    *generation = generation.wrapping_add(1);
-    *in_flight = None;
+#[derive(Debug)]
+struct SnapshotRefreshController {
+    tx: mpsc::UnboundedSender<SnapshotRefreshResult>,
+    generation: u64,
+    in_flight: Option<u64>,
+    pending: bool,
 }
 
-fn start_snapshot_refresh(
-    generation: &mut u64,
-    in_flight: &mut Option<u64>,
-    tx: &mpsc::UnboundedSender<SnapshotRefreshResult>,
-    state: Arc<ProxyState>,
-    cfg: Arc<ProxyConfig>,
-    service_name: &'static str,
-    stats_days: usize,
-) {
-    if in_flight.is_some() {
-        return;
+impl SnapshotRefreshController {
+    fn new(tx: mpsc::UnboundedSender<SnapshotRefreshResult>) -> Self {
+        Self {
+            tx,
+            generation: 0,
+            in_flight: None,
+            pending: false,
+        }
     }
 
-    *generation = generation.wrapping_add(1);
-    let generation = *generation;
-    *in_flight = Some(generation);
-    let config_version = cfg.version;
-    let tx = tx.clone();
-    tokio::spawn(async move {
-        let snapshot = refresh_snapshot(&state, cfg, service_name, stats_days).await;
-        let _ = tx.send(SnapshotRefreshResult {
-            generation,
-            config_version,
-            stats_days,
-            snapshot,
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.in_flight = None;
+        self.pending = false;
+    }
+
+    fn request(
+        &mut self,
+        state: Arc<ProxyState>,
+        cfg: Arc<ProxyConfig>,
+        service_name: &'static str,
+        stats_days: usize,
+    ) {
+        if self.in_flight.is_some() {
+            self.pending = true;
+            return;
+        }
+
+        self.start(state, cfg, service_name, stats_days);
+    }
+
+    fn finish(&mut self, generation: u64) {
+        if self.in_flight == Some(generation) {
+            self.in_flight = None;
+        }
+    }
+
+    fn result_is_current(
+        &self,
+        result: &SnapshotRefreshResult,
+        current_config_version: Option<u32>,
+        current_stats_days: usize,
+    ) -> bool {
+        snapshot_refresh_result_is_current(
+            result.generation,
+            result.config_version,
+            result.stats_days,
+            self.generation,
+            current_config_version,
+            current_stats_days,
+        )
+    }
+
+    fn request_pending_if_idle(
+        &mut self,
+        state: Arc<ProxyState>,
+        cfg: Arc<ProxyConfig>,
+        service_name: &'static str,
+        stats_days: usize,
+    ) {
+        if self.pending && self.in_flight.is_none() {
+            self.request(state, cfg, service_name, stats_days);
+        }
+    }
+
+    fn start(
+        &mut self,
+        state: Arc<ProxyState>,
+        cfg: Arc<ProxyConfig>,
+        service_name: &'static str,
+        stats_days: usize,
+    ) {
+        debug_assert!(self.in_flight.is_none());
+        self.pending = false;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.in_flight = Some(generation);
+        let config_version = cfg.version;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let snapshot = refresh_snapshot(&state, cfg, service_name, stats_days).await;
+            let _ = tx.send(SnapshotRefreshResult {
+                generation,
+                config_version,
+                stats_days,
+                snapshot,
+            });
         });
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn request_snapshot_refresh(
-    generation: &mut u64,
-    in_flight: &mut Option<u64>,
-    pending: &mut bool,
-    tx: &mpsc::UnboundedSender<SnapshotRefreshResult>,
-    state: Arc<ProxyState>,
-    cfg: Arc<ProxyConfig>,
-    service_name: &'static str,
-    stats_days: usize,
-) {
-    if in_flight.is_some() {
-        *pending = true;
-        return;
     }
-
-    *pending = false;
-    start_snapshot_refresh(
-        generation,
-        in_flight,
-        tx,
-        state,
-        cfg,
-        service_name,
-        stats_days,
-    );
 }
 
 fn balance_refresh_summary_message(
@@ -333,9 +370,7 @@ pub async fn run_dashboard(
         mpsc::unbounded_channel::<CodexHistoryRefreshResult>();
     let (recent_refresh_tx, mut recent_refresh_rx) =
         mpsc::unbounded_channel::<CodexRecentRefreshResult>();
-    let mut snapshot_refresh_generation = 0_u64;
-    let mut snapshot_refresh_in_flight = None;
-    let mut snapshot_refresh_pending = false;
+    let mut snapshot_refresh = SnapshotRefreshController::new(snapshot_refresh_tx);
 
     let mut render_invalidation = RenderInvalidation::FullClear;
     let mut last_drawn_page = ui.page;
@@ -383,11 +418,7 @@ pub async fn run_dashboard(
         tokio::select! {
             _ = ticker.tick() => {
                 if snapshot.refreshed_at.elapsed() >= snapshot_fallback_interval {
-                    request_snapshot_refresh(
-                        &mut snapshot_refresh_generation,
-                        &mut snapshot_refresh_in_flight,
-                        &mut snapshot_refresh_pending,
-                        &snapshot_refresh_tx,
+                    snapshot_refresh.request(
                         state.clone(),
                         cfg.clone(),
                         service_name,
@@ -431,11 +462,7 @@ pub async fn run_dashboard(
             }
             changed = state_changes.changed() => {
                 if changed.is_ok() {
-                    request_snapshot_refresh(
-                        &mut snapshot_refresh_generation,
-                        &mut snapshot_refresh_in_flight,
-                        &mut snapshot_refresh_pending,
-                        &snapshot_refresh_tx,
+                    snapshot_refresh.request(
                         state.clone(),
                         cfg.clone(),
                         service_name,
@@ -445,33 +472,18 @@ pub async fn run_dashboard(
             }
             maybe_snapshot_refresh = snapshot_refresh_rx.recv() => {
                 if let Some(result) = maybe_snapshot_refresh {
-                    if snapshot_refresh_in_flight == Some(result.generation) {
-                        snapshot_refresh_in_flight = None;
-                    }
-                    if snapshot_refresh_result_is_current(
-                        result.generation,
-                        result.config_version,
-                        result.stats_days,
-                        snapshot_refresh_generation,
-                        cfg.version,
-                        ui.stats_days,
-                    ) {
+                    snapshot_refresh.finish(result.generation);
+                    if snapshot_refresh.result_is_current(&result, cfg.version, ui.stats_days) {
                         snapshot = result.snapshot;
                         ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
                         request_redraw(&mut render_invalidation);
                     }
-                    if snapshot_refresh_pending && snapshot_refresh_in_flight.is_none() {
-                        request_snapshot_refresh(
-                            &mut snapshot_refresh_generation,
-                            &mut snapshot_refresh_in_flight,
-                            &mut snapshot_refresh_pending,
-                            &snapshot_refresh_tx,
-                            state.clone(),
-                            cfg.clone(),
-                            service_name,
-                            ui.stats_days,
-                        );
-                    }
+                    snapshot_refresh.request_pending_if_idle(
+                        state.clone(),
+                        cfg.clone(),
+                        service_name,
+                        ui.stats_days,
+                    );
                 }
             }
             maybe_balance_refresh = balance_refresh_rx.recv() => {
@@ -493,11 +505,7 @@ pub async fn run_dashboard(
                                 Some((format!("balance refresh failed: {err}"), Instant::now()));
                         }
                     }
-                    request_snapshot_refresh(
-                        &mut snapshot_refresh_generation,
-                        &mut snapshot_refresh_in_flight,
-                        &mut snapshot_refresh_pending,
-                        &snapshot_refresh_tx,
+                    snapshot_refresh.request(
                         state.clone(),
                         cfg.clone(),
                         service_name,
@@ -577,17 +585,9 @@ pub async fn run_dashboard(
                                     Ok(new_cfg) => {
                                         cfg = Arc::new(new_cfg);
                                         ui.config_version = cfg.version;
-                                        invalidate_snapshot_refresh(
-                                            &mut snapshot_refresh_generation,
-                                            &mut snapshot_refresh_in_flight,
-                                        );
-                                        snapshot_refresh_pending = false;
+                                        snapshot_refresh.invalidate();
                                         providers = build_provider_options(&cfg, service_name);
-                                        request_snapshot_refresh(
-                                            &mut snapshot_refresh_generation,
-                                            &mut snapshot_refresh_in_flight,
-                                            &mut snapshot_refresh_pending,
-                                            &snapshot_refresh_tx,
+                                        snapshot_refresh.request(
                                             state.clone(),
                                             cfg.clone(),
                                             service_name,
@@ -608,16 +608,8 @@ pub async fn run_dashboard(
                                 ui.needs_config_refresh = false;
                             }
                             if ui.needs_snapshot_refresh {
-                                invalidate_snapshot_refresh(
-                                    &mut snapshot_refresh_generation,
-                                    &mut snapshot_refresh_in_flight,
-                                );
-                                snapshot_refresh_pending = false;
-                                request_snapshot_refresh(
-                                    &mut snapshot_refresh_generation,
-                                    &mut snapshot_refresh_in_flight,
-                                    &mut snapshot_refresh_pending,
-                                    &snapshot_refresh_tx,
+                                snapshot_refresh.invalidate();
+                                snapshot_refresh.request(
                                     state.clone(),
                                     cfg.clone(),
                                     service_name,
@@ -873,9 +865,7 @@ async fn read_git_branch_shallow(workdir: &str) -> Option<String> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{
-        invalidate_snapshot_refresh, request_snapshot_refresh, snapshot_refresh_result_is_current,
-    };
+    use super::{SnapshotRefreshController, snapshot_refresh_result_is_current};
     use crate::config::ProxyConfig;
     use crate::state::ProxyState;
 
@@ -916,36 +906,57 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_refresh_invalidation_clears_in_flight_task() {
-        let mut generation = 41;
-        let mut in_flight = Some(41);
+    fn snapshot_refresh_controller_invalidation_clears_task_state() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut controller = SnapshotRefreshController::new(tx);
+        controller.generation = 41;
+        controller.in_flight = Some(41);
+        controller.pending = true;
 
-        invalidate_snapshot_refresh(&mut generation, &mut in_flight);
+        controller.invalidate();
 
-        assert_eq!(generation, 42);
-        assert_eq!(in_flight, None);
+        assert_eq!(controller.generation, 42);
+        assert_eq!(controller.in_flight, None);
+        assert!(!controller.pending);
     }
 
     #[test]
-    fn snapshot_refresh_request_marks_pending_without_invalidating_in_flight() {
+    fn snapshot_refresh_controller_request_marks_pending_without_invalidating_in_flight() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut generation = 7;
-        let mut in_flight = Some(7);
-        let mut pending = false;
+        let mut controller = SnapshotRefreshController::new(tx);
+        controller.generation = 7;
+        controller.in_flight = Some(7);
 
-        request_snapshot_refresh(
-            &mut generation,
-            &mut in_flight,
-            &mut pending,
-            &tx,
+        controller.request(
             ProxyState::new(),
             Arc::new(ProxyConfig::default()),
             "codex",
             7,
         );
 
-        assert_eq!(generation, 7);
-        assert_eq!(in_flight, Some(7));
-        assert!(pending);
+        assert_eq!(controller.generation, 7);
+        assert_eq!(controller.in_flight, Some(7));
+        assert!(controller.pending);
+    }
+
+    #[tokio::test]
+    async fn snapshot_refresh_controller_restarts_pending_work_after_current_finish() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut controller = SnapshotRefreshController::new(tx);
+        controller.generation = 7;
+        controller.in_flight = Some(7);
+        controller.pending = true;
+
+        controller.finish(7);
+        controller.request_pending_if_idle(
+            ProxyState::new(),
+            Arc::new(ProxyConfig::default()),
+            "codex",
+            7,
+        );
+
+        assert_eq!(controller.generation, 8);
+        assert_eq!(controller.in_flight, Some(8));
+        assert!(!controller.pending);
     }
 }
