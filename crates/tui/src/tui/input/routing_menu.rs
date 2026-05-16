@@ -8,8 +8,9 @@ use crate::tui::i18n;
 use crate::tui::model::{ProviderOption, RoutingSpecView, Snapshot, routing_leaf_provider_names};
 use crate::tui::state::UiState;
 
-use super::{
-    BalanceRefreshSender, apply_persisted_routing, refresh_route_graph_balances,
+use super::BalanceRefreshSender;
+use super::routing::{
+    apply_persisted_routing, refresh_route_graph_balances,
     request_provider_balance_refresh_after_control_change, set_provider_billing_tag,
     set_provider_enabled,
 };
