@@ -227,6 +227,40 @@ fn balance_refresh_summary_message(
     parts.join(" · ")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DashboardTiming {
+    refresh_ms: u64,
+    io_timeout: Duration,
+    snapshot_fallback_interval: Duration,
+}
+
+impl DashboardTiming {
+    fn from_env() -> Self {
+        let refresh_ms = std::env::var("CODEX_HELPER_TUI_REFRESH_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1_000)
+            .clamp(250, 5_000);
+
+        let io_timeout = Duration::from_millis((refresh_ms / 2).clamp(50, 250));
+        let snapshot_fallback_interval = Duration::from_secs(
+            std::env::var("CODEX_HELPER_TUI_SNAPSHOT_FALLBACK_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(10)
+                .clamp(2, 300),
+        );
+
+        Self {
+            refresh_ms,
+            io_timeout,
+            snapshot_fallback_interval,
+        }
+    }
+}
+
 async fn refresh_runtime_config_if_due(
     ui: &mut UiState,
     proxy: &ProxyService,
@@ -446,6 +480,8 @@ struct CodexRecentRefreshPayload {
 
 const CODEX_RECENT_BRANCH_LOOKUP_CONCURRENCY: usize = 8;
 
+type DashboardTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
 impl RenderSurfaceKey {
     fn capture(ui: &UiState) -> Self {
         Self {
@@ -477,6 +513,71 @@ impl RenderSurfaceKey {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn render_dashboard_if_needed(
+    terminal: &mut DashboardTerminal,
+    render_invalidation: &mut RenderInvalidation,
+    last_drawn_page: &mut types::Page,
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    proxy: &ProxyService,
+    balance_refresh_tx: &input::BalanceRefreshSender,
+    palette: Palette,
+    service_name: &'static str,
+    port: u16,
+    providers: &[ProviderOption],
+) -> anyhow::Result<()> {
+    if *render_invalidation == RenderInvalidation::None {
+        return Ok(());
+    }
+
+    if ui.page != *last_drawn_page {
+        // Defensive: some terminals occasionally leave stale cells when only a small
+        // region changes (e.g., switching tabs). A full clear on page switch keeps the
+        // UI visually consistent without clearing on every tick.
+        request_full_clear(render_invalidation);
+        ui.reset_table_viewports();
+        *last_drawn_page = ui.page;
+        if ui.uses_route_graph_routing() && ui.page == types::Page::Stations {
+            let _ = input::request_provider_balance_refresh(
+                ui,
+                snapshot,
+                proxy,
+                input::BalanceRefreshMode::Auto,
+                balance_refresh_tx,
+            );
+        }
+    }
+    if matches!(render_invalidation, RenderInvalidation::FullClear) {
+        terminal.clear()?;
+    }
+    terminal.draw(|f| view::render_app(f, palette, ui, snapshot, service_name, port, providers))?;
+    *render_invalidation = RenderInvalidation::None;
+    Ok(())
+}
+
+fn enter_dashboard_terminal() -> anyhow::Result<(TerminalGuard, DashboardTerminal)> {
+    let term_guard = TerminalGuard::enter()?;
+    let stdout = io::stdout();
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.hide_cursor()?;
+
+    Ok((term_guard, terminal))
+}
+
+fn leave_dashboard_terminal(
+    mut term_guard: TerminalGuard,
+    terminal: &mut DashboardTerminal,
+) -> anyhow::Result<()> {
+    terminal.show_cursor()?;
+    crossterm::terminal::disable_raw_mode()?;
+    terminal.backend_mut().execute(LeaveAlternateScreen)?;
+    term_guard.disarm();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_dashboard(
     proxy: ProxyService,
     state: Arc<ProxyState>,
@@ -489,34 +590,13 @@ pub async fn run_dashboard(
     shutdown: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let refresh_ms = std::env::var("CODEX_HELPER_TUI_REFRESH_MS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(1_000)
-        .clamp(250, 5_000);
-
-    let io_timeout = Duration::from_millis((refresh_ms / 2).clamp(50, 250));
-    let snapshot_fallback_interval = Duration::from_secs(
-        std::env::var("CODEX_HELPER_TUI_SNAPSHOT_FALLBACK_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(10)
-            .clamp(2, 300),
-    );
-
-    let mut term_guard = TerminalGuard::enter()?;
-    let stdout = io::stdout();
-
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.hide_cursor()?;
+    let timing = DashboardTiming::from_env();
+    let (term_guard, mut terminal) = enter_dashboard_terminal()?;
 
     let mut ui = UiState {
         service_name,
         language,
-        refresh_ms,
+        refresh_ms: timing.refresh_ms,
         config_version: cfg.version,
         ..Default::default()
     };
@@ -524,7 +604,7 @@ pub async fn run_dashboard(
     let palette = Palette::default();
 
     let mut events = EventStream::new();
-    let mut ticker = tokio::time::interval(Duration::from_millis(refresh_ms));
+    let mut ticker = tokio::time::interval(Duration::from_millis(timing.refresh_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut state_changes = state.subscribe_state_changes();
 
@@ -547,40 +627,19 @@ pub async fn run_dashboard(
     let mut render_invalidation = RenderInvalidation::FullClear;
     let mut last_drawn_page = ui.page;
     loop {
-        if render_invalidation != RenderInvalidation::None {
-            if ui.page != last_drawn_page {
-                // Defensive: some terminals occasionally leave stale cells when only a small
-                // region changes (e.g., switching tabs). A full clear on page switch keeps the
-                // UI visually consistent without clearing on every tick.
-                request_full_clear(&mut render_invalidation);
-                ui.reset_table_viewports();
-                last_drawn_page = ui.page;
-                if ui.uses_route_graph_routing() && ui.page == types::Page::Stations {
-                    let _ = input::request_provider_balance_refresh(
-                        &mut ui,
-                        &snapshot,
-                        &proxy,
-                        input::BalanceRefreshMode::Auto,
-                        &balance_refresh_tx,
-                    );
-                }
-            }
-            if matches!(render_invalidation, RenderInvalidation::FullClear) {
-                terminal.clear()?;
-            }
-            terminal.draw(|f| {
-                view::render_app(
-                    f,
-                    palette,
-                    &mut ui,
-                    &snapshot,
-                    service_name,
-                    port,
-                    &providers,
-                )
-            })?;
-            render_invalidation = RenderInvalidation::None;
-        }
+        render_dashboard_if_needed(
+            &mut terminal,
+            &mut render_invalidation,
+            &mut last_drawn_page,
+            &mut ui,
+            &snapshot,
+            &proxy,
+            &balance_refresh_tx,
+            palette,
+            service_name,
+            port,
+            &providers,
+        )?;
 
         if ui.should_exit || *shutdown_rx.borrow() {
             let _ = shutdown.send(true);
@@ -597,8 +656,8 @@ pub async fn run_dashboard(
                     service_name,
                     &snapshot,
                     providers.len(),
-                    io_timeout,
-                    snapshot_fallback_interval,
+                    timing.io_timeout,
+                    timing.snapshot_fallback_interval,
                     &mut snapshot_refresh,
                 ).await;
                 request_redraw(&mut render_invalidation);
@@ -639,7 +698,7 @@ pub async fn run_dashboard(
                         service_name,
                         &snapshot,
                         providers.len(),
-                        io_timeout,
+                        timing.io_timeout,
                         &mut snapshot_refresh,
                         result,
                     ).await;
@@ -716,11 +775,7 @@ pub async fn run_dashboard(
         }
     }
 
-    terminal.show_cursor()?;
-    crossterm::terminal::disable_raw_mode()?;
-    terminal.backend_mut().execute(LeaveAlternateScreen)?;
-    term_guard.disarm();
-    Ok(())
+    leave_dashboard_terminal(term_guard, &mut terminal)
 }
 
 fn start_codex_history_refresh(
