@@ -6,7 +6,9 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 
+use crate::dashboard_core::WindowStats;
 use crate::state::UsageRollupView;
+use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
 use crate::usage_providers::UsageProviderRefreshSummary;
 
 fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>) -> Snapshot {
