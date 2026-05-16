@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::dashboard_core::{
@@ -734,6 +734,23 @@ fn routing_provider_balance_brief_lang(
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn routing_provider_balance_cell_lang(
+    p: Palette,
+    snapshot: &Snapshot,
+    provider_name: &str,
+    max_width: usize,
+    lang: Language,
+) -> (String, Style) {
+    let balances = routing_provider_balance_snapshots(snapshot, provider_name);
+    match balances.first() {
+        Some(balance) => (
+            provider_balance_compact_lang(balance, max_width, lang),
+            balance_snapshot_status_style(p, balance),
+        ),
+        None => ("-".to_string(), Style::default().fg(p.muted)),
+    }
+}
+
 fn routing_provider_display_label(
     provider: Option<&crate::tui::state::RoutingProviderRow>,
     provider_name: &str,
@@ -1093,13 +1110,14 @@ fn render_route_graph_routing_page(
             let name = row.name.as_str();
             let marker = routing_provider_marker(&spec, name, Some(row));
             let label = row.display_label();
-            let balance = routing_provider_balance_brief_lang(
+            let (balance, balance_style) = routing_provider_balance_cell_lang(
+                p,
                 snapshot,
                 name,
                 usize::from(balance_column_width),
                 lang,
             );
-            let style = if !row.enabled {
+            let provider_style = if !row.enabled {
                 Style::default().fg(p.muted)
             } else if session_route_target == Some(name) {
                 Style::default().fg(p.focus).add_modifier(Modifier::BOLD)
@@ -1110,23 +1128,41 @@ fn render_route_graph_routing_page(
             } else {
                 Style::default().fg(p.text)
             };
+            let on_style = Style::default().fg(if row.enabled { p.good } else { p.muted });
+            let route_style = if row.enabled {
+                provider_style
+            } else {
+                Style::default().fg(p.muted)
+            };
             let cells = if compact_provider_table {
                 vec![
-                    (idx + 1).to_string(),
-                    shorten_middle(&label, 28),
-                    if row.enabled { l("on") } else { l("off") }.to_string(),
-                    balance,
+                    Cell::from(Span::styled(
+                        (idx + 1).to_string(),
+                        Style::default().fg(p.muted),
+                    )),
+                    Cell::from(Span::styled(shorten_middle(&label, 28), provider_style)),
+                    Cell::from(Span::styled(
+                        if row.enabled { l("on") } else { l("off") }.to_string(),
+                        on_style,
+                    )),
+                    Cell::from(Span::styled(balance, balance_style)),
                 ]
             } else {
                 vec![
-                    (idx + 1).to_string(),
-                    shorten_middle(&label, 28),
-                    if row.enabled { l("on") } else { l("off") }.to_string(),
-                    marker.to_string(),
-                    balance,
+                    Cell::from(Span::styled(
+                        (idx + 1).to_string(),
+                        Style::default().fg(p.muted),
+                    )),
+                    Cell::from(Span::styled(shorten_middle(&label, 28), provider_style)),
+                    Cell::from(Span::styled(
+                        if row.enabled { l("on") } else { l("off") }.to_string(),
+                        on_style,
+                    )),
+                    Cell::from(Span::styled(marker.to_string(), route_style)),
+                    Cell::from(Span::styled(balance, balance_style)),
                 ]
             };
-            Row::new(cells).style(style).height(1)
+            Row::new(cells).height(1)
         })
         .collect::<Vec<_>>();
 

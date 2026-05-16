@@ -199,7 +199,7 @@ impl Default for UiState {
             configured_default_profile: None,
             effective_default_profile: None,
             runtime_default_profile_override: None,
-            stats_focus: StatsFocus::Stations,
+            stats_focus: StatsFocus::Providers,
             stats_days: 7,
             stats_errors_only: false,
             stats_attention_only: false,

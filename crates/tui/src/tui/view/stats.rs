@@ -66,6 +66,40 @@ fn usage_balance_status_label(status: UsageBalanceStatus, lang: Language) -> &'s
     }
 }
 
+fn usage_balance_status_style(p: Palette, status: UsageBalanceStatus) -> Style {
+    match status {
+        UsageBalanceStatus::Ok => Style::default().fg(p.good),
+        UsageBalanceStatus::Unlimited => Style::default().fg(p.accent),
+        UsageBalanceStatus::Exhausted => Style::default().fg(p.bad),
+        UsageBalanceStatus::Stale | UsageBalanceStatus::Error => Style::default().fg(p.warn),
+        UsageBalanceStatus::Unknown => Style::default().fg(p.muted),
+    }
+}
+
+fn provider_balance_status_style(p: Palette, row: &UsageBalanceProviderRow) -> Style {
+    if row
+        .primary_balance
+        .as_ref()
+        .is_some_and(|balance| balance.routing_ignored_exhaustion)
+    {
+        Style::default().fg(p.warn)
+    } else {
+        usage_balance_status_style(p, row.balance_status)
+    }
+}
+
+fn endpoint_balance_status_style(p: Palette, row: &UsageBalanceEndpointRow) -> Style {
+    if row
+        .balance
+        .as_ref()
+        .is_some_and(|balance| balance.routing_ignored_exhaustion)
+    {
+        Style::default().fg(p.warn)
+    } else {
+        usage_balance_status_style(p, row.balance_status)
+    }
+}
+
 fn usage_balance_counts_line(counts: &UsageBalanceStatusCounts, lang: Language) -> String {
     let mut parts = Vec::new();
     if counts.ok > 0 {
@@ -650,43 +684,76 @@ fn render_tables(
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
 
+    let provider_rows = ui.filtered_usage_balance_provider_rows(usage_balance);
+    let provider_title = format!(
+        "{} / {} ({window_label}){}",
+        i18n::label(lang, "Provider"),
+        i18n::label(lang, "Balance"),
+        filter_suffix(ui.stats_attention_only, lang)
+    );
+    let station_title = format!(
+        "{} scorecard ({window_label})",
+        i18n::label(lang, "Stations")
+    );
+    let providers_focused = ui.stats_focus == StatsFocus::Providers;
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints(if providers_focused {
+            [Constraint::Percentage(64), Constraint::Percentage(36)]
+        } else {
+            [Constraint::Percentage(50), Constraint::Percentage(50)]
+        })
         .split(cols[0]);
-    let provider_rows = ui.filtered_usage_balance_provider_rows(usage_balance);
 
-    render_bucket_table_stateful(
-        f,
-        p,
-        ui.stats_focus == StatsFocus::Stations,
-        &format!(
-            "{} scorecard ({window_label})",
-            i18n::label(lang, "Stations")
-        ),
-        &snapshot.usage_rollup.by_config,
-        snapshot,
-        StatsFocus::Stations,
-        left[0],
-        &mut ui.stats_stations_table,
-        lang,
-    );
-    render_provider_usage_balance_table_stateful(
-        f,
-        p,
-        ui.stats_focus == StatsFocus::Providers,
-        &format!(
-            "{} / {} ({window_label}){}",
-            i18n::label(lang, "Provider"),
-            i18n::label(lang, "Balance"),
-            filter_suffix(ui.stats_attention_only, lang)
-        ),
-        &provider_rows,
-        snapshot,
-        left[1],
-        &mut ui.stats_providers_table,
-        lang,
-    );
+    if providers_focused {
+        render_provider_usage_balance_table_stateful(
+            f,
+            p,
+            true,
+            &provider_title,
+            &provider_rows,
+            snapshot,
+            left[0],
+            &mut ui.stats_providers_table,
+            lang,
+        );
+        render_bucket_table_stateful(
+            f,
+            p,
+            false,
+            &station_title,
+            &snapshot.usage_rollup.by_config,
+            snapshot,
+            StatsFocus::Stations,
+            left[1],
+            &mut ui.stats_stations_table,
+            lang,
+        );
+    } else {
+        render_bucket_table_stateful(
+            f,
+            p,
+            true,
+            &station_title,
+            &snapshot.usage_rollup.by_config,
+            snapshot,
+            StatsFocus::Stations,
+            left[0],
+            &mut ui.stats_stations_table,
+            lang,
+        );
+        render_provider_usage_balance_table_stateful(
+            f,
+            p,
+            false,
+            &provider_title,
+            &provider_rows,
+            snapshot,
+            left[1],
+            &mut ui.stats_providers_table,
+            lang,
+        );
+    }
 
     render_detail_panel(
         f,
@@ -828,6 +895,7 @@ fn render_provider_usage_balance_table_stateful(
                 usize::from(STATS_BALANCE_COLUMN_WIDTH),
                 lang,
             );
+            let status_style = provider_balance_status_style(p, row);
             let route = shorten(
                 &provider_route_brief(row, lang),
                 if compact { 10 } else { 18 },
@@ -835,20 +903,26 @@ fn render_provider_usage_balance_table_stateful(
             let cells = if compact {
                 vec![
                     Cell::from(shorten_middle(&row.provider_id, 18)),
-                    Cell::from(usage_balance_status_label(row.balance_status, lang)),
-                    Cell::from(balance),
-                    Cell::from(route),
+                    Cell::from(Span::styled(
+                        usage_balance_status_label(row.balance_status, lang),
+                        status_style,
+                    )),
+                    Cell::from(Span::styled(balance, status_style)),
+                    Cell::from(Span::styled(route, Style::default().fg(p.muted))),
                 ]
             } else {
                 vec![
                     Cell::from(shorten_middle(&row.provider_id, 22)),
-                    Cell::from(usage_balance_status_label(row.balance_status, lang)),
-                    Cell::from(balance),
+                    Cell::from(Span::styled(
+                        usage_balance_status_label(row.balance_status, lang),
+                        status_style,
+                    )),
+                    Cell::from(Span::styled(balance, status_style)),
                     Cell::from(row.usage.requests_total.to_string()),
                     Cell::from(fmt_per_mille(row.success_per_mille)),
                     Cell::from(tokens_short(row.usage.usage.total_tokens)),
                     Cell::from(row.cost_display.clone()),
-                    Cell::from(route),
+                    Cell::from(Span::styled(route, Style::default().fg(p.muted))),
                 ]
             };
             Row::new(cells)
@@ -956,6 +1030,7 @@ fn render_provider_usage_detail(
         .unwrap_or("-");
     let route = provider_route_brief(row, lang);
     let latest_error = row.latest_balance_error.as_deref().unwrap_or("-");
+    let status_style = provider_balance_status_style(p, row);
     let lines = vec![
         Line::from(vec![
             Span::styled(format!("{}: ", l("provider")), Style::default().fg(p.muted)),
@@ -1000,14 +1075,10 @@ fn render_provider_usage_detail(
             Span::styled(format!("{} ", l("balance")), Style::default().fg(p.muted)),
             Span::styled(
                 usage_balance_status_label(row.balance_status, lang),
-                Style::default().fg(if row.balance_status.is_attention() {
-                    p.warn
-                } else {
-                    p.good
-                }),
+                status_style,
             ),
             Span::raw("  "),
-            Span::styled(balance_summary.to_string(), Style::default().fg(p.text)),
+            Span::styled(balance_summary.to_string(), status_style),
         ]),
         Line::from(vec![
             Span::styled(format!("{} ", l("counts")), Style::default().fg(p.muted)),
@@ -1117,16 +1188,17 @@ fn render_endpoint_rows(
             } else {
                 endpoint.route_skip_reasons.join(",")
             };
+            let balance_style = endpoint_balance_status_style(p, endpoint);
             let cells = if compact {
                 vec![
                     Cell::from(shorten_middle(endpoint_label, 14)),
-                    Cell::from(balance),
+                    Cell::from(Span::styled(balance, balance_style)),
                     Cell::from(endpoint.usage.requests_total.to_string()),
                 ]
             } else {
                 vec![
                     Cell::from(shorten_middle(endpoint_label, 30)),
-                    Cell::from(balance),
+                    Cell::from(Span::styled(balance, balance_style)),
                     Cell::from(endpoint.usage.requests_total.to_string()),
                     Cell::from(endpoint.usage.requests_error.to_string()),
                     Cell::from(tokens_short(endpoint.usage.usage.total_tokens)),
