@@ -33,7 +33,7 @@ use crate::proxy::ProxyService;
 use crate::state::ProxyState;
 use crate::usage_providers::UsageProviderRefreshSummary;
 
-use self::model::{Palette, now_ms, refresh_snapshot};
+use self::model::{Palette, Snapshot, now_ms, refresh_snapshot};
 use self::state::{RecentCodexRow, UiState, merge_codex_history_external_focus};
 use self::terminal::TerminalGuard;
 
@@ -52,6 +52,61 @@ fn request_redraw(invalidation: &mut RenderInvalidation) {
 
 fn request_full_clear(invalidation: &mut RenderInvalidation) {
     *invalidation = RenderInvalidation::FullClear;
+}
+
+#[derive(Debug)]
+struct SnapshotRefreshResult {
+    generation: u64,
+    config_version: Option<u32>,
+    stats_days: usize,
+    snapshot: Snapshot,
+}
+
+fn snapshot_refresh_result_is_current(
+    result_generation: u64,
+    result_config_version: Option<u32>,
+    result_stats_days: usize,
+    current_generation: u64,
+    current_config_version: Option<u32>,
+    current_stats_days: usize,
+) -> bool {
+    result_generation == current_generation
+        && result_config_version == current_config_version
+        && result_stats_days == current_stats_days
+}
+
+fn invalidate_snapshot_refresh(generation: &mut u64, in_flight: &mut Option<u64>) {
+    *generation = generation.wrapping_add(1);
+    *in_flight = None;
+}
+
+fn start_snapshot_refresh(
+    generation: &mut u64,
+    in_flight: &mut Option<u64>,
+    tx: &mpsc::UnboundedSender<SnapshotRefreshResult>,
+    state: Arc<ProxyState>,
+    cfg: Arc<ProxyConfig>,
+    service_name: &'static str,
+    stats_days: usize,
+) {
+    if in_flight.is_some() {
+        return;
+    }
+
+    *generation = generation.wrapping_add(1);
+    let generation = *generation;
+    *in_flight = Some(generation);
+    let config_version = cfg.version;
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let snapshot = refresh_snapshot(&state, cfg, service_name, stats_days).await;
+        let _ = tx.send(SnapshotRefreshResult {
+            generation,
+            config_version,
+            stats_days,
+            snapshot,
+        });
+    });
 }
 
 fn balance_refresh_summary_message(
@@ -235,10 +290,14 @@ pub async fn run_dashboard(
     ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
     let (balance_refresh_tx, mut balance_refresh_rx) =
         mpsc::unbounded_channel::<input::BalanceRefreshOutcome>();
+    let (snapshot_refresh_tx, mut snapshot_refresh_rx) =
+        mpsc::unbounded_channel::<SnapshotRefreshResult>();
     let (history_refresh_tx, mut history_refresh_rx) =
         mpsc::unbounded_channel::<CodexHistoryRefreshResult>();
     let (recent_refresh_tx, mut recent_refresh_rx) =
         mpsc::unbounded_channel::<CodexRecentRefreshResult>();
+    let mut snapshot_refresh_generation = 0_u64;
+    let mut snapshot_refresh_in_flight = None;
 
     let mut render_invalidation = RenderInvalidation::FullClear;
     let mut last_drawn_page = ui.page;
@@ -285,11 +344,15 @@ pub async fn run_dashboard(
 
         tokio::select! {
             _ = ticker.tick() => {
-                let refresh = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days);
-                if let Ok(new_snapshot) = tokio::time::timeout(io_timeout, refresh).await {
-                    snapshot = new_snapshot;
-                    ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
-                }
+                start_snapshot_refresh(
+                    &mut snapshot_refresh_generation,
+                    &mut snapshot_refresh_in_flight,
+                    &snapshot_refresh_tx,
+                    state.clone(),
+                    cfg.clone(),
+                    service_name,
+                    ui.stats_days,
+                );
                 if ui.page == crate::tui::types::Page::Settings
                     && ui
                         .last_runtime_config_refresh_at
@@ -325,6 +388,25 @@ pub async fn run_dashboard(
                 }
                 request_redraw(&mut render_invalidation);
             }
+            maybe_snapshot_refresh = snapshot_refresh_rx.recv() => {
+                if let Some(result) = maybe_snapshot_refresh {
+                    if snapshot_refresh_in_flight == Some(result.generation) {
+                        snapshot_refresh_in_flight = None;
+                    }
+                    if snapshot_refresh_result_is_current(
+                        result.generation,
+                        result.config_version,
+                        result.stats_days,
+                        snapshot_refresh_generation,
+                        cfg.version,
+                        ui.stats_days,
+                    ) {
+                        snapshot = result.snapshot;
+                        ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
+                        request_redraw(&mut render_invalidation);
+                    }
+                }
+            }
             maybe_balance_refresh = balance_refresh_rx.recv() => {
                 if let Some(result) = maybe_balance_refresh {
                     ui.balance_refresh_in_flight = false;
@@ -344,11 +426,15 @@ pub async fn run_dashboard(
                                 Some((format!("balance refresh failed: {err}"), Instant::now()));
                         }
                     }
-                    let refresh = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days);
-                    if let Ok(new_snapshot) = tokio::time::timeout(io_timeout, refresh).await {
-                        snapshot = new_snapshot;
-                        ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
-                    }
+                    start_snapshot_refresh(
+                        &mut snapshot_refresh_generation,
+                        &mut snapshot_refresh_in_flight,
+                        &snapshot_refresh_tx,
+                        state.clone(),
+                        cfg.clone(),
+                        service_name,
+                        ui.stats_days,
+                    );
                     if ui.uses_route_graph_routing()
                         && ui.page == crate::tui::types::Page::Stations
                     {
@@ -423,6 +509,10 @@ pub async fn run_dashboard(
                                     Ok(new_cfg) => {
                                         cfg = Arc::new(new_cfg);
                                         ui.config_version = cfg.version;
+                                        invalidate_snapshot_refresh(
+                                            &mut snapshot_refresh_generation,
+                                            &mut snapshot_refresh_in_flight,
+                                        );
                                         providers = build_provider_options(&cfg, service_name);
                                         ui.clamp_selection(
                                             &snapshot,
@@ -439,6 +529,10 @@ pub async fn run_dashboard(
                                 ui.needs_config_refresh = false;
                             }
                             if ui.needs_snapshot_refresh {
+                                invalidate_snapshot_refresh(
+                                    &mut snapshot_refresh_generation,
+                                    &mut snapshot_refresh_in_flight,
+                                );
                                 snapshot = refresh_snapshot(&state, cfg.clone(), service_name, ui.stats_days).await;
                                 ui.clamp_selection(
                                     &snapshot,
@@ -687,5 +781,57 @@ async fn read_git_branch_shallow(workdir: &str) -> Option<String> {
         None
     } else {
         Some(head.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{invalidate_snapshot_refresh, snapshot_refresh_result_is_current};
+
+    #[test]
+    fn snapshot_refresh_result_guard_rejects_stale_results() {
+        assert!(snapshot_refresh_result_is_current(
+            3,
+            Some(5),
+            7,
+            3,
+            Some(5),
+            7
+        ));
+        assert!(!snapshot_refresh_result_is_current(
+            2,
+            Some(5),
+            7,
+            3,
+            Some(5),
+            7
+        ));
+        assert!(!snapshot_refresh_result_is_current(
+            3,
+            Some(4),
+            7,
+            3,
+            Some(5),
+            7
+        ));
+        assert!(!snapshot_refresh_result_is_current(
+            3,
+            Some(5),
+            30,
+            3,
+            Some(5),
+            7
+        ));
+    }
+
+    #[test]
+    fn snapshot_refresh_invalidation_clears_in_flight_task() {
+        let mut generation = 41;
+        let mut in_flight = Some(41);
+
+        invalidate_snapshot_refresh(&mut generation, &mut in_flight);
+
+        assert_eq!(generation, 42);
+        assert_eq!(in_flight, None);
     }
 }
