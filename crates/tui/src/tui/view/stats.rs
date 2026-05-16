@@ -88,6 +88,26 @@ fn provider_balance_status_style(p: Palette, row: &UsageBalanceProviderRow) -> S
     }
 }
 
+fn provider_usage_balance_status_label(
+    row: &UsageBalanceProviderRow,
+    compact: bool,
+    lang: Language,
+) -> &'static str {
+    if row
+        .primary_balance
+        .as_ref()
+        .is_some_and(|balance| balance.routing_ignored_exhaustion)
+    {
+        if compact {
+            i18n::label(lang, "lazy")
+        } else {
+            i18n::label(lang, "lazy reset")
+        }
+    } else {
+        usage_balance_status_label(row.balance_status, lang)
+    }
+}
+
 fn endpoint_balance_status_style(p: Palette, row: &UsageBalanceEndpointRow) -> Style {
     if row
         .balance
@@ -904,7 +924,7 @@ fn render_provider_usage_balance_table_stateful(
                 vec![
                     Cell::from(shorten_middle(&row.provider_id, 18)),
                     Cell::from(Span::styled(
-                        usage_balance_status_label(row.balance_status, lang),
+                        provider_usage_balance_status_label(row, true, lang),
                         status_style,
                     )),
                     Cell::from(Span::styled(balance, status_style)),
@@ -914,7 +934,7 @@ fn render_provider_usage_balance_table_stateful(
                 vec![
                     Cell::from(shorten_middle(&row.provider_id, 22)),
                     Cell::from(Span::styled(
-                        usage_balance_status_label(row.balance_status, lang),
+                        provider_usage_balance_status_label(row, false, lang),
                         status_style,
                     )),
                     Cell::from(Span::styled(balance, status_style)),
@@ -1074,7 +1094,7 @@ fn render_provider_usage_detail(
         Line::from(vec![
             Span::styled(format!("{} ", l("balance")), Style::default().fg(p.muted)),
             Span::styled(
-                usage_balance_status_label(row.balance_status, lang),
+                provider_usage_balance_status_label(row, false, lang),
                 status_style,
             ),
             Span::raw("  "),

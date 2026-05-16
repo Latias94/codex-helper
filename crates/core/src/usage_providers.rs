@@ -468,6 +468,16 @@ fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> Usag
     provider
 }
 
+fn auto_target_matches_provider_id_filter(
+    target: &UsageProviderTarget,
+    provider_id_filter: Option<&str>,
+) -> bool {
+    match provider_id_filter {
+        Some(filter) => auto_provider_id(target) == filter,
+        None => true,
+    }
+}
+
 fn first_auto_probe_kind(target: &UsageProviderTarget) -> ProviderKind {
     if is_rightcode_base_url(&target.base_url) {
         ProviderKind::RightCodeAccountSummary
@@ -794,6 +804,7 @@ impl UsageProviderUpstreamIdentityExt for crate::config::UpstreamConfig {
     }
 }
 
+#[cfg(test)]
 fn configured_target_keys(
     cfg: &ProxyConfig,
     service_name: &str,
@@ -2622,19 +2633,10 @@ pub async fn refresh_balances_for_service(
         providers_configured: providers_file.providers.len(),
         ..UsageProviderRefreshSummary::default()
     };
-    let configured_keys = if provider_id_filter.is_none() {
-        configured_target_keys(
-            &cfg,
-            service_name,
-            &providers_file.providers,
-            station_name_filter,
-        )
-    } else {
-        HashSet::new()
-    };
 
     let poll_map = LAST_USAGE_POLL.get_or_init(|| Mutex::new(HashMap::new()));
     let mut configured_jobs = Vec::new();
+    let mut configured_job_keys = HashSet::new();
     for provider in &providers_file.providers {
         if provider_id_filter.is_some_and(|filter| filter != provider.id.as_str()) {
             continue;
@@ -2652,6 +2654,7 @@ pub async fn refresh_balances_for_service(
         let interval_secs = snapshot_refresh_interval_secs(provider);
         for target in targets {
             summary.attempted += 1;
+            configured_job_keys.insert(target_key(&target));
             configured_jobs.push(ConfiguredRefreshJob {
                 provider,
                 target,
@@ -2683,35 +2686,35 @@ pub async fn refresh_balances_for_service(
         }
     }
 
-    if provider_id_filter.is_none() {
-        let mut auto_jobs = Vec::new();
-        for target in usage_provider_targets(&cfg, service_name, station_name_filter) {
-            if configured_keys.contains(&target_key(&target)) {
-                continue;
-            }
-
-            summary.attempted += 1;
-            summary.auto_attempted += 1;
-            auto_jobs.push(AutoRefreshJob { target });
+    let mut auto_jobs = Vec::new();
+    for target in usage_provider_targets(&cfg, service_name, station_name_filter) {
+        if configured_job_keys.contains(&target_key(&target)) {
+            continue;
+        }
+        if !auto_target_matches_provider_id_filter(&target, provider_id_filter) {
+            continue;
         }
 
-        if !auto_jobs.is_empty() {
-            for outcome in
-                run_auto_refresh_jobs(client, auto_jobs, &cfg, &lb_states, &state, service_name)
-                    .await
-            {
-                match outcome {
-                    UsageProviderRefreshOutcome::Refreshed => {
-                        summary.refreshed += 1;
-                        summary.auto_refreshed += 1;
-                    }
-                    UsageProviderRefreshOutcome::Failed => {
-                        summary.failed += 1;
-                        summary.auto_failed += 1;
-                    }
-                    UsageProviderRefreshOutcome::MissingToken => {
-                        summary.missing_token += 1;
-                    }
+        summary.attempted += 1;
+        summary.auto_attempted += 1;
+        auto_jobs.push(AutoRefreshJob { target });
+    }
+
+    if !auto_jobs.is_empty() {
+        for outcome in
+            run_auto_refresh_jobs(client, auto_jobs, &cfg, &lb_states, &state, service_name).await
+        {
+            match outcome {
+                UsageProviderRefreshOutcome::Refreshed => {
+                    summary.refreshed += 1;
+                    summary.auto_refreshed += 1;
+                }
+                UsageProviderRefreshOutcome::Failed => {
+                    summary.failed += 1;
+                    summary.auto_failed += 1;
+                }
+                UsageProviderRefreshOutcome::MissingToken => {
+                    summary.missing_token += 1;
                 }
             }
         }
@@ -3299,6 +3302,51 @@ mod tests {
         let provider = auto_usage_provider(&target, ProviderKind::Sub2ApiUsage);
 
         assert_eq!(provider.id, "input");
+    }
+
+    #[test]
+    fn auto_target_provider_id_filter_matches_runtime_provider_tag() {
+        let target = UsageProviderTarget {
+            upstream: UpstreamRef {
+                station_name: "routing".to_string(),
+                index: 6,
+                provider_endpoint: Some(ProviderEndpointKey::new("codex", "input6", "default")),
+            },
+            base_url: "https://input.9z1.me/v1".to_string(),
+            provider_id: Some("input6".to_string()),
+        };
+
+        assert!(auto_target_matches_provider_id_filter(&target, None));
+        assert!(auto_target_matches_provider_id_filter(
+            &target,
+            Some("input6")
+        ));
+        assert!(!auto_target_matches_provider_id_filter(
+            &target,
+            Some("input5")
+        ));
+    }
+
+    #[test]
+    fn auto_target_provider_id_filter_matches_generated_auto_id() {
+        let target = UsageProviderTarget {
+            upstream: UpstreamRef {
+                station_name: "routing".to_string(),
+                index: 6,
+                provider_endpoint: None,
+            },
+            base_url: "https://input.9z1.me/v1".to_string(),
+            provider_id: None,
+        };
+
+        assert!(auto_target_matches_provider_id_filter(
+            &target,
+            Some("auto:balance:routing:6")
+        ));
+        assert!(!auto_target_matches_provider_id_filter(
+            &target,
+            Some("input6")
+        ));
     }
 
     #[test]
