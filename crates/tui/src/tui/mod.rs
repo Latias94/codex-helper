@@ -227,6 +227,178 @@ fn balance_refresh_summary_message(
     parts.join(" · ")
 }
 
+async fn refresh_runtime_config_if_due(
+    ui: &mut UiState,
+    proxy: &ProxyService,
+    io_timeout: Duration,
+) {
+    if ui.page != crate::tui::types::Page::Settings
+        || ui
+            .last_runtime_config_refresh_at
+            .is_some_and(|t| t.elapsed() <= Duration::from_secs(2))
+    {
+        return;
+    }
+
+    if let Ok(status) = tokio::time::timeout(io_timeout, proxy.runtime_status()).await {
+        ui.last_runtime_config_loaded_at_ms = Some(status.loaded_at_ms);
+        ui.last_runtime_config_source_mtime_ms = status.source_mtime_ms;
+        ui.last_runtime_retry = Some(status.retry);
+    }
+    ui.last_runtime_config_refresh_at = Some(Instant::now());
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_route_graph_control_if_needed(
+    ui: &mut UiState,
+    proxy: &ProxyService,
+    snapshot: &Snapshot,
+    providers_len: usize,
+    io_timeout: Duration,
+    force: bool,
+    suppress_error_toast: bool,
+) {
+    if !ui.uses_route_graph_routing()
+        || ui.page != crate::tui::types::Page::Stations
+        || (!force
+            && ui
+                .last_routing_control_refresh_at
+                .is_some_and(|t| t.elapsed() <= Duration::from_secs(5)))
+    {
+        return;
+    }
+
+    let refresh = input::refresh_routing_control_state(ui, proxy);
+    match tokio::time::timeout(io_timeout, refresh).await {
+        Ok(Ok(())) => {
+            ui.clamp_selection(snapshot, ui.station_page_rows_len(providers_len));
+        }
+        Ok(Err(err)) => {
+            ui.last_routing_control_refresh_at = Some(Instant::now());
+            if !suppress_error_toast {
+                ui.toast = Some((format!("routing refresh failed: {err}"), Instant::now()));
+            }
+        }
+        Err(_) => {
+            ui.last_routing_control_refresh_at = Some(Instant::now());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_ticker_refreshes(
+    ui: &mut UiState,
+    proxy: &ProxyService,
+    state: Arc<ProxyState>,
+    cfg: Arc<ProxyConfig>,
+    service_name: &'static str,
+    snapshot: &Snapshot,
+    providers_len: usize,
+    io_timeout: Duration,
+    snapshot_fallback_interval: Duration,
+    snapshot_refresh: &mut SnapshotRefreshController,
+) {
+    if snapshot.refreshed_at.elapsed() >= snapshot_fallback_interval {
+        snapshot_refresh.request(state, cfg, service_name, ui.stats_days);
+    }
+    refresh_runtime_config_if_due(ui, proxy, io_timeout).await;
+    refresh_route_graph_control_if_needed(
+        ui,
+        proxy,
+        snapshot,
+        providers_len,
+        io_timeout,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_balance_refresh_result(
+    ui: &mut UiState,
+    proxy: &ProxyService,
+    state: Arc<ProxyState>,
+    cfg: Arc<ProxyConfig>,
+    service_name: &'static str,
+    snapshot: &Snapshot,
+    providers_len: usize,
+    io_timeout: Duration,
+    snapshot_refresh: &mut SnapshotRefreshController,
+    result: input::BalanceRefreshOutcome,
+) {
+    ui.balance_refresh_in_flight = false;
+    ui.last_balance_refresh_finished_at = Some(Instant::now());
+    match result {
+        Ok(summary) => {
+            ui.last_balance_refresh_summary = Some(summary.clone());
+            ui.last_balance_refresh_error = None;
+            ui.last_balance_refresh_message =
+                Some(balance_refresh_summary_message(ui.language, &summary));
+        }
+        Err(err) => {
+            ui.last_balance_refresh_summary = None;
+            ui.last_balance_refresh_message = None;
+            ui.last_balance_refresh_error = Some(err.clone());
+            ui.toast = Some((format!("balance refresh failed: {err}"), Instant::now()));
+        }
+    }
+    snapshot_refresh.request(state, cfg, service_name, ui.stats_days);
+    refresh_route_graph_control_if_needed(
+        ui,
+        proxy,
+        snapshot,
+        providers_len,
+        io_timeout,
+        true,
+        ui.last_balance_refresh_error.is_some(),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_pending_refresh_requests(
+    ui: &mut UiState,
+    state: Arc<ProxyState>,
+    cfg: &mut Arc<ProxyConfig>,
+    service_name: &'static str,
+    snapshot: &Snapshot,
+    providers: &mut Vec<ProviderOption>,
+    snapshot_refresh: &mut SnapshotRefreshController,
+    history_refresh_tx: mpsc::UnboundedSender<CodexHistoryRefreshResult>,
+    recent_refresh_tx: mpsc::UnboundedSender<CodexRecentRefreshResult>,
+) {
+    if ui.needs_config_refresh {
+        match load_config().await {
+            Ok(new_cfg) => {
+                *cfg = Arc::new(new_cfg);
+                ui.config_version = cfg.version;
+                snapshot_refresh.invalidate();
+                *providers = build_provider_options(cfg.as_ref(), service_name);
+                snapshot_refresh.request(state.clone(), cfg.clone(), service_name, ui.stats_days);
+                ui.clamp_selection(snapshot, ui.station_page_rows_len(providers.len()));
+            }
+            Err(err) => {
+                ui.toast = Some((format!("config refresh failed: {err}"), Instant::now()));
+            }
+        }
+        ui.needs_config_refresh = false;
+    }
+    if ui.needs_snapshot_refresh {
+        snapshot_refresh.invalidate();
+        snapshot_refresh.request(state.clone(), cfg.clone(), service_name, ui.stats_days);
+        ui.needs_snapshot_refresh = false;
+    }
+    if ui.needs_codex_history_refresh {
+        start_codex_history_refresh(ui, history_refresh_tx);
+        ui.needs_codex_history_refresh = false;
+    }
+    if ui.needs_codex_recent_refresh {
+        start_codex_recent_refresh(ui, recent_refresh_tx);
+        ui.needs_codex_recent_refresh = false;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RenderSurfaceKey {
     page: types::Page,
@@ -417,47 +589,18 @@ pub async fn run_dashboard(
 
         tokio::select! {
             _ = ticker.tick() => {
-                if snapshot.refreshed_at.elapsed() >= snapshot_fallback_interval {
-                    snapshot_refresh.request(
-                        state.clone(),
-                        cfg.clone(),
-                        service_name,
-                        ui.stats_days,
-                    );
-                }
-                if ui.page == crate::tui::types::Page::Settings
-                    && ui
-                        .last_runtime_config_refresh_at
-                        .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
-                {
-                    if let Ok(status) = tokio::time::timeout(io_timeout, proxy.runtime_status()).await {
-                        ui.last_runtime_config_loaded_at_ms = Some(status.loaded_at_ms);
-                        ui.last_runtime_config_source_mtime_ms = status.source_mtime_ms;
-                        ui.last_runtime_retry = Some(status.retry);
-                    }
-                    ui.last_runtime_config_refresh_at = Some(Instant::now());
-                }
-                if ui.uses_route_graph_routing()
-                    && ui.page == crate::tui::types::Page::Stations
-                    && ui
-                        .last_routing_control_refresh_at
-                        .is_none_or(|t| t.elapsed() > Duration::from_secs(5))
-                {
-                    let refresh = input::refresh_routing_control_state(&mut ui, &proxy);
-                    match tokio::time::timeout(io_timeout, refresh).await {
-                        Ok(Ok(())) => {
-                            ui.clamp_selection(&snapshot, ui.station_page_rows_len(providers.len()));
-                        }
-                        Ok(Err(err)) => {
-                            ui.last_routing_control_refresh_at = Some(Instant::now());
-                            ui.toast =
-                                Some((format!("routing refresh failed: {err}"), Instant::now()));
-                        }
-                        Err(_) => {
-                            ui.last_routing_control_refresh_at = Some(Instant::now());
-                        }
-                    }
-                }
+                handle_ticker_refreshes(
+                    &mut ui,
+                    &proxy,
+                    state.clone(),
+                    cfg.clone(),
+                    service_name,
+                    &snapshot,
+                    providers.len(),
+                    io_timeout,
+                    snapshot_fallback_interval,
+                    &mut snapshot_refresh,
+                ).await;
                 request_redraw(&mut render_invalidation);
             }
             changed = state_changes.changed() => {
@@ -488,54 +631,18 @@ pub async fn run_dashboard(
             }
             maybe_balance_refresh = balance_refresh_rx.recv() => {
                 if let Some(result) = maybe_balance_refresh {
-                    ui.balance_refresh_in_flight = false;
-                    ui.last_balance_refresh_finished_at = Some(Instant::now());
-                    match result {
-                        Ok(summary) => {
-                            ui.last_balance_refresh_summary = Some(summary.clone());
-                            ui.last_balance_refresh_error = None;
-                            ui.last_balance_refresh_message =
-                                Some(balance_refresh_summary_message(ui.language, &summary));
-                        }
-                        Err(err) => {
-                            ui.last_balance_refresh_summary = None;
-                            ui.last_balance_refresh_message = None;
-                            ui.last_balance_refresh_error = Some(err.clone());
-                            ui.toast =
-                                Some((format!("balance refresh failed: {err}"), Instant::now()));
-                        }
-                    }
-                    snapshot_refresh.request(
+                    handle_balance_refresh_result(
+                        &mut ui,
+                        &proxy,
                         state.clone(),
                         cfg.clone(),
                         service_name,
-                        ui.stats_days,
-                    );
-                    if ui.uses_route_graph_routing()
-                        && ui.page == crate::tui::types::Page::Stations
-                    {
-                        let refresh = input::refresh_routing_control_state(&mut ui, &proxy);
-                        match tokio::time::timeout(io_timeout, refresh).await {
-                            Ok(Ok(())) => {
-                                ui.clamp_selection(
-                                    &snapshot,
-                                    ui.station_page_rows_len(providers.len()),
-                                );
-                            }
-                            Ok(Err(err)) => {
-                                ui.last_routing_control_refresh_at = Some(Instant::now());
-                                if ui.last_balance_refresh_error.is_none() {
-                                    ui.toast = Some((
-                                        format!("routing refresh failed: {err}"),
-                                        Instant::now(),
-                                    ));
-                                }
-                            }
-                            Err(_) => {
-                                ui.last_routing_control_refresh_at = Some(Instant::now());
-                            }
-                        }
-                    }
+                        &snapshot,
+                        providers.len(),
+                        io_timeout,
+                        &mut snapshot_refresh,
+                        result,
+                    ).await;
                     request_redraw(&mut render_invalidation);
                 }
             }
@@ -580,51 +687,17 @@ pub async fn run_dashboard(
                         )
                         .await
                         {
-                            if ui.needs_config_refresh {
-                                match load_config().await {
-                                    Ok(new_cfg) => {
-                                        cfg = Arc::new(new_cfg);
-                                        ui.config_version = cfg.version;
-                                        snapshot_refresh.invalidate();
-                                        providers = build_provider_options(&cfg, service_name);
-                                        snapshot_refresh.request(
-                                            state.clone(),
-                                            cfg.clone(),
-                                            service_name,
-                                            ui.stats_days,
-                                        );
-                                        ui.clamp_selection(
-                                            &snapshot,
-                                            ui.station_page_rows_len(providers.len()),
-                                        );
-                                    }
-                                    Err(err) => {
-                                        ui.toast = Some((
-                                            format!("config refresh failed: {err}"),
-                                            Instant::now(),
-                                        ));
-                                    }
-                                }
-                                ui.needs_config_refresh = false;
-                            }
-                            if ui.needs_snapshot_refresh {
-                                snapshot_refresh.invalidate();
-                                snapshot_refresh.request(
-                                    state.clone(),
-                                    cfg.clone(),
-                                    service_name,
-                                    ui.stats_days,
-                                );
-                                ui.needs_snapshot_refresh = false;
-                            }
-                            if ui.needs_codex_history_refresh {
-                                start_codex_history_refresh(&mut ui, history_refresh_tx.clone());
-                                ui.needs_codex_history_refresh = false;
-                            }
-                            if ui.needs_codex_recent_refresh {
-                                start_codex_recent_refresh(&mut ui, recent_refresh_tx.clone());
-                                ui.needs_codex_recent_refresh = false;
-                            }
+                            apply_pending_refresh_requests(
+                                &mut ui,
+                                state.clone(),
+                                &mut cfg,
+                                service_name,
+                                &snapshot,
+                                &mut providers,
+                                &mut snapshot_refresh,
+                                history_refresh_tx.clone(),
+                                recent_refresh_tx.clone(),
+                            ).await;
                             let after_surface = RenderSurfaceKey::capture(&ui);
                             if before_surface != after_surface {
                                 request_full_clear(&mut render_invalidation);
