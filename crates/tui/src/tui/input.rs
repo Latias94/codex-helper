@@ -4,6 +4,7 @@ mod history_bridge;
 mod profile;
 mod routing;
 mod routing_menu;
+mod session_overrides;
 mod transcript;
 
 use std::sync::Arc;
@@ -16,7 +17,6 @@ use crate::config::{
     proxy_home_dir,
     storage::{load_config, save_config},
 };
-use crate::dashboard_core::build_model_options_from_mgr;
 use crate::proxy::ProxyService;
 use crate::sessions::find_codex_session_file_by_id;
 use crate::state::ProxyState;
@@ -30,7 +30,7 @@ use super::model::{
 };
 use super::report::build_stats_report;
 use super::state::{CodexHistoryExternalFocusOrigin, UiState, adjust_table_selection};
-use super::types::{EffortChoice, Focus, Overlay, Page, ServiceTierChoice, StatsFocus};
+use super::types::{Focus, Overlay, Page, StatsFocus};
 pub(in crate::tui) use balance::{
     BalanceRefreshMode, BalanceRefreshOutcome, BalanceRefreshSender,
     request_provider_balance_refresh,
@@ -54,6 +54,13 @@ use routing::{
     refresh_route_graph_balances,
 };
 use routing_menu::handle_key_routing_menu;
+use session_overrides::{
+    add_model_option_if_missing, apply_effort_override, current_model_override,
+    current_service_tier_override, handle_key_effort_menu, handle_key_model_input,
+    handle_key_model_menu, handle_key_service_tier_input, handle_key_service_tier_menu,
+    load_model_options_for_service, selected_session_model_hint,
+    selected_session_service_tier_hint,
+};
 use transcript::{handle_key_session_transcript, open_session_transcript_from_path};
 
 pub(in crate::tui) use routing::refresh_routing_control_state;
@@ -225,65 +232,6 @@ fn apply_selected_session(ui: &mut UiState, snapshot: &Snapshot, idx: usize) {
         .select(if req_len == 0 { None } else { Some(0) });
 }
 
-async fn load_model_options_for_service(service_name: &str) -> anyhow::Result<Vec<String>> {
-    let cfg = load_config().await?;
-    let mgr = match service_name {
-        "claude" => &cfg.claude,
-        _ => &cfg.codex,
-    };
-    Ok(build_model_options_from_mgr(mgr))
-}
-
-fn selected_session_model_hint(snapshot: &Snapshot, ui: &UiState) -> Option<String> {
-    snapshot.rows.get(ui.selected_session_idx).and_then(|row| {
-        row.override_model
-            .as_deref()
-            .or(row
-                .effective_model
-                .as_ref()
-                .map(|value| value.value.as_str()))
-            .or(row.last_model.as_deref())
-            .map(ToString::to_string)
-    })
-}
-
-fn add_model_option_if_missing(options: &mut Vec<String>, model: Option<&str>) {
-    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
-        return;
-    };
-    if options.iter().all(|existing| existing != model) {
-        options.push(model.to_string());
-        options.sort();
-    }
-}
-
-fn current_model_override(snapshot: &Snapshot, ui: &UiState) -> Option<String> {
-    snapshot
-        .rows
-        .get(ui.selected_session_idx)
-        .and_then(|row| row.override_model.clone())
-}
-
-fn selected_session_service_tier_hint(snapshot: &Snapshot, ui: &UiState) -> Option<String> {
-    snapshot.rows.get(ui.selected_session_idx).and_then(|row| {
-        row.override_service_tier
-            .as_deref()
-            .or(row
-                .effective_service_tier
-                .as_ref()
-                .map(|value| value.value.as_str()))
-            .or(row.last_service_tier.as_deref())
-            .map(ToString::to_string)
-    })
-}
-
-fn current_service_tier_override(snapshot: &Snapshot, ui: &UiState) -> Option<String> {
-    snapshot
-        .rows
-        .get(ui.selected_session_idx)
-        .and_then(|row| row.override_service_tier.clone())
-}
-
 fn focus_session_in_sessions(ui: &mut UiState, snapshot: &Snapshot, sid: &str) -> bool {
     let Some(idx) = find_session_idx(snapshot, sid) else {
         return false;
@@ -311,39 +259,6 @@ fn prepare_select_requests_for_session(ui: &mut UiState, sid: String) {
 fn clear_request_page_focus(ui: &mut UiState) {
     ui.focused_request_session_id = None;
     ui.selected_request_page_idx = 0;
-}
-
-async fn apply_effort_override(state: &ProxyState, sid: String, effort: Option<String>) {
-    let now = now_ms();
-    if let Some(eff) = effort {
-        state.set_session_effort_override(sid, eff, now).await;
-    } else {
-        state.clear_session_effort_override(&sid).await;
-    }
-}
-
-async fn apply_model_override(state: &ProxyState, sid: String, model: Option<String>) {
-    let now = now_ms();
-    if let Some(model) = model {
-        state.set_session_model_override(sid, model, now).await;
-    } else {
-        state.clear_session_model_override(&sid).await;
-    }
-}
-
-async fn apply_service_tier_override(
-    state: &ProxyState,
-    sid: String,
-    service_tier: Option<String>,
-) {
-    let now = now_ms();
-    if let Some(service_tier) = service_tier {
-        state
-            .set_session_service_tier_override(sid, service_tier, now)
-            .await;
-    } else {
-        state.clear_session_service_tier_override(&sid).await;
-    }
 }
 
 async fn apply_session_provider_override(state: &ProxyState, sid: String, cfg: Option<String>) {
@@ -2635,57 +2550,6 @@ async fn handle_key_normal(
     }
 }
 
-async fn handle_key_effort_menu(
-    state: &ProxyState,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    key: KeyEvent,
-) -> bool {
-    match key.code {
-        KeyCode::Esc => {
-            ui.overlay = Overlay::None;
-            true
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            ui.effort_menu_idx = ui.effort_menu_idx.saturating_sub(1);
-            true
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            ui.effort_menu_idx = (ui.effort_menu_idx + 1).min(4);
-            true
-        }
-        KeyCode::Enter => {
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|r| r.session_id.clone())
-            else {
-                ui.overlay = Overlay::None;
-                return true;
-            };
-            let choice = match ui.effort_menu_idx {
-                1 => EffortChoice::Low,
-                2 => EffortChoice::Medium,
-                3 => EffortChoice::High,
-                4 => EffortChoice::XHigh,
-                _ => EffortChoice::Clear,
-            };
-            apply_effort_override(state, sid, choice.value().map(|s| s.to_string())).await;
-            ui.overlay = Overlay::None;
-            ui.toast = Some((
-                format!(
-                    "{}: {}",
-                    i18n::label(ui.language, "effort set"),
-                    choice.label(ui.language)
-                ),
-                Instant::now(),
-            ));
-            true
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -3408,241 +3272,6 @@ mod tests {
             vec!["monthly_pool".to_string(), "paygo".to_string()]
         );
         assert!(!routing_entry_is_flat_provider_list(&spec));
-    }
-}
-
-async fn handle_key_service_tier_menu(
-    state: &ProxyState,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    key: KeyEvent,
-) -> bool {
-    match key.code {
-        KeyCode::Esc => {
-            ui.overlay = Overlay::None;
-            true
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            ui.service_tier_menu_idx = ui.service_tier_menu_idx.saturating_sub(1);
-            true
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            ui.service_tier_menu_idx = (ui.service_tier_menu_idx + 1).min(4);
-            true
-        }
-        KeyCode::Enter => {
-            if ui.service_tier_menu_idx == 4 {
-                ui.session_service_tier_input =
-                    current_service_tier_override(snapshot, ui).unwrap_or_default();
-                ui.session_service_tier_input_hint =
-                    selected_session_service_tier_hint(snapshot, ui);
-                ui.overlay = Overlay::ServiceTierInputSession;
-                return true;
-            }
-
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|row| row.session_id.clone())
-            else {
-                ui.overlay = Overlay::None;
-                return true;
-            };
-            let choice = match ui.service_tier_menu_idx {
-                1 => ServiceTierChoice::Default,
-                2 => ServiceTierChoice::Priority,
-                3 => ServiceTierChoice::Flex,
-                _ => ServiceTierChoice::Clear,
-            };
-            apply_service_tier_override(state, sid, choice.value().map(|s| s.to_string())).await;
-            ui.overlay = Overlay::None;
-            ui.toast = Some((
-                format!(
-                    "{}: {}",
-                    i18n::label(ui.language, "service_tier set"),
-                    choice.label(ui.language)
-                ),
-                Instant::now(),
-            ));
-            true
-        }
-        _ => false,
-    }
-}
-
-async fn handle_key_service_tier_input(
-    state: &ProxyState,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    key: KeyEvent,
-) -> bool {
-    match key.code {
-        KeyCode::Esc => {
-            ui.overlay = Overlay::ServiceTierMenuSession;
-            true
-        }
-        KeyCode::Enter => {
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|row| row.session_id.clone())
-            else {
-                ui.overlay = Overlay::None;
-                return true;
-            };
-            let value = ui.session_service_tier_input.trim().to_string();
-            let tier = if value.is_empty() { None } else { Some(value) };
-            apply_service_tier_override(state, sid, tier.clone()).await;
-            ui.overlay = Overlay::None;
-            ui.toast = Some((
-                format!(
-                    "{}: {}",
-                    i18n::label(ui.language, "service_tier set"),
-                    tier.as_deref()
-                        .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
-                ),
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Backspace => {
-            ui.session_service_tier_input.pop();
-            true
-        }
-        KeyCode::Delete => {
-            ui.session_service_tier_input.clear();
-            true
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            ui.session_service_tier_input.clear();
-            true
-        }
-        KeyCode::Char(ch)
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT) =>
-        {
-            ui.session_service_tier_input.push(ch);
-            true
-        }
-        _ => false,
-    }
-}
-
-async fn handle_key_model_menu(
-    state: &ProxyState,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    key: KeyEvent,
-) -> bool {
-    match key.code {
-        KeyCode::Esc => {
-            ui.overlay = Overlay::None;
-            true
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            ui.model_menu_idx = ui.model_menu_idx.saturating_sub(1);
-            true
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            let max = ui.session_model_options.len() + 1;
-            ui.model_menu_idx = (ui.model_menu_idx + 1).min(max);
-            true
-        }
-        KeyCode::Enter => {
-            if ui.model_menu_idx == ui.session_model_options.len() + 1 {
-                ui.session_model_input = current_model_override(snapshot, ui).unwrap_or_default();
-                ui.session_model_input_hint = selected_session_model_hint(snapshot, ui);
-                ui.overlay = Overlay::ModelInputSession;
-                return true;
-            }
-
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|row| row.session_id.clone())
-            else {
-                ui.overlay = Overlay::None;
-                return true;
-            };
-            let model = if ui.model_menu_idx == 0 {
-                None
-            } else {
-                ui.session_model_options.get(ui.model_menu_idx - 1).cloned()
-            };
-            apply_model_override(state, sid, model.clone()).await;
-            ui.overlay = Overlay::None;
-            ui.toast = Some((
-                format!(
-                    "{}: {}",
-                    i18n::label(ui.language, "model override"),
-                    model
-                        .as_deref()
-                        .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
-                ),
-                Instant::now(),
-            ));
-            true
-        }
-        _ => false,
-    }
-}
-
-async fn handle_key_model_input(
-    state: &ProxyState,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    key: KeyEvent,
-) -> bool {
-    match key.code {
-        KeyCode::Esc => {
-            ui.overlay = Overlay::ModelMenuSession;
-            true
-        }
-        KeyCode::Enter => {
-            let Some(sid) = snapshot
-                .rows
-                .get(ui.selected_session_idx)
-                .and_then(|row| row.session_id.clone())
-            else {
-                ui.overlay = Overlay::None;
-                return true;
-            };
-            let value = ui.session_model_input.trim().to_string();
-            let model = if value.is_empty() { None } else { Some(value) };
-            apply_model_override(state, sid, model.clone()).await;
-            ui.overlay = Overlay::None;
-            ui.toast = Some((
-                format!(
-                    "{}: {}",
-                    i18n::label(ui.language, "model override"),
-                    model
-                        .as_deref()
-                        .unwrap_or_else(|| i18n::label(ui.language, "<clear>"))
-                ),
-                Instant::now(),
-            ));
-            true
-        }
-        KeyCode::Backspace => {
-            ui.session_model_input.pop();
-            true
-        }
-        KeyCode::Delete => {
-            ui.session_model_input.clear();
-            true
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            ui.session_model_input.clear();
-            true
-        }
-        KeyCode::Char(ch)
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT) =>
-        {
-            ui.session_model_input.push(ch);
-            true
-        }
-        _ => false,
     }
 }
 
