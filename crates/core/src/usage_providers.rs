@@ -681,22 +681,22 @@ fn target_key(target: &UsageProviderTarget) -> UsageProviderTargetKey {
     }
 }
 
-fn enqueue_request_balance_refresh(key: RequestBalanceQueueKey) -> bool {
+fn enqueue_request_balance_refresh(key: RequestBalanceQueueKey) -> Option<Duration> {
     let now = Instant::now();
     let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut queue = match queue.lock() {
         Ok(queue) => queue,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
-    if let Some(due_at) = queue.get(&key)
-        && *due_at > now
-    {
-        return false;
+    match queue.get(&key).copied() {
+        Some(due_at) if due_at > now => None,
+        Some(_) => Some(Duration::ZERO),
+        None => {
+            queue.insert(key, now + REQUEST_BALANCE_REFRESH_DELAY);
+            Some(REQUEST_BALANCE_REFRESH_DELAY)
+        }
     }
-
-    queue.insert(key, now + REQUEST_BALANCE_REFRESH_DELAY);
-    true
 }
 
 fn schedule_request_balance_refresh_at(key: RequestBalanceQueueKey, due_at: Instant) {
@@ -2745,14 +2745,14 @@ pub fn enqueue_poll_for_codex_upstream(
         station_name: station_name.to_string(),
         upstream_index,
     };
-    if !enqueue_request_balance_refresh(key.clone()) {
+    let Some(initial_sleep_for) = enqueue_request_balance_refresh(key.clone()) else {
         return;
-    }
+    };
 
     let service_name = service_name.to_string();
     let station_name = station_name.to_string();
     tokio::spawn(async move {
-        let mut sleep_for = REQUEST_BALANCE_REFRESH_DELAY;
+        let mut sleep_for = initial_sleep_for;
         loop {
             tokio::time::sleep(sleep_for).await;
             match take_request_balance_refresh_if_due(&key) {
@@ -2804,13 +2804,13 @@ pub fn enqueue_poll_for_codex_provider_endpoint(
     provider_endpoint: ProviderEndpointKey,
 ) {
     let key = RequestBalanceQueueKey::ProviderEndpoint(provider_endpoint.clone());
-    if !enqueue_request_balance_refresh(key.clone()) {
+    let Some(initial_sleep_for) = enqueue_request_balance_refresh(key.clone()) else {
         return;
-    }
+    };
 
     let service_name = service_name.to_string();
     tokio::spawn(async move {
-        let mut sleep_for = REQUEST_BALANCE_REFRESH_DELAY;
+        let mut sleep_for = initial_sleep_for;
         loop {
             tokio::time::sleep(sleep_for).await;
             match take_request_balance_refresh_if_due(&key) {
@@ -3344,8 +3344,11 @@ mod tests {
             queue.remove(&key);
         }
 
-        assert!(enqueue_request_balance_refresh(key.clone()));
-        assert!(!enqueue_request_balance_refresh(key.clone()));
+        assert_eq!(
+            enqueue_request_balance_refresh(key.clone()),
+            Some(REQUEST_BALANCE_REFRESH_DELAY)
+        );
+        assert_eq!(enqueue_request_balance_refresh(key.clone()), None);
         assert!(matches!(
             take_request_balance_refresh_if_due(&key),
             RequestBalanceQueueDue::NotDue(_)
@@ -3364,7 +3367,37 @@ mod tests {
             take_request_balance_refresh_if_due(&key),
             RequestBalanceQueueDue::Missing
         );
-        assert!(enqueue_request_balance_refresh(key.clone()));
+        assert_eq!(
+            enqueue_request_balance_refresh(key.clone()),
+            Some(REQUEST_BALANCE_REFRESH_DELAY)
+        );
+
+        queue.lock().expect("queue").remove(&key);
+    }
+
+    #[test]
+    fn request_balance_queue_does_not_extend_due_refresh() {
+        let key = RequestBalanceQueueKey::ProviderEndpoint(ProviderEndpointKey::new(
+            "codex", "input", "default",
+        ));
+        let queue = REQUEST_BALANCE_QUEUE.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let mut queue = queue.lock().expect("queue");
+            queue.insert(key.clone(), Instant::now() - Duration::from_secs(1));
+        }
+
+        assert_eq!(
+            enqueue_request_balance_refresh(key.clone()),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            take_request_balance_refresh_if_due(&key),
+            RequestBalanceQueueDue::Due
+        );
+        assert_eq!(
+            take_request_balance_refresh_if_due(&key),
+            RequestBalanceQueueDue::Missing
+        );
 
         queue.lock().expect("queue").remove(&key);
     }
