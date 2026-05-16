@@ -1,7 +1,7 @@
+mod balance;
 mod routing;
 mod routing_menu;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Url;
-use tokio::sync::{OnceCell, Semaphore, mpsc};
+use tokio::sync::{OnceCell, Semaphore};
 
 use crate::config::{
     UpstreamConfig,
@@ -26,10 +26,7 @@ use crate::sessions::{
     SessionSummary, SessionSummarySource, find_codex_session_file_by_id, read_codex_session_meta,
     read_codex_session_transcript,
 };
-use crate::state::{
-    FinishedRequest, ProviderBalanceSnapshot, ProxyState, StationHealth, UpstreamHealth,
-};
-use crate::usage_providers::UsageProviderRefreshSummary;
+use crate::state::{FinishedRequest, ProxyState, StationHealth, UpstreamHealth};
 
 use super::Language;
 use super::i18n::{self, msg};
@@ -44,6 +41,10 @@ use super::state::{
     CodexHistoryExternalFocusOrigin, RecentCodexRow, UiState, adjust_table_selection,
 };
 use super::types::{EffortChoice, Focus, Overlay, Page, ServiceTierChoice, StatsFocus};
+pub(in crate::tui) use balance::{
+    BalanceRefreshMode, BalanceRefreshOutcome, BalanceRefreshSender,
+    request_provider_balance_refresh,
+};
 use routing::{
     apply_global_route_target_pin, invalidate_route_target_preview, open_routing_editor,
     refresh_route_graph_balances,
@@ -53,6 +54,8 @@ use routing_menu::handle_key_routing_menu;
 pub(in crate::tui) use routing::refresh_routing_control_state;
 
 #[cfg(test)]
+use balance::should_request_provider_balance_refresh;
+#[cfg(test)]
 use routing_menu::{
     routing_entry_children, routing_entry_is_flat_provider_list,
     routing_spec_after_provider_enabled_change, routing_spec_with_order,
@@ -61,9 +64,6 @@ use routing_menu::{
 pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
     matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
-
-pub(in crate::tui) type BalanceRefreshOutcome = Result<UsageProviderRefreshSummary, String>;
-pub(in crate::tui) type BalanceRefreshSender = mpsc::UnboundedSender<BalanceRefreshOutcome>;
 
 pub(in crate::tui) async fn handle_key_event(
     state: Arc<ProxyState>,
@@ -787,102 +787,6 @@ async fn apply_global_station_pin(
         state.clear_global_station_override().await;
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::tui) enum BalanceRefreshMode {
-    Auto,
-    Force,
-    ControlChanged,
-}
-
-fn balance_auto_refresh_cooldown(
-    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    now_ms: u64,
-) -> Option<Duration> {
-    let mut seen = false;
-    let mut any_refresh_worthy = false;
-
-    for snapshot in provider_balances.values().flatten() {
-        seen = true;
-        let expired = snapshot.stale
-            || snapshot
-                .stale_after_ms
-                .is_some_and(|stale_after_ms| now_ms > stale_after_ms);
-        let problematic = matches!(
-            snapshot.status,
-            crate::state::BalanceSnapshotStatus::Unknown
-                | crate::state::BalanceSnapshotStatus::Error
-        );
-        any_refresh_worthy |= expired || problematic;
-    }
-
-    if !seen {
-        Some(Duration::from_secs(10))
-    } else if any_refresh_worthy {
-        Some(Duration::from_secs(60))
-    } else {
-        None
-    }
-}
-
-fn should_request_provider_balance_refresh(
-    provider_balances: &HashMap<String, Vec<ProviderBalanceSnapshot>>,
-    mode: BalanceRefreshMode,
-    now_ms: u64,
-    last_request_elapsed: Option<Duration>,
-) -> bool {
-    let cooldown = match mode {
-        BalanceRefreshMode::Force => Some(Duration::from_secs(2)),
-        BalanceRefreshMode::ControlChanged => Some(Duration::ZERO),
-        BalanceRefreshMode::Auto => balance_auto_refresh_cooldown(provider_balances, now_ms),
-    };
-
-    let Some(cooldown) = cooldown else {
-        return false;
-    };
-
-    last_request_elapsed.is_none_or(|elapsed| elapsed >= cooldown)
-}
-
-pub(in crate::tui) fn request_provider_balance_refresh(
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    proxy: &ProxyService,
-    mode: BalanceRefreshMode,
-    balance_refresh_tx: &BalanceRefreshSender,
-) -> bool {
-    let now = Instant::now();
-    let last_request_elapsed = ui
-        .last_balance_refresh_requested_at
-        .map(|last| now.duration_since(last));
-    if !should_request_provider_balance_refresh(
-        &snapshot.provider_balances,
-        mode,
-        now_ms(),
-        last_request_elapsed,
-    ) {
-        return false;
-    }
-    ui.last_balance_refresh_requested_at = Some(now);
-    ui.balance_refresh_in_flight = true;
-    ui.last_balance_refresh_message = Some(match ui.language {
-        Language::Zh => "余额刷新中".to_string(),
-        Language::En => "balance refresh in progress".to_string(),
-    });
-    ui.last_balance_refresh_error = None;
-    ui.last_balance_refresh_summary = None;
-    let proxy = proxy.clone();
-    let balance_refresh_tx = balance_refresh_tx.clone();
-    tokio::spawn(async move {
-        let outcome = proxy
-            .refresh_provider_balances(None, None)
-            .await
-            .map(|response| response.refresh)
-            .map_err(|err| err.to_string());
-        let _ = balance_refresh_tx.send(outcome);
-    });
-    true
 }
 
 async fn persist_ui_language(language: Language) -> anyhow::Result<()> {
