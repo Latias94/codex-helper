@@ -63,7 +63,7 @@ codex-helper switch on --mode default
 
 `chatgpt-bridge` 会写入 `~/.codex/config.toml` 的 `requires_openai_auth = true`、`supports_websockets = false`，并把 `~/.codex/auth.json` 中的 `auth_mode` 改为 `"chatgpt"`、`OPENAI_API_KEY` 改为 `null`，其它字段保持不变。启用前必须已经在官方 Codex 里完成 ChatGPT 登录；如果 `auth.json` 没有完整 token、email 和账号信息，codex-helper 会在写入 `config.toml` / `auth.json` 前拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。修改 Codex 客户端配置后，已经打开的 Codex app 通常需要重启后才会读取新配置。
 
-`imagegen-bridge` 是显式的实验 hack 模式。它会写入一个最小 ChatGPT facade 形式的 `~/.codex/auth.json`，让 Codex 暴露 hosted `image_generation` tool；真实上游凭据仍来自 codex-helper routing（`auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`）。它不要求官方 ChatGPT 登录。启用前，codex-helper 会校验 Codex 服务至少有一个已启用上游，并且当前进程实际能取得至少一个上游凭据；对于环境变量凭据，只在配置里写 env var 名称不够，运行 `switch on` 或启动 `serve` 时该环境变量必须有值。codex-helper 会把旧 `auth.json` 存入 switch state，并在切回 `default` 或执行 `switch off` 时恢复；但只有当前 `auth.json` 仍等于 helper 写入的 facade 时才恢复。如果用户或 Codex 期间改过 `auth.json`，codex-helper 会保持现状，不覆盖用户变更。
+`imagegen-bridge` 是显式的实验 hack 模式。它会把 `~/.codex/auth.json` 临时写成空对象 `{}`，让 Codex 的默认 auth 解析仍把会话视为 ChatGPT-backed 并暴露 hosted `image_generation` tool；真实上游凭据仍来自 codex-helper routing（`auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`）。它不要求官方 ChatGPT 登录，也不会显式写入 `auth_mode`。启用前，codex-helper 会校验 Codex 服务至少有一个已启用上游，并且当前进程实际能取得至少一个上游凭据；对于环境变量凭据，只在配置里写 env var 名称不够，运行 `switch on` 或启动 `serve` 时该环境变量必须有值。codex-helper 会把旧 `auth.json` 存入 switch state，并在切回 `default` 或执行 `switch off` 时恢复；但只有当前 `auth.json` 仍等于 helper 写入的 facade 时才恢复。如果用户或 Codex 期间改过 `auth.json`，codex-helper 会保持现状，不覆盖用户变更。
 
 切回 `default` 会移除 `codex_proxy` provider 的 bridge 专用字段，并在安全时恢复 helper 管理过的 auth patch。
 

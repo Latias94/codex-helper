@@ -239,6 +239,23 @@ enum CodexAuthEdit {
     RemoveFile,
 }
 
+fn auth_json_matches_helper_patch(current_text: Option<&str>, patched_auth_json: &str) -> bool {
+    let Some(current_text) = current_text else {
+        return false;
+    };
+    if current_text == patched_auth_json {
+        return true;
+    }
+
+    let Ok(current_value) = serde_json::from_str::<serde_json::Value>(current_text) else {
+        return false;
+    };
+    let Ok(patched_value) = serde_json::from_str::<serde_json::Value>(patched_auth_json) else {
+        return false;
+    };
+    current_value == patched_value
+}
+
 fn apply_codex_auth_edit(edit: CodexAuthEdit) -> Result<()> {
     match edit {
         CodexAuthEdit::None => Ok(()),
@@ -266,7 +283,7 @@ fn auth_restore_edit_from_state(state: &mut CodexSwitchState) -> Result<CodexAut
         None
     };
 
-    let edit = if current_text.as_deref() == Some(patched_auth_json) {
+    let edit = if auth_json_matches_helper_patch(current_text.as_deref(), patched_auth_json) {
         if state.original_auth_json_absent {
             CodexAuthEdit::RemoveFile
         } else if let Some(original) = state.original_auth_json.clone() {
@@ -291,7 +308,7 @@ fn auth_baseline_for_patch(state: &CodexSwitchState) -> Result<(bool, Option<Str
     };
 
     if let Some(patched_auth_json) = state.patched_auth_json.as_deref()
-        && current_text.as_deref() == Some(patched_auth_json)
+        && auth_json_matches_helper_patch(current_text.as_deref(), patched_auth_json)
     {
         return Ok((
             state.original_auth_json_absent,
@@ -598,9 +615,7 @@ fn chatgpt_bridge_auth_json_text(text: &str) -> Result<String> {
 }
 
 fn imagegen_bridge_auth_json_text() -> Result<String> {
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "auth_mode": "chatgpt",
-    }))?)
+    Ok(serde_json::to_string_pretty(&serde_json::json!({}))?)
 }
 
 fn prepare_chatgpt_bridge_auth_patch_from_baseline(
@@ -993,7 +1008,10 @@ pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
                 )?,
                 CodexPatchMode::Default => unreachable!("handled above"),
             };
-            let auth_edit = if current_auth.as_deref() == Some(patch.patched_text.as_str()) {
+            let auth_edit = if auth_json_matches_helper_patch(
+                current_auth.as_deref(),
+                patch.patched_text.as_str(),
+            ) {
                 CodexAuthEdit::None
             } else {
                 CodexAuthEdit::Write(patch.patched_text.clone())
@@ -1695,16 +1713,26 @@ supports_websockets = false
     }
 
     #[test]
-    fn imagegen_bridge_auth_patch_writes_minimal_chatgpt_facade() {
+    fn imagegen_bridge_auth_patch_writes_empty_chatgpt_facade() {
         let updated = imagegen_bridge_auth_json_text().expect("serialize facade auth");
         let value: serde_json::Value = serde_json::from_str(&updated).expect("valid json");
 
-        assert_eq!(
-            value.get("auth_mode").and_then(|value| value.as_str()),
-            Some("chatgpt")
+        assert!(
+            value.as_object().is_some_and(serde_json::Map::is_empty),
+            "imagegen bridge must rely on Codex's default ChatGPT mode fallback, not an explicit auth_mode field"
         );
-        assert!(value.get("OPENAI_API_KEY").is_none());
-        assert!(value.get("tokens").is_none());
+    }
+
+    #[test]
+    fn helper_auth_patch_match_uses_json_semantics() {
+        assert!(auth_json_matches_helper_patch(
+            Some(r#"{"auth_mode":"chatgpt"}"#),
+            "{\n  \"auth_mode\": \"chatgpt\"\n}"
+        ));
+        assert!(!auth_json_matches_helper_patch(
+            Some(r#"{"auth_mode":"apikey"}"#),
+            "{\n  \"auth_mode\": \"chatgpt\"\n}"
+        ));
     }
 
     #[test]
@@ -1831,14 +1859,11 @@ base_url = "https://api.openai.com/v1"
 
         let updated_auth: serde_json::Value =
             serde_json::from_str(&read_file(&auth_path)).expect("valid auth json");
-        assert_eq!(
+        assert!(
             updated_auth
-                .get("auth_mode")
-                .and_then(|value| value.as_str()),
-            Some("chatgpt")
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
         );
-        assert!(updated_auth.get("tokens").is_none());
-        assert!(updated_auth.get("OPENAI_API_KEY").is_none());
 
         let state_text = read_file(&state_path);
         let state: serde_json::Value = serde_json::from_str(&state_text).expect("valid state");
@@ -1852,7 +1877,12 @@ base_url = "https://api.openai.com/v1"
                 .and_then(|value| value.as_str()),
             Some(original_auth.as_str())
         );
-        assert!(state.get("patched_auth_json").is_some());
+        assert_eq!(
+            state
+                .get("patched_auth_json")
+                .and_then(|value| value.as_str()),
+            Some("{}")
+        );
     }
 
     #[test]
