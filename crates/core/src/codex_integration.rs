@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use crate::client_config::{
     CLAUDE_ABSENT_BACKUP_SENTINEL, claude_settings_backup_path_for as claude_settings_backup_path,
     claude_settings_path, codex_auth_path, codex_config_path, codex_switch_state_path,
 };
+use crate::config::{ProxyConfig, ProxyConfigV2, ProxyConfigV4};
 use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
 use toml::Value;
@@ -82,10 +84,18 @@ fn codex_text_points_to_local_helper(text: &str) -> Result<bool> {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct CodexSwitchState {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    patch_mode: Option<CodexPatchMode>,
     original_config_absent: bool,
     original_model_provider: Option<String>,
     original_codex_proxy: Option<Value>,
     had_model_providers: bool,
+    #[serde(default)]
+    original_auth_json_absent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_auth_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    patched_auth_json: Option<String>,
 }
 
 impl CodexSwitchState {
@@ -101,12 +111,28 @@ impl CodexSwitchState {
             .and_then(EditableTomlItem::as_table);
 
         Ok(Self {
-            version: 1,
+            version: 2,
+            patch_mode: None,
             original_config_absent,
             original_model_provider: toml_string(root, "model_provider"),
             original_codex_proxy: original_codex_proxy_value(text)?,
             had_model_providers: providers_table.is_some(),
+            original_auth_json_absent: false,
+            original_auth_json: None,
+            patched_auth_json: None,
         })
+    }
+
+    fn set_auth_patch(&mut self, patch: &CodexAuthPatch) {
+        self.original_auth_json_absent = patch.original_absent;
+        self.original_auth_json = patch.original_text.clone();
+        self.patched_auth_json = Some(patch.patched_text.clone());
+    }
+
+    fn clear_auth_patch(&mut self) {
+        self.original_auth_json_absent = false;
+        self.original_auth_json = None;
+        self.patched_auth_json = None;
     }
 }
 
@@ -148,11 +174,8 @@ fn read_codex_switch_state() -> Result<Option<CodexSwitchState>> {
     Ok(Some(state))
 }
 
-fn write_codex_switch_state_if_absent(state: &CodexSwitchState) -> Result<()> {
+fn write_codex_switch_state(state: &CodexSwitchState) -> Result<()> {
     let path = codex_switch_state_path();
-    if path.exists() {
-        return Ok(());
-    }
     let text = serde_json::to_string_pretty(state)?;
     atomic_write(&path, &text)
 }
@@ -170,6 +193,9 @@ pub enum CodexPatchMode {
     /// Keep Codex/ChatGPT account auth for app/mobile features while model traffic goes through
     /// codex-helper.
     ChatGptBridge,
+    /// Use a minimal ChatGPT-looking auth facade to expose Codex hosted image generation while
+    /// request credentials still come from codex-helper routing/upstream configuration.
+    ImagegenBridge,
 }
 
 impl CodexPatchMode {
@@ -177,11 +203,16 @@ impl CodexPatchMode {
         match self {
             Self::Default => "default",
             Self::ChatGptBridge => "chatgpt-bridge",
+            Self::ImagegenBridge => "imagegen-bridge",
         }
     }
 
     pub fn is_default(self) -> bool {
         matches!(self, Self::Default)
+    }
+
+    pub fn strips_codex_client_auth(self) -> bool {
+        matches!(self, Self::ChatGptBridge | Self::ImagegenBridge)
     }
 }
 
@@ -194,6 +225,81 @@ impl std::fmt::Display for CodexPatchMode {
 enum CodexSwitchOffEdit {
     Write(String),
     RemoveFile,
+}
+
+struct CodexAuthPatch {
+    original_absent: bool,
+    original_text: Option<String>,
+    patched_text: String,
+}
+
+enum CodexAuthEdit {
+    None,
+    Write(String),
+    RemoveFile,
+}
+
+fn apply_codex_auth_edit(edit: CodexAuthEdit) -> Result<()> {
+    match edit {
+        CodexAuthEdit::None => Ok(()),
+        CodexAuthEdit::Write(text) => atomic_write(&codex_auth_path(), &text)
+            .with_context(|| format!("patch {:?}", codex_auth_path())),
+        CodexAuthEdit::RemoveFile => {
+            let path = codex_auth_path();
+            if path.exists() {
+                fs::remove_file(&path).with_context(|| format!("remove {:?}", path))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn auth_restore_edit_from_state(state: &mut CodexSwitchState) -> Result<CodexAuthEdit> {
+    let Some(patched_auth_json) = state.patched_auth_json.as_deref() else {
+        return Ok(CodexAuthEdit::None);
+    };
+
+    let auth_path = codex_auth_path();
+    let current_text = if auth_path.exists() {
+        Some(read_config_text(&auth_path)?)
+    } else {
+        None
+    };
+
+    let edit = if current_text.as_deref() == Some(patched_auth_json) {
+        if state.original_auth_json_absent {
+            CodexAuthEdit::RemoveFile
+        } else if let Some(original) = state.original_auth_json.clone() {
+            CodexAuthEdit::Write(original)
+        } else {
+            CodexAuthEdit::None
+        }
+    } else {
+        CodexAuthEdit::None
+    };
+
+    state.clear_auth_patch();
+    Ok(edit)
+}
+
+fn auth_baseline_for_patch(state: &CodexSwitchState) -> Result<(bool, Option<String>)> {
+    let auth_path = codex_auth_path();
+    let current_text = if auth_path.exists() {
+        Some(read_config_text(&auth_path)?)
+    } else {
+        None
+    };
+
+    if let Some(patched_auth_json) = state.patched_auth_json.as_deref()
+        && current_text.as_deref() == Some(patched_auth_json)
+    {
+        return Ok((
+            state.original_auth_json_absent,
+            state.original_auth_json.clone(),
+        ));
+    }
+
+    Ok((current_text.is_none(), current_text))
 }
 
 fn switch_off_codex_toml(
@@ -351,7 +457,7 @@ fn switch_on_codex_toml_with_mode(text: &str, port: u16, mode: CodexPatchMode) -
         proxy_table.insert("request_max_retries", editable_toml_value(0));
     }
     match mode {
-        CodexPatchMode::Default => {
+        CodexPatchMode::Default | CodexPatchMode::ImagegenBridge => {
             proxy_table.remove("requires_openai_auth");
             proxy_table.remove("supports_websockets");
         }
@@ -489,6 +595,193 @@ fn chatgpt_bridge_auth_json_text(text: &str) -> Result<String> {
         serde_json::from_str(text).context("parse Codex auth.json as JSON")?;
     value = chatgpt_bridge_auth_json_value(value)?;
     Ok(serde_json::to_string_pretty(&value)?)
+}
+
+fn imagegen_bridge_auth_json_text() -> Result<String> {
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "auth_mode": "chatgpt",
+    }))?)
+}
+
+fn prepare_chatgpt_bridge_auth_patch_from_baseline(
+    original_absent: bool,
+    original_text: Option<String>,
+) -> Result<CodexAuthPatch> {
+    let auth_path = codex_auth_path();
+    let Some(original_text) = original_text else {
+        return Err(anyhow!(
+            "Codex auth.json not found at {:?}; run `codex login` first, then enable chatgpt-bridge mode.",
+            auth_path
+        ));
+    };
+    if original_absent {
+        return Err(anyhow!(
+            "Codex auth.json not found at {:?}; run `codex login` first, then enable chatgpt-bridge mode.",
+            auth_path
+        ));
+    }
+    let patched_text = chatgpt_bridge_auth_json_text(&original_text)?;
+    Ok(CodexAuthPatch {
+        original_absent: false,
+        original_text: Some(original_text),
+        patched_text,
+    })
+}
+
+fn prepare_imagegen_bridge_auth_patch_from_baseline(
+    original_absent: bool,
+    original_text: Option<String>,
+) -> Result<CodexAuthPatch> {
+    Ok(CodexAuthPatch {
+        original_absent,
+        original_text,
+        patched_text: imagegen_bridge_auth_json_text()?,
+    })
+}
+
+fn auth_env_is_set(env_name: &str) -> bool {
+    let env_name = env_name.trim();
+    !env_name.is_empty() && std::env::var(env_name).is_ok_and(|value| !value.trim().is_empty())
+}
+
+fn upstream_has_resolved_auth(upstream: &crate::config::UpstreamConfig) -> bool {
+    upstream
+        .auth
+        .auth_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty())
+        || upstream
+            .auth
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+        || upstream
+            .auth
+            .auth_token_env
+            .as_deref()
+            .is_some_and(auth_env_is_set)
+        || upstream
+            .auth
+            .api_key_env
+            .as_deref()
+            .is_some_and(auth_env_is_set)
+}
+
+fn upstream_auth_env_names(upstream: &crate::config::UpstreamConfig) -> impl Iterator<Item = &str> {
+    upstream
+        .auth
+        .auth_token_env
+        .as_deref()
+        .into_iter()
+        .chain(upstream.auth.api_key_env.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn config_toml_schema_version_or_shape(text: &str) -> Option<u32> {
+    let value = toml::from_str::<toml::Value>(text).ok()?;
+    if let Some(version) = value
+        .get("version")
+        .and_then(|value| value.as_integer())
+        .map(|value| value as u32)
+    {
+        return Some(version);
+    }
+
+    let has_v4_routing = ["codex", "claude"].iter().any(|service| {
+        value
+            .get(*service)
+            .and_then(|service| service.get("routing"))
+            .and_then(|routing| routing.get("entry").or_else(|| routing.get("routes")))
+            .is_some()
+    });
+    if has_v4_routing {
+        return Some(4);
+    }
+
+    let has_legacy_routing = ["codex", "claude"].iter().any(|service| {
+        value
+            .get(*service)
+            .and_then(|service| service.get("routing"))
+            .is_some()
+    });
+    if has_legacy_routing { Some(3) } else { None }
+}
+
+fn load_runtime_config_for_imagegen_bridge_check() -> Result<ProxyConfig> {
+    let path = crate::config::config_file_path();
+    if !path.exists() {
+        return Ok(ProxyConfig::default());
+    }
+
+    let text = read_config_text(&path).with_context(|| format!("read {:?}", path))?;
+    if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+        let version = config_toml_schema_version_or_shape(&text);
+        if version.is_some_and(crate::config::is_supported_route_graph_config_version) {
+            let cfg = toml::from_str::<ProxyConfigV4>(&text)
+                .with_context(|| format!("parse {:?} as route graph config", path))?;
+            return crate::config::compile_v4_to_runtime(&cfg);
+        }
+        if version == Some(3) {
+            let cfg = toml::from_str::<crate::config::legacy::ProxyConfigV3Legacy>(&text)
+                .with_context(|| format!("parse {:?} as legacy route config", path))?;
+            let migrated = crate::config::legacy::migrate_v3_legacy_to_v4(&cfg)?;
+            return crate::config::compile_v4_to_runtime(&migrated.config);
+        }
+        if version == Some(2) {
+            let cfg = toml::from_str::<ProxyConfigV2>(&text)
+                .with_context(|| format!("parse {:?} as v2 config", path))?;
+            return crate::config::compile_v2_to_runtime(&cfg);
+        }
+        return toml::from_str::<ProxyConfig>(&text)
+            .with_context(|| format!("parse {:?} as runtime config", path));
+    }
+
+    serde_json::from_str::<ProxyConfig>(&text).with_context(|| format!("parse {:?}", path))
+}
+
+fn ensure_imagegen_bridge_runtime_ready() -> Result<()> {
+    let cfg = load_runtime_config_for_imagegen_bridge_check()
+        .context("load codex-helper config before enabling imagegen-bridge")?;
+    let mut routable_upstreams = 0usize;
+    let mut authed_upstreams = 0usize;
+    let mut missing_env = BTreeSet::new();
+    for station in cfg
+        .codex
+        .stations()
+        .values()
+        .filter(|station| station.enabled)
+    {
+        for upstream in &station.upstreams {
+            routable_upstreams += 1;
+            if upstream_has_resolved_auth(upstream) {
+                authed_upstreams += 1;
+            } else {
+                for env_name in upstream_auth_env_names(upstream) {
+                    missing_env.insert(env_name.to_string());
+                }
+            }
+        }
+    }
+
+    if routable_upstreams == 0 {
+        anyhow::bail!(
+            "imagegen-bridge requires at least one enabled Codex upstream in codex-helper config; run `codex-helper config init` or add a [codex.providers.*] entry first"
+        );
+    }
+    if authed_upstreams == 0 {
+        if missing_env.is_empty() {
+            anyhow::bail!(
+                "imagegen-bridge strips Codex client auth, but no enabled Codex upstream has auth_token/auth_token_env/api_key/api_key_env configured; configure an upstream credential before enabling it"
+            );
+        }
+        anyhow::bail!(
+            "imagegen-bridge strips Codex client auth, but no enabled Codex upstream credential is available in this process; set one of these env vars first: {}",
+            missing_env.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    Ok(())
 }
 
 pub fn patch_codex_auth_for_chatgpt_bridge() -> Result<()> {
@@ -634,11 +927,15 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
         enabled,
         model_provider,
         base_url,
-        patch_mode: enabled.then_some(if requires_openai_auth == Some(true) {
-            CodexPatchMode::ChatGptBridge
-        } else {
-            CodexPatchMode::Default
-        }),
+        patch_mode: enabled.then_some(
+            read_codex_switch_state()?
+                .and_then(|state| state.patch_mode)
+                .unwrap_or(if requires_openai_auth == Some(true) {
+                    CodexPatchMode::ChatGptBridge
+                } else {
+                    CodexPatchMode::Default
+                }),
+        ),
         requires_openai_auth,
         supports_websockets,
         has_switch_state: state_path.exists(),
@@ -652,6 +949,10 @@ pub fn switch_on(port: u16) -> Result<()> {
 
 /// Switch Codex to use the local codex-helper model provider with an explicit client patch mode.
 pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
+    if mode == CodexPatchMode::ImagegenBridge {
+        ensure_imagegen_bridge_runtime_ready()?;
+    }
+
     let cfg_path = codex_config_path();
     let state_path = codex_switch_state_path();
     let text = read_config_text(&cfg_path)?;
@@ -661,33 +962,58 @@ pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
             state_path
         ));
     }
-    let auth_patch = if mode == CodexPatchMode::ChatGptBridge {
-        let auth_path = codex_auth_path();
-        if !auth_path.exists() {
-            return Err(anyhow!(
-                "Codex auth.json not found at {:?}; run `codex login` first, then enable chatgpt-bridge mode.",
-                auth_path
-            ));
-        }
-        let auth_text = read_config_text(&auth_path)?;
-        let auth_value: serde_json::Value =
-            serde_json::from_str(&auth_text).context("parse Codex auth.json as JSON")?;
-        let patched_auth_value = chatgpt_bridge_auth_json_value(auth_value.clone())?;
-        if patched_auth_value == auth_value {
-            None
-        } else {
-            let patched_auth_text = serde_json::to_string_pretty(&patched_auth_value)?;
-            Some((auth_path, patched_auth_text))
-        }
+    let mut state = if state_path.exists() {
+        read_codex_switch_state()?.ok_or_else(|| {
+            anyhow!(
+                "missing Codex switch state at {:?}",
+                codex_switch_state_path()
+            )
+        })?
     } else {
-        None
+        CodexSwitchState::from_codex_config_text(&text, !cfg_path.exists())?
     };
-    let state = CodexSwitchState::from_codex_config_text(&text, !cfg_path.exists())?;
+    state.patch_mode = Some(mode);
+
+    let auth_edit = match mode {
+        CodexPatchMode::Default => auth_restore_edit_from_state(&mut state)?,
+        CodexPatchMode::ChatGptBridge | CodexPatchMode::ImagegenBridge => {
+            let current_auth = if codex_auth_path().exists() {
+                Some(read_config_text(&codex_auth_path())?)
+            } else {
+                None
+            };
+            let (original_absent, original_text) = auth_baseline_for_patch(&state)?;
+            let patch = match mode {
+                CodexPatchMode::ChatGptBridge => {
+                    prepare_chatgpt_bridge_auth_patch_from_baseline(original_absent, original_text)?
+                }
+                CodexPatchMode::ImagegenBridge => prepare_imagegen_bridge_auth_patch_from_baseline(
+                    original_absent,
+                    original_text,
+                )?,
+                CodexPatchMode::Default => unreachable!("handled above"),
+            };
+            let auth_edit = if current_auth.as_deref() == Some(patch.patched_text.as_str()) {
+                CodexAuthEdit::None
+            } else {
+                CodexAuthEdit::Write(patch.patched_text.clone())
+            };
+            state.set_auth_patch(&patch);
+            auth_edit
+        }
+    };
     let new_text = switch_on_codex_toml_with_mode(&text, port, mode)?;
-    write_codex_switch_state_if_absent(&state)?;
-    atomic_write(&cfg_path, &new_text)?;
-    if let Some((auth_path, auth_text)) = auth_patch {
-        atomic_write(&auth_path, &auth_text)?;
+    match mode {
+        CodexPatchMode::Default => {
+            atomic_write(&cfg_path, &new_text)?;
+            apply_codex_auth_edit(auth_edit)?;
+            write_codex_switch_state(&state)?;
+        }
+        CodexPatchMode::ChatGptBridge | CodexPatchMode::ImagegenBridge => {
+            write_codex_switch_state(&state)?;
+            atomic_write(&cfg_path, &new_text)?;
+            apply_codex_auth_edit(auth_edit)?;
+        }
     }
     Ok(())
 }
@@ -697,17 +1023,19 @@ pub fn switch_off() -> Result<()> {
     let cfg_path = codex_config_path();
     let state_path = codex_switch_state_path();
     if state_path.exists() {
-        if !cfg_path.exists() {
-            fs::remove_file(&state_path)
-                .with_context(|| format!("remove stale switch state {:?}", state_path))?;
-            return Ok(());
-        }
-        let state = read_codex_switch_state()?.ok_or_else(|| {
+        let mut state = read_codex_switch_state()?.ok_or_else(|| {
             anyhow!(
                 "missing Codex switch state at {:?}",
                 codex_switch_state_path()
             )
         })?;
+        let auth_edit = auth_restore_edit_from_state(&mut state)?;
+        if !cfg_path.exists() {
+            apply_codex_auth_edit(auth_edit)?;
+            fs::remove_file(&state_path)
+                .with_context(|| format!("remove stale switch state {:?}", state_path))?;
+            return Ok(());
+        }
         let current_text = read_config_text(&cfg_path)?;
         match switch_off_codex_toml(&current_text, &state)? {
             CodexSwitchOffEdit::RemoveFile => {
@@ -721,6 +1049,7 @@ pub fn switch_off() -> Result<()> {
                     .with_context(|| format!("patch {:?} to disable local proxy", cfg_path))?;
             }
         }
+        apply_codex_auth_edit(auth_edit)?;
         fs::remove_file(&state_path)
             .with_context(|| format!("remove stale switch state {:?}", state_path))?;
     }
@@ -1014,6 +1343,11 @@ mod tests {
             self.saved.push((key.to_string(), std::env::var(key).ok()));
             unsafe { std::env::set_var(key, value) };
         }
+
+        unsafe fn set_str(&mut self, key: &str, value: &str) {
+            self.saved.push((key.to_string(), std::env::var(key).ok()));
+            unsafe { std::env::set_var(key, value) };
+        }
     }
 
     impl Drop for ScopedEnv {
@@ -1052,15 +1386,20 @@ mod tests {
 
         let codex_home = root.join(".codex");
         let claude_home = root.join(".claude");
+        let proxy_home = root.join(".codex-helper");
         std::fs::create_dir_all(&codex_home).expect("create temp codex home");
         std::fs::create_dir_all(&claude_home).expect("create temp claude home");
+        std::fs::create_dir_all(&proxy_home).expect("create temp proxy home");
 
         let mut scoped = ScopedEnv::new();
         unsafe {
             scoped.set_path("CODEX_HOME", &codex_home);
             scoped.set_path("CLAUDE_HOME", &claude_home);
+            scoped.set_path("CODEX_HELPER_HOME", &proxy_home);
             scoped.set_path("HOME", &root);
             scoped.set_path("USERPROFILE", &root);
+            scoped.set_str("CODEX_HELPER_IMAGEGEN_TEST_KEY", "sk-relay-test");
+            scoped.set_str("CODEX_HELPER_MISSING_IMAGEGEN_KEY", "");
         }
 
         TestEnv {
@@ -1080,6 +1419,31 @@ mod tests {
 
     fn read_file(path: &Path) -> String {
         std::fs::read_to_string(path).expect("read test file")
+    }
+
+    fn write_helper_codex_config(env: &TestEnv, content: &str) {
+        let proxy_home = env.codex_home.parent().unwrap().join(".codex-helper");
+        write_file(&proxy_home.join("config.toml"), content.trim_start());
+    }
+
+    fn write_helper_codex_config_with_env_auth(env: &TestEnv) {
+        write_helper_codex_config(
+            env,
+            r#"
+version = 5
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "CODEX_HELPER_IMAGEGEN_TEST_KEY"
+
+[codex.routing]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["relay"]
+"#,
+        );
     }
 
     fn fake_chatgpt_jwt(email: &str, account_id: &str, plan_type: &str) -> String {
@@ -1209,6 +1573,17 @@ request_max_retries = 5
     }
 
     #[test]
+    fn codex_switch_on_imagegen_bridge_uses_default_proxy_flags() {
+        let updated = switch_on_codex_toml_with_mode("", 3333, CodexPatchMode::ImagegenBridge)
+            .expect("switch_on should write imagegen bridge fields");
+
+        assert!(updated.contains("model_provider = \"codex_proxy\""));
+        assert!(updated.contains("base_url = \"http://127.0.0.1:3333\""));
+        assert!(!updated.contains("requires_openai_auth"));
+        assert!(!updated.contains("supports_websockets"));
+    }
+
+    #[test]
     fn codex_switch_on_default_removes_bridge_only_flags() {
         let text = r#"
 model_provider = "codex_proxy"
@@ -1320,6 +1695,61 @@ supports_websockets = false
     }
 
     #[test]
+    fn imagegen_bridge_auth_patch_writes_minimal_chatgpt_facade() {
+        let updated = imagegen_bridge_auth_json_text().expect("serialize facade auth");
+        let value: serde_json::Value = serde_json::from_str(&updated).expect("valid json");
+
+        assert_eq!(
+            value.get("auth_mode").and_then(|value| value.as_str()),
+            Some("chatgpt")
+        );
+        assert!(value.get("OPENAI_API_KEY").is_none());
+        assert!(value.get("tokens").is_none());
+    }
+
+    #[test]
+    fn imagegen_bridge_ready_check_rejects_missing_codex_upstreams() {
+        let _env = setup_temp_env();
+
+        let err = ensure_imagegen_bridge_runtime_ready()
+            .expect_err("imagegen bridge should require codex-helper upstreams");
+
+        assert!(
+            err.to_string()
+                .contains("requires at least one enabled Codex upstream")
+        );
+    }
+
+    #[test]
+    fn imagegen_bridge_ready_check_rejects_unresolved_upstream_env() {
+        let env = setup_temp_env();
+        write_helper_codex_config(
+            &env,
+            r#"
+version = 5
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "CODEX_HELPER_MISSING_IMAGEGEN_KEY"
+
+[codex.routing]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["relay"]
+"#,
+        );
+
+        let err = ensure_imagegen_bridge_runtime_ready()
+            .expect_err("imagegen bridge should require resolved upstream auth");
+
+        let message = err.to_string();
+        assert!(message.contains("no enabled Codex upstream credential is available"));
+        assert!(message.contains("CODEX_HELPER_MISSING_IMAGEGEN_KEY"));
+    }
+
+    #[test]
     fn codex_switch_on_chatgpt_bridge_patches_auth_json() {
         let env = setup_temp_env();
         let cfg_path = env.codex_home.join("config.toml");
@@ -1367,6 +1797,197 @@ base_url = "https://api.openai.com/v1"
                 .and_then(|value| value.get("account_id"))
                 .and_then(|value| value.as_str()),
             Some("acct_1")
+        );
+    }
+
+    #[test]
+    fn codex_switch_on_imagegen_bridge_patches_auth_json_and_records_mode() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let state_path = env.codex_home.join("codex-helper-switch-state.json");
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, &original_auth);
+
+        switch_on_with_mode(3211, CodexPatchMode::ImagegenBridge)
+            .expect("switch_on imagegen bridge should patch config and auth");
+
+        let updated_cfg = read_file(&cfg_path);
+        assert!(updated_cfg.contains("model_provider = \"codex_proxy\""));
+        assert!(!updated_cfg.contains("requires_openai_auth"));
+
+        let updated_auth: serde_json::Value =
+            serde_json::from_str(&read_file(&auth_path)).expect("valid auth json");
+        assert_eq!(
+            updated_auth
+                .get("auth_mode")
+                .and_then(|value| value.as_str()),
+            Some("chatgpt")
+        );
+        assert!(updated_auth.get("tokens").is_none());
+        assert!(updated_auth.get("OPENAI_API_KEY").is_none());
+
+        let state_text = read_file(&state_path);
+        let state: serde_json::Value = serde_json::from_str(&state_text).expect("valid state");
+        assert_eq!(
+            state.get("patch_mode").and_then(|value| value.as_str()),
+            Some("imagegen-bridge")
+        );
+        assert_eq!(
+            state
+                .get("original_auth_json")
+                .and_then(|value| value.as_str()),
+            Some(original_auth.as_str())
+        );
+        assert!(state.get("patched_auth_json").is_some());
+    }
+
+    #[test]
+    fn codex_switch_default_restores_imagegen_bridge_auth_json() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, &original_auth);
+
+        switch_on_with_mode(3211, CodexPatchMode::ImagegenBridge)
+            .expect("switch_on imagegen bridge should patch auth");
+        assert_ne!(read_file(&auth_path), original_auth);
+
+        switch_on_with_mode(3211, CodexPatchMode::Default)
+            .expect("switching to default should restore auth");
+
+        assert_eq!(read_file(&auth_path), original_auth);
+        let status = codex_switch_status().expect("status should load");
+        assert_eq!(status.patch_mode, Some(CodexPatchMode::Default));
+    }
+
+    #[test]
+    fn codex_switch_off_restores_imagegen_bridge_auth_json() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, &original_auth);
+
+        switch_on_with_mode(3211, CodexPatchMode::ImagegenBridge)
+            .expect("switch_on imagegen bridge should patch auth");
+        switch_off().expect("switch_off should restore auth");
+
+        assert_eq!(read_file(&auth_path), original_auth);
+        assert!(read_file(&cfg_path).contains("model_provider = \"openai\""));
+    }
+
+    #[test]
+    fn codex_switch_off_does_not_restore_auth_if_user_changed_it() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let user_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-user"}"#;
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(
+            &auth_path,
+            &chatgpt_auth_json("user@example.com", "acct_1", "plus"),
+        );
+
+        switch_on_with_mode(3211, CodexPatchMode::ImagegenBridge)
+            .expect("switch_on imagegen bridge should patch auth");
+        write_file(&auth_path, user_auth);
+        switch_off().expect("switch_off should leave user auth alone");
+
+        assert_eq!(read_file(&auth_path), user_auth);
+    }
+
+    #[test]
+    fn codex_switch_imagegen_to_chatgpt_bridge_uses_original_auth_json() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, &original_auth);
+
+        switch_on_with_mode(3211, CodexPatchMode::ImagegenBridge)
+            .expect("switch_on imagegen bridge should patch auth");
+        switch_on_with_mode(3211, CodexPatchMode::ChatGptBridge)
+            .expect("switching to chatgpt bridge should use original auth snapshot");
+
+        let updated_auth: serde_json::Value =
+            serde_json::from_str(&read_file(&auth_path)).expect("valid auth json");
+        assert_eq!(
+            updated_auth
+                .get("tokens")
+                .and_then(|value| value.get("account_id"))
+                .and_then(|value| value.as_str()),
+            Some("acct_1")
+        );
+        assert!(
+            updated_auth
+                .get("OPENAI_API_KEY")
+                .is_some_and(|value| value.is_null())
         );
     }
 

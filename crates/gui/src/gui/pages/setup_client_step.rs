@@ -201,6 +201,37 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                     }
                 }
 
+                let enable_imagegen_label = match ctx.lang {
+                    Language::Zh => format!("Imagegen Bridge（端口 {port}）"),
+                    Language::En => format!("Imagegen bridge (port {port})"),
+                };
+                if ui
+                    .add_enabled(
+                        !status.enabled
+                            || status.patch_mode
+                                != Some(crate::codex_integration::CodexPatchMode::ImagegenBridge),
+                        egui::Button::new(enable_imagegen_label),
+                    )
+                    .clicked()
+                {
+                    match crate::codex_integration::switch_on_with_mode(
+                        port,
+                        crate::codex_integration::CodexPatchMode::ImagegenBridge,
+                    ) {
+                        Ok(()) => {
+                            *ctx.last_info = Some(
+                                pick(
+                                    ctx.lang,
+                                    "已启用 Imagegen bridge；auth.json 会在关闭或切回默认时安全恢复，已有 Codex app 需要重启后生效",
+                                    "Enabled Imagegen bridge; auth.json will be safely restored on disable/default switch, restart existing Codex apps to apply it",
+                                )
+                                .to_string(),
+                            );
+                        }
+                        Err(e) => *ctx.last_error = Some(format!("switch on failed: {e}")),
+                    }
+                }
+
                 if ui
                     .add_enabled(
                         status.has_switch_state,

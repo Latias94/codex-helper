@@ -675,10 +675,10 @@ pub(super) fn render_settings_page(
                 lines.push(Line::from(vec![Span::styled(
                     match ui.language {
                         Language::Zh => {
-                            "  B 启用 ChatGPT bridge；D 切回默认。修改 ~/.codex/config.toml 后已有 Codex app 需要重启。"
+                            "  B 启用 ChatGPT bridge；I 启用 Imagegen bridge；D 切回默认。修改 ~/.codex/config.toml 后已有 Codex app 需要重启。"
                         }
                         Language::En => {
-                            "  B enables ChatGPT bridge; D switches to default. Restart existing Codex apps after ~/.codex/config.toml changes."
+                            "  B enables ChatGPT bridge; I enables Imagegen bridge; D switches to default. Restart existing Codex apps after ~/.codex/config.toml changes."
                         }
                     },
                     Style::default().fg(p.muted),

@@ -55,16 +55,19 @@ You can also switch it temporarily from the CLI:
 
 ```bash
 codex-helper switch on --mode chatgpt-bridge
+codex-helper switch on --mode imagegen-bridge
 codex-helper switch on --mode default
 ```
 
-On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client patch mode is preserved; use `switch on --mode ...` or the TUI Settings `B`/`D` keys to change it explicitly.
+On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client patch mode is preserved; use `switch on --mode ...` or the TUI Settings `B`/`I`/`D` keys to change it explicitly.
 
 `chatgpt-bridge` writes `requires_openai_auth = true` and `supports_websockets = false` into `~/.codex/config.toml`, and changes only two `~/.codex/auth.json` fields: `auth_mode` becomes `"chatgpt"` and `OPENAI_API_KEY` becomes `null`. It requires an existing official Codex ChatGPT login state; if `auth.json` has no complete token/email/account metadata, codex-helper refuses the patch before writing `config.toml` or `auth.json`. Existing Codex apps usually need a restart before they read the changed client config.
 
-Switching back to `default` only removes the bridge-only fields from `codex_proxy`; it does not restore the previous `OPENAI_API_KEY` value. To return to API-key auth, reconfigure Codex auth separately.
+`imagegen-bridge` is an explicit experimental hack mode. It writes a minimal ChatGPT-looking `~/.codex/auth.json` facade so Codex exposes the hosted `image_generation` tool, while actual upstream credentials still come from codex-helper routing (`auth_token_env`, `auth_token`, `api_key_env`, or `api_key`). It does not require an official ChatGPT login. Before enabling it, codex-helper verifies that the Codex service has at least one enabled upstream and that at least one upstream credential is actually available to the current process. For env-based credentials, setting only the env var name in config is not enough; the env var value must also be present when you run `switch on` or start `serve`. codex-helper stores the previous `auth.json` in its switch state and restores it when switching back to `default` or running `switch off`, but only if the current `auth.json` still matches the helper-written facade. If the user or Codex changed `auth.json` meanwhile, codex-helper leaves it untouched.
 
-Safety rule: in bridge mode, upstream providers should configure their own `auth_token_env` / `auth_token`. If an upstream has no helper-side secret, codex-helper strips Codex client auth headers to avoid forwarding ChatGPT login tokens to third-party relays.
+Switching back to `default` removes the bridge-only fields from `codex_proxy` and restores helper-managed auth patches when it is safe to do so.
+
+Safety rule: in bridge modes, upstream providers should configure their own `auth_token_env` / `auth_token` or API key equivalent. If an upstream has no helper-side secret, codex-helper strips Codex client auth headers to avoid forwarding ChatGPT/facade auth to third-party relays.
 
 ## Recommended Start
 

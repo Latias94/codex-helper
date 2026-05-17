@@ -403,6 +403,37 @@ pub(super) async fn handle_key_normal(
             }
             true
         }
+        KeyCode::Char('I') if ui.page == Page::Settings && ui.service_name == "codex" => {
+            match codex_integration::switch_on_with_mode(
+                ui.proxy_port,
+                CodexPatchMode::ImagegenBridge,
+            ) {
+                Ok(()) => {
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => {
+                                "已启用 Imagegen bridge；重启已有 Codex app 后生效".to_string()
+                            }
+                            Language::En => {
+                                "Imagegen bridge enabled; restart existing Codex apps to apply it"
+                                    .to_string()
+                            }
+                        },
+                        Instant::now(),
+                    ));
+                }
+                Err(err) => {
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("启用 Imagegen bridge 失败：{err}"),
+                            Language::En => format!("enable Imagegen bridge failed: {err}"),
+                        },
+                        Instant::now(),
+                    ));
+                }
+            }
+            true
+        }
         KeyCode::Char('D') if ui.page == Page::Settings && ui.service_name == "codex" => {
             match codex_integration::switch_on_with_mode(ui.proxy_port, CodexPatchMode::Default) {
                 Ok(()) => {

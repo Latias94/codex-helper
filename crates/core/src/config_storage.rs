@@ -44,8 +44,11 @@ fn codex_client_patch_mode_from_toml_value(
         "chatgpt-bridge" | "chatgpt_bridge" => {
             Ok(crate::codex_integration::CodexPatchMode::ChatGptBridge)
         }
+        "imagegen-bridge" | "imagegen_bridge" => {
+            Ok(crate::codex_integration::CodexPatchMode::ImagegenBridge)
+        }
         other => anyhow::bail!(
-            "unsupported codex.client_patch.mode '{}'; expected 'default' or 'chatgpt-bridge'",
+            "unsupported codex.client_patch.mode '{}'; expected 'default', 'chatgpt-bridge', or 'imagegen-bridge'",
             other
         ),
     }
@@ -175,12 +178,18 @@ version = 5
 #
 # default：保持历史行为，只把 ~/.codex/config.toml 的 model_provider 指到本地代理。
 # chatgpt-bridge：保留 Codex/ChatGPT 登录态用于移动端/桌面端账号能力，同时模型请求进入 codex-helper。
+# imagegen-bridge：实验模式；写入最小 ChatGPT facade auth 以暴露 Codex hosted image_generation，
+#                 实际上游凭据仍来自 codex-helper routing / env key。
 # 启用 chatgpt-bridge 时，`switch on --mode chatgpt-bridge` 会把 ~/.codex/auth.json 的
 # auth_mode 改为 "chatgpt"，OPENAI_API_KEY 改为 null，其它字段不动。
+# 启用 imagegen-bridge 时，`switch on --mode imagegen-bridge` 会临时把 ~/.codex/auth.json
+# 改为最小 ChatGPT facade，并在 `switch off` 或切回 default 时安全恢复。
+# 该模式启用前会校验 Codex 至少有一个已启用上游，且当前进程能读到其上游凭据。
 #
 # [codex.client_patch]
 # mode = "default"
 # mode = "chatgpt-bridge"
+# mode = "imagegen-bridge"
 
 # --- TUI 用量预测（可选） ---
 #

@@ -876,6 +876,7 @@ fn do_switch_on(port: u16, mode: CodexPatchModeArg, codex: bool, claude: bool) -
     let mode = match mode {
         CodexPatchModeArg::Default => codex_integration::CodexPatchMode::Default,
         CodexPatchModeArg::ChatgptBridge => codex_integration::CodexPatchMode::ChatGptBridge,
+        CodexPatchModeArg::ImagegenBridge => codex_integration::CodexPatchMode::ImagegenBridge,
     };
     if claude {
         if !mode.is_default() {
@@ -893,10 +894,18 @@ fn do_switch_on(port: u16, mode: CodexPatchModeArg, codex: bool, claude: bool) -
         codex_integration::switch_on_with_mode(port, mode)
             .map_err(|e| CliError::CodexConfig(e.to_string()))?;
         println!("Codex client patch mode: {mode}");
-        if mode == codex_integration::CodexPatchMode::ChatGptBridge {
-            println!(
-                "Updated ~/.codex/config.toml and auth.json for ChatGPT bridge mode. Restart existing Codex apps to apply the client config change."
-            );
+        match mode {
+            codex_integration::CodexPatchMode::Default => {}
+            codex_integration::CodexPatchMode::ChatGptBridge => {
+                println!(
+                    "Updated ~/.codex/config.toml and auth.json for ChatGPT bridge mode. Restart existing Codex apps to apply the client config change."
+                );
+            }
+            codex_integration::CodexPatchMode::ImagegenBridge => {
+                println!(
+                    "Updated ~/.codex/config.toml and auth.json for imagegen bridge mode. Restart existing Codex apps to apply the client config change."
+                );
+            }
         }
     }
     Ok(())
@@ -1029,11 +1038,14 @@ fn print_codex_switch_status() {
         let supports_websockets = proxy.get("supports_websockets").and_then(|v| v.as_bool());
         println!("  codex_proxy.name: {}", name);
         println!("  codex_proxy.base_url: {}", base_url);
-        let patch_mode = if requires_openai_auth == Some(true) {
-            codex_integration::CodexPatchMode::ChatGptBridge
-        } else {
-            codex_integration::CodexPatchMode::Default
-        };
+        let patch_mode = codex_integration::codex_switch_status()
+            .ok()
+            .and_then(|status| status.patch_mode)
+            .unwrap_or(if requires_openai_auth == Some(true) {
+                codex_integration::CodexPatchMode::ChatGptBridge
+            } else {
+                codex_integration::CodexPatchMode::Default
+            });
         println!("  codex_proxy.patch_mode: {}", patch_mode);
         if let Some(value) = requires_openai_auth {
             println!("  codex_proxy.requires_openai_auth: {}", value);

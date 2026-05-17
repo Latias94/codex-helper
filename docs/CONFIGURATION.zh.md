@@ -55,16 +55,19 @@ mode = "chatgpt-bridge"
 
 ```bash
 codex-helper switch on --mode chatgpt-bridge
+codex-helper switch on --mode imagegen-bridge
 codex-helper switch on --mode default
 ```
 
-启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 模式。要显式切换，可使用 `switch on --mode ...` 或 TUI Settings 页的 `B`/`D`。
+启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 模式。要显式切换，可使用 `switch on --mode ...` 或 TUI Settings 页的 `B`/`I`/`D`。
 
 `chatgpt-bridge` 会写入 `~/.codex/config.toml` 的 `requires_openai_auth = true`、`supports_websockets = false`，并把 `~/.codex/auth.json` 中的 `auth_mode` 改为 `"chatgpt"`、`OPENAI_API_KEY` 改为 `null`，其它字段保持不变。启用前必须已经在官方 Codex 里完成 ChatGPT 登录；如果 `auth.json` 没有完整 token、email 和账号信息，codex-helper 会在写入 `config.toml` / `auth.json` 前拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。修改 Codex 客户端配置后，已经打开的 Codex app 通常需要重启后才会读取新配置。
 
-切回 `default` 只会把 `codex_proxy` provider 的 bridge 专用字段移除，不会自动恢复 `OPENAI_API_KEY` 的旧值；如果要回到 API Key 认证，需要重新配置 Codex auth。
+`imagegen-bridge` 是显式的实验 hack 模式。它会写入一个最小 ChatGPT facade 形式的 `~/.codex/auth.json`，让 Codex 暴露 hosted `image_generation` tool；真实上游凭据仍来自 codex-helper routing（`auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`）。它不要求官方 ChatGPT 登录。启用前，codex-helper 会校验 Codex 服务至少有一个已启用上游，并且当前进程实际能取得至少一个上游凭据；对于环境变量凭据，只在配置里写 env var 名称不够，运行 `switch on` 或启动 `serve` 时该环境变量必须有值。codex-helper 会把旧 `auth.json` 存入 switch state，并在切回 `default` 或执行 `switch off` 时恢复；但只有当前 `auth.json` 仍等于 helper 写入的 facade 时才恢复。如果用户或 Codex 期间改过 `auth.json`，codex-helper 会保持现状，不覆盖用户变更。
 
-安全约束：bridge 模式下，上游 provider 应配置自己的 `auth_token_env` / `auth_token`。如果上游未配置密钥，codex-helper 会移除来自 Codex 客户端的认证头，避免把 ChatGPT 登录 token 透传给第三方 relay。
+切回 `default` 会移除 `codex_proxy` provider 的 bridge 专用字段，并在安全时恢复 helper 管理过的 auth patch。
+
+安全约束：bridge 模式下，上游 provider 应配置自己的 `auth_token_env` / `auth_token` 或等价 API key。如果上游未配置密钥，codex-helper 会移除来自 Codex 客户端的认证头，避免把 ChatGPT/facade auth 透传给第三方 relay。
 
 ## 推荐开始方式
 

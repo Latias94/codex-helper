@@ -190,6 +190,8 @@ pub(crate) enum CodexPatchModeArg {
     Default,
     /// Keep ChatGPT account auth while routing model traffic through codex-helper
     ChatgptBridge,
+    /// Experimental image generation bridge using a minimal ChatGPT auth facade
+    ImagegenBridge,
 }
 
 #[derive(Subcommand, Debug)]

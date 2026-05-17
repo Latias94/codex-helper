@@ -109,7 +109,7 @@ fn inject_auth_headers(
     headers: &mut HeaderMap,
 ) {
     let allow_client_passthrough =
-        !(service_name == "codex" && codex_client_patch_mode == CodexPatchMode::ChatGptBridge);
+        !(service_name == "codex" && codex_client_patch_mode.strips_codex_client_auth());
 
     let client_has_auth = headers.contains_key("authorization");
     let (token, _token_src) = resolve_auth_token_with_source(
@@ -323,6 +323,40 @@ mod tests {
             setup.headers.get("authorization"),
             Some(&HeaderValue::from_static("Bearer relay-token"))
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_attempt_request_strips_client_auth_in_imagegen_bridge_without_upstream_secret()
+    {
+        let proxy = test_proxy_service();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer facade-token"),
+        );
+        client_headers.insert("x-api-key", HeaderValue::from_static("client-key"));
+
+        let cache = OnceLock::new();
+        let setup = prepare_attempt_request(AttemptRequestSetupParams {
+            proxy: &proxy,
+            auth: &UpstreamAuth::default(),
+            codex_client_patch_mode: CodexPatchMode::ImagegenBridge,
+            client_headers: &client_headers,
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 0,
+            warn_max: 0,
+            client_uri: "/v1/responses",
+            target_url: "https://third-party.example/v1/responses",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        });
+
+        assert!(!setup.headers.contains_key("authorization"));
+        assert!(!setup.headers.contains_key("x-api-key"));
     }
 
     #[tokio::test]
