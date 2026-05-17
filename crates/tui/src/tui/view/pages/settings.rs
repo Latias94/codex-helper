@@ -646,6 +646,56 @@ pub(super) fn render_settings_page(
         Span::styled(profile_list, Style::default().fg(p.text)),
     ]));
 
+    if ui.service_name == "codex" {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            match ui.language {
+                Language::Zh => "Codex 客户端 Patch",
+                Language::En => "Codex Client Patch",
+            },
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )]));
+        match crate::codex_integration::codex_switch_status() {
+            Ok(status) => {
+                lines.push(Line::from(vec![
+                    Span::styled("  mode: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        status
+                            .patch_mode
+                            .map(|mode| mode.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        Style::default().fg(p.text),
+                    ),
+                    Span::styled("  base_url: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        status.base_url.as_deref().unwrap_or("-").to_string(),
+                        Style::default().fg(p.text),
+                    ),
+                ]));
+                lines.push(Line::from(vec![Span::styled(
+                    match ui.language {
+                        Language::Zh => {
+                            "  B 启用 ChatGPT bridge；D 切回默认。修改 ~/.codex/config.toml 后已有 Codex app 需要重启。"
+                        }
+                        Language::En => {
+                            "  B enables ChatGPT bridge; D switches to default. Restart existing Codex apps after ~/.codex/config.toml changes."
+                        }
+                    },
+                    Style::default().fg(p.muted),
+                )]));
+            }
+            Err(err) => {
+                lines.push(Line::from(vec![Span::styled(
+                    match ui.language {
+                        Language::Zh => format!("  读取 Codex switch 状态失败：{err}"),
+                        Language::En => format!("  read Codex switch status failed: {err}"),
+                    },
+                    Style::default().fg(p.warn),
+                )]));
+            }
+        }
+    }
+
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         i18n::text(ui.language, msg::HEALTH_CHECK_TITLE),

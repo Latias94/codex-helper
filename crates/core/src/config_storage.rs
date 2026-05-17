@@ -1,6 +1,9 @@
 use super::bootstrap_impl::bootstrap_from_codex;
 use super::*;
 use crate::file_replace::write_bytes_file_async;
+use toml_edit::{
+    Document as EditableTomlDocument, Item as EditableTomlItem, Table as EditableTomlTable,
+};
 
 fn config_dir() -> PathBuf {
     proxy_home_dir()
@@ -20,6 +23,77 @@ fn config_toml_path() -> PathBuf {
 
 fn config_toml_backup_path() -> PathBuf {
     config_dir().join("config.toml.bak")
+}
+
+fn codex_client_patch_mode_from_toml_value(
+    value: &TomlValue,
+) -> Result<crate::codex_integration::CodexPatchMode> {
+    let Some(mode) = value
+        .get("codex")
+        .and_then(|codex| codex.get("client_patch"))
+        .and_then(|patch| patch.get("mode"))
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+    else {
+        return Ok(crate::codex_integration::CodexPatchMode::Default);
+    };
+
+    match mode {
+        "default" => Ok(crate::codex_integration::CodexPatchMode::Default),
+        "chatgpt-bridge" | "chatgpt_bridge" => {
+            Ok(crate::codex_integration::CodexPatchMode::ChatGptBridge)
+        }
+        other => anyhow::bail!(
+            "unsupported codex.client_patch.mode '{}'; expected 'default' or 'chatgpt-bridge'",
+            other
+        ),
+    }
+}
+
+pub fn codex_client_patch_mode_from_config_file() -> Result<crate::codex_integration::CodexPatchMode>
+{
+    let path = config_file_path();
+    if !path.exists() || path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+        return Ok(crate::codex_integration::CodexPatchMode::Default);
+    }
+
+    let text = stdfs::read_to_string(&path).with_context(|| format!("read {:?}", path))?;
+    let value: TomlValue = toml::from_str(&text).with_context(|| format!("parse {:?}", path))?;
+    codex_client_patch_mode_from_toml_value(&value)
+}
+
+fn existing_codex_client_patch_item() -> Option<EditableTomlItem> {
+    let path = config_toml_path();
+    let text = stdfs::read_to_string(path).ok()?;
+    let doc = text.parse::<EditableTomlDocument>().ok()?;
+    doc.as_table()
+        .get("codex")
+        .and_then(EditableTomlItem::as_table)
+        .and_then(|codex| codex.get("client_patch"))
+        .cloned()
+}
+
+fn preserve_existing_codex_client_patch(text: String) -> String {
+    let Some(client_patch) = existing_codex_client_patch_item() else {
+        return text;
+    };
+    let Ok(mut doc) = text.parse::<EditableTomlDocument>() else {
+        return text;
+    };
+
+    let root = doc.as_table_mut();
+    if !root.contains_key("codex") {
+        root.insert("codex", EditableTomlItem::Table(EditableTomlTable::new()));
+    }
+    let Some(codex) = root
+        .get_mut("codex")
+        .and_then(EditableTomlItem::as_table_mut)
+    else {
+        return text;
+    };
+    codex.insert("client_patch", client_patch);
+    doc.to_string()
 }
 
 fn config_backup_source_and_path() -> (PathBuf, PathBuf) {
@@ -97,6 +171,17 @@ version = 5
 # default_service = "codex"
 # default_service = "claude"
 
+# --- Codex 客户端 patch 模式（可选） ---
+#
+# default：保持历史行为，只把 ~/.codex/config.toml 的 model_provider 指到本地代理。
+# chatgpt-bridge：保留 Codex/ChatGPT 登录态用于移动端/桌面端账号能力，同时模型请求进入 codex-helper。
+# 启用 chatgpt-bridge 时，`switch on --mode chatgpt-bridge` 会把 ~/.codex/auth.json 的
+# auth_mode 改为 "chatgpt"，OPENAI_API_KEY 改为 null，其它字段不动。
+#
+# [codex.client_patch]
+# mode = "default"
+# mode = "chatgpt-bridge"
+
 # --- 自动导入（可选） ---
 #
 # 如果你的机器上已配置 Codex CLI（存在 `~/.codex/config.toml`），`codex-helper config init`
@@ -125,6 +210,15 @@ version = 5
 # base_url = "https://your-backup-provider.example/v1"
 # auth_token_env = "BACKUP_API_KEY"
 # tags = { vendor = "backup", region = "hk" }
+#
+# 如果 Codex 请求的模型名和中转站要求的模型名不同，可按 provider 配置 model_mapping。
+# 例如 Codex 仍请求 `gpt-5.5`，但 relay 要求 `openai/gpt-5.5`：
+#
+# [codex.providers.relay]
+# base_url = "https://relay.example/v1"
+# auth_token_env = "RELAY_API_KEY"
+# supported_models = { "gpt-5.5" = true }
+# model_mapping = { "gpt-5.5" = "openai/gpt-5.5", "gpt-*" = "openai/gpt-*" }
 #
 # [codex.routing]
 # entry = "main"
@@ -586,10 +680,10 @@ pub async fn save_config_v2(cfg: &ProxyConfigV2) -> Result<PathBuf> {
     let path = config_toml_path();
     let (backup_source_path, backup_path) = config_backup_source_and_path();
     let body = toml::to_string_pretty(&normalized)?;
-    let text = format!(
+    let text = preserve_existing_codex_client_patch(format!(
         "{CONFIG_TOML_DOC_HEADER}
 {body}"
-    );
+    ));
     let data = text.into_bytes();
 
     if backup_source_path.exists()
@@ -618,10 +712,10 @@ pub async fn save_config_v4(cfg: &ProxyConfigV4) -> Result<PathBuf> {
     let path = config_toml_path();
     let (backup_source_path, backup_path) = config_backup_source_and_path();
     let body = toml::to_string_pretty(&normalized)?;
-    let text = format!(
+    let text = preserve_existing_codex_client_patch(format!(
         "{CONFIG_TOML_DOC_HEADER}
 {body}"
-    );
+    ));
     let data = text.into_bytes();
 
     if backup_source_path.exists()

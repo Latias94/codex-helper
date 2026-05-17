@@ -1,6 +1,7 @@
 use super::config_doc::{
     ensure_v4_routing, ensure_v4_routing_order_contains, load_v4_config, ordered_v4_provider_names,
-    parse_cli_tags, print_v4_provider_list, select_v4_service_view, select_v4_service_view_mut,
+    parse_cli_string_map, parse_cli_tags, print_v4_provider_list, select_v4_service_view,
+    select_v4_service_view_mut,
 };
 use crate::cli_types::ProviderCommand;
 use crate::config::{
@@ -46,6 +47,8 @@ struct ProviderView {
     has_inline_auth_token: bool,
     has_inline_api_key: bool,
     tags: BTreeMap<String, String>,
+    supported_models: Vec<String>,
+    model_mapping: BTreeMap<String, String>,
     endpoints: Vec<ProviderEndpointView>,
 }
 
@@ -110,6 +113,8 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
             api_key_env,
             alias,
             tags,
+            supported_models,
+            model_mapping,
             disabled,
             replace,
             codex,
@@ -117,6 +122,10 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
         } => {
             let parsed_tags =
                 parse_cli_tags(&tags).map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let parsed_supported_models = parse_cli_supported_models(&supported_models)
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
+            let parsed_model_mapping = parse_cli_string_map(&model_mapping, "model-map")
+                .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
             let (mut cfg, service, label) = load_v4_config(codex, claude, "provider")
                 .await
                 .map_err(|e| CliError::ProxyConfig(e.to_string()))?;
@@ -141,6 +150,8 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
                             api_key_env,
                         },
                         tags: parsed_tags,
+                        supported_models: parsed_supported_models,
+                        model_mapping: parsed_model_mapping,
                         ..ProviderConfigV4::default()
                     },
                 );
@@ -266,6 +277,12 @@ fn build_provider_view(view: &ServiceViewV4, name: &str) -> Option<ProviderView>
         has_inline_api_key: provider.inline_auth.api_key.is_some()
             || provider.auth.api_key.is_some(),
         tags: provider.tags.clone(),
+        supported_models: provider
+            .supported_models
+            .iter()
+            .filter_map(|(model, supported)| supported.then(|| model.clone()))
+            .collect(),
+        model_mapping: provider.model_mapping.clone(),
         endpoints: provider_endpoints(provider),
     })
 }
@@ -340,6 +357,14 @@ fn print_provider_detail(label: &str, provider: &ProviderView) {
     );
     println!("Auth: {}", provider_auth_summary(provider));
     println!("Tags: {}", format_tags(&provider.tags));
+    println!(
+        "Supported models: {}",
+        format_models(&provider.supported_models)
+    );
+    println!(
+        "Model mapping: {}",
+        format_string_map(&provider.model_mapping)
+    );
     println!("Endpoints:");
     if provider.endpoints.is_empty() {
         println!("  <none>");
@@ -355,6 +380,20 @@ fn print_provider_detail(label: &str, provider: &ProviderView) {
             );
         }
     }
+}
+
+fn parse_cli_supported_models(raw_models: &[String]) -> anyhow::Result<BTreeMap<String, bool>> {
+    let mut models = BTreeMap::new();
+    for raw in raw_models {
+        let model = raw.trim();
+        if model.is_empty() {
+            anyhow::bail!("supported-model must not be empty");
+        }
+        if models.insert(model.to_string(), true).is_some() {
+            anyhow::bail!("duplicate supported-model '{}'", model);
+        }
+    }
+    Ok(models)
 }
 
 fn provider_auth_summary(provider: &ProviderView) -> String {
@@ -378,12 +417,43 @@ fn provider_auth_summary(provider: &ProviderView) -> String {
     }
 }
 
+fn format_models(models: &[String]) -> String {
+    if models.is_empty() {
+        "-".to_string()
+    } else {
+        models.join(",")
+    }
+}
+
 fn format_tags(tags: &BTreeMap<String, String>) -> String {
     if tags.is_empty() {
         return "-".to_string();
     }
-    tags.iter()
+    format_string_map(tags)
+}
+
+fn format_string_map(map: &BTreeMap<String, String>) -> String {
+    if map.is_empty() {
+        return "-".to_string();
+    }
+    map.iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cli_supported_models_rejects_empty_and_duplicate_entries() {
+        let models = parse_cli_supported_models(&["gpt-5".to_string(), "gpt-5.5".to_string()])
+            .expect("valid supported models");
+        assert_eq!(models.get("gpt-5").copied(), Some(true));
+        assert_eq!(models.get("gpt-5.5").copied(), Some(true));
+
+        assert!(parse_cli_supported_models(&[" ".to_string()]).is_err());
+        assert!(parse_cli_supported_models(&["gpt-5".to_string(), "gpt-5".to_string()]).is_err());
+    }
 }

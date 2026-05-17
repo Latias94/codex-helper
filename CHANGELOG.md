@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
+- 新增 Codex `chatgpt-bridge` 客户端 patch 模式：可保留 Codex/ChatGPT 账号登录态用于桌面端和移动端能力，同时把模型请求交给 codex-helper 路由到第三方中转；bridge 模式会写入 `requires_openai_auth = true`、`supports_websockets = false`，并只把 `auth.json` 的 `auth_mode` 改为 `chatgpt`、`OPENAI_API_KEY` 改为 `null`。
+- bridge 模式下如果上游没有配置 codex-helper 自己的 `auth_token_env` / `auth_token` / `api_key`，会移除来自 Codex 客户端的认证头，避免把 ChatGPT 登录 token 透传到第三方 relay。
+- `provider add` 支持 `--supported-model` 和 `--model-map FROM=TO`，`provider show --json` 也会带出 `supported_models` 和 `model_mapping`；用于 Codex 请求模型名和 relay 实际模型名不一致的场景，例如 `gpt-5.5` -> `openai/gpt-5.5`。
 - TUI 的 `Stats` 导航位升级为 `Usage`，页面集中展示 provider 用量、成本、余额/配额状态、刷新摘要、路由影响和 endpoint 最近样本。
 - TUI `Usage` 页面新增关注项筛选：按 `a` 只看余额异常、刷新失败、用量异常或状态需要处理的 provider。
 - TUI `Usage` 页面 provider 详情支持 `PgUp` / `PgDn` 滚动 endpoint 列表，provider 很多或 endpoint 很多时更容易查看余额和最近请求。
@@ -31,6 +34,9 @@ All notable changes to this project will be documented in this file.
 
 ### English Summary
 
+- Added Codex `chatgpt-bridge` client patch mode, keeping Codex/ChatGPT account auth for desktop/mobile features while routing model traffic through codex-helper to third-party relays.
+- In bridge mode, codex-helper strips Codex client auth headers unless the selected upstream has its own helper-side secret, preventing ChatGPT login tokens from being forwarded to third-party relays.
+- `provider add` now accepts `--supported-model` and `--model-map FROM=TO`, and `provider show --json` exposes `supported_models` / `model_mapping`, covering relay model aliases such as `gpt-5.5` -> `openai/gpt-5.5`.
 - The TUI `Stats` slot is now `Usage`, focused on provider usage, cost, balance/quota state, refresh status, route impact, and endpoint recent samples.
 - Press `a` on the TUI `Usage` page to filter providers that need attention, including balance issues, refresh failures, usage errors, and actionable states.
 - Provider details on the TUI `Usage` page now support `PgUp` / `PgDn` endpoint scrolling, making large provider and endpoint sets easier to inspect.

@@ -211,6 +211,7 @@ pub(super) async fn execute_selected_upstream(
             method,
             uri,
             client_headers,
+            codex_client_patch_mode: request_flavor.codex_client_patch_mode,
             client_headers_entries_cache,
             request_body_len,
             upstream_request_body_len,

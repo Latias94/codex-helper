@@ -1,10 +1,12 @@
-use crate::cli_types::{Cli, CliError, CliResult, Command, NotifyCommand, SwitchCommand};
+use crate::cli_types::{
+    Cli, CliError, CliResult, CodexPatchModeArg, Command, NotifyCommand, SwitchCommand,
+};
 use crate::codex_integration;
 use crate::commands;
 use crate::config::{
-    ServiceKind, claude_settings_backup_path, claude_settings_path, codex_config_path,
-    codex_switch_state_path, load_config, load_or_bootstrap_for_service_with_v4_source,
-    model_routing_warnings,
+    ServiceKind, claude_settings_backup_path, claude_settings_path,
+    codex_client_patch_mode_from_config_file, codex_config_path, codex_switch_state_path,
+    load_config, load_or_bootstrap_for_service_with_v4_source, model_routing_warnings,
 };
 use crate::notify;
 use crate::proxy::{
@@ -45,9 +47,10 @@ pub async fn run_cli() -> CliResult<()> {
             match cmd {
                 SwitchCommand::On {
                     port,
+                    mode,
                     codex,
                     claude,
-                } => do_switch_on(port, codex, claude)?,
+                } => do_switch_on(port, mode, codex, claude)?,
                 SwitchCommand::Off { codex, claude } => do_switch_off(codex, claude)?,
                 SwitchCommand::Status { codex, claude } => do_switch_status(codex, claude),
             }
@@ -276,9 +279,33 @@ async fn run_server(
         if let Err(err) = codex_integration::guard_codex_config_before_switch_on_interactive() {
             tracing::warn!("Failed to guard Codex config before switch on: {}", err);
         }
-        match codex_integration::switch_on(port) {
+        let configured_patch_mode = || match codex_client_patch_mode_from_config_file() {
+            Ok(mode) => mode,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to read codex.client_patch.mode from codex-helper config, falling back to default: {}",
+                    err
+                );
+                codex_integration::CodexPatchMode::Default
+            }
+        };
+        let patch_mode = match codex_integration::codex_switch_status() {
+            Ok(status) => status.patch_mode.unwrap_or_else(configured_patch_mode),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to read Codex patch mode from ~/.codex/config.toml, falling back to default: {}",
+                    err
+                );
+                configured_patch_mode()
+            }
+        };
+        match codex_integration::switch_on_with_mode(port, patch_mode) {
             Ok(()) => {
-                tracing::info!("Codex config switched to local proxy on port {}", port);
+                tracing::info!(
+                    "Codex config switched to local proxy on port {} (patch_mode={})",
+                    port,
+                    patch_mode
+                );
             }
             Err(err) => {
                 tracing::warn!("Failed to switch Codex config to local proxy: {}", err);
@@ -840,13 +867,22 @@ fn parse_unix_lsof_owners(output: &str) -> Vec<PortOwner> {
     owners
 }
 
-fn do_switch_on(port: u16, codex: bool, claude: bool) -> CliResult<()> {
+fn do_switch_on(port: u16, mode: CodexPatchModeArg, codex: bool, claude: bool) -> CliResult<()> {
     if codex && claude {
         return Err(CliError::Other(
             "Please specify at most one of --codex / --claude".to_string(),
         ));
     }
+    let mode = match mode {
+        CodexPatchModeArg::Default => codex_integration::CodexPatchMode::Default,
+        CodexPatchModeArg::ChatgptBridge => codex_integration::CodexPatchMode::ChatGptBridge,
+    };
     if claude {
+        if !mode.is_default() {
+            return Err(CliError::Other(
+                "--mode is only supported for Codex switch on".to_string(),
+            ));
+        }
         if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
             tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
         }
@@ -854,7 +890,14 @@ fn do_switch_on(port: u16, codex: bool, claude: bool) -> CliResult<()> {
             .map_err(|e| CliError::CodexConfig(e.to_string()))?;
     } else {
         codex_integration::guard_codex_config_before_switch_on_interactive()?;
-        codex_integration::switch_on(port).map_err(|e| CliError::CodexConfig(e.to_string()))?;
+        codex_integration::switch_on_with_mode(port, mode)
+            .map_err(|e| CliError::CodexConfig(e.to_string()))?;
+        println!("Codex client patch mode: {mode}");
+        if mode == codex_integration::CodexPatchMode::ChatGptBridge {
+            println!(
+                "Updated ~/.codex/config.toml and auth.json for ChatGPT bridge mode. Restart existing Codex apps to apply the client config change."
+            );
+        }
     }
     Ok(())
 }
@@ -982,8 +1025,22 @@ fn print_codex_switch_status() {
     {
         let base_url = proxy.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
         let name = proxy.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let requires_openai_auth = proxy.get("requires_openai_auth").and_then(|v| v.as_bool());
+        let supports_websockets = proxy.get("supports_websockets").and_then(|v| v.as_bool());
         println!("  codex_proxy.name: {}", name);
         println!("  codex_proxy.base_url: {}", base_url);
+        let patch_mode = if requires_openai_auth == Some(true) {
+            codex_integration::CodexPatchMode::ChatGptBridge
+        } else {
+            codex_integration::CodexPatchMode::Default
+        };
+        println!("  codex_proxy.patch_mode: {}", patch_mode);
+        if let Some(value) = requires_openai_auth {
+            println!("  codex_proxy.requires_openai_auth: {}", value);
+        }
+        if let Some(value) = supports_websockets {
+            println!("  codex_proxy.supports_websockets: {}", value);
+        }
 
         let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
         if is_local {

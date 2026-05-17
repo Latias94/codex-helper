@@ -40,6 +40,32 @@ Codex-owned files remain owned by Codex:
 
 `switch on/off` and one-command startup only patch the local Codex proxy section. They do not overwrite unrelated Codex config changes.
 
+## Codex Client Patch Mode
+
+Default mode only points `~/.codex/config.toml` `model_provider` at the local `codex_proxy`. To keep ChatGPT account auth and mobile/desktop account features while routing model requests through codex-helper, enable ChatGPT bridge:
+
+```toml
+version = 5
+
+[codex.client_patch]
+mode = "chatgpt-bridge"
+```
+
+You can also switch it temporarily from the CLI:
+
+```bash
+codex-helper switch on --mode chatgpt-bridge
+codex-helper switch on --mode default
+```
+
+On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client patch mode is preserved; use `switch on --mode ...` or the TUI Settings `B`/`D` keys to change it explicitly.
+
+`chatgpt-bridge` writes `requires_openai_auth = true` and `supports_websockets = false` into `~/.codex/config.toml`, and changes only two `~/.codex/auth.json` fields: `auth_mode` becomes `"chatgpt"` and `OPENAI_API_KEY` becomes `null`. Existing Codex apps usually need a restart before they read the changed client config.
+
+Switching back to `default` only removes the bridge-only fields from `codex_proxy`; it does not restore the previous `OPENAI_API_KEY` value. To return to API-key auth, reconfigure Codex auth separately.
+
+Safety rule: in bridge mode, upstream providers should configure their own `auth_token_env` / `auth_token`. If an upstream has no helper-side secret, codex-helper strips Codex client auth headers to avoid forwarding ChatGPT login tokens to third-party relays.
+
 ## Recommended Start
 
 Use CLI commands when possible:
@@ -502,6 +528,36 @@ Common provider fields:
 | `enabled` | Whether the provider is routeable | Prefer `provider disable/enable` for temporary changes |
 | `supported_models` | Optional model allowlist | Advanced |
 | `model_mapping` | Optional model alias map | Advanced |
+
+Use `model_mapping` when the model requested by Codex differs from the model name expected by a specific relay. The mapping is provider-scoped: codex-helper rewrites the request body `model` only after that provider is selected, so other providers are not affected.
+
+```toml
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "RELAY_API_KEY"
+supported_models = { "gpt-5.5" = true }
+model_mapping = { "gpt-5.5" = "openai/gpt-5.5" }
+```
+
+A single `*` wildcard is supported, which is useful when a relay wants a provider prefix for a whole model family:
+
+```toml
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "RELAY_API_KEY"
+supported_models = { "gpt-*" = true }
+model_mapping = { "gpt-*" = "openai/gpt-*" }
+```
+
+The provider CLI can write the same fields:
+
+```bash
+codex-helper provider add relay \
+  --base-url https://relay.example/v1 \
+  --auth-token-env RELAY_API_KEY \
+  --supported-model gpt-5.5 \
+  --model-map gpt-5.5=openai/gpt-5.5
+```
 
 Example with an inline secret:
 

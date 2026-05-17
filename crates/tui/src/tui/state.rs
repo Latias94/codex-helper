@@ -61,6 +61,7 @@ pub(in crate::tui) struct CodexHistoryExternalFocus {
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
+    pub(in crate::tui) proxy_port: u16,
     pub(in crate::tui) language: Language,
     pub(in crate::tui) refresh_ms: u64,
     pub(in crate::tui) config_version: Option<u32>,
@@ -163,6 +164,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             service_name: "codex",
+            proxy_port: 3211,
             language: Language::En,
             refresh_ms: 500,
             config_version: None,

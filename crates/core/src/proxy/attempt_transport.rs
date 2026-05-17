@@ -7,6 +7,7 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use futures_util::StreamExt;
 
+use crate::codex_integration::CodexPatchMode;
 use crate::lb::LoadBalancer;
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog};
 use crate::state::RouteDecisionProvenance;
@@ -127,6 +128,7 @@ pub(super) struct AttemptTransportParams<'a> {
     pub(super) method: &'a Method,
     pub(super) uri: &'a Uri,
     pub(super) client_headers: &'a HeaderMap,
+    pub(super) codex_client_patch_mode: CodexPatchMode,
     pub(super) client_headers_entries_cache: &'a OnceLock<Vec<HeaderEntry>>,
     pub(super) request_body_len: usize,
     pub(super) upstream_request_body_len: usize,
@@ -182,6 +184,7 @@ pub(super) async fn handle_attempt_transport(
         method,
         uri,
         client_headers,
+        codex_client_patch_mode,
         client_headers_entries_cache,
         request_body_len,
         upstream_request_body_len,
@@ -248,6 +251,7 @@ pub(super) async fn handle_attempt_transport(
     let attempt_request = prepare_attempt_request(AttemptRequestSetupParams {
         proxy,
         auth: &target.upstream().auth,
+        codex_client_patch_mode,
         client_headers,
         client_headers_entries_cache,
         request_body_len,

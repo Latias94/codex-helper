@@ -121,6 +121,14 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                 pick(ctx.lang, "当前 base_url", "Current base_url"),
                 status.base_url.as_deref().unwrap_or("-")
             ));
+            ui.label(format!(
+                "{}: {}",
+                pick(ctx.lang, "当前 patch mode", "Current patch mode"),
+                status
+                    .patch_mode
+                    .map(|mode| mode.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            ));
             render_switch_enabled_state(
                 ui,
                 ctx.lang,
@@ -131,21 +139,60 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
             );
 
             ui.horizontal(|ui| {
-                let enable_label = match ctx.lang {
-                    Language::Zh => format!("启用（端口 {port}）"),
-                    Language::En => format!("Enable (port {port})"),
+                let enable_default_label = match ctx.lang {
+                    Language::Zh => format!("默认启用（端口 {port}）"),
+                    Language::En => format!("Enable default (port {port})"),
                 };
                 if ui
-                    .add_enabled(!status.enabled, egui::Button::new(enable_label))
+                    .add_enabled(
+                        !status.enabled
+                            || status.patch_mode
+                                != Some(crate::codex_integration::CodexPatchMode::Default),
+                        egui::Button::new(enable_default_label),
+                    )
                     .clicked()
                 {
-                    match crate::codex_integration::switch_on(port) {
+                    match crate::codex_integration::switch_on_with_mode(
+                        port,
+                        crate::codex_integration::CodexPatchMode::Default,
+                    ) {
                         Ok(()) => {
                             *ctx.last_info = Some(
                                 pick(
                                     ctx.lang,
-                                    "已更新 ~/.codex/config.toml 指向本地代理",
-                                    "Updated ~/.codex/config.toml to local proxy",
+                                    "已用默认模式更新 ~/.codex/config.toml；已有 Codex app 需要重启后生效",
+                                    "Updated ~/.codex/config.toml in default mode; restart existing Codex apps to apply it",
+                                )
+                                .to_string(),
+                            );
+                        }
+                        Err(e) => *ctx.last_error = Some(format!("switch on failed: {e}")),
+                    }
+                }
+
+                let enable_bridge_label = match ctx.lang {
+                    Language::Zh => format!("ChatGPT Bridge（端口 {port}）"),
+                    Language::En => format!("ChatGPT bridge (port {port})"),
+                };
+                if ui
+                    .add_enabled(
+                        !status.enabled
+                            || status.patch_mode
+                                != Some(crate::codex_integration::CodexPatchMode::ChatGptBridge),
+                        egui::Button::new(enable_bridge_label),
+                    )
+                    .clicked()
+                {
+                    match crate::codex_integration::switch_on_with_mode(
+                        port,
+                        crate::codex_integration::CodexPatchMode::ChatGptBridge,
+                    ) {
+                        Ok(()) => {
+                            *ctx.last_info = Some(
+                                pick(
+                                    ctx.lang,
+                                    "已更新 ~/.codex/config.toml 与 auth.json；已有 Codex app 需要重启后生效",
+                                    "Updated ~/.codex/config.toml and auth.json; restart existing Codex apps to apply it",
                                 )
                                 .to_string(),
                             );

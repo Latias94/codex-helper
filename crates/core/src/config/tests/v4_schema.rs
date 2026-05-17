@@ -962,6 +962,62 @@ fn save_config_v4_writes_v4_route_graph_schema() {
 }
 
 #[test]
+fn codex_client_patch_mode_survives_save_config_v4() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        write_file(
+            &toml_path,
+            r#"
+version = 5
+
+[codex.client_patch]
+mode = "chatgpt-bridge"
+"#,
+        );
+
+        assert_eq!(
+            super::codex_client_patch_mode_from_config_file().expect("read client patch mode"),
+            crate::codex_integration::CodexPatchMode::ChatGptBridge
+        );
+
+        let cfg = ProxyConfigV4 {
+            version: 4,
+            codex: ServiceViewV4 {
+                providers: BTreeMap::from([(
+                    "main".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some("https://api.example.com/v1".to_string()),
+                        inline_auth: UpstreamAuth {
+                            auth_token_env: Some("MAIN_API_KEY".to_string()),
+                            ..UpstreamAuth::default()
+                        },
+                        ..ProviderConfigV4::default()
+                    },
+                )]),
+                routing: Some(RoutingConfigV4::manual_sticky(
+                    "main".to_string(),
+                    vec!["main".to_string()],
+                )),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+
+        let path = super::save_config_v4(&cfg).await.expect("save v4");
+        let saved = std::fs::read_to_string(path).expect("read saved v4 config");
+        assert!(saved.contains("[codex.client_patch]"));
+        assert!(saved.contains("mode = \"chatgpt-bridge\""));
+    });
+}
+
+#[test]
 fn load_config_auto_compacts_legacy_v3_import_metadata_to_v4() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()

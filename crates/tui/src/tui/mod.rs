@@ -203,6 +203,7 @@ pub async fn run_dashboard(
 
     let mut ui = UiState {
         service_name,
+        proxy_port: port,
         language,
         refresh_ms: timing.refresh_ms,
         config_version: cfg.version,

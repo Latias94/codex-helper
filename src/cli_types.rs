@@ -154,6 +154,9 @@ pub(crate) enum SwitchCommand {
         /// Listen port for local proxy; defaults to 3211
         #[arg(long, default_value_t = 3211)]
         port: u16,
+        /// Codex client patch mode; default preserves historical behavior
+        #[arg(long, value_enum, default_value_t = CodexPatchModeArg::Default)]
+        mode: CodexPatchModeArg,
         /// Target Codex config (default if neither flag is set)
         #[arg(long)]
         codex: bool,
@@ -179,6 +182,14 @@ pub(crate) enum SwitchCommand {
         #[arg(long)]
         claude: bool,
     },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexPatchModeArg {
+    /// Historical codex-helper patch behavior
+    Default,
+    /// Keep ChatGPT account auth while routing model traffic through codex-helper
+    ChatgptBridge,
 }
 
 #[derive(Subcommand, Debug)]
@@ -425,6 +436,12 @@ pub enum ProviderCommand {
         /// Provider tag in KEY=VALUE form; can be passed multiple times
         #[arg(long = "tag", value_name = "KEY=VALUE")]
         tags: Vec<String>,
+        /// Model that this provider can accept before mapping; can be passed multiple times
+        #[arg(long = "supported-model", value_name = "MODEL")]
+        supported_models: Vec<String>,
+        /// Rewrite requested model names for this provider, in FROM=TO form; supports one '*' wildcard
+        #[arg(long = "model-map", value_name = "FROM=TO")]
+        model_mapping: Vec<String>,
         /// Exclude this provider from automatic routing
         #[arg(long)]
         disabled: bool,

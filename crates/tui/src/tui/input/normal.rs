@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::codex_integration::{self, CodexPatchMode};
 use crate::config::{
     bootstrap::overwrite_codex_config_from_codex_cli_in_place,
     proxy_home_dir,
@@ -370,6 +371,64 @@ pub(super) async fn handle_key_normal(
                     true
                 }
             }
+        }
+        KeyCode::Char('B') if ui.page == Page::Settings && ui.service_name == "codex" => {
+            match codex_integration::switch_on_with_mode(
+                ui.proxy_port,
+                CodexPatchMode::ChatGptBridge,
+            ) {
+                Ok(()) => {
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => {
+                                "已启用 ChatGPT bridge；重启已有 Codex app 后生效".to_string()
+                            }
+                            Language::En => {
+                                "ChatGPT bridge enabled; restart existing Codex apps to apply it"
+                                    .to_string()
+                            }
+                        },
+                        Instant::now(),
+                    ));
+                }
+                Err(err) => {
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("启用 ChatGPT bridge 失败：{err}"),
+                            Language::En => format!("enable ChatGPT bridge failed: {err}"),
+                        },
+                        Instant::now(),
+                    ));
+                }
+            }
+            true
+        }
+        KeyCode::Char('D') if ui.page == Page::Settings && ui.service_name == "codex" => {
+            match codex_integration::switch_on_with_mode(ui.proxy_port, CodexPatchMode::Default) {
+                Ok(()) => {
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => "已切回默认客户端 patch；重启已有 Codex app 后生效"
+                                .to_string(),
+                            Language::En => {
+                                "Default client patch enabled; restart existing Codex apps to apply it"
+                                    .to_string()
+                            }
+                        },
+                        Instant::now(),
+                    ));
+                }
+                Err(err) => {
+                    ui.toast = Some((
+                        match ui.language {
+                            Language::Zh => format!("切回默认 patch 失败：{err}"),
+                            Language::En => format!("enable default patch failed: {err}"),
+                        },
+                        Instant::now(),
+                    ));
+                }
+            }
+            true
         }
         KeyCode::Char('R') if ui.page == Page::Settings => {
             let now = Instant::now();

@@ -247,6 +247,30 @@ pub(super) fn parse_cli_tags(raw_tags: &[String]) -> anyhow::Result<BTreeMap<Str
     Ok(tags)
 }
 
+pub(super) fn parse_cli_string_map(
+    raw_entries: &[String],
+    label: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    for raw in raw_entries {
+        let Some((key, value)) = raw.split_once('=') else {
+            anyhow::bail!("{} '{}' must use KEY=VALUE form", label, raw);
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            anyhow::bail!("{} '{}' has an empty key", label, raw);
+        }
+        if value.is_empty() {
+            anyhow::bail!("{} '{}' has an empty value", label, raw);
+        }
+        if map.insert(key.to_string(), value.to_string()).is_some() {
+            anyhow::bail!("duplicate {} key '{}'", label, key);
+        }
+    }
+    Ok(map)
+}
+
 pub(super) fn routing_policy_label(policy: RoutingPolicyV4) -> &'static str {
     match policy {
         RoutingPolicyV4::ManualSticky => "manual-sticky",
@@ -260,6 +284,35 @@ pub(super) fn routing_exhausted_label(action: RoutingExhaustedActionV4) -> &'sta
     match action {
         RoutingExhaustedActionV4::Continue => "continue",
         RoutingExhaustedActionV4::Stop => "stop",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cli_string_map_rejects_invalid_entries() {
+        let map = parse_cli_string_map(
+            &[
+                "gpt-5.5=openai/gpt-5.5".to_string(),
+                "gpt-* = openai/gpt-*".to_string(),
+            ],
+            "model-map",
+        )
+        .expect("valid map");
+        assert_eq!(
+            map.get("gpt-5.5").map(String::as_str),
+            Some("openai/gpt-5.5")
+        );
+        assert_eq!(map.get("gpt-*").map(String::as_str), Some("openai/gpt-*"));
+
+        assert!(parse_cli_string_map(&["missing-separator".to_string()], "model-map").is_err());
+        assert!(parse_cli_string_map(&["=target".to_string()], "model-map").is_err());
+        assert!(parse_cli_string_map(&["source=".to_string()], "model-map").is_err());
+        assert!(
+            parse_cli_string_map(&["a=b".to_string(), "a=c".to_string()], "model-map").is_err()
+        );
     }
 }
 

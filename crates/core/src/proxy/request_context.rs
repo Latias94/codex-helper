@@ -86,8 +86,21 @@ pub(super) async fn prepare_proxy_request(
     } else {
         None
     };
-    let request_flavor =
-        detect_request_flavor(proxy.service_name, &method, &client_headers, uri.path());
+    let codex_client_patch_mode = if proxy.service_name == "codex" {
+        crate::codex_integration::codex_switch_status()
+            .ok()
+            .and_then(|status| status.patch_mode)
+            .unwrap_or(crate::codex_integration::CodexPatchMode::Default)
+    } else {
+        crate::codex_integration::CodexPatchMode::Default
+    };
+    let request_flavor = detect_request_flavor(
+        proxy.service_name,
+        &method,
+        &client_headers,
+        uri.path(),
+        codex_client_patch_mode,
+    );
     let cwd = resolve_and_touch_session_state(proxy, session_id.as_deref(), started_at_ms).await;
     let session_override_config = if !route_graph_config && let Some(id) = session_id.as_deref() {
         proxy.state.get_session_station_override(id).await

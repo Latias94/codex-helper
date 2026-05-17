@@ -40,6 +40,32 @@ Codex 自己的文件仍由 Codex 维护：
 
 `switch on/off` 和一键启动只会 patch Codex 配置中的本地代理片段。它们不会覆盖无关的 Codex 配置改动。
 
+## Codex 客户端 Patch 模式
+
+默认模式只把 `~/.codex/config.toml` 的 `model_provider` 指到本地 `codex_proxy`。如果要保留 ChatGPT 登录态和移动端/桌面端账号能力，同时让模型请求进入 codex-helper，可启用 ChatGPT bridge：
+
+```toml
+version = 5
+
+[codex.client_patch]
+mode = "chatgpt-bridge"
+```
+
+也可以临时用 CLI 切换：
+
+```bash
+codex-helper switch on --mode chatgpt-bridge
+codex-helper switch on --mode default
+```
+
+启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 模式。要显式切换，可使用 `switch on --mode ...` 或 TUI Settings 页的 `B`/`D`。
+
+`chatgpt-bridge` 会写入 `~/.codex/config.toml` 的 `requires_openai_auth = true`、`supports_websockets = false`，并把 `~/.codex/auth.json` 中的 `auth_mode` 改为 `"chatgpt"`、`OPENAI_API_KEY` 改为 `null`，其它字段保持不变。修改 Codex 客户端配置后，已经打开的 Codex app 通常需要重启后才会读取新配置。
+
+切回 `default` 只会把 `codex_proxy` provider 的 bridge 专用字段移除，不会自动恢复 `OPENAI_API_KEY` 的旧值；如果要回到 API Key 认证，需要重新配置 Codex auth。
+
+安全约束：bridge 模式下，上游 provider 应配置自己的 `auth_token_env` / `auth_token`。如果上游未配置密钥，codex-helper 会移除来自 Codex 客户端的认证头，避免把 ChatGPT 登录 token 透传给第三方 relay。
+
 ## 推荐开始方式
 
 尽量使用 CLI 命令：
@@ -500,6 +526,36 @@ tags = { billing = "monthly" }
 | `enabled` | provider 是否可路由 | 临时变更优先用 `provider disable/enable` |
 | `supported_models` | 可选 model allowlist | 高级 |
 | `model_mapping` | 可选 model alias map | 高级 |
+
+`model_mapping` 用于“Codex 请求的模型名”和“某个 relay 实际要求的模型名”不一致的场景。它是 provider 级别配置，路由选中该 provider 后才会改写请求体里的 `model` 字段；没有选中该 provider 时不会影响其它 provider。
+
+```toml
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "RELAY_API_KEY"
+supported_models = { "gpt-5.5" = true }
+model_mapping = { "gpt-5.5" = "openai/gpt-5.5" }
+```
+
+也支持一个 `*` 通配符，适合一整类模型都要加 provider 前缀：
+
+```toml
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "RELAY_API_KEY"
+supported_models = { "gpt-*" = true }
+model_mapping = { "gpt-*" = "openai/gpt-*" }
+```
+
+CLI 添加 provider 时也可以直接写：
+
+```bash
+codex-helper provider add relay \
+  --base-url https://relay.example/v1 \
+  --auth-token-env RELAY_API_KEY \
+  --supported-model gpt-5.5 \
+  --model-map gpt-5.5=openai/gpt-5.5
+```
 
 内联 secret 示例：
 

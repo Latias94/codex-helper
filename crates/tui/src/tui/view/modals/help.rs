@@ -103,6 +103,7 @@ pub(super) fn current_page_help_lines(
             "  p/P        管理配置默认 profile / 运行时默认 profile",
             "  R          重载运行时配置",
             "  O          从 ~/.codex 覆盖导入站点，需要二次确认",
+            "  B/D        启用 ChatGPT bridge / 切回默认客户端 patch",
         ],
         (Language::Zh, Page::Settings, _, false) => vec![
             "  p/P        管理配置默认 profile / 运行时默认 profile",
@@ -171,6 +172,7 @@ pub(super) fn current_page_help_lines(
             "  p/P        manage configured default profile / runtime default profile",
             "  R          reload runtime config",
             "  O          overwrite-import stations from ~/.codex, with confirmation",
+            "  B/D        enable ChatGPT bridge / switch to default client patch",
         ],
         (Language::En, Page::Settings, _, false) => vec![
             "  p/P        manage configured default profile / runtime default profile",

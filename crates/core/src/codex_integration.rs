@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::client_config::{
     CLAUDE_ABSENT_BACKUP_SENTINEL, claude_settings_backup_path_for as claude_settings_backup_path,
-    claude_settings_path, codex_config_path, codex_switch_state_path,
+    claude_settings_path, codex_auth_path, codex_config_path, codex_switch_state_path,
 };
 use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
@@ -161,6 +161,36 @@ pub fn codex_switch_state_exists() -> bool {
     codex_switch_state_path().exists()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexPatchMode {
+    /// Keep the historical codex-helper patch behavior.
+    #[default]
+    Default,
+    /// Keep Codex/ChatGPT account auth for app/mobile features while model traffic goes through
+    /// codex-helper.
+    ChatGptBridge,
+}
+
+impl CodexPatchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ChatGptBridge => "chatgpt-bridge",
+        }
+    }
+
+    pub fn is_default(self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
+impl std::fmt::Display for CodexPatchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 enum CodexSwitchOffEdit {
     Write(String),
     RemoveFile,
@@ -284,7 +314,7 @@ pub fn codex_config_text_for_import() -> Result<Option<String>> {
     codex_config_text_with_switch_state(&current_text, &state).map(Some)
 }
 
-fn switch_on_codex_toml(text: &str, port: u16) -> Result<String> {
+fn switch_on_codex_toml_with_mode(text: &str, port: u16, mode: CodexPatchMode) -> Result<String> {
     let mut doc = if text.trim().is_empty() {
         EditableTomlDocument::new()
     } else {
@@ -320,9 +350,47 @@ fn switch_on_codex_toml(text: &str, port: u16) -> Result<String> {
     if !proxy_table.contains_key("request_max_retries") {
         proxy_table.insert("request_max_retries", editable_toml_value(0));
     }
+    match mode {
+        CodexPatchMode::Default => {
+            proxy_table.remove("requires_openai_auth");
+            proxy_table.remove("supports_websockets");
+        }
+        CodexPatchMode::ChatGptBridge => {
+            proxy_table.insert("requires_openai_auth", editable_toml_value(true));
+            proxy_table.insert("supports_websockets", editable_toml_value(false));
+        }
+    }
 
     set_toml_string(root, "model_provider", "codex_proxy");
     Ok(doc.to_string())
+}
+
+fn chatgpt_bridge_auth_json_text(text: &str) -> Result<String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(text).context("parse Codex auth.json as JSON")?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Codex auth.json root must be a JSON object"))?;
+    obj.insert(
+        "auth_mode".to_string(),
+        serde_json::Value::String("chatgpt".to_string()),
+    );
+    obj.insert("OPENAI_API_KEY".to_string(), serde_json::Value::Null);
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+pub fn patch_codex_auth_for_chatgpt_bridge() -> Result<()> {
+    let auth_path = codex_auth_path();
+    if !auth_path.exists() {
+        return Err(anyhow!(
+            "Codex auth.json not found at {:?}; run `codex login` first, then enable chatgpt-bridge mode.",
+            auth_path
+        ));
+    }
+    let text = read_config_text(&auth_path)?;
+    let new_text = chatgpt_bridge_auth_json_text(&text)?;
+    atomic_write(&auth_path, &new_text)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +401,12 @@ pub struct CodexSwitchStatus {
     pub model_provider: Option<String>,
     /// Current `model_providers.codex_proxy.base_url` (if any).
     pub base_url: Option<String>,
+    /// Current codex-helper Codex patch mode inferred from `model_providers.codex_proxy`.
+    pub patch_mode: Option<CodexPatchMode>,
+    /// Current `model_providers.codex_proxy.requires_openai_auth` value (if any).
+    pub requires_openai_auth: Option<bool>,
+    /// Current `model_providers.codex_proxy.supports_websockets` value (if any).
+    pub supports_websockets: Option<bool>,
     /// Whether original switch metadata exists for disabling the local proxy patch.
     pub has_switch_state: bool,
 }
@@ -346,6 +420,9 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             enabled: false,
             model_provider: None,
             base_url: None,
+            patch_mode: None,
+            requires_openai_auth: None,
+            supports_websockets: None,
             has_switch_state: state_path.exists(),
         });
     }
@@ -356,6 +433,9 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             enabled: false,
             model_provider: None,
             base_url: None,
+            patch_mode: None,
+            requires_openai_auth: None,
+            supports_websockets: None,
             has_switch_state: state_path.exists(),
         });
     }
@@ -367,6 +447,9 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
                 enabled: false,
                 model_provider: None,
                 base_url: None,
+                patch_mode: None,
+                requires_openai_auth: None,
+                supports_websockets: None,
                 has_switch_state: state_path.exists(),
             });
         }
@@ -378,6 +461,9 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
                 enabled: false,
                 model_provider: None,
                 base_url: None,
+                patch_mode: None,
+                requires_openai_auth: None,
+                supports_websockets: None,
                 has_switch_state: state_path.exists(),
             });
         }
@@ -393,6 +479,9 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
             enabled: false,
             model_provider,
             base_url: None,
+            patch_mode: None,
+            requires_openai_auth: None,
+            supports_websockets: None,
             has_switch_state: state_path.exists(),
         });
     }
@@ -416,22 +505,41 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    let requires_openai_auth = proxy_table
+        .get("requires_openai_auth")
+        .and_then(|v| v.as_bool());
+    let supports_websockets = proxy_table
+        .get("supports_websockets")
+        .and_then(|v| v.as_bool());
 
     let is_local = base_url
         .as_deref()
         .is_some_and(|u| u.contains("127.0.0.1") || u.contains("localhost"));
     let is_helper_name = name == "codex-helper";
+    let enabled = is_local || is_helper_name;
 
     Ok(CodexSwitchStatus {
-        enabled: is_local || is_helper_name,
+        enabled,
         model_provider,
         base_url,
+        patch_mode: enabled.then_some(if requires_openai_auth == Some(true) {
+            CodexPatchMode::ChatGptBridge
+        } else {
+            CodexPatchMode::Default
+        }),
+        requires_openai_auth,
+        supports_websockets,
         has_switch_state: state_path.exists(),
     })
 }
 
 /// Switch Codex to use the local codex-helper model provider.
 pub fn switch_on(port: u16) -> Result<()> {
+    switch_on_with_mode(port, CodexPatchMode::Default)
+}
+
+/// Switch Codex to use the local codex-helper model provider with an explicit client patch mode.
+pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
     let cfg_path = codex_config_path();
     let state_path = codex_switch_state_path();
     let text = read_config_text(&cfg_path)?;
@@ -441,10 +549,26 @@ pub fn switch_on(port: u16) -> Result<()> {
             state_path
         ));
     }
+    let auth_patch = if mode == CodexPatchMode::ChatGptBridge {
+        let auth_path = codex_auth_path();
+        if !auth_path.exists() {
+            return Err(anyhow!(
+                "Codex auth.json not found at {:?}; run `codex login` first, then enable chatgpt-bridge mode.",
+                auth_path
+            ));
+        }
+        let auth_text = read_config_text(&auth_path)?;
+        Some((auth_path, chatgpt_bridge_auth_json_text(&auth_text)?))
+    } else {
+        None
+    };
     let state = CodexSwitchState::from_codex_config_text(&text, !cfg_path.exists())?;
+    let new_text = switch_on_codex_toml_with_mode(&text, port, mode)?;
     write_codex_switch_state_if_absent(&state)?;
-    let new_text = switch_on_codex_toml(&text, port)?;
     atomic_write(&cfg_path, &new_text)?;
+    if let Some((auth_path, auth_text)) = auth_patch {
+        atomic_write(&auth_path, &auth_text)?;
+    }
     Ok(())
 }
 
@@ -878,12 +1002,132 @@ base_url = "http://127.0.0.1:1111"
 request_max_retries = 5
 "#;
 
-        let updated = switch_on_codex_toml(text, 3333)
+        let updated = switch_on_codex_toml_with_mode(text, 3333, CodexPatchMode::Default)
             .expect("switch_on should update the local proxy provider in place");
 
         assert!(updated.contains("request_max_retries = 5"));
         assert!(updated.contains("base_url = \"http://127.0.0.1:3333\""));
         assert!(updated.contains("name = \"codex-helper\""));
+    }
+
+    #[test]
+    fn codex_switch_on_chatgpt_bridge_sets_openai_auth_flags() {
+        let updated = switch_on_codex_toml_with_mode("", 3333, CodexPatchMode::ChatGptBridge)
+            .expect("switch_on should write chatgpt bridge fields");
+
+        assert!(updated.contains("model_provider = \"codex_proxy\""));
+        assert!(updated.contains("base_url = \"http://127.0.0.1:3333\""));
+        assert!(updated.contains("requires_openai_auth = true"));
+        assert!(updated.contains("supports_websockets = false"));
+    }
+
+    #[test]
+    fn codex_switch_on_default_removes_bridge_only_flags() {
+        let text = r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "http://127.0.0.1:1111"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+"#;
+
+        let updated = switch_on_codex_toml_with_mode(text, 3333, CodexPatchMode::Default)
+            .expect("switch_on should switch local proxy back to default mode");
+
+        assert!(updated.contains("base_url = \"http://127.0.0.1:3333\""));
+        assert!(!updated.contains("requires_openai_auth"));
+        assert!(!updated.contains("supports_websockets"));
+    }
+
+    #[test]
+    fn chatgpt_bridge_auth_patch_preserves_other_auth_json_fields() {
+        let input = r#"{
+  "auth_mode": "apikey",
+  "OPENAI_API_KEY": "sk-original",
+  "tokens": {
+    "access_token": "chatgpt-token"
+  },
+  "last_refresh": 123
+}"#;
+
+        let updated = chatgpt_bridge_auth_json_text(input)
+            .expect("auth json patch should preserve unrelated fields");
+        let value: serde_json::Value = serde_json::from_str(&updated).expect("valid json");
+        let object = value.as_object().expect("root object");
+
+        assert_eq!(
+            object.get("auth_mode").and_then(|value| value.as_str()),
+            Some("chatgpt")
+        );
+        assert!(
+            object
+                .get("OPENAI_API_KEY")
+                .is_some_and(|value| value.is_null())
+        );
+        assert_eq!(
+            object
+                .get("tokens")
+                .and_then(|value| value.get("access_token"))
+                .and_then(|value| value.as_str()),
+            Some("chatgpt-token")
+        );
+        assert_eq!(
+            object.get("last_refresh").and_then(|value| value.as_i64()),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn codex_switch_on_chatgpt_bridge_patches_auth_json() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(
+            &auth_path,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-old","account_id":"acct_1"}"#,
+        );
+
+        switch_on_with_mode(3211, CodexPatchMode::ChatGptBridge)
+            .expect("switch_on bridge should patch config and auth");
+
+        let updated_cfg = read_file(&cfg_path);
+        assert!(updated_cfg.contains("requires_openai_auth = true"));
+        assert!(updated_cfg.contains("supports_websockets = false"));
+
+        let updated_auth: serde_json::Value =
+            serde_json::from_str(&read_file(&auth_path)).expect("valid auth json");
+        assert_eq!(
+            updated_auth
+                .get("auth_mode")
+                .and_then(|value| value.as_str()),
+            Some("chatgpt")
+        );
+        assert!(
+            updated_auth
+                .get("OPENAI_API_KEY")
+                .is_some_and(|value| value.is_null())
+        );
+        assert_eq!(
+            updated_auth
+                .get("account_id")
+                .and_then(|value| value.as_str()),
+            Some("acct_1")
+        );
     }
 
     #[test]

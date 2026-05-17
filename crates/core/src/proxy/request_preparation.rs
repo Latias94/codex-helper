@@ -1,6 +1,7 @@
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method};
 
+use crate::codex_integration::CodexPatchMode;
 use crate::logging::{BodyPreview, ServiceTierLog, make_body_preview};
 
 use super::request_body::{
@@ -15,6 +16,7 @@ pub(super) struct RequestFlavor {
     pub is_stream: bool,
     pub is_user_turn: bool,
     pub is_codex_service: bool,
+    pub codex_client_patch_mode: CodexPatchMode,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,7 @@ pub(super) fn detect_request_flavor(
     method: &Method,
     headers: &HeaderMap,
     path: &str,
+    codex_client_patch_mode: CodexPatchMode,
 ) -> RequestFlavor {
     let client_content_type = headers
         .get("content-type")
@@ -57,6 +60,7 @@ pub(super) fn detect_request_flavor(
         is_stream,
         is_user_turn,
         is_codex_service: service_name == "codex",
+        codex_client_patch_mode,
     }
 }
 
@@ -154,7 +158,13 @@ mod tests {
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
-        let flavor = detect_request_flavor("codex", &Method::POST, &headers, "/v1/responses");
+        let flavor = detect_request_flavor(
+            "codex",
+            &Method::POST,
+            &headers,
+            "/v1/responses",
+            CodexPatchMode::Default,
+        );
 
         assert_eq!(
             flavor.client_content_type.as_deref(),
