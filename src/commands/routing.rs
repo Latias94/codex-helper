@@ -701,6 +701,7 @@ mod tests {
             tags: BTreeMap::new(),
             supported_models: BTreeMap::new(),
             model_mapping: BTreeMap::new(),
+            limits: Default::default(),
         }
     }
 
