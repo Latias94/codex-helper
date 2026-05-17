@@ -92,7 +92,7 @@ codex-helper switch status
 codex-helper switch off
 ```
 
-`--mode chatgpt-bridge` 用于“ChatGPT Auth 保留、模型层走 codex-helper”的场景，会 patch `~/.codex/config.toml` 的 `requires_openai_auth = true` / `supports_websockets = false`，并只把 `~/.codex/auth.json` 的 `auth_mode` 改为 `chatgpt`、`OPENAI_API_KEY` 改为 `null`。已有 Codex app 通常需要重启后才会应用这些客户端配置变更。
+`--mode chatgpt-bridge` 用于“ChatGPT Auth 保留、模型层走 codex-helper”的场景，会 patch `~/.codex/config.toml` 的 `requires_openai_auth = true` / `supports_websockets = false`，并只把 `~/.codex/auth.json` 的 `auth_mode` 改为 `chatgpt`、`OPENAI_API_KEY` 改为 `null`。启用前必须先在官方 Codex 中完成 ChatGPT 登录；如果 `auth.json` 没有完整登录 token、email 和账号信息，codex-helper 会拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。已有 Codex app 通常需要重启后才会应用这些客户端配置变更。
 
 如果中转站要求带 provider 前缀的模型名，可以用 provider 级 `model_mapping` 改写请求体里的 `model`：
 

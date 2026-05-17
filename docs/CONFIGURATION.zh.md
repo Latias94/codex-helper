@@ -60,7 +60,7 @@ codex-helper switch on --mode default
 
 启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 模式。要显式切换，可使用 `switch on --mode ...` 或 TUI Settings 页的 `B`/`D`。
 
-`chatgpt-bridge` 会写入 `~/.codex/config.toml` 的 `requires_openai_auth = true`、`supports_websockets = false`，并把 `~/.codex/auth.json` 中的 `auth_mode` 改为 `"chatgpt"`、`OPENAI_API_KEY` 改为 `null`，其它字段保持不变。修改 Codex 客户端配置后，已经打开的 Codex app 通常需要重启后才会读取新配置。
+`chatgpt-bridge` 会写入 `~/.codex/config.toml` 的 `requires_openai_auth = true`、`supports_websockets = false`，并把 `~/.codex/auth.json` 中的 `auth_mode` 改为 `"chatgpt"`、`OPENAI_API_KEY` 改为 `null`，其它字段保持不变。启用前必须已经在官方 Codex 里完成 ChatGPT 登录；如果 `auth.json` 没有完整 token、email 和账号信息，codex-helper 会在写入 `config.toml` / `auth.json` 前拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。修改 Codex 客户端配置后，已经打开的 Codex app 通常需要重启后才会读取新配置。
 
 切回 `default` 只会把 `codex_proxy` provider 的 bridge 专用字段移除，不会自动恢复 `OPENAI_API_KEY` 的旧值；如果要回到 API Key 认证，需要重新配置 Codex auth。
 

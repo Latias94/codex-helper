@@ -60,7 +60,7 @@ codex-helper switch on --mode default
 
 On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client patch mode is preserved; use `switch on --mode ...` or the TUI Settings `B`/`D` keys to change it explicitly.
 
-`chatgpt-bridge` writes `requires_openai_auth = true` and `supports_websockets = false` into `~/.codex/config.toml`, and changes only two `~/.codex/auth.json` fields: `auth_mode` becomes `"chatgpt"` and `OPENAI_API_KEY` becomes `null`. Existing Codex apps usually need a restart before they read the changed client config.
+`chatgpt-bridge` writes `requires_openai_auth = true` and `supports_websockets = false` into `~/.codex/config.toml`, and changes only two `~/.codex/auth.json` fields: `auth_mode` becomes `"chatgpt"` and `OPENAI_API_KEY` becomes `null`. It requires an existing official Codex ChatGPT login state; if `auth.json` has no complete token/email/account metadata, codex-helper refuses the patch before writing `config.toml` or `auth.json`. Existing Codex apps usually need a restart before they read the changed client config.
 
 Switching back to `default` only removes the bridge-only fields from `codex_proxy`; it does not restore the previous `OPENAI_API_KEY` value. To return to API-key auth, reconfigure Codex auth separately.
 

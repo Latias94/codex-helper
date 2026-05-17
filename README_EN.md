@@ -80,7 +80,7 @@ codex-helper switch status
 codex-helper switch off
 ```
 
-For Codex app/mobile bridge setups, use `codex-helper switch on --mode chatgpt-bridge`. It keeps ChatGPT account auth for the client layer while routing model traffic through codex-helper. If a relay expects provider-prefixed model names, add provider-scoped model mapping:
+For Codex app/mobile bridge setups, use `codex-helper switch on --mode chatgpt-bridge`. It keeps ChatGPT account auth for the client layer while routing model traffic through codex-helper. Sign in with ChatGPT in official Codex first; if `auth.json` lacks the full login tokens, email, and account metadata, codex-helper refuses the patch to avoid Codex TUI bootstrap failures such as `email and plan type are required for chatgpt authentication`. If a relay expects provider-prefixed model names, add provider-scoped model mapping:
 
 ```bash
 codex-helper provider add relay --base-url https://relay.example/v1 --auth-token-env RELAY_API_KEY --supported-model gpt-5.5 --model-map gpt-5.5=openai/gpt-5.5

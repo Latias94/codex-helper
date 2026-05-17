@@ -365,9 +365,116 @@ fn switch_on_codex_toml_with_mode(text: &str, port: u16, mode: CodexPatchMode) -
     Ok(doc.to_string())
 }
 
+fn json_string_at_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str().filter(|text| !text.trim().is_empty())
+}
+
+fn decode_jwt_payload(jwt: &str) -> Result<serde_json::Value> {
+    use base64::Engine as _;
+
+    let mut parts = jwt.split('.');
+    let (_header, payload, _signature) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(header), Some(payload), Some(signature))
+            if !header.is_empty() && !payload.is_empty() && !signature.is_empty() =>
+        {
+            (header, payload, signature)
+        }
+        _ => return Err(anyhow!("invalid JWT format")),
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .context("decode JWT payload")?;
+    serde_json::from_slice(&bytes).context("parse JWT payload JSON")
+}
+
+fn chatgpt_bridge_auth_requirements_missing(
+    value: &serde_json::Value,
+) -> Result<Vec<&'static str>> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow!("Codex auth.json root must be a JSON object"))?;
+    let tokens = obj.get("tokens").and_then(serde_json::Value::as_object);
+    let mut missing = Vec::new();
+
+    let id_token = match tokens.and_then(|tokens| tokens.get("id_token")) {
+        Some(value) => value.as_str().filter(|text| !text.trim().is_empty()),
+        None => None,
+    };
+    let id_token_payload = match id_token {
+        Some(id_token) => Some(decode_jwt_payload(id_token).context("decode tokens.id_token")?),
+        None => {
+            missing.push("tokens.id_token");
+            None
+        }
+    };
+
+    if tokens
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|text| text.trim().is_empty())
+    {
+        missing.push("tokens.access_token");
+    }
+    if tokens
+        .and_then(|tokens| tokens.get("refresh_token"))
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|text| text.trim().is_empty())
+    {
+        missing.push("tokens.refresh_token");
+    }
+    if obj
+        .get("last_refresh")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        missing.push("last_refresh");
+    }
+
+    if let Some(payload) = id_token_payload.as_ref() {
+        let has_email = json_string_at_path(payload, &["email"])
+            .or_else(|| json_string_at_path(payload, &["https://api.openai.com/profile", "email"]))
+            .is_some();
+        if !has_email {
+            missing.push("tokens.id_token.email");
+        }
+
+        let has_account_id = tokens
+            .and_then(|tokens| tokens.get("account_id"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+            || json_string_at_path(
+                payload,
+                &["https://api.openai.com/auth", "chatgpt_account_id"],
+            )
+            .is_some();
+        if !has_account_id {
+            missing.push("tokens.account_id or tokens.id_token.chatgpt_account_id");
+        }
+    }
+
+    Ok(missing)
+}
+
+fn ensure_chatgpt_bridge_auth_ready(value: &serde_json::Value) -> Result<()> {
+    let missing = chatgpt_bridge_auth_requirements_missing(value)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "Codex auth.json does not contain a complete ChatGPT login state required for chatgpt-bridge (missing: {}). Open Codex and sign in with ChatGPT first, then run `codex-helper switch on --mode chatgpt-bridge` again.",
+        missing.join(", ")
+    ))
+}
+
 fn chatgpt_bridge_auth_json_text(text: &str) -> Result<String> {
     let mut value: serde_json::Value =
         serde_json::from_str(text).context("parse Codex auth.json as JSON")?;
+    ensure_chatgpt_bridge_auth_ready(&value)?;
     let obj = value
         .as_object_mut()
         .ok_or_else(|| anyhow!("Codex auth.json root must be a JSON object"))?;
@@ -876,6 +983,8 @@ pub fn claude_switch_off() -> Result<()> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use serde_json::json;
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
@@ -958,6 +1067,71 @@ mod tests {
 
     fn read_file(path: &Path) -> String {
         std::fs::read_to_string(path).expect("read test file")
+    }
+
+    fn fake_chatgpt_jwt(email: &str, account_id: &str, plan_type: &str) -> String {
+        let header = json!({
+            "alg": "none",
+            "typ": "JWT",
+        });
+        let payload = json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_plan_type": plan_type,
+            },
+        });
+        let encode = |value: serde_json::Value| {
+            let bytes = serde_json::to_vec(&value).expect("serialize JWT part");
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        format!("{}.{}.sig", encode(header), encode(payload))
+    }
+
+    fn chatgpt_auth_json(email: &str, account_id: &str, plan_type: &str) -> String {
+        let id_token = fake_chatgpt_jwt(email, account_id, plan_type);
+        serde_json::to_string_pretty(&json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": "sk-platform-onboarding",
+            "tokens": {
+                "id_token": id_token,
+                "access_token": "chatgpt-access-token",
+                "refresh_token": "chatgpt-refresh-token",
+                "account_id": account_id,
+            },
+            "last_refresh": "2026-05-17T00:00:00Z",
+        }))
+        .expect("serialize chatgpt auth fixture")
+    }
+
+    fn chatgpt_auth_json_without_plan(email: &str, account_id: &str) -> String {
+        let header = json!({
+            "alg": "none",
+            "typ": "JWT",
+        });
+        let payload = json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+            },
+        });
+        let encode = |value: serde_json::Value| {
+            let bytes = serde_json::to_vec(&value).expect("serialize JWT part");
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        let id_token = format!("{}.{}.sig", encode(header), encode(payload));
+        serde_json::to_string_pretty(&json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": "chatgpt-access-token",
+                "refresh_token": "chatgpt-refresh-token",
+                "account_id": account_id,
+            },
+            "last_refresh": "2026-05-17T00:00:00Z",
+        }))
+        .expect("serialize chatgpt auth fixture")
     }
 
     #[test]
@@ -1044,16 +1218,13 @@ supports_websockets = false
 
     #[test]
     fn chatgpt_bridge_auth_patch_preserves_other_auth_json_fields() {
-        let input = r#"{
-  "auth_mode": "apikey",
-  "OPENAI_API_KEY": "sk-original",
-  "tokens": {
-    "access_token": "chatgpt-token"
-  },
-  "last_refresh": 123
-}"#;
+        let mut input: serde_json::Value =
+            serde_json::from_str(&chatgpt_auth_json("user@example.com", "account-1", "plus"))
+                .expect("valid fixture");
+        input["last_refresh"] = json!(123);
+        input["unrelated"] = json!("keep");
 
-        let updated = chatgpt_bridge_auth_json_text(input)
+        let updated = chatgpt_bridge_auth_json_text(&serde_json::to_string_pretty(&input).unwrap())
             .expect("auth json patch should preserve unrelated fields");
         let value: serde_json::Value = serde_json::from_str(&updated).expect("valid json");
         let object = value.as_object().expect("root object");
@@ -1072,11 +1243,66 @@ supports_websockets = false
                 .get("tokens")
                 .and_then(|value| value.get("access_token"))
                 .and_then(|value| value.as_str()),
-            Some("chatgpt-token")
+            Some("chatgpt-access-token")
+        );
+        assert_eq!(
+            object
+                .get("tokens")
+                .and_then(|value| value.get("account_id"))
+                .and_then(|value| value.as_str()),
+            Some("account-1")
         );
         assert_eq!(
             object.get("last_refresh").and_then(|value| value.as_i64()),
             Some(123)
+        );
+        assert_eq!(
+            object.get("unrelated").and_then(|value| value.as_str()),
+            Some("keep")
+        );
+    }
+
+    #[test]
+    fn chatgpt_bridge_auth_patch_rejects_incomplete_login_state() {
+        let err = chatgpt_bridge_auth_json_text(r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null}"#)
+            .expect_err("empty ChatGPT auth state should be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("complete ChatGPT login state"));
+        assert!(message.contains("tokens.id_token"));
+        assert!(message.contains("tokens.access_token"));
+        assert!(message.contains("last_refresh"));
+    }
+
+    #[test]
+    fn chatgpt_bridge_auth_patch_rejects_api_key_only_auth() {
+        let err = chatgpt_bridge_auth_json_text(
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-old","account_id":"acct_1"}"#,
+        )
+        .expect_err("API key auth should not be converted into fake ChatGPT auth");
+
+        assert!(
+            err.to_string()
+                .contains("Open Codex and sign in with ChatGPT first")
+        );
+    }
+
+    #[test]
+    fn chatgpt_bridge_auth_patch_accepts_chatgpt_auth_without_plan_claim() {
+        let input = chatgpt_auth_json_without_plan("user@example.com", "acct_1");
+
+        let updated = chatgpt_bridge_auth_json_text(&input)
+            .expect("Codex maps missing ChatGPT plan claims to unknown");
+        let value: serde_json::Value = serde_json::from_str(&updated).expect("valid json");
+
+        assert_eq!(
+            value.get("auth_mode").and_then(|value| value.as_str()),
+            Some("chatgpt")
+        );
+        assert!(
+            value
+                .get("OPENAI_API_KEY")
+                .is_some_and(|value| value.is_null())
         );
     }
 
@@ -1099,7 +1325,7 @@ base_url = "https://api.openai.com/v1"
         );
         write_file(
             &auth_path,
-            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-old","account_id":"acct_1"}"#,
+            &chatgpt_auth_json("user@example.com", "acct_1", "plus"),
         );
 
         switch_on_with_mode(3211, CodexPatchMode::ChatGptBridge)
@@ -1124,9 +1350,41 @@ base_url = "https://api.openai.com/v1"
         );
         assert_eq!(
             updated_auth
-                .get("account_id")
+                .get("tokens")
+                .and_then(|value| value.get("account_id"))
                 .and_then(|value| value.as_str()),
             Some("acct_1")
+        );
+    }
+
+    #[test]
+    fn codex_switch_on_chatgpt_bridge_refuses_incomplete_auth_without_writing_config() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let state_path = env.codex_home.join("codex-helper-switch-state.json");
+        let original_config = r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+        .trim_start();
+        let original_auth = r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null}"#;
+
+        write_file(&cfg_path, original_config);
+        write_file(&auth_path, original_auth);
+
+        let err = switch_on_with_mode(3211, CodexPatchMode::ChatGptBridge)
+            .expect_err("incomplete ChatGPT auth should be rejected before writing config");
+
+        assert!(err.to_string().contains("complete ChatGPT login state"));
+        assert_eq!(read_file(&cfg_path), original_config);
+        assert_eq!(read_file(&auth_path), original_auth);
+        assert!(
+            !state_path.exists(),
+            "failed bridge switch must not create switch state"
         );
     }
 
