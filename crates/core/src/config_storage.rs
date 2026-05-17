@@ -182,6 +182,18 @@ version = 5
 # mode = "default"
 # mode = "chatgpt-bridge"
 
+# --- TUI 用量预测（可选） ---
+#
+# TUI Stats 页会按最近窗口的已计价请求估算 USD/h，并外推到下次配额刷新时间。
+# 如果你的中转站余额每天本地 0 点刷新，保留下面默认即可；如果按其它时区结算，改 reset_utc_offset。
+#
+# [ui.usage_forecast]
+# enabled = true
+# rate_window_minutes = 60
+# min_priced_requests = 1
+# reset_time = "00:00"
+# reset_utc_offset = "+08:00"
+
 # --- 自动导入（可选） ---
 #
 # 如果你的机器上已配置 Codex CLI（存在 `~/.codex/config.toml`），`codex-helper config init`

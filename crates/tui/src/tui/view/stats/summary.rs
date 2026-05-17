@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use ratatui::prelude::{Line, Span, Style};
 use unicode_width::UnicodeWidthStr;
 
-use crate::dashboard_core::WindowStats;
 use crate::pricing::CostConfidence;
 use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot, UsageBucket};
 use crate::tui::Language;
@@ -17,6 +16,9 @@ use crate::usage::UsageMetrics;
 use crate::usage_balance::{
     UsageBalanceEndpointRow, UsageBalanceProviderRow, UsageBalanceStatus, UsageBalanceStatusCounts,
     UsageBalanceView,
+};
+use crate::usage_forecast::{
+    UsageForecastConfidence, UsageSpendForecast, build_usage_spend_forecast,
 };
 
 pub(super) const STATS_BALANCE_COLUMN_WIDTH: u16 = 14;
@@ -373,26 +375,133 @@ pub(super) fn stats_coverage_line(
     ])
 }
 
-pub(super) fn live_health_line(stats: &WindowStats, lang: Language) -> String {
-    if stats.total == 0 {
+pub(super) fn usage_spend_forecast(
+    snapshot: &Snapshot,
+    config: &crate::config::UsageForecastConfig,
+    now_ms: u64,
+) -> UsageSpendForecast {
+    let balances = snapshot
+        .provider_balances
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    build_usage_spend_forecast(config, &snapshot.recent, &balances, now_ms)
+}
+
+pub(super) fn spend_forecast_rate_line(forecast: &UsageSpendForecast, lang: Language) -> String {
+    if !forecast.enabled {
+        return match lang {
+            Language::Zh => "预测已关闭".to_string(),
+            Language::En => "forecast disabled".to_string(),
+        };
+    }
+    if forecast.rate_per_hour_usd.is_none() {
+        return forecast.reason.clone().unwrap_or_else(|| match lang {
+            Language::Zh => "暂无可计价样本".to_string(),
+            Language::En => "no priced sample".to_string(),
+        });
+    }
+
+    let rate = fmt_usd_compact(forecast.rate_per_hour_usd.as_deref());
+    let projected = fmt_usd_compact(forecast.projected_until_reset_usd.as_deref());
+    let reset = forecast
+        .reset_in_ms
+        .map(duration_short)
+        .unwrap_or_else(|| "-".to_string());
+    match lang {
+        Language::Zh => format!("速率 {rate}/h  到0点 {projected} ({reset})"),
+        Language::En => format!("rate {rate}/h  to reset {projected} ({reset})"),
+    }
+}
+
+pub(super) fn spend_forecast_balance_line(forecast: &UsageSpendForecast, lang: Language) -> String {
+    if forecast.rate_per_hour_usd.is_none() {
         return "-".to_string();
     }
-    format!(
-        "{} {} p95 {} retry {} 429 {} 5xx {} n={}",
-        i18n::label(lang, "ok"),
-        fmt_pct(stats.ok_2xx as u64, stats.total as u64),
-        stats
-            .p95_ms
-            .map(duration_short)
-            .unwrap_or_else(|| "-".to_string()),
-        stats
-            .retry_rate
-            .map(|rate| format!("{:.0}%", rate * 100.0))
-            .unwrap_or_else(|| "-".to_string()),
-        stats.err_429,
-        stats.err_5xx,
-        stats.total
-    )
+    let sample = match lang {
+        Language::Zh => "样本",
+        Language::En => "sample",
+    };
+    let confidence = spend_forecast_confidence_label(forecast.confidence, lang);
+    let sample_prefix = format!("{sample} {} req {confidence}", forecast.priced_requests);
+
+    match (
+        forecast.primary_balance_remaining_usd.as_deref(),
+        forecast.projected_balance_after_reset_usd.as_deref(),
+    ) {
+        (Some(left), Some(after)) if forecast.projected_exhaustion => match lang {
+            Language::Zh => format!(
+                "{sample_prefix}  可能耗尽: {} -> {}",
+                fmt_usd_compact(Some(left)),
+                fmt_usd_compact(Some(after))
+            ),
+            Language::En => format!(
+                "{sample_prefix}  may exhaust: {} -> {}",
+                fmt_usd_compact(Some(left)),
+                fmt_usd_compact(Some(after))
+            ),
+        },
+        (Some(left), Some(after)) => match lang {
+            Language::Zh => format!(
+                "{sample_prefix}  余额 {} -> {}",
+                fmt_usd_compact(Some(left)),
+                fmt_usd_compact(Some(after))
+            ),
+            Language::En => format!(
+                "{sample_prefix}  left {} -> {}",
+                fmt_usd_compact(Some(left)),
+                fmt_usd_compact(Some(after))
+            ),
+        },
+        _ => sample_prefix,
+    }
+}
+
+fn fmt_usd_compact(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "-".to_string();
+    };
+    let Ok(parsed) = value.trim().parse::<f64>() else {
+        return format!("${value}");
+    };
+    if parsed == 0.0 {
+        "$0".to_string()
+    } else if parsed.abs() < 0.01 {
+        format!("${parsed:.4}")
+    } else if parsed.abs() < 100.0 {
+        format!("${parsed:.2}")
+    } else {
+        format!("${parsed:.0}")
+    }
+}
+
+fn spend_forecast_confidence_label(
+    confidence: UsageForecastConfidence,
+    lang: Language,
+) -> &'static str {
+    match confidence {
+        UsageForecastConfidence::Disabled => match lang {
+            Language::Zh => "关闭",
+            Language::En => "disabled",
+        },
+        UsageForecastConfidence::NoData => match lang {
+            Language::Zh => "无数据",
+            Language::En => "no-data",
+        },
+        UsageForecastConfidence::LowSample => match lang {
+            Language::Zh => "样本少",
+            Language::En => "low-sample",
+        },
+        UsageForecastConfidence::PartialPricing => match lang {
+            Language::Zh => "部分计价",
+            Language::En => "partial",
+        },
+        UsageForecastConfidence::Estimated => match lang {
+            Language::Zh => "估算",
+            Language::En => "estimated",
+        },
+    }
 }
 
 pub(super) fn balance_status_rank(status: BalanceSnapshotStatus) -> u8 {

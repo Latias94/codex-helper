@@ -410,6 +410,96 @@ pub struct NotifyConfig {
     pub exec: NotifyExecConfig,
 }
 
+fn default_usage_forecast_enabled() -> bool {
+    true
+}
+
+fn default_usage_forecast_rate_window_minutes() -> u64 {
+    60
+}
+
+fn default_usage_forecast_min_priced_requests() -> u64 {
+    1
+}
+
+fn default_usage_forecast_reset_time() -> String {
+    "00:00".to_string()
+}
+
+fn default_usage_forecast_reset_utc_offset() -> String {
+    "+08:00".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageForecastConfig {
+    /// Whether spend forecast rendering is enabled.
+    #[serde(
+        default = "default_usage_forecast_enabled",
+        skip_serializing_if = "is_default_usage_forecast_enabled"
+    )]
+    pub enabled: bool,
+    /// Rolling spend-rate window used for projection.
+    #[serde(
+        default = "default_usage_forecast_rate_window_minutes",
+        skip_serializing_if = "is_default_usage_forecast_rate_window_minutes"
+    )]
+    pub rate_window_minutes: u64,
+    /// Minimum priced requests before the forecast is treated as confident enough to show.
+    #[serde(
+        default = "default_usage_forecast_min_priced_requests",
+        skip_serializing_if = "is_default_usage_forecast_min_priced_requests"
+    )]
+    pub min_priced_requests: u64,
+    /// Daily quota reset clock time in the reset timezone, formatted as HH:MM.
+    #[serde(
+        default = "default_usage_forecast_reset_time",
+        skip_serializing_if = "is_default_usage_forecast_reset_time"
+    )]
+    pub reset_time: String,
+    /// Reset timezone as a fixed UTC offset, for example +08:00.
+    #[serde(
+        default = "default_usage_forecast_reset_utc_offset",
+        skip_serializing_if = "is_default_usage_forecast_reset_utc_offset"
+    )]
+    pub reset_utc_offset: String,
+}
+
+impl Default for UsageForecastConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_usage_forecast_enabled(),
+            rate_window_minutes: default_usage_forecast_rate_window_minutes(),
+            min_priced_requests: default_usage_forecast_min_priced_requests(),
+            reset_time: default_usage_forecast_reset_time(),
+            reset_utc_offset: default_usage_forecast_reset_utc_offset(),
+        }
+    }
+}
+
+fn is_default_usage_forecast_enabled(value: &bool) -> bool {
+    *value == default_usage_forecast_enabled()
+}
+
+fn is_default_usage_forecast_rate_window_minutes(value: &u64) -> bool {
+    *value == default_usage_forecast_rate_window_minutes()
+}
+
+fn is_default_usage_forecast_min_priced_requests(value: &u64) -> bool {
+    *value == default_usage_forecast_min_priced_requests()
+}
+
+fn is_default_usage_forecast_reset_time(value: &String) -> bool {
+    value == &default_usage_forecast_reset_time()
+}
+
+fn is_default_usage_forecast_reset_utc_offset(value: &String) -> bool {
+    value == &default_usage_forecast_reset_utc_offset()
+}
+
+fn is_default_usage_forecast_config(value: &UsageForecastConfig) -> bool {
+    value == &UsageForecastConfig::default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     /// Optional config schema version for future migrations
@@ -1262,6 +1352,9 @@ pub struct UiConfig {
     /// When unset, codex-helper will pick a default language based on system locale for the first run.
     #[serde(default)]
     pub language: Option<String>,
+    /// Spend-rate projection shown in operator UIs.
+    #[serde(default, skip_serializing_if = "is_default_usage_forecast_config")]
+    pub usage_forecast: UsageForecastConfig,
 }
 
 /// 获取 codex-helper 的主目录（用于配置、日志等）

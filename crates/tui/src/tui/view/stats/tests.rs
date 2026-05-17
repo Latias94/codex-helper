@@ -7,8 +7,9 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 
 use crate::dashboard_core::WindowStats;
-use crate::state::UsageRollupView;
-use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot};
+use crate::state::{
+    BalanceSnapshotStatus, FinishedRequest, ProviderBalanceSnapshot, UsageRollupView,
+};
 use crate::usage_providers::UsageProviderRefreshSummary;
 
 fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapshot>>) -> Snapshot {
@@ -51,6 +52,58 @@ fn sample_snapshot(provider_balances: HashMap<String, Vec<ProviderBalanceSnapsho
         stats_1h: WindowStats::default(),
         pricing_catalog: crate::pricing::bundled_model_price_catalog_snapshot(),
         refreshed_at: Instant::now(),
+    }
+}
+
+fn sample_priced_request(ended_at_ms: u64, usd: &str) -> FinishedRequest {
+    let usage = crate::usage::UsageMetrics {
+        input_tokens: 1_000_000,
+        total_tokens: 1_000_000,
+        ..Default::default()
+    };
+    let price = crate::pricing::ModelPrice::from_per_million_usd(
+        "gpt-test",
+        None,
+        usd,
+        "0",
+        Some("0"),
+        Some("0"),
+        "test",
+    )
+    .expect("test price");
+    let cost = crate::pricing::estimate_usage_cost_with_accounting(
+        &usage,
+        &price,
+        crate::pricing::CostAdjustments::default(),
+        crate::usage::CacheInputAccounting::default(),
+    );
+
+    FinishedRequest {
+        id: ended_at_ms,
+        trace_id: None,
+        session_id: None,
+        client_name: None,
+        client_addr: None,
+        cwd: None,
+        model: Some("gpt-test".to_string()),
+        reasoning_effort: None,
+        service_tier: None,
+        station_name: Some("station".to_string()),
+        provider_id: Some("provider".to_string()),
+        upstream_base_url: None,
+        route_decision: None,
+        usage: Some(usage),
+        cost,
+        retry: None,
+        observability: crate::state::RequestObservability::default(),
+        service: "codex".to_string(),
+        method: "POST".to_string(),
+        path: "/v1/responses".to_string(),
+        status_code: 200,
+        duration_ms: 100,
+        ttfb_ms: None,
+        streaming: false,
+        ended_at_ms,
     }
 }
 
@@ -187,6 +240,37 @@ fn stats_narrow_render_keeps_cjk_provider_and_complete_balance_amount() {
 
     assert!(text.contains("超") && text.contains("级"), "{text}");
     assert!(text.contains("$0/$300.00"), "{text}");
+}
+
+#[test]
+fn stats_kpis_show_spend_forecast_when_priced_requests_exist() {
+    let now = crate::tui::model::now_ms();
+    let mut snapshot = sample_snapshot(HashMap::from([(
+        "provider".to_string(),
+        vec![ProviderBalanceSnapshot {
+            provider_id: "provider".to_string(),
+            status: BalanceSnapshotStatus::Ok,
+            quota_remaining_usd: Some("20".to_string()),
+            fetched_at_ms: now,
+            ..ProviderBalanceSnapshot::default()
+        }],
+    )]));
+    snapshot.recent = vec![sample_priced_request(now.saturating_sub(30 * 60_000), "1")];
+    let mut ui = UiState {
+        page: crate::tui::types::Page::Stats,
+        usage_forecast: crate::config::UsageForecastConfig {
+            rate_window_minutes: 60,
+            reset_utc_offset: "+08:00".to_string(),
+            ..Default::default()
+        },
+        ..UiState::default()
+    };
+
+    let text = render_stats_text(120, 28, &mut ui, &snapshot);
+
+    assert!(text.contains("burn"), "{text}");
+    assert!(text.contains("rate"), "{text}");
+    assert!(text.contains("/h"), "{text}");
 }
 
 #[test]

@@ -17,6 +17,11 @@ use crate::usage_balance::{UsageBalanceEndpointRow, UsageBalanceProviderRow, Usa
 mod summary;
 use summary::*;
 
+struct StatsKpiContext<'a> {
+    usage_balance: &'a UsageBalanceView,
+    usage_forecast: &'a crate::config::UsageForecastConfig,
+}
+
 pub(super) fn render_stats_page(
     f: &mut Frame<'_>,
     p: Palette,
@@ -29,7 +34,7 @@ pub(super) fn render_stats_page(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(7),
             Constraint::Min(0),
         ])
@@ -37,7 +42,18 @@ pub(super) fn render_stats_page(
 
     let lang = ui.language;
     let window_label = stats_window_label(ui.stats_days, lang);
-    render_kpis(f, p, snapshot, &usage_balance, &window_label, rows[0], lang);
+    render_kpis(
+        f,
+        p,
+        snapshot,
+        StatsKpiContext {
+            usage_balance: &usage_balance,
+            usage_forecast: &ui.usage_forecast,
+        },
+        &window_label,
+        rows[0],
+        lang,
+    );
     render_sparkline(f, p, snapshot, &window_label, rows[1], lang);
     render_tables(
         f,
@@ -55,7 +71,7 @@ fn render_kpis(
     f: &mut Frame<'_>,
     p: Palette,
     snapshot: &Snapshot,
-    usage_balance: &UsageBalanceView,
+    ctx: StatsKpiContext<'_>,
     window_label: &str,
     area: Rect,
     lang: Language,
@@ -158,26 +174,39 @@ fn render_kpis(
         .title(l("Usage / Balance"))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
+    let forecast = usage_spend_forecast(snapshot, ctx.usage_forecast, crate::tui::model::now_ms());
+    let forecast_style = if forecast.projected_exhaustion {
+        Style::default().fg(p.warn)
+    } else {
+        Style::default().fg(p.muted)
+    };
     let live_text = Text::from(vec![
         Line::from(vec![
             Span::styled("bal ", Style::default().fg(p.muted)),
             Span::styled(
-                usage_balance_counts_line(&usage_balance.totals.balance_status_counts, lang),
+                usage_balance_counts_line(&ctx.usage_balance.totals.balance_status_counts, lang),
                 Style::default().fg(p.text),
             ),
         ]),
         Line::from(vec![
             Span::styled("ref ", Style::default().fg(p.muted)),
             Span::styled(
-                shorten(&usage_refresh_line(usage_balance, lang), 48),
+                shorten(&usage_refresh_line(ctx.usage_balance, lang), 48),
                 Style::default().fg(p.muted),
             ),
         ]),
         Line::from(vec![
-            Span::styled("5m ", Style::default().fg(p.muted)),
+            Span::styled("burn ", Style::default().fg(p.muted)),
             Span::styled(
-                live_health_line(&snapshot.stats_5m, lang),
-                Style::default().fg(p.muted),
+                shorten(&spend_forecast_rate_line(&forecast, lang), 48),
+                forecast_style,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("left ", Style::default().fg(p.muted)),
+            Span::styled(
+                shorten(&spend_forecast_balance_line(&forecast, lang), 48),
+                forecast_style,
             ),
         ]),
     ]);

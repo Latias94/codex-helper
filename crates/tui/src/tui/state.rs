@@ -1,6 +1,8 @@
 use ratatui::widgets::{ListState, TableState};
 
-use crate::config::{ResolvedRetryConfig, is_supported_route_graph_config_version};
+use crate::config::{
+    ResolvedRetryConfig, UsageForecastConfig, is_supported_route_graph_config_version,
+};
 use crate::dashboard_core::ControlProfileOption;
 use crate::routing_explain::RoutingExplainResponse;
 use crate::sessions::{
@@ -63,6 +65,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
     pub(in crate::tui) proxy_port: u16,
     pub(in crate::tui) language: Language,
+    pub(in crate::tui) usage_forecast: UsageForecastConfig,
     pub(in crate::tui) refresh_ms: u64,
     pub(in crate::tui) config_version: Option<u32>,
     pub(in crate::tui) page: Page,
@@ -166,6 +169,7 @@ impl Default for UiState {
             service_name: "codex",
             proxy_port: 3211,
             language: Language::En,
+            usage_forecast: UsageForecastConfig::default(),
             refresh_ms: 500,
             config_version: None,
             page: Page::Dashboard,
