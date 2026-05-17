@@ -387,6 +387,7 @@ pub enum RoutingCommand {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum ProviderCommand {
     /// Show providers in the v4 catalog

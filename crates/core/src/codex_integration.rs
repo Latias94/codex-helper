@@ -471,9 +471,7 @@ fn ensure_chatgpt_bridge_auth_ready(value: &serde_json::Value) -> Result<()> {
     ))
 }
 
-fn chatgpt_bridge_auth_json_text(text: &str) -> Result<String> {
-    let mut value: serde_json::Value =
-        serde_json::from_str(text).context("parse Codex auth.json as JSON")?;
+fn chatgpt_bridge_auth_json_value(mut value: serde_json::Value) -> Result<serde_json::Value> {
     ensure_chatgpt_bridge_auth_ready(&value)?;
     let obj = value
         .as_object_mut()
@@ -483,6 +481,13 @@ fn chatgpt_bridge_auth_json_text(text: &str) -> Result<String> {
         serde_json::Value::String("chatgpt".to_string()),
     );
     obj.insert("OPENAI_API_KEY".to_string(), serde_json::Value::Null);
+    Ok(value)
+}
+
+fn chatgpt_bridge_auth_json_text(text: &str) -> Result<String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(text).context("parse Codex auth.json as JSON")?;
+    value = chatgpt_bridge_auth_json_value(value)?;
     Ok(serde_json::to_string_pretty(&value)?)
 }
 
@@ -665,7 +670,15 @@ pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
             ));
         }
         let auth_text = read_config_text(&auth_path)?;
-        Some((auth_path, chatgpt_bridge_auth_json_text(&auth_text)?))
+        let auth_value: serde_json::Value =
+            serde_json::from_str(&auth_text).context("parse Codex auth.json as JSON")?;
+        let patched_auth_value = chatgpt_bridge_auth_json_value(auth_value.clone())?;
+        if patched_auth_value == auth_value {
+            None
+        } else {
+            let patched_auth_text = serde_json::to_string_pretty(&patched_auth_value)?;
+            Some((auth_path, patched_auth_text))
+        }
     } else {
         None
     };
@@ -1355,6 +1368,47 @@ base_url = "https://api.openai.com/v1"
                 .and_then(|value| value.as_str()),
             Some("acct_1")
         );
+    }
+
+    #[test]
+    fn codex_switch_on_chatgpt_bridge_does_not_rewrite_already_patched_auth_json() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(
+            &auth_path,
+            &chatgpt_bridge_auth_json_text(&chatgpt_auth_json(
+                "user@example.com",
+                "acct_1",
+                "plus",
+            ))
+            .expect("pre-patch auth fixture"),
+        );
+        let before = std::fs::metadata(&auth_path)
+            .expect("auth metadata")
+            .modified()
+            .expect("auth modified time");
+
+        switch_on_with_mode(3211, CodexPatchMode::ChatGptBridge)
+            .expect("switch_on bridge should patch config without rewriting already-patched auth");
+
+        let after = std::fs::metadata(&auth_path)
+            .expect("auth metadata")
+            .modified()
+            .expect("auth modified time");
+        assert_eq!(before, after);
     }
 
     #[test]

@@ -280,7 +280,8 @@ fn build_provider_view(view: &ServiceViewV4, name: &str) -> Option<ProviderView>
         supported_models: provider
             .supported_models
             .iter()
-            .filter_map(|(model, supported)| supported.then(|| model.clone()))
+            .filter(|(_model, supported)| **supported)
+            .map(|(model, _supported)| model.clone())
             .collect(),
         model_mapping: provider.model_mapping.clone(),
         endpoints: provider_endpoints(provider),

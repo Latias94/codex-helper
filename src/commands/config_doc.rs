@@ -287,35 +287,6 @@ pub(super) fn routing_exhausted_label(action: RoutingExhaustedActionV4) -> &'sta
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_cli_string_map_rejects_invalid_entries() {
-        let map = parse_cli_string_map(
-            &[
-                "gpt-5.5=openai/gpt-5.5".to_string(),
-                "gpt-* = openai/gpt-*".to_string(),
-            ],
-            "model-map",
-        )
-        .expect("valid map");
-        assert_eq!(
-            map.get("gpt-5.5").map(String::as_str),
-            Some("openai/gpt-5.5")
-        );
-        assert_eq!(map.get("gpt-*").map(String::as_str), Some("openai/gpt-*"));
-
-        assert!(parse_cli_string_map(&["missing-separator".to_string()], "model-map").is_err());
-        assert!(parse_cli_string_map(&["=target".to_string()], "model-map").is_err());
-        assert!(parse_cli_string_map(&["source=".to_string()], "model-map").is_err());
-        assert!(
-            parse_cli_string_map(&["a=b".to_string(), "a=c".to_string()], "model-map").is_err()
-        );
-    }
-}
-
 pub(super) fn v4_provider_endpoint_count(provider: &ProviderConfigV4) -> usize {
     let inline = provider
         .base_url
@@ -428,5 +399,34 @@ pub(super) fn print_v4_provider_list(label: &str, view: &ServiceViewV4) {
                 marker, enabled, provider_name, endpoints, tags
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cli_string_map_rejects_invalid_entries() {
+        let map = parse_cli_string_map(
+            &[
+                "gpt-5.5=openai/gpt-5.5".to_string(),
+                "gpt-* = openai/gpt-*".to_string(),
+            ],
+            "model-map",
+        )
+        .expect("valid map");
+        assert_eq!(
+            map.get("gpt-5.5").map(String::as_str),
+            Some("openai/gpt-5.5")
+        );
+        assert_eq!(map.get("gpt-*").map(String::as_str), Some("openai/gpt-*"));
+
+        assert!(parse_cli_string_map(&["missing-separator".to_string()], "model-map").is_err());
+        assert!(parse_cli_string_map(&["=target".to_string()], "model-map").is_err());
+        assert!(parse_cli_string_map(&["source=".to_string()], "model-map").is_err());
+        assert!(
+            parse_cli_string_map(&["a=b".to_string(), "a=c".to_string()], "model-map").is_err()
+        );
     }
 }
