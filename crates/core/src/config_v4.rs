@@ -90,6 +90,7 @@ fn provider_v4_to_v2(
     provider_name: &str,
     provider: &ProviderConfigV4,
 ) -> Result<ProviderConfigV2> {
+    validate_provider_concurrency_limits(service_name, provider_name, None, &provider.limits)?;
     let mut endpoints = BTreeMap::new();
     if let Some(base_url) = provider
         .base_url
@@ -116,6 +117,12 @@ fn provider_v4_to_v2(
     }
 
     for (endpoint_name, endpoint) in &provider.endpoints {
+        validate_provider_concurrency_limits(
+            service_name,
+            provider_name,
+            Some(endpoint_name),
+            &endpoint.limits,
+        )?;
         if endpoint.base_url.trim().is_empty() {
             anyhow::bail!(
                 "[{service_name}] provider '{provider_name}' endpoint '{endpoint_name}' has an empty base_url"
@@ -175,6 +182,7 @@ fn validate_runtime_provider_v4_shape(
     provider_name: &str,
     provider: &ProviderConfigV4,
 ) -> Result<()> {
+    validate_provider_concurrency_limits(service_name, provider_name, None, &provider.limits)?;
     let mut has_endpoint = false;
     if let Some(_base_url) = provider
         .base_url
@@ -191,6 +199,12 @@ fn validate_runtime_provider_v4_shape(
     }
 
     for (endpoint_name, endpoint) in &provider.endpoints {
+        validate_provider_concurrency_limits(
+            service_name,
+            provider_name,
+            Some(endpoint_name),
+            &endpoint.limits,
+        )?;
         if endpoint.base_url.trim().is_empty() {
             anyhow::bail!(
                 "[{service_name}] provider '{provider_name}' endpoint '{endpoint_name}' has an empty base_url"
@@ -203,6 +217,25 @@ fn validate_runtime_provider_v4_shape(
         anyhow::bail!("[{service_name}] provider '{provider_name}' has no base_url or endpoints");
     }
 
+    Ok(())
+}
+
+fn validate_provider_concurrency_limits(
+    service_name: &str,
+    provider_name: &str,
+    endpoint_name: Option<&str>,
+    limits: &ProviderConcurrencyLimits,
+) -> Result<()> {
+    if limits.max_concurrent_requests == Some(0) {
+        if let Some(endpoint_name) = endpoint_name {
+            anyhow::bail!(
+                "[{service_name}] provider '{provider_name}' endpoint '{endpoint_name}' limits.max_concurrent_requests must be greater than 0"
+            );
+        }
+        anyhow::bail!(
+            "[{service_name}] provider '{provider_name}' limits.max_concurrent_requests must be greater than 0"
+        );
+    }
     Ok(())
 }
 
@@ -638,6 +671,7 @@ fn endpoint_v2_to_v4(endpoint: &ProviderEndpointV2) -> ProviderEndpointV4 {
         tags: endpoint.tags.clone(),
         supported_models: endpoint.supported_models.clone(),
         model_mapping: endpoint.model_mapping.clone(),
+        limits: ProviderConcurrencyLimits::default(),
     }
 }
 
@@ -660,6 +694,7 @@ fn provider_v2_to_v4(provider: &ProviderConfigV2) -> ProviderConfigV4 {
         tags: provider.tags.clone(),
         supported_models: provider.supported_models.clone(),
         model_mapping: provider.model_mapping.clone(),
+        limits: ProviderConcurrencyLimits::default(),
         endpoints: BTreeMap::new(),
     };
 

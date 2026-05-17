@@ -301,6 +301,10 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
             tags: [("billing".to_string(), "monthly".to_string())]
                 .into_iter()
                 .collect(),
+            limits: ProviderConcurrencyLimits {
+                max_concurrent_requests: Some(5),
+                limit_group: Some("relay-account".to_string()),
+            },
             ..Default::default()
         },
     );
@@ -318,6 +322,25 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
             tags: [("billing".to_string(), "paygo".to_string())]
                 .into_iter()
                 .collect(),
+            endpoints: [(
+                "hk".to_string(),
+                crate::config::ProviderEndpointV4 {
+                    base_url: "https://backup-hk.example.com/v1".to_string(),
+                    enabled: true,
+                    priority: 1,
+                    tags: [("region".to_string(), "hk".to_string())]
+                        .into_iter()
+                        .collect(),
+                    supported_models: Default::default(),
+                    model_mapping: Default::default(),
+                    limits: ProviderConcurrencyLimits {
+                        max_concurrent_requests: Some(2),
+                        limit_group: Some("relay-hk".to_string()),
+                    },
+                },
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         },
     );
@@ -403,6 +426,38 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
         })
         .expect("input provider spec");
     assert_eq!(input_spec["tags"]["billing"].as_str(), Some("monthly"));
+    assert_eq!(
+        input_spec["limits"]["max_concurrent_requests"].as_u64(),
+        Some(5)
+    );
+    assert_eq!(
+        input_spec["limits"]["limit_group"].as_str(),
+        Some("relay-account")
+    );
+    let backup_spec = provider_specs["providers"]
+        .as_array()
+        .and_then(|providers| {
+            providers.iter().find(|provider| {
+                provider.get("name").and_then(|value| value.as_str()) == Some("backup")
+            })
+        })
+        .expect("backup provider spec");
+    let backup_hk = backup_spec["endpoints"]
+        .as_array()
+        .and_then(|endpoints| {
+            endpoints.iter().find(|endpoint| {
+                endpoint.get("name").and_then(|value| value.as_str()) == Some("hk")
+            })
+        })
+        .expect("backup hk endpoint spec");
+    assert_eq!(
+        backup_hk["limits"]["max_concurrent_requests"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        backup_hk["limits"]["limit_group"].as_str(),
+        Some("relay-hk")
+    );
 
     let capabilities = client
         .get(format!(
@@ -710,6 +765,102 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
         input_after_enable["tags"]["billing"].as_str(),
         Some("monthly")
     );
+    assert_eq!(
+        input_after_enable["limits"]["max_concurrent_requests"].as_u64(),
+        Some(5)
+    );
+    assert_eq!(
+        input_after_enable["limits"]["limit_group"].as_str(),
+        Some("relay-account")
+    );
+
+    let update_backup_limits = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/backup",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "enabled": true,
+            "auth_token_env": "BACKUP_KEY",
+            "limits": {
+                "max_concurrent_requests": 4,
+                "limit_group": " backup-account "
+            },
+            "endpoints": [
+                {
+                    "name": "default",
+                    "base_url": "https://backup.example.com/v1",
+                    "enabled": true
+                },
+                {
+                    "name": "hk",
+                    "base_url": "https://backup-hk2.example.com/v1",
+                    "enabled": true,
+                    "priority": 1,
+                    "limits": {
+                        "max_concurrent_requests": 3,
+                        "limit_group": " relay-hk-next "
+                    }
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("update backup concurrency limits send");
+    assert_eq!(update_backup_limits.status(), StatusCode::NO_CONTENT);
+
+    let reject_zero_limit = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/backup",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "enabled": true,
+            "auth_token_env": "BACKUP_KEY",
+            "limits": {
+                "max_concurrent_requests": 0
+            },
+            "endpoints": [
+                {
+                    "name": "hk",
+                    "base_url": "https://backup-hk2.example.com/v1",
+                    "enabled": true
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("reject zero concurrency limit send");
+    assert_eq!(reject_zero_limit.status(), StatusCode::BAD_REQUEST);
+
+    let clear_backup_limits = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/backup",
+            proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "enabled": true,
+            "auth_token_env": "BACKUP_KEY",
+            "limits": {},
+            "endpoints": [
+                {
+                    "name": "default",
+                    "base_url": "https://backup.example.com/v1",
+                    "enabled": true
+                },
+                {
+                    "name": "hk",
+                    "base_url": "https://backup-hk3.example.com/v1",
+                    "enabled": true,
+                    "priority": 1,
+                    "limits": {}
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("clear backup concurrency limits send");
+    assert_eq!(clear_backup_limits.status(), StatusCode::NO_CONTENT);
 
     let set_routing_target = client
         .put(format!(
@@ -1032,6 +1183,20 @@ async fn proxy_api_v1_v4_persisted_control_plane_edits_v4_document() {
         input.tags.get("region").map(|value| value.as_str()),
         Some("hk")
     );
+    assert_eq!(input.limits.max_concurrent_requests, Some(5));
+    assert_eq!(input.limits.limit_group.as_deref(), Some("relay-account"));
+    let backup = persisted_cfg
+        .codex
+        .providers
+        .get("backup")
+        .expect("backup provider");
+    assert_eq!(backup.limits, ProviderConcurrencyLimits::default());
+    let backup_hk = backup.endpoints.get("hk").expect("backup hk endpoint");
+    assert_eq!(
+        backup_hk.base_url.as_str(),
+        "https://backup-hk3.example.com/v1"
+    );
+    assert_eq!(backup_hk.limits, ProviderConcurrencyLimits::default());
 
     proxy_handle.abort();
 }
@@ -1390,24 +1555,21 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
     crate::config::save_config_v2(&cfg)
         .await
         .expect("write initial provider v2 config");
-    let loaded = crate::config::load_config()
-        .await
-        .expect("load initial runtime config");
-
-    let proxy = ProxyService::new(
+    let v2_runtime = crate::config::compile_v2_to_runtime(&cfg).expect("compile v2 runtime config");
+    let v2_proxy = ProxyService::new(
         Client::new(),
-        Arc::new(loaded),
+        Arc::new(v2_runtime),
         "codex",
         Arc::new(std::sync::Mutex::new(HashMap::new())),
     );
-    let app = crate::proxy::router(proxy);
-    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let v2_app = crate::proxy::router(v2_proxy);
+    let (v2_proxy_addr, v2_proxy_handle) = spawn_axum_server(v2_app);
     let client = reqwest::Client::new();
 
     let initial = client
         .get(format!(
             "http://{}/__codex_helper/api/v1/providers/specs",
-            proxy_addr
+            v2_proxy_addr
         ))
         .send()
         .await
@@ -1423,6 +1585,52 @@ async fn proxy_api_v1_provider_specs_crud_persists_endpoints_and_env_refs() {
             .map(|providers| providers.len()),
         Some(1)
     );
+
+    let reject_v2_limits = client
+        .put(format!(
+            "http://{}/__codex_helper/api/v1/providers/specs/alpha",
+            v2_proxy_addr
+        ))
+        .json(&serde_json::json!({
+            "alias": "Relay Alpha",
+            "enabled": true,
+            "auth_token_env": "ALPHA_KEY",
+            "limits": {
+                "max_concurrent_requests": 2
+            },
+            "endpoints": [
+                {
+                    "name": "default",
+                    "base_url": "https://alpha.example.com/v1",
+                    "enabled": true
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("reject v2 provider limits send");
+    assert_eq!(reject_v2_limits.status(), StatusCode::BAD_REQUEST);
+    let reject_v2_limits_body = reject_v2_limits
+        .text()
+        .await
+        .expect("reject v2 provider limits body");
+    assert!(
+        reject_v2_limits_body.contains("provider concurrency limits require a route graph config"),
+        "{reject_v2_limits_body}"
+    );
+    v2_proxy_handle.abort();
+
+    let loaded = crate::config::load_config()
+        .await
+        .expect("load migrated runtime config");
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(loaded),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
     let update_alpha = client
         .put(format!(

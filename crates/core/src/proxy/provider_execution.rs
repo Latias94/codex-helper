@@ -11,9 +11,9 @@ use crate::config::{RetryStrategy, RoutingAffinityPolicyV5};
 use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_retry_trace};
 use crate::routing_ir::{
-    RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState, RoutePlanSkipReason,
-    SelectedRouteCandidate, SkippedRouteCandidate, SkippedStationRouteCandidate,
-    compile_legacy_route_plan_template,
+    RouteCandidate, RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState,
+    RoutePlanSkipReason, SelectedRouteCandidate, SkippedRouteCandidate,
+    SkippedStationRouteCandidate, compile_legacy_route_plan_template,
 };
 use crate::state::SessionBinding;
 
@@ -23,6 +23,7 @@ use super::attempt_execution::{
 };
 use super::attempt_selection::station_upstreams_exhausted;
 use super::attempt_target::AttemptTarget;
+use super::concurrency_limits::ConcurrencyAcquireError;
 use super::provider_orchestration::{
     CrossStationFailoverBlockedParams, cross_station_failover_enabled,
     log_cross_station_failover_blocked, log_same_station_failover_trace,
@@ -79,6 +80,55 @@ pub(super) struct ProviderExecutionState {
     pub(super) upstream_chain: Vec<String>,
     pub(super) route_attempts: Vec<RouteAttemptLog>,
     pub(super) last_err: Option<(StatusCode, String)>,
+}
+
+pub(super) fn apply_concurrency_snapshots_to_runtime(
+    proxy: &ProxyService,
+    template: &crate::routing_ir::RoutePlanTemplate,
+    runtime: &mut RoutePlanRuntimeState,
+) {
+    for candidate in &template.candidates {
+        let Some(limit) = candidate.concurrency.max_concurrent_requests else {
+            continue;
+        };
+        if limit == 0 {
+            continue;
+        }
+        let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
+        let Some(key) = candidate
+            .concurrency
+            .limit_key(proxy.service_name, &provider_endpoint)
+        else {
+            continue;
+        };
+        let snapshot = proxy.concurrency_limiter.snapshot(key.as_str(), limit);
+        let mut state = runtime.provider_endpoint(&provider_endpoint);
+        state.concurrency_saturated = snapshot.saturated;
+        state.concurrency_active = Some(snapshot.active);
+        state.concurrency_limit = Some(snapshot.limit);
+        runtime.set_provider_endpoint(provider_endpoint, state);
+    }
+}
+
+fn try_acquire_candidate_concurrency_permit(
+    proxy: &ProxyService,
+    template: &crate::routing_ir::RoutePlanTemplate,
+    candidate: &RouteCandidate,
+) -> Result<Option<super::concurrency_limits::ConcurrencyPermit>, ConcurrencyAcquireError> {
+    let Some(limit) = candidate.concurrency.max_concurrent_requests else {
+        return Ok(None);
+    };
+    if limit == 0 {
+        return Ok(None);
+    }
+    let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
+    let Some(key) = candidate
+        .concurrency
+        .limit_key(proxy.service_name, &provider_endpoint)
+    else {
+        return Ok(None);
+    };
+    proxy.concurrency_limiter.try_acquire(key, limit).map(Some)
 }
 
 #[cfg(test)]
@@ -177,6 +227,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                 .state
                 .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
                 .await;
+            apply_concurrency_snapshots_to_runtime(proxy, template, &mut runtime);
             apply_session_route_affinity_to_runtime(
                 proxy,
                 session_id,
@@ -536,6 +587,28 @@ async fn execute_route_graph_candidates_with_route_executor(
         let mut avoid_set = hash_set_from_indices(&avoided_candidate_indices);
 
         let target = AttemptTarget::from_candidate(proxy.service_name, selected_candidate);
+        let concurrency_permit = match try_acquire_candidate_concurrency_permit(
+            proxy,
+            executor.template(),
+            selected_candidate,
+        ) {
+            Ok(permit) => permit,
+            Err(ConcurrencyAcquireError::Saturated { active, limit }) => {
+                let provider_endpoint = executor
+                    .template()
+                    .candidate_provider_endpoint_key(selected_candidate);
+                route_state.avoid_provider_endpoint(provider_endpoint.clone());
+                log_retry_trace(serde_json::json!({
+                    "event": "route_candidate_concurrency_saturated",
+                    "service": proxy.service_name,
+                    "request_id": request_id,
+                    "provider_endpoint_key": provider_endpoint.stable_key(),
+                    "active": active,
+                    "limit": limit,
+                }));
+                continue;
+            }
+        };
 
         match execute_selected_upstream(ExecuteSelectedUpstreamParams {
             proxy,
@@ -582,6 +655,7 @@ async fn execute_route_graph_candidates_with_route_executor(
             last_err,
             upstream_chain,
             route_attempts,
+            concurrency_permit,
         })
         .await
         {
@@ -734,6 +808,7 @@ async fn execute_station_upstreams_with_route_executor(
             last_err,
             upstream_chain,
             route_attempts,
+            concurrency_permit: None,
         })
         .await
         {

@@ -489,6 +489,40 @@ profile = "balanced"
 
 不要用 endpoints 来模拟互不相关的 providers。互不相关的账号应该放在不同 provider 名下。
 
+### Provider 并发上限
+
+当某个 relay 账号只允许很少的同时请求数时，可以配置 `limits.max_concurrent_requests`。这是本进程本地限制：一个正在运行的 codex-helper 进程会统计活跃请求，并在路由时跳过已饱和候选。它不是多个 codex-helper 进程之间共享的分布式配额。
+
+```toml
+[codex.providers.relay.limits]
+max_concurrent_requests = 5
+limit_group = "relay-account"
+```
+
+`limit_group` 可选。不配置时，上限按 provider endpoint 单独生效。多个 provider endpoints 共用同一个上游账号额度时，可以给它们配置相同的 `limit_group`。endpoint 级 `limits` 会覆盖 provider 级 `limits`：
+
+```toml
+[codex.providers.relay]
+alias = "Relay account"
+auth_token_env = "RELAY_API_KEY"
+
+[codex.providers.relay.limits]
+max_concurrent_requests = 5
+limit_group = "relay-account"
+
+[codex.providers.relay.endpoints.hk]
+base_url = "https://hk.relay.example/v1"
+
+[codex.providers.relay.endpoints.us]
+base_url = "https://us.relay.example/v1"
+
+[codex.providers.relay.endpoints.us.limits]
+max_concurrent_requests = 2
+limit_group = "relay-us"
+```
+
+候选饱和时，routing 会把它当作临时不可用并继续走下一个 fallback。饱和不会记为 provider 失败，不会打开 cooldown，也不会污染 session affinity。`routing explain` 会用 `concurrency_saturated` 展示当前活跃数和上限。
+
 ## Route 策略
 
 | Strategy | 最适合 | UI 心智模型 |

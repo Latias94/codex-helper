@@ -39,6 +39,7 @@ English: [README_EN.md](README_EN.md)
 - **安全 Codex 局部修改**：只改本地代理片段，不影响 Codex 运行中写入的其他配置。
 - **provider / routing 配置**：`version = 5` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
 - **会话粘性与自动兜底**：同一 Codex 会话会尽量粘住已选 provider，请求失败、上游不可用或可信余额显示耗尽时再按策略切换候选 provider/upstream。
+- **本地并发上限**：可为 provider 或 endpoint 配置本进程并发上限，relay 账号饱和时自动跳过并走 fallback。
 - **余额/套餐**：支持 Sub2API、New API 和常见 `/user/balance` 探测；失败不计为耗尽。
 - **出站代理兼容**：本地代理和出站网络代理是两层概念；当前出站请求受系统/环境代理变量影响，还没有 `config.toml` 专用代理段。
 - **请求可观测**：记录 provider、model、token、cache token、缓存命中率、TTFB、总耗时、输出速度、重试链和估算成本。
@@ -130,6 +131,10 @@ version = 5
 base_url = "https://ai.input.im/v1"
 auth_token_env = "INPUT_API_KEY"
 tags = { billing = "monthly" }
+
+[codex.providers.input.limits]
+max_concurrent_requests = 5
+limit_group = "input-account"
 
 [codex.providers.openai]
 base_url = "https://api.openai.com/v1"

@@ -250,6 +250,7 @@ fn compile_v4_to_runtime_direct_path_matches_v2_bridge_for_compat_state() {
                                     )]),
                                     supported_models: BTreeMap::new(),
                                     model_mapping: BTreeMap::new(),
+                                    limits: ProviderConcurrencyLimits::default(),
                                 },
                             ),
                             (
@@ -267,6 +268,7 @@ fn compile_v4_to_runtime_direct_path_matches_v2_bridge_for_compat_state() {
                                         "gpt-5".to_string(),
                                         "provider-gpt-5".to_string(),
                                     )]),
+                                    limits: ProviderConcurrencyLimits::default(),
                                 },
                             ),
                         ]),
@@ -959,6 +961,35 @@ fn save_config_v4_writes_v4_route_graph_schema() {
         assert!(!saved.contains("source = \"codex-config\""));
         assert!(!saved.contains("[codex.stations."));
     });
+}
+
+#[test]
+fn compile_v4_rejects_zero_provider_concurrency_limit() {
+    let v4 = ProxyConfigV4 {
+        version: 5,
+        codex: ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "relay".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("https://relay.example/v1".to_string()),
+                    limits: ProviderConcurrencyLimits {
+                        max_concurrent_requests: Some(0),
+                        limit_group: None,
+                    },
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+
+    let err = compile_v4_to_runtime(&v4).expect_err("zero concurrency limit should fail");
+    assert!(
+        err.to_string()
+            .contains("limits.max_concurrent_requests must be greater than 0"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

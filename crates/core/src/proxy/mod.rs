@@ -17,6 +17,7 @@ mod attempt_transport;
 mod auth_resolution;
 mod classify;
 mod client_identity;
+mod concurrency_limits;
 mod control_plane;
 mod control_plane_manifest;
 mod control_plane_routes;
@@ -68,6 +69,7 @@ pub use self::admin::{
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
 pub use self::api_responses::{ProfilesResponse, ReloadResult, RuntimeStatusResponse};
+use self::concurrency_limits::ConcurrencyLimiter;
 pub use self::entrypoint::handle_proxy;
 pub use self::persisted_registry_api::PersistedRoutingUpsertRequest;
 pub use self::router_setup::{
@@ -102,6 +104,7 @@ pub struct ProxyService {
     config: Arc<RuntimeConfig>,
     pub service_name: &'static str,
     lb_states: Arc<Mutex<HashMap<String, LbState>>>,
+    concurrency_limiter: Arc<ConcurrencyLimiter>,
     filter: RequestFilter,
     state: Arc<ProxyState>,
 }

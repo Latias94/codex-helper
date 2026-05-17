@@ -491,6 +491,40 @@ profile = "balanced"
 
 Do not use endpoints just to model unrelated providers. Put unrelated accounts under separate provider names.
 
+### Provider Concurrency Limits
+
+Use `limits.max_concurrent_requests` when an upstream relay account only allows a small number of simultaneous requests. This is a local-process cap: one running codex-helper process tracks active requests and skips saturated candidates during routing. It is not a distributed quota across several codex-helper processes.
+
+```toml
+[codex.providers.relay.limits]
+max_concurrent_requests = 5
+limit_group = "relay-account"
+```
+
+`limit_group` is optional. Without it, the cap is scoped to that provider endpoint. Use the same `limit_group` on several provider endpoints when they share one upstream account quota. Endpoint-level `limits` override provider-level `limits`:
+
+```toml
+[codex.providers.relay]
+alias = "Relay account"
+auth_token_env = "RELAY_API_KEY"
+
+[codex.providers.relay.limits]
+max_concurrent_requests = 5
+limit_group = "relay-account"
+
+[codex.providers.relay.endpoints.hk]
+base_url = "https://hk.relay.example/v1"
+
+[codex.providers.relay.endpoints.us]
+base_url = "https://us.relay.example/v1"
+
+[codex.providers.relay.endpoints.us.limits]
+max_concurrent_requests = 2
+limit_group = "relay-us"
+```
+
+When a candidate is saturated, routing treats it as temporarily unavailable and continues to the next fallback. Saturation does not count as a provider failure, does not open cooldown, and does not poison session affinity. `routing explain` reports `concurrency_saturated` with the active count and limit.
+
 ## Route Strategies
 
 | Strategy | Best For | UI Mental Model |

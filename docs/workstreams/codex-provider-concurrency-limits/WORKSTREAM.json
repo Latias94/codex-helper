@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "slug": "codex-provider-concurrency-limits",
+  "title": "Codex Provider Concurrency Limits",
+  "status": "implemented",
+  "updated": "2026-05-17",
+  "scope_kind": "execution",
+  "problem": "codex-helper cannot currently protect providers or endpoints that have small upstream concurrency caps.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-provider-concurrency-limits/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-provider-concurrency-limits/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-provider-concurrency-limits/EVIDENCE_AND_GATES.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core concurrency",
+    "cargo nextest run -p codex-helper-core route_plan_executor_skips_saturated_candidate_without_failure_penalty"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-provider-concurrency-limits/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue while provider/endpoint local concurrency limits remain the target. Split rate limiting, queueing, or distributed quotas into follow-ons."
+  }
+}

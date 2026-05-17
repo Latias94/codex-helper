@@ -432,9 +432,24 @@ fn format_runtime_skip_reasons(
     }
     reasons
         .iter()
-        .map(crate::routing_explain::RoutingExplainSkipReason::code)
+        .map(format_runtime_skip_reason)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn format_runtime_skip_reason(reason: &crate::routing_explain::RoutingExplainSkipReason) -> String {
+    match reason {
+        crate::routing_explain::RoutingExplainSkipReason::ConcurrencySaturated {
+            active,
+            limit,
+        } => match (active, limit) {
+            (Some(active), Some(limit)) => {
+                format!("concurrency_saturated(active={active}/limit={limit})")
+            }
+            _ => reason.code().to_string(),
+        },
+        _ => reason.code().to_string(),
+    }
 }
 
 fn session_pin_note(
@@ -473,6 +488,19 @@ mod tests {
 
         assert!(text.contains("before first output"));
         assert!(text.contains("stays on the current station"));
+    }
+
+    #[test]
+    fn runtime_skip_reasons_include_concurrency_counts() {
+        let text = format_runtime_skip_reasons(&[
+            crate::routing_explain::RoutingExplainSkipReason::ConcurrencySaturated {
+                active: Some(5),
+                limit: Some(5),
+            },
+            crate::routing_explain::RoutingExplainSkipReason::MissingAuth,
+        ]);
+
+        assert_eq!(text, "concurrency_saturated(active=5/limit=5),missing_auth");
     }
 
     #[test]

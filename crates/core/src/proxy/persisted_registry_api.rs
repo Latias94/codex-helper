@@ -54,6 +54,8 @@ pub(super) struct PersistedProviderEndpointSpecUpsertRequest {
     priority: u32,
     #[serde(default)]
     tags: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    limits: Option<crate::config::ProviderConcurrencyLimits>,
 }
 
 impl From<crate::config::PersistedProviderEndpointSpec>
@@ -66,6 +68,7 @@ impl From<crate::config::PersistedProviderEndpointSpec>
             enabled: endpoint.enabled,
             priority: endpoint.priority,
             tags: Some(endpoint.tags),
+            limits: Some(endpoint.limits),
         }
     }
 }
@@ -83,6 +86,8 @@ pub(super) struct PersistedProviderSpecUpsertRequest {
     #[serde(default)]
     tags: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
+    limits: Option<crate::config::ProviderConcurrencyLimits>,
+    #[serde(default)]
     endpoints: Vec<PersistedProviderEndpointSpecUpsertRequest>,
 }
 
@@ -94,6 +99,7 @@ impl From<crate::config::PersistedProviderSpec> for PersistedProviderSpecUpsertR
             auth_token_env: provider.auth_token_env,
             api_key_env: provider.api_key_env,
             tags: Some(provider.tags),
+            limits: Some(provider.limits),
             endpoints: provider.endpoints.into_iter().map(Into::into).collect(),
         }
     }
@@ -102,7 +108,9 @@ impl From<crate::config::PersistedProviderSpec> for PersistedProviderSpecUpsertR
 struct SanitizedPersistedProviderSpec {
     spec: crate::config::PersistedProviderSpec,
     tags_provided: bool,
+    limits_provided: bool,
     endpoint_tags_provided: std::collections::BTreeMap<String, bool>,
+    endpoint_limits_provided: std::collections::BTreeMap<String, bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -258,6 +266,22 @@ fn sanitize_tag_map(
     Ok(out)
 }
 
+fn sanitize_provider_concurrency_limits(
+    limits: crate::config::ProviderConcurrencyLimits,
+    context: &str,
+) -> Result<crate::config::ProviderConcurrencyLimits, (StatusCode, String)> {
+    if limits.max_concurrent_requests == Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{context} limits.max_concurrent_requests must be greater than 0"),
+        ));
+    }
+    Ok(crate::config::ProviderConcurrencyLimits {
+        max_concurrent_requests: limits.max_concurrent_requests,
+        limit_group: normalize_optional_config_string(limits.limit_group),
+    })
+}
+
 fn sanitize_station_spec_request(
     payload: PersistedStationSpecUpsertRequest,
 ) -> Result<crate::config::PersistedStationSpec, (StatusCode, String)> {
@@ -300,6 +324,7 @@ fn sanitize_provider_spec_request(
 ) -> Result<SanitizedPersistedProviderSpec, (StatusCode, String)> {
     let mut endpoints = Vec::new();
     let mut endpoint_tags_provided = std::collections::BTreeMap::new();
+    let mut endpoint_limits_provided = std::collections::BTreeMap::new();
     let mut seen = std::collections::BTreeSet::new();
     for endpoint in payload.endpoints {
         let endpoint_name = endpoint.name.trim();
@@ -328,14 +353,27 @@ fn sanitize_provider_spec_request(
             .map(|tags| sanitize_tag_map(tags, &format!("provider endpoint '{}'", endpoint_name)))
             .transpose()?
             .unwrap_or_default();
+        let limits_provided = endpoint.limits.is_some();
+        let limits = endpoint
+            .limits
+            .map(|limits| {
+                sanitize_provider_concurrency_limits(
+                    limits,
+                    &format!("provider endpoint '{}'", endpoint_name),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
 
         endpoint_tags_provided.insert(endpoint_name.to_string(), tags_provided);
+        endpoint_limits_provided.insert(endpoint_name.to_string(), limits_provided);
         endpoints.push(crate::config::PersistedProviderEndpointSpec {
             name: endpoint_name.to_string(),
             base_url: base_url.to_string(),
             enabled: endpoint.enabled,
             priority: endpoint.priority,
             tags,
+            limits,
         });
     }
 
@@ -343,6 +381,12 @@ fn sanitize_provider_spec_request(
     let tags = payload
         .tags
         .map(|tags| sanitize_tag_map(tags, "provider"))
+        .transpose()?
+        .unwrap_or_default();
+    let limits_provided = payload.limits.is_some();
+    let limits = payload
+        .limits
+        .map(|limits| sanitize_provider_concurrency_limits(limits, "provider"))
         .transpose()?
         .unwrap_or_default();
 
@@ -354,10 +398,13 @@ fn sanitize_provider_spec_request(
             auth_token_env: normalize_optional_config_string(payload.auth_token_env),
             api_key_env: normalize_optional_config_string(payload.api_key_env),
             tags,
+            limits,
             endpoints,
         },
         tags_provided,
+        limits_provided,
         endpoint_tags_provided,
+        endpoint_limits_provided,
     })
 }
 
@@ -698,15 +745,44 @@ fn validate_v4_routing_spec_for_view(
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))
 }
 
-fn v4_default_endpoint_can_be_inlined(existing: Option<&crate::config::ProviderConfigV4>) -> bool {
-    existing
-        .and_then(|provider| provider.endpoints.get("default"))
-        .map(|endpoint| {
-            endpoint.tags.is_empty()
-                && endpoint.supported_models.is_empty()
-                && endpoint.model_mapping.is_empty()
-        })
-        .unwrap_or(true)
+fn v4_default_endpoint_can_be_inlined(
+    existing: Option<&crate::config::ProviderConfigV4>,
+    provider: &SanitizedPersistedProviderSpec,
+    endpoint: &crate::config::PersistedProviderEndpointSpec,
+) -> bool {
+    let existing_endpoint = existing.and_then(|provider| provider.endpoints.get("default"));
+    let final_tags = if provider
+        .endpoint_tags_provided
+        .get("default")
+        .copied()
+        .unwrap_or(false)
+    {
+        endpoint.tags.clone()
+    } else {
+        existing_endpoint
+            .map(|endpoint| endpoint.tags.clone())
+            .unwrap_or_default()
+    };
+    let final_limits = if provider
+        .endpoint_limits_provided
+        .get("default")
+        .copied()
+        .unwrap_or(false)
+    {
+        endpoint.limits.clone()
+    } else {
+        existing_endpoint
+            .map(|endpoint| endpoint.limits.clone())
+            .unwrap_or_default()
+    };
+
+    final_tags.is_empty()
+        && crate::config::ProviderConcurrencyLimits::default() == final_limits
+        && existing_endpoint
+            .map(|endpoint| {
+                endpoint.supported_models.is_empty() && endpoint.model_mapping.is_empty()
+            })
+            .unwrap_or(true)
 }
 
 fn merge_persisted_provider_spec_v4(
@@ -740,6 +816,13 @@ fn merge_persisted_provider_spec_v4(
         model_mapping: existing
             .map(|provider| provider.model_mapping.clone())
             .unwrap_or_default(),
+        limits: if provider.limits_provided {
+            spec.limits.clone()
+        } else {
+            existing
+                .map(|provider| provider.limits.clone())
+                .unwrap_or_default()
+        },
         endpoints: std::collections::BTreeMap::new(),
     };
 
@@ -747,7 +830,7 @@ fn merge_persisted_provider_spec_v4(
         && spec.endpoints[0].name == "default"
         && spec.endpoints[0].priority == 0
         && spec.endpoints[0].tags.is_empty()
-        && v4_default_endpoint_can_be_inlined(existing)
+        && v4_default_endpoint_can_be_inlined(existing, provider, &spec.endpoints[0])
     {
         out.base_url = Some(spec.endpoints[0].base_url.clone());
     } else {
@@ -781,6 +864,18 @@ fn merge_persisted_provider_spec_v4(
                         model_mapping: existing_endpoint
                             .map(|endpoint| endpoint.model_mapping.clone())
                             .unwrap_or_default(),
+                        limits: if provider
+                            .endpoint_limits_provided
+                            .get(endpoint.name.as_str())
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            endpoint.limits.clone()
+                        } else {
+                            existing_endpoint
+                                .map(|endpoint| endpoint.limits.clone())
+                                .unwrap_or_default()
+                        },
                     },
                 )
             })
@@ -1338,6 +1433,18 @@ pub(super) async fn upsert_persisted_provider_spec_for_proxy(
         )
         .await?;
         return Ok(StatusCode::NO_CONTENT);
+    }
+
+    if provider.limits_provided
+        || provider
+            .endpoint_limits_provided
+            .values()
+            .any(|provided| *provided)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "provider concurrency limits require a route graph config".to_string(),
+        ));
     }
 
     let mut cfg = load_persisted_proxy_settings_v2().await?;

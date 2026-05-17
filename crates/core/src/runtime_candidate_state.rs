@@ -130,8 +130,8 @@ mod tests {
     use super::*;
     use crate::balance::BalanceSnapshotStatus;
     use crate::config::{
-        ProviderConfigV4, ProviderEndpointV4, ServiceConfig, ServiceViewV4, UpstreamAuth,
-        UpstreamConfig,
+        ProviderConcurrencyLimits, ProviderConfigV4, ProviderEndpointV4, ServiceConfig,
+        ServiceViewV4, UpstreamAuth, UpstreamConfig,
     };
     use crate::routing_ir::{compile_legacy_route_plan_template, compile_v4_route_plan_template};
     use crate::state::{PassiveHealthState, UpstreamHealth};
@@ -247,6 +247,7 @@ mod tests {
                 tags: BTreeMap::new(),
                 supported_models: BTreeMap::new(),
                 model_mapping: BTreeMap::new(),
+                limits: ProviderConcurrencyLimits::default(),
             },
         );
         endpoints.insert(
@@ -258,6 +259,7 @@ mod tests {
                 tags: BTreeMap::new(),
                 supported_models: BTreeMap::new(),
                 model_mapping: BTreeMap::new(),
+                limits: ProviderConcurrencyLimits::default(),
             },
         );
         let view = ServiceViewV4 {

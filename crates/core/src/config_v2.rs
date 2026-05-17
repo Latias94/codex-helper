@@ -198,6 +198,7 @@ pub fn build_persisted_provider_catalog(view: &ServiceViewV2) -> PersistedProvid
             auth_token_env: provider.auth.auth_token_env.clone(),
             api_key_env: provider.auth.api_key_env.clone(),
             tags: provider.tags.clone(),
+            limits: crate::config::ProviderConcurrencyLimits::default(),
             endpoints: provider
                 .endpoints
                 .iter()
@@ -207,6 +208,7 @@ pub fn build_persisted_provider_catalog(view: &ServiceViewV2) -> PersistedProvid
                     enabled: endpoint.enabled,
                     priority: endpoint.priority,
                     tags: endpoint.tags.clone(),
+                    limits: crate::config::ProviderConcurrencyLimits::default(),
                 })
                 .collect(),
         })

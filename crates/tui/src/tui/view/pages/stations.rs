@@ -389,9 +389,24 @@ fn format_runtime_skip_reasons(
     }
     reasons
         .iter()
-        .map(crate::routing_explain::RoutingExplainSkipReason::code)
+        .map(format_runtime_skip_reason)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn format_runtime_skip_reason(reason: &crate::routing_explain::RoutingExplainSkipReason) -> String {
+    match reason {
+        crate::routing_explain::RoutingExplainSkipReason::ConcurrencySaturated {
+            active,
+            limit,
+        } => match (active, limit) {
+            (Some(active), Some(limit)) => {
+                format!("concurrency_saturated(active={active}/limit={limit})")
+            }
+            _ => reason.code().to_string(),
+        },
+        _ => reason.code().to_string(),
+    }
 }
 
 pub(super) fn render_stations_page(

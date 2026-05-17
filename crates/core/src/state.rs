@@ -1219,6 +1219,9 @@ impl ProxyState {
                             cooldown_active,
                             usage_exhausted: health.usage_exhausted,
                             missing_auth: false,
+                            concurrency_saturated: false,
+                            concurrency_active: None,
+                            concurrency_limit: None,
                         },
                     );
                     if let Some(last_good_at_ms) = health.last_good_at_ms

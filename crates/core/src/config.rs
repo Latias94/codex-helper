@@ -285,6 +285,18 @@ fn is_default_provider_endpoint_priority(value: &u32) -> bool {
     *value == default_provider_endpoint_priority()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+pub struct ProviderConcurrencyLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_group: Option<String>,
+}
+
+fn is_default_provider_concurrency_limits(value: &ProviderConcurrencyLimits) -> bool {
+    value == &ProviderConcurrencyLimits::default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServiceConfigManager {
     /// 当前激活配置名
@@ -648,6 +660,11 @@ pub struct ProviderConfigV4 {
         alias = "modelMapping"
     )]
     pub model_mapping: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_provider_concurrency_limits"
+    )]
+    pub limits: ProviderConcurrencyLimits,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub endpoints: BTreeMap<String, ProviderEndpointV4>,
 }
@@ -663,6 +680,7 @@ impl Default for ProviderConfigV4 {
             tags: BTreeMap::new(),
             supported_models: BTreeMap::new(),
             model_mapping: BTreeMap::new(),
+            limits: ProviderConcurrencyLimits::default(),
             endpoints: BTreeMap::new(),
         }
     }
@@ -695,6 +713,11 @@ pub struct ProviderEndpointV4 {
         alias = "modelMapping"
     )]
     pub model_mapping: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_provider_concurrency_limits"
+    )]
+    pub limits: ProviderConcurrencyLimits,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1320,6 +1343,11 @@ pub struct PersistedProviderEndpointSpec {
     pub priority: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_provider_concurrency_limits"
+    )]
+    pub limits: ProviderConcurrencyLimits,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1335,6 +1363,11 @@ pub struct PersistedProviderSpec {
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_provider_concurrency_limits"
+    )]
+    pub limits: ProviderConcurrencyLimits,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<PersistedProviderEndpointSpec>,
 }

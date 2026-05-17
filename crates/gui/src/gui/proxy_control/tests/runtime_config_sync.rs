@@ -34,6 +34,7 @@ fn v4_config(base_url: &str) -> ProxyConfig {
                     tags: BTreeMap::new(),
                     supported_models: BTreeMap::new(),
                     model_mapping: BTreeMap::new(),
+                    limits: Default::default(),
                     endpoints: BTreeMap::new(),
                     alias: Some("Monthly".to_string()),
                     enabled: true,

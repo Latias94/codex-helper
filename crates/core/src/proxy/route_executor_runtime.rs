@@ -72,6 +72,9 @@ pub(super) fn route_plan_runtime_state_from_lbs_with_overrides(
                 cooldown_active,
                 usage_exhausted: state.usage_exhausted.get(idx).copied().unwrap_or(false),
                 missing_auth: false,
+                concurrency_saturated: false,
+                concurrency_active: None,
+                concurrency_limit: None,
             };
             runtime.set_provider_endpoint(provider_endpoint_key.clone(), upstream_state);
             if state.last_good_index == Some(idx) && runtime.affinity_provider_endpoint().is_none()

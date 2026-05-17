@@ -19,6 +19,7 @@ use super::attempt_transport::{
     AttemptReadBodyOutcome, AttemptReadBodyParams, AttemptTransportOutcome, AttemptTransportParams,
     handle_attempt_transport, read_attempt_response_body,
 };
+use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::filter_response_headers;
 use super::request_preparation::RequestFlavor;
 use super::retry::{RetryLayerOptions, RetryPlan};
@@ -93,6 +94,7 @@ pub(super) struct ExecuteSelectedUpstreamParams<'a> {
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
     pub(super) upstream_chain: &'a mut Vec<String>,
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
+    pub(super) concurrency_permit: Option<ConcurrencyPermit>,
 }
 
 pub(super) async fn execute_selected_upstream(
@@ -143,6 +145,7 @@ pub(super) async fn execute_selected_upstream(
         last_err,
         upstream_chain,
         route_attempts,
+        mut concurrency_permit,
     } = params;
 
     let selected_setup = prepare_selected_upstream_request(SelectedUpstreamRequestSetupParams {
@@ -287,6 +290,7 @@ pub(super) async fn execute_selected_upstream(
                     cooldown_backoff,
                     method,
                     path: uri.path(),
+                    concurrency_permit: concurrency_permit.take(),
                 })
                 .await,
             );

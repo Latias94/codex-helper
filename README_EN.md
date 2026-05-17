@@ -143,6 +143,14 @@ Common routing policies:
 | Monthly stop-loss | Same command with `--on-exhausted stop` | Avoids silent pay-as-you-go spillover |
 | Monthly pool + paygo fallback | Use nested route nodes in TOML | Keeps `monthly_pool -> paygo` explicit |
 
+Provider or endpoint concurrency caps can protect relay accounts with small upstream limits:
+
+```toml
+[codex.providers.input.limits]
+max_concurrent_requests = 5
+limit_group = "input-account"
+```
+
 For complete config, migration, balance adapters, pricing, and GUI/TUI editing notes, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The equivalent Chinese reference is [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md).
 
 ## Proxy Notes

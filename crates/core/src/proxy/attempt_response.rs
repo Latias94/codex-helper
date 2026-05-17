@@ -14,6 +14,7 @@ use super::attempt_health::{
 };
 use super::attempt_target::AttemptTarget;
 use super::classify::{class_is_health_neutral, classify_upstream_response};
+use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::request_body::extract_service_tier_from_response_body;
@@ -99,6 +100,7 @@ pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) cooldown_backoff: CooldownBackoff,
     pub(super) method: &'a Method,
     pub(super) path: &'a str,
+    pub(super) concurrency_permit: Option<ConcurrencyPermit>,
 }
 
 fn summarize_upstream_error_body(response_body: &Bytes, response_headers: &HeaderMap) -> String {
@@ -151,6 +153,7 @@ pub(super) async fn handle_streaming_attempt_success(
         cooldown_backoff,
         method,
         path,
+        concurrency_permit,
     } = params;
 
     record_attempt_success(
@@ -216,6 +219,7 @@ pub(super) async fn handle_streaming_attempt_success(
             cooldown_backoff,
             method: method.clone(),
             path: path.to_string(),
+            concurrency_permit,
         },
     )
     .await

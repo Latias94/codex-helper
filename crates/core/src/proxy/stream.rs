@@ -21,6 +21,7 @@ use super::attempt_health::{
 };
 use super::attempt_target::AttemptTarget;
 use super::classify::classify_upstream_response;
+use super::concurrency_limits::ConcurrencyPermit;
 use super::headers::header_map_to_entries;
 use super::http_debug::{HttpDebugBase, warn_http_debug};
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
@@ -99,6 +100,7 @@ struct StreamFinalize {
     target: AttemptTarget,
     transport_cooldown_secs: u64,
     cooldown_backoff: crate::lb::CooldownBackoff,
+    _concurrency_permit: Option<ConcurrencyPermit>,
 }
 
 fn summarize_error_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
@@ -414,6 +416,7 @@ pub(super) async fn build_sse_success_response(
         cooldown_backoff,
         method,
         path,
+        concurrency_permit,
     } = meta;
 
     if is_user_turn {
@@ -502,6 +505,7 @@ pub(super) async fn build_sse_success_response(
         target: target.clone(),
         transport_cooldown_secs,
         cooldown_backoff,
+        _concurrency_permit: concurrency_permit,
     };
 
     if is_user_turn && is_codex_service {
@@ -684,4 +688,5 @@ pub(super) struct SseSuccessMeta {
     pub(super) cooldown_backoff: crate::lb::CooldownBackoff,
     pub(super) method: Method,
     pub(super) path: String,
+    pub(super) concurrency_permit: Option<ConcurrencyPermit>,
 }

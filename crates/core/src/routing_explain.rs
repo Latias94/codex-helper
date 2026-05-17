@@ -142,12 +142,20 @@ pub struct RoutingExplainCompatibility {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum RoutingExplainSkipReason {
-    UnsupportedModel { requested_model: String },
+    UnsupportedModel {
+        requested_model: String,
+    },
     RuntimeDisabled,
     Cooldown,
-    BreakerOpen { failure_count: u32 },
+    BreakerOpen {
+        failure_count: u32,
+    },
     UsageExhausted,
     MissingAuth,
+    ConcurrencySaturated {
+        active: Option<u32>,
+        limit: Option<u32>,
+    },
 }
 
 pub fn build_routing_explain_response(
@@ -294,6 +302,12 @@ impl From<&RoutePlanSkipReason> for RoutingExplainSkipReason {
             }
             RoutePlanSkipReason::UsageExhausted => RoutingExplainSkipReason::UsageExhausted,
             RoutePlanSkipReason::MissingAuth => RoutingExplainSkipReason::MissingAuth,
+            RoutePlanSkipReason::ConcurrencySaturated { active, limit } => {
+                RoutingExplainSkipReason::ConcurrencySaturated {
+                    active: *active,
+                    limit: *limit,
+                }
+            }
         }
     }
 }
@@ -307,6 +321,7 @@ impl RoutingExplainSkipReason {
             RoutingExplainSkipReason::BreakerOpen { .. } => "breaker_open",
             RoutingExplainSkipReason::UsageExhausted => "usage_exhausted",
             RoutingExplainSkipReason::MissingAuth => "missing_auth",
+            RoutingExplainSkipReason::ConcurrencySaturated { .. } => "concurrency_saturated",
         }
     }
 }

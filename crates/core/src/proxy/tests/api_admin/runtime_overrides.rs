@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-use crate::config::ProviderEndpointV4;
+use crate::config::{ProviderConcurrencyLimits, ProviderEndpointV4};
 use crate::state::FinishRequestParams;
 
 #[tokio::test]
@@ -882,6 +882,7 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
                                 tags: BTreeMap::new(),
                                 supported_models: BTreeMap::new(),
                                 model_mapping: BTreeMap::new(),
+                                limits: ProviderConcurrencyLimits::default(),
                             },
                         ),
                         (
@@ -893,6 +894,7 @@ async fn proxy_api_v1_provider_runtime_override_filters_v4_route_plan_routing() 
                                 tags: BTreeMap::new(),
                                 supported_models: BTreeMap::new(),
                                 model_mapping: BTreeMap::new(),
+                                limits: ProviderConcurrencyLimits::default(),
                             },
                         ),
                     ]),

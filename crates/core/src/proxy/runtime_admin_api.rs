@@ -19,6 +19,7 @@ use super::api_responses::{
     build_retry_config_response, make_profiles_response,
 };
 use super::control_plane_service::save_runtime_proxy_settings_and_reload;
+use super::provider_execution::apply_concurrency_snapshots_to_runtime;
 use super::request_routing::RequestRouteSelection;
 use super::route_affinity::apply_session_route_affinity_to_runtime;
 use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
@@ -224,6 +225,7 @@ pub(super) async fn routing_explain_for_proxy(
                 .state
                 .route_plan_runtime_state_for_provider_endpoints(proxy.service_name)
                 .await;
+            apply_concurrency_snapshots_to_runtime(proxy, template, &mut runtime);
             let route_graph_key = template.route_graph_key();
             apply_session_route_affinity_to_runtime(
                 proxy,

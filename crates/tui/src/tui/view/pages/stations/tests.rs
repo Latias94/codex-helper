@@ -123,6 +123,19 @@ fn station_routing_preview_uses_single_level_fallback_order() {
 }
 
 #[test]
+fn runtime_skip_reasons_include_concurrency_counts() {
+    let text = format_runtime_skip_reasons(&[
+        crate::routing_explain::RoutingExplainSkipReason::ConcurrencySaturated {
+            active: Some(5),
+            limit: Some(5),
+        },
+        crate::routing_explain::RoutingExplainSkipReason::MissingAuth,
+    ]);
+
+    assert_eq!(text, "concurrency_saturated(active=5/limit=5),missing_auth");
+}
+
+#[test]
 fn station_routing_preview_sorts_multi_level_and_active_tiebreak() {
     let providers = vec![
         provider("alpha", true, 2, false, 1),

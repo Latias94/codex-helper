@@ -64,6 +64,7 @@ impl ProxyService {
             config: Arc::new(RuntimeConfig::new_with_v4(config, v4_source)),
             service_name,
             lb_states,
+            concurrency_limiter: Arc::new(super::concurrency_limits::ConcurrencyLimiter::default()),
             filter: RequestFilter::new(),
             state,
         }
@@ -426,6 +427,7 @@ fn persisted_provider_spec_from_v4_for_service(
             enabled: provider.enabled,
             priority: 0,
             tags: std::collections::BTreeMap::new(),
+            limits: crate::config::ProviderConcurrencyLimits::default(),
         });
     }
     endpoints.extend(provider.endpoints.iter().map(|(endpoint_name, endpoint)| {
@@ -435,6 +437,7 @@ fn persisted_provider_spec_from_v4_for_service(
             enabled: endpoint.enabled,
             priority: endpoint.priority,
             tags: endpoint.tags.clone(),
+            limits: endpoint.limits.clone(),
         }
     }));
 
@@ -445,6 +448,7 @@ fn persisted_provider_spec_from_v4_for_service(
         auth_token_env: provider.inline_auth.auth_token_env.clone(),
         api_key_env: provider.inline_auth.api_key_env.clone(),
         tags: provider.tags.clone(),
+        limits: provider.limits.clone(),
         endpoints,
     }
 }

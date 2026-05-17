@@ -4,9 +4,9 @@ use std::hash::{Hash, Hasher};
 use anyhow::{Context, Result};
 
 use crate::config::{
-    ProviderConfigV4, RoutingAffinityPolicyV5, RoutingConditionV4, RoutingConfigV4,
-    RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4, ServiceConfig, ServiceViewV4,
-    UpstreamAuth, UpstreamConfig, effective_v4_routing,
+    ProviderConcurrencyLimits, ProviderConfigV4, RoutingAffinityPolicyV5, RoutingConditionV4,
+    RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4, ServiceConfig,
+    ServiceViewV4, UpstreamAuth, UpstreamConfig, effective_v4_routing,
 };
 use crate::lb::{FAILURE_THRESHOLD, SelectedUpstream};
 use crate::model_routing;
@@ -139,6 +139,7 @@ fn hash_route_candidate<H: Hasher>(candidate: &RouteCandidate, hasher: &mut H) {
     candidate.route_path.hash(hasher);
     candidate.preference_group.hash(hasher);
     candidate.stable_index.hash(hasher);
+    candidate.concurrency.hash(hasher);
     candidate.compatibility_station_name.hash(hasher);
     candidate.compatibility_upstream_index.hash(hasher);
 }
@@ -188,8 +189,38 @@ pub struct RouteCandidate {
     pub route_path: Vec<String>,
     pub preference_group: u32,
     pub stable_index: usize,
+    pub concurrency: RouteCandidateConcurrency,
     pub compatibility_station_name: Option<String>,
     pub compatibility_upstream_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct RouteCandidateConcurrency {
+    pub max_concurrent_requests: Option<u32>,
+    pub limit_group: Option<String>,
+}
+
+impl RouteCandidateConcurrency {
+    pub fn is_limited(&self) -> bool {
+        self.max_concurrent_requests.is_some()
+    }
+
+    pub fn limit_key(
+        &self,
+        service_name: &str,
+        provider_endpoint: &ProviderEndpointKey,
+    ) -> Option<String> {
+        self.max_concurrent_requests?;
+        if let Some(scope) = self
+            .limit_group
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(format!("{service_name}/{scope}"));
+        }
+        Some(provider_endpoint.stable_key())
+    }
 }
 
 impl RouteCandidate {
@@ -396,6 +427,9 @@ pub struct RoutePlanUpstreamRuntimeState {
     pub cooldown_active: bool,
     pub usage_exhausted: bool,
     pub missing_auth: bool,
+    pub concurrency_saturated: bool,
+    pub concurrency_active: Option<u32>,
+    pub concurrency_limit: Option<u32>,
 }
 
 impl RoutePlanUpstreamRuntimeState {
@@ -410,12 +444,20 @@ impl RoutePlanUpstreamRuntimeState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutePlanSkipReason {
-    UnsupportedModel { requested_model: String },
+    UnsupportedModel {
+        requested_model: String,
+    },
     RuntimeDisabled,
     Cooldown,
-    BreakerOpen { failure_count: u32 },
+    BreakerOpen {
+        failure_count: u32,
+    },
     UsageExhausted,
     MissingAuth,
+    ConcurrencySaturated {
+        active: Option<u32>,
+        limit: Option<u32>,
+    },
 }
 
 impl RoutePlanSkipReason {
@@ -427,6 +469,7 @@ impl RoutePlanSkipReason {
             RoutePlanSkipReason::BreakerOpen { .. } => "breaker_open",
             RoutePlanSkipReason::UsageExhausted => "usage_exhausted",
             RoutePlanSkipReason::MissingAuth => "missing_auth",
+            RoutePlanSkipReason::ConcurrencySaturated { .. } => "concurrency_saturated",
         }
     }
 }
@@ -756,6 +799,12 @@ impl<'a> RoutePlanExecutor<'a> {
         if runtime_state.missing_auth {
             reasons.push(RoutePlanSkipReason::MissingAuth);
         }
+        if runtime_state.concurrency_saturated {
+            reasons.push(RoutePlanSkipReason::ConcurrencySaturated {
+                active: runtime_state.concurrency_active,
+                limit: runtime_state.concurrency_limit,
+            });
+        }
         reasons
     }
 
@@ -1003,7 +1052,9 @@ fn candidate_available_in_runtime(
     require_usage_available: bool,
 ) -> bool {
     let upstream = runtime.runtime_state_for_candidate(template, candidate);
-    !upstream.hard_unavailable() && (!require_usage_available || !upstream.usage_exhausted)
+    !upstream.hard_unavailable()
+        && !upstream.concurrency_saturated
+        && (!require_usage_available || !upstream.usage_exhausted)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1054,6 +1105,7 @@ struct EndpointParts {
     tags: BTreeMap<String, String>,
     supported_models: BTreeMap<String, bool>,
     model_mapping: BTreeMap<String, String>,
+    limits: ProviderConcurrencyLimits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1176,6 +1228,7 @@ pub fn compile_legacy_route_plan_template<'a>(
                 route_path,
                 preference_group: 0,
                 stable_index,
+                concurrency: RouteCandidateConcurrency::default(),
                 compatibility_station_name: Some(service.name.clone()),
                 compatibility_upstream_index: Some(upstream_index),
             });
@@ -1921,12 +1974,31 @@ fn route_candidates_from_leaves(
                 route_path: leaf.route_path.clone(),
                 preference_group: leaf.preference_group,
                 stable_index,
+                concurrency: effective_candidate_concurrency(&provider.limits, &endpoint.limits),
                 compatibility_station_name: None,
                 compatibility_upstream_index: None,
             });
         }
     }
     Ok(candidates)
+}
+
+fn effective_candidate_concurrency(
+    provider: &ProviderConcurrencyLimits,
+    endpoint: &ProviderConcurrencyLimits,
+) -> RouteCandidateConcurrency {
+    RouteCandidateConcurrency {
+        max_concurrent_requests: endpoint
+            .max_concurrent_requests
+            .or(provider.max_concurrent_requests),
+        limit_group: endpoint
+            .limit_group
+            .as_ref()
+            .or(provider.limit_group.as_ref())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+    }
 }
 
 fn ordered_provider_endpoints(
@@ -1954,6 +2026,7 @@ fn ordered_provider_endpoints(
             tags: BTreeMap::new(),
             supported_models: BTreeMap::new(),
             model_mapping: BTreeMap::new(),
+            limits: ProviderConcurrencyLimits::default(),
         });
     }
 
@@ -1971,6 +2044,7 @@ fn ordered_provider_endpoints(
             tags: endpoint.tags.clone(),
             supported_models: endpoint.supported_models.clone(),
             model_mapping: endpoint.model_mapping.clone(),
+            limits: endpoint.limits.clone(),
         });
     }
 
@@ -2094,9 +2168,9 @@ fn btree_bool_map_to_hash_map(values: &BTreeMap<String, bool>) -> HashMap<String
 mod tests {
     use super::*;
     use crate::config::{
-        ProviderEndpointV4, ProxyConfigV4, RoutingAffinityPolicyV5, RoutingConditionV4,
-        RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4, RoutingPolicyV4,
-        compile_v4_to_runtime, resolved_v4_provider_order,
+        ProviderConcurrencyLimits, ProviderEndpointV4, ProxyConfigV4, RoutingAffinityPolicyV5,
+        RoutingConditionV4, RoutingConfigV4, RoutingExhaustedActionV4, RoutingNodeV4,
+        RoutingPolicyV4, compile_v4_to_runtime, resolved_v4_provider_order,
     };
     use crate::lb::{LbState, LoadBalancer, SelectedUpstream};
     use std::collections::{HashMap, HashSet};
@@ -2113,6 +2187,17 @@ mod tests {
         ProviderConfigV4 {
             base_url: Some(base_url.to_string()),
             tags: BTreeMap::from([(key.to_string(), value.to_string())]),
+            ..ProviderConfigV4::default()
+        }
+    }
+
+    fn limited_provider(base_url: &str, max_concurrent_requests: u32) -> ProviderConfigV4 {
+        ProviderConfigV4 {
+            base_url: Some(base_url.to_string()),
+            limits: ProviderConcurrencyLimits {
+                max_concurrent_requests: Some(max_concurrent_requests),
+                limit_group: None,
+            },
             ..ProviderConfigV4::default()
         }
     }
@@ -3074,6 +3159,7 @@ mod tests {
                 tags: BTreeMap::from([("region".to_string(), "us".to_string())]),
                 supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
                 model_mapping: BTreeMap::new(),
+                limits: ProviderConcurrencyLimits::default(),
             },
         );
         endpoints.insert(
@@ -3088,6 +3174,7 @@ mod tests {
                     "gpt-5".to_string(),
                     "provider-gpt-5".to_string(),
                 )]),
+                limits: ProviderConcurrencyLimits::default(),
             },
         );
         let view = ServiceViewV4 {
@@ -3145,6 +3232,113 @@ mod tests {
     }
 
     #[test]
+    fn routing_ir_provider_concurrency_limit_compiles_to_default_endpoint() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "relay".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("https://relay.example/v1".to_string()),
+                    limits: ProviderConcurrencyLimits {
+                        max_concurrent_requests: Some(5),
+                        limit_group: Some(" relay-account ".to_string()),
+                    },
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            ..ServiceViewV4::default()
+        };
+
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let concurrency = &template.candidates[0].concurrency;
+
+        assert_eq!(concurrency.max_concurrent_requests, Some(5));
+        assert_eq!(concurrency.limit_group.as_deref(), Some("relay-account"));
+        assert_eq!(
+            concurrency.limit_key(
+                "codex",
+                &template.candidate_provider_endpoint_key(&template.candidates[0])
+            ),
+            Some("codex/relay-account".to_string())
+        );
+    }
+
+    #[test]
+    fn routing_ir_endpoint_concurrency_limit_overrides_provider_limit() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "relay".to_string(),
+                ProviderConfigV4 {
+                    limits: ProviderConcurrencyLimits {
+                        max_concurrent_requests: Some(5),
+                        limit_group: Some("relay-account".to_string()),
+                    },
+                    endpoints: BTreeMap::from([(
+                        "hk".to_string(),
+                        ProviderEndpointV4 {
+                            base_url: "https://hk.relay.example/v1".to_string(),
+                            enabled: true,
+                            priority: 0,
+                            tags: BTreeMap::new(),
+                            supported_models: BTreeMap::new(),
+                            model_mapping: BTreeMap::new(),
+                            limits: ProviderConcurrencyLimits {
+                                max_concurrent_requests: Some(2),
+                                limit_group: Some("relay-hk".to_string()),
+                            },
+                        },
+                    )]),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            ..ServiceViewV4::default()
+        };
+
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let concurrency = &template.candidates[0].concurrency;
+
+        assert_eq!(concurrency.max_concurrent_requests, Some(2));
+        assert_eq!(concurrency.limit_group.as_deref(), Some("relay-hk"));
+        assert_eq!(
+            concurrency.limit_key(
+                "codex",
+                &template.candidate_provider_endpoint_key(&template.candidates[0])
+            ),
+            Some("codex/relay-hk".to_string())
+        );
+    }
+
+    #[test]
+    fn routing_ir_default_concurrency_is_unlimited_and_keyed_by_provider_endpoint_without_group() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([(
+                "relay".to_string(),
+                ProviderConfigV4 {
+                    base_url: Some("https://relay.example/v1".to_string()),
+                    ..ProviderConfigV4::default()
+                },
+            )]),
+            ..ServiceViewV4::default()
+        };
+
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let concurrency = &template.candidates[0].concurrency;
+        let provider_endpoint = template.candidate_provider_endpoint_key(&template.candidates[0]);
+
+        assert_eq!(concurrency.max_concurrent_requests, None);
+        assert_eq!(concurrency.limit_group, None);
+        assert_eq!(concurrency.limit_key("codex", &provider_endpoint), None);
+
+        let grouped = RouteCandidateConcurrency {
+            max_concurrent_requests: Some(3),
+            limit_group: None,
+        };
+        assert_eq!(
+            grouped.limit_key("codex", &provider_endpoint),
+            Some("codex/relay/default".to_string())
+        );
+    }
+
+    #[test]
     fn routing_ir_manual_sticky_can_target_provider_endpoint() {
         let view = ServiceViewV4 {
             providers: BTreeMap::from([(
@@ -3160,6 +3354,7 @@ mod tests {
                                 tags: BTreeMap::new(),
                                 supported_models: BTreeMap::new(),
                                 model_mapping: BTreeMap::new(),
+                                limits: ProviderConcurrencyLimits::default(),
                             },
                         ),
                         (
@@ -3171,6 +3366,7 @@ mod tests {
                                 tags: BTreeMap::new(),
                                 supported_models: BTreeMap::new(),
                                 model_mapping: BTreeMap::new(),
+                                limits: ProviderConcurrencyLimits::default(),
                             },
                         ),
                     ]),
@@ -3220,6 +3416,7 @@ mod tests {
                             tags: BTreeMap::new(),
                             supported_models: BTreeMap::new(),
                             model_mapping: BTreeMap::new(),
+                            limits: ProviderConcurrencyLimits::default(),
                         },
                     )]),
                     ..ProviderConfigV4::default()
@@ -3365,6 +3562,7 @@ mod tests {
                 tags: BTreeMap::from([("region".to_string(), "us".to_string())]),
                 supported_models: BTreeMap::from([("gpt-4.1".to_string(), true)]),
                 model_mapping: BTreeMap::new(),
+                limits: ProviderConcurrencyLimits::default(),
             },
         );
         endpoints.insert(
@@ -3379,6 +3577,7 @@ mod tests {
                     "gpt-5".to_string(),
                     "provider-gpt-5".to_string(),
                 )]),
+                limits: ProviderConcurrencyLimits::default(),
             },
         );
 
@@ -3670,6 +3869,62 @@ mod tests {
         );
         let selected = selection.selected.expect("healthy candidate selected");
         assert_eq!(selected.candidate.provider_id, "healthy");
+    }
+
+    #[test]
+    fn route_plan_executor_skips_saturated_candidate_without_failure_penalty() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    limited_provider("https://primary.example/v1", 5),
+                ),
+                ("backup".to_string(), provider("https://backup.example/v1")),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "primary".to_string(),
+                "backup".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        assert_eq!(
+            template.candidates[0].concurrency.max_concurrent_requests,
+            Some(5)
+        );
+
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "primary", "default"),
+            RoutePlanUpstreamRuntimeState {
+                concurrency_saturated: true,
+                concurrency_active: Some(5),
+                concurrency_limit: Some(5),
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        let explanations =
+            executor.explain_candidate_skip_reasons_with_runtime_state(&runtime, None);
+        assert_eq!(explanations.len(), 1);
+        assert_eq!(explanations[0].candidate.provider_id, "primary");
+        assert_eq!(
+            explanations[0]
+                .reasons
+                .iter()
+                .map(RoutePlanSkipReason::code)
+                .collect::<Vec<_>>(),
+            vec!["concurrency_saturated"]
+        );
+
+        let mut state = RoutePlanAttemptState::default();
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+        let selected = selection.selected.expect("fallback candidate selected");
+
+        assert_eq!(selected.candidate.provider_id, "backup");
+        assert_eq!(selection.avoided_candidate_indices, Vec::<usize>::new());
     }
 
     #[test]

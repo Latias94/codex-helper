@@ -691,6 +691,171 @@ async fn proxy_v4_route_graph_health_does_not_write_synthetic_routing_lb_state()
 }
 
 #[tokio::test]
+async fn proxy_v4_route_graph_skips_provider_when_local_concurrency_limit_is_saturated() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let primary_started = Arc::new(tokio::sync::Notify::new());
+    let release_primary = Arc::new(tokio::sync::Notify::new());
+
+    let primary_counter = primary_hits.clone();
+    let primary_started_for_route = primary_started.clone();
+    let release_primary_for_route = release_primary.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            let primary_started = primary_started_for_route.clone();
+            let release_primary = release_primary_for_route.clone();
+            async move {
+                primary_counter.fetch_add(1, Ordering::SeqCst);
+                primary_started.notify_one();
+                release_primary.notified().await;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "primary" })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let v4 = ProxyConfigV4 {
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{primary_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        limits: ProviderConcurrencyLimits {
+                            max_concurrent_requests: Some(1),
+                            limit_group: None,
+                        },
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{backup_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4 {
+                entry: "main".to_string(),
+                routes: std::collections::BTreeMap::from([(
+                    "main".to_string(),
+                    RoutingNodeV4 {
+                        strategy: RoutingPolicyV4::OrderedFailover,
+                        children: vec!["primary".to_string(), "backup".to_string()],
+                        ..RoutingNodeV4::default()
+                    },
+                )]),
+                ..RoutingConfigV4::default()
+            }),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compat runtime");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let first_request = tokio::spawn({
+        let client = client.clone();
+        async move { send_responses_json(&client, proxy_addr, Some("sid-primary")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), primary_started.notified())
+        .await
+        .expect("primary request should acquire the only local concurrency permit");
+
+    let explain = client
+        .get(format!(
+            "http://{}/__codex_helper/api/v1/routing/explain?session=sid-second",
+            proxy_addr
+        ))
+        .send()
+        .await
+        .expect("routing explain send")
+        .error_for_status()
+        .expect("routing explain status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("routing explain json");
+    assert_eq!(
+        explain["selected_route"]["provider_id"].as_str(),
+        Some("backup")
+    );
+    assert_eq!(
+        explain["candidates"][0]["skip_reasons"][0]["code"].as_str(),
+        Some("concurrency_saturated")
+    );
+    assert_eq!(
+        explain["candidates"][0]["skip_reasons"][0]["active"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        explain["candidates"][0]["skip_reasons"][0]["limit"].as_u64(),
+        Some(1)
+    );
+
+    let second = match tokio::time::timeout(
+        Duration::from_secs(2),
+        send_responses_json(&client, proxy_addr, Some("sid-second")),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            release_primary.notify_waiters();
+            panic!("second request should fail over instead of waiting for primary: {error}");
+        }
+    };
+    assert_eq!(second["provider"].as_str(), Some("backup"));
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    release_primary.notify_one();
+    let first = tokio::time::timeout(Duration::from_secs(2), first_request)
+        .await
+        .expect("primary request should finish after release")
+        .expect("primary request task should join");
+    assert_eq!(first["provider"].as_str(), Some("primary"));
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_v4_conditional_routing_selects_branch_by_request_model() {
     let small_hits = Arc::new(AtomicUsize::new(0));
     let large_hits = Arc::new(AtomicUsize::new(0));
