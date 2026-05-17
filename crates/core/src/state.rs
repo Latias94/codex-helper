@@ -1660,6 +1660,14 @@ impl ProxyState {
                 .or_default()
                 .entry(station_name.clone())
                 .or_default();
+            if !snapshot.has_amount_data()
+                && let Some(previous) = station_balances
+                    .get(&upstream_index)
+                    .and_then(|providers| providers.get(&snapshot.provider_id))
+            {
+                snapshot.carry_forward_amount_data_from(previous);
+                snapshot.refresh_status(now_ms);
+            }
             station_balances
                 .entry(upstream_index)
                 .or_default()
@@ -4035,6 +4043,63 @@ mod tests {
                     .map(|snapshot| snapshot.provider_id.as_str())
                     .collect::<Vec<_>>(),
                 vec!["general", "newapi"]
+            );
+        });
+    }
+
+    #[test]
+    fn provider_balance_error_refresh_preserves_previous_amounts() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            state
+                .record_provider_balance_snapshot(
+                    "codex",
+                    ProviderBalanceSnapshot {
+                        provider_id: "input".to_string(),
+                        station_name: Some("routing".to_string()),
+                        upstream_index: Some(0),
+                        source: "usage_provider:sub2api_usage".to_string(),
+                        fetched_at_ms: unix_now_ms(),
+                        stale_after_ms: None,
+                        exhausted: Some(false),
+                        quota_period: Some("daily".to_string()),
+                        quota_remaining_usd: Some("263.68".to_string()),
+                        quota_limit_usd: Some("300.00".to_string()),
+                        ..ProviderBalanceSnapshot::default()
+                    },
+                )
+                .await;
+
+            state
+                .record_provider_balance_snapshot(
+                    "codex",
+                    ProviderBalanceSnapshot {
+                        provider_id: "input".to_string(),
+                        station_name: Some("routing".to_string()),
+                        upstream_index: Some(0),
+                        source: "usage_provider:openai_balance_http_json".to_string(),
+                        fetched_at_ms: unix_now_ms(),
+                        stale_after_ms: None,
+                        error: Some("usage provider response read failed".to_string()),
+                        ..ProviderBalanceSnapshot::default()
+                    },
+                )
+                .await;
+
+            let view = state.get_provider_balance_view("codex").await;
+            let snapshot = view
+                .get("routing")
+                .and_then(|snapshots| snapshots.first())
+                .expect("routing balance snapshot");
+
+            assert_eq!(snapshot.status, BalanceSnapshotStatus::Error);
+            assert_eq!(snapshot.quota_period.as_deref(), Some("daily"));
+            assert_eq!(snapshot.quota_remaining_usd.as_deref(), Some("263.68"));
+            assert_eq!(snapshot.quota_limit_usd.as_deref(), Some("300.00"));
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some("usage provider response read failed")
             );
         });
     }

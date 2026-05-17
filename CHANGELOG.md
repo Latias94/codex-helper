@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 - `provider add` 支持 `--supported-model` 和 `--model-map FROM=TO`，`provider show --json` 也会带出 `supported_models` 和 `model_mapping`；用于 Codex 请求模型名和 relay 实际模型名不一致的场景，例如 `gpt-5.5` -> `openai/gpt-5.5`。
 - TUI 的 `Stats` 导航位升级为 `Usage`，页面集中展示 provider 用量、成本、余额/配额状态、刷新摘要、路由影响和 endpoint 最近样本。
 - TUI `Usage / Balance` 卡片新增 USD 消耗速率预测：按最近已计价请求估算 `$ / h`，并外推到每日刷新时间（默认本地 `+08:00` 0 点）；可通过 `[ui.usage_forecast]` 配置窗口、最小样本和刷新时区。
+- 余额刷新短暂失败时会保留上一条可用金额，只把快照标记为错误/待关注，避免 `Routing` 页面把已有的 `input*` 余额清成纯“未知”。
 - TUI `Usage` 页面新增关注项筛选：按 `a` 只看余额异常、刷新失败、用量异常或状态需要处理的 provider。
 - TUI `Usage` 页面 provider 详情支持 `PgUp` / `PgDn` 滚动 endpoint 列表，provider 很多或 endpoint 很多时更容易查看余额和最近请求。
 - 窄终端和中英文混排下，余额/配额会保持金额原子显示；空间不足时退回状态标签，避免出现 `$0/$` 这类半截金额。
@@ -42,6 +43,7 @@ All notable changes to this project will be documented in this file.
 - `provider add` now accepts `--supported-model` and `--model-map FROM=TO`, and `provider show --json` exposes `supported_models` / `model_mapping`, covering relay model aliases such as `gpt-5.5` -> `openai/gpt-5.5`.
 - The TUI `Stats` slot is now `Usage`, focused on provider usage, cost, balance/quota state, refresh status, route impact, and endpoint recent samples.
 - The TUI `Usage / Balance` card now forecasts USD burn: it estimates `$ / h` from recent priced requests and projects spend until the daily reset time (default local `+08:00` midnight), configurable via `[ui.usage_forecast]`.
+- Transient balance refresh failures now keep the last usable amount and mark the snapshot as actionable/error, avoiding `input*` balances disappearing into a plain `unknown` state on the `Routing` page.
 - Press `a` on the TUI `Usage` page to filter providers that need attention, including balance issues, refresh failures, usage errors, and actionable states.
 - Provider details on the TUI `Usage` page now support `PgUp` / `PgDn` endpoint scrolling, making large provider and endpoint sets easier to inspect.
 - Narrow terminals and mixed CJK/English layouts now keep balance/quota amounts atomic. When there is not enough room, the UI falls back to a status label instead of showing partial amounts such as `$0/$`.

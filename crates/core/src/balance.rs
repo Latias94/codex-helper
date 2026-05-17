@@ -186,7 +186,7 @@ impl ProviderBalanceSnapshot {
         self.status == BalanceSnapshotStatus::Exhausted && !self.exhaustion_affects_routing
     }
 
-    fn has_amount_data(&self) -> bool {
+    pub fn has_amount_data(&self) -> bool {
         self.total_balance_usd.is_some()
             || self.subscription_balance_usd.is_some()
             || self.paygo_balance_usd.is_some()
@@ -199,6 +199,29 @@ impl ProviderBalanceSnapshot {
             || self.unlimited_quota == Some(true)
             || self.total_used_usd.is_some()
             || self.today_used_usd.is_some()
+    }
+
+    pub fn carry_forward_amount_data_from(&mut self, previous: &Self) {
+        if self.has_amount_data() {
+            return;
+        }
+        self.plan_name = previous.plan_name.clone();
+        self.total_balance_usd = previous.total_balance_usd.clone();
+        self.subscription_balance_usd = previous.subscription_balance_usd.clone();
+        self.paygo_balance_usd = previous.paygo_balance_usd.clone();
+        self.monthly_budget_usd = previous.monthly_budget_usd.clone();
+        self.monthly_spent_usd = previous.monthly_spent_usd.clone();
+        self.quota_period = previous.quota_period.clone();
+        self.quota_remaining_usd = previous.quota_remaining_usd.clone();
+        self.quota_limit_usd = previous.quota_limit_usd.clone();
+        self.quota_used_usd = previous.quota_used_usd.clone();
+        self.unlimited_quota = previous.unlimited_quota;
+        self.total_used_usd = previous.total_used_usd.clone();
+        self.today_used_usd = previous.today_used_usd.clone();
+        self.total_requests = previous.total_requests;
+        self.today_requests = previous.today_requests;
+        self.total_tokens = previous.total_tokens;
+        self.today_tokens = previous.today_tokens;
     }
 
     pub fn amount_summary(&self) -> String {
