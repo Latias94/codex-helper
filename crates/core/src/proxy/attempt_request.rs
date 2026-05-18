@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 
 use crate::codex_integration::CodexPatchMode;
 use crate::config::UpstreamAuth;
@@ -73,6 +73,10 @@ pub(super) fn prepare_attempt_request(
 
     // 复制客户端请求头，并按上游配置覆盖认证头；未提供上游凭证时保留客户端值。
     let mut headers = filter_request_headers(client_headers);
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
     inject_auth_headers(
         proxy.service_name,
         auth,
@@ -251,6 +255,10 @@ mod tests {
         assert_eq!(
             setup.headers.get("x-api-key"),
             Some(&HeaderValue::from_static("server-key"))
+        );
+        assert_eq!(
+            setup.headers.get("accept-encoding"),
+            Some(&HeaderValue::from_static("identity"))
         );
         assert!(setup.debug_base.is_none());
     }

@@ -16,6 +16,7 @@ use super::attempt_target::AttemptTarget;
 use super::classify::{class_is_health_neutral, classify_upstream_response};
 use super::concurrency_limits::ConcurrencyPermit;
 use super::http_debug::HttpDebugBase;
+use super::models_compat::maybe_decode_models_response_body;
 use super::passive_health::{record_passive_upstream_failure, record_passive_upstream_success};
 use super::request_body::extract_service_tier_from_response_body;
 use super::response_finalization::{
@@ -262,6 +263,16 @@ pub(super) async fn handle_attempt_response(
         cooldown_backoff,
     } = params;
 
+    let response_body = if status.is_success() {
+        maybe_decode_models_response_body(
+            proxy.service_name,
+            path,
+            &response_headers,
+            response_body,
+        )
+    } else {
+        response_body
+    };
     let status_code = status.as_u16();
     let (cls, _hint, _cf_ray) =
         classify_upstream_response(status_code, &response_headers, response_body.as_ref());

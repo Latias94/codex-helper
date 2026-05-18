@@ -1,6 +1,283 @@
 use super::*;
 
 #[tokio::test]
+async fn proxy_decodes_unlabeled_gzip_models_response_before_forwarding() {
+    static GZIPPED_MODELS_JSON: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0x4a, 0x49, 0x2c,
+        0x49, 0x54, 0xb2, 0x8a, 0xae, 0x56, 0xca, 0x4c, 0x51, 0xb2, 0x52, 0x4a, 0x2f, 0x28, 0xd1,
+        0x35, 0xd5, 0x33, 0x55, 0xd2, 0x51, 0xca, 0x4f, 0xca, 0x4a, 0x4d, 0x2e, 0x01, 0x0a, 0xe5,
+        0xe6, 0xa7, 0xa4, 0xe6, 0x28, 0xd5, 0xc6, 0xd6, 0x02, 0x00, 0x93, 0xd6, 0xe0, 0xa4, 0x2c,
+        0x00, 0x00, 0x00,
+    ];
+    let upstream_accept_encoding = Arc::new(std::sync::Mutex::new(None::<String>));
+    let seen_accept_encoding = upstream_accept_encoding.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/models",
+        get(move |headers: axum::http::HeaderMap| {
+            let seen_accept_encoding = seen_accept_encoding.clone();
+            async move {
+                let accept_encoding = headers
+                    .get(axum::http::header::ACCEPT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                *seen_accept_encoding.lock().expect("lock") = accept_encoding;
+
+                let mut response =
+                    Response::new(Body::from(Bytes::from_static(GZIPPED_MODELS_JSON)));
+                *response.status_mut() = StatusCode::OK;
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response
+            }
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let proxy_client = Client::new();
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        proxy_client,
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::builder()
+        .no_gzip()
+        .build()
+        .expect("client");
+    let resp = client
+        .get(format!("http://{}/models", proxy_addr))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        !resp
+            .headers()
+            .contains_key(axum::http::header::CONTENT_ENCODING)
+    );
+    let body = resp.bytes().await.expect("body");
+    assert_codex_models_response(body.as_ref(), "gpt-5.5", true);
+    assert_eq!(
+        upstream_accept_encoding.lock().expect("lock").as_deref(),
+        Some("identity")
+    );
+
+    proxy_handle.abort();
+    u_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_decodes_brotli_models_response_before_forwarding() {
+    static BROTLI_MODELS_JSON: &[u8] = &[
+        0x8b, 0x15, 0x80, 0x7b, 0x22, 0x64, 0x61, 0x74, 0x61, 0x22, 0x3a, 0x5b, 0x7b, 0x22, 0x69,
+        0x64, 0x22, 0x3a, 0x22, 0x67, 0x70, 0x74, 0x2d, 0x35, 0x2e, 0x35, 0x22, 0x2c, 0x22, 0x6f,
+        0x62, 0x6a, 0x65, 0x63, 0x74, 0x22, 0x3a, 0x22, 0x6d, 0x6f, 0x64, 0x65, 0x6c, 0x22, 0x7d,
+        0x5d, 0x7d, 0x03,
+    ];
+    let upstream_accept_encoding = Arc::new(std::sync::Mutex::new(None::<String>));
+    let seen_accept_encoding = upstream_accept_encoding.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/models",
+        get(move |headers: axum::http::HeaderMap| {
+            let seen_accept_encoding = seen_accept_encoding.clone();
+            async move {
+                let accept_encoding = headers
+                    .get(axum::http::header::ACCEPT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                *seen_accept_encoding.lock().expect("lock") = accept_encoding;
+
+                let mut response =
+                    Response::new(Body::from(Bytes::from_static(BROTLI_MODELS_JSON)));
+                *response.status_mut() = StatusCode::OK;
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_ENCODING,
+                    HeaderValue::from_static("br"),
+                );
+                response
+            }
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let proxy_client = Client::new();
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        proxy_client,
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::builder()
+        .no_gzip()
+        .build()
+        .expect("client");
+    let resp = client
+        .get(format!("http://{}/models", proxy_addr))
+        .header("accept-encoding", "br")
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        !resp
+            .headers()
+            .contains_key(axum::http::header::CONTENT_ENCODING)
+    );
+    let body = resp.bytes().await.expect("body");
+    assert_codex_models_response(body.as_ref(), "gpt-5.5", true);
+    assert_eq!(
+        upstream_accept_encoding.lock().expect("lock").as_deref(),
+        Some("identity")
+    );
+
+    proxy_handle.abort();
+    u_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_translates_openai_models_list_to_codex_models_response() {
+    let upstream = axum::Router::new().route(
+        "/v1/models",
+        get(|| async move {
+            Json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    { "id": "codex-auto-review", "object": "model" },
+                    { "id": "gpt-5.5", "object": "model", "display_name": "GPT-5.5" },
+                    { "id": "gpt-image-1", "object": "model" }
+                ]
+            }))
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let proxy_client = Client::new();
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        proxy_client,
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = Client::new()
+        .get(format!("http://{}/models", proxy_addr))
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.bytes().await.expect("body");
+    let value = assert_codex_models_response(body.as_ref(), "gpt-5.5", true);
+    let models = value["models"].as_array().expect("models array");
+    let auto_review = models
+        .iter()
+        .find(|model| model["slug"].as_str() == Some("codex-auto-review"))
+        .expect("auto review model");
+    assert_eq!(auto_review["visibility"].as_str(), Some("hide"));
+    let gpt_image = models
+        .iter()
+        .find(|model| model["slug"].as_str() == Some("gpt-image-1"))
+        .expect("image model");
+    assert_eq!(gpt_image["visibility"].as_str(), Some("hide"));
+
+    proxy_handle.abort();
+    u_handle.abort();
+}
+
+fn assert_codex_models_response(
+    body: &[u8],
+    expected_slug: &str,
+    expect_image_modality: bool,
+) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_slice(body).expect("json body");
+    assert!(value.get("data").is_none());
+    let models = value["models"].as_array().expect("models array");
+    let model = models
+        .iter()
+        .find(|model| model["slug"].as_str() == Some(expected_slug))
+        .expect("expected model");
+    assert_eq!(model["visibility"].as_str(), Some("list"));
+    let modalities = model["input_modalities"]
+        .as_array()
+        .expect("input_modalities array");
+    assert_eq!(
+        modalities
+            .iter()
+            .any(|modality| modality.as_str() == Some("image")),
+        expect_image_modality
+    );
+    value
+}
+
+#[tokio::test]
 async fn proxy_streaming_parses_usage_even_when_usage_is_late_in_stream() {
     // Large prefix with no `data:` lines: should push the stream well past 1MB without triggering JSON parse.
     // The final `data:` line includes `response.usage`, which codex-helper should still detect.

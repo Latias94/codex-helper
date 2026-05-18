@@ -11,7 +11,7 @@ use axum::extract::ConnectInfo;
 use axum::http::StatusCode;
 use axum::http::{HeaderValue, Request};
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, post};
 use futures_util::stream;
 use reqwest::Client;
 use tokio::time::{Duration, sleep};
