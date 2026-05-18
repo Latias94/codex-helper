@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "slug": "codex-official-relay-bridge",
+  "title": "Codex Official Relay Bridge",
+  "status": "complete",
+  "updated": "2026-05-18",
+  "scope_kind": "execution",
+  "problem": "codex-helper relays ordinary Codex Responses traffic but did not expose official-only Codex paths such as remote context compaction v1 through compatible relay providers.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-official-relay-bridge/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-official-relay-bridge/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-official-relay-bridge/EVIDENCE_AND_GATES.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core codex_integration",
+    "cargo nextest run -p codex-helper-core responses_compact",
+    "cargo nextest run -p codex-helper-core"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-official-relay-bridge/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "closed",
+    "notes": "HTTP compact v1 bridge, diagnostics, static unsupported-relay fallback, review, and workspace gate are complete. WebSocket upgrade forwarding, remote compaction v2, and active compact probing/capability hints are follow-ons."
+  }
+}

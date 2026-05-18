@@ -49,6 +49,7 @@ pub struct RequestLogFilters {
     pub model: Option<String>,
     pub station: Option<String>,
     pub provider: Option<String>,
+    pub path: Option<String>,
     pub status_min: Option<u64>,
     pub status_max: Option<u64>,
     pub fast: bool,
@@ -61,6 +62,7 @@ impl RequestLogFilters {
             && self.model.is_none()
             && self.station.is_none()
             && self.provider.is_none()
+            && self.path.is_none()
             && self.status_min.is_none()
             && self.status_max.is_none()
             && !self.fast
@@ -85,6 +87,11 @@ impl RequestLogFilters {
         }
         if let Some(expected) = self.provider.as_deref()
             && !field_contains(str_field(record, "provider_id"), expected)
+        {
+            return false;
+        }
+        if let Some(expected) = self.path.as_deref()
+            && !field_contains(str_field(record, "path"), expected)
         {
             return false;
         }
@@ -792,6 +799,7 @@ mod tests {
     #[test]
     fn filters_match_route_model_fast_retry_and_status() {
         let record = json!({
+            "path": "/v1/responses",
             "session_id": "sid-abc",
             "station_name": "main-station",
             "provider_id": "relay-one",
@@ -814,6 +822,7 @@ mod tests {
             model: Some("5.4".to_string()),
             station: Some("main".to_string()),
             provider: Some("relay".to_string()),
+            path: Some("responses".to_string()),
             status_min: Some(400),
             status_max: Some(499),
             fast: true,
@@ -835,6 +844,25 @@ mod tests {
         };
 
         assert!(!filters.matches(&record));
+    }
+
+    #[test]
+    fn filters_match_compact_request_path() {
+        let compact = json!({
+            "path": "/responses/compact",
+            "status_code": 200
+        });
+        let ordinary = json!({
+            "path": "/responses",
+            "status_code": 200
+        });
+        let filters = RequestLogFilters {
+            path: Some("responses/compact".to_string()),
+            ..RequestLogFilters::default()
+        };
+
+        assert!(filters.matches(&compact));
+        assert!(!filters.matches(&ordinary));
     }
 
     #[test]

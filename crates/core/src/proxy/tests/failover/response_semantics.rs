@@ -113,6 +113,180 @@ data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_t
 }
 
 #[tokio::test]
+async fn proxy_forwards_responses_compact_to_upstream_v1_compact_path() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+
+    let hits = upstream_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses/compact",
+        post(move |body: axum::body::Bytes| async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("compact body should parse");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "compact": true,
+                    "model": value.get("model").and_then(|model| model.as_str()).unwrap_or("")
+                })),
+            )
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let proxy_client = Client::new();
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        proxy_client,
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/responses/compact", proxy_addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":[{"role":"user","content":"compact me"}]}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp
+        .json::<serde_json::Value>()
+        .await
+        .expect("response json");
+    assert_eq!(body["compact"], true);
+    assert_eq!(body["model"], "gpt-5");
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    let mut finished = Vec::new();
+    for _ in 0..100 {
+        finished = state.list_recent_finished(10).await;
+        if finished
+            .iter()
+            .any(|request| request.path == "/responses/compact")
+        {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        finished
+            .iter()
+            .any(|request| request.path == "/responses/compact"),
+        "expected compact request path to be visible in finished requests"
+    );
+
+    proxy_handle.abort();
+    u_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_records_responses_compact_unsupported_status_for_fallback_diagnostics() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+
+    let hits = upstream_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses/compact",
+        post(move || async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "compact_not_supported",
+                        "message": "compact is not supported"
+                    }
+                })),
+            )
+        }),
+    );
+    let (u_addr, u_handle) = spawn_axum_server(upstream);
+
+    let proxy_client = Client::new();
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{}/v1", u_addr),
+            auth: UpstreamAuth {
+                auth_token: None,
+                auth_token_env: None,
+                api_key: None,
+                api_key_env: None,
+            },
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        retry,
+    );
+
+    let proxy = ProxyService::new(
+        proxy_client,
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/responses/compact", proxy_addr))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":[{"role":"user","content":"compact me"}]}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    let mut finished = Vec::new();
+    for _ in 0..100 {
+        finished = state.list_recent_finished(10).await;
+        if finished
+            .iter()
+            .any(|request| request.path == "/responses/compact")
+        {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    let compact = finished
+        .iter()
+        .find(|request| request.path == "/responses/compact")
+        .expect("expected compact request path to be visible in finished requests");
+    assert_eq!(compact.status_code, StatusCode::NOT_FOUND.as_u16());
+
+    proxy_handle.abort();
+    u_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_does_not_retry_or_failover_on_400() {
     let upstream1_hits = Arc::new(AtomicUsize::new(0));
     let upstream2_hits = Arc::new(AtomicUsize::new(0));

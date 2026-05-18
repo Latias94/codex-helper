@@ -232,6 +232,39 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                     }
                 }
 
+                let enable_official_relay_label = match ctx.lang {
+                    Language::Zh => format!("Official Relay Bridge（端口 {port}）"),
+                    Language::En => format!("Official relay bridge (port {port})"),
+                };
+                if ui
+                    .add_enabled(
+                        !status.enabled
+                            || status.patch_mode
+                                != Some(
+                                    crate::codex_integration::CodexPatchMode::OfficialRelayBridge,
+                                ),
+                        egui::Button::new(enable_official_relay_label),
+                    )
+                    .clicked()
+                {
+                    match crate::codex_integration::switch_on_with_mode(
+                        port,
+                        crate::codex_integration::CodexPatchMode::OfficialRelayBridge,
+                    ) {
+                        Ok(()) => {
+                            *ctx.last_info = Some(
+                                pick(
+                                    ctx.lang,
+                                    "已启用 Official relay bridge；已有 Codex app 需要重启后生效",
+                                    "Enabled Official relay bridge; restart existing Codex apps to apply it",
+                                )
+                                .to_string(),
+                            );
+                        }
+                        Err(e) => *ctx.last_error = Some(format!("switch on failed: {e}")),
+                    }
+                }
+
                 if ui
                     .add_enabled(
                         status.has_switch_state,

@@ -56,14 +56,26 @@ You can also switch it temporarily from the CLI:
 ```bash
 codex-helper switch on --mode chatgpt-bridge
 codex-helper switch on --mode imagegen-bridge
+codex-helper switch on --mode official-relay-bridge
 codex-helper switch on --mode default
 ```
 
-On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client patch mode is preserved; use `switch on --mode ...` or the TUI Settings `B`/`I`/`D` keys to change it explicitly.
+On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client patch mode is preserved; use `switch on --mode ...` or the TUI Settings `B`/`I`/`F`/`D` keys to change it explicitly.
 
 `chatgpt-bridge` writes `requires_openai_auth = true` and `supports_websockets = false` into `~/.codex/config.toml`, and changes only two `~/.codex/auth.json` fields: `auth_mode` becomes `"chatgpt"` and `OPENAI_API_KEY` becomes `null`. It requires an existing official Codex ChatGPT login state; if `auth.json` has no complete token/email/account metadata, codex-helper refuses the patch before writing `config.toml` or `auth.json`. Existing Codex apps usually need a restart before they read the changed client config.
 
 `imagegen-bridge` is an explicit experimental hack mode. It writes an empty `{}` `~/.codex/auth.json` facade so Codex's default auth resolution still treats the session as ChatGPT-backed and exposes the hosted `image_generation` tool, while actual upstream credentials still come from codex-helper routing (`auth_token_env`, `auth_token`, `api_key_env`, or `api_key`). It does not require an official ChatGPT login and does not write an explicit `auth_mode`. Before enabling it, codex-helper verifies that the Codex service has at least one enabled upstream and that at least one upstream credential is actually available to the current process. For env-based credentials, setting only the env var name in config is not enough; the env var value must also be present when you run `switch on` or start `serve`. codex-helper stores the previous `auth.json` in its switch state and restores it when switching back to `default` or running `switch off`, but only if the current `auth.json` still matches the helper-written facade. If the user or Codex changed `auth.json` meanwhile, codex-helper leaves it untouched.
+
+`official-relay-bridge` is an experimental HTTP official-relay mode for relays that forward OpenAI Responses semantics, especially sub2api-style relays that support `/responses/compact`. It writes `name = "OpenAI"` and `supports_websockets = false` into `~/.codex/config.toml` so Codex can choose official remote compaction v1 while keeping WebSocket disabled. It does not write `requires_openai_auth` and does not patch `auth.json`; upstream credentials still must come from codex-helper routing. If the relay rejects `/responses/compact` with 404/405/501 or an unsupported-compact error, switch back to `default` or use a relay account that advertises compact support.
+
+To diagnose whether remote compaction v1 is active, inspect the codex-helper request ledger after a Codex compaction happens:
+
+```bash
+codex-helper usage find --path responses/compact --limit 20
+codex-helper usage find --path responses --limit 20
+```
+
+An official compact hit normally appears as `POST /responses/compact` in codex-helper logs. Ordinary local fallback compaction appears as a normal `POST /responses` request. Remote compaction v2, when Codex enables it, also travels through ordinary `/responses` with a `compaction_trigger` payload/event shape rather than `/responses/compact`; this helper mode does not enable v2 or WebSocket transport.
 
 Switching back to `default` removes the bridge-only fields from `codex_proxy` and restores helper-managed auth patches when it is safe to do so.
 
@@ -873,6 +885,14 @@ Every completed request is written to:
 ```
 
 When a request retries or switches provider, the request log stores `retry.route_attempts[]`. The most useful fields are `provider_id`, `endpoint_id`, `route_path`, `decision`, `status_code`, and `error_class`.
+
+For compact diagnostics, filter by request path:
+
+```bash
+codex-helper usage find --path responses/compact --limit 20
+```
+
+The same filter is available through the local admin API as `GET /__codex_helper/api/v1/request-ledger/recent?path=responses/compact`.
 
 The control trace is enabled by default and is written to:
 

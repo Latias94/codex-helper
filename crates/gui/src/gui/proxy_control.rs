@@ -574,6 +574,9 @@ fn request_ledger_summary_query_pairs(
     if let Some(provider) = filters.provider.as_deref() {
         query.push(("provider".to_string(), provider.to_string()));
     }
+    if let Some(path) = filters.path.as_deref() {
+        query.push(("path".to_string(), path.to_string()));
+    }
     if let Some(status_min) = filters.status_min {
         query.push(("status_min".to_string(), status_min.to_string()));
     }

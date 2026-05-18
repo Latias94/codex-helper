@@ -389,6 +389,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_attempt_request_strips_client_auth_in_official_relay_bridge_without_upstream_secret()
+     {
+        let proxy = test_proxy_service();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer codex-client-token"),
+        );
+        client_headers.insert("x-api-key", HeaderValue::from_static("client-key"));
+        client_headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("account-client"),
+        );
+        client_headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
+
+        let cache = OnceLock::new();
+        let setup = prepare_attempt_request(AttemptRequestSetupParams {
+            proxy: &proxy,
+            auth: &UpstreamAuth::default(),
+            codex_client_patch_mode: CodexPatchMode::OfficialRelayBridge,
+            client_headers: &client_headers,
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 0,
+            warn_max: 0,
+            client_uri: "/responses/compact",
+            target_url: "https://third-party.example/v1/responses/compact",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        });
+
+        assert!(!setup.headers.contains_key("authorization"));
+        assert!(!setup.headers.contains_key("x-api-key"));
+        assert!(!setup.headers.contains_key("chatgpt-account-id"));
+        assert!(!setup.headers.contains_key("x-openai-fedramp"));
+    }
+
+    #[tokio::test]
     async fn prepare_attempt_request_builds_debug_base_when_limits_enabled() {
         let proxy = test_proxy_service();
         let mut client_headers = HeaderMap::new();

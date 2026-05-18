@@ -144,6 +144,7 @@ fn read_request_ledger_summary_prefers_attached_api_when_supported() {
         model: Some("gpt-5.4".to_string()),
         station: Some("backup".to_string()),
         provider: Some("relay".to_string()),
+        path: Some("responses/compact".to_string()),
         status_min: Some(400),
         status_max: Some(499),
         fast: true,
@@ -211,6 +212,13 @@ fn read_request_ledger_summary_prefers_attached_api_when_supported() {
             .and_then(|query| query.get("provider"))
             .map(String::as_str),
         Some("relay")
+    );
+    assert_eq!(
+        captured
+            .as_ref()
+            .and_then(|query| query.get("path"))
+            .map(String::as_str),
+        Some("responses/compact")
     );
     assert_eq!(
         captured

@@ -207,6 +207,8 @@ pub(crate) enum CodexPatchModeArg {
     ChatgptBridge,
     /// Experimental image generation bridge using a minimal ChatGPT auth facade
     ImagegenBridge,
+    /// Experimental official relay bridge for HTTP OpenAI Responses features
+    OfficialRelayBridge,
 }
 
 #[derive(Subcommand, Debug)]
@@ -702,6 +704,9 @@ pub enum UsageCommand {
         /// Match provider id substring
         #[arg(long)]
         provider: Option<String>,
+        /// Match request path substring, for example responses/compact
+        #[arg(long)]
+        path: Option<String>,
         /// Match status_code >= this value
         #[arg(long)]
         status_min: Option<u64>,

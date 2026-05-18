@@ -357,7 +357,7 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
                 "trace_id": "codex-42",
                 "service": "codex",
                 "method": "POST",
-                "path": "/v1/responses",
+                "path": "/responses/compact",
                 "status_code": 429,
                 "duration_ms": 1500,
                 "ttfb_ms": 300,
@@ -472,7 +472,7 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
 
     let filtered_request_ledger = client
         .get(format!(
-            "http://{}/__codex_helper/api/v1/request-ledger/recent?limit=40&station=backup&provider=fallback&model=5.4&fast=true&retried=true&status_min=400&status_max=499",
+            "http://{}/__codex_helper/api/v1/request-ledger/recent?limit=40&station=backup&provider=fallback&model=5.4&path=responses%2Fcompact&fast=true&retried=true&status_min=400&status_max=499",
             proxy_addr
         ))
         .send()
@@ -491,7 +491,7 @@ async fn proxy_api_v1_capabilities_and_overrides_work() {
 
     let request_summary = client
         .get(format!(
-            "http://{}/__codex_helper/api/v1/request-ledger/summary?limit=10&by=provider&station=backup&provider=fallback&model=5.4&fast=true&retried=true&status_min=400&status_max=499",
+            "http://{}/__codex_helper/api/v1/request-ledger/summary?limit=10&by=provider&station=backup&provider=fallback&model=5.4&path=responses%2Fcompact&fast=true&retried=true&status_min=400&status_max=499",
             proxy_addr
         ))
         .send()

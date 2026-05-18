@@ -905,6 +905,9 @@ fn do_switch_on(port: u16, mode: CodexPatchModeArg, codex: bool, claude: bool) -
         CodexPatchModeArg::Default => codex_integration::CodexPatchMode::Default,
         CodexPatchModeArg::ChatgptBridge => codex_integration::CodexPatchMode::ChatGptBridge,
         CodexPatchModeArg::ImagegenBridge => codex_integration::CodexPatchMode::ImagegenBridge,
+        CodexPatchModeArg::OfficialRelayBridge => {
+            codex_integration::CodexPatchMode::OfficialRelayBridge
+        }
     };
     if claude {
         if !mode.is_default() {
@@ -932,6 +935,11 @@ fn do_switch_on(port: u16, mode: CodexPatchModeArg, codex: bool, claude: bool) -
             codex_integration::CodexPatchMode::ImagegenBridge => {
                 println!(
                     "Updated ~/.codex/config.toml and auth.json for imagegen bridge mode. Restart existing Codex apps to apply the client config change."
+                );
+            }
+            codex_integration::CodexPatchMode::OfficialRelayBridge => {
+                println!(
+                    "Updated ~/.codex/config.toml for official relay bridge mode. Restart existing Codex apps to apply the client config change."
                 );
             }
         }
@@ -1149,10 +1157,14 @@ fn print_codex_switch_status() {
         let patch_mode = codex_integration::codex_switch_status()
             .ok()
             .and_then(|status| status.patch_mode)
-            .unwrap_or(if requires_openai_auth == Some(true) {
-                codex_integration::CodexPatchMode::ChatGptBridge
-            } else {
-                codex_integration::CodexPatchMode::Default
+            .unwrap_or_else(|| {
+                if requires_openai_auth == Some(true) {
+                    codex_integration::CodexPatchMode::ChatGptBridge
+                } else if name == "OpenAI" && supports_websockets == Some(false) {
+                    codex_integration::CodexPatchMode::OfficialRelayBridge
+                } else {
+                    codex_integration::CodexPatchMode::Default
+                }
             });
         println!("  codex_proxy.patch_mode: {}", patch_mode);
         if let Some(value) = requires_openai_auth {

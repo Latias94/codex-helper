@@ -56,14 +56,26 @@ mode = "chatgpt-bridge"
 ```bash
 codex-helper switch on --mode chatgpt-bridge
 codex-helper switch on --mode imagegen-bridge
+codex-helper switch on --mode official-relay-bridge
 codex-helper switch on --mode default
 ```
 
-启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 模式。要显式切换，可使用 `switch on --mode ...` 或 TUI Settings 页的 `B`/`I`/`D`。
+启动时，`codex-helper serve` 会在 Codex 尚未切到 codex-helper 时读取 `[codex.client_patch]`；如果 Codex 已经切到 helper，则保留当前客户端 patch 模式。要显式切换，可使用 `switch on --mode ...` 或 TUI Settings 页的 `B`/`I`/`F`/`D`。
 
 `chatgpt-bridge` 会写入 `~/.codex/config.toml` 的 `requires_openai_auth = true`、`supports_websockets = false`，并把 `~/.codex/auth.json` 中的 `auth_mode` 改为 `"chatgpt"`、`OPENAI_API_KEY` 改为 `null`，其它字段保持不变。启用前必须已经在官方 Codex 里完成 ChatGPT 登录；如果 `auth.json` 没有完整 token、email 和账号信息，codex-helper 会在写入 `config.toml` / `auth.json` 前拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。修改 Codex 客户端配置后，已经打开的 Codex app 通常需要重启后才会读取新配置。
 
 `imagegen-bridge` 是显式的实验 hack 模式。它会把 `~/.codex/auth.json` 临时写成空对象 `{}`，让 Codex 的默认 auth 解析仍把会话视为 ChatGPT-backed 并暴露 hosted `image_generation` tool；真实上游凭据仍来自 codex-helper routing（`auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`）。它不要求官方 ChatGPT 登录，也不会显式写入 `auth_mode`。启用前，codex-helper 会校验 Codex 服务至少有一个已启用上游，并且当前进程实际能取得至少一个上游凭据；对于环境变量凭据，只在配置里写 env var 名称不够，运行 `switch on` 或启动 `serve` 时该环境变量必须有值。codex-helper 会把旧 `auth.json` 存入 switch state，并在切回 `default` 或执行 `switch off` 时恢复；但只有当前 `auth.json` 仍等于 helper 写入的 facade 时才恢复。如果用户或 Codex 期间改过 `auth.json`，codex-helper 会保持现状，不覆盖用户变更。
+
+`official-relay-bridge` 是实验性的 HTTP 官方中转模式，适合能转发 OpenAI Responses 语义的中转，尤其是支持 `/responses/compact` 的 sub2api 风格中转。它会在 `~/.codex/config.toml` 写入 `name = "OpenAI"` 和 `supports_websockets = false`，让 Codex 选择官方 remote compaction v1，同时保持 WebSocket 关闭。它不会写 `requires_openai_auth`，也不会 patch `auth.json`；真实上游凭据仍必须来自 codex-helper routing。如果中转对 `/responses/compact` 返回 404/405/501 或 compact unsupported 这类错误，请切回 `default`，或改用明确支持 compact 的中转账号。
+
+要诊断 remote compaction v1 是否生效，可以在 Codex 发生压缩后查看 codex-helper 请求账本：
+
+```bash
+codex-helper usage find --path responses/compact --limit 20
+codex-helper usage find --path responses --limit 20
+```
+
+官方 compact 命中通常会在 codex-helper 日志中显示为 `POST /responses/compact`。普通本地 fallback 压缩只会显示为普通 `POST /responses` 请求。等 Codex 以后启用 remote compaction v2 时，它也会走普通 `/responses`，通过 `compaction_trigger` payload/event 形态表达，而不是 `/responses/compact`；当前 helper 模式不会启用 v2 或 WebSocket transport。
 
 切回 `default` 会移除 `codex_proxy` provider 的 bridge 专用字段，并在安全时恢复 helper 管理过的 auth patch。
 
@@ -871,6 +883,14 @@ codex-helper routing explain --model <MODEL> --json
 ```
 
 当请求重试或切换 provider 时，请求日志会保存 `retry.route_attempts[]`。最有用的字段是 `provider_id`、`endpoint_id`、`route_path`、`decision`、`status_code` 和 `error_class`。
+
+排查 compact 时，按请求路径过滤：
+
+```bash
+codex-helper usage find --path responses/compact --limit 20
+```
+
+同一过滤条件也可以通过本地 admin API 使用：`GET /__codex_helper/api/v1/request-ledger/recent?path=responses/compact`。
 
 Control trace 默认启用，写入：
 
