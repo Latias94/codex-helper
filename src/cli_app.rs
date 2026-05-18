@@ -5,7 +5,7 @@ use crate::cli_types::{
 use crate::codex_integration;
 use crate::commands;
 use crate::config::{
-    ServiceKind, claude_settings_backup_path, claude_settings_path,
+    ServiceKind, claude_settings_backup_path, claude_settings_path, codex_auth_path,
     codex_client_patch_mode_from_config_file, codex_config_path, codex_switch_state_path,
     load_config, load_or_bootstrap_for_service_with_v4_source, model_routing_warnings,
 };
@@ -237,6 +237,10 @@ fn rotate_runtime_log_if_needed(log_dir: &std::path::Path) {
     }
 }
 
+fn read_existing_text(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
 async fn run_server(
     service_name: &'static str,
     host: IpAddr,
@@ -272,10 +276,15 @@ async fn run_server(
     }
 
     let _restore_guard = AutoRestoreGuard { service_name };
+    let mut codex_startup_patch_mode = codex_integration::CodexPatchMode::Default;
+    let mut codex_client_state_changed_this_startup = false;
+    let mut codex_switch_error: Option<String> = None;
 
     // In Codex mode, automatically switch Codex to the local proxy; in Claude mode, try updating
     // settings.json as well (experimental).
     if service_name == "codex" {
+        let codex_config_before_switch = read_existing_text(&codex_config_path());
+        let codex_auth_before_switch = read_existing_text(&codex_auth_path());
         // Guard before switching: if Codex is already pointing to the local proxy with switch
         // state, ask whether to disable the stale local proxy patch first (interactive only).
         if let Err(err) = codex_integration::guard_codex_config_before_switch_on_interactive() {
@@ -301,6 +310,7 @@ async fn run_server(
                 configured_patch_mode()
             }
         };
+        codex_startup_patch_mode = patch_mode;
         match codex_integration::switch_on_with_mode(port, patch_mode) {
             Ok(()) => {
                 tracing::info!(
@@ -310,9 +320,14 @@ async fn run_server(
                 );
             }
             Err(err) => {
+                let err = err.to_string();
                 tracing::warn!("Failed to switch Codex config to local proxy: {}", err);
+                codex_switch_error = Some(err);
             }
         }
+        codex_client_state_changed_this_startup = codex_config_before_switch
+            != read_existing_text(&codex_config_path())
+            || codex_auth_before_switch != read_existing_text(&codex_auth_path());
     } else if service_name == "claude" {
         if let Err(err) = codex_integration::guard_claude_settings_before_switch_on_interactive() {
             tracing::warn!("Failed to guard Claude settings before switch on: {}", err);
@@ -476,6 +491,16 @@ async fn run_server(
         });
 
         let providers = tui::build_provider_options(&cfg, service_name);
+        let startup_readiness = (service_name == "codex").then(|| {
+            codex_integration::codex_tui_startup_readiness(
+                codex_integration::CodexStartupReadinessInput {
+                    expected_port: port,
+                    expected_patch_mode: codex_startup_patch_mode,
+                    client_state_changed_this_startup: codex_client_state_changed_this_startup,
+                    switch_error: codex_switch_error.clone(),
+                },
+            )
+        });
 
         let mut tui_handle = tokio::spawn(tui::run_dashboard(
             proxy.clone(),
@@ -485,6 +510,7 @@ async fn run_server(
             port,
             admin_addr.port(),
             providers,
+            startup_readiness,
             tui_lang,
             shutdown_tx.clone(),
             shutdown_rx.clone(),

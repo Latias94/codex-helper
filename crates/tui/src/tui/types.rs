@@ -43,6 +43,7 @@ pub(in crate::tui) enum Overlay {
     RoutingMenu,
     StationInfo,
     SessionTranscript,
+    StartupAlert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -4,6 +4,10 @@ use super::{
     routing_spec_after_provider_enabled_change, routing_spec_with_order,
     should_request_provider_balance_refresh,
 };
+use crate::codex_integration::{
+    CodexStartupReadiness, CodexStartupReadinessIssue, CodexStartupReadinessIssueKind,
+    CodexStartupReadinessSeverity,
+};
 use crate::config::{
     ProviderConfigV4, ProxyConfig, ProxyConfigV4, RoutingConfigV4, RoutingExhaustedActionV4,
     RoutingPolicyV4, ServiceConfig, ServiceConfigManager, ServiceViewV4, UpstreamAuth,
@@ -16,7 +20,7 @@ use crate::tui::model::{
     ProviderOption, RoutingProviderRef, RoutingSpecView, Snapshot, routing_provider_names,
 };
 use crate::tui::state::UiState;
-use crate::tui::types::Page;
+use crate::tui::types::{Overlay, Page};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -114,6 +118,18 @@ fn proxy_with_single_station_without_upstreams() -> (ProxyService, Arc<ProxyConf
         Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
     );
     (proxy, cfg)
+}
+
+fn sample_startup_readiness() -> CodexStartupReadiness {
+    CodexStartupReadiness {
+        issues: vec![CodexStartupReadinessIssue {
+            kind: CodexStartupReadinessIssueKind::ClientStateChanged,
+            severity: CodexStartupReadinessSeverity::Warning,
+            title: "Codex client config changed on startup".to_string(),
+            detail: "codex-helper updated ~/.codex/config.toml.".to_string(),
+            action: "Restart Codex App before relying on this session.".to_string(),
+        }],
+    }
 }
 
 struct ScopedEnv {
@@ -483,6 +499,35 @@ async fn route_graph_global_route_target_key_uses_routing_order_and_invalidates_
     assert!(ui.routing_explain.is_none());
     assert!(ui.last_routing_control_refresh_at.is_none());
     assert!(ui.needs_snapshot_refresh);
+}
+
+#[tokio::test]
+async fn startup_alert_enter_dismisses_report() {
+    let (proxy, cfg) = proxy_with_single_station_without_upstreams();
+    let state = proxy.state_handle();
+    let snapshot = empty_snapshot(state.as_ref(), cfg).await;
+    let mut providers = Vec::new();
+    let mut ui = UiState {
+        overlay: Overlay::StartupAlert,
+        startup_readiness: Some(sample_startup_readiness()),
+        ..UiState::default()
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let handled = super::handle_key_event(
+        state,
+        &mut providers,
+        &mut ui,
+        &snapshot,
+        &proxy,
+        tx,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await;
+
+    assert!(handled);
+    assert_eq!(ui.overlay, Overlay::None);
+    assert!(ui.startup_readiness.is_none());
 }
 
 #[test]

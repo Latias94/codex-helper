@@ -77,14 +77,24 @@ fn render_kpis(
     lang: Language,
 ) {
     let l = |text| i18n::label(lang, text);
+    let kpi_constraints = if area.width >= 112 {
+        [
+            Constraint::Percentage(20),
+            Constraint::Percentage(22),
+            Constraint::Percentage(20),
+            Constraint::Percentage(38),
+        ]
+    } else {
+        [
+            Constraint::Percentage(22),
+            Constraint::Percentage(22),
+            Constraint::Percentage(20),
+            Constraint::Percentage(36),
+        ]
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
+        .constraints(kpi_constraints)
         .split(area);
 
     let s = &snapshot.usage_rollup.window;
@@ -92,7 +102,7 @@ fn render_kpis(
     let ok = s.requests_total.saturating_sub(s.requests_error);
 
     let req_block = Block::default()
-        .title(format!("{} ({window_label})", l("Requests")))
+        .title(format!("{} {window_label}", l("Requests")))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border));
     let req_text = Text::from(vec![
@@ -180,32 +190,45 @@ fn render_kpis(
     } else {
         Style::default().fg(p.muted)
     };
+    let live_value_width = usize::from(cols[3].width.saturating_sub(8)).clamp(12, 72);
     let live_text = Text::from(vec![
         Line::from(vec![
             Span::styled("bal ", Style::default().fg(p.muted)),
             Span::styled(
-                usage_balance_counts_line(&ctx.usage_balance.totals.balance_status_counts, lang),
+                shorten(
+                    &usage_balance_counts_line(
+                        &ctx.usage_balance.totals.balance_status_counts,
+                        lang,
+                    ),
+                    live_value_width,
+                ),
                 Style::default().fg(p.text),
             ),
         ]),
         Line::from(vec![
             Span::styled("ref ", Style::default().fg(p.muted)),
             Span::styled(
-                shorten(&usage_refresh_line(ctx.usage_balance, lang), 48),
+                shorten(
+                    &usage_refresh_brief_line(ctx.usage_balance, lang),
+                    live_value_width,
+                ),
                 Style::default().fg(p.muted),
             ),
         ]),
         Line::from(vec![
             Span::styled("burn ", Style::default().fg(p.muted)),
             Span::styled(
-                shorten(&spend_forecast_rate_line(&forecast, lang), 48),
+                shorten(&spend_forecast_rate_line(&forecast, lang), live_value_width),
                 forecast_style,
             ),
         ]),
         Line::from(vec![
             Span::styled("left ", Style::default().fg(p.muted)),
             Span::styled(
-                shorten(&spend_forecast_balance_line(&forecast, lang), 48),
+                shorten(
+                    &spend_forecast_balance_line(&forecast, lang),
+                    live_value_width,
+                ),
                 forecast_style,
             ),
         ]),
@@ -269,15 +292,12 @@ fn render_tables(
 
     let provider_rows = ui.filtered_usage_balance_provider_rows(usage_balance);
     let provider_title = format!(
-        "{} / {} ({window_label}){}",
+        "{} / {}{}",
         i18n::label(lang, "Provider"),
         i18n::label(lang, "Balance"),
         filter_suffix(ui.stats_attention_only, lang)
     );
-    let station_title = format!(
-        "{} scorecard ({window_label})",
-        i18n::label(lang, "Stations")
-    );
+    let station_title = format!("{} scorecard", i18n::label(lang, "Stations"));
     let providers_focused = ui.stats_focus == StatsFocus::Providers;
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -577,12 +597,7 @@ fn render_provider_usage_detail(
     let l = |text| i18n::label(lang, text);
     let block = Block::default()
         .title(Span::styled(
-            format!(
-                "{} / {}  {}: {window_label}",
-                l("Usage"),
-                l("Balance"),
-                l("window")
-            ),
+            format!("{} / {} {window_label}", l("Usage"), l("Balance")),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)

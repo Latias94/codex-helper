@@ -27,6 +27,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, watch};
 
+use crate::codex_integration::CodexStartupReadiness;
 use crate::config::ProxyConfig;
 use crate::proxy::ProxyService;
 use crate::state::ProxyState;
@@ -194,6 +195,7 @@ pub async fn run_dashboard(
     port: u16,
     _admin_port: u16,
     providers: Vec<ProviderOption>,
+    startup_readiness: Option<CodexStartupReadiness>,
     language: Language,
     shutdown: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -201,6 +203,9 @@ pub async fn run_dashboard(
     let timing = DashboardTiming::from_env();
     let (term_guard, mut terminal) = enter_dashboard_terminal()?;
 
+    let show_startup_alert = startup_readiness
+        .as_ref()
+        .is_some_and(CodexStartupReadiness::has_issues);
     let mut ui = UiState {
         service_name,
         proxy_port: port,
@@ -208,6 +213,12 @@ pub async fn run_dashboard(
         usage_forecast: cfg.ui.usage_forecast.clone(),
         refresh_ms: timing.refresh_ms,
         config_version: cfg.version,
+        overlay: if show_startup_alert {
+            types::Overlay::StartupAlert
+        } else {
+            types::Overlay::None
+        },
+        startup_readiness,
         ..Default::default()
     };
     let _ = input::refresh_profile_control_state(&mut ui, &proxy).await;

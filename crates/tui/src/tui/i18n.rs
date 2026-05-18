@@ -93,6 +93,7 @@ define_messages! {
     OVERLAY_MANAGE_RUNTIME_PROFILE => { zh: "管理运行时默认 Profile", en: "Manage runtime default profile" },
     OVERLAY_MANAGE_CONFIGURED_PROFILE => { zh: "管理配置默认 Profile", en: "Manage configured default profile" },
     OVERLAY_MANAGE_SESSION_PROFILE => { zh: "管理 Session Profile Binding", en: "Manage session profile binding" },
+    OVERLAY_STARTUP_GUARDRAIL => { zh: "启动检查", en: "Startup guardrail" },
 
     FOOTER_DASHBOARD => { zh: "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  b/M/f 覆盖  p/P 站点  ? 帮助", en: "1-8 pages  q quit  L language  Tab focus  ↑/↓ move  b/M/f overrides  p/P station  ? help" },
     FOOTER_DASHBOARD_ROUTE_GRAPH => { zh: "1-8 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  b/M/f 覆盖  p/P 路由  ? 帮助", en: "1-8 pages  q quit  L language  Tab focus  ↑/↓ move  b/M/f overrides  p/P route  ? help" },
@@ -117,6 +118,7 @@ define_messages! {
     FOOTER_ROUTING_MENU => { zh: "↑/↓ 选择  Enter pin  a 顺序  e/f/s 策略  1/2/0 billing  []/u/d 重排  g 刷新  Esc 关闭", en: "↑/↓ select  Enter pin  a order  e/f/s policy  1/2/0 billing  []/u/d reorder  g refresh  Esc close" },
     FOOTER_STATION_INFO => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  Esc close  L language" },
     FOOTER_SESSION_TRANSCRIPT => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  A 全量/尾部  y 复制  t/Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  A all/tail  y copy  t/Esc close  L language" },
+    FOOTER_STARTUP_GUARDRAIL => { zh: "Esc/Enter 关闭启动检查  L 语言", en: "Esc/Enter close startup guardrail  L language" },
 
     DECLARED_LABEL => { zh: "声明：", en: "declared:" },
     RESOLVED_LABEL => { zh: "生效：", en: "resolved:" },

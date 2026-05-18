@@ -40,6 +40,7 @@ pub(in crate::tui) fn render_app(
         Overlay::None => {}
         Overlay::Help => modals::render_help_modal(f, p, ui),
         Overlay::StationInfo => modals::render_station_info_modal(f, p, ui, snapshot, providers),
+        Overlay::StartupAlert => modals::render_startup_alert_modal(f, p, ui),
         Overlay::EffortMenu => modals::render_effort_modal(f, p, ui),
         Overlay::ModelMenuSession => modals::render_model_modal(f, p, ui),
         Overlay::ModelInputSession => modals::render_model_input_modal(f, p, ui),
@@ -81,10 +82,14 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
+    use crate::codex_integration::{
+        CodexStartupReadiness, CodexStartupReadinessIssue, CodexStartupReadinessIssueKind,
+        CodexStartupReadinessSeverity,
+    };
     use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot, UsageBucket};
     use crate::tui::Language;
     use crate::tui::model::{RoutingProviderRef, RoutingSpecView, Snapshot};
-    use crate::tui::types::{Page, StatsFocus};
+    use crate::tui::types::{Overlay, Page, StatsFocus};
 
     fn buffer_text(buffer: &Buffer) -> String {
         let mut out = String::new();
@@ -214,6 +219,18 @@ mod tests {
         }
     }
 
+    fn sample_startup_readiness() -> CodexStartupReadiness {
+        CodexStartupReadiness {
+            issues: vec![CodexStartupReadinessIssue {
+                kind: CodexStartupReadinessIssueKind::ClientStateChanged,
+                severity: CodexStartupReadinessSeverity::Warning,
+                title: "Codex client config changed on startup".to_string(),
+                detail: "codex-helper updated ~/.codex/config.toml.".to_string(),
+                action: "Restart Codex App before relying on this session.".to_string(),
+            }],
+        }
+    }
+
     fn render_app_text(width: u16, height: u16, ui: &mut UiState, snapshot: &Snapshot) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -269,5 +286,42 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn startup_alert_modal_renders_issue_and_close_hint() {
+        let snapshot = sample_snapshot();
+        let mut ui = UiState {
+            overlay: Overlay::StartupAlert,
+            startup_readiness: Some(sample_startup_readiness()),
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_app_text(88, 28, &mut ui, &snapshot);
+
+        assert!(text.contains("Startup guardrail"), "{text}");
+        assert!(
+            text.contains("Codex client config changed on startup"),
+            "{text}"
+        );
+        assert!(text.contains("Esc/Enter close startup guardrail"), "{text}");
+    }
+
+    #[test]
+    fn startup_alert_modal_keeps_core_copy_visible_at_narrow_width() {
+        let snapshot = sample_snapshot();
+        let mut ui = UiState {
+            overlay: Overlay::StartupAlert,
+            startup_readiness: Some(sample_startup_readiness()),
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_app_text(64, 24, &mut ui, &snapshot);
+
+        assert!(text.contains("Startup guardrail"), "{text}");
+        assert!(text.contains("config changed"), "{text}");
+        assert!(text.contains("Esc/Enter close"), "{text}");
     }
 }

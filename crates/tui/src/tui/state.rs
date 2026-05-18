@@ -1,5 +1,6 @@
 use ratatui::widgets::{ListState, TableState};
 
+use crate::codex_integration::CodexStartupReadiness;
 use crate::config::{
     ResolvedRetryConfig, UsageForecastConfig, is_supported_route_graph_config_version,
 };
@@ -71,6 +72,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) page: Page,
     pub(in crate::tui) focus: Focus,
     pub(in crate::tui) overlay: Overlay,
+    pub(in crate::tui) startup_readiness: Option<CodexStartupReadiness>,
     pub(in crate::tui) selected_station_idx: usize,
     pub(in crate::tui) selected_session_idx: usize,
     pub(in crate::tui) selected_session_id: Option<String>,
@@ -175,6 +177,7 @@ impl Default for UiState {
             page: Page::Dashboard,
             focus: Focus::Sessions,
             overlay: Overlay::None,
+            startup_readiness: None,
             selected_station_idx: 0,
             selected_session_idx: 0,
             selected_session_id: None,

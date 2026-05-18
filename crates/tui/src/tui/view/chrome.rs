@@ -211,6 +211,7 @@ fn footer_help_text(ui: &UiState) -> &'static str {
         Overlay::RoutingMenu => i18n::text(ui.language, msg::FOOTER_ROUTING_MENU),
         Overlay::StationInfo => i18n::text(ui.language, msg::FOOTER_STATION_INFO),
         Overlay::SessionTranscript => i18n::text(ui.language, msg::FOOTER_SESSION_TRANSCRIPT),
+        Overlay::StartupAlert => i18n::text(ui.language, msg::FOOTER_STARTUP_GUARDRAIL),
     }
 }
 

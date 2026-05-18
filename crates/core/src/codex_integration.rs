@@ -882,6 +882,279 @@ pub struct CodexSwitchStatus {
     pub has_switch_state: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexStartupReadinessSeverity {
+    Info,
+    Warning,
+}
+
+impl CodexStartupReadinessSeverity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexStartupReadinessIssueKind {
+    ClientStateChanged,
+    SwitchFailed,
+    SwitchDisabled,
+    SwitchPortMismatch,
+    PatchModeMismatch,
+    MissingSwitchState,
+    RemoteControlRemovedKeyPresent,
+    RemoteControlIncomplete,
+    RemoteControlLogUnconfirmed,
+    DiagnosticError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexStartupReadinessIssue {
+    pub kind: CodexStartupReadinessIssueKind,
+    pub severity: CodexStartupReadinessSeverity,
+    pub title: String,
+    pub detail: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexStartupReadiness {
+    pub issues: Vec<CodexStartupReadinessIssue>,
+}
+
+impl CodexStartupReadiness {
+    pub fn has_issues(&self) -> bool {
+        !self.issues.is_empty()
+    }
+
+    fn push(
+        &mut self,
+        kind: CodexStartupReadinessIssueKind,
+        severity: CodexStartupReadinessSeverity,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        action: impl Into<String>,
+    ) {
+        self.issues.push(CodexStartupReadinessIssue {
+            kind,
+            severity,
+            title: title.into(),
+            detail: detail.into(),
+            action: action.into(),
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexStartupReadinessInput {
+    pub expected_port: u16,
+    pub expected_patch_mode: CodexPatchMode,
+    pub client_state_changed_this_startup: bool,
+    pub switch_error: Option<String>,
+}
+
+pub fn codex_tui_startup_readiness(input: CodexStartupReadinessInput) -> CodexStartupReadiness {
+    let mut report = CodexStartupReadiness::default();
+
+    if input.client_state_changed_this_startup {
+        report.push(
+            CodexStartupReadinessIssueKind::ClientStateChanged,
+            CodexStartupReadinessSeverity::Warning,
+            "Codex client config changed on startup",
+            "codex-helper updated ~/.codex/config.toml or ~/.codex/auth.json for the local bridge.",
+            "Fully restart any already running Codex App, Codex TUI, or codex exec session so it rereads the client config.",
+        );
+    }
+
+    if let Some(err) = input
+        .switch_error
+        .as_deref()
+        .filter(|err| !err.trim().is_empty())
+    {
+        report.push(
+            CodexStartupReadinessIssueKind::SwitchFailed,
+            CodexStartupReadinessSeverity::Warning,
+            "Codex local proxy patch failed",
+            err,
+            "Run `codex-helper switch status` and fix the reported Codex client config issue before relying on the bridge.",
+        );
+    }
+
+    match codex_switch_status() {
+        Ok(status) => collect_switch_startup_issues(&mut report, &input, &status),
+        Err(err) => report.push(
+            CodexStartupReadinessIssueKind::DiagnosticError,
+            CodexStartupReadinessSeverity::Warning,
+            "Could not inspect Codex switch status",
+            err.to_string(),
+            "Run `codex-helper switch status` from a normal shell to inspect the client config.",
+        ),
+    }
+
+    match codex_remote_control_status() {
+        Ok(status) => collect_remote_control_startup_issues(&mut report, &status),
+        Err(err) => report.push(
+            CodexStartupReadinessIssueKind::DiagnosticError,
+            CodexStartupReadinessSeverity::Warning,
+            "Could not inspect Codex remote-control status",
+            err.to_string(),
+            "Run `codex-helper switch remote-control status` from a normal shell to inspect the desktop state.",
+        ),
+    }
+
+    report
+}
+
+fn collect_switch_startup_issues(
+    report: &mut CodexStartupReadiness,
+    input: &CodexStartupReadinessInput,
+    status: &CodexSwitchStatus,
+) {
+    if !status.enabled {
+        report.push(
+            CodexStartupReadinessIssueKind::SwitchDisabled,
+            CodexStartupReadinessSeverity::Warning,
+            "Codex is not using the local helper",
+            format!(
+                "Current model_provider is {}.",
+                status.model_provider.as_deref().unwrap_or("<unset>")
+            ),
+            format!(
+                "Run `codex-helper switch on --port {}` or restart codex-helper so the client patch can be applied.",
+                input.expected_port
+            ),
+        );
+        return;
+    }
+
+    if !status.has_switch_state {
+        report.push(
+            CodexStartupReadinessIssueKind::MissingSwitchState,
+            CodexStartupReadinessSeverity::Warning,
+            "Codex local proxy patch has no switch state",
+            "Codex points at the local helper, but codex-helper cannot find its restore metadata.",
+            "Inspect ~/.codex/config.toml before running switch-off operations.",
+        );
+    }
+
+    if !base_url_points_to_expected_local_port(status.base_url.as_deref(), input.expected_port) {
+        report.push(
+            CodexStartupReadinessIssueKind::SwitchPortMismatch,
+            CodexStartupReadinessSeverity::Warning,
+            "Codex local proxy port does not match this TUI",
+            format!(
+                "codex_proxy.base_url is {}; this TUI is serving port {}.",
+                status.base_url.as_deref().unwrap_or("<missing>"),
+                input.expected_port
+            ),
+            format!(
+                "Run `codex-helper switch on --port {}` or restart this helper instance on the configured port.",
+                input.expected_port
+            ),
+        );
+    }
+
+    if status.patch_mode != Some(input.expected_patch_mode) {
+        let actual = status
+            .patch_mode
+            .map(|mode| mode.as_str())
+            .unwrap_or("<unknown>");
+        report.push(
+            CodexStartupReadinessIssueKind::PatchModeMismatch,
+            CodexStartupReadinessSeverity::Warning,
+            "Codex bridge mode does not match helper config",
+            format!(
+                "Expected patch mode {}, but Codex currently reports {}.",
+                input.expected_patch_mode, actual
+            ),
+            "Run `codex-helper switch status`; if this changed recently, fully restart Codex clients after switching.",
+        );
+    }
+}
+
+fn base_url_points_to_expected_local_port(base_url: Option<&str>, port: u16) -> bool {
+    let Some(base_url) = base_url else {
+        return false;
+    };
+    let port_marker = format!(":{port}");
+    (base_url.contains("127.0.0.1") || base_url.contains("localhost") || base_url.contains("[::1]"))
+        && base_url.contains(&port_marker)
+}
+
+fn collect_remote_control_startup_issues(
+    report: &mut CodexStartupReadiness,
+    status: &CodexRemoteControlStatus,
+) {
+    if status.remote_control_config_present {
+        report.push(
+            CodexStartupReadinessIssueKind::RemoteControlRemovedKeyPresent,
+            CodexStartupReadinessSeverity::Warning,
+            "Removed remote_control config key is present",
+            format!(
+                "{:?} contains [features].remote_control, which current Codex builds do not use for this enablement path.",
+                status.config_path
+            ),
+            "Remove remote_control and keep [features].remote_connections = true instead.",
+        );
+    }
+
+    let remote_requested = status.remote_connections_enabled
+        || status.remote_control_config_present
+        || status.db_enabled == Some(true);
+    if !remote_requested {
+        return;
+    }
+
+    if !remote_control_status_is_fully_enabled(status) {
+        report.push(
+            CodexStartupReadinessIssueKind::RemoteControlIncomplete,
+            CodexStartupReadinessSeverity::Warning,
+            "Codex App remote-control state is incomplete",
+            format!(
+                "remote_connections={}, db_exists={}, table_exists={}, db_enabled={}.",
+                status.remote_connections_enabled,
+                status.db_exists,
+                status.db_table_exists,
+                status
+                    .db_enabled
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<missing>".to_string())
+            ),
+            "Run `codex-helper switch remote-control enable`, then fully restart Codex App.",
+        );
+        return;
+    }
+
+    match codex_remote_control_successful_enablement_log_seen() {
+        Ok(true) => {}
+        Ok(false) => report.push(
+            CodexStartupReadinessIssueKind::RemoteControlLogUnconfirmed,
+            CodexStartupReadinessSeverity::Warning,
+            "Remote-control enablement is not confirmed in Codex logs",
+            "The config and SQLite state look enabled, but no experimentalFeature/enablement/set success log was found.",
+            "Fully restart Codex App, then run `codex-helper switch remote-control check-logs`.",
+        ),
+        Err(err) => report.push(
+            CodexStartupReadinessIssueKind::DiagnosticError,
+            CodexStartupReadinessSeverity::Warning,
+            "Could not inspect Codex remote-control logs",
+            err.to_string(),
+            "Run `codex-helper switch remote-control check-logs` from a normal shell after restarting Codex App.",
+        ),
+    }
+}
+
+fn remote_control_status_is_fully_enabled(status: &CodexRemoteControlStatus) -> bool {
+    status.remote_connections_enabled
+        && !status.remote_control_config_present
+        && status.db_exists
+        && status.db_table_exists
+        && status.db_enabled == Some(true)
+}
+
 pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
     let cfg_path = codex_config_path();
     let state_path = codex_switch_state_path();
@@ -2158,6 +2431,144 @@ apps = true
             codex_remote_control_successful_enablement_log_seen_in_dir(&log_dir)
                 .expect("scan logs")
         );
+    }
+
+    fn startup_readiness_input(changed: bool) -> CodexStartupReadinessInput {
+        CodexStartupReadinessInput {
+            expected_port: 3211,
+            expected_patch_mode: CodexPatchMode::Default,
+            client_state_changed_this_startup: changed,
+            switch_error: None,
+        }
+    }
+
+    fn has_startup_issue(
+        report: &CodexStartupReadiness,
+        kind: CodexStartupReadinessIssueKind,
+    ) -> bool {
+        report.issues.iter().any(|issue| issue.kind == kind)
+    }
+
+    #[test]
+    fn codex_tui_startup_readiness_is_quiet_when_switch_is_ready() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        switch_on(3211).expect("switch_on should create a valid local proxy patch");
+
+        let report = codex_tui_startup_readiness(startup_readiness_input(false));
+
+        assert_eq!(report.issues, Vec::new());
+    }
+
+    #[test]
+    fn codex_tui_startup_readiness_reports_client_state_changed() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        switch_on(3211).expect("switch_on should create a valid local proxy patch");
+
+        let report = codex_tui_startup_readiness(startup_readiness_input(true));
+
+        assert!(has_startup_issue(
+            &report,
+            CodexStartupReadinessIssueKind::ClientStateChanged
+        ));
+        assert_eq!(report.issues.len(), 1);
+    }
+
+    #[test]
+    fn codex_tui_startup_readiness_warns_for_local_proxy_without_switch_state() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+"#
+            .trim_start(),
+        );
+
+        let report = codex_tui_startup_readiness(startup_readiness_input(false));
+
+        assert!(has_startup_issue(
+            &report,
+            CodexStartupReadinessIssueKind::MissingSwitchState
+        ));
+    }
+
+    #[test]
+    fn codex_tui_startup_readiness_warns_when_remote_control_log_is_unconfirmed() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        let db_dir = env.codex_home.join("sqlite");
+        let db_path = db_dir.join("codex-dev.db");
+        std::fs::create_dir_all(&db_dir).expect("create sqlite dir");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[features]
+remote_connections = true
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open test sqlite");
+            conn.execute(
+                "CREATE TABLE local_app_server_feature_enablement (
+                    feature_name TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )",
+                [],
+            )
+            .expect("create feature table");
+            conn.execute(
+                "INSERT INTO local_app_server_feature_enablement (feature_name, enabled, updated_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["remote_control", 1_i64, 7_i64],
+            )
+            .expect("seed feature row");
+        }
+        switch_on(3211).expect("switch_on should preserve features");
+
+        let report = codex_tui_startup_readiness(startup_readiness_input(false));
+
+        assert!(has_startup_issue(
+            &report,
+            CodexStartupReadinessIssueKind::RemoteControlLogUnconfirmed
+        ));
     }
 
     #[test]

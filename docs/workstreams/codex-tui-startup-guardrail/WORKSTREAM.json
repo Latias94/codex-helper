@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "slug": "codex-tui-startup-guardrail",
+  "title": "Codex TUI Startup Guardrail",
+  "status": "active",
+  "updated": "2026-05-18",
+  "scope_kind": "execution",
+  "problem": "Interactive Codex TUI startups can skip the normal verification flow, so stale patch or remote-control state is only noticed after the session has already started.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-tui-startup-guardrail/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-tui-startup-guardrail/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-tui-startup-guardrail/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "manual-smoke",
+      "path": "docs/workstreams/codex-tui-startup-guardrail/SMOKE.md"
+    }
+  ],
+  "gates": [
+    "cargo fmt --all --check",
+    "cargo nextest run -p codex-helper-tui",
+    "manual interactive TUI smoke on direct startup"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-tui-startup-guardrail/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "continue",
+    "notes": "Continue while the startup readiness prompt remains the target. Split capability-matrix, response-fixer, GUI wizard, or protocol-normalizer follow-ons into separate lanes."
+  }
+}

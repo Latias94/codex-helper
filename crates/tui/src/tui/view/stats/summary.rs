@@ -158,6 +158,7 @@ pub(super) fn usage_balance_counts_line(
     }
 }
 
+#[cfg(test)]
 pub(super) fn usage_refresh_line(view: &UsageBalanceView, lang: Language) -> String {
     if view.refresh_status.refreshing {
         return match lang {
@@ -197,6 +198,79 @@ pub(super) fn usage_refresh_line(view: &UsageBalanceView, lang: Language) -> Str
     }
 }
 
+pub(super) fn usage_refresh_brief_line(view: &UsageBalanceView, lang: Language) -> String {
+    if view.refresh_status.refreshing {
+        return match lang {
+            Language::Zh => "刷新中".to_string(),
+            Language::En => "refreshing".to_string(),
+        };
+    }
+    if let Some(err) = view.refresh_status.last_error.as_deref() {
+        return format!("{}: {err}", i18n::label(lang, "error"));
+    }
+
+    let mut parts = Vec::new();
+    if let Some(summary) = view.refresh_status.last_provider_refresh.as_ref() {
+        parts.push(balance_refresh_summary_brief_line(summary, lang));
+    }
+    if view.refresh_status.latest_error.is_some() {
+        let source = view
+            .refresh_status
+            .latest_error_provider_id
+            .as_deref()
+            .unwrap_or("-");
+        parts.push(format!("{} {source}", i18n::label(lang, "err")));
+    } else if let Some(msg) = view.refresh_status.last_message.as_deref() {
+        parts.push(msg.to_string());
+    }
+
+    if parts.is_empty() {
+        format!(
+            "{}={}",
+            i18n::label(lang, "snapshots"),
+            view.refresh_status.total_snapshots
+        )
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn balance_refresh_summary_brief_line(
+    summary: &crate::usage_providers::UsageProviderRefreshSummary,
+    lang: Language,
+) -> String {
+    if summary.deduplicated > 0 && summary.attempted == 0 {
+        return match lang {
+            Language::Zh => "刷新已在进行".to_string(),
+            Language::En => "refresh requested".to_string(),
+        };
+    }
+
+    match lang {
+        Language::Zh => {
+            let mut parts = vec![format!("成功 {}/{}", summary.refreshed, summary.attempted)];
+            if summary.failed > 0 {
+                parts.push(format!("失败 {}", summary.failed));
+            }
+            if summary.missing_token > 0 {
+                parts.push(format!("缺 key {}", summary.missing_token));
+            }
+            parts.join(" ")
+        }
+        Language::En => {
+            let mut parts = vec![format!("ok {}/{}", summary.refreshed, summary.attempted)];
+            if summary.failed > 0 {
+                parts.push(format!("fail {}", summary.failed));
+            }
+            if summary.missing_token > 0 {
+                parts.push(format!("no-key {}", summary.missing_token));
+            }
+            parts.join(" ")
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) fn balance_refresh_summary_line(
     summary: &crate::usage_providers::UsageProviderRefreshSummary,
     lang: Language,

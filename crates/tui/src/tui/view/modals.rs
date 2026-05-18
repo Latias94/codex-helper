@@ -3,6 +3,7 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::codex_integration::CodexStartupReadinessSeverity;
 use crate::tui::ProviderOption;
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
@@ -153,6 +154,99 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
         .block(block)
         .style(Style::default().fg(p.text))
         .scroll((ui.session_transcript_scroll, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, area);
+}
+
+pub(super) fn render_startup_alert_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
+    let area = centered_rect(76, 66, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            i18n::text(ui.language, msg::OVERLAY_STARTUP_GUARDRAIL),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.focus))
+        .style(Style::default().bg(p.panel));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        i18n::label(
+            ui.language,
+            "Review these Codex client state items before relying on this TUI session.",
+        ),
+        Style::default().fg(p.muted),
+    )));
+    lines.push(Line::from(""));
+
+    let Some(report) = ui.startup_readiness.as_ref() else {
+        lines.push(Line::from(Span::styled(
+            i18n::label(ui.language, "No startup issues are currently recorded."),
+            Style::default().fg(p.text),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            i18n::text(ui.language, msg::FOOTER_STARTUP_GUARDRAIL),
+            Style::default().fg(p.muted),
+        )));
+        let content = Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().fg(p.text))
+            .wrap(Wrap { trim: false });
+        f.render_widget(content, area);
+        return;
+    };
+
+    let max_visible = 5;
+    for (idx, issue) in report.issues.iter().take(max_visible).enumerate() {
+        let severity_style = match issue.severity {
+            CodexStartupReadinessSeverity::Info => Style::default().fg(p.accent),
+            CodexStartupReadinessSeverity::Warning => Style::default().fg(p.warn),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}. [{}] ", idx + 1, issue.severity.label()),
+                severity_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                issue.title.clone(),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            issue.detail.clone(),
+            Style::default().fg(p.text),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}: ", i18n::label(ui.language, "next")),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled(issue.action.clone(), Style::default().fg(p.accent)),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    let hidden = report.issues.len().saturating_sub(max_visible);
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "+{hidden} more startup item(s); run `codex-helper switch status` for details."
+            ),
+            Style::default().fg(p.muted),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        i18n::text(ui.language, msg::FOOTER_STARTUP_GUARDRAIL),
+        Style::default().fg(p.muted),
+    )));
+
+    let content = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(p.text))
         .wrap(Wrap { trim: false });
     f.render_widget(content, area);
 }

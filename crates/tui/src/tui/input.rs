@@ -86,6 +86,18 @@ pub(in crate::tui) async fn handle_key_event(
             _ => false,
         },
         Overlay::SessionTranscript => handle_key_session_transcript(ui, key).await,
+        Overlay::StartupAlert => match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                ui.startup_readiness = None;
+                ui.overlay = Overlay::None;
+                true
+            }
+            KeyCode::Char('L') => {
+                toggle_language(ui).await;
+                true
+            }
+            _ => false,
+        },
         Overlay::StationInfo => match key.code {
             KeyCode::Esc | KeyCode::Char('i') => {
                 ui.overlay = Overlay::None;

@@ -203,6 +203,40 @@ fn stats_refresh_line_shows_summary_counts_and_latest_provider_error() {
 }
 
 #[test]
+fn stats_kpis_use_brief_refresh_line_for_latest_provider_error() {
+    let snapshot = sample_snapshot(HashMap::from([(
+        "bad".to_string(),
+        vec![ProviderBalanceSnapshot {
+            provider_id: "very-long-provider-name-that-would-crowd-the-kpi".to_string(),
+            status: BalanceSnapshotStatus::Error,
+            error: Some(
+                "very long upstream dashboard error text that belongs in provider detail"
+                    .to_string(),
+            ),
+            fetched_at_ms: 100,
+            ..ProviderBalanceSnapshot::default()
+        }],
+    )]));
+    let ui = UiState {
+        page: crate::tui::types::Page::Stats,
+        last_balance_refresh_summary: Some(UsageProviderRefreshSummary {
+            attempted: 29,
+            refreshed: 28,
+            failed: 1,
+            ..UsageProviderRefreshSummary::default()
+        }),
+        ..UiState::default()
+    };
+    let view = ui.usage_balance_view_for_selection(&snapshot);
+    let line = usage_refresh_brief_line(&view, Language::En);
+
+    assert!(line.contains("ok 28/29"), "{line}");
+    assert!(line.contains("err very-long-provider-name"), "{line}");
+    assert!(!line.contains("latest error"), "{line}");
+    assert!(!line.contains("very long upstream"), "{line}");
+}
+
+#[test]
 fn stats_narrow_render_keeps_cjk_provider_and_complete_balance_amount() {
     let snapshot = sample_snapshot(HashMap::from([
         (
