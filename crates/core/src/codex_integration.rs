@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::client_config::{
     CLAUDE_ABSENT_BACKUP_SENTINEL, claude_settings_backup_path_for as claude_settings_backup_path,
-    claude_settings_path, codex_auth_path, codex_config_path, codex_switch_state_path,
+    claude_settings_path, codex_app_db_path, codex_auth_path, codex_config_path,
+    codex_switch_state_path,
 };
 use crate::config::{ProxyConfig, ProxyConfigV2, ProxyConfigV4};
 use crate::file_replace::write_text_file;
@@ -486,6 +487,56 @@ fn switch_on_codex_toml_with_mode(text: &str, port: u16, mode: CodexPatchMode) -
 
     set_toml_string(root, "model_provider", "codex_proxy");
     Ok(doc.to_string())
+}
+
+fn ensure_codex_remote_connections_feature_in_toml(text: &str) -> Result<String> {
+    let mut doc = if text.trim().is_empty() {
+        EditableTomlDocument::new()
+    } else {
+        text.parse::<EditableTomlDocument>()?
+    };
+    let root = doc.as_table_mut();
+
+    if !root.contains_key("features") {
+        root.insert(
+            "features",
+            EditableTomlItem::Table(EditableTomlTable::new()),
+        );
+    }
+    let features = root
+        .get_mut("features")
+        .and_then(EditableTomlItem::as_table_mut)
+        .ok_or_else(|| anyhow!("features must be a table"))?;
+    features.insert("remote_connections", editable_toml_value(true));
+    features.remove("remote_control");
+
+    Ok(doc.to_string())
+}
+
+fn codex_remote_connections_feature_enabled_from_toml(text: &str) -> Result<bool> {
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    let value = text.parse::<Value>()?;
+    Ok(value
+        .as_table()
+        .and_then(|root| root.get("features"))
+        .and_then(Value::as_table)
+        .and_then(|features| features.get("remote_connections"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
+fn codex_remote_control_feature_present_in_toml(text: &str) -> Result<bool> {
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    let value = text.parse::<Value>()?;
+    Ok(value
+        .as_table()
+        .and_then(|root| root.get("features"))
+        .and_then(Value::as_table)
+        .is_some_and(|features| features.contains_key("remote_control")))
 }
 
 fn json_string_at_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
@@ -1075,6 +1126,374 @@ pub fn switch_off() -> Result<()> {
 }
 
 #[derive(Debug, Clone)]
+pub struct CodexRemoteControlStatus {
+    pub config_path: PathBuf,
+    pub remote_connections_enabled: bool,
+    pub remote_control_config_present: bool,
+    pub db_path: PathBuf,
+    pub db_exists: bool,
+    pub db_table_exists: bool,
+    pub db_enabled: Option<bool>,
+    pub db_updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexRemoteControlEnablement {
+    pub status: CodexRemoteControlStatus,
+    pub backup_path: PathBuf,
+}
+
+pub fn codex_remote_control_enable() -> Result<CodexRemoteControlEnablement> {
+    let cfg_path = codex_config_path();
+    let config_text = read_config_text(&cfg_path)?;
+    let updated_config = ensure_codex_remote_connections_feature_in_toml(&config_text)?;
+    let db_path = codex_app_db_path();
+
+    validate_codex_remote_control_feature_enablement_schema(&db_path)?;
+    let backup_path = backup_codex_app_db(&db_path)?;
+
+    if updated_config != config_text {
+        atomic_write(&cfg_path, &updated_config)
+            .with_context(|| format!("patch {:?} for Codex remote connections", cfg_path))?;
+    }
+
+    upsert_codex_remote_control_feature_enablement(&db_path)?;
+    let status = codex_remote_control_status()?;
+
+    Ok(CodexRemoteControlEnablement {
+        status,
+        backup_path,
+    })
+}
+
+pub fn codex_remote_control_status() -> Result<CodexRemoteControlStatus> {
+    let config_path = codex_config_path();
+    let config_text = read_config_text(&config_path)?;
+    let remote_connections_enabled =
+        codex_remote_connections_feature_enabled_from_toml(&config_text)?;
+    let remote_control_config_present = codex_remote_control_feature_present_in_toml(&config_text)?;
+
+    let db_path = codex_app_db_path();
+    let db_exists = db_path.exists();
+    let db_status = if db_exists {
+        read_codex_remote_control_db_status(&db_path)?
+    } else {
+        CodexRemoteControlDbStatus {
+            table_exists: false,
+            enabled: None,
+            updated_at: None,
+        }
+    };
+
+    Ok(CodexRemoteControlStatus {
+        config_path,
+        remote_connections_enabled,
+        remote_control_config_present,
+        db_path,
+        db_exists,
+        db_table_exists: db_status.table_exists,
+        db_enabled: db_status.enabled,
+        db_updated_at: db_status.updated_at,
+    })
+}
+
+fn backup_codex_app_db(db_path: &Path) -> Result<PathBuf> {
+    if !db_path.exists() {
+        return Err(anyhow!(
+            "Codex App SQLite database not found at {:?}; open Codex App once so it creates the local database, then retry",
+            db_path
+        ));
+    }
+
+    let timestamp = timestamp_for_backup_filename();
+    let file_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("codex-dev.db");
+    let backup_path = db_path.with_file_name(format!("{file_name}.{timestamp}.bak"));
+    fs::copy(db_path, &backup_path)
+        .with_context(|| format!("backup {:?} -> {:?}", db_path, backup_path))?;
+    Ok(backup_path)
+}
+
+fn validate_codex_remote_control_feature_enablement_schema(db_path: &Path) -> Result<()> {
+    if !db_path.exists() {
+        return Err(anyhow!(
+            "Codex App SQLite database not found at {:?}; open Codex App once so it creates the local database, then retry",
+            db_path
+        ));
+    }
+
+    let conn = rusqlite::Connection::open(db_path)
+        .with_context(|| format!("open Codex App SQLite database {:?}", db_path))?;
+    let columns = local_app_server_feature_enablement_columns(&conn)?;
+    if columns.is_empty() {
+        return Err(anyhow!(
+            "SQLite table local_app_server_feature_enablement not found in {:?}; this Codex App build may use a different desktop state schema",
+            db_path
+        ));
+    }
+    ensure_required_enablement_columns(&columns)
+}
+
+fn timestamp_for_backup_filename() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    millis.to_string()
+}
+
+fn current_unix_millis_i64() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn upsert_codex_remote_control_feature_enablement(db_path: &Path) -> Result<()> {
+    let conn = rusqlite::Connection::open(db_path)
+        .with_context(|| format!("open Codex App SQLite database {:?}", db_path))?;
+    let columns = local_app_server_feature_enablement_columns(&conn)?;
+    if columns.is_empty() {
+        return Err(anyhow!(
+            "SQLite table local_app_server_feature_enablement not found in {:?}; this Codex App build may use a different desktop state schema",
+            db_path
+        ));
+    }
+    ensure_required_enablement_columns(&columns)?;
+
+    let updated_at = current_unix_millis_i64();
+    let column_names = columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    let has_created_at = column_names.contains(&"created_at");
+
+    let updated_rows = conn
+        .execute(
+            "UPDATE local_app_server_feature_enablement \
+             SET enabled = ?1, updated_at = ?2 \
+             WHERE feature_name = ?3",
+            rusqlite::params![1_i64, updated_at, "remote_control"],
+        )
+        .with_context(|| {
+            format!(
+                "update remote_control in local_app_server_feature_enablement in {:?}",
+                db_path
+            )
+        })?;
+    if updated_rows > 0 {
+        return Ok(());
+    }
+
+    let mut insert_columns = vec!["feature_name", "enabled", "updated_at"];
+    let mut insert_values = vec!["?1", "?2", "?3"];
+    if has_created_at {
+        insert_columns.push("created_at");
+        insert_values.push("?3");
+    }
+
+    let sql = format!(
+        "INSERT INTO local_app_server_feature_enablement ({}) VALUES ({})",
+        insert_columns.join(", "),
+        insert_values.join(", ")
+    );
+    conn.execute(
+        sql.as_str(),
+        rusqlite::params!["remote_control", 1_i64, updated_at],
+    )
+    .with_context(|| {
+        format!(
+            "upsert remote_control into local_app_server_feature_enablement in {:?}",
+            db_path
+        )
+    })?;
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SqliteColumnInfo {
+    name: String,
+    not_null: bool,
+    pk: i32,
+}
+
+fn local_app_server_feature_enablement_columns(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<SqliteColumnInfo>> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(local_app_server_feature_enablement)")
+        .context("prepare table_info(local_app_server_feature_enablement)")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SqliteColumnInfo {
+                name: row.get(1)?,
+                not_null: row.get::<_, i64>(3)? != 0,
+                pk: row.get(5)?,
+            })
+        })
+        .context("query table_info(local_app_server_feature_enablement)")?;
+
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row?);
+    }
+    Ok(columns)
+}
+
+fn ensure_required_enablement_columns(columns: &[SqliteColumnInfo]) -> Result<()> {
+    for required in ["feature_name", "enabled", "updated_at"] {
+        if !columns.iter().any(|column| column.name == required) {
+            return Err(anyhow!(
+                "SQLite table local_app_server_feature_enablement is missing required column `{required}`"
+            ));
+        }
+    }
+
+    let optional_supported = ["id", "created_at", "feature_name", "enabled", "updated_at"];
+    let unsupported_required = columns
+        .iter()
+        .filter(|column| column.not_null && column.pk == 0)
+        .filter(|column| {
+            !optional_supported
+                .iter()
+                .any(|supported| *supported == column.name)
+        })
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    if !unsupported_required.is_empty() {
+        return Err(anyhow!(
+            "SQLite table local_app_server_feature_enablement has unsupported NOT NULL columns without known values: {}",
+            unsupported_required.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CodexRemoteControlDbStatus {
+    table_exists: bool,
+    enabled: Option<bool>,
+    updated_at: Option<i64>,
+}
+
+fn read_codex_remote_control_db_status(db_path: &Path) -> Result<CodexRemoteControlDbStatus> {
+    let conn = rusqlite::Connection::open(db_path)
+        .with_context(|| format!("open Codex App SQLite database {:?}", db_path))?;
+    let columns = local_app_server_feature_enablement_columns(&conn)?;
+    if columns.is_empty() {
+        return Ok(CodexRemoteControlDbStatus {
+            table_exists: false,
+            enabled: None,
+            updated_at: None,
+        });
+    }
+
+    ensure_required_enablement_columns(&columns)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT enabled, updated_at \
+             FROM local_app_server_feature_enablement \
+             WHERE feature_name = ?1 \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+        )
+        .context("prepare local_app_server_feature_enablement status query")?;
+    let mut rows = stmt
+        .query(rusqlite::params!["remote_control"])
+        .context("query local_app_server_feature_enablement status")?;
+
+    if let Some(row) = rows.next()? {
+        Ok(CodexRemoteControlDbStatus {
+            table_exists: true,
+            enabled: Some(row.get::<_, i64>(0)? != 0),
+            updated_at: row.get(1)?,
+        })
+    } else {
+        Ok(CodexRemoteControlDbStatus {
+            table_exists: true,
+            enabled: None,
+            updated_at: None,
+        })
+    }
+}
+
+pub fn codex_remote_control_successful_enablement_log_seen() -> Result<bool> {
+    let base_dir = codex_config_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    for candidate in [base_dir.join("log"), base_dir.join("logs")] {
+        if codex_remote_control_successful_enablement_log_seen_in_dir(candidate.as_path())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn codex_remote_control_successful_enablement_log_seen_in_dir(log_dir: &Path) -> Result<bool> {
+    if !log_dir.exists() {
+        return Ok(false);
+    }
+
+    let mut files = Vec::new();
+    collect_regular_files(log_dir, &mut files)?;
+    files.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+
+    for path in files.into_iter().rev().take(20) {
+        if file_contains_remote_control_success(path.as_path())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn collect_regular_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {:?}", dir))? {
+        let entry = entry.with_context(|| format!("read entry in {:?}", dir))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("read file type for {:?}", path))?;
+        if file_type.is_dir() {
+            collect_regular_files(&path, out)?;
+        } else if file_type.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn file_contains_remote_control_success(path: &Path) -> Result<bool> {
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    let mut file = fs::File::open(path).with_context(|| format!("open log {:?}", path))?;
+    let len = file.metadata()?.len();
+    if len > MAX_BYTES {
+        file.seek(SeekFrom::End(-(MAX_BYTES as i64)))
+            .with_context(|| format!("seek log {:?}", path))?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read log {:?}", path))?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(text.contains("experimentalFeature/enablement/set")
+        && (text.contains("errorCode=null")
+            || text.contains("\"errorCode\":null")
+            || text.contains("'errorCode':null")))
+}
+
+#[derive(Debug, Clone)]
 pub struct ClaudeSwitchStatus {
     /// Whether Claude Code currently appears to be configured to use the local codex-helper proxy.
     pub enabled: bool,
@@ -1620,6 +2039,125 @@ supports_websockets = false
         assert!(updated.contains("base_url = \"http://127.0.0.1:3333\""));
         assert!(!updated.contains("requires_openai_auth"));
         assert!(!updated.contains("supports_websockets"));
+    }
+
+    #[test]
+    fn remote_control_config_patch_sets_remote_connections_and_removes_removed_key() {
+        let text = r#"
+[features]
+remote_control = true
+apps = true
+"#;
+
+        let updated = ensure_codex_remote_connections_feature_in_toml(text)
+            .expect("remote-control config patch should parse");
+
+        assert!(updated.contains("remote_connections = true"));
+        assert!(updated.contains("apps = true"));
+        assert!(!updated.contains("remote_control = true"));
+        assert!(
+            codex_remote_connections_feature_enabled_from_toml(&updated)
+                .expect("remote_connections should parse")
+        );
+        assert!(
+            !codex_remote_control_feature_present_in_toml(&updated)
+                .expect("remote_control should parse")
+        );
+    }
+
+    #[test]
+    fn codex_remote_control_enable_patches_config_backs_up_db_and_writes_sqlite() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        let db_dir = env.codex_home.join("sqlite");
+        let db_path = db_dir.join("codex-dev.db");
+        std::fs::create_dir_all(&db_dir).expect("create sqlite dir");
+        write_file(
+            &cfg_path,
+            r#"
+[features]
+remote_control = true
+"#
+            .trim_start(),
+        );
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open test sqlite");
+            conn.execute(
+                "CREATE TABLE local_app_server_feature_enablement (
+                    feature_name TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )",
+                [],
+            )
+            .expect("create feature table");
+            conn.execute(
+                "INSERT INTO local_app_server_feature_enablement (feature_name, enabled, updated_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["remote_control", 0_i64, 7_i64],
+            )
+            .expect("seed feature row");
+        }
+
+        let result =
+            codex_remote_control_enable().expect("remote-control enablement should succeed");
+
+        assert!(result.backup_path.exists(), "backup should be created");
+        assert!(result.status.remote_connections_enabled);
+        assert!(!result.status.remote_control_config_present);
+        assert_eq!(result.status.db_enabled, Some(true));
+        assert!(result.status.db_updated_at.unwrap_or_default() > 7);
+
+        let updated_cfg = read_file(&cfg_path);
+        assert!(updated_cfg.contains("remote_connections = true"));
+        assert!(!updated_cfg.contains("remote_control = true"));
+    }
+
+    #[test]
+    fn codex_remote_control_enable_does_not_patch_config_when_db_schema_is_missing() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        let db_dir = env.codex_home.join("sqlite");
+        let db_path = db_dir.join("codex-dev.db");
+        std::fs::create_dir_all(&db_dir).expect("create sqlite dir");
+        write_file(
+            &cfg_path,
+            r#"
+[features]
+apps = true
+"#
+            .trim_start(),
+        );
+        {
+            let _conn = rusqlite::Connection::open(&db_path).expect("open empty test sqlite");
+        }
+        let original = read_file(&cfg_path);
+
+        let err = codex_remote_control_enable()
+            .expect_err("remote-control enablement should reject missing feature table");
+
+        assert!(
+            err.to_string()
+                .contains("local_app_server_feature_enablement")
+        );
+        assert_eq!(read_file(&cfg_path), original);
+    }
+
+    #[test]
+    fn remote_control_log_scan_detects_successful_enablement_set() {
+        let env = setup_temp_env();
+        let log_dir = env.codex_home.join("log");
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        write_file(
+            &log_dir.join("codex-app.log"),
+            r#"{"method":"experimentalFeature/enablement/set","errorCode":null}"#,
+        );
+
+        assert!(
+            codex_remote_control_successful_enablement_log_seen_in_dir(&log_dir)
+                .expect("scan logs")
+        );
     }
 
     #[test]

@@ -110,6 +110,9 @@ fn inject_auth_headers(
 ) {
     let allow_client_passthrough =
         !(service_name == "codex" && codex_client_patch_mode.strips_codex_client_auth());
+    if !allow_client_passthrough {
+        strip_codex_client_account_headers(headers);
+    }
 
     let client_has_auth = headers.contains_key("authorization");
     let (token, _token_src) = resolve_auth_token_with_source(
@@ -138,6 +141,11 @@ fn inject_auth_headers(
     } else if client_has_x_api_key && !allow_client_passthrough {
         headers.remove("x-api-key");
     }
+}
+
+fn strip_codex_client_account_headers(headers: &mut HeaderMap) {
+    headers.remove(HeaderName::from_static("chatgpt-account-id"));
+    headers.remove(HeaderName::from_static("x-openai-fedramp"));
 }
 
 fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBase> {
@@ -257,6 +265,11 @@ mod tests {
             HeaderValue::from_static("Bearer chatgpt-token"),
         );
         client_headers.insert("x-api-key", HeaderValue::from_static("client-key"));
+        client_headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("account-client"),
+        );
+        client_headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
         client_headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         let cache = OnceLock::new();
@@ -280,6 +293,8 @@ mod tests {
 
         assert!(!setup.headers.contains_key("authorization"));
         assert!(!setup.headers.contains_key("x-api-key"));
+        assert!(!setup.headers.contains_key("chatgpt-account-id"));
+        assert!(!setup.headers.contains_key("x-openai-fedramp"));
         assert_eq!(
             setup.headers.get("content-type"),
             Some(&HeaderValue::from_static("application/json"))
@@ -294,6 +309,11 @@ mod tests {
             "authorization",
             HeaderValue::from_static("Bearer chatgpt-token"),
         );
+        client_headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("account-client"),
+        );
+        client_headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
@@ -323,6 +343,8 @@ mod tests {
             setup.headers.get("authorization"),
             Some(&HeaderValue::from_static("Bearer relay-token"))
         );
+        assert!(!setup.headers.contains_key("chatgpt-account-id"));
+        assert!(!setup.headers.contains_key("x-openai-fedramp"));
     }
 
     #[tokio::test]
@@ -335,6 +357,11 @@ mod tests {
             HeaderValue::from_static("Bearer facade-token"),
         );
         client_headers.insert("x-api-key", HeaderValue::from_static("client-key"));
+        client_headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("account-client"),
+        );
+        client_headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
 
         let cache = OnceLock::new();
         let setup = prepare_attempt_request(AttemptRequestSetupParams {
@@ -357,6 +384,8 @@ mod tests {
 
         assert!(!setup.headers.contains_key("authorization"));
         assert!(!setup.headers.contains_key("x-api-key"));
+        assert!(!setup.headers.contains_key("chatgpt-account-id"));
+        assert!(!setup.headers.contains_key("x-openai-fedramp"));
     }
 
     #[tokio::test]

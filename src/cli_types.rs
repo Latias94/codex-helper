@@ -182,6 +182,21 @@ pub(crate) enum SwitchCommand {
         #[arg(long)]
         claude: bool,
     },
+    /// Manage Codex App mobile remote-control enablement
+    RemoteControl {
+        #[command(subcommand)]
+        cmd: RemoteControlCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum RemoteControlCommand {
+    /// Enable Codex App mobile remote control on this machine
+    Enable,
+    /// Show Codex App mobile remote-control status
+    Status,
+    /// Check Codex logs for a successful experimentalFeature/enablement/set response
+    CheckLogs,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

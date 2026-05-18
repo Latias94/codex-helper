@@ -22,6 +22,14 @@ pub fn codex_config_path() -> PathBuf {
     codex_home().join("config.toml")
 }
 
+pub fn codex_sqlite_dir() -> PathBuf {
+    codex_home().join("sqlite")
+}
+
+pub fn codex_app_db_path() -> PathBuf {
+    codex_sqlite_dir().join("codex-dev.db")
+}
+
 pub fn codex_switch_state_path() -> PathBuf {
     codex_home().join("codex-helper-switch-state.json")
 }

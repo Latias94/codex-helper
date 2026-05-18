@@ -1,5 +1,6 @@
 use crate::cli_types::{
-    Cli, CliError, CliResult, CodexPatchModeArg, Command, NotifyCommand, SwitchCommand,
+    Cli, CliError, CliResult, CodexPatchModeArg, Command, NotifyCommand, RemoteControlCommand,
+    SwitchCommand,
 };
 use crate::codex_integration;
 use crate::commands;
@@ -53,6 +54,7 @@ pub async fn run_cli() -> CliResult<()> {
                 } => do_switch_on(port, mode, codex, claude)?,
                 SwitchCommand::Off { codex, claude } => do_switch_off(codex, claude)?,
                 SwitchCommand::Status { codex, claude } => do_switch_status(codex, claude),
+                SwitchCommand::RemoteControl { cmd } => do_remote_control(cmd)?,
             }
             return Ok(());
         }
@@ -938,6 +940,86 @@ fn do_switch_status(codex_flag: bool, claude_flag: bool) {
     }
     if show_claude {
         print_claude_switch_status();
+    }
+}
+
+fn do_remote_control(cmd: RemoteControlCommand) -> CliResult<()> {
+    match cmd {
+        RemoteControlCommand::Enable => {
+            let result = codex_integration::codex_remote_control_enable()
+                .map_err(|e| CliError::CodexConfig(e.to_string()))?;
+            println!("{}", "Codex App 手机远程控制".bold());
+            println!("  已写入 [features].remote_connections = true");
+            println!(
+                "  未写入 [features].remote_control = true（该 key 在当前 Codex 源码中是 no-op/removed）"
+            );
+            println!("  SQLite 备份: {:?}", result.backup_path);
+            print_remote_control_status_details(&result.status);
+            println!();
+            println!(
+                "请完整退出并重启 Codex App，使 App 重新读取 config.toml 和本地 SQLite 状态。"
+            );
+            println!(
+                "重启后运行 `codex-helper switch remote-control check-logs`，确认 experimentalFeature/enablement/set 至少出现一次 errorCode=null。"
+            );
+            println!("手机端连接时必须先完成 ChatGPT 账号 MFA / 多因素认证。");
+        }
+        RemoteControlCommand::Status => {
+            let status = codex_integration::codex_remote_control_status()
+                .map_err(|e| CliError::CodexConfig(e.to_string()))?;
+            println!("{}", "Codex App 手机远程控制状态".bold());
+            print_remote_control_status_details(&status);
+        }
+        RemoteControlCommand::CheckLogs => {
+            let seen = codex_integration::codex_remote_control_successful_enablement_log_seen()
+                .map_err(|e| CliError::CodexConfig(e.to_string()))?;
+            println!("{}", "Codex App 远程控制日志检查".bold());
+            if seen {
+                println!(
+                    "  已在 Codex 日志中看到 experimentalFeature/enablement/set 且 errorCode=null。"
+                );
+            } else {
+                println!(
+                    "  尚未在 Codex 日志中看到 experimentalFeature/enablement/set 且 errorCode=null。"
+                );
+                println!("  请确认已完整重启 Codex App，并在 App 中触发远程控制相关设置刷新。");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_remote_control_status_details(status: &codex_integration::CodexRemoteControlStatus) {
+    println!("  config.toml: {:?}", status.config_path);
+    println!(
+        "  features.remote_connections: {}",
+        if status.remote_connections_enabled {
+            "true".green().to_string()
+        } else {
+            "false".red().to_string()
+        }
+    );
+    println!(
+        "  features.remote_control present: {}",
+        if status.remote_control_config_present {
+            "true".red().to_string()
+        } else {
+            "false".green().to_string()
+        }
+    );
+    println!("  SQLite DB: {:?}", status.db_path);
+    println!("  SQLite DB exists: {}", status.db_exists);
+    println!(
+        "  local_app_server_feature_enablement table: {}",
+        status.db_table_exists
+    );
+    match status.db_enabled {
+        Some(enabled) => println!("  remote_control enabled: {}", enabled),
+        None => println!("  remote_control enabled: <未写入>"),
+    }
+    match status.db_updated_at {
+        Some(updated_at) => println!("  remote_control updated_at: {}", updated_at),
+        None => println!("  remote_control updated_at: <未写入>"),
     }
 }
 

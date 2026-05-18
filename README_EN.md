@@ -80,7 +80,65 @@ codex-helper switch status
 codex-helper switch off
 ```
 
-For Codex app/mobile bridge setups, use `codex-helper switch on --mode chatgpt-bridge`. It keeps ChatGPT account auth for the client layer while routing model traffic through codex-helper. Sign in with ChatGPT in official Codex first; if `auth.json` lacks the full login tokens, email, and account metadata, codex-helper refuses the patch to avoid Codex TUI bootstrap failures such as `email and plan type are required for chatgpt authentication`. If a relay expects provider-prefixed model names, add provider-scoped model mapping:
+For Codex app/mobile bridge setups, use `codex-helper switch on --mode chatgpt-bridge`. It keeps ChatGPT account auth for the client layer while routing model traffic through codex-helper. Sign in with ChatGPT in official Codex first; if `auth.json` lacks the full login tokens, email, and account metadata, codex-helper refuses the patch to avoid Codex TUI bootstrap failures such as `email and plan type are required for chatgpt authentication`.
+
+Note: any change to `~/.codex/config.toml` is only picked up by newly started Codex sessions. After changing it, fully restart the Codex App, TUI, or `codex exec` session.
+
+If you want Codex to stay logged into ChatGPT while the actual conversation/model traffic goes through a relay, split the setup into two layers:
+
+1. Use `chatgpt-bridge` to keep the Codex App on the ChatGPT auth path.
+2. `codex-helper switch on --mode chatgpt-bridge` points Codex's own `~/.codex/config.toml` at the local `codex_proxy`.
+3. Configure `codex.providers.*` and `codex.routing` in `~/.codex-helper/config.toml` so codex-helper selects your relay.
+4. If the relay expects prefixed model names, add `model_mapping` on the provider.
+
+This mode is meant for users who want Codex App/mobile/subscription-gated account features to keep seeing ChatGPT auth, while day-to-day conversation, tool, and imagegen model usage consumes their own relay or monthly quota.
+
+The Codex-side local proxy entry is normally written by `switch on`; avoid hand-editing it over unrelated Codex settings:
+
+```toml
+# ~/.codex/config.toml
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+```
+
+The codex-helper side only owns upstreams and routing:
+
+```toml
+# ~/.codex-helper/config.toml
+version = 5
+
+[codex.client_patch]
+mode = "chatgpt-bridge"
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "RELAY_API_KEY"
+
+[codex.routing]
+entry = "relay_first"
+
+[codex.routing.routes.relay_first]
+strategy = "ordered-failover"
+children = ["relay"]
+```
+
+Codex App mobile remote control is a separate path, not the same as `chatgpt-bridge`:
+
+```bash
+codex-helper switch remote-control enable
+codex-helper switch remote-control status
+codex-helper switch remote-control check-logs
+```
+
+This writes `remote_connections = true` under `~/.codex/config.toml`'s `[features]` table, does not write `remote_control = true`, and then backs up and updates `local_app_server_feature_enablement.remote_control` inside `~/.codex/sqlite/codex-dev.db`. After that, fully restart the Codex app, then use `check-logs` to confirm `experimentalFeature/enablement/set` appeared at least once with `errorCode=null`. Mobile login still requires MFA on the ChatGPT account.
+
+If a relay expects provider-prefixed model names, add provider-scoped model mapping:
 
 ```bash
 codex-helper provider add relay --base-url https://relay.example/v1 --auth-token-env RELAY_API_KEY --supported-model gpt-5.5 --model-map gpt-5.5=openai/gpt-5.5

@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - `chatgpt-bridge` 启用前会校验 `~/.codex/auth.json` 是否已有完整 ChatGPT 登录态；未登录或缺少 token/email/account 信息时拒绝 patch，避免 Codex TUI 因半登录 auth 状态启动失败。
 - `imagegen-bridge` 的 auth facade 改为写入空对象 `{}`，不再显式写 `auth_mode = chatgpt`；恢复逻辑现在按 JSON 语义匹配，兼容旧版本已写入的 facade。
 - bridge 模式下如果上游没有配置 codex-helper 自己的 `auth_token_env` / `auth_token` / `api_key`，会移除来自 Codex 客户端的认证头，避免把 ChatGPT 登录 token 透传到第三方 relay。
+- 新增 `codex-helper switch remote-control` 子命令组：可开启、查看并检查 Codex App 手机远程控制状态；命令会写入 `[features].remote_connections = true`，不会写已失效的 `remote_control = true`，并会备份和更新 `~/.codex/sqlite/codex-dev.db` 的 `local_app_server_feature_enablement.remote_control`。
 - `provider add` 支持 `--supported-model` 和 `--model-map FROM=TO`，`provider show --json` 也会带出 `supported_models` 和 `model_mapping`；用于 Codex 请求模型名和 relay 实际模型名不一致的场景，例如 `gpt-5.5` -> `openai/gpt-5.5`。
 - TUI 的 `Stats` 导航位升级为 `Usage`，页面集中展示 provider 用量、成本、余额/配额状态、刷新摘要、路由影响和 endpoint 最近样本。
 - TUI `Usage / Balance` 卡片新增 USD 消耗速率预测：按最近已计价请求估算 `$ / h`，并外推到每日刷新时间（默认本地 `+08:00` 0 点）；可通过 `[ui.usage_forecast]` 配置窗口、最小样本和刷新时区。
@@ -43,6 +44,7 @@ All notable changes to this project will be documented in this file.
 - `chatgpt-bridge` now validates that `~/.codex/auth.json` already contains a complete ChatGPT login state and refuses to patch incomplete auth files, avoiding Codex TUI bootstrap failures from half-written auth.
 - `imagegen-bridge` now writes an empty `{}` auth facade instead of an explicit `auth_mode = chatgpt`; auth restoration matches helper-written facades by JSON semantics so older patched states remain recoverable.
 - In bridge mode, codex-helper strips Codex client auth headers unless the selected upstream has its own helper-side secret, preventing ChatGPT login tokens from being forwarded to third-party relays.
+- Added the `codex-helper switch remote-control` command group to enable, inspect, and verify Codex App mobile remote control. It writes `[features].remote_connections = true`, avoids the removed `remote_control = true` key, and backs up/updates `local_app_server_feature_enablement.remote_control` in `~/.codex/sqlite/codex-dev.db`.
 - `provider add` now accepts `--supported-model` and `--model-map FROM=TO`, and `provider show --json` exposes `supported_models` / `model_mapping`, covering relay model aliases such as `gpt-5.5` -> `openai/gpt-5.5`.
 - The TUI `Stats` slot is now `Usage`, focused on provider usage, cost, balance/quota state, refresh status, route impact, and endpoint recent samples.
 - The TUI `Usage / Balance` card now forecasts USD burn: it estimates `$ / h` from recent priced requests and projects spend until the daily reset time (default local `+08:00` midnight), configurable via `[ui.usage_forecast]`.

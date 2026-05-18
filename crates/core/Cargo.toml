@@ -33,6 +33,7 @@ regex = "1.12.3"
 owo-colors = "4.2.3"
 humantime = "2.1.0"
 atty = "0.2.14"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }

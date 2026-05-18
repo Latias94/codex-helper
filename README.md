@@ -95,6 +95,62 @@ codex-helper switch off
 
 `--mode chatgpt-bridge` 用于“ChatGPT Auth 保留、模型层走 codex-helper”的场景，会 patch `~/.codex/config.toml` 的 `requires_openai_auth = true` / `supports_websockets = false`，并只把 `~/.codex/auth.json` 的 `auth_mode` 改为 `chatgpt`、`OPENAI_API_KEY` 改为 `null`。启用前必须先在官方 Codex 中完成 ChatGPT 登录；如果 `auth.json` 没有完整登录 token、email 和账号信息，codex-helper 会拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。已有 Codex app 通常需要重启后才会应用这些客户端配置变更。
 
+注意：任何对 `~/.codex/config.toml` 的修改都只会被新启动的 Codex 会话读取；修改后请完整重启 Codex App、TUI 或 `codex exec` 会话。
+
+如果你的目标是“还能登录 ChatGPT，但实际对话流量走中转”，推荐把账号层和路由层分开：
+
+1. 用 `chatgpt-bridge` 保留 Codex App 的 ChatGPT 登录态。
+2. `codex-helper switch on --mode chatgpt-bridge` 会把 Codex 自己的 `~/.codex/config.toml` 指向本地 `codex_proxy`。
+3. 在 `~/.codex-helper/config.toml` 配 `codex.providers.*` 和 `codex.routing`，让 codex-helper 最终选择你的 relay。
+4. 如果 relay 需要带前缀的模型名，就给 provider 配 `model_mapping`。
+
+这种模式适合想保留 Codex App / 手机端 / 订阅账号能力判定，同时把日常对话、工具调用和 imagegen 等模型消耗放到自有中转或包月额度上的场景。
+
+Codex 侧的本地代理入口通常由 `switch on` 写入，不建议手写覆盖其它 Codex 配置：
+
+```toml
+# ~/.codex/config.toml
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "codex-helper"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+```
+
+codex-helper 侧只负责上游和路由：
+
+```toml
+# ~/.codex-helper/config.toml
+version = 5
+
+[codex.client_patch]
+mode = "chatgpt-bridge"
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "RELAY_API_KEY"
+
+[codex.routing]
+entry = "relay_first"
+
+[codex.routing.routes.relay_first]
+strategy = "ordered-failover"
+children = ["relay"]
+```
+
+Codex App 手机远程控制走的是另一条路径，不要把它和 `chatgpt-bridge` 混在一起：
+
+```bash
+codex-helper switch remote-control enable
+codex-helper switch remote-control status
+codex-helper switch remote-control check-logs
+```
+
+这个命令会写 `~/.codex/config.toml` 的 `[features].remote_connections = true`，不会写 `remote_control = true`，然后备份并更新 `~/.codex/sqlite/codex-dev.db` 里的 `local_app_server_feature_enablement.remote_control`。执行后请完整重启 Codex App，再用 `check-logs` 验证 `experimentalFeature/enablement/set` 至少出现一次 `errorCode=null`。手机端连接时仍然需要 ChatGPT 账号完成 MFA / 多因素认证。
+
 如果中转站要求带 provider 前缀的模型名，可以用 provider 级 `model_mapping` 改写请求体里的 `model`：
 
 ```bash
