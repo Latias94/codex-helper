@@ -1,4 +1,5 @@
 use crate::CliResult;
+use crate::codex_integration::{CodexBridgeDiagnosticStatus, codex_bridge_diagnostics};
 use crate::config::{
     codex_auth_path, codex_config_path, load_config, probe_codex_bootstrap_from_cli, proxy_home_dir,
 };
@@ -20,6 +21,7 @@ struct StatusJson<'a> {
     claude: &'a crate::config::ServiceConfigManager,
     lb_failure_threshold: u32,
     lb_cooldown_secs: u64,
+    codex_bridge: crate::codex_integration::CodexBridgeDiagnostics,
 }
 
 pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
@@ -32,6 +34,7 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
             claude: &cfg.claude,
             lb_failure_threshold: crate::lb::FAILURE_THRESHOLD,
             lb_cooldown_secs: crate::lb::COOLDOWN_SECS,
+            codex_bridge: codex_bridge_diagnostics(),
         };
         let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
         println!("{text}");
@@ -43,6 +46,35 @@ pub async fn handle_status_cmd(json: bool) -> CliResult<()> {
 
     if let Some(ver) = cfg.version {
         println!("{} {}", "Config version:".bold(), ver);
+    }
+    let bridge = codex_bridge_diagnostics();
+    let bridge_status = bridge.worst_status();
+    println!(
+        "{} {} (patch_mode={}, remote_compaction_v1_ready={}, imagegen_facade_ready={}, upstream_auth_ready={})",
+        "Codex bridge:".bold(),
+        bridge_status.as_str(),
+        bridge
+            .patch_mode
+            .map(|mode| mode.as_str())
+            .unwrap_or("<none>"),
+        bridge.remote_compaction_v1_ready,
+        bridge.imagegen_facade_ready,
+        bridge.upstream_auth_ready,
+    );
+    for check in bridge
+        .checks
+        .iter()
+        .filter(|check| check.status != CodexBridgeDiagnosticStatus::Ok)
+        .take(3)
+    {
+        println!(
+            "  [{}] {}",
+            check.status.as_str().to_uppercase(),
+            check.message
+        );
+        if let Some(action) = check.action.as_deref() {
+            println!("      Action: {action}");
+        }
     }
 
     // Codex section
@@ -123,6 +155,24 @@ struct DoctorCheck {
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     checks: Vec<DoctorCheck>,
+}
+
+fn doctor_status_label(status: CodexBridgeDiagnosticStatus) -> &'static str {
+    match status {
+        CodexBridgeDiagnosticStatus::Ok => "ok",
+        CodexBridgeDiagnosticStatus::Info => "info",
+        CodexBridgeDiagnosticStatus::Warn => "warn",
+        CodexBridgeDiagnosticStatus::Fail => "fail",
+    }
+}
+
+fn print_doctor_bridge_check(status: CodexBridgeDiagnosticStatus, message: &str) {
+    match status {
+        CodexBridgeDiagnosticStatus::Ok => println!("{}   {}", "[OK]".green(), message),
+        CodexBridgeDiagnosticStatus::Info => println!("{} {}", "[INFO]".cyan(), message),
+        CodexBridgeDiagnosticStatus::Warn => println!("{} {}", "[WARN]".yellow(), message),
+        CodexBridgeDiagnosticStatus::Fail => println!("{} {}", "[FAIL]".red(), message),
+    }
 }
 
 pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
@@ -422,6 +472,27 @@ pub async fn handle_doctor_cmd(json: bool) -> CliResult<()> {
             id: "codex.auth.json",
             status: "warn",
             message: msg,
+        });
+    }
+
+    // 2.5) Codex official bridge diagnostics. Keep this offline: no live upstream probe here.
+    let bridge = codex_bridge_diagnostics();
+    if !json {
+        println!("{}", "Codex official bridge diagnostics:".bold());
+    }
+    for check in bridge.checks {
+        let message = if let Some(action) = check.action {
+            format!("{} Action: {}", check.message, action)
+        } else {
+            check.message
+        };
+        if !json {
+            print_doctor_bridge_check(check.status, &message);
+        }
+        checks.push(DoctorCheck {
+            id: check.id,
+            status: doctor_status_label(check.status),
+            message,
         });
     }
 

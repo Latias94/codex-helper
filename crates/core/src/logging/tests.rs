@@ -25,6 +25,7 @@ fn request_log_serializes_request_id_when_present() {
             effective: Some("priority".to_string()),
             actual: Some("priority".to_string()),
         },
+        codex_bridge: None,
         usage: None,
         http_debug: None,
         http_debug_ref: None,
@@ -57,6 +58,7 @@ fn request_log_can_serialize_provider_endpoint_without_station_identity() {
         cwd: Some("/workdir".to_string()),
         reasoning_effort: Some("medium".to_string()),
         service_tier: ServiceTierLog::default(),
+        codex_bridge: None,
         usage: None,
         http_debug: None,
         http_debug_ref: None,
@@ -70,6 +72,53 @@ fn request_log_can_serialize_provider_endpoint_without_station_identity() {
     assert_eq!(
         value["provider_endpoint_key"].as_str(),
         Some("codex/input/default")
+    );
+}
+
+#[test]
+fn request_log_serializes_codex_bridge_metadata() {
+    let value = serde_json::to_value(RequestLog {
+        timestamp_ms: 1,
+        request_id: Some(42),
+        trace_id: Some(request_trace_id("codex", 42)),
+        service: "codex",
+        method: "POST",
+        path: "/v1/responses/compact",
+        status_code: 200,
+        duration_ms: 123,
+        ttfb_ms: Some(10),
+        station_name: Some("relay"),
+        provider_id: Some("relay".to_string()),
+        endpoint_id: None,
+        provider_endpoint_key: None,
+        upstream_base_url: "https://relay.example/v1",
+        session_id: Some("sid-1".to_string()),
+        cwd: Some("/workdir".to_string()),
+        reasoning_effort: Some("medium".to_string()),
+        service_tier: ServiceTierLog::default(),
+        codex_bridge: Some(CodexBridgeLog {
+            patch_mode: "official-imagegen-bridge".to_string(),
+            remote_compaction_v1_request: true,
+            strips_client_auth: true,
+        }),
+        usage: None,
+        http_debug: None,
+        http_debug_ref: None,
+        retry: None,
+    })
+    .expect("serialize request log");
+
+    assert_eq!(
+        value["codex_bridge"]["patch_mode"].as_str(),
+        Some("official-imagegen-bridge")
+    );
+    assert_eq!(
+        value["codex_bridge"]["remote_compaction_v1_request"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        value["codex_bridge"]["strips_client_auth"].as_bool(),
+        Some(true)
     );
 }
 

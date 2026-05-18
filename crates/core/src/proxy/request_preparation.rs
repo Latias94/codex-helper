@@ -2,7 +2,7 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, Method};
 
 use crate::codex_integration::CodexPatchMode;
-use crate::logging::{BodyPreview, ServiceTierLog, make_body_preview};
+use crate::logging::{BodyPreview, CodexBridgeLog, ServiceTierLog, make_body_preview};
 
 use super::request_body::{
     apply_model_override_value, apply_reasoning_effort_override_value,
@@ -17,6 +17,7 @@ pub(super) struct RequestFlavor {
     pub is_user_turn: bool,
     pub is_codex_service: bool,
     pub codex_client_patch_mode: CodexPatchMode,
+    pub codex_bridge_log: Option<CodexBridgeLog>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,14 +54,24 @@ pub(super) fn detect_request_flavor(
         .unwrap_or(false);
 
     let is_responses_path = path.ends_with("/responses");
+    let is_remote_compaction_v1_request = path.ends_with("/responses/compact");
     let is_user_turn = *method == Method::POST && is_responses_path;
+    let is_codex_service = service_name == "codex";
+    let codex_bridge_log = (is_codex_service
+        && (!codex_client_patch_mode.is_default() || is_remote_compaction_v1_request))
+        .then(|| CodexBridgeLog {
+            patch_mode: codex_client_patch_mode.as_str().to_string(),
+            remote_compaction_v1_request: is_remote_compaction_v1_request,
+            strips_client_auth: codex_client_patch_mode.strips_codex_client_auth(),
+        });
 
     RequestFlavor {
         client_content_type,
         is_stream,
         is_user_turn,
-        is_codex_service: service_name == "codex",
+        is_codex_service,
         codex_client_patch_mode,
+        codex_bridge_log,
     }
 }
 
@@ -173,6 +184,25 @@ mod tests {
         assert!(flavor.is_stream);
         assert!(flavor.is_user_turn);
         assert!(flavor.is_codex_service);
+    }
+
+    #[test]
+    fn detect_request_flavor_marks_codex_bridge_compact_request() {
+        let headers = HeaderMap::new();
+
+        let flavor = detect_request_flavor(
+            "codex",
+            &Method::POST,
+            &headers,
+            "/v1/responses/compact",
+            CodexPatchMode::OfficialImagegenBridge,
+        );
+
+        assert!(!flavor.is_user_turn);
+        let bridge = flavor.codex_bridge_log.expect("bridge log");
+        assert_eq!(bridge.patch_mode, "official-imagegen-bridge");
+        assert!(bridge.remote_compaction_v1_request);
+        assert!(bridge.strips_client_auth);
     }
 
     #[test]

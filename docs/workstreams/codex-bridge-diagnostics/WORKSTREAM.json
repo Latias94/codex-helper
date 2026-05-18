@@ -1,0 +1,10 @@
+{
+  "slug": "codex-bridge-diagnostics",
+  "title": "Codex official bridge diagnostics",
+  "status": "complete",
+  "owner": "codex",
+  "created": "2026-05-18",
+  "goal": "Expose offline diagnostics and request observability for official relay/imagegen bridge modes, including remote compaction v1 and remote_compaction_v2 risk detection.",
+  "current_task": null,
+  "completed": "2026-05-18"
+}

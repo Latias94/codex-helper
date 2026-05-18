@@ -266,6 +266,15 @@ fn service_tier_log_is_empty(value: &ServiceTierLog) -> bool {
     value.requested.is_none() && value.effective.is_none() && value.actual.is_none()
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct CodexBridgeLog {
+    pub patch_mode: String,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub remote_compaction_v1_request: bool,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub strips_client_auth: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RequestLog<'a> {
     pub timestamp_ms: u64,
@@ -300,6 +309,8 @@ pub struct RequestLog<'a> {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "service_tier_log_is_empty", default)]
     pub service_tier: ServiceTierLog,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_bridge: Option<CodexBridgeLog>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -707,6 +718,8 @@ struct HttpDebugLogEntry<'a> {
     #[serde(skip_serializing_if = "service_tier_log_is_empty", default)]
     pub service_tier: ServiceTierLog,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_bridge: Option<CodexBridgeLog>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryInfo>,
@@ -842,6 +855,7 @@ pub fn log_request_with_debug(
     cwd: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: ServiceTierLog,
+    codex_bridge: Option<CodexBridgeLog>,
     usage: Option<UsageMetrics>,
     retry: Option<RetryInfo>,
     http_debug: Option<HttpDebugLog>,
@@ -892,6 +906,7 @@ pub fn log_request_with_debug(
             cwd: cwd.clone(),
             reasoning_effort: reasoning_effort.clone(),
             service_tier: service_tier.clone(),
+            codex_bridge: codex_bridge.clone(),
             usage: usage.clone(),
             retry: retry.clone(),
             http_debug: h,
@@ -935,6 +950,7 @@ pub fn log_request_with_debug(
         cwd,
         reasoning_effort,
         service_tier,
+        codex_bridge,
         usage,
         http_debug: http_debug_for_main,
         http_debug_ref,

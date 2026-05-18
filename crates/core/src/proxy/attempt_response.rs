@@ -5,7 +5,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 
 use crate::lb::{CooldownBackoff, LoadBalancer};
-use crate::logging::{RouteAttemptLog, ServiceTierLog, make_body_preview};
+use crate::logging::{CodexBridgeLog, RouteAttemptLog, ServiceTierLog, make_body_preview};
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
 
 use super::ProxyService;
@@ -54,6 +54,7 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) cwd: Option<&'a str>,
     pub(super) effective_effort: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
+    pub(super) codex_bridge: Option<CodexBridgeLog>,
     pub(super) route_graph_key: Option<&'a str>,
     pub(super) upstream_chain: &'a mut Vec<String>,
     pub(super) route_attempts: &'a mut Vec<RouteAttemptLog>,
@@ -92,6 +93,7 @@ pub(super) struct StreamingAttemptResponseParams<'a> {
     pub(super) cwd: Option<&'a str>,
     pub(super) effective_effort: Option<&'a str>,
     pub(super) base_service_tier: &'a ServiceTierLog,
+    pub(super) codex_bridge: Option<CodexBridgeLog>,
     pub(super) route_graph_key: Option<&'a str>,
     pub(super) request_id: u64,
     pub(super) is_user_turn: bool,
@@ -145,6 +147,7 @@ pub(super) async fn handle_streaming_attempt_success(
         cwd,
         effective_effort,
         base_service_tier,
+        codex_bridge,
         route_graph_key,
         request_id,
         is_user_turn,
@@ -212,6 +215,7 @@ pub(super) async fn handle_streaming_attempt_success(
             cwd: cwd.map(ToOwned::to_owned),
             effective_effort: effective_effort.map(ToOwned::to_owned),
             service_tier: base_service_tier.clone(),
+            codex_bridge,
             request_id,
             is_user_turn,
             is_codex_service,
@@ -247,6 +251,7 @@ pub(super) async fn handle_attempt_response(
         cwd,
         effective_effort,
         base_service_tier,
+        codex_bridge,
         route_graph_key,
         upstream_chain,
         route_attempts,
@@ -341,6 +346,7 @@ pub(super) async fn handle_attempt_response(
                 effective_effort,
                 base_service_tier,
                 observed_service_tier,
+                codex_bridge.clone(),
                 usage,
                 retry,
                 response_headers_filtered,
@@ -394,6 +400,7 @@ pub(super) async fn handle_attempt_response(
                 effective_effort,
                 base_service_tier,
                 observed_service_tier,
+                codex_bridge.clone(),
                 None,
                 retry,
                 response_headers_filtered,
@@ -473,6 +480,7 @@ pub(super) async fn handle_attempt_response(
             effective_effort,
             base_service_tier,
             observed_service_tier,
+            codex_bridge,
             None,
             retry,
             response_headers_filtered,
@@ -499,6 +507,7 @@ async fn finish_attempt_forward_response(
     effective_effort: Option<&str>,
     base_service_tier: &ServiceTierLog,
     observed_service_tier: Option<String>,
+    codex_bridge: Option<CodexBridgeLog>,
     usage: Option<UsageMetrics>,
     retry: Option<crate::logging::RetryInfo>,
     response_headers: HeaderMap,
@@ -530,6 +539,7 @@ async fn finish_attempt_forward_response(
             cwd: cwd.map(ToOwned::to_owned),
             effective_effort: effective_effort.map(ToOwned::to_owned),
             service_tier: service_tier_for_log,
+            codex_bridge,
             usage,
             retry,
             response_headers,
