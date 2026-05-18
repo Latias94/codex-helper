@@ -82,6 +82,8 @@ codex-helper switch off
 
 For Codex app/mobile bridge setups, use `codex-helper switch on --mode chatgpt-bridge`. It keeps ChatGPT account auth for the client layer while routing model traffic through codex-helper. Sign in with ChatGPT in official Codex first; if `auth.json` lacks the full login tokens, email, and account metadata, codex-helper refuses the patch to avoid Codex TUI bootstrap failures such as `email and plan type are required for chatgpt authentication`.
 
+For official-subscription relays where you want both remote compaction and hosted image generation, use `codex-helper switch on --mode official-imagegen-bridge`. It declares the Codex-facing provider as `OpenAI`, disables WebSocket, and writes the empty `{}` imagegen auth facade; real upstream credentials still come from codex-helper provider configuration.
+
 Note: any change to `~/.codex/config.toml` is only picked up by newly started Codex sessions. After changing it, fully restart the Codex App, TUI, or `codex exec` session.
 
 If you want Codex to stay logged into ChatGPT while the actual conversation/model traffic goes through a relay, split the setup into two layers:

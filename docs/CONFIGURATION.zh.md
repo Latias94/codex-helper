@@ -57,6 +57,7 @@ mode = "chatgpt-bridge"
 codex-helper switch on --mode chatgpt-bridge
 codex-helper switch on --mode imagegen-bridge
 codex-helper switch on --mode official-relay-bridge
+codex-helper switch on --mode official-imagegen-bridge
 codex-helper switch on --mode default
 ```
 
@@ -67,6 +68,8 @@ codex-helper switch on --mode default
 `imagegen-bridge` 是显式的实验 hack 模式。它会把 `~/.codex/auth.json` 临时写成空对象 `{}`，让 Codex 的默认 auth 解析仍把会话视为 ChatGPT-backed 并暴露 hosted `image_generation` tool；真实上游凭据仍来自 codex-helper routing（`auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`）。它不要求官方 ChatGPT 登录，也不会显式写入 `auth_mode`。启用前，codex-helper 会校验 Codex 服务至少有一个已启用上游，并且当前进程实际能取得至少一个上游凭据；对于环境变量凭据，只在配置里写 env var 名称不够，运行 `switch on` 或启动 `serve` 时该环境变量必须有值。codex-helper 会把旧 `auth.json` 存入 switch state，并在切回 `default` 或执行 `switch off` 时恢复；但只有当前 `auth.json` 仍等于 helper 写入的 facade 时才恢复。如果用户或 Codex 期间改过 `auth.json`，codex-helper 会保持现状，不覆盖用户变更。
 
 `official-relay-bridge` 是实验性的 HTTP 官方中转模式，适合能转发 OpenAI Responses 语义的中转，尤其是支持 `/responses/compact` 的 sub2api 风格中转。它会在 `~/.codex/config.toml` 写入 `name = "OpenAI"` 和 `supports_websockets = false`，让 Codex 选择官方 remote compaction v1，同时保持 WebSocket 关闭。它不会写 `requires_openai_auth`，也不会 patch `auth.json`；真实上游凭据仍必须来自 codex-helper routing。如果中转对 `/responses/compact` 返回 404/405/501 或 compact unsupported 这类错误，请切回 `default`，或改用明确支持 compact 的中转账号。
+
+`official-imagegen-bridge` 是混合实验模式，适合背后确实是官方订阅账号的中转。它会像 `official-relay-bridge` 一样把 provider 声明成 `OpenAI`，让 Codex 走官方 remote compaction v1；同时像 `imagegen-bridge` 一样写入 `{}` auth facade，让 Codex 暴露 hosted `image_generation`。它保持 `supports_websockets = false`，不写 `requires_openai_auth`，且除非选中的上游配置了 helper 侧凭据，否则仍会剥离 Codex 客户端 auth。该模式只负责让 Codex 暴露并发送官方 hosted tool；中转账号本身仍必须同时支持 `/responses/compact` 和 hosted image generation 调用。
 
 要诊断 remote compaction v1 是否生效，可以在 Codex 发生压缩后查看 codex-helper 请求账本：
 

@@ -1,0 +1,24 @@
+{
+  "slug": "codex-official-imagegen-bridge",
+  "status": "complete",
+  "current_task": null,
+  "summary": "Add an explicit Codex patch mode that combines official remote compaction v1 with hosted image generation auth facade behavior.",
+  "artifacts": [
+    {
+      "path": "docs/workstreams/codex-official-imagegen-bridge/DESIGN.md",
+      "role": "design"
+    },
+    {
+      "path": "docs/workstreams/codex-official-imagegen-bridge/TODO.md",
+      "role": "task-ledger"
+    },
+    {
+      "path": "docs/workstreams/codex-official-imagegen-bridge/EVIDENCE_AND_GATES.md",
+      "role": "evidence"
+    },
+    {
+      "path": "docs/workstreams/codex-official-imagegen-bridge/CLOSEOUT.md",
+      "role": "closeout"
+    }
+  ]
+}

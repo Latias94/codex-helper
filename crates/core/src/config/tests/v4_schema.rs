@@ -1091,6 +1091,27 @@ mode = "official-relay-bridge"
 }
 
 #[test]
+fn codex_client_patch_mode_parses_official_imagegen_bridge() {
+    let _env = setup_temp_codex_home();
+    let dir = super::proxy_home_dir();
+    let toml_path = dir.join("config.toml");
+    write_file(
+        &toml_path,
+        r#"
+version = 5
+
+[codex.client_patch]
+mode = "official-imagegen-bridge"
+"#,
+    );
+
+    assert_eq!(
+        super::codex_client_patch_mode_from_config_file().expect("read client patch mode"),
+        crate::codex_integration::CodexPatchMode::OfficialImagegenBridge
+    );
+}
+
+#[test]
 fn load_config_auto_compacts_legacy_v3_import_metadata_to_v4() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()

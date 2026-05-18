@@ -201,6 +201,10 @@ pub enum CodexPatchMode {
     /// first-party HTTP features that helper can safely forward, starting with remote compaction
     /// v1. Request credentials still come from codex-helper routing/upstream configuration.
     OfficialRelayBridge,
+    /// Combine official relay provider identity for remote compaction with the image generation
+    /// ChatGPT auth facade. Request credentials still come from codex-helper routing/upstream
+    /// configuration.
+    OfficialImagegenBridge,
 }
 
 impl CodexPatchMode {
@@ -210,6 +214,7 @@ impl CodexPatchMode {
             Self::ChatGptBridge => "chatgpt-bridge",
             Self::ImagegenBridge => "imagegen-bridge",
             Self::OfficialRelayBridge => "official-relay-bridge",
+            Self::OfficialImagegenBridge => "official-imagegen-bridge",
         }
     }
 
@@ -220,7 +225,10 @@ impl CodexPatchMode {
     pub fn strips_codex_client_auth(self) -> bool {
         matches!(
             self,
-            Self::ChatGptBridge | Self::ImagegenBridge | Self::OfficialRelayBridge
+            Self::ChatGptBridge
+                | Self::ImagegenBridge
+                | Self::OfficialRelayBridge
+                | Self::OfficialImagegenBridge
         )
     }
 }
@@ -477,7 +485,7 @@ fn switch_on_codex_toml_with_mode(text: &str, port: u16, mode: CodexPatchMode) -
         .ok_or_else(|| anyhow!("model_providers.codex_proxy must be a table"))?;
 
     let provider_name = match mode {
-        CodexPatchMode::OfficialRelayBridge => "OpenAI",
+        CodexPatchMode::OfficialRelayBridge | CodexPatchMode::OfficialImagegenBridge => "OpenAI",
         CodexPatchMode::Default
         | CodexPatchMode::ChatGptBridge
         | CodexPatchMode::ImagegenBridge => "codex-helper",
@@ -497,7 +505,7 @@ fn switch_on_codex_toml_with_mode(text: &str, port: u16, mode: CodexPatchMode) -
             proxy_table.insert("requires_openai_auth", editable_toml_value(true));
             proxy_table.insert("supports_websockets", editable_toml_value(false));
         }
-        CodexPatchMode::OfficialRelayBridge => {
+        CodexPatchMode::OfficialRelayBridge | CodexPatchMode::OfficialImagegenBridge => {
             proxy_table.remove("requires_openai_auth");
             proxy_table.insert("supports_websockets", editable_toml_value(false));
         }
@@ -685,6 +693,27 @@ fn chatgpt_bridge_auth_json_text(text: &str) -> Result<String> {
 
 fn imagegen_bridge_auth_json_text() -> Result<String> {
     Ok(serde_json::to_string_pretty(&serde_json::json!({}))?)
+}
+
+fn auth_json_is_empty_chatgpt_facade_text(text: Option<&str>) -> bool {
+    let Some(text) = text else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|object| object.is_empty())
+}
+
+fn current_auth_json_is_empty_chatgpt_facade() -> bool {
+    let path = codex_auth_path();
+    if !path.exists() {
+        return false;
+    }
+    let Ok(text) = read_config_text(&path) else {
+        return false;
+    };
+    auth_json_is_empty_chatgpt_facade_text(Some(&text))
 }
 
 fn prepare_chatgpt_bridge_auth_patch_from_baseline(
@@ -1289,7 +1318,11 @@ pub fn codex_switch_status() -> Result<CodexSwitchStatus> {
     let inferred_patch_mode = if requires_openai_auth == Some(true) {
         CodexPatchMode::ChatGptBridge
     } else if name == "OpenAI" && supports_websockets == Some(false) {
-        CodexPatchMode::OfficialRelayBridge
+        if current_auth_json_is_empty_chatgpt_facade() {
+            CodexPatchMode::OfficialImagegenBridge
+        } else {
+            CodexPatchMode::OfficialRelayBridge
+        }
     } else {
         CodexPatchMode::Default
     };
@@ -1341,7 +1374,9 @@ pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
         CodexPatchMode::Default | CodexPatchMode::OfficialRelayBridge => {
             auth_restore_edit_from_state(&mut state)?
         }
-        CodexPatchMode::ChatGptBridge | CodexPatchMode::ImagegenBridge => {
+        CodexPatchMode::ChatGptBridge
+        | CodexPatchMode::ImagegenBridge
+        | CodexPatchMode::OfficialImagegenBridge => {
             let current_auth = if codex_auth_path().exists() {
                 Some(read_config_text(&codex_auth_path())?)
             } else {
@@ -1356,6 +1391,12 @@ pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
                     original_absent,
                     original_text,
                 )?,
+                CodexPatchMode::OfficialImagegenBridge => {
+                    prepare_imagegen_bridge_auth_patch_from_baseline(
+                        original_absent,
+                        original_text,
+                    )?
+                }
                 CodexPatchMode::Default | CodexPatchMode::OfficialRelayBridge => {
                     unreachable!("handled above")
                 }
@@ -1379,7 +1420,9 @@ pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
             apply_codex_auth_edit(auth_edit)?;
             write_codex_switch_state(&state)?;
         }
-        CodexPatchMode::ChatGptBridge | CodexPatchMode::ImagegenBridge => {
+        CodexPatchMode::ChatGptBridge
+        | CodexPatchMode::ImagegenBridge
+        | CodexPatchMode::OfficialImagegenBridge => {
             write_codex_switch_state(&state)?;
             atomic_write(&cfg_path, &new_text)?;
             apply_codex_auth_edit(auth_edit)?;
@@ -2336,6 +2379,31 @@ request_max_retries = 5
     }
 
     #[test]
+    fn codex_switch_on_official_imagegen_bridge_sets_openai_name_and_disables_websockets() {
+        let updated =
+            switch_on_codex_toml_with_mode("", 3333, CodexPatchMode::OfficialImagegenBridge)
+                .expect("switch_on should write official imagegen bridge fields");
+
+        assert!(updated.contains("model_provider = \"codex_proxy\""));
+        assert!(updated.contains("name = \"OpenAI\""));
+        assert!(updated.contains("base_url = \"http://127.0.0.1:3333\""));
+        assert!(updated.contains("wire_api = \"responses\""));
+        assert!(updated.contains("supports_websockets = false"));
+        assert!(!updated.contains("requires_openai_auth"));
+    }
+
+    #[test]
+    fn empty_auth_json_facade_detection_uses_json_semantics() {
+        assert!(auth_json_is_empty_chatgpt_facade_text(Some("{}")));
+        assert!(auth_json_is_empty_chatgpt_facade_text(Some("{\n}\n")));
+        assert!(!auth_json_is_empty_chatgpt_facade_text(Some(
+            r#"{"auth_mode":"chatgpt"}"#
+        )));
+        assert!(!auth_json_is_empty_chatgpt_facade_text(None));
+        assert!(!auth_json_is_empty_chatgpt_facade_text(Some("not-json")));
+    }
+
+    #[test]
     fn codex_switch_on_default_removes_bridge_only_flags() {
         let text = r#"
 model_provider = "codex_proxy"
@@ -2799,6 +2867,36 @@ children = ["relay"]
     }
 
     #[test]
+    fn official_imagegen_bridge_ready_check_rejects_unresolved_upstream_env() {
+        let env = setup_temp_env();
+        write_helper_codex_config(
+            &env,
+            r#"
+version = 5
+
+[codex.providers.relay]
+base_url = "https://relay.example/v1"
+auth_token_env = "CODEX_HELPER_MISSING_IMAGEGEN_KEY"
+
+[codex.routing]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["relay"]
+"#,
+        );
+
+        let err = ensure_bridge_runtime_ready(CodexPatchMode::OfficialImagegenBridge)
+            .expect_err("official imagegen bridge should require resolved upstream auth");
+
+        let message = err.to_string();
+        assert!(message.contains("official-imagegen-bridge"));
+        assert!(message.contains("no enabled Codex upstream credential is available"));
+        assert!(message.contains("CODEX_HELPER_MISSING_IMAGEGEN_KEY"));
+    }
+
+    #[test]
     fn codex_switch_on_chatgpt_bridge_patches_auth_json() {
         let env = setup_temp_env();
         let cfg_path = env.codex_home.join("config.toml");
@@ -2953,6 +3051,73 @@ base_url = "https://api.openai.com/v1"
     }
 
     #[test]
+    fn codex_switch_on_official_imagegen_bridge_records_mode_and_patches_auth_json() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let state_path = env.codex_home.join("codex-helper-switch-state.json");
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, &original_auth);
+
+        switch_on_with_mode(3211, CodexPatchMode::OfficialImagegenBridge)
+            .expect("switch_on official imagegen bridge should patch config and auth");
+
+        let updated_cfg = read_file(&cfg_path);
+        assert!(updated_cfg.contains("model_provider = \"codex_proxy\""));
+        assert!(updated_cfg.contains("name = \"OpenAI\""));
+        assert!(updated_cfg.contains("supports_websockets = false"));
+        assert!(!updated_cfg.contains("requires_openai_auth"));
+
+        let updated_auth: serde_json::Value =
+            serde_json::from_str(&read_file(&auth_path)).expect("valid auth json");
+        assert!(
+            updated_auth
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+        );
+
+        let state_text = read_file(&state_path);
+        let state: serde_json::Value = serde_json::from_str(&state_text).expect("valid state");
+        assert_eq!(
+            state.get("patch_mode").and_then(|value| value.as_str()),
+            Some("official-imagegen-bridge")
+        );
+        assert_eq!(
+            state
+                .get("original_auth_json")
+                .and_then(|value| value.as_str()),
+            Some(original_auth.as_str())
+        );
+        assert_eq!(
+            state
+                .get("patched_auth_json")
+                .and_then(|value| value.as_str()),
+            Some("{}")
+        );
+
+        let status = codex_switch_status().expect("status should load");
+        assert_eq!(
+            status.patch_mode,
+            Some(CodexPatchMode::OfficialImagegenBridge)
+        );
+        assert_eq!(status.requires_openai_auth, None);
+        assert_eq!(status.supports_websockets, Some(false));
+    }
+
+    #[test]
     fn codex_switch_status_infers_official_relay_bridge_without_state() {
         let env = setup_temp_env();
         let cfg_path = env.codex_home.join("config.toml");
@@ -2974,6 +3139,38 @@ supports_websockets = false
 
         assert!(status.enabled);
         assert_eq!(status.patch_mode, Some(CodexPatchMode::OfficialRelayBridge));
+        assert_eq!(status.supports_websockets, Some(false));
+        assert_eq!(status.requires_openai_auth, None);
+        assert!(!status.has_switch_state);
+    }
+
+    #[test]
+    fn codex_switch_status_infers_official_imagegen_bridge_from_empty_auth_facade_without_state() {
+        let env = setup_temp_env();
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+supports_websockets = false
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, "{}");
+
+        let status = codex_switch_status().expect("status should load");
+
+        assert!(status.enabled);
+        assert_eq!(
+            status.patch_mode,
+            Some(CodexPatchMode::OfficialImagegenBridge)
+        );
         assert_eq!(status.supports_websockets, Some(false));
         assert_eq!(status.requires_openai_auth, None);
         assert!(!status.has_switch_state);
@@ -3002,6 +3199,39 @@ base_url = "https://api.openai.com/v1"
 
         switch_on_with_mode(3211, CodexPatchMode::ImagegenBridge)
             .expect("switch_on imagegen bridge should patch auth");
+        assert_ne!(read_file(&auth_path), original_auth);
+
+        switch_on_with_mode(3211, CodexPatchMode::Default)
+            .expect("switching to default should restore auth");
+
+        assert_eq!(read_file(&auth_path), original_auth);
+        let status = codex_switch_status().expect("status should load");
+        assert_eq!(status.patch_mode, Some(CodexPatchMode::Default));
+    }
+
+    #[test]
+    fn codex_switch_default_restores_official_imagegen_bridge_auth_json() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, &original_auth);
+
+        switch_on_with_mode(3211, CodexPatchMode::OfficialImagegenBridge)
+            .expect("switch_on official imagegen bridge should patch auth");
         assert_ne!(read_file(&auth_path), original_auth);
 
         switch_on_with_mode(3211, CodexPatchMode::Default)
@@ -3098,6 +3328,52 @@ base_url = "https://api.openai.com/v1"
             .expect("switch_on imagegen bridge should patch auth");
         switch_on_with_mode(3211, CodexPatchMode::ChatGptBridge)
             .expect("switching to chatgpt bridge should use original auth snapshot");
+
+        let updated_auth: serde_json::Value =
+            serde_json::from_str(&read_file(&auth_path)).expect("valid auth json");
+        assert_eq!(
+            updated_auth
+                .get("tokens")
+                .and_then(|value| value.get("account_id"))
+                .and_then(|value| value.as_str()),
+            Some("acct_1")
+        );
+        assert!(
+            updated_auth
+                .get("OPENAI_API_KEY")
+                .is_some_and(|value| value.is_null())
+        );
+    }
+
+    #[test]
+    fn codex_switch_official_imagegen_to_chatgpt_bridge_uses_original_auth_json() {
+        let env = setup_temp_env();
+        write_helper_codex_config_with_env_auth(&env);
+        let cfg_path = env.codex_home.join("config.toml");
+        let auth_path = env.codex_home.join("auth.json");
+        let original_auth = chatgpt_auth_json("user@example.com", "acct_1", "plus");
+
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+"#
+            .trim_start(),
+        );
+        write_file(&auth_path, &original_auth);
+
+        switch_on_with_mode(3211, CodexPatchMode::OfficialImagegenBridge)
+            .expect("switch_on official imagegen bridge should patch auth");
+        switch_on_with_mode(3211, CodexPatchMode::ChatGptBridge)
+            .expect("switching to chatgpt bridge should use original auth snapshot");
+
+        let updated_cfg = read_file(&cfg_path);
+        assert!(updated_cfg.contains("name = \"codex-helper\""));
+        assert!(updated_cfg.contains("requires_openai_auth = true"));
 
         let updated_auth: serde_json::Value =
             serde_json::from_str(&read_file(&auth_path)).expect("valid auth json");

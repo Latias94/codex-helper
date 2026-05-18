@@ -209,6 +209,8 @@ pub(crate) enum CodexPatchModeArg {
     ImagegenBridge,
     /// Experimental official relay bridge for HTTP OpenAI Responses features
     OfficialRelayBridge,
+    /// Experimental official relay bridge plus minimal image generation auth facade
+    OfficialImagegenBridge,
 }
 
 #[derive(Subcommand, Debug)]

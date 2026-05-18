@@ -50,8 +50,11 @@ fn codex_client_patch_mode_from_toml_value(
         "official-relay-bridge" | "official_relay_bridge" => {
             Ok(crate::codex_integration::CodexPatchMode::OfficialRelayBridge)
         }
+        "official-imagegen-bridge" | "official_imagegen_bridge" => {
+            Ok(crate::codex_integration::CodexPatchMode::OfficialImagegenBridge)
+        }
         other => anyhow::bail!(
-            "unsupported codex.client_patch.mode '{}'; expected 'default', 'chatgpt-bridge', 'imagegen-bridge', or 'official-relay-bridge'",
+            "unsupported codex.client_patch.mode '{}'; expected 'default', 'chatgpt-bridge', 'imagegen-bridge', 'official-relay-bridge', or 'official-imagegen-bridge'",
             other
         ),
     }
@@ -186,9 +189,12 @@ version = 5
 # official-relay-bridge：实验模式；把本地 codex_proxy 声明为 OpenAI Responses provider，
 #                        让 Codex 使用可由中转转发的官方 HTTP 能力，例如 /responses/compact。
 #                        不启用 WebSocket，且真实上游凭据仍来自 codex-helper routing / env key。
+# official-imagegen-bridge：实验模式；同时启用 official-relay-bridge 的 OpenAI provider
+#                           标识和 imagegen-bridge 的 {} auth facade，用于同时尝试
+#                           /responses/compact 与 hosted image_generation。
 # 启用 chatgpt-bridge 时，`switch on --mode chatgpt-bridge` 会把 ~/.codex/auth.json 的
 # auth_mode 改为 "chatgpt"，OPENAI_API_KEY 改为 null，其它字段不动。
-# 启用 imagegen-bridge 时，`switch on --mode imagegen-bridge` 会临时把 ~/.codex/auth.json
+# 启用 imagegen-bridge / official-imagegen-bridge 时，`switch on --mode ...` 会临时把 ~/.codex/auth.json
 # 改为 {} facade，并在 `switch off` 或切回 default 时安全恢复。
 # 该模式启用前会校验 Codex 至少有一个已启用上游，且当前进程能读到其上游凭据。
 #
@@ -197,6 +203,7 @@ version = 5
 # mode = "chatgpt-bridge"
 # mode = "imagegen-bridge"
 # mode = "official-relay-bridge"
+# mode = "official-imagegen-bridge"
 
 # --- TUI 用量预测（可选） ---
 #

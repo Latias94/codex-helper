@@ -908,6 +908,9 @@ fn do_switch_on(port: u16, mode: CodexPatchModeArg, codex: bool, claude: bool) -
         CodexPatchModeArg::OfficialRelayBridge => {
             codex_integration::CodexPatchMode::OfficialRelayBridge
         }
+        CodexPatchModeArg::OfficialImagegenBridge => {
+            codex_integration::CodexPatchMode::OfficialImagegenBridge
+        }
     };
     if claude {
         if !mode.is_default() {
@@ -940,6 +943,11 @@ fn do_switch_on(port: u16, mode: CodexPatchModeArg, codex: bool, claude: bool) -
             codex_integration::CodexPatchMode::OfficialRelayBridge => {
                 println!(
                     "Updated ~/.codex/config.toml for official relay bridge mode. Restart existing Codex apps to apply the client config change."
+                );
+            }
+            codex_integration::CodexPatchMode::OfficialImagegenBridge => {
+                println!(
+                    "Updated ~/.codex/config.toml and auth.json for official imagegen bridge mode. Restart existing Codex apps to apply the client config change."
                 );
             }
         }

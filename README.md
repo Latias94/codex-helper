@@ -89,11 +89,14 @@ codex-helper serve --no-tui
 ```bash
 codex-helper switch on
 codex-helper switch on --mode chatgpt-bridge
+codex-helper switch on --mode official-imagegen-bridge
 codex-helper switch status
 codex-helper switch off
 ```
 
 `--mode chatgpt-bridge` 用于“ChatGPT Auth 保留、模型层走 codex-helper”的场景，会 patch `~/.codex/config.toml` 的 `requires_openai_auth = true` / `supports_websockets = false`，并只把 `~/.codex/auth.json` 的 `auth_mode` 改为 `chatgpt`、`OPENAI_API_KEY` 改为 `null`。启用前必须先在官方 Codex 中完成 ChatGPT 登录；如果 `auth.json` 没有完整登录 token、email 和账号信息，codex-helper 会拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。已有 Codex app 通常需要重启后才会应用这些客户端配置变更。
+
+`--mode official-imagegen-bridge` 用于“中转背后是官方订阅，希望同时拿到 remote compaction 和 hosted image_generation”的实验场景。它把 Codex 侧 provider 声明为 `OpenAI`、关闭 WebSocket，并写入 `{}` auth facade 暴露 imagegen；真实请求凭据仍来自 codex-helper 上游配置。
 
 注意：任何对 `~/.codex/config.toml` 的修改都只会被新启动的 Codex 会话读取；修改后请完整重启 Codex App、TUI 或 `codex exec` 会话。
 

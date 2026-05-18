@@ -103,7 +103,7 @@ pub(super) fn current_page_help_lines(
             "  p/P        管理配置默认 profile / 运行时默认 profile",
             "  R          重载运行时配置",
             "  O          从 ~/.codex 覆盖导入站点，需要二次确认",
-            "  B/I/F/D    启用 ChatGPT / Imagegen / Official relay bridge / 切回默认 patch",
+            "  B/I/F/V/D  启用 ChatGPT / Imagegen / Official relay / Official imagegen / 默认 patch",
         ],
         (Language::Zh, Page::Settings, _, false) => vec![
             "  p/P        管理配置默认 profile / 运行时默认 profile",
@@ -172,7 +172,7 @@ pub(super) fn current_page_help_lines(
             "  p/P        manage configured default profile / runtime default profile",
             "  R          reload runtime config",
             "  O          overwrite-import stations from ~/.codex, with confirmation",
-            "  B/I/F/D    enable ChatGPT / Imagegen / Official relay bridge / switch to default patch",
+            "  B/I/F/V/D  enable ChatGPT / Imagegen / Official relay / Official imagegen / default patch",
         ],
         (Language::En, Page::Settings, _, false) => vec![
             "  p/P        manage configured default profile / runtime default profile",
