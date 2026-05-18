@@ -25,7 +25,9 @@ fn normalize_client_identity_value(value: &str, max_chars: usize) -> Option<Stri
 
 pub(super) fn extract_session_id(headers: &HeaderMap) -> Option<String> {
     header_str(headers, "session_id")
+        .or_else(|| header_str(headers, "session-id"))
         .or_else(|| header_str(headers, "conversation_id"))
+        .or_else(|| header_str(headers, "thread-id"))
         .map(str::to_owned)
 }
 
@@ -63,6 +65,28 @@ mod tests {
 
         headers.insert("session_id", HeaderValue::from_static("sess-1"));
         assert_eq!(extract_session_id(&headers).as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn extract_session_id_accepts_official_codex_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("thread-id", HeaderValue::from_static("thread-1"));
+        assert_eq!(extract_session_id(&headers).as_deref(), Some("thread-1"));
+
+        headers.insert("conversation_id", HeaderValue::from_static("conv-1"));
+        assert_eq!(extract_session_id(&headers).as_deref(), Some("conv-1"));
+
+        headers.insert("session-id", HeaderValue::from_static("sess-hyphen-1"));
+        assert_eq!(
+            extract_session_id(&headers).as_deref(),
+            Some("sess-hyphen-1")
+        );
+
+        headers.insert("session_id", HeaderValue::from_static("sess-underscore-1"));
+        assert_eq!(
+            extract_session_id(&headers).as_deref(),
+            Some("sess-underscore-1")
+        );
     }
 
     #[test]

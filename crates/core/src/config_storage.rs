@@ -257,7 +257,7 @@ version = 5
 #
 # [codex.routing]
 # entry = "main"
-# affinity_policy = "preferred-group"
+# affinity_policy = "fallback-sticky"
 # fallback_ttl_ms = 120000
 # reprobe_preferred_after_ms = 30000
 #
@@ -450,6 +450,10 @@ fn codex_bootstrap_snippet() -> Result<Option<String>> {
     }
 
     let migrated = migrate_legacy_to_v4(&cfg)?;
+    let mut migrated = migrated;
+    if let Some(routing) = migrated.codex.routing.as_mut() {
+        routing.affinity_policy = RoutingAffinityPolicyV5::FallbackSticky;
+    }
     let body = toml::to_string_pretty(&CodexOnly {
         codex: &migrated.codex,
     })?;

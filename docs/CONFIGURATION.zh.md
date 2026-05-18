@@ -138,7 +138,7 @@ profile = "balanced"
 ```toml
 [codex.routing]
 entry = "monthly_first"
-affinity_policy = "preferred-group"
+affinity_policy = "fallback-sticky"
 # fallback-sticky affinity 的可选兼容边界。
 # fallback_ttl_ms = 120000
 # reprobe_preferred_after_ms = 30000
@@ -173,9 +173,9 @@ children = ["monthly_pool", "codex_for"]
 
 Route graph 的会话粘性是运行时状态。TOML 配置选择 affinity policy，并且可以选择性约束 fallback 粘性的边界：
 
-- `preferred-group` 是默认值。会话粘性只会在当前最佳可用 preference group 内生效，所以一个临时 fallback 到 paygo 的会话，会在月包 provider 再次可用时回到月包组。
+- `fallback-sticky` 是生成配置模板和 Codex 自动导入使用的默认值。它会在 fallback provider 仍可用时继续让同一会话使用上次成功的 fallback provider；对于 remote compaction 这类可能携带上游账号绑定 encrypted state 的 official relay 功能更稳。设置 `fallback_ttl_ms` 可以限制低优先级 fallback affinity 的复用时长；设置 `reprobe_preferred_after_ms` 可以在 fallback target 变化后强制 reprobe 高优先级组。
+- `preferred-group` 只会在当前最佳可用 preference group 内应用会话粘性，所以一个临时 fallback 到 paygo 的会话，会在月包 provider 再次可用时回到月包组。
 - `off` 忽略自动 route affinity。
-- `fallback-sticky` 保留旧 fallback 粘性行为，作为显式兼容模式。设置 `fallback_ttl_ms` 可以限制低优先级 fallback affinity 的复用时长；设置 `reprobe_preferred_after_ms` 可以在 fallback target 变化后强制 reprobe 高优先级组。
 - `hard` 会把已有 affinity target 当成这个 route graph 的严格目标；如果该目标不可用，不会选择其他候选。
 
 对于带 session id 的每个请求，codex-helper 使用 `session_id + service + route_graph_key` 作为 affinity key。只要 route graph 不变，同一会话就可以按 policy 继续使用之前选中的 provider/endpoint。这能提高一些 relay provider 的上游 prompt-cache 命中率，同时默认不会让自动粘性覆盖用户偏好。
@@ -918,14 +918,14 @@ codex-helper routing explain --model <MODEL> --json
 - `affinity.policy` / `affinity_policy` 显示自动 affinity 是 `preferred-group`、`off`、`fallback-sticky` 还是 `hard`。
 - `compatibility` 只是 legacy station/upstream 上下文。route graph 决策优先看 `provider_endpoint_key`、`provider_id`、`endpoint_id` 和 `route_path`。
 
-对于 monthly-first setup，默认通常是 `affinity_policy = "preferred-group"`。使用该 policy 时，会话可能在临时故障期间使用 fallback provider，但只要 monthly provider 重新可用，下一次请求会回到最佳可用 monthly group。如果 route 一直使用 paygo，请检查这些原因：
+对于 monthly-first setup，生成配置默认使用 `affinity_policy = "fallback-sticky"`，因为中转 provider 往往会把缓存和 encrypted response state 绑定到上游账号。如果你更希望故障恢复后自动回到最佳 monthly group，可以显式设置 `affinity_policy = "preferred-group"`。如果 route 意外一直使用 paygo，请检查这些原因：
 
 - 显式 session/global route target override 已设置；
 - monthly provider 被禁用或缺少 auth；
 - 请求的 model 不被 monthly provider 支持；
 - monthly endpoint 在 retryable failures 后处于 cooldown；
 - 可信 balance data 把 endpoint 标记为 `usage_exhausted`；
-- 配置显式使用 `affinity_policy = "fallback-sticky"` 或 `hard`。
+- 配置使用 `affinity_policy = "fallback-sticky"` 或 `hard`。
 
 可信余额耗尽是 provider-endpoint 运行时信号。它可以在当前请求/刷新窗口内降级 monthly endpoint，但不是永久 session preference。如果某个 provider 对可用订阅返回误导性的零余额，请为该 usage provider 设置 `trust_exhaustion_for_routing = false`，或修复 balance extractor。
 
@@ -965,7 +965,7 @@ TUI routing editor 快捷键：
 
 正常用户通常不需要手动运行迁移命令。启动 codex-helper，包括默认打开 TUI 的启动路径，会加载 legacy `version = 4`、`version = 3`、`version = 2`、未标版本 TOML 和 legacy `config.json`，然后迁移到带 `version = 5` 的 `config.toml`。写入新文件前，旧文件会复制为 `config.toml.bak` 或 `config.json.bak`。
 
-迁移期间，如果结果 route graph 会使用新的 `preferred-group` 默认值，而不是旧 fallback stickiness，codex-helper 会发出警告。如果你想恢复旧行为，请在迁移前或迁移后显式设置 `affinity_policy = "fallback-sticky"`。
+迁移期间，如果旧 route graph 会使用代码层的 `preferred-group` 默认值，而不是 fallback stickiness，codex-helper 会发出警告。新生成配置会显式写入 `affinity_policy = "fallback-sticky"`；已有配置可以按需求选择：更重视 official relay 连续性就用 `fallback-sticky`，更重视尽快回到优先组就用 `preferred-group`。
 
 手动迁移命令主要用于在不走正常 TUI/proxy 启动路径的情况下预览或诊断迁移：
 

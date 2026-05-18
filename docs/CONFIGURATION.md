@@ -138,7 +138,7 @@ Every service can have its own route graph:
 ```toml
 [codex.routing]
 entry = "monthly_first"
-affinity_policy = "preferred-group"
+affinity_policy = "fallback-sticky"
 # Optional compatibility bounds for fallback-sticky affinity.
 # fallback_ttl_ms = 120000
 # reprobe_preferred_after_ms = 30000
@@ -173,9 +173,9 @@ Most users should prefer `ordered-failover` for fixed priority and `tag-preferre
 
 Route graph session affinity is runtime state. The TOML config chooses the affinity policy and can optionally bound fallback stickiness:
 
-- `preferred-group` is the default. Session affinity is only applied inside the currently best available preference group, so a session that temporarily falls back to paygo returns to monthly as soon as a monthly provider is viable again.
+- `fallback-sticky` is the default used by the generated config template and Codex bootstrap import. It keeps a session on the last successful fallback provider while that provider remains viable, which is safer for official relay features such as remote compaction that may carry upstream-account-bound encrypted state. Set `fallback_ttl_ms` to cap how long a lower-priority fallback affinity can be reused, or `reprobe_preferred_after_ms` to force a preferred-group reprobe after a fallback target change.
+- `preferred-group` applies session affinity only inside the currently best available preference group, so a session that temporarily falls back to paygo returns to monthly as soon as a monthly provider is viable again.
 - `off` ignores automatic route affinity.
-- `fallback-sticky` keeps the old fallback-sticky behavior as an explicit compatibility mode. Set `fallback_ttl_ms` to cap how long a lower-priority fallback affinity can be reused, or `reprobe_preferred_after_ms` to force a preferred-group reprobe after a fallback target change.
 - `hard` treats an existing affinity target as strict for that route graph; if the target is unavailable, no alternate candidate is selected.
 
 For each request with a session id, codex-helper keys affinity by `session_id + service + route_graph_key`. While the route graph is unchanged, the same session can keep using the previously selected provider/endpoint according to the policy. This improves upstream prompt-cache locality for relay providers that cache by account or upstream target without letting automatic stickiness override user preference by default.
@@ -920,14 +920,14 @@ Check these fields first:
 - `affinity.policy` / `affinity_policy` tells whether automatic affinity is `preferred-group`, `off`, `fallback-sticky`, or `hard`.
 - `compatibility` is legacy station/upstream context only. For route graph decisions, prefer `provider_endpoint_key`, `provider_id`, `endpoint_id`, and `route_path`.
 
-For a monthly-first setup, the normal default is `affinity_policy = "preferred-group"`. With that policy, a session may use a fallback provider during a temporary outage, but the next request returns to the best viable monthly group once a monthly provider is available again. If the route keeps using paygo, look for one of these causes:
+For a monthly-first setup, the generated default is `affinity_policy = "fallback-sticky"`, because relay providers often bind cache and encrypted response state to an upstream account. If you prefer automatic return to the best monthly group after an outage, explicitly set `affinity_policy = "preferred-group"`. If the route keeps using paygo unexpectedly, look for one of these causes:
 
 - an explicit session/global route target override is set;
 - the monthly provider is disabled or missing auth;
 - the requested model is unsupported by the monthly provider;
 - the monthly endpoint is cooling down after retryable failures;
 - trusted balance data marks the endpoint `usage_exhausted`;
-- the config explicitly uses `affinity_policy = "fallback-sticky"` or `hard`.
+- the config uses `affinity_policy = "fallback-sticky"` or `hard`.
 
 Trusted balance exhaustion is a provider-endpoint runtime signal. It can demote a monthly endpoint for the current request/refresh window, but it is not a permanent session preference. If a provider reports misleading zero balances for an active subscription, set `trust_exhaustion_for_routing = false` for that usage provider or fix the balance extractor.
 
@@ -967,7 +967,7 @@ The current route graph schema writes `version = 5`. Existing `version = 4` rout
 
 Normal users usually do not need to run migration commands by hand. Starting codex-helper, including the default TUI startup path, loads legacy `version = 4`, `version = 3`, `version = 2`, unversioned TOML, and legacy `config.json`, then migrates them to `config.toml` with `version = 5`. The previous file is copied to `config.toml.bak` or `config.json.bak` before writing the new file.
 
-During migration, codex-helper warns when the resulting route graph would use the new `preferred-group` default instead of old fallback stickiness. If you want the old behavior back, set `affinity_policy = "fallback-sticky"` explicitly before or after migration.
+During migration, codex-helper warns when an older route graph would use the code-level `preferred-group` default instead of fallback stickiness. New generated configs write `affinity_policy = "fallback-sticky"` explicitly; existing configs can set either policy depending on whether official relay continuity or fastest return to the preferred group matters more.
 
 Manual migration commands are mainly for previewing or diagnosing a migration without going through the normal TUI/proxy startup path:
 

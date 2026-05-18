@@ -8,7 +8,7 @@ use crate::client_config::{
     claude_settings_path, codex_app_db_path, codex_auth_path, codex_config_path,
     codex_switch_state_path,
 };
-use crate::config::{ProxyConfig, ProxyConfigV2, ProxyConfigV4};
+use crate::config::{ProxyConfig, ProxyConfigV2, ProxyConfigV4, RoutingAffinityPolicyV5};
 use crate::file_replace::write_text_file;
 use anyhow::{Context, Result, anyhow};
 use toml::Value;
@@ -229,6 +229,13 @@ impl CodexPatchMode {
                 | Self::ImagegenBridge
                 | Self::OfficialRelayBridge
                 | Self::OfficialImagegenBridge
+        )
+    }
+
+    pub fn enables_official_relay_features(self) -> bool {
+        matches!(
+            self,
+            Self::OfficialRelayBridge | Self::OfficialImagegenBridge
         )
     }
 }
@@ -757,27 +764,20 @@ fn auth_env_is_set(env_name: &str) -> bool {
     !env_name.is_empty() && std::env::var(env_name).is_ok_and(|value| !value.trim().is_empty())
 }
 
-fn upstream_has_resolved_auth(upstream: &crate::config::UpstreamConfig) -> bool {
-    upstream
-        .auth
-        .auth_token
+fn upstream_auth_has_resolved_credential(auth: &crate::config::UpstreamAuth) -> bool {
+    auth.auth_token
         .as_deref()
         .is_some_and(|token| !token.trim().is_empty())
-        || upstream
-            .auth
+        || auth
             .api_key
             .as_deref()
             .is_some_and(|key| !key.trim().is_empty())
-        || upstream
-            .auth
-            .auth_token_env
-            .as_deref()
-            .is_some_and(auth_env_is_set)
-        || upstream
-            .auth
-            .api_key_env
-            .as_deref()
-            .is_some_and(auth_env_is_set)
+        || auth.auth_token_env.as_deref().is_some_and(auth_env_is_set)
+        || auth.api_key_env.as_deref().is_some_and(auth_env_is_set)
+}
+
+fn upstream_has_resolved_auth(upstream: &crate::config::UpstreamConfig) -> bool {
+    upstream_auth_has_resolved_credential(&upstream.auth)
 }
 
 fn upstream_auth_env_names(upstream: &crate::config::UpstreamConfig) -> impl Iterator<Item = &str> {
@@ -960,6 +960,7 @@ pub enum CodexStartupReadinessIssueKind {
     RemoteControlRemovedKeyPresent,
     RemoteControlIncomplete,
     RemoteControlLogUnconfirmed,
+    OfficialRelayAffinityPolicy,
     DiagnosticError,
 }
 
@@ -1125,6 +1126,29 @@ fn collect_switch_startup_issues(
             "Run `codex-helper switch status`; if this changed recently, fully restart Codex clients after switching.",
         );
     }
+
+    if status
+        .patch_mode
+        .is_some_and(CodexPatchMode::enables_official_relay_features)
+    {
+        match official_relay_affinity_policy_warning() {
+            Ok(Some(detail)) => report.push(
+                CodexStartupReadinessIssueKind::OfficialRelayAffinityPolicy,
+                CodexStartupReadinessSeverity::Warning,
+                "Official relay bridge can route a session across providers",
+                detail,
+                "For the most official-like remote compaction behavior, set [codex.routing].affinity_policy = \"fallback-sticky\" or \"hard\" when using multiple authenticated upstreams.",
+            ),
+            Ok(None) => {}
+            Err(err) => report.push(
+                CodexStartupReadinessIssueKind::DiagnosticError,
+                CodexStartupReadinessSeverity::Warning,
+                "Could not inspect codex-helper routing affinity",
+                err.to_string(),
+                "Inspect ~/.codex-helper/config.toml and choose an affinity policy appropriate for official relay features.",
+            ),
+        }
+    }
 }
 
 fn base_url_points_to_expected_local_port(base_url: Option<&str>, port: u16) -> bool {
@@ -1134,6 +1158,53 @@ fn base_url_points_to_expected_local_port(base_url: Option<&str>, port: u16) -> 
     let port_marker = format!(":{port}");
     (base_url.contains("127.0.0.1") || base_url.contains("localhost") || base_url.contains("[::1]"))
         && base_url.contains(&port_marker)
+}
+
+fn official_relay_affinity_policy_warning() -> Result<Option<String>> {
+    let path = crate::config::config_file_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = read_config_text(&path).with_context(|| format!("read {:?}", path))?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+        return Ok(None);
+    }
+
+    let version = config_toml_schema_version_or_shape(&text);
+    if !version.is_some_and(crate::config::is_supported_route_graph_config_version) {
+        return Ok(None);
+    }
+
+    let cfg = toml::from_str::<ProxyConfigV4>(&text)
+        .with_context(|| format!("parse {:?} as route graph config", path))?;
+    let Some(routing) = cfg.codex.routing.as_ref() else {
+        return Ok(None);
+    };
+    if routing.affinity_policy != RoutingAffinityPolicyV5::PreferredGroup {
+        return Ok(None);
+    }
+
+    let authed_provider_count = cfg
+        .codex
+        .providers
+        .values()
+        .filter(|provider| provider.enabled && provider_v4_has_resolved_auth(provider))
+        .count();
+    if authed_provider_count <= 1 {
+        return Ok(None);
+    }
+
+    Ok(Some(format!(
+        "codex-helper has {authed_provider_count} authenticated Codex providers and [codex.routing].affinity_policy is \"preferred-group\". Remote compaction v1 may include encrypted conversation state, so /responses and /responses/compact should stay on the same upstream account when a session has failed over."
+    )))
+}
+
+fn provider_v4_has_resolved_auth(provider: &crate::config::ProviderConfigV4) -> bool {
+    upstream_auth_has_resolved_credential(&provider.auth)
+        || upstream_auth_has_resolved_credential(&provider.inline_auth)
 }
 
 fn collect_remote_control_startup_issues(
@@ -2629,6 +2700,106 @@ wire_api = "responses"
         assert!(has_startup_issue(
             &report,
             CodexStartupReadinessIssueKind::MissingSwitchState
+        ));
+    }
+
+    #[test]
+    fn codex_tui_startup_readiness_warns_official_bridge_with_preferred_group_multi_provider() {
+        let env = setup_temp_env();
+        write_helper_codex_config(
+            &env,
+            r#"
+version = 5
+
+[codex.providers.a]
+base_url = "https://a.example/v1"
+auth_token_env = "CODEX_HELPER_IMAGEGEN_TEST_KEY"
+
+[codex.providers.b]
+base_url = "https://b.example/v1"
+auth_token_env = "CODEX_HELPER_IMAGEGEN_TEST_KEY"
+
+[codex.routing]
+entry = "main"
+affinity_policy = "preferred-group"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["a", "b"]
+"#,
+        );
+        let cfg_path = env.codex_home.join("config.toml");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+supports_websockets = false
+"#
+            .trim_start(),
+        );
+
+        let mut input = startup_readiness_input(false);
+        input.expected_patch_mode = CodexPatchMode::OfficialRelayBridge;
+        let report = codex_tui_startup_readiness(input);
+
+        assert!(has_startup_issue(
+            &report,
+            CodexStartupReadinessIssueKind::OfficialRelayAffinityPolicy
+        ));
+    }
+
+    #[test]
+    fn codex_tui_startup_readiness_accepts_official_bridge_with_fallback_sticky() {
+        let env = setup_temp_env();
+        write_helper_codex_config(
+            &env,
+            r#"
+version = 5
+
+[codex.providers.a]
+base_url = "https://a.example/v1"
+auth_token_env = "CODEX_HELPER_IMAGEGEN_TEST_KEY"
+
+[codex.providers.b]
+base_url = "https://b.example/v1"
+auth_token_env = "CODEX_HELPER_IMAGEGEN_TEST_KEY"
+
+[codex.routing]
+entry = "main"
+affinity_policy = "fallback-sticky"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["a", "b"]
+"#,
+        );
+        let cfg_path = env.codex_home.join("config.toml");
+        write_file(
+            &cfg_path,
+            r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+supports_websockets = false
+"#
+            .trim_start(),
+        );
+
+        let mut input = startup_readiness_input(false);
+        input.expected_patch_mode = CodexPatchMode::OfficialRelayBridge;
+        let report = codex_tui_startup_readiness(input);
+
+        assert!(!has_startup_issue(
+            &report,
+            CodexStartupReadinessIssueKind::OfficialRelayAffinityPolicy
         ));
     }
 

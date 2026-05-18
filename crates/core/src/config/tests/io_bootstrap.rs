@@ -204,6 +204,10 @@ env_key = "RIGHTCODE_API_KEY"
             "expected imported routing children to be present"
         );
         assert!(
+            text.contains("affinity_policy = \"fallback-sticky\""),
+            "expected imported Codex routing to default to fallback-sticky"
+        );
+        assert!(
             text.contains("\n[retry]\n") && text.contains("profile = \"balanced\""),
             "expected retry.profile default to be visible"
         );
