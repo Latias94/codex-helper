@@ -243,6 +243,9 @@ codex-helper routing explain --model gpt-5 --json
 
 # 会话
 codex-helper session list
+codex-helper session list --truncate 120
+codex-helper session search "remote_control"
+codex-helper session search "remote_control" --truncate 120
 codex-helper session recent
 codex-helper session last
 codex-helper session transcript <SESSION_ID> --tail 40

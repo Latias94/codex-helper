@@ -58,6 +58,15 @@ fn print_recent_sessions(
     Ok(())
 }
 
+fn session_prompt_preview(first_user_message: Option<&str>, truncate: Option<usize>) -> String {
+    let preview_raw = first_user_message.unwrap_or("").replace('\n', " ");
+    if let Some(n) = truncate {
+        super::doctor::truncate_for_display(&preview_raw, n)
+    } else {
+        preview_raw
+    }
+}
+
 fn spawn_cmd_dry_run(label: &str, program: &str, args: &[String]) {
     let joined = std::iter::once(program.to_string())
         .chain(args.iter().cloned())
@@ -191,16 +200,7 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                     let last_update = s.updated_at.as_deref().unwrap_or("-");
                     let last_response = s.last_response_at.as_deref().unwrap_or("-");
                     let cwd = s.cwd.as_deref().unwrap_or("-");
-                    let preview_raw = s
-                        .first_user_message
-                        .as_deref()
-                        .unwrap_or("")
-                        .replace('\n', " ");
-                    let preview = if let Some(n) = truncate {
-                        super::doctor::truncate_for_display(&preview_raw, n)
-                    } else {
-                        preview_raw
-                    };
+                    let preview = session_prompt_preview(s.first_user_message.as_deref(), truncate);
 
                     println!("- id: {}", s.id);
                     println!(
@@ -400,7 +400,12 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                 println!();
             }
         }
-        SessionCommand::Search { query, limit, path } => {
+        SessionCommand::Search {
+            query,
+            limit,
+            path,
+            truncate,
+        } => {
             let sessions: Vec<SessionSummary> = if let Some(p) = path {
                 let root = std::path::PathBuf::from(p);
                 search_codex_sessions_for_dir(&root, &query, limit).await?
@@ -418,12 +423,7 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
                     let last_update = s.updated_at.as_deref().unwrap_or("-");
                     let last_response = s.last_response_at.as_deref().unwrap_or("-");
                     let cwd = s.cwd.as_deref().unwrap_or("-");
-                    let preview_raw = s
-                        .first_user_message
-                        .as_deref()
-                        .unwrap_or("")
-                        .replace('\n', " ");
-                    let preview = super::doctor::truncate_for_display(&preview_raw, 80);
+                    let preview = session_prompt_preview(s.first_user_message.as_deref(), truncate);
 
                     println!("- id: {}", s.id);
                     println!(
@@ -513,4 +513,28 @@ pub async fn handle_session_cmd(cmd: SessionCommand) -> CliResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_prompt_preview_keeps_full_prompt_by_default() {
+        let prompt = "first line\nsecond line with enough extra words to exceed the old search preview width";
+
+        let preview = session_prompt_preview(Some(prompt), None);
+
+        assert_eq!(
+            preview,
+            "first line second line with enough extra words to exceed the old search preview width"
+        );
+    }
+
+    #[test]
+    fn session_prompt_preview_truncates_when_requested() {
+        let preview = session_prompt_preview(Some("abcdefghijklmnopqrstuvwxyz"), Some(10));
+
+        assert_eq!(preview, "abcdefghij...");
+    }
 }

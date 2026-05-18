@@ -625,6 +625,9 @@ pub enum SessionCommand {
         /// Optional directory to search sessions for; defaults to current dir
         #[arg(long)]
         path: Option<String>,
+        /// Truncate the first prompt to N characters (default: do not truncate)
+        #[arg(long)]
+        truncate: Option<usize>,
     },
     /// Export a Codex session to a file
     Export {

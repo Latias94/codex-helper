@@ -233,6 +233,9 @@ codex-helper routing explain
 
 # sessions
 codex-helper session list
+codex-helper session list --truncate 120
+codex-helper session search "remote_control"
+codex-helper session search "remote_control" --truncate 120
 codex-helper session recent
 codex-helper session last
 codex-helper session transcript <SESSION_ID> --tail 40
