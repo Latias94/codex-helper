@@ -119,6 +119,53 @@ const SESSION_IO_CONCURRENCY: usize = 8;
 
 const MAX_SCAN_FILES_RECENT: usize = 200_000;
 
+/// Find recent Codex sessions across all projects. Results are ordered newest-first by updated_at.
+pub async fn find_codex_sessions(limit: usize) -> Result<Vec<SessionSummary>> {
+    let root = codex_sessions_dir();
+    find_codex_sessions_in_dir(&root, limit).await
+}
+
+async fn find_codex_sessions_in_dir(
+    sessions_dir: &Path,
+    limit: usize,
+) -> Result<Vec<SessionSummary>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut headers: Vec<SessionHeader> = Vec::new();
+    let mut scanned_files: usize = 0;
+
+    let year_dirs = collect_dirs_desc(sessions_dir, |s| s.parse::<u32>().ok()).await?;
+
+    'outer: for (_year, year_path) in year_dirs {
+        let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
+        for (_month, month_path) in month_dirs {
+            let day_dirs = collect_dirs_desc(&month_path, |s| s.parse::<u8>().ok()).await?;
+            for (_day, day_path) in day_dirs {
+                let day_files = collect_rollout_files_sorted(&day_path).await?;
+                for path in day_files {
+                    if scanned_files >= MAX_SCAN_FILES {
+                        break 'outer;
+                    }
+                    scanned_files += 1;
+
+                    let header_opt = read_session_header(&path, &cwd).await?;
+                    if let Some(header) = header_opt {
+                        headers.push(header);
+                    }
+                }
+            }
+        }
+    }
+
+    select_and_expand_headers(Vec::new(), headers, limit).await
+}
+
 /// Find recent Codex sessions for a given directory, preferring sessions whose cwd matches that directory
 /// (or one of its ancestors/descendants). Results are ordered newest-first by updated_at.
 pub async fn find_codex_sessions_for_dir(

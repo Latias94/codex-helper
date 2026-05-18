@@ -103,6 +103,98 @@ async fn summarize_session_tracks_rounds_and_last_response() {
     );
 }
 
+fn write_test_session_file(
+    day_dir: &std::path::Path,
+    file_ts: &str,
+    id: &str,
+    cwd: &std::path::Path,
+    first_user_message: &str,
+) -> std::path::PathBuf {
+    std::fs::create_dir_all(day_dir).expect("create sessions day dir");
+    let path = day_dir.join(format!("rollout-{file_ts}-{id}.jsonl"));
+    let created_at = format!(
+        "{}:{}:{}.000Z",
+        &file_ts[..13],
+        &file_ts[14..16],
+        &file_ts[17..19]
+    );
+    let meta_line = serde_json::json!({
+        "timestamp": created_at.clone(),
+        "type": "session_meta",
+        "payload": {
+            "id": id,
+            "cwd": cwd.to_str().expect("cwd utf8"),
+            "timestamp": created_at.clone()
+        }
+    })
+    .to_string();
+    let lines = [
+        meta_line,
+        serde_json::json!({
+            "timestamp": created_at.clone(),
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": first_user_message
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "timestamp": created_at,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }
+        })
+        .to_string(),
+    ]
+    .join("\n");
+    std::fs::write(&path, lines).expect("write session file");
+    path
+}
+
+#[tokio::test]
+async fn find_codex_sessions_in_dir_keeps_other_projects_when_current_matches() {
+    let tmp = std::env::temp_dir().join(format!("codex-helper-test-{}", uuid::Uuid::new_v4()));
+    let sessions = tmp.join("sessions").join("2026").join("05").join("18");
+    let current = tmp.join("current-project");
+    let other = tmp.join("other-project");
+    std::fs::create_dir_all(&current).expect("create current project");
+    std::fs::create_dir_all(&other).expect("create other project");
+
+    write_test_session_file(
+        &sessions,
+        "2026-05-18T00-00-00",
+        "11111111-1111-1111-1111-111111111111",
+        &current,
+        "current project session",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_test_session_file(
+        &sessions,
+        "2026-05-18T00-00-01",
+        "22222222-2222-2222-2222-222222222222",
+        &other,
+        "other project session",
+    );
+
+    let all = find_codex_sessions_in_dir(&tmp.join("sessions"), 10)
+        .await
+        .expect("global history scan ok");
+
+    let ids = all.iter().map(|s| s.id.as_str()).collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![
+            "22222222-2222-2222-2222-222222222222",
+            "11111111-1111-1111-1111-111111111111"
+        ],
+        "global history must not drop unrelated projects when current-project matches exist"
+    );
+}
+
 #[tokio::test]
 async fn read_codex_session_transcript_extracts_messages_and_tail() {
     let dir = std::env::temp_dir().join(format!("codex-helper-test-{}", uuid::Uuid::new_v4()));

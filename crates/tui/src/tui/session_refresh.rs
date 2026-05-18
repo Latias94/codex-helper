@@ -43,7 +43,7 @@ pub(super) fn start_codex_history_refresh(
     ));
 
     tokio::spawn(async move {
-        let result = crate::sessions::find_codex_sessions_for_current_dir(200)
+        let result = crate::sessions::find_codex_sessions(300)
             .await
             .map_err(|err| err.to_string());
         let _ = tx.send(CodexHistoryRefreshResult { generation, result });

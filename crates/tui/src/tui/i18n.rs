@@ -159,7 +159,7 @@ define_messages! {
     CLEAR_SESSION_PROFILE_BINDING => { zh: "Clear binding（移除会话已存储的 profile 绑定）", en: "Clear binding (remove stored session profile binding)" },
     CLEAR_SESSION_PROFILE_BINDING_HELP => { zh: "只清理 profile binding；保留当前会话的 model / effort / provider / service_tier 覆盖", en: "Only clears the profile binding; keeps the current session model / effort / provider / service_tier overrides" },
 
-    HISTORY_TITLE => { zh: "历史会话 (Codex)", en: "History sessions (Codex)" },
+    HISTORY_TITLE => { zh: "历史会话 (Codex 全局)", en: "History sessions (Codex global)" },
     RECENT_TITLE => { zh: "最近会话 (Codex)", en: "Recent sessions (Codex)" },
     DETAILS_TITLE => { zh: "详情", en: "Details" },
     FIRST_USER_MESSAGE => { zh: "首条用户消息", en: "First user message" },

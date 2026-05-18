@@ -24,6 +24,7 @@ All notable changes to this project will be documented in this file.
 - TUI `Routing` 的 route graph 模式现在按实际 routing order 解析 provider 选中项，避免表格、详情、Enter 固定目标、会话 override 和 provider 重排在配置顺序不一致时错位。
 - TUI `Routing` 的 route graph provider 表格、详情面板、菜单入口和重排操作现在共用同一套行模型，刷新、重排或窗口变化后选中行与详情更不容易错位。
 - TUI 底部快捷键栏改为只保留当前页面的关键操作，`?` 帮助会先显示当前页面完整快捷键，窄终端下隐藏的动作仍可发现。
+- TUI `History` 页改为读取 Codex 全局历史最近条目，不再因为当前启动目录有匹配会话就丢掉其它项目历史。
 - TUI `Usage` 页面支持按 `g` 直接刷新余额；刷新失败会显示为错误状态，但不会阻塞页面刷新或其他 provider 的余额刷新。
 - Codex 请求触发的余额刷新改为 provider/endpoint 级延迟队列：请求命中后先去重入队，稍后只刷新对应 provider/endpoint，避免高频请求立即打余额 API 或无条件全量刷新。
 - Codex 请求触发的余额刷新如果撞上 provider 冷却窗口，现在会延后到冷却结束补刷一次，避免高频请求停止后余额长期停在旧快照；进入 TUI `Routing` 页面时也会对空、过期、未知或错误余额做一次懒刷新。
@@ -55,6 +56,7 @@ All notable changes to this project will be documented in this file.
 - TUI `Routing` route graph mode now resolves provider selection from the actual routing order, keeping the table, detail pane, Enter target pinning, session overrides, and provider reordering aligned when config order differs.
 - The TUI `Routing` route graph provider table, detail pane, menu entry, and reorder actions now share the same row model, reducing selection/detail drift after refreshes, reorders, and viewport changes.
 - The TUI footer now keeps only page-critical actions. Press `?` to open page-aware help first, so actions hidden from narrow footers remain discoverable.
+- The TUI `History` page now loads recent Codex history globally instead of dropping other projects when the launch directory has matching sessions.
 - Press `g` on the TUI `Usage` page to refresh balances. Failures stay visible as state/errors without blocking UI redraws or other provider refreshes.
 - Codex request-driven balance refresh now uses a provider/endpoint delayed queue: routed requests enqueue and deduplicate the touched provider endpoint, then refresh only that target later instead of immediately hitting balance APIs or polling all providers.
 - If request-driven balance refresh lands inside a provider cooldown window, it now schedules a trailing refresh after the cooldown instead of dropping the update; entering the TUI `Routing` page also lazily refreshes empty, stale, unknown, or errored balances.
