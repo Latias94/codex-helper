@@ -1034,7 +1034,7 @@ pub struct CodexSwitchStatus {
     pub provider_name: Option<String>,
     /// Current `model_providers.codex_proxy.base_url` (if any).
     pub base_url: Option<String>,
-    /// Current codex-helper Codex patch preset inferred from `model_providers.codex_proxy`.
+    /// Current codex-helper Codex preset inferred from `model_providers.codex_proxy`.
     pub patch_mode: Option<CodexPatchMode>,
     /// Current `model_providers.codex_proxy.requires_openai_auth` value (if any).
     pub requires_openai_auth: Option<bool>,
@@ -1170,7 +1170,7 @@ pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
                     "codex_bridge.switch",
                     CodexBridgeDiagnosticStatus::Ok,
                     format!(
-                        "Codex is routed through codex-helper on {} with patch_preset={}.",
+                        "Codex is routed through codex-helper on {} with preset={}.",
                         status.base_url.as_deref().unwrap_or("<missing base_url>"),
                         patch_mode
                             .map(|mode| mode.as_preset_str())
@@ -1210,7 +1210,7 @@ pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
                     "codex_bridge.remote_compaction_v1",
                     CodexBridgeDiagnosticStatus::Info,
                     format!(
-                        "Current patch preset {} does not advertise the local relay as the official OpenAI provider.",
+                        "Current preset {} does not advertise the local relay as the official OpenAI provider.",
                         patch_mode
                             .map(|mode| mode.as_preset_str())
                             .unwrap_or("<unknown>")
@@ -1256,7 +1256,7 @@ pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
                     &mut checks,
                     "codex_bridge.responses_websocket",
                     ws_status,
-                    "Current patch preset does not advertise Responses WebSocket transport."
+                    "Current preset does not advertise Responses WebSocket transport."
                         .to_string(),
                     Some(
                         "Use `--responses-websocket` only when helper and the selected relay both support Responses WebSocket v2.".to_string(),
@@ -1314,7 +1314,7 @@ pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
                     "codex_bridge.imagegen_facade",
                     CodexBridgeDiagnosticStatus::Info,
                     format!(
-                        "Current patch preset {} does not install the imagegen auth facade.",
+                        "Current preset {} does not install the imagegen auth facade.",
                         patch_mode
                             .map(|mode| mode.as_preset_str())
                             .unwrap_or("<unknown>")
@@ -1599,7 +1599,7 @@ fn collect_switch_startup_issues(
             CodexStartupReadinessSeverity::Warning,
             "Codex bridge preset does not match helper config",
             format!(
-                "Expected patch preset {}, but Codex currently reports {}.",
+                "Expected preset {}, but Codex currently reports {}.",
                 input.expected_patch_mode.as_preset_str(),
                 actual
             ),
@@ -1632,7 +1632,7 @@ fn collect_switch_startup_issues(
             Ok(Some(detail)) => report.push(
                 CodexStartupReadinessIssueKind::OfficialRelayAffinityPolicy,
                 CodexStartupReadinessSeverity::Warning,
-                "Official relay bridge can route a session across providers",
+                "Official relay preset can route a session across providers",
                 detail,
                 "For the most official-like remote compaction behavior, set [codex.routing].affinity_policy = \"fallback-sticky\" or \"hard\" when using multiple authenticated upstreams.",
             ),
@@ -1926,12 +1926,12 @@ pub fn switch_on(port: u16) -> Result<()> {
     switch_on_with_mode(port, CodexPatchMode::Default)
 }
 
-/// Switch Codex to use the local codex-helper model provider with an explicit client patch preset.
+/// Switch Codex to use the local codex-helper model provider with an explicit client preset.
 pub fn switch_on_with_mode(port: u16, mode: CodexPatchMode) -> Result<()> {
     switch_on_with_options(port, mode, CodexSwitchOptions::default())
 }
 
-/// Switch Codex to use the local codex-helper model provider with an explicit client patch preset and
+/// Switch Codex to use the local codex-helper model provider with an explicit client preset and
 /// transport options.
 pub fn switch_on_with_options(
     port: u16,
@@ -2963,7 +2963,7 @@ request_max_retries = 5
     #[test]
     fn codex_switch_on_official_relay_bridge_sets_openai_name_and_disables_websockets() {
         let updated = switch_on_codex_toml_with_mode("", 3333, CodexPatchMode::OfficialRelayBridge)
-            .expect("switch_on should write official relay bridge fields");
+            .expect("switch_on should write official relay preset fields");
 
         assert!(updated.contains("model_provider = \"codex_proxy\""));
         assert!(updated.contains("name = \"OpenAI\""));
@@ -2983,7 +2983,7 @@ request_max_retries = 5
                 responses_websocket: true,
             },
         )
-        .expect("switch_on should write official relay bridge fields with websocket transport");
+        .expect("switch_on should write official relay preset fields with websocket transport");
 
         assert!(updated.contains("model_provider = \"codex_proxy\""));
         assert!(updated.contains("name = \"OpenAI\""));
@@ -2997,7 +2997,7 @@ request_max_retries = 5
     fn codex_switch_on_official_imagegen_bridge_sets_openai_name_and_disables_websockets() {
         let updated =
             switch_on_codex_toml_with_mode("", 3333, CodexPatchMode::OfficialImagegenBridge)
-                .expect("switch_on should write official imagegen bridge fields");
+                .expect("switch_on should write official imagegen preset fields");
 
         assert!(updated.contains("model_provider = \"codex_proxy\""));
         assert!(updated.contains("name = \"OpenAI\""));
@@ -3017,7 +3017,7 @@ request_max_retries = 5
                 responses_websocket: true,
             },
         )
-        .expect("switch_on should write official imagegen bridge fields with websocket transport");
+        .expect("switch_on should write official imagegen preset fields with websocket transport");
 
         assert!(updated.contains("model_provider = \"codex_proxy\""));
         assert!(updated.contains("name = \"OpenAI\""));
@@ -3594,7 +3594,7 @@ children = ["relay"]
         );
 
         let err = ensure_bridge_runtime_ready(CodexPatchMode::OfficialRelayBridge)
-            .expect_err("official relay bridge should require resolved upstream auth");
+            .expect_err("official relay preset should require resolved upstream auth");
 
         let message = err.to_string();
         assert!(message.contains("official-relay"));
@@ -3624,7 +3624,7 @@ children = ["relay"]
         );
 
         let err = ensure_bridge_runtime_ready(CodexPatchMode::OfficialImagegenBridge)
-            .expect_err("official imagegen bridge should require resolved upstream auth");
+            .expect_err("official imagegen preset should require resolved upstream auth");
 
         let message = err.to_string();
         assert!(message.contains("official-imagegen"));
@@ -3661,7 +3661,7 @@ children = ["relay"]
                 responses_websocket: true,
             },
         )
-        .expect_err("official relay bridge with websocket should require resolved upstream auth");
+        .expect_err("official relay preset with websocket should require resolved upstream auth");
 
         let message = err.to_string();
         assert!(message.contains("official-relay"));
@@ -3800,7 +3800,7 @@ base_url = "https://api.openai.com/v1"
         write_file(&auth_path, &original_auth);
 
         switch_on_with_mode(3211, CodexPatchMode::OfficialRelayBridge)
-            .expect("switch_on official relay bridge should patch config");
+            .expect("switch_on official relay preset should patch config");
 
         let updated_cfg = read_file(&cfg_path);
         assert!(updated_cfg.contains("model_provider = \"codex_proxy\""));
@@ -3852,7 +3852,7 @@ base_url = "https://api.openai.com/v1"
                 responses_websocket: true,
             },
         )
-        .expect("switch_on official relay bridge should patch config with websocket transport");
+        .expect("switch_on official relay preset should patch config with websocket transport");
 
         let updated_cfg = read_file(&cfg_path);
         assert!(updated_cfg.contains("model_provider = \"codex_proxy\""));
@@ -3904,7 +3904,7 @@ base_url = "https://api.openai.com/v1"
         write_file(&auth_path, &original_auth);
 
         switch_on_with_mode(3211, CodexPatchMode::OfficialImagegenBridge)
-            .expect("switch_on official imagegen bridge should patch config and auth");
+            .expect("switch_on official imagegen preset should patch config and auth");
 
         let updated_cfg = read_file(&cfg_path);
         assert!(updated_cfg.contains("model_provider = \"codex_proxy\""));
@@ -3977,7 +3977,7 @@ base_url = "https://api.openai.com/v1"
                 responses_websocket: true,
             },
         )
-        .expect("switch_on official imagegen bridge should patch config and auth with websocket transport");
+        .expect("switch_on official imagegen preset should patch config and auth with websocket transport");
 
         let updated_cfg = read_file(&cfg_path);
         assert!(updated_cfg.contains("model_provider = \"codex_proxy\""));
@@ -4391,7 +4391,7 @@ base_url = "https://api.openai.com/v1"
         write_file(&auth_path, &original_auth);
 
         switch_on_with_mode(3211, CodexPatchMode::OfficialImagegenBridge)
-            .expect("switch_on official imagegen bridge should patch auth");
+            .expect("switch_on official imagegen preset should patch auth");
         assert_ne!(read_file(&auth_path), original_auth);
 
         switch_on_with_mode(3211, CodexPatchMode::Default)
@@ -4430,7 +4430,7 @@ base_url = "https://api.openai.com/v1"
                 responses_websocket: true,
             },
         )
-        .expect("switch_on official imagegen bridge should patch auth with websocket transport");
+        .expect("switch_on official imagegen preset should patch auth with websocket transport");
         assert_ne!(read_file(&auth_path), original_auth);
 
         switch_on_with_mode(3211, CodexPatchMode::Default)
@@ -4566,7 +4566,7 @@ base_url = "https://api.openai.com/v1"
         write_file(&auth_path, &original_auth);
 
         switch_on_with_mode(3211, CodexPatchMode::OfficialImagegenBridge)
-            .expect("switch_on official imagegen bridge should patch auth");
+            .expect("switch_on official imagegen preset should patch auth");
         switch_on_with_mode(3211, CodexPatchMode::ChatGptBridge)
             .expect("switching to chatgpt bridge should use original auth snapshot");
 

@@ -159,7 +159,7 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
         response.upstream_base_url
     );
     println!(
-        "Patch preset: {}; Responses WebSocket: {}; model: {}",
+        "Preset: {}; Responses WebSocket: {}; model: {}",
         response.patch_mode.as_preset_str(),
         response.responses_websocket,
         response.model.as_deref().unwrap_or("<none>")

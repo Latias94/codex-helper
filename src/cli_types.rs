@@ -153,7 +153,7 @@ pub(crate) enum CodexCommand {
         /// Requested model used for model-catalog capability interpretation
         #[arg(long)]
         model: Option<String>,
-        /// Patch preset to evaluate; defaults to current switch/config preset
+        /// Preset to evaluate; defaults to current switch/config preset
         #[arg(long = "preset", alias = "mode", value_enum)]
         preset: Option<CodexClientPatchPresetArg>,
         /// Output JSON instead of text
@@ -241,7 +241,7 @@ pub(crate) enum SwitchCommand {
         /// Listen port for local proxy; defaults to 3211
         #[arg(long, default_value_t = 3211)]
         port: u16,
-        /// Codex client patch preset; default preserves historical behavior
+        /// Codex client preset; default preserves historical behavior
         #[arg(long = "preset", alias = "mode", value_enum, default_value_t = CodexClientPatchPresetArg::Default)]
         preset: CodexClientPatchPresetArg,
         /// Enable Responses WebSocket transport advertising for official bridge presets
@@ -297,10 +297,10 @@ pub(crate) enum CodexClientPatchPresetArg {
     ChatgptBridge,
     /// Experimental image generation bridge using a minimal ChatGPT auth facade
     ImagegenBridge,
-    /// Experimental official relay bridge for HTTP OpenAI Responses features
+    /// Experimental official relay preset for HTTP OpenAI Responses features
     #[value(name = "official-relay", alias = "official-relay-bridge")]
     OfficialRelayBridge,
-    /// Experimental official relay bridge plus minimal image generation auth facade
+    /// Experimental official imagegen preset plus minimal image generation auth facade
     #[value(name = "official-imagegen", alias = "official-imagegen-bridge")]
     OfficialImagegenBridge,
 }

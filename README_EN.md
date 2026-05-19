@@ -4,7 +4,7 @@ A local relay proxy and operator console for Codex CLI, focused on two jobs: man
 
 Some Codex features do not appear just because `/responses` can be forwarded. ChatGPT auth shape, OpenAI provider identity, `/models` metadata, `/responses/compact`, and hosted `image_generation` all affect what Codex decides to expose. Some sub2api-style and other relays also return shapes that work for normal chat but are not quite what Codex expects.
 
-codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, client patch presets, capability diagnostics, balance visibility, and fallback policy.
+codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, client presets, capability diagnostics, balance visibility, and fallback policy.
 
 Current release: `v0.15.0`
 

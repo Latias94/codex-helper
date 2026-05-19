@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file.
 
 #### Codex 中转和 ChatGPT 原生体验
 
-- 新增 Codex client patch preset 体系，用来处理“Codex 客户端想要官方/ChatGPT 形态，但模型流量要走中转”的场景。用户侧推荐使用 `[codex.client_patch].preset = "..."` 和 `codex-helper switch on --preset ...`；旧配置 `mode = "..."` 和 CLI `--mode ...` 仍兼容读取，但 helper 保存/生成配置时统一写 `preset`。
+- 新增 Codex client preset 体系，用来处理“Codex 客户端想要官方/ChatGPT 形态，但模型流量要走中转”的场景。用户侧推荐使用 `[codex.client_patch].preset = "..."` 和 `codex-helper switch on --preset ...`；旧配置 `mode = "..."` 和 CLI `--mode ...` 仍兼容读取，但 helper 保存/生成配置时统一写 `preset`。
 - `chatgpt-bridge` 适合已经在官方 Codex 登录 ChatGPT 的用户。Codex 仍看到 ChatGPT 登录态，桌面端和手机端账号能力可以继续按官方路径判断；模型请求由 codex-helper 路由到你的 relay。
 - `imagegen-bridge` 适合 relay 不支持 official provider 身份，但你想让 Codex 暴露 hosted `image_generation` 的场景。它会写入 `{}` auth facade，真实上游密钥仍来自 codex-helper 配置。
 - `official-relay` 适合能转发 OpenAI Responses 语义的中转，尤其是支持 `/responses/compact` 的 sub2api 或类似服务。它让 Codex 尝试 remote compaction v1。
@@ -21,11 +21,11 @@ All notable changes to this project will be documented in this file.
 #### 中转能力诊断
 
 - 新增 Codex relay 能力诊断，可从 TUI Settings、admin API 或 CLI 运行。常用 CLI：`codex-helper codex relay-capabilities --preset official-imagegen --model gpt-5.5`。
-- 诊断会检查 relay 的 `/models`、`/responses`、`/responses/compact`，然后给出更适合的 patch preset。它不会自动切换配置。
+- 诊断会检查 relay 的 `/models`、`/responses`、`/responses/compact`，然后给出更适合的 preset。它不会自动切换配置。
 - 诊断和 live smoke 支持 provider/endpoint 定向：CLI 可用 `--provider <ID>`、`--endpoint <ID>`，便于直接验证某个中转，而不是只测当前路由首选项。
 - 如果 relay 返回 OpenAI 风格的 `/models`（`data: [...]`），codex-helper 会翻译成 Codex 需要的 `models: [...]` catalog，避免 Codex 因模型 metadata 形态不对而看不到 image/search/apply_patch 等能力。
 - 新增需要明确确认的 live smoke：`codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5`。默认只测 `/responses/compact`；加 `--image` 只测 hosted image generation，加 `--websocket` 只测 Responses WebSocket v2，同时传多个可选 case 时只跑显式指定的 case。这个命令会打真实上游，可能消耗额度、生成图片或建立 WebSocket 会话。
-- 诊断和 live smoke 会写入 `~/.codex-helper/logs/codex_relay_evidence.jsonl`。这是给人看的本地证据，不参与 routing、affinity、health、余额、retry 或自动 patch preset。
+- 诊断和 live smoke 会写入 `~/.codex-helper/logs/codex_relay_evidence.jsonl`。这是给人看的本地证据，不参与 routing、affinity、health、余额、retry 或自动切换 preset。
 
 #### 多中转路由和余额
 
@@ -44,7 +44,7 @@ All notable changes to this project will be documented in this file.
 
 #### 升级时关注
 
-- 常用 client patch preset 放在 `[codex.client_patch] preset = "..."`，也可以用 `codex-helper switch on --preset ...` 显式切换。旧的 `mode` / `--mode` 仍可读，但建议迁移到 `preset`。改完后需要完整重启 Codex App、TUI 或 `codex exec`。
+- 常用 client preset 放在 `[codex.client_patch] preset = "..."`，也可以用 `codex-helper switch on --preset ...` 显式切换。旧的 `mode` / `--mode` 仍可读，但建议迁移到 `preset`。改完后需要完整重启 Codex App、TUI 或 `codex exec`。
 - 如果想启用 Responses WebSocket，请额外设置 `responses_websocket = true` 或传 `--responses-websocket`；它不是 preset，只建议在已验证支持 WebSocket 的上游上开启。例如实测 `input8` 支持，`ciii` 的 HTTP endpoints 可用但 WebSocket upstream/proxy 失败，应保持关闭。
 - relay 要求模型名前缀时，用 `provider add --model-map FROM=TO` 或 provider 级 `model_mapping`，例如 `gpt-5.5` -> `openai/gpt-5.5`。
 - 不确定 relay 是否支持 compact/imagegen 时，先跑 `codex-helper codex relay-capabilities`；只有要真实验证上游链路时再跑 live smoke。
@@ -54,7 +54,7 @@ All notable changes to this project will be documented in this file.
 
 #### Codex relays and native ChatGPT behavior
 
-- Added Codex client patch presets for setups where Codex should keep an official or ChatGPT-like client shape while model traffic goes through codex-helper relays. Use `[codex.client_patch].preset = "..."` and `codex-helper switch on --preset ...`; legacy `mode = "..."` and CLI `--mode ...` are still accepted, but helper writes saved/generated config as `preset`.
+- Added Codex client presets for setups where Codex should keep an official or ChatGPT-like client shape while model traffic goes through codex-helper relays. Use `[codex.client_patch].preset = "..."` and `codex-helper switch on --preset ...`; legacy `mode = "..."` and CLI `--mode ...` are still accepted, but helper writes saved/generated config as `preset`.
 - `chatgpt-bridge` is for users already signed in to ChatGPT in official Codex. Codex keeps seeing ChatGPT account state, while model requests are routed through codex-helper.
 - `imagegen-bridge` exposes hosted `image_generation` for relays that do not support official provider identity. It writes the empty `{}` auth facade; real upstream credentials still come from helper config.
 - `official-relay` is for relays that forward OpenAI Responses semantics, especially `/responses/compact`. It lets Codex try remote compaction v1.
@@ -66,11 +66,11 @@ All notable changes to this project will be documented in this file.
 #### Relay diagnostics
 
 - Added Codex relay capability diagnostics in TUI Settings, admin API, and CLI. Common CLI: `codex-helper codex relay-capabilities --preset official-imagegen --model gpt-5.5`.
-- Diagnostics check `/models`, `/responses`, and `/responses/compact`, then recommend a patch preset. They do not switch modes automatically.
+- Diagnostics check `/models`, `/responses`, and `/responses/compact`, then recommend a preset. They do not switch presets automatically.
 - Diagnostics and live smoke can target a specific provider/endpoint with `--provider <ID>` and `--endpoint <ID>`, making it possible to verify one relay directly instead of only the current routing preference.
 - OpenAI-style `/models` responses (`data: [...]`) are translated into the Codex `models: [...]` catalog so Codex can see model metadata such as image/search/apply_patch support.
 - Added explicit live smoke: `codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5`. It checks compact by default; `--image` tests only hosted image generation, `--websocket` tests only Responses WebSocket v2, and multiple optional cases run only the explicitly requested cases. This sends real upstream requests and may spend quota, create an image, or open a WebSocket session.
-- Diagnostics and live smoke append sanitized records to `~/.codex-helper/logs/codex_relay_evidence.jsonl`. That file is local diagnostic evidence only; it does not affect routing, affinity, health, balance, retry, or patch-preset automation.
+- Diagnostics and live smoke append sanitized records to `~/.codex-helper/logs/codex_relay_evidence.jsonl`. That file is local diagnostic evidence only; it does not affect routing, affinity, health, balance, retry, or automatic preset switching.
 
 #### Multi-relay routing and balance
 
@@ -89,7 +89,7 @@ All notable changes to this project will be documented in this file.
 
 #### Upgrade notes
 
-- Set the usual client patch preset with `[codex.client_patch] preset = "..."` or `codex-helper switch on --preset ...`. Legacy `mode` / `--mode` are still accepted, but `preset` is the recommended spelling. Restart Codex App, TUI, or `codex exec` after changing it.
+- Set the usual client preset with `[codex.client_patch] preset = "..."` or `codex-helper switch on --preset ...`. Legacy `mode` / `--mode` are still accepted, but `preset` is the recommended spelling. Restart Codex App, TUI, or `codex exec` after changing it.
 - To enable Responses WebSocket, set `responses_websocket = true` or pass `--responses-websocket`; it is not a preset and should only be enabled for upstream relays verified to support WebSocket. For example, `input8` was verified to support it, while `ciii` supports the HTTP endpoints but fails the WebSocket upstream/proxy path and should keep it disabled.
 - If a relay requires provider-prefixed model names, use `provider add --model-map FROM=TO` or provider-level `model_mapping`, for example `gpt-5.5` -> `openai/gpt-5.5`.
 - If you are unsure whether a relay supports compact or imagegen, run `codex-helper codex relay-capabilities` first. Use live smoke only when you want a real upstream test.

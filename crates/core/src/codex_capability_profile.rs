@@ -288,7 +288,7 @@ impl CodexPatchModeRecommendation {
             CodexCapabilitySupport::Unsupported => {
                 reasons.push("/responses endpoint is not available".to_string());
                 warnings.push(
-                    "no Codex patch mode can compensate for a relay that does not expose /responses"
+                    "no Codex preset can compensate for a relay that does not expose /responses"
                         .to_string(),
                 );
                 return Self::new(
@@ -302,7 +302,7 @@ impl CodexPatchModeRecommendation {
             CodexCapabilitySupport::Unknown => {
                 reasons.push("/responses endpoint support is unknown".to_string());
                 warnings.push(
-                    "do not upgrade patch mode until ordinary Codex model requests are proven"
+                    "do not upgrade preset until ordinary Codex model requests are proven"
                         .to_string(),
                 );
                 return Self::new(
@@ -551,7 +551,7 @@ fn hosted_image_generation_support(
 ) -> CodexCapabilityDecision {
     if !auth_shape.allows_codex_backend_tools() {
         return CodexCapabilityDecision::unsupported(
-            "current patch mode does not make Codex auth look like Codex backend auth",
+            "current preset does not make Codex auth look like Codex backend auth",
         );
     }
 
@@ -1051,7 +1051,7 @@ mod tests {
             recommendation
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("no Codex patch mode can compensate"))
+                .any(|warning| warning.contains("no Codex preset can compensate"))
         );
     }
 }

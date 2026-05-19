@@ -77,14 +77,14 @@ codex-helper switch on --preset default
 
 `official-imagegen` 是混合实验预设，适合背后确实是官方订阅账号的中转。它会像 `official-relay` 一样把 provider 声明成 `OpenAI`，让 Codex 走官方 remote compaction v1；同时像 `imagegen-bridge` 一样写入 `{}` auth facade，让 Codex 暴露 hosted `image_generation`。它默认保持 `supports_websockets = false`，不写 `requires_openai_auth`，且除非选中的上游配置了 helper 侧凭据，否则仍会剥离 Codex 客户端 auth。该预设只负责让 Codex 暴露并发送官方 hosted tool；中转账号本身仍必须同时支持 `/responses/compact` 和 hosted image generation 调用。
 
-`responses_websocket = true` 是传输开关，不是新的 patch 预设。它只允许搭配 `official-relay` 和 `official-imagegen`。启用后，codex-helper 会在 Codex provider 配置里写入 `supports_websockets = true`，并由 helper 自己处理 `/responses`、`/v1/responses`、`/backend-api/codex/responses` 的 WebSocket upgrade。relay 会读取第一个 `response.create` frame，复用普通 helper 请求的 model override、model mapping、request filter、routing selection、session affinity、concurrency snapshot 和 auth injection，注入 `OpenAI-Beta: responses_websockets=2026-02-06`，然后和选中的上游做双向 frame 转发。除非你的上游中转也支持 Responses WebSocket v2，否则保持关闭。
+`responses_websocket = true` 是传输开关，不是新的 preset。它只允许搭配 `official-relay` 和 `official-imagegen`。启用后，codex-helper 会在 Codex provider 配置里写入 `supports_websockets = true`，并由 helper 自己处理 `/responses`、`/v1/responses`、`/backend-api/codex/responses` 的 WebSocket upgrade。relay 会读取第一个 `response.create` frame，复用普通 helper 请求的 model override、model mapping、request filter、routing selection、session affinity、concurrency snapshot 和 auth injection，注入 `OpenAI-Beta: responses_websockets=2026-02-06`，然后和选中的上游做双向 frame 转发。除非你的上游中转也支持 Responses WebSocket v2，否则保持关闭。
 
 可以通过本地 admin API 主动检查某个中转的 Codex 能力画像：
 
 内置 TUI 也能直接跑同一个诊断：进入 Settings（`6`）后按 `C`，它会针对当前 Codex runtime
 执行一次有界 relay 诊断。Settings 页会显示选中的目标上游、expected 能力、实际观测到的
-`/models` / `/responses` / `/responses/compact` 支持情况、mismatch、warning 和推荐 patch 预设。
-这个 TUI 动作只诊断，不会自动修改 patch 预设。
+`/models` / `/responses` / `/responses/compact` 支持情况、mismatch、warning 和推荐 preset。
+这个 TUI 动作只诊断，不会自动修改 preset。
 
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
@@ -99,10 +99,10 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
 
 响应里会包含：
 
-- `expected`：当前 patch 预设和模型 metadata 下，Codex 客户端理论上会暴露什么能力。
+- `expected`：当前 preset 和模型 metadata 下，Codex 客户端理论上会暴露什么能力。
 - `observed`：中转对 `/models`、`/responses`、`/responses/compact` 的实际响应、置信度，以及是否需要 helper 翻译模型列表。
 - `mismatches`：Codex 会尝试使用、但中转没有证明支持的能力。
-- `recommendation`：基于观测结果给出的保守 patch 预设建议。
+- `recommendation`：基于观测结果给出的保守 preset 建议。
 
 推荐矩阵刻意保守：
 
@@ -113,7 +113,7 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
 | `/responses` 可用，`/responses/compact` 不支持，选中模型支持 image input | `imagegen-bridge` |
 | `/responses` 可用，`/responses/compact` 不支持，未证明 image 能力 | `default` |
 | `/responses/compact` 状态未知 | 暂时不要推荐 official relay 预设，先证明 compact |
-| `/responses` 不可用 | `default`；缺少 Responses 端点时任何 patch 预设都补不了 |
+| `/responses` 不可用 | `default`；缺少 Responses 端点时任何 preset 都补不了 |
 
 对 sub2api 风格中转来说，原始 OpenAI `/models` 响应（`data: [...]`）本身可以接受，但前提是 codex-helper 在 Codex 看到之前把它翻译成 Codex 的 `models: [...]` catalog。诊断响应会把这类情况标成 `observed.models.translation_required = true`。非 sub2api 中转也按同一套规则处理：它可以直接返回 Codex 形态的模型 metadata，也可以返回 helper 能翻译的 OpenAI model list。如果选中模型缺失，或 metadata 无法证明 image input，推荐器不会假设 hosted image generation 可用。
 

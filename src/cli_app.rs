@@ -318,7 +318,7 @@ async fn run_server(
             ),
             Err(err) => {
                 tracing::warn!(
-                    "Failed to read Codex patch preset from ~/.codex/config.toml, falling back to default: {}",
+                    "Failed to read Codex preset from ~/.codex/config.toml, falling back to default: {}",
                     err
                 );
                 (client_patch.preset, client_patch.options)
@@ -329,7 +329,7 @@ async fn run_server(
         match codex_integration::switch_on_with_options(port, patch_mode, switch_options) {
             Ok(()) => {
                 tracing::info!(
-                    "Codex config switched to local proxy on port {} (patch_preset={}, responses_websocket={})",
+                    "Codex config switched to local proxy on port {} (preset={}, responses_websocket={})",
                     port,
                     patch_mode.as_preset_str(),
                     switch_options.responses_websocket
@@ -962,7 +962,7 @@ fn do_switch_on(
         codex_integration::guard_codex_config_before_switch_on_interactive()?;
         codex_integration::switch_on_with_options(port, mode, switch_options)
             .map_err(|e| CliError::CodexConfig(e.to_string()))?;
-        println!("Codex client patch preset: {}", mode.as_preset_str());
+        println!("Codex client preset: {}", mode.as_preset_str());
         println!(
             "Responses WebSocket: {}",
             if responses_websocket {
@@ -1217,7 +1217,7 @@ fn print_codex_switch_status() {
                     codex_integration::CodexPatchMode::Default
                 }
             });
-        println!("  codex_proxy.patch_preset: {}", patch_mode.as_preset_str());
+        println!("  codex_proxy.preset: {}", patch_mode.as_preset_str());
         if let Some(value) = requires_openai_auth {
             println!("  codex_proxy.requires_openai_auth: {}", value);
         }

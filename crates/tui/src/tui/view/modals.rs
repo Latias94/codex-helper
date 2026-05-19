@@ -109,8 +109,8 @@ fn startup_issue_copy(issue: &CodexStartupReadinessIssue, lang: Language) -> Sta
             action: "运行 `codex-helper switch status`；如果刚切换过预设，请完整重启 Codex 客户端。"
                 .to_string(),
         },
-        "Official relay bridge can route a session across providers" => StartupIssueCopy {
-            title: "官方 relay 桥接可能把同一会话路由到不同 provider".to_string(),
+        "Official relay preset can route a session across providers" => StartupIssueCopy {
+            title: "官方 relay 预设可能把同一会话路由到不同 provider".to_string(),
             detail: issue.detail.clone(),
             action: "多认证上游使用官方 relay 功能时，建议把 [codex.routing].affinity_policy 设为 \"fallback-sticky\" 或 \"hard\"，让 remote compaction 更接近官方体验。"
                 .to_string(),

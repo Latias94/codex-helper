@@ -123,10 +123,10 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
             ));
             ui.label(format!(
                 "{}: {}",
-                pick(ctx.lang, "当前 patch mode", "Current patch mode"),
+                pick(ctx.lang, "当前 preset", "Current preset"),
                 status
                     .patch_mode
-                    .map(|mode| mode.to_string())
+                    .map(|mode| mode.as_preset_str().to_string())
                     .unwrap_or_else(|| "-".to_string())
             ));
             render_switch_enabled_state(
@@ -160,8 +160,8 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                             *ctx.last_info = Some(
                                 pick(
                                     ctx.lang,
-                                    "已用默认模式更新 ~/.codex/config.toml；已有 Codex app 需要重启后生效",
-                                    "Updated ~/.codex/config.toml in default mode; restart existing Codex apps to apply it",
+                                    "已用默认 preset 更新 ~/.codex/config.toml；已有 Codex app 需要重启后生效",
+                                    "Updated ~/.codex/config.toml with the default preset; restart existing Codex apps to apply it",
                                 )
                                 .to_string(),
                             );
@@ -233,8 +233,8 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                 }
 
                 let enable_official_relay_label = match ctx.lang {
-                    Language::Zh => format!("Official Relay Bridge（端口 {port}）"),
-                    Language::En => format!("Official relay bridge (port {port})"),
+                    Language::Zh => format!("Official Relay（端口 {port}）"),
+                    Language::En => format!("Official relay (port {port})"),
                 };
                 if ui
                     .add_enabled(
@@ -255,8 +255,8 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                             *ctx.last_info = Some(
                                 pick(
                                     ctx.lang,
-                                    "已启用 Official relay bridge；已有 Codex app 需要重启后生效",
-                                    "Enabled Official relay bridge; restart existing Codex apps to apply it",
+                                    "已启用 Official relay preset；已有 Codex app 需要重启后生效",
+                                    "Enabled official relay preset; restart existing Codex apps to apply it",
                                 )
                                 .to_string(),
                             );
@@ -266,8 +266,8 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                 }
 
                 let enable_official_imagegen_label = match ctx.lang {
-                    Language::Zh => format!("Official Imagegen Bridge（端口 {port}）"),
-                    Language::En => format!("Official imagegen bridge (port {port})"),
+                    Language::Zh => format!("Official Imagegen（端口 {port}）"),
+                    Language::En => format!("Official imagegen (port {port})"),
                 };
                 if ui
                     .add_enabled(
@@ -288,8 +288,8 @@ fn render_codex_switch_step(ui: &mut egui::Ui, ctx: &mut PageCtx<'_>, port: u16)
                             *ctx.last_info = Some(
                                 pick(
                                     ctx.lang,
-                                    "已启用 Official imagegen bridge；auth.json 会在关闭或切回默认时安全恢复，已有 Codex app 需要重启后生效",
-                                    "Enabled Official imagegen bridge; auth.json will be safely restored on disable/default switch, restart existing Codex apps to apply it",
+                                    "已启用 Official imagegen preset；auth.json 会在关闭或切回默认时安全恢复，已有 Codex app 需要重启后生效",
+                                    "Enabled official imagegen preset; auth.json will be safely restored on disable/default switch, restart existing Codex apps to apply it",
                                 )
                                 .to_string(),
                             );

@@ -172,7 +172,7 @@ pub(super) fn current_page_help_lines(
             "  p/P        manage configured default profile / runtime default profile",
             "  R          reload runtime config",
             "  O          overwrite-import stations from ~/.codex, with confirmation",
-            "  B/I/F/V/D  enable ChatGPT / Imagegen / Official relay / Official imagegen / default patch",
+            "  B/I/F/V/D  enable ChatGPT / Imagegen / Official relay / Official imagegen / default preset",
         ],
         (Language::En, Page::Settings, _, false) => vec![
             "  p/P        manage configured default profile / runtime default profile",

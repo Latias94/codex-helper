@@ -175,10 +175,10 @@ fn codex_relay_diagnostics_lines(p: Palette, ui: &UiState) -> Vec<Line<'static>>
     lines.push(Line::from(vec![Span::styled(
         match ui.language {
             Language::Zh => {
-                "  C 运行一次有界诊断：/models 只读，/responses 与 /responses/compact 只发 {} 校验请求；不会自动切换 patch 预设。"
+                "  C 运行一次有界诊断：/models 只读，/responses 与 /responses/compact 只发 {} 校验请求；不会自动切换 preset。"
             }
             Language::En => {
-                "  C runs one bounded diagnostic: /models read-only, /responses and /responses/compact send {} validation probes; patch preset is not changed automatically."
+                "  C runs one bounded diagnostic: /models read-only, /responses and /responses/compact send {} validation probes; preset is not changed automatically."
             }
         },
         Style::default().fg(p.muted),
@@ -1086,10 +1086,10 @@ pub(super) fn render_settings_page(
                 lines.push(Line::from(vec![Span::styled(
                     match ui.language {
                         Language::Zh => {
-                            "  B/I/F/V/D 启用 ChatGPT / Imagegen / Official relay / Official imagegen / 默认 patch；C 诊断 relay 能力；X/Y 确认后运行 live smoke。修改 ~/.codex/config.toml 后已有 Codex app 需要重启。"
+                            "  B/I/F/V/D 启用 ChatGPT / Imagegen / Official relay / Official imagegen / 默认 preset；C 诊断 relay 能力；X/Y 确认后运行 live smoke。修改 ~/.codex/config.toml 后已有 Codex app 需要重启。"
                         }
                         Language::En => {
-                            "  B/I/F/V/D enable ChatGPT / Imagegen / Official relay / Official imagegen / default patch; C diagnoses relay capabilities; X/Y run live smoke after confirmation. Restart existing Codex apps after ~/.codex/config.toml changes."
+                            "  B/I/F/V/D enable ChatGPT / Imagegen / Official relay / Official imagegen / default preset; C diagnoses relay capabilities; X/Y run live smoke after confirmation. Restart existing Codex apps after ~/.codex/config.toml changes."
                         }
                     },
                     Style::default().fg(p.muted),

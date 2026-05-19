@@ -451,11 +451,11 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     ui.toast = Some((
                         match ui.language {
                             Language::Zh => {
-                                "已启用 Official relay bridge；重启已有 Codex app 后生效"
+                                "已启用 Official relay preset；重启已有 Codex app 后生效"
                                     .to_string()
                             }
                             Language::En => {
-                                "Official relay bridge enabled; restart existing Codex apps to apply it"
+                                "Official relay preset enabled; restart existing Codex apps to apply it"
                                     .to_string()
                             }
                         },
@@ -465,9 +465,9 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 Err(err) => {
                     ui.toast = Some((
                         match ui.language {
-                            Language::Zh => format!("启用 Official relay bridge 失败：{err}"),
+                            Language::Zh => format!("启用 Official relay preset 失败：{err}"),
                             Language::En => {
-                                format!("enable Official relay bridge failed: {err}")
+                                format!("enable Official relay preset failed: {err}")
                             }
                         },
                         Instant::now(),
@@ -485,11 +485,11 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     ui.toast = Some((
                         match ui.language {
                             Language::Zh => {
-                                "已启用 Official imagegen bridge；重启已有 Codex app 后生效"
+                                "已启用 Official imagegen preset；重启已有 Codex app 后生效"
                                     .to_string()
                             }
                             Language::En => {
-                                "Official imagegen bridge enabled; restart existing Codex apps to apply it"
+                                "Official imagegen preset enabled; restart existing Codex apps to apply it"
                                     .to_string()
                             }
                         },
@@ -500,10 +500,10 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     ui.toast = Some((
                         match ui.language {
                             Language::Zh => {
-                                format!("启用 Official imagegen bridge 失败：{err}")
+                                format!("启用 Official imagegen preset 失败：{err}")
                             }
                             Language::En => {
-                                format!("enable Official imagegen bridge failed: {err}")
+                                format!("enable Official imagegen preset failed: {err}")
                             }
                         },
                         Instant::now(),
@@ -517,10 +517,10 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 Ok(()) => {
                     ui.toast = Some((
                         match ui.language {
-                            Language::Zh => "已切回默认客户端 patch；重启已有 Codex app 后生效"
+                            Language::Zh => "已切回默认客户端 preset；重启已有 Codex app 后生效"
                                 .to_string(),
                             Language::En => {
-                                "Default client patch enabled; restart existing Codex apps to apply it"
+                                "Default client preset enabled; restart existing Codex apps to apply it"
                                     .to_string()
                             }
                         },
@@ -530,8 +530,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 Err(err) => {
                     ui.toast = Some((
                         match ui.language {
-                            Language::Zh => format!("切回默认 patch 失败：{err}"),
-                            Language::En => format!("enable default patch failed: {err}"),
+                            Language::Zh => format!("切回默认 preset 失败：{err}"),
+                            Language::En => format!("enable default preset failed: {err}"),
                         },
                         Instant::now(),
                     ));

@@ -41,7 +41,7 @@ Codex-owned files remain owned by Codex:
 
 `switch on/off` and one-command startup only patch the local Codex proxy section. They do not overwrite unrelated Codex config changes.
 
-## Codex Client Patch Preset
+## Codex Client Preset
 
 The default preset only points `~/.codex/config.toml` `model_provider` at the local `codex_proxy`. To keep ChatGPT account auth and mobile/desktop account features while routing model requests through codex-helper, enable ChatGPT bridge:
 
@@ -67,7 +67,7 @@ codex-helper switch on --preset official-imagegen
 codex-helper switch on --preset default
 ```
 
-The legacy CLI spelling `--mode ...` is also accepted as an alias. On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client patch preset is preserved; use `switch on --preset ...` or the TUI Settings `B`/`I`/`F`/`D` keys to change it explicitly.
+The legacy CLI spelling `--mode ...` is also accepted as an alias. On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not already switched to codex-helper. If Codex is already switched, the existing client preset is preserved; use `switch on --preset ...` or the TUI Settings `B`/`I`/`F`/`D` keys to change it explicitly.
 
 `chatgpt-bridge` writes `requires_openai_auth = true` and `supports_websockets = false` into `~/.codex/config.toml`, and changes only two `~/.codex/auth.json` fields: `auth_mode` becomes `"chatgpt"` and `OPENAI_API_KEY` becomes `null`. It requires an existing official Codex ChatGPT login state; if `auth.json` has no complete token/email/account metadata, codex-helper refuses the patch before writing `config.toml` or `auth.json`. Existing Codex apps usually need a restart before they read the changed client config.
 
@@ -77,15 +77,15 @@ The legacy CLI spelling `--mode ...` is also accepted as an alias. On startup, `
 
 `official-imagegen` is the hybrid experimental preset for relays backed by official OpenAI subscriptions. It writes the same OpenAI provider identity as `official-relay` so Codex can use remote compaction v1, and writes the same empty `{}` auth facade as `imagegen-bridge` so Codex exposes hosted `image_generation`. By default it keeps `supports_websockets = false`, does not write `requires_openai_auth`, and still strips Codex client auth before forwarding unless the selected upstream has its own helper-side credential. This preset only makes Codex expose and send the official hosted tool; the relay account still has to support both `/responses/compact` and hosted image generation calls.
 
-`responses_websocket = true` is a transport switch, not a separate patch preset. It is only valid with `official-relay` and `official-imagegen`. When enabled, codex-helper writes `supports_websockets = true` into Codex's provider config and handles the WebSocket upgrade itself on `/responses`, `/v1/responses`, and `/backend-api/codex/responses`. The relay path reads the first `response.create` frame, applies the same model override, model mapping, request filter, routing selection, session affinity, concurrency snapshot, and auth injection as normal helper traffic, injects `OpenAI-Beta: responses_websockets=2026-02-06`, then bridges frames bidirectionally to the selected upstream. Keep it disabled unless your upstream relay also supports Responses WebSocket v2.
+`responses_websocket = true` is a transport switch, not a separate preset. It is only valid with `official-relay` and `official-imagegen`. When enabled, codex-helper writes `supports_websockets = true` into Codex's provider config and handles the WebSocket upgrade itself on `/responses`, `/v1/responses`, and `/backend-api/codex/responses`. The relay path reads the first `response.create` frame, applies the same model override, model mapping, request filter, routing selection, session affinity, concurrency snapshot, and auth injection as normal helper traffic, injects `OpenAI-Beta: responses_websockets=2026-02-06`, then bridges frames bidirectionally to the selected upstream. Keep it disabled unless your upstream relay also supports Responses WebSocket v2.
 
 You can actively inspect a relay's Codex capability profile through the local admin API:
 
 In the built-in TUI, open Settings (`6`) and press `C` to run the same bounded relay diagnostic
 against the current Codex runtime. The Settings page shows the selected target, expected
 capabilities, observed `/models` / `/responses` / `/responses/compact` support, mismatches,
-warnings, and the recommended patch preset. The TUI action is diagnostic-only; it never changes the
-patch preset automatically.
+warnings, and the recommended preset. The TUI action is diagnostic-only; it never changes the
+preset automatically.
 
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
@@ -105,11 +105,11 @@ a request storm amplifier.
 
 The response includes:
 
-- `expected`: what Codex should expose for the requested patch preset and model metadata.
+- `expected`: what Codex should expose for the requested preset and model metadata.
 - `observed`: what the relay actually returned for `/models`, `/responses`, and
   `/responses/compact`, including confidence and whether helper translation is required.
 - `mismatches`: places where Codex will try a capability that the relay did not prove.
-- `recommendation`: the conservative patch preset recommendation for the observed relay.
+- `recommendation`: the conservative preset recommendation for the observed relay.
 
 Recommendation rules are intentionally conservative:
 
@@ -120,7 +120,7 @@ Recommendation rules are intentionally conservative:
 | `/responses` works, `/responses/compact` is unsupported, selected model is image-capable | `imagegen-bridge` |
 | `/responses` works, `/responses/compact` is unsupported, no image capability is proven | `default` |
 | `/responses/compact` is unknown | avoid official relay presets until compact is proven |
-| `/responses` is unavailable | `default`; no patch preset can compensate for a missing Responses endpoint |
+| `/responses` is unavailable | `default`; no preset can compensate for a missing Responses endpoint |
 
 For sub2api-style relays, a raw OpenAI `/models` response (`data: [...]`) is fine only if
 codex-helper translates it into the Codex `models: [...]` catalog before Codex sees it. The
