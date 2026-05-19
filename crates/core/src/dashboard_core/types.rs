@@ -79,6 +79,8 @@ pub struct ControlPlaneSurfaceCapabilities {
     #[serde(default)]
     pub station_probe: bool,
     #[serde(default)]
+    pub codex_relay_capabilities: bool,
+    #[serde(default)]
     pub providers: bool,
     #[serde(default)]
     pub provider_runtime: bool,

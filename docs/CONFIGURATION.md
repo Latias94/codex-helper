@@ -71,6 +71,53 @@ On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not a
 
 `official-imagegen-bridge` is the hybrid experimental mode for relays backed by official OpenAI subscriptions. It writes the same OpenAI provider identity as `official-relay-bridge` so Codex can use remote compaction v1, and writes the same empty `{}` auth facade as `imagegen-bridge` so Codex exposes hosted `image_generation`. It keeps `supports_websockets = false`, does not write `requires_openai_auth`, and still strips Codex client auth before forwarding unless the selected upstream has its own helper-side credential. This mode only makes Codex expose and send the official hosted tool; the relay account still has to support both `/responses/compact` and hosted image generation calls.
 
+You can actively inspect a relay's Codex capability profile through the local admin API:
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
+  -H 'content-type: application/json' \
+  -d '{"patch_mode":"official-imagegen-bridge","model":"gpt-5.5"}'
+```
+
+Use the admin port for your Codex proxy port (`proxy_port + 1000`; the default Codex proxy is
+`3211`, so the default admin port is `4211`). The endpoint is `POST` on purpose: it sends one
+bounded active probe to the selected upstream's `/models`, `/responses`, and `/responses/compact`
+endpoints. `/models` is read-only; the two Responses probes send `{}` and classify validation
+errors as endpoint support. The endpoint does not use normal routing, retry, request ledger,
+session affinity, passive health, or runtime health state, so it is a diagnostic action rather than
+a request storm amplifier.
+
+The response includes:
+
+- `expected`: what Codex should expose for the requested patch mode and model metadata.
+- `observed`: what the relay actually returned for `/models`, `/responses`, and
+  `/responses/compact`, including confidence and whether helper translation is required.
+- `mismatches`: places where Codex will try a capability that the relay did not prove.
+- `recommendation`: the conservative patch mode recommendation for the observed relay.
+
+Recommendation rules are intentionally conservative:
+
+| Observed relay state | Recommended mode |
+| --- | --- |
+| `/responses` works, `/responses/compact` works, selected model is image-capable | `official-imagegen-bridge` |
+| `/responses` works, `/responses/compact` works, selected model is not image-capable | `official-relay-bridge` |
+| `/responses` works, `/responses/compact` is unsupported, selected model is image-capable | `imagegen-bridge` |
+| `/responses` works, `/responses/compact` is unsupported, no image capability is proven | `default` |
+| `/responses/compact` is unknown | avoid official relay modes until compact is proven |
+| `/responses` is unavailable | `default`; no patch mode can compensate for a missing Responses endpoint |
+
+For sub2api-style relays, a raw OpenAI `/models` response (`data: [...]`) is fine only if
+codex-helper translates it into the Codex `models: [...]` catalog before Codex sees it. The
+diagnostic response reports this as `observed.models.translation_required = true`. For non-sub2api
+relays, the same rules apply: the relay can either return Codex-shaped model metadata directly or
+return an OpenAI model list that codex-helper can translate. If the selected model is absent or its
+metadata does not prove image input, the recommendation will not assume hosted image generation.
+
+Hosted `image_generation` is not actively probed by this diagnostic endpoint because that can spend
+quota or create image artifacts. WebSocket relay support is still not implemented; bridge modes keep
+`supports_websockets = false`. Remote compaction v2 remains diagnostic-only and is not enabled by
+these modes.
+
 To diagnose whether remote compaction v1 is active, inspect the codex-helper request ledger after a Codex compaction happens:
 
 ```bash

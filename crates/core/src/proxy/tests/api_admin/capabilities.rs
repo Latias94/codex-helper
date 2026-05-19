@@ -934,3 +934,347 @@ async fn proxy_api_v1_capabilities_report_remote_enabled_when_admin_token_config
 
     proxy_handle.abort();
 }
+
+#[tokio::test]
+async fn codex_capabilities_api_reports_expected_observed_and_mismatches() {
+    let model_hits = Arc::new(AtomicUsize::new(0));
+    let responses_hits = Arc::new(AtomicUsize::new(0));
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+
+    let model_hits_for_route = model_hits.clone();
+    let responses_hits_for_route = responses_hits.clone();
+    let compact_hits_for_route = compact_hits.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/v1/models",
+            get(move || {
+                let model_hits = model_hits_for_route.clone();
+                async move {
+                    model_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "object": "list",
+                        "data": [
+                            { "id": "gpt-5.5", "object": "model", "display_name": "GPT-5.5" }
+                        ]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1/responses",
+            post(move || {
+                let responses_hits = responses_hits_for_route.clone();
+                async move {
+                    responses_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": "Missing required parameter: model"
+                            }
+                        })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move || {
+                let compact_hits = compact_hits_for_route.clone();
+                async move {
+                    compact_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "compact_not_supported",
+                                "message": "compact is not supported"
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{upstream_addr}/v1"),
+            auth: UpstreamAuth::default(),
+            tags: {
+                let mut t = HashMap::new();
+                t.insert("provider_id".to_string(), "relay-a".to_string());
+                t
+            },
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let client = reqwest::Client::new();
+    let caps = client
+        .get(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/capabilities"
+        ))
+        .send()
+        .await
+        .expect("codex capabilities manifest send")
+        .error_for_status()
+        .expect("codex capabilities manifest status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("codex capabilities manifest json");
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/codex/relay-capabilities"))
+    }));
+    assert_eq!(
+        caps["surface_capabilities"]["codex_relay_capabilities"].as_bool(),
+        Some(true)
+    );
+
+    let summary = client
+        .get(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/operator/summary"
+        ))
+        .send()
+        .await
+        .expect("operator summary send")
+        .error_for_status()
+        .expect("operator summary status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("operator summary json");
+    assert_eq!(
+        summary["links"]["codex_relay_capabilities"].as_str(),
+        Some("/__codex_helper/api/v1/codex/relay-capabilities")
+    );
+
+    let diagnostics = client
+        .post(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/codex/relay-capabilities"
+        ))
+        .json(&serde_json::json!({
+            "patch_mode": "official-imagegen-bridge",
+            "model": "gpt-5.5"
+        }))
+        .send()
+        .await
+        .expect("codex capabilities send")
+        .error_for_status()
+        .expect("codex capabilities status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("codex capabilities json");
+
+    assert_eq!(model_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        diagnostics.get("service_name").and_then(|v| v.as_str()),
+        Some("codex")
+    );
+    assert_eq!(
+        diagnostics.get("station_name").and_then(|v| v.as_str()),
+        Some("test")
+    );
+    assert_eq!(
+        diagnostics.get("upstream_index").and_then(|v| v.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        diagnostics.get("patch_mode").and_then(|v| v.as_str()),
+        Some("official-imagegen-bridge")
+    );
+    assert_eq!(
+        diagnostics["observed"]["models"]["response_shape"].as_str(),
+        Some("openai_data_list")
+    );
+    assert_eq!(
+        diagnostics["observed"]["models"]["translation_required"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        diagnostics["expected"]["remote_compaction_v1"]["support"].as_str(),
+        Some("supported")
+    );
+    assert_eq!(
+        diagnostics["expected"]["hosted_image_generation"]["support"].as_str(),
+        Some("supported")
+    );
+    assert_eq!(
+        diagnostics["observed"]["responses"]["support"].as_str(),
+        Some("supported")
+    );
+    assert_eq!(
+        diagnostics["observed"]["responses_compact"]["support"].as_str(),
+        Some("unsupported")
+    );
+    assert_eq!(
+        diagnostics["recommendation"]["current_patch_mode"].as_str(),
+        Some("official-imagegen-bridge")
+    );
+    assert_eq!(
+        diagnostics["recommendation"]["recommended_patch_mode"].as_str(),
+        Some("imagegen-bridge")
+    );
+    assert_eq!(
+        diagnostics["recommendation"]["changes_current_mode"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        diagnostics["recommendation"]["confidence"].as_str(),
+        Some("medium")
+    );
+    assert!(diagnostics["mismatches"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item.get("capability").and_then(|v| v.as_str()) == Some("remote_compaction_v1")
+                && item
+                    .get("observed")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|value| value.contains("unsupported"))
+        })
+    }));
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn codex_capabilities_api_uses_current_codex_switch_mode_when_payload_omits_patch_mode() {
+    let _env_lock = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let codex_home = temp_dir.join(".codex");
+    let helper_home = temp_dir.join(".codex-helper");
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", codex_home.as_path());
+        scoped.set_path("CODEX_HELPER_HOME", helper_home.as_path());
+    }
+    write_text_file(
+        &codex_home.join("config.toml"),
+        r#"
+model_provider = "codex_proxy"
+
+[model_providers.codex_proxy]
+name = "OpenAI"
+base_url = "http://127.0.0.1:3211"
+wire_api = "responses"
+supports_websockets = false
+request_max_retries = 0
+"#
+        .trim_start(),
+    );
+    write_text_file(&codex_home.join("auth.json"), "{}");
+
+    let upstream = axum::Router::new()
+        .route(
+            "/v1/models",
+            get(|| async {
+                Json(serde_json::json!({
+                    "models": [
+                        {
+                            "slug": "gpt-5.5",
+                            "input_modalities": ["text", "image"],
+                            "supports_search_tool": true,
+                            "apply_patch_tool_type": "freeform",
+                            "supports_reasoning_summaries": true
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1/responses",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "Missing required parameter: model"
+                        }
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "compact_not_supported",
+                            "message": "compact is not supported"
+                        }
+                    })),
+                )
+            }),
+        );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{upstream_addr}/v1"),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let diagnostics = reqwest::Client::new()
+        .post(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/codex/relay-capabilities"
+        ))
+        .json(&serde_json::json!({ "model": "gpt-5.5" }))
+        .send()
+        .await
+        .expect("codex capabilities send")
+        .error_for_status()
+        .expect("codex capabilities status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("codex capabilities json");
+
+    assert_eq!(
+        diagnostics.get("patch_mode").and_then(|v| v.as_str()),
+        Some("official-imagegen-bridge")
+    );
+    assert_eq!(
+        diagnostics["expected"]["remote_compaction_v1"]["support"].as_str(),
+        Some("supported")
+    );
+    assert_eq!(
+        diagnostics["recommendation"]["current_patch_mode"].as_str(),
+        Some("official-imagegen-bridge")
+    );
+    assert_eq!(
+        diagnostics["recommendation"]["recommended_patch_mode"].as_str(),
+        Some("imagegen-bridge")
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}

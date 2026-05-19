@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "slug": "codex-relay-capability-profile",
+  "title": "Codex Relay Capability Profile",
+  "status": "complete",
+  "updated": "2026-05-19",
+  "scope_kind": "execution",
+  "problem": "Codex bridge modes can expose official-like client features, but codex-helper does not yet provide a relay-agnostic capability profile, active probes, or mode recommendations that distinguish client exposure from upstream support.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-relay-capability-profile/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-relay-capability-profile/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-relay-capability-profile/EVIDENCE_AND_GATES.md"
+    },
+    {
+      "role": "handoff",
+      "path": "docs/workstreams/codex-relay-capability-profile/HANDOFF.md"
+    }
+  ],
+  "gates": [
+    "cargo nextest run -p codex-helper-core codex_capability_profile",
+    "cargo nextest run -p codex-helper-core codex_relay_probe",
+    "cargo nextest run -p codex-helper-core codex_capabilities_api",
+    "cargo nextest run -p codex-helper-core codex_patch_mode_recommendation",
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-relay-capability-profile/EVIDENCE_AND_GATES.md"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "closed",
+    "notes": "Completed with static profile, bounded probes, admin diagnostics, conservative patch-mode recommendations, docs, changelog, and full core package gate evidence. Split WebSocket relay, remote compaction v2, TUI/GUI wrappers, or paid hosted-tool probes into follow-on lanes."
+  }
+}

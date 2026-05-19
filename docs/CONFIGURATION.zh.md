@@ -71,6 +71,39 @@ codex-helper switch on --mode default
 
 `official-imagegen-bridge` 是混合实验模式，适合背后确实是官方订阅账号的中转。它会像 `official-relay-bridge` 一样把 provider 声明成 `OpenAI`，让 Codex 走官方 remote compaction v1；同时像 `imagegen-bridge` 一样写入 `{}` auth facade，让 Codex 暴露 hosted `image_generation`。它保持 `supports_websockets = false`，不写 `requires_openai_auth`，且除非选中的上游配置了 helper 侧凭据，否则仍会剥离 Codex 客户端 auth。该模式只负责让 Codex 暴露并发送官方 hosted tool；中转账号本身仍必须同时支持 `/responses/compact` 和 hosted image generation 调用。
 
+可以通过本地 admin API 主动检查某个中转的 Codex 能力画像：
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
+  -H 'content-type: application/json' \
+  -d '{"patch_mode":"official-imagegen-bridge","model":"gpt-5.5"}'
+```
+
+这里要使用 Codex proxy port 对应的 admin port（`proxy_port + 1000`；默认 Codex proxy 是
+`3211`，所以默认 admin port 是 `4211`）。这个端点故意设计成 `POST`：它会对选中的上游各发一次有界主动探测，分别访问 `/models`、`/responses` 和 `/responses/compact`。其中 `/models` 是只读探测；两个 Responses 探测发送 `{}`，并把“缺少 model/input”这类校验错误判断为端点存在。它不会走正常 routing、retry、request ledger、session affinity、passive health 或 runtime health 状态，所以这是显式诊断动作，不会放大成每请求重试风暴。
+
+响应里会包含：
+
+- `expected`：当前 patch mode 和模型 metadata 下，Codex 客户端理论上会暴露什么能力。
+- `observed`：中转对 `/models`、`/responses`、`/responses/compact` 的实际响应、置信度，以及是否需要 helper 翻译模型列表。
+- `mismatches`：Codex 会尝试使用、但中转没有证明支持的能力。
+- `recommendation`：基于观测结果给出的保守 patch mode 建议。
+
+推荐矩阵刻意保守：
+
+| 中转观测状态 | 推荐模式 |
+| --- | --- |
+| `/responses` 可用，`/responses/compact` 可用，选中模型支持 image input | `official-imagegen-bridge` |
+| `/responses` 可用，`/responses/compact` 可用，选中模型不支持 image input | `official-relay-bridge` |
+| `/responses` 可用，`/responses/compact` 不支持，选中模型支持 image input | `imagegen-bridge` |
+| `/responses` 可用，`/responses/compact` 不支持，未证明 image 能力 | `default` |
+| `/responses/compact` 状态未知 | 暂时不要推荐 official relay 模式，先证明 compact |
+| `/responses` 不可用 | `default`；缺少 Responses 端点时任何 patch mode 都补不了 |
+
+对 sub2api 风格中转来说，原始 OpenAI `/models` 响应（`data: [...]`）本身可以接受，但前提是 codex-helper 在 Codex 看到之前把它翻译成 Codex 的 `models: [...]` catalog。诊断响应会把这类情况标成 `observed.models.translation_required = true`。非 sub2api 中转也按同一套规则处理：它可以直接返回 Codex 形态的模型 metadata，也可以返回 helper 能翻译的 OpenAI model list。如果选中模型缺失，或 metadata 无法证明 image input，推荐器不会假设 hosted image generation 可用。
+
+该诊断端点不会主动探测 hosted `image_generation`，因为这可能消耗额度或生成实际图片。WebSocket relay 仍未实现；bridge 模式会继续保持 `supports_websockets = false`。Remote compaction v2 仍只作为诊断认知保留，不由这些模式启用。
+
 要诊断 remote compaction v1 是否生效，可以在 Codex 发生压缩后查看 codex-helper 请求账本：
 
 ```bash

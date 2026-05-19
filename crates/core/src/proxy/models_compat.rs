@@ -13,11 +13,22 @@ pub(super) fn maybe_decode_models_response_body(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Bytes {
+    let body =
+        maybe_decode_models_response_body_without_translation(service_name, path, headers, body);
+    maybe_translate_openai_models_list(body.as_ref()).unwrap_or(body)
+}
+
+pub(super) fn maybe_decode_models_response_body_without_translation(
+    service_name: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Bytes {
     if service_name != "codex" || path != "/models" {
         return body;
     }
 
-    let body = if looks_like_json(body.as_ref()) {
+    if looks_like_json(body.as_ref()) {
         body
     } else if let Some(decoded) = decode_from_content_encoding(headers, body.as_ref())
         .or_else(|| decode_from_signature(body.as_ref()))
@@ -25,9 +36,7 @@ pub(super) fn maybe_decode_models_response_body(
         Bytes::from(decoded)
     } else {
         body
-    };
-
-    maybe_translate_openai_models_list(body.as_ref()).unwrap_or(body)
+    }
 }
 
 fn decode_from_content_encoding(headers: &HeaderMap, body: &[u8]) -> Option<Vec<u8>> {
@@ -318,4 +327,46 @@ fn display_name(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codex_capability_profile::{
+        CodexCapabilityProfile, CodexCapabilitySupport, CodexModelCatalogShape,
+    };
+    use crate::codex_integration::CodexPatchMode;
+
+    #[test]
+    fn codex_capability_profile_understands_translated_openai_models_list() {
+        let body = br#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-5.5", "object": "model", "display_name": "GPT-5.5" }
+            ]
+        }"#;
+
+        let translated = maybe_translate_openai_models_list(body)
+            .expect("OpenAI models list should translate to Codex catalog");
+        let value: serde_json::Value =
+            serde_json::from_slice(translated.as_ref()).expect("translated JSON");
+        let profile = CodexCapabilityProfile::for_models_response_json(
+            CodexPatchMode::OfficialImagegenBridge,
+            &value,
+            Some("gpt-5.5"),
+        );
+
+        assert_eq!(
+            profile.model_catalog.shape,
+            CodexModelCatalogShape::CodexModels
+        );
+        assert_eq!(
+            profile.hosted_image_generation.support,
+            CodexCapabilitySupport::Supported
+        );
+        assert_eq!(
+            profile.remote_compaction_v1.support,
+            CodexCapabilitySupport::Supported
+        );
+    }
 }

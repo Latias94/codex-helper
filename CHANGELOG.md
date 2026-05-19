@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 ### 中文
 
 - 新增 Codex `official-imagegen-bridge` 客户端 patch 模式：组合 `official-relay-bridge` 的 OpenAI provider 身份与 `imagegen-bridge` 的 `{}` auth facade，用于同时尝试官方 remote compaction v1 和 hosted `image_generation`。
+- 新增 Codex relay 能力诊断 admin API：`POST /__codex_helper/api/v1/codex/relay-capabilities` 会显式探测选中上游的 `/models`、`/responses` 和 `/responses/compact`，输出 expected/observed/mismatches/recommendation，帮助判断 `default`、`imagegen-bridge`、`official-relay-bridge` 和 `official-imagegen-bridge` 哪个更匹配当前中转。
+- Codex `/models` 兼容层现在会把 OpenAI-style `data: [...]` 模型列表翻译成 Codex `models: [...]` catalog，并在能力诊断里保留 `translation_required` 观测，避免 sub2api 或其它中转因为模型列表形态不同导致 Codex 看不到 image/search/apply_patch 等模型 metadata。
+- Codex relay 能力推荐保持保守：未知或不支持 `/responses/compact` 时不会推荐 official relay 模式；hosted `image_generation` 不会被主动探测，因为它可能消耗额度或生成实际图片；WebSocket relay 和 remote compaction v2 仍不作为已启用能力。
 - 新增 Codex `chatgpt-bridge` 客户端 patch 模式：可保留 Codex/ChatGPT 账号登录态用于桌面端和移动端能力，同时把模型请求交给 codex-helper 路由到第三方中转；bridge 模式会写入 `requires_openai_auth = true`、`supports_websockets = false`，并只把 `auth.json` 的 `auth_mode` 改为 `chatgpt`、`OPENAI_API_KEY` 改为 `null`。
 - `chatgpt-bridge` 启用前会校验 `~/.codex/auth.json` 是否已有完整 ChatGPT 登录态；未登录或缺少 token/email/account 信息时拒绝 patch，避免 Codex TUI 因半登录 auth 状态启动失败。
 - `imagegen-bridge` 的 auth facade 改为写入空对象 `{}`，不再显式写 `auth_mode = chatgpt`；恢复逻辑现在按 JSON 语义匹配，兼容旧版本已写入的 facade。
@@ -43,6 +46,9 @@ All notable changes to this project will be documented in this file.
 ### English Summary
 
 - Added Codex `official-imagegen-bridge` client patch mode, combining OpenAI provider identity for remote compaction v1 with the empty auth facade used to expose hosted image generation.
+- Added the Codex relay capability diagnostics admin API at `POST /__codex_helper/api/v1/codex/relay-capabilities`; it explicitly probes the selected upstream's `/models`, `/responses`, and `/responses/compact` endpoints and returns expected/observed/mismatches/recommendation to choose between `default`, `imagegen-bridge`, `official-relay-bridge`, and `official-imagegen-bridge`.
+- Codex `/models` compatibility now translates OpenAI-style `data: [...]` model lists into Codex `models: [...]` catalogs while diagnostics preserve the raw `translation_required` observation, helping sub2api and other relays expose Codex model metadata such as image/search/apply_patch support.
+- Codex relay recommendations are conservative: unknown or unsupported `/responses/compact` does not upgrade to official relay modes; hosted `image_generation` is not actively probed because it can spend quota or create image artifacts; WebSocket relay and remote compaction v2 remain unsupported/diagnostic-only.
 - Added Codex `chatgpt-bridge` client patch mode, keeping Codex/ChatGPT account auth for desktop/mobile features while routing model traffic through codex-helper to third-party relays.
 - `chatgpt-bridge` now validates that `~/.codex/auth.json` already contains a complete ChatGPT login state and refuses to patch incomplete auth files, avoiding Codex TUI bootstrap failures from half-written auth.
 - `imagegen-bridge` now writes an empty `{}` auth facade instead of an explicit `auth_mode = chatgpt`; auth restoration matches helper-written facades by JSON semantics so older patched states remain recoverable.
