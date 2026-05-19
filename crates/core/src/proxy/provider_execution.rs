@@ -15,7 +15,9 @@ use crate::routing_ir::{
     RoutePlanSkipReason, SelectedRouteCandidate, SkippedRouteCandidate,
     SkippedStationRouteCandidate, compile_legacy_route_plan_template,
 };
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::state::SessionBinding;
+use crate::usage_providers;
 
 use super::ProxyService;
 use super::attempt_execution::{
@@ -35,6 +37,7 @@ use super::retry::{RetryPlan, backoff_sleep};
 use super::route_affinity::apply_session_route_affinity_to_runtime;
 use super::route_attempts::{UnsupportedModelSkipParams, record_unsupported_model_skip};
 use super::route_executor_runtime::route_plan_runtime_state_from_lbs_with_overrides;
+use super::route_unavailability::route_unavailable_report;
 
 pub(super) struct ExecuteProviderChainParams<'a> {
     pub(super) proxy: &'a ProxyService,
@@ -572,6 +575,22 @@ async fn execute_route_graph_candidates_with_route_executor(
         let avoided_candidate_indices = selection.avoided_candidate_indices.clone();
         let mut avoided_total = selection.avoided_total;
         let Some(selected) = selection.selected else {
+            if let Some(report) = route_unavailable_report(
+                proxy.service_name,
+                request_id,
+                executor,
+                runtime,
+                route_state,
+                request_model,
+            ) {
+                enqueue_usage_probes_for_provider_endpoints(
+                    proxy,
+                    report.provider_endpoints_to_probe.iter(),
+                )
+                .await;
+                route_attempts.extend(report.route_attempts.clone());
+                *last_err = Some(report.failure_status_message());
+            }
             break;
         };
         log_route_graph_selection_explain(
@@ -932,6 +951,28 @@ fn routing_affinity_policy_trace_label(policy: RoutingAffinityPolicyV5) -> &'sta
         RoutingAffinityPolicyV5::PreferredGroup => "preferred_group",
         RoutingAffinityPolicyV5::FallbackSticky => "fallback_sticky",
         RoutingAffinityPolicyV5::Hard => "hard",
+    }
+}
+
+async fn enqueue_usage_probes_for_provider_endpoints<'a>(
+    proxy: &ProxyService,
+    provider_endpoints: impl IntoIterator<Item = &'a ProviderEndpointKey>,
+) {
+    let provider_endpoints = provider_endpoints.into_iter().cloned().collect::<Vec<_>>();
+    if provider_endpoints.is_empty() {
+        return;
+    }
+
+    let cfg_snapshot = proxy.config.snapshot().await;
+    for provider_endpoint in provider_endpoints {
+        usage_providers::enqueue_poll_for_codex_provider_endpoint(
+            proxy.client.clone(),
+            cfg_snapshot.clone(),
+            proxy.lb_states.clone(),
+            proxy.state.clone(),
+            proxy.service_name,
+            provider_endpoint,
+        );
     }
 }
 

@@ -45,6 +45,13 @@ pub(super) fn route_plan_runtime_state_from_lbs_with_overrides(
             );
             let cooldown_until = state.cooldown_until.get(idx).and_then(|until| *until);
             let cooldown_active = cooldown_until.is_some_and(|until| now < until);
+            let cooldown_remaining_secs = cooldown_until.and_then(|until| {
+                if now < until {
+                    Some(until.duration_since(now).as_secs().max(1))
+                } else {
+                    None
+                }
+            });
             let failure_count = if cooldown_until.is_some_and(|until| now >= until) {
                 0
             } else {
@@ -70,6 +77,7 @@ pub(super) fn route_plan_runtime_state_from_lbs_with_overrides(
                     || state_override.is_some_and(|state| state != RuntimeConfigState::Normal),
                 failure_count,
                 cooldown_active,
+                cooldown_remaining_secs,
                 usage_exhausted: state.usage_exhausted.get(idx).copied().unwrap_or(false),
                 missing_auth: false,
                 concurrency_saturated: false,

@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, Method, Response, StatusCode};
 use crate::lb::{CooldownBackoff, LoadBalancer};
 use crate::logging::{RouteAttemptLog, ServiceTierLog, make_body_preview};
 use crate::usage::{UsageMetrics, extract_usage_from_bytes};
+use crate::usage_providers;
 
 use super::ProxyService;
 use super::attempt_health::{
@@ -68,6 +69,8 @@ pub(super) struct AttemptResponseParams<'a> {
     pub(super) avoided_total: &'a mut usize,
     pub(super) last_err: &'a mut Option<(StatusCode, String)>,
     pub(super) cooldown_backoff: CooldownBackoff,
+    pub(super) is_user_turn: bool,
+    pub(super) is_codex_service: bool,
 }
 
 pub(super) struct StreamingAttemptResponseParams<'a> {
@@ -261,6 +264,8 @@ pub(super) async fn handle_attempt_response(
         avoided_total,
         last_err,
         cooldown_backoff,
+        is_user_turn,
+        is_codex_service,
     } = params;
 
     let response_body = if status.is_success() {
@@ -286,6 +291,8 @@ pub(super) async fn handle_attempt_response(
         || should_retry_class(provider_opt, cls.as_deref());
     let provider_failover =
         !status.is_success() && !never_retry && !can_retry_same_upstream && provider_retryable;
+    let should_probe_codex_usage =
+        status_code == StatusCode::TOO_MANY_REQUESTS.as_u16() && is_user_turn && is_codex_service;
     let cooldown_reason = format!("status_{status_code}");
     record_status_route_attempt(
         upstream_chain,
@@ -362,6 +369,9 @@ pub(super) async fn handle_attempt_response(
     }
 
     let response_text = summarize_upstream_error_body(&response_body, &response_headers);
+    if should_probe_codex_usage {
+        enqueue_usage_probe_for_target(proxy, target).await;
+    }
     if never_retry {
         if !class_is_health_neutral(cls.as_deref()) {
             record_attempt_failure(
@@ -491,6 +501,33 @@ pub(super) async fn handle_attempt_response(
         )
         .await,
     )
+}
+
+async fn enqueue_usage_probe_for_target(proxy: &ProxyService, target: &AttemptTarget) {
+    let cfg_snapshot = proxy.config.snapshot().await;
+    if let Some(provider_endpoint) = target.provider_endpoint_ref().cloned() {
+        usage_providers::enqueue_poll_for_codex_provider_endpoint(
+            proxy.client.clone(),
+            cfg_snapshot,
+            proxy.lb_states.clone(),
+            proxy.state.clone(),
+            proxy.service_name,
+            provider_endpoint,
+        );
+    } else if let (Some(station_name), Some(upstream_index)) = (
+        target.compatibility_station_name().map(ToOwned::to_owned),
+        target.compatibility_upstream_index(),
+    ) {
+        usage_providers::enqueue_poll_for_codex_upstream(
+            proxy.client.clone(),
+            cfg_snapshot,
+            proxy.lb_states.clone(),
+            proxy.state.clone(),
+            proxy.service_name,
+            &station_name,
+            upstream_index,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

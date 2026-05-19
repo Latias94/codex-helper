@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_report_matches_usage_exhaustion_fallback_state() {
+    fn shadow_report_matches_usage_exhaustion_skip_state() {
         let lb = load_balancer(
             "routing",
             vec![
@@ -526,12 +526,12 @@ mod tests {
                 .iter()
                 .map(|attempt| attempt.upstream_index)
                 .collect::<Vec<_>>(),
-            vec![1, 0]
+            vec![1]
         );
     }
 
     #[test]
-    fn shadow_report_matches_all_usage_exhausted_second_round_fallback() {
+    fn shadow_report_matches_all_usage_exhausted_as_unroutable() {
         let lb = load_balancer(
             "routing",
             vec![
@@ -549,14 +549,8 @@ mod tests {
 
         let report = route_executor_shadow_report("codex", std::slice::from_ref(&lb), None);
 
+        assert!(report.legacy_attempts.is_empty());
+        assert!(report.executor_attempts.is_empty());
         assert!(report.matches);
-        assert_eq!(
-            report
-                .executor_attempts
-                .iter()
-                .map(|attempt| attempt.upstream_index)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
     }
 }

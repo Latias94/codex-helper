@@ -927,7 +927,7 @@ codex-helper routing explain --model <MODEL> --json
 - 可信 balance data 把 endpoint 标记为 `usage_exhausted`；
 - 配置使用 `affinity_policy = "fallback-sticky"` 或 `hard`。
 
-可信余额耗尽是 provider-endpoint 运行时信号。它可以在当前请求/刷新窗口内降级 monthly endpoint，但不是永久 session preference。如果某个 provider 对可用订阅返回误导性的零余额，请为该 usage provider 设置 `trust_exhaustion_for_routing = false`，或修复 balance extractor。
+可信余额耗尽是 provider-endpoint 运行时信号。它可以在当前请求/刷新窗口内降级 monthly endpoint，但不是永久 session preference。如果所有 candidate 当前都被可信耗尽或 cooldown 阻断，Codex streaming turn 会收到带有限延迟的可重试 `response.failed` SSE，而不是反复打已耗尽 upstream；helper 也会排队一个受节流的 balance refresh，让恢复后的中转重新进入路由。如果某个 provider 对可用订阅返回误导性的零余额，请为该 usage provider 设置 `trust_exhaustion_for_routing = false`，或修复 balance extractor。
 
 当选中低优先级组时，使用 control trace：
 

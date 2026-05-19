@@ -929,7 +929,7 @@ For a monthly-first setup, the generated default is `affinity_policy = "fallback
 - trusted balance data marks the endpoint `usage_exhausted`;
 - the config uses `affinity_policy = "fallback-sticky"` or `hard`.
 
-Trusted balance exhaustion is a provider-endpoint runtime signal. It can demote a monthly endpoint for the current request/refresh window, but it is not a permanent session preference. If a provider reports misleading zero balances for an active subscription, set `trust_exhaustion_for_routing = false` for that usage provider or fix the balance extractor.
+Trusted balance exhaustion is a provider-endpoint runtime signal. It can demote a monthly endpoint for the current request/refresh window, but it is not a permanent session preference. If every candidate is currently blocked by trusted exhaustion or cooldown, Codex streaming turns receive a retryable `response.failed` SSE with a bounded delay instead of repeatedly hitting depleted upstreams; the helper also queues a throttled balance refresh so recovered relays can re-enter routing. If a provider reports misleading zero balances for an active subscription, set `trust_exhaustion_for_routing = false` for that usage provider or fix the balance extractor.
 
 Use the control trace when a lower-priority group is selected:
 

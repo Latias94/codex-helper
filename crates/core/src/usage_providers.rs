@@ -237,7 +237,7 @@ static REQUEST_BALANCE_QUEUE: OnceLock<Mutex<HashMap<RequestBalanceQueueKey, Ins
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 // Minimal poll interval per provider to avoid hammering usage APIs.
 const MIN_POLL_INTERVAL_SECS: u64 = 20;
-const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(8);
+pub const REQUEST_BALANCE_REFRESH_DELAY: Duration = Duration::from_secs(8);
 const BALANCE_REFRESH_CONCURRENCY: usize = 6;
 const BALANCE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const AUTO_PROVIDER_ID_PREFIX: &str = "auto:balance:";
@@ -731,6 +731,25 @@ fn take_request_balance_refresh_if_due(key: &RequestBalanceQueueKey) -> RequestB
         }
         Some(due_at) => RequestBalanceQueueDue::NotDue(due_at.saturating_duration_since(now)),
         None => RequestBalanceQueueDue::Missing,
+    }
+}
+
+#[cfg(test)]
+pub fn request_balance_refresh_queued_for_provider_endpoint(
+    provider_endpoint: &ProviderEndpointKey,
+) -> bool {
+    let Some(queue) = REQUEST_BALANCE_QUEUE.get() else {
+        return false;
+    };
+    match queue.lock() {
+        Ok(guard) => guard.contains_key(&RequestBalanceQueueKey::ProviderEndpoint(
+            provider_endpoint.clone(),
+        )),
+        Err(error) => error
+            .into_inner()
+            .contains_key(&RequestBalanceQueueKey::ProviderEndpoint(
+                provider_endpoint.clone(),
+            )),
     }
 }
 

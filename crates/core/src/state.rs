@@ -1211,12 +1211,20 @@ impl ProxyState {
                         health.cooldown_until = None;
                     }
                     let cooldown_active = health.cooldown_until.is_some_and(|until| now < until);
+                    let cooldown_remaining_secs = health.cooldown_until.and_then(|until| {
+                        if now < until {
+                            Some(until.duration_since(now).as_secs().max(1))
+                        } else {
+                            None
+                        }
+                    });
                     runtime.set_provider_endpoint(
                         endpoint_key.clone(),
                         RoutePlanUpstreamRuntimeState {
                             runtime_disabled: false,
                             failure_count: health.failure_count,
                             cooldown_active,
+                            cooldown_remaining_secs,
                             usage_exhausted: health.usage_exhausted,
                             missing_auth: false,
                             concurrency_saturated: false,

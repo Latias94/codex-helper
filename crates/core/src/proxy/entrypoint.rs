@@ -12,6 +12,7 @@ use super::provider_execution::{
 use super::request_context::prepare_proxy_request;
 use super::request_failures::finish_failed_proxy_request;
 use super::retry::retry_info_for_failed_attempts;
+use super::route_unavailability::route_unavailable_response_for_request;
 
 #[instrument(skip_all, fields(service = %proxy.service_name))]
 pub async fn handle_proxy(
@@ -78,23 +79,31 @@ pub async fn handle_proxy(
         )
     });
 
-    Err(
-        finish_failed_proxy_request(super::request_failures::FailedProxyRequestParams {
-            proxy: &proxy,
-            method: &prepared.method,
-            path: prepared.uri.path(),
-            request_id: prepared.request_id,
-            status,
-            message: msg,
-            duration_ms: dur,
-            started_at_ms,
-            session_id: prepared.session_id.clone(),
-            cwd: prepared.cwd.clone(),
-            effective_effort: prepared.effective_effort.clone(),
-            service_tier: prepared.base_service_tier.clone(),
-            retry,
-            failure_route_attempts: route_attempts,
-        })
-        .await,
-    )
+    let failure = finish_failed_proxy_request(super::request_failures::FailedProxyRequestParams {
+        proxy: &proxy,
+        method: &prepared.method,
+        path: prepared.uri.path(),
+        request_id: prepared.request_id,
+        status,
+        message: msg,
+        duration_ms: dur,
+        started_at_ms,
+        session_id: prepared.session_id.clone(),
+        cwd: prepared.cwd.clone(),
+        effective_effort: prepared.effective_effort.clone(),
+        service_tier: prepared.base_service_tier.clone(),
+        retry,
+        failure_route_attempts: route_attempts.clone(),
+    })
+    .await;
+
+    if let Some(response) = route_unavailable_response_for_request(
+        &prepared.request_flavor,
+        failure.1.as_str(),
+        &route_attempts,
+    ) {
+        return Ok(response);
+    }
+
+    Err(failure)
 }

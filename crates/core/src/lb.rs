@@ -292,7 +292,7 @@ impl LoadBalancer {
             });
         }
 
-        // 第二轮：忽略 usage_exhausted，只看失败阈值，仍然按顺序选第一个。
+        // 第二轮：非 strict 模式允许熔断兜底，但不能打已确认 usage_exhausted 的上游。
         if let Some(idx) = self
             .service
             .upstreams
@@ -302,11 +302,13 @@ impl LoadBalancer {
                 if avoid.contains(&idx) {
                     return None;
                 }
-                if entry.failure_counts[idx] >= FAILURE_THRESHOLD {
-                    None
-                } else {
-                    Some(idx)
+                if entry.usage_exhausted.get(idx).copied().unwrap_or(false) {
+                    return None;
                 }
+                if strict && entry.failure_counts[idx] >= FAILURE_THRESHOLD {
+                    return None;
+                }
+                Some(idx)
             })
         {
             let upstream = self.service.upstreams[idx].clone();
@@ -317,21 +319,7 @@ impl LoadBalancer {
             });
         }
 
-        if strict {
-            return None;
-        }
-
-        // 兜底：所有 upstream 都已达到失败阈值时，仍然返回第一个，以保证永远有兜底。
-        // 如果 avoid 把所有都排除了，则兜底返回第一个“非 avoid”的 upstream；仍然没有则返回 0。
-        let idx = (0..self.service.upstreams.len())
-            .find(|i| !avoid.contains(i))
-            .unwrap_or(0);
-        let upstream = self.service.upstreams[idx].clone();
-        Some(SelectedUpstream {
-            station_name: self.service.name.clone(),
-            index: idx,
-            upstream,
-        })
+        None
     }
 
     pub fn penalize_with_backoff(
@@ -531,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn lb_falls_back_when_all_exhausted() {
+    fn lb_does_not_select_when_all_usage_exhausted() {
         let service = make_service(
             "codex-main",
             &["https://primary.example", "https://backup.example"],
@@ -539,7 +527,6 @@ mod tests {
         let states = Arc::new(Mutex::new(HashMap::new()));
         let lb = LoadBalancer::new(Arc::new(service), states.clone());
 
-        // 初始化状态
         let _ = lb.select_upstream();
 
         {
@@ -552,15 +539,14 @@ mod tests {
             entry.usage_exhausted[1] = true;
         }
 
-        // 所有 upstream 都 exhausted 时，仍然应返回 index 0 做兜底。
-        let selected = lb
-            .select_upstream()
-            .expect("should still select an upstream");
-        assert_eq!(selected.index, 0);
+        assert!(
+            lb.select_upstream().is_none(),
+            "trusted usage exhaustion must not keep hammering a depleted upstream"
+        );
     }
 
     #[test]
-    fn lb_strict_mode_still_falls_back_when_all_usage_exhausted() {
+    fn lb_strict_mode_does_not_select_when_all_usage_exhausted() {
         let service = make_service(
             "codex-main",
             &["https://primary.example", "https://backup.example"],
@@ -578,10 +564,11 @@ mod tests {
             entry.usage_exhausted[1] = true;
         }
 
-        let selected = lb
-            .select_upstream_avoiding_strict(&HashSet::new())
-            .expect("strict mode should still ignore usage exhaustion on fallback");
-        assert_eq!(selected.index, 0);
+        assert!(
+            lb.select_upstream_avoiding_strict(&HashSet::new())
+                .is_none(),
+            "strict mode must not ignore trusted usage exhaustion"
+        );
     }
 
     #[test]

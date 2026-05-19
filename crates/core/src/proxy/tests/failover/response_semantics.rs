@@ -278,6 +278,433 @@ fn assert_codex_models_response(
 }
 
 #[tokio::test]
+async fn proxy_codex_stream_route_unavailable_returns_retryable_response_failed_sse() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+
+    let primary_counter = primary_hits.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            async move {
+                primary_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "primary" })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let retry = RetryConfig {
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "probe-primary".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{primary_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "probe-backup".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{backup_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "probe-primary".to_string(),
+                "probe-backup".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    state
+        .penalize_provider_endpoint_attempt(
+            "codex",
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "probe-primary", "default"),
+            30,
+            crate::lb::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    state
+        .penalize_provider_endpoint_attempt(
+            "codex",
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "probe-backup", "default"),
+            30,
+            crate::lb::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("text/event-stream")),
+        Some(true)
+    );
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("event: response.failed"), "{body}");
+    assert!(body.contains(r#""code":"rate_limit_exceeded""#), "{body}");
+    assert!(body.contains("try again in"), "{body}");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+
+    let mut finished = Vec::new();
+    for _ in 0..100 {
+        finished = state.list_recent_finished(10).await;
+        if finished.iter().any(|request| request.status_code == 502) {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    let failed = finished
+        .iter()
+        .find(|request| request.status_code == 502)
+        .expect("failed request should be finalized");
+    let retry = failed.retry.as_ref().expect("retry trace");
+    assert_eq!(
+        retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.decision.as_str())
+            .collect::<Vec<_>>(),
+        vec!["route_unavailable", "route_unavailable"]
+    );
+    assert!(retry.route_attempts.iter().all(|attempt| {
+        attempt
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cooldown"))
+    }));
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_codex_stream_usage_exhausted_route_returns_retryable_response_failed_sse() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+
+    let primary_counter = primary_hits.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            async move {
+                primary_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "primary" })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let v4 = ProxyConfigV4 {
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "limited-primary".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{primary_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "limited-backup".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{backup_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "limited-primary".to_string(),
+                "limited-backup".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let state = proxy.state.clone();
+    state
+        .set_provider_endpoint_usage_exhausted(
+            "codex",
+            crate::runtime_identity::ProviderEndpointKey::new(
+                "codex",
+                "limited-primary",
+                "default",
+            ),
+            true,
+        )
+        .await;
+    state
+        .set_provider_endpoint_usage_exhausted(
+            "codex",
+            crate::runtime_identity::ProviderEndpointKey::new("codex", "limited-backup", "default"),
+            true,
+        )
+        .await;
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("event: response.failed"), "{body}");
+    assert!(body.contains(r#""code":"rate_limit_exceeded""#), "{body}");
+    assert!(body.contains("try again in 8 seconds"), "{body}");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+
+    let mut finished = Vec::new();
+    for _ in 0..100 {
+        finished = state.list_recent_finished(10).await;
+        if finished.iter().any(|request| request.status_code == 502) {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    let failed = finished
+        .iter()
+        .find(|request| request.status_code == 502)
+        .expect("failed request should be finalized");
+    let retry = failed.retry.as_ref().expect("retry trace");
+    assert_eq!(
+        retry
+            .route_attempts
+            .iter()
+            .map(|attempt| attempt.reason.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("usage_exhausted"), Some("usage_exhausted")]
+    );
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_codex_retryable_429_enqueues_usage_probe_for_provider_endpoint() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+
+    let primary_counter = primary_hits.clone();
+    let primary = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let primary_counter = primary_counter.clone();
+            async move {
+                primary_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "rate_limit_exceeded",
+                            "message": "relay quota exhausted"
+                        }
+                    })),
+                )
+            }
+        }),
+    );
+    let (primary_addr, primary_handle) = spawn_axum_server(primary);
+
+    let backup_counter = backup_hits.clone();
+    let backup = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let backup_counter = backup_counter.clone();
+            async move {
+                backup_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "backup" })),
+                )
+            }
+        }),
+    );
+    let (backup_addr, backup_handle) = spawn_axum_server(backup);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "429",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "429",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        allow_cross_station_before_first_output: Some(true),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let v4 = ProxyConfigV4 {
+        retry,
+        codex: ServiceViewV4 {
+            providers: std::collections::BTreeMap::from([
+                (
+                    "primary".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{primary_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    ProviderConfigV4 {
+                        base_url: Some(format!("http://{backup_addr}/v1")),
+                        inline_auth: UpstreamAuth::default(),
+                        ..ProviderConfigV4::default()
+                    },
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "primary".to_string(),
+                "backup".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        },
+        ..ProxyConfigV4::default()
+    };
+    let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4");
+    let proxy = ProxyService::new_with_v4_source(
+        Client::new(),
+        Arc::new(runtime),
+        Some(Arc::new(v4)),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let resp = Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    assert!(
+        crate::usage_providers::request_balance_refresh_queued_for_provider_endpoint(
+            &crate::runtime_identity::ProviderEndpointKey::new("codex", "primary", "default")
+        ),
+        "retryable 429 should enqueue a balance refresh for the failed provider endpoint"
+    );
+
+    proxy_handle.abort();
+    primary_handle.abort();
+    backup_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_streaming_parses_usage_even_when_usage_is_late_in_stream() {
     // Large prefix with no `data:` lines: should push the stream well past 1MB without triggering JSON parse.
     // The final `data:` line includes `response.usage`, which codex-helper should still detect.

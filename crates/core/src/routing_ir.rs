@@ -425,6 +425,7 @@ pub struct RoutePlanUpstreamRuntimeState {
     pub runtime_disabled: bool,
     pub failure_count: u32,
     pub cooldown_active: bool,
+    pub cooldown_remaining_secs: Option<u64>,
     pub usage_exhausted: bool,
     pub missing_auth: bool,
     pub concurrency_saturated: bool,
@@ -756,13 +757,7 @@ impl<'a> RoutePlanExecutor<'a> {
             .filter(|candidate| !state.avoids_candidate(self.template, candidate))
             .collect::<Vec<_>>();
 
-        if let Some(candidate) =
-            best_candidate_by_affinity_policy(self.template, runtime, &route_candidates, true)
-        {
-            return Some(candidate);
-        }
-
-        best_candidate_by_affinity_policy(self.template, runtime, &route_candidates, false)
+        best_candidate_by_affinity_policy(self.template, runtime, &route_candidates)
     }
 
     fn candidates_exhausted(&self, state: &RoutePlanAttemptState) -> bool {
@@ -839,13 +834,7 @@ impl<'a> RoutePlanExecutor<'a> {
             })
             .collect::<Vec<_>>();
 
-        if let Some(candidate) =
-            best_candidate_by_affinity_policy(self.template, runtime, &station_candidates, true)
-        {
-            return Some(candidate);
-        }
-
-        best_candidate_by_affinity_policy(self.template, runtime, &station_candidates, false)
+        best_candidate_by_affinity_policy(self.template, runtime, &station_candidates)
     }
 }
 
@@ -853,60 +842,37 @@ fn best_candidate_by_affinity_policy<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
     station_candidates: &[&'a RouteCandidate],
-    require_usage_available: bool,
 ) -> Option<&'a RouteCandidate> {
     match template.affinity_policy {
-        RoutingAffinityPolicyV5::Off => first_candidate_in_best_preference_group(
-            template,
-            runtime,
-            station_candidates,
-            require_usage_available,
-        ),
-        RoutingAffinityPolicyV5::PreferredGroup => best_candidate_in_preference_group(
-            template,
-            runtime,
-            station_candidates,
-            require_usage_available,
-        ),
-        RoutingAffinityPolicyV5::FallbackSticky => affinity_candidate(
-            template,
-            runtime,
-            station_candidates,
-            require_usage_available,
-        )
-        .filter(|candidate| {
-            fallback_affinity_within_configured_window(template, runtime, station_candidates)
-                || first_candidate_in_best_preference_group(
-                    template,
-                    runtime,
-                    station_candidates,
-                    require_usage_available,
-                )
-                .is_none_or(|best| best.preference_group >= candidate.preference_group)
-        })
-        .or_else(|| {
-            first_candidate_in_best_preference_group(
-                template,
-                runtime,
-                station_candidates,
-                require_usage_available,
-            )
-        }),
+        RoutingAffinityPolicyV5::Off => {
+            first_candidate_in_best_preference_group(template, runtime, station_candidates)
+        }
+        RoutingAffinityPolicyV5::PreferredGroup => {
+            best_candidate_in_preference_group(template, runtime, station_candidates)
+        }
+        RoutingAffinityPolicyV5::FallbackSticky => {
+            affinity_candidate(template, runtime, station_candidates)
+                .filter(|candidate| {
+                    fallback_affinity_within_configured_window(
+                        template,
+                        runtime,
+                        station_candidates,
+                    ) || first_candidate_in_best_preference_group(
+                        template,
+                        runtime,
+                        station_candidates,
+                    )
+                    .is_none_or(|best| best.preference_group >= candidate.preference_group)
+                })
+                .or_else(|| {
+                    first_candidate_in_best_preference_group(template, runtime, station_candidates)
+                })
+        }
         RoutingAffinityPolicyV5::Hard => {
             if runtime.affinity_provider_endpoint().is_some() {
-                affinity_candidate(
-                    template,
-                    runtime,
-                    station_candidates,
-                    require_usage_available,
-                )
+                affinity_candidate(template, runtime, station_candidates)
             } else {
-                first_candidate_in_best_preference_group(
-                    template,
-                    runtime,
-                    station_candidates,
-                    require_usage_available,
-                )
+                first_candidate_in_best_preference_group(template, runtime, station_candidates)
             }
         }
     }
@@ -916,20 +882,17 @@ fn first_candidate_in_best_preference_group<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
     station_candidates: &[&'a RouteCandidate],
-    require_usage_available: bool,
 ) -> Option<&'a RouteCandidate> {
     let best_group = station_candidates
         .iter()
         .copied()
-        .filter(|candidate| {
-            candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
-        })
+        .filter(|candidate| candidate_available_in_runtime(template, runtime, candidate))
         .map(|candidate| candidate.preference_group)
         .min()?;
 
     station_candidates.iter().copied().find(|candidate| {
         candidate.preference_group == best_group
-            && candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+            && candidate_available_in_runtime(template, runtime, candidate)
     })
 }
 
@@ -937,30 +900,23 @@ fn best_candidate_in_preference_group<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
     station_candidates: &[&'a RouteCandidate],
-    require_usage_available: bool,
 ) -> Option<&'a RouteCandidate> {
     let best_group = station_candidates
         .iter()
         .copied()
-        .filter(|candidate| {
-            candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
-        })
+        .filter(|candidate| candidate_available_in_runtime(template, runtime, candidate))
         .map(|candidate| candidate.preference_group)
         .min()?;
 
-    if let Some(candidate) = affinity_candidate_in_group(
-        template,
-        runtime,
-        station_candidates,
-        best_group,
-        require_usage_available,
-    ) {
+    if let Some(candidate) =
+        affinity_candidate_in_group(template, runtime, station_candidates, best_group)
+    {
         return Some(candidate);
     }
 
     station_candidates.iter().copied().find(|candidate| {
         candidate.preference_group == best_group
-            && candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+            && candidate_available_in_runtime(template, runtime, candidate)
     })
 }
 
@@ -968,12 +924,11 @@ fn affinity_candidate<'a>(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
     station_candidates: &[&'a RouteCandidate],
-    require_usage_available: bool,
 ) -> Option<&'a RouteCandidate> {
     let affinity_key = runtime.affinity_provider_endpoint()?;
     station_candidates.iter().copied().find(|candidate| {
         candidate_provider_endpoint_key(template, candidate) == *affinity_key
-            && candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+            && candidate_available_in_runtime(template, runtime, candidate)
     })
 }
 
@@ -982,13 +937,12 @@ fn affinity_candidate_in_group<'a>(
     runtime: &RoutePlanRuntimeState,
     station_candidates: &[&'a RouteCandidate],
     preference_group: u32,
-    require_usage_available: bool,
 ) -> Option<&'a RouteCandidate> {
     let affinity_key = runtime.affinity_provider_endpoint()?;
     station_candidates.iter().copied().find(|candidate| {
         candidate.preference_group == preference_group
             && candidate_provider_endpoint_key(template, candidate) == *affinity_key
-            && candidate_available_in_runtime(template, runtime, candidate, require_usage_available)
+            && candidate_available_in_runtime(template, runtime, candidate)
     })
 }
 
@@ -1010,7 +964,7 @@ fn fallback_affinity_within_configured_window(
     let Some(best_group) = station_candidates
         .iter()
         .copied()
-        .filter(|candidate| candidate_available_in_runtime(template, runtime, candidate, false))
+        .filter(|candidate| candidate_routable_except_usage(template, runtime, candidate))
         .map(|candidate| candidate.preference_group)
         .min()
     else {
@@ -1049,12 +1003,18 @@ fn candidate_available_in_runtime(
     template: &RoutePlanTemplate,
     runtime: &RoutePlanRuntimeState,
     candidate: &RouteCandidate,
-    require_usage_available: bool,
 ) -> bool {
     let upstream = runtime.runtime_state_for_candidate(template, candidate);
-    !upstream.hard_unavailable()
-        && !upstream.concurrency_saturated
-        && (!require_usage_available || !upstream.usage_exhausted)
+    candidate_routable_except_usage(template, runtime, candidate) && !upstream.usage_exhausted
+}
+
+fn candidate_routable_except_usage(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    candidate: &RouteCandidate,
+) -> bool {
+    let upstream = runtime.runtime_state_for_candidate(template, candidate);
+    !upstream.hard_unavailable() && !upstream.concurrency_saturated
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4056,6 +4016,72 @@ mod tests {
             selected.provider_endpoint,
             endpoint_key("codex", "chili", "default")
         );
+    }
+
+    #[test]
+    fn route_plan_executor_stops_when_all_candidates_usage_exhausted() {
+        let view = ServiceViewV4 {
+            providers: BTreeMap::from([
+                (
+                    "monthly".to_string(),
+                    tagged_provider("https://monthly.example/v1", "billing", "monthly"),
+                ),
+                (
+                    "chili".to_string(),
+                    tagged_provider("https://chili.example/v1", "billing", "paygo"),
+                ),
+            ]),
+            routing: Some(RoutingConfigV4::ordered_failover(vec![
+                "monthly".to_string(),
+                "chili".to_string(),
+            ])),
+            ..ServiceViewV4::default()
+        };
+        let template = compile_v4_route_plan_template("codex", &view).expect("route template");
+        let executor = RoutePlanExecutor::new(&template);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "monthly", "default"),
+            RoutePlanUpstreamRuntimeState {
+                usage_exhausted: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        runtime.set_provider_endpoint(
+            endpoint_key("codex", "chili", "default"),
+            RoutePlanUpstreamRuntimeState {
+                usage_exhausted: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+        let mut state = RoutePlanAttemptState::default();
+
+        let selection =
+            executor.select_supported_candidate_with_runtime_state(&mut state, &runtime, None);
+
+        assert!(
+            selection.selected.is_none(),
+            "trusted usage exhaustion should make the route temporarily unroutable"
+        );
+        let reasons = executor
+            .explain_candidate_skip_reasons_with_runtime_state(&runtime, None)
+            .iter()
+            .map(|explanation| {
+                (
+                    explanation.candidate.provider_id.as_str(),
+                    explanation
+                        .reasons
+                        .iter()
+                        .map(RoutePlanSkipReason::code)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            reasons.get("monthly").cloned(),
+            Some(vec!["usage_exhausted"])
+        );
+        assert_eq!(reasons.get("chili").cloned(), Some(vec!["usage_exhausted"]));
     }
 
     #[test]
