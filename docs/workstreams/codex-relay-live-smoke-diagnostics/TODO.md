@@ -23,12 +23,12 @@ Last updated: 2026-05-19
 
 ## M2 — Admin API Surface
 
-- [ ] RLS-030 [owner=codex] [deps=RLS-020] [scope=crates/core/src/proxy/control_plane*,crates/core/src/dashboard_core]
+- [x] RLS-030 [owner=codex] [deps=RLS-020] [scope=crates/core/src/proxy/control_plane*,crates/core/src/dashboard_core]
   Goal: Expose live smoke through an admin API and manifest/operator-summary links.
   Validation: `cargo nextest run -p codex-helper-core codex_live_smoke_api`
   Review: Confirm endpoint is admin protected and opt-in rejection happens before upstream IO.
   Evidence: Admin API tests.
-  Handoff: API route should be documented as cost-bearing and manual-only.
+  Handoff: DONE 2026-05-19; API route should be documented as cost-bearing and manual-only.
 
 ## M3 — TUI Operator Flow
 

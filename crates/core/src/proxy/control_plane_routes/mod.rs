@@ -6,15 +6,16 @@ use super::ProxyService;
 use super::admin::{AdminAccessConfig, require_admin_access};
 use super::control_plane::{
     api_capabilities, api_operator_summary, api_v1_snapshot, apply_session_profile,
-    codex_relay_capabilities, get_global_station_override, get_session_identity_card,
-    list_active_requests, list_recent_finished, list_session_identity_cards, list_session_stats,
-    set_default_profile, set_global_station_override,
+    codex_relay_capabilities, codex_relay_live_smoke, get_global_station_override,
+    get_session_identity_card, list_active_requests, list_recent_finished,
+    list_session_identity_cards, list_session_stats, set_default_profile,
+    set_global_station_override,
 };
 use super::control_plane_manifest::{
-    API_V1_CAPABILITIES, API_V1_CODEX_RELAY_CAPABILITIES, API_V1_CONTROL_TRACE,
-    API_V1_GLOBAL_ROUTE_OVERRIDE, API_V1_GLOBAL_STATION_OVERRIDE, API_V1_HEALTHCHECK_CANCEL,
-    API_V1_HEALTHCHECK_START, API_V1_OPERATOR_SUMMARY, API_V1_PRICING_CATALOG,
-    API_V1_PROFILE_BY_NAME, API_V1_PROFILES, API_V1_PROFILES_DEFAULT,
+    API_V1_CAPABILITIES, API_V1_CODEX_RELAY_CAPABILITIES, API_V1_CODEX_RELAY_LIVE_SMOKE,
+    API_V1_CONTROL_TRACE, API_V1_GLOBAL_ROUTE_OVERRIDE, API_V1_GLOBAL_STATION_OVERRIDE,
+    API_V1_HEALTHCHECK_CANCEL, API_V1_HEALTHCHECK_START, API_V1_OPERATOR_SUMMARY,
+    API_V1_PRICING_CATALOG, API_V1_PROFILE_BY_NAME, API_V1_PROFILES, API_V1_PROFILES_DEFAULT,
     API_V1_PROFILES_DEFAULT_PERSISTED, API_V1_PROVIDER_SPEC_BY_NAME, API_V1_PROVIDER_SPECS,
     API_V1_PROVIDERS, API_V1_PROVIDERS_BALANCES_REFRESH, API_V1_PROVIDERS_RUNTIME,
     API_V1_REQUEST_LEDGER_RECENT, API_V1_REQUEST_LEDGER_SUMMARY, API_V1_RETRY_CONFIG,

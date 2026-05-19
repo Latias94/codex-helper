@@ -203,6 +203,8 @@ pub struct OperatorSummaryLinks {
     #[serde(default)]
     pub codex_relay_capabilities: String,
     #[serde(default)]
+    pub codex_relay_live_smoke: String,
+    #[serde(default)]
     pub healthcheck_start: String,
     #[serde(default)]
     pub healthcheck_cancel: String,

@@ -1278,3 +1278,208 @@ request_max_retries = 0
     proxy_handle.abort();
     upstream_handle.abort();
 }
+
+#[tokio::test]
+async fn codex_live_smoke_api_reports_manifest_and_summary_links() {
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let client = reqwest::Client::new();
+
+    let caps = client
+        .get(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/capabilities"
+        ))
+        .send()
+        .await
+        .expect("caps send")
+        .error_for_status()
+        .expect("caps status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("caps json");
+
+    assert!(caps["endpoints"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.as_str() == Some("/__codex_helper/api/v1/codex/relay-live-smoke"))
+    }));
+    assert_eq!(
+        caps["surface_capabilities"]["codex_relay_live_smoke"].as_bool(),
+        Some(true)
+    );
+
+    let summary = client
+        .get(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/operator/summary"
+        ))
+        .send()
+        .await
+        .expect("summary send")
+        .error_for_status()
+        .expect("summary status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("summary json");
+    assert_eq!(
+        summary["links"]["codex_relay_live_smoke"].as_str(),
+        Some("/__codex_helper/api/v1/codex/relay-live-smoke")
+    );
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn codex_live_smoke_api_rejects_missing_ack_before_upstream_io() {
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+    let compact_hits_for_route = compact_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses/compact",
+        post(move || {
+            let compact_hits = compact_hits_for_route.clone();
+            async move {
+                compact_hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "output": [] }))
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{upstream_addr}/v1"),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/codex/relay-live-smoke"
+        ))
+        .json(&serde_json::json!({ "model": "gpt-5.5" }))
+        .send()
+        .await
+        .expect("live smoke send");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(compact_hits.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn codex_live_smoke_api_runs_compact_live_smoke() {
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+    let seen_body = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+
+    let compact_hits_for_route = compact_hits.clone();
+    let seen_body_for_route = seen_body.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses/compact",
+        post(move |request: Request<Body>| {
+            let compact_hits = compact_hits_for_route.clone();
+            let seen_body = seen_body_for_route.clone();
+            async move {
+                compact_hits.fetch_add(1, Ordering::SeqCst);
+                let body = to_bytes(request.into_body(), 16 * 1024)
+                    .await
+                    .expect("body");
+                let body: serde_json::Value =
+                    serde_json::from_slice(body.as_ref()).expect("json body");
+                *seen_body.lock().expect("lock body") = Some(body);
+                Json(serde_json::json!({
+                    "output": [
+                        { "type": "compaction", "encrypted_content": "summary" }
+                    ]
+                }))
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let cfg = make_proxy_config(
+        vec![UpstreamConfig {
+            base_url: format!("http://{upstream_addr}/v1"),
+            auth: UpstreamAuth::default(),
+            tags: HashMap::new(),
+            supported_models: HashMap::new(),
+            model_mapping: HashMap::new(),
+        }],
+        RetryConfig::default(),
+    );
+    let proxy = ProxyService::new(
+        Client::new(),
+        Arc::new(cfg),
+        "codex",
+        Arc::new(std::sync::Mutex::new(HashMap::new())),
+    );
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+    let result = reqwest::Client::new()
+        .post(format!(
+            "http://{proxy_addr}/__codex_helper/api/v1/codex/relay-live-smoke"
+        ))
+        .json(&serde_json::json!({
+            "acknowledgement": crate::proxy::CODEX_RELAY_LIVE_SMOKE_ACK,
+            "model": "gpt-5.5"
+        }))
+        .send()
+        .await
+        .expect("live smoke send")
+        .error_for_status()
+        .expect("live smoke status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("live smoke json");
+
+    assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(result["api_version"].as_u64(), Some(1));
+    assert_eq!(result["service_name"].as_str(), Some("codex"));
+    assert_eq!(result["station_name"].as_str(), Some("test"));
+    assert_eq!(result["requested_model"].as_str(), Some("gpt-5.5"));
+    assert_eq!(result["upstream_model"].as_str(), Some("gpt-5.5"));
+    assert_eq!(result["cases"][0].as_str(), Some("responses_compact"));
+    assert_eq!(result["results"][0]["outcome"].as_str(), Some("passed"));
+    assert_eq!(
+        result["results"][0]["response_shape"].as_str(),
+        Some("compact_output_compaction_item")
+    );
+    assert_eq!(
+        seen_body
+            .lock()
+            .expect("lock body")
+            .as_ref()
+            .and_then(|body| body["model"].as_str()),
+        Some("gpt-5.5")
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}

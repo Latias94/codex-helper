@@ -28,6 +28,8 @@ pub(super) const API_V1_STATIONS_ACTIVE: &str = "/__codex_helper/api/v1/stations
 pub(super) const API_V1_STATIONS_PROBE: &str = "/__codex_helper/api/v1/stations/probe";
 pub(super) const API_V1_CODEX_RELAY_CAPABILITIES: &str =
     "/__codex_helper/api/v1/codex/relay-capabilities";
+pub(super) const API_V1_CODEX_RELAY_LIVE_SMOKE: &str =
+    "/__codex_helper/api/v1/codex/relay-live-smoke";
 pub(super) const API_V1_STATION_BY_NAME: &str = "/__codex_helper/api/v1/stations/{name}";
 pub(super) const API_V1_STATION_SPECS: &str = "/__codex_helper/api/v1/stations/specs";
 pub(super) const API_V1_STATION_SPEC_BY_NAME: &str = "/__codex_helper/api/v1/stations/specs/{name}";
@@ -90,6 +92,7 @@ const API_V1_ENDPOINT_PATHS: &[&str] = &[
     API_V1_STATIONS_ACTIVE,
     API_V1_STATIONS_PROBE,
     API_V1_CODEX_RELAY_CAPABILITIES,
+    API_V1_CODEX_RELAY_LIVE_SMOKE,
     API_V1_STATION_BY_NAME,
     API_V1_STATION_SPECS,
     API_V1_STATION_SPEC_BY_NAME,
@@ -148,6 +151,7 @@ pub(super) fn api_v1_surface_capabilities() -> ControlPlaneSurfaceCapabilities {
         station_specs: true,
         station_probe: true,
         codex_relay_capabilities: true,
+        codex_relay_live_smoke: true,
         providers: true,
         provider_runtime: true,
         provider_balance_refresh: true,
@@ -199,6 +203,7 @@ pub(super) fn api_v1_operator_summary_links() -> OperatorSummaryLinks {
         station_spec_by_name_template: API_V1_STATION_SPEC_BY_NAME.to_string(),
         station_probe: API_V1_STATIONS_PROBE.to_string(),
         codex_relay_capabilities: API_V1_CODEX_RELAY_CAPABILITIES.to_string(),
+        codex_relay_live_smoke: API_V1_CODEX_RELAY_LIVE_SMOKE.to_string(),
         healthcheck_start: API_V1_HEALTHCHECK_START.to_string(),
         healthcheck_cancel: API_V1_HEALTHCHECK_CANCEL.to_string(),
         providers: API_V1_PROVIDERS.to_string(),

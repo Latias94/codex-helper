@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn capability_and_session_routes(proxy: ProxyService) -> Router {
     let capabilities_proxy = proxy.clone();
     let codex_capabilities_proxy = proxy.clone();
+    let codex_live_smoke_proxy = proxy.clone();
     let snapshot_proxy = proxy.clone();
     let summary_proxy = proxy.clone();
     let sessions_proxy = proxy.clone();
@@ -17,6 +18,10 @@ pub(super) fn capability_and_session_routes(proxy: ProxyService) -> Router {
             post(move |payload| {
                 codex_relay_capabilities(codex_capabilities_proxy.clone(), payload)
             }),
+        )
+        .route(
+            API_V1_CODEX_RELAY_LIVE_SMOKE,
+            post(move |payload| codex_relay_live_smoke(codex_live_smoke_proxy.clone(), payload)),
         )
         .route(
             API_V1_SNAPSHOT,

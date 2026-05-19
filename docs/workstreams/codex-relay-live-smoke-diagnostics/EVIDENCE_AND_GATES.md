@@ -83,6 +83,43 @@ Files:
 - `crates/core/src/proxy/codex_relay_target.rs`
 - `crates/core/src/proxy/service_core.rs`
 
+### 2026-05-19 — RLS-030 Admin API Surface
+
+Command:
+
+```bash
+cargo nextest run -p codex-helper-core codex_live_smoke_api
+```
+
+Result: PASS; 3 tests passed, 535 skipped.
+
+Proves:
+
+- `POST /__codex_helper/api/v1/codex/relay-live-smoke` is listed in API v1 endpoints,
+- `surface_capabilities.codex_relay_live_smoke` is advertised,
+- operator summary links include `codex_relay_live_smoke`,
+- missing acknowledgement returns `400` before upstream IO,
+- an acknowledged compact live smoke request reaches one selected upstream and returns a summarized result.
+
+Files:
+
+- `crates/core/src/proxy/control_plane/codex_live_smoke.rs`
+- `crates/core/src/proxy/control_plane_manifest.rs`
+- `crates/core/src/proxy/control_plane_routes/capability_session.rs`
+- `crates/core/src/dashboard_core/types.rs`
+- `crates/core/src/dashboard_core/operator_summary.rs`
+
+### 2026-05-19 — RLS-030 Regression Gates
+
+Commands:
+
+```bash
+cargo nextest run -p codex-helper-core codex_relay_live_smoke
+cargo fmt --check
+```
+
+Result: PASS; core live-smoke tests passed again (7 passed, 531 skipped) and formatting check passed.
+
 ## Notes
 
 Live relay smoke against a real paid upstream is optional evidence unless the user explicitly requests it. Automated tests must use local fake upstreams.
