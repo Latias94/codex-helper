@@ -1,8 +1,10 @@
 # codex-helper
 
-A local relay proxy and operator console for Codex CLI.
+A local relay proxy and operator console for Codex CLI, focused on two jobs: managing multiple relays and keeping Codex as close as possible to the native ChatGPT-backed experience while those relays are in use.
 
-codex-helper puts a local proxy between Codex and your upstream providers. It lets you manage multiple relays, keys, balances, request logs, cost estimates, and fallback policies without interrupting the normal Codex workflow.
+Some Codex features do not appear just because `/responses` can be forwarded. ChatGPT auth shape, OpenAI provider identity, `/models` metadata, `/responses/compact`, and hosted `image_generation` all affect what Codex decides to expose. Some sub2api-style and other relays also return shapes that work for normal chat but are not quite what Codex expects.
+
+codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, bridge patching, capability diagnostics, balance visibility, and fallback policy.
 
 Current release: `v0.15.0`
 
@@ -16,6 +18,8 @@ Use codex-helper if:
 
 - you use multiple Codex/OpenAI-compatible relays and do not want to keep editing `~/.codex/config.toml`;
 - you want monthly relays first, then pay-as-you-go or official providers as fallback;
+- you want Codex to keep ChatGPT login/account behavior for the app or mobile flow, while model traffic uses your own relay or monthly quota;
+- your sub2api-style or other relay works for ordinary chat but is shaky around `/models`, `/responses/compact`, hosted `image_generation`, or provider-specific model names;
 - you want TUI/GUI visibility into provider choice, balance/plan, tokens, cache tokens, latency, retries, and estimated cost;
 - you run a local proxy for long periods and need bounded runtime state plus rotated logs;
 - you want quick helpers for local Codex session discovery and resume.
@@ -26,6 +30,8 @@ It is probably unnecessary if you only use one official account and do not need 
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
 - **Safe Codex patching**: only touches the local proxy fields in `~/.codex/config.toml`; unrelated Codex edits are preserved.
+- **Native Codex bridge modes**: `chatgpt-bridge` keeps ChatGPT login shape, `imagegen-bridge` exposes hosted image generation, and `official-relay-bridge` / `official-imagegen-bridge` let relays that forward official Responses semantics try remote compaction v1.
+- **Relay capability diagnostics**: TUI, CLI, and admin API checks for `/models`, `/responses`, and `/responses/compact`, then recommends the patch mode that matches the selected relay.
 - **Provider / routing config**: `version = 5` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
 - **Session affinity and failover**: each Codex session tries to keep using the selected provider, then falls through to other route candidates when requests fail, upstreams are unavailable, or trusted balance snapshots are exhausted.
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
@@ -76,13 +82,26 @@ Manage the Codex proxy patch explicitly:
 
 ```bash
 codex-helper switch on
+codex-helper switch on --mode chatgpt-bridge
+codex-helper switch on --mode official-relay-bridge
+codex-helper switch on --mode official-imagegen-bridge
 codex-helper switch status
 codex-helper switch off
 ```
 
-For Codex app/mobile bridge setups, use `codex-helper switch on --mode chatgpt-bridge`. It keeps ChatGPT account auth for the client layer while routing model traffic through codex-helper. Sign in with ChatGPT in official Codex first; if `auth.json` lacks the full login tokens, email, and account metadata, codex-helper refuses the patch to avoid Codex TUI bootstrap failures such as `email and plan type are required for chatgpt authentication`.
+Patch mode choices:
 
-For official-subscription relays where you want both remote compaction and hosted image generation, use `codex-helper switch on --mode official-imagegen-bridge`. It declares the Codex-facing provider as `OpenAI`, disables WebSocket, and writes the empty `{}` imagegen auth facade; real upstream credentials still come from codex-helper provider configuration.
+| Mode | Use it when | Effect |
+| --- | --- | --- |
+| `default` | You only need the local proxy, multiple providers, and fallback | Codex sends model requests to the local helper; helper picks the upstream |
+| `chatgpt-bridge` | You are already signed in to ChatGPT in official Codex and want app/mobile account behavior, but model traffic should use a relay | Keeps the ChatGPT auth shape while upstream credentials still come from helper config |
+| `imagegen-bridge` | The relay does not support official provider identity, but you want Codex to expose hosted `image_generation` | Writes the empty `{}` auth facade and does not require official login |
+| `official-relay-bridge` | The relay forwards official OpenAI Responses semantics, especially `/responses/compact` | Makes Codex treat the local helper as an OpenAI provider so it can try remote compaction v1 |
+| `official-imagegen-bridge` | The relay is backed by an official subscription account and supports both `/responses/compact` and hosted image generation | Combines OpenAI provider identity with the imagegen auth facade |
+
+`chatgpt-bridge` requires a completed ChatGPT login in official Codex first. If `~/.codex/auth.json` lacks the full token, email, and account metadata, codex-helper refuses the patch instead of leaving Codex in a half-login state.
+
+`official-relay-bridge` and `official-imagegen-bridge` are experimental. They only change how Codex chooses client-side capabilities; the relay still has to support the underlying endpoints. Real request credentials come from `~/.codex-helper/config.toml`, and bridge mode does not forward Codex ChatGPT tokens to third-party relays that do not have helper-side credentials.
 
 Note: any change to `~/.codex/config.toml` is only picked up by newly started Codex sessions. After changing it, fully restart the Codex App, TUI, or `codex exec` session.
 
@@ -93,7 +112,7 @@ If you want Codex to stay logged into ChatGPT while the actual conversation/mode
 3. Configure `codex.providers.*` and `codex.routing` in `~/.codex-helper/config.toml` so codex-helper selects your relay.
 4. If the relay expects prefixed model names, add `model_mapping` on the provider.
 
-This mode is meant for users who want Codex App/mobile/subscription-gated account features to keep seeing ChatGPT auth, while day-to-day conversation, tool, and imagegen model usage consumes their own relay or monthly quota.
+This split is for setups where Codex App, mobile, and subscription-gated account checks should still see ChatGPT auth, while day-to-day conversation, tool, and imagegen model usage consumes your relay or monthly quota.
 
 The Codex-side local proxy entry is normally written by `switch on`; avoid hand-editing it over unrelated Codex settings:
 
@@ -254,6 +273,9 @@ codex-helper pricing sync-basellm --model gpt-5 --dry-run
 # diagnostics
 codex-helper status
 codex-helper doctor
+codex-helper codex relay-capabilities --mode official-imagegen-bridge --model gpt-5.5
+codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5
+codex-helper codex relay-evidence --limit 20
 codex-helper --version
 ```
 
@@ -291,6 +313,7 @@ The GUI can start or attach to a proxy, edit common single-endpoint providers, r
 - Pricing overrides: `~/.codex-helper/pricing_overrides.toml`
 - Request filter: `~/.codex-helper/filter.json`
 - Request log: `~/.codex-helper/logs/requests.jsonl`
+- Codex relay diagnostic evidence: `~/.codex-helper/logs/codex_relay_evidence.jsonl`
 - GUI config: `~/.codex-helper/gui.toml`
 
 Codex-owned files remain owned by Codex:

@@ -1,8 +1,10 @@
 # codex-helper
 
-Codex CLI 的本地中转代理与控制台。
+Codex CLI 的本地中转代理与控制台，重点解决两个问题：多中转站管理，以及在走中转时尽量保留 Codex 原生 ChatGPT 使用体验。
 
-它把 Codex 请求先送到本机代理，再按你配置的 provider / routing 转发到 OpenAI 官方或各类中转站。这样你可以在不中断 Codex 使用体验的情况下集中管理多个中转、多个 key、余额/套餐、请求日志、成本估算和 fallback 策略。
+很多 Codex 能力不是简单转发 `/responses` 就会稳定出现。ChatGPT 登录态、OpenAI provider 身份、`/models` metadata、`/responses/compact`、hosted `image_generation` 都会影响 Codex 是否显示和调用对应能力；一些 sub2api 或其它 relay 在这些细节上返回的形态也不完全符合 Codex 预期。
+
+codex-helper 把这些差异收在本地：Codex 连接本机代理，helper 再按 provider / routing 选择 OpenAI 官方或你的中转站，并补上模型列表翻译、bridge patch、能力诊断、余额观测和 fallback 策略。
 
 当前发布版本：`v0.15.0`
 
@@ -27,6 +29,8 @@ English: [README_EN.md](README_EN.md)
 
 - 你有多个 Codex/OpenAI 兼容中转站，不想反复手改 `~/.codex/config.toml`。
 - 你希望“包月中转优先，用完或失败后再兜底到备用线路”。
+- 你想让 Codex 保留 ChatGPT 登录态、桌面端/手机端账号能力判定，但模型请求实际走自有 relay 或包月额度。
+- 你的 sub2api 或其它中转普通对话能跑，但 `/models`、`/responses/compact`、hosted `image_generation`、模型名映射这类 Codex 细节不稳定。
 - 你想在 TUI/GUI 里看到当前 provider、余额/套餐、请求 token、cache token、耗时、重试和成本估算。
 - 你需要长期运行的本地代理，并希望日志、状态、session 绑定和 dashboard 刷新保持可控。
 - 你想快速查看和恢复本机 Codex 会话。
@@ -37,6 +41,8 @@ English: [README_EN.md](README_EN.md)
 
 - **本地代理**：默认监听 `127.0.0.1:3211`，Codex 继续按原方式使用。
 - **安全 Codex 局部修改**：只改本地代理片段，不影响 Codex 运行中写入的其他配置。
+- **Codex 原生体验桥接**：`chatgpt-bridge` 保留 ChatGPT 登录态，`imagegen-bridge` 暴露 hosted image generation，`official-relay-bridge` / `official-imagegen-bridge` 尝试让支持官方 Responses 语义的中转走 remote compaction v1。
+- **中转能力诊断**：TUI、CLI 和 admin API 都可以检查 `/models`、`/responses`、`/responses/compact`，并给出当前 relay 更适合哪种 patch mode。
 - **provider / routing 配置**：`version = 5` route graph 格式，新增 provider 后用 routing entry/routes 决定顺序、固定、分组或标签优先。
 - **会话粘性与自动兜底**：同一 Codex 会话会尽量粘住已选 provider，请求失败、上游不可用或可信余额显示耗尽时再按策略切换候选 provider/upstream。
 - **本地并发上限**：可为 provider 或 endpoint 配置本进程并发上限，relay 账号饱和时自动跳过并走 fallback。
@@ -89,14 +95,25 @@ codex-helper serve --no-tui
 ```bash
 codex-helper switch on
 codex-helper switch on --mode chatgpt-bridge
+codex-helper switch on --mode official-relay-bridge
 codex-helper switch on --mode official-imagegen-bridge
 codex-helper switch status
 codex-helper switch off
 ```
 
-`--mode chatgpt-bridge` 用于“ChatGPT Auth 保留、模型层走 codex-helper”的场景，会 patch `~/.codex/config.toml` 的 `requires_openai_auth = true` / `supports_websockets = false`，并只把 `~/.codex/auth.json` 的 `auth_mode` 改为 `chatgpt`、`OPENAI_API_KEY` 改为 `null`。启用前必须先在官方 Codex 中完成 ChatGPT 登录；如果 `auth.json` 没有完整登录 token、email 和账号信息，codex-helper 会拒绝 patch，避免 Codex TUI 启动时报 `email and plan type are required for chatgpt authentication`。已有 Codex app 通常需要重启后才会应用这些客户端配置变更。
+模式怎么选：
 
-`--mode official-imagegen-bridge` 用于“中转背后是官方订阅，希望同时拿到 remote compaction 和 hosted image_generation”的实验场景。它把 Codex 侧 provider 声明为 `OpenAI`、关闭 WebSocket，并写入 `{}` auth facade 暴露 imagegen；真实请求凭据仍来自 codex-helper 上游配置。
+| 模式 | 适合什么情况 | 效果 |
+| --- | --- | --- |
+| `default` | 只需要本地代理、多 provider 和 fallback | Codex 把模型请求发到本地 helper，helper 再选上游 |
+| `chatgpt-bridge` | 你已经在官方 Codex 里登录 ChatGPT，希望保留桌面端/手机端账号体验，但模型流量走 relay | 写入 ChatGPT auth 形态，真实上游凭据仍来自 helper 配置 |
+| `imagegen-bridge` | relay 不支持 official provider 身份，但你想让 Codex 暴露 hosted `image_generation` | 写入 `{}` auth facade；不会要求官方登录 |
+| `official-relay-bridge` | relay 背后能转发官方 OpenAI Responses 语义，尤其支持 `/responses/compact` | 让 Codex 把本地 helper 当作 OpenAI provider，从而尝试 remote compaction v1 |
+| `official-imagegen-bridge` | relay 背后是官方订阅账号，并且同时支持 `/responses/compact` 和 hosted image generation | 同时启用 OpenAI provider 身份和 `{}` imagegen facade |
+
+`chatgpt-bridge` 启用前必须先在官方 Codex 中完成 ChatGPT 登录。如果 `~/.codex/auth.json` 没有完整 token、email 和账号信息，codex-helper 会拒绝 patch，避免 Codex TUI 因半登录状态启动失败。
+
+`official-relay-bridge` 和 `official-imagegen-bridge` 都是实验模式。它们只负责让 Codex 使用更接近官方的客户端能力选择；中转站本身仍必须真正支持对应接口。真实请求密钥来自 `~/.codex-helper/config.toml` 的 provider 配置，bridge 模式不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。
 
 注意：任何对 `~/.codex/config.toml` 的修改都只会被新启动的 Codex 会话读取；修改后请完整重启 Codex App、TUI 或 `codex exec` 会话。
 
@@ -107,7 +124,7 @@ codex-helper switch off
 3. 在 `~/.codex-helper/config.toml` 配 `codex.providers.*` 和 `codex.routing`，让 codex-helper 最终选择你的 relay。
 4. 如果 relay 需要带前缀的模型名，就给 provider 配 `model_mapping`。
 
-这种模式适合想保留 Codex App / 手机端 / 订阅账号能力判定，同时把日常对话、工具调用和 imagegen 等模型消耗放到自有中转或包月额度上的场景。
+这种拆法适合保留 Codex App、手机端和订阅账号能力判定，同时把日常对话、工具调用和 imagegen 等模型消耗放到自有中转或包月额度。
 
 Codex 侧的本地代理入口通常由 `switch on` 写入，不建议手写覆盖其它 Codex 配置：
 
@@ -265,6 +282,9 @@ codex-helper pricing sync-basellm --model gpt-5 --dry-run
 # 诊断
 codex-helper status
 codex-helper doctor
+codex-helper codex relay-capabilities --mode official-imagegen-bridge --model gpt-5.5
+codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5
+codex-helper codex relay-evidence --limit 20
 codex-helper --version
 ```
 
@@ -303,6 +323,7 @@ GUI 可以启动/附着本地代理，编辑常见单 endpoint provider、route 
 - 价格覆盖：`~/.codex-helper/pricing_overrides.toml`
 - 请求过滤：`~/.codex-helper/filter.json`
 - 请求日志：`~/.codex-helper/logs/requests.jsonl`
+- Codex relay 诊断证据：`~/.codex-helper/logs/codex_relay_evidence.jsonl`
 - GUI 配置：`~/.codex-helper/gui.toml`
 
 Codex 自己的文件仍由 Codex 维护：

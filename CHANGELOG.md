@@ -7,89 +7,83 @@ All notable changes to this project will be documented in this file.
 
 ### 中文
 
-- 新增 Codex `official-imagegen-bridge` 客户端 patch 模式：组合 `official-relay-bridge` 的 OpenAI provider 身份与 `imagegen-bridge` 的 `{}` auth facade，用于同时尝试官方 remote compaction v1 和 hosted `image_generation`。
-- 新增 Codex relay 能力诊断 admin API：`POST /__codex_helper/api/v1/codex/relay-capabilities` 会显式探测选中上游的 `/models`、`/responses` 和 `/responses/compact`，输出 expected/observed/mismatches/recommendation，帮助判断 `default`、`imagegen-bridge`、`official-relay-bridge` 和 `official-imagegen-bridge` 哪个更匹配当前中转。
-- TUI Settings 页新增 Codex relay 能力诊断入口：按 `C` 会通过同一套核心诊断逻辑跑一次有界 probe，并在 TUI 内展示 target、expected、observed、mismatch、warning 和推荐 patch mode；该动作不会自动切换 patch。
-- 新增强 opt-in 的 Codex relay live smoke 诊断：`POST /__codex_helper/api/v1/codex/relay-live-smoke` 必须携带 `acknowledgement = "run-live-codex-relay-smoke"`，可对选中上游真实验证 `/responses/compact`，也可在显式请求时验证 hosted `image_generation` 请求链路。
-- TUI Settings 页新增 live smoke 双确认入口：`X` 二次确认只跑 compact，`Y` 二次确认跑 compact + image；该功能会发送真实上游请求，可能消耗额度或生成图片，不会自动修改 patch mode、路由、affinity、health 或余额状态，也不会保存原始图片字节/base64。
-- 新增 Codex relay CLI 诊断入口：`codex-helper codex relay-capabilities`、`codex-helper codex relay-live-smoke` 和 `codex-helper codex relay-evidence`，用于在不启动 TUI/admin listener 的情况下手工探测中转能力、触发强 opt-in live smoke、查看最近诊断证据。
-- Capability diagnostics 与 live smoke 现在会写入独立 JSONL 证据文件 `~/.codex-helper/logs/codex_relay_evidence.jsonl`；该证据只用于人工诊断，不参与 request ledger、routing、affinity、health、balance、retry 或 patch-mode 自动切换。
-- Codex `/models` 兼容层现在会把 OpenAI-style `data: [...]` 模型列表翻译成 Codex `models: [...]` catalog，并在能力诊断里保留 `translation_required` 观测，避免 sub2api 或其它中转因为模型列表形态不同导致 Codex 看不到 image/search/apply_patch 等模型 metadata。
-- Codex relay 能力推荐保持保守：未知或不支持 `/responses/compact` 时不会推荐 official relay 模式；hosted `image_generation` 不会被主动探测，因为它可能消耗额度或生成实际图片；WebSocket relay 和 remote compaction v2 仍不作为已启用能力。
-- 新增 Codex `chatgpt-bridge` 客户端 patch 模式：可保留 Codex/ChatGPT 账号登录态用于桌面端和移动端能力，同时把模型请求交给 codex-helper 路由到第三方中转；bridge 模式会写入 `requires_openai_auth = true`、`supports_websockets = false`，并只把 `auth.json` 的 `auth_mode` 改为 `chatgpt`、`OPENAI_API_KEY` 改为 `null`。
-- `chatgpt-bridge` 启用前会校验 `~/.codex/auth.json` 是否已有完整 ChatGPT 登录态；未登录或缺少 token/email/account 信息时拒绝 patch，避免 Codex TUI 因半登录 auth 状态启动失败。
-- `imagegen-bridge` 的 auth facade 改为写入空对象 `{}`，不再显式写 `auth_mode = chatgpt`；恢复逻辑现在按 JSON 语义匹配，兼容旧版本已写入的 facade。
-- bridge 模式下如果上游没有配置 codex-helper 自己的 `auth_token_env` / `auth_token` / `api_key`，会移除来自 Codex 客户端的认证头，避免把 ChatGPT 登录 token 透传到第三方 relay。
-- 新增 `codex-helper switch remote-control` 子命令组：可开启、查看并检查 Codex App 手机远程控制状态；命令会写入 `[features].remote_connections = true`，不会写已失效的 `remote_control = true`，并会备份和更新 `~/.codex/sqlite/codex-dev.db` 的 `local_app_server_feature_enablement.remote_control`。
-- `provider add` 支持 `--supported-model` 和 `--model-map FROM=TO`，`provider show --json` 也会带出 `supported_models` 和 `model_mapping`；用于 Codex 请求模型名和 relay 实际模型名不一致的场景，例如 `gpt-5.5` -> `openai/gpt-5.5`。
-- TUI 的 `Stats` 导航位升级为 `Usage`，页面集中展示 provider 用量、成本、余额/配额状态、刷新摘要、路由影响和 endpoint 最近样本。
-- TUI `Usage / Balance` 卡片新增 USD 消耗速率预测：按最近已计价请求估算 `$ / h`，并外推到每日刷新时间（默认本地 `+08:00` 0 点）；可通过 `[ui.usage_forecast]` 配置窗口、最小样本和刷新时区。
-- 余额刷新短暂失败时会保留上一条可用金额，只把快照标记为错误/待关注，避免 `Routing` 页面把已有的 `input*` 余额清成纯“未知”。
-- TUI `Usage` 页面新增关注项筛选：按 `a` 只看余额异常、刷新失败、用量异常或状态需要处理的 provider。
-- TUI `Usage` 页面 provider 详情支持 `PgUp` / `PgDn` 滚动 endpoint 列表，provider 很多或 endpoint 很多时更容易查看余额和最近请求。
-- 窄终端和中英文混排下，余额/配额会保持金额原子显示；空间不足时退回状态标签，避免出现 `$0/$` 这类半截金额。
-- TUI `Usage` 页面现在会显示本次余额刷新 summary，包括成功/失败/缺 key/自动刷新数量，并会带出最新错误所属 provider。
-- TUI `Routing` 页面优化了窄终端显示：长 provider 顺序会折叠但保留选中项，目标 provider 和余额分行展示，避免全局 route target 的金额被截断。
-- TUI 设置或清除全局/会话 route target 后，会立即清掉旧路由预览并刷新快照，避免短时间显示过期 provider 或余额信息。
-- TUI `Routing` 的 route graph 模式现在按实际 routing order 解析 provider 选中项，避免表格、详情、Enter 固定目标、会话 override 和 provider 重排在配置顺序不一致时错位。
-- TUI `Routing` 的 route graph provider 表格、详情面板、菜单入口和重排操作现在共用同一套行模型，刷新、重排或窗口变化后选中行与详情更不容易错位。
-- TUI 底部快捷键栏改为只保留当前页面的关键操作，`?` 帮助会先显示当前页面完整快捷键，窄终端下隐藏的动作仍可发现。
-- TUI `History` 页改为读取 Codex 全局历史最近条目，不再因为当前启动目录有匹配会话就丢掉其它项目历史。
-- TUI `Usage` 页面支持按 `g` 直接刷新余额；刷新失败会显示为错误状态，但不会阻塞页面刷新或其他 provider 的余额刷新。
-- Codex 请求触发的余额刷新改为 provider/endpoint 级延迟队列：请求命中后先去重入队，稍后只刷新对应 provider/endpoint，避免高频请求立即打余额 API 或无条件全量刷新。
-- Codex 请求触发的余额刷新如果撞上 provider 冷却窗口，现在会延后到冷却结束补刷一次，避免高频请求停止后余额长期停在旧快照；进入 TUI `Routing` 页面时也会对空、过期、未知或错误余额做一次懒刷新。
-- 手动余额刷新现在也能用 `provider_id` 命中自动探测的 provider，例如 `provider_id=input6` 会刷新 sub2api 网关层余额，而不是因为没有显式 `usage_providers.json` 条目而跳过。
-- TUI 快照刷新改为后台完成后应用，避免请求很多或日志很大时因为短超时丢弃余额快照，导致 `Routing` / `Usage` 页面看起来不自动刷新。
-- TUI `Routing` 页面和路由编辑弹窗在同名 provider 同时存在 `routing` 与独立站点余额时，优先显示路由层余额，避免请求后刷新了网关层余额但路由页仍显示旧站点余额。
-- TUI 运行时快照刷新改为状态变更事件驱动，并保留低频兜底刷新；普通心跳不再每 500ms 重建 snapshot，减少路由页常驻时的无效刷新。
-- TUI `Usage` provider 余额状态会把“不参与路由降级的耗尽”显示为 `lazy reset` / `不降级耗尽`，避免和普通耗尽或可路由降级状态混淆。
-- TUI `Usage` 页面的 provider 表格、详情面板和报告导出现在共用同一套筛选后的行模型，降低关注项筛选后详情或导出目标错位的风险。
-- GUI 统计页和余额概览迁移到同一套 core `UsageBalanceView` 语义，`unknown`、`stale`、`exhausted`、`error` 和 `unlimited` 不再由各 UI 自行混算。
-- 路由页继续只保留紧凑余额上下文，详细用量、余额和 endpoint 分析统一到 `Usage / Balance`。
-- Codex streaming 请求在所有 route candidates 都被可信余额耗尽或 cooldown 阻断时，会返回带延迟的可重试 `response.failed` SSE，并排队受节流的 provider/endpoint 余额刷新；已确认 `usage_exhausted` 的上游不再作为兜底目标被反复请求。
+#### Codex 中转和 ChatGPT 原生体验
 
-### English Summary
+- 新增一组 Codex bridge 模式，用来处理“Codex 客户端想要官方/ChatGPT 形态，但模型流量要走中转”的场景。
+- `chatgpt-bridge` 适合已经在官方 Codex 登录 ChatGPT 的用户。Codex 仍看到 ChatGPT 登录态，桌面端和手机端账号能力可以继续按官方路径判断；模型请求由 codex-helper 路由到你的 relay。
+- `imagegen-bridge` 适合 relay 不支持 official provider 身份，但你想让 Codex 暴露 hosted `image_generation` 的场景。它会写入 `{}` auth facade，真实上游密钥仍来自 codex-helper 配置。
+- `official-relay-bridge` 适合能转发 OpenAI Responses 语义的中转，尤其是支持 `/responses/compact` 的 sub2api 或类似服务。它让 Codex 尝试 remote compaction v1。
+- `official-imagegen-bridge` 适合背后确实是官方订阅账号、同时支持 `/responses/compact` 和 hosted image generation 的 relay。它同时给 Codex official provider 身份和 imagegen facade。
+- bridge 模式不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。上游应配置自己的 `auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`。
 
-- Added Codex `official-imagegen-bridge` client patch mode, combining OpenAI provider identity for remote compaction v1 with the empty auth facade used to expose hosted image generation.
-- Added the Codex relay capability diagnostics admin API at `POST /__codex_helper/api/v1/codex/relay-capabilities`; it explicitly probes the selected upstream's `/models`, `/responses`, and `/responses/compact` endpoints and returns expected/observed/mismatches/recommendation to choose between `default`, `imagegen-bridge`, `official-relay-bridge`, and `official-imagegen-bridge`.
-- Added a TUI Settings entry for Codex relay capability diagnostics. Press `C` to run the same bounded probe through the shared core diagnostic path and see target, expected, observed, mismatch, warning, and recommended patch mode details without auto-switching modes.
-- Added a strongly opt-in Codex relay live-smoke diagnostic at `POST /__codex_helper/api/v1/codex/relay-live-smoke`; callers must send `acknowledgement = "run-live-codex-relay-smoke"` before helper performs real selected-upstream checks for `/responses/compact`, with hosted `image_generation` smoke only when explicitly requested.
-- Added TUI Settings live-smoke confirmations: press `X` twice for compact-only smoke, or `Y` twice for compact + image smoke. These are real upstream requests that can spend quota or create images, and they do not mutate patch mode, routing, affinity, health, balance state, or store raw image bytes/base64.
-- Added Codex relay CLI diagnostics: `codex-helper codex relay-capabilities`, `codex-helper codex relay-live-smoke`, and `codex-helper codex relay-evidence` for terminal-first capability checks, strongly opt-in live smoke, and recent evidence inspection without starting the TUI/admin listener.
-- Capability diagnostics and live smoke now append sanitized records to the separate JSONL evidence file `~/.codex-helper/logs/codex_relay_evidence.jsonl`; this is human diagnostic evidence only and does not feed the request ledger, routing, affinity, health, balance, retry, or patch-mode automation.
-- Codex `/models` compatibility now translates OpenAI-style `data: [...]` model lists into Codex `models: [...]` catalogs while diagnostics preserve the raw `translation_required` observation, helping sub2api and other relays expose Codex model metadata such as image/search/apply_patch support.
-- Codex relay recommendations are conservative: unknown or unsupported `/responses/compact` does not upgrade to official relay modes; hosted `image_generation` is not actively probed because it can spend quota or create image artifacts; WebSocket relay and remote compaction v2 remain unsupported/diagnostic-only.
-- Added Codex `chatgpt-bridge` client patch mode, keeping Codex/ChatGPT account auth for desktop/mobile features while routing model traffic through codex-helper to third-party relays.
-- `chatgpt-bridge` now validates that `~/.codex/auth.json` already contains a complete ChatGPT login state and refuses to patch incomplete auth files, avoiding Codex TUI bootstrap failures from half-written auth.
-- `imagegen-bridge` now writes an empty `{}` auth facade instead of an explicit `auth_mode = chatgpt`; auth restoration matches helper-written facades by JSON semantics so older patched states remain recoverable.
-- In bridge mode, codex-helper strips Codex client auth headers unless the selected upstream has its own helper-side secret, preventing ChatGPT login tokens from being forwarded to third-party relays.
-- Added the `codex-helper switch remote-control` command group to enable, inspect, and verify Codex App mobile remote control. It writes `[features].remote_connections = true`, avoids the removed `remote_control = true` key, and backs up/updates `local_app_server_feature_enablement.remote_control` in `~/.codex/sqlite/codex-dev.db`.
-- `provider add` now accepts `--supported-model` and `--model-map FROM=TO`, and `provider show --json` exposes `supported_models` / `model_mapping`, covering relay model aliases such as `gpt-5.5` -> `openai/gpt-5.5`.
-- The TUI `Stats` slot is now `Usage`, focused on provider usage, cost, balance/quota state, refresh status, route impact, and endpoint recent samples.
-- The TUI `Usage / Balance` card now forecasts USD burn: it estimates `$ / h` from recent priced requests and projects spend until the daily reset time (default local `+08:00` midnight), configurable via `[ui.usage_forecast]`.
-- Transient balance refresh failures now keep the last usable amount and mark the snapshot as actionable/error, avoiding `input*` balances disappearing into a plain `unknown` state on the `Routing` page.
-- Press `a` on the TUI `Usage` page to filter providers that need attention, including balance issues, refresh failures, usage errors, and actionable states.
-- Provider details on the TUI `Usage` page now support `PgUp` / `PgDn` endpoint scrolling, making large provider and endpoint sets easier to inspect.
-- Narrow terminals and mixed CJK/English layouts now keep balance/quota amounts atomic. When there is not enough room, the UI falls back to a status label instead of showing partial amounts such as `$0/$`.
-- The TUI `Usage` page now surfaces the latest balance refresh summary, including success/failure counts, missing-token counts, auto-refresh counts, and the provider behind the latest error.
-- The TUI `Routing` page now behaves better in narrow terminals: long provider order chains are folded while keeping the selected provider visible, and route target balances are shown on their own line to avoid truncated amounts.
-- After setting or clearing a global/session route target in the TUI, stale routing previews are invalidated immediately and a snapshot refresh is queued, avoiding short-lived stale provider or balance text.
-- TUI `Routing` route graph mode now resolves provider selection from the actual routing order, keeping the table, detail pane, Enter target pinning, session overrides, and provider reordering aligned when config order differs.
-- The TUI `Routing` route graph provider table, detail pane, menu entry, and reorder actions now share the same row model, reducing selection/detail drift after refreshes, reorders, and viewport changes.
-- The TUI footer now keeps only page-critical actions. Press `?` to open page-aware help first, so actions hidden from narrow footers remain discoverable.
-- The TUI `History` page now loads recent Codex history globally instead of dropping other projects when the launch directory has matching sessions.
-- Press `g` on the TUI `Usage` page to refresh balances. Failures stay visible as state/errors without blocking UI redraws or other provider refreshes.
-- Codex request-driven balance refresh now uses a provider/endpoint delayed queue: routed requests enqueue and deduplicate the touched provider endpoint, then refresh only that target later instead of immediately hitting balance APIs or polling all providers.
-- If request-driven balance refresh lands inside a provider cooldown window, it now schedules a trailing refresh after the cooldown instead of dropping the update; entering the TUI `Routing` page also lazily refreshes empty, stale, unknown, or errored balances.
-- Manual balance refresh now matches auto-discovered providers by `provider_id`, so requests such as `provider_id=input6` refresh the sub2api gateway balance instead of being skipped when no explicit `usage_providers.json` entry exists.
-- TUI snapshot refreshes now apply after the background build finishes, avoiding dropped balance snapshots when request/log volume makes a refresh exceed the short UI timeout.
-- The TUI `Routing` page and routing editor now prefer route-context balances over same-named standalone station balances, so routed provider rows show the gateway balance refreshed by requests.
-- TUI runtime snapshots now refresh from runtime state-change events with a low-frequency fallback; the heartbeat no longer rebuilds snapshots every 500ms while sitting on routing pages.
-- The TUI `Usage` provider balance state now labels exhaustion that is ignored for routing demotion as `lazy reset` / `不降级耗尽`, making it distinct from ordinary exhaustion or demotion-triggering states.
-- The TUI `Usage` provider table, detail pane, and report export now share the same filtered row model, reducing the risk of detail/export target drift after attention filtering.
-- The GUI stats and balance views now consume the shared core `UsageBalanceView`, so `unknown`, `stale`, `exhausted`, `error`, and `unlimited` stay distinct across UI surfaces.
-- Routing pages keep compact balance context; detailed usage, balance, and endpoint inspection lives in `Usage / Balance`.
-- Codex streaming requests now return a delayed retryable `response.failed` SSE when every route candidate is blocked by trusted balance exhaustion or cooldown, while queueing a throttled provider/endpoint balance refresh; confirmed `usage_exhausted` upstreams are no longer hammered as fallback targets.
+#### 中转能力诊断
+
+- 新增 Codex relay 能力诊断，可从 TUI Settings、admin API 或 CLI 运行。常用 CLI：`codex-helper codex relay-capabilities --mode official-imagegen-bridge --model gpt-5.5`。
+- 诊断会检查 relay 的 `/models`、`/responses`、`/responses/compact`，然后给出更适合的 patch mode。它不会自动切换配置。
+- 如果 relay 返回 OpenAI 风格的 `/models`（`data: [...]`），codex-helper 会翻译成 Codex 需要的 `models: [...]` catalog，避免 Codex 因模型 metadata 形态不对而看不到 image/search/apply_patch 等能力。
+- 新增需要明确确认的 live smoke：`codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5`。默认只测 `/responses/compact`；加 `--image` 才会测试 hosted image generation。这个命令会打真实上游，可能消耗额度或生成图片。
+- 诊断和 live smoke 会写入 `~/.codex-helper/logs/codex_relay_evidence.jsonl`。这是给人看的本地证据，不参与 routing、affinity、health、余额、retry 或自动 patch mode。
+
+#### 多中转路由和余额
+
+- Codex 多中转默认更偏向“稳定粘住当前可用上游”。对 official relay、remote compaction 这类可能带上游账号绑定状态的请求，建议使用 `[codex.routing].affinity_policy = "fallback-sticky"`。
+- 当所有候选都因为可信余额耗尽或 cooldown 被挡住时，Codex streaming 请求会收到可重试的 `response.failed`，helper 会排队一次受节流的余额刷新，而不是每秒反复打同一个已耗尽上游。
+- 如果某个中转余额接口经常把可用账号报成 0，把对应 usage provider 的 `trust_exhaustion_for_routing` 设为 `false`，让余额只作为提示，不再驱动路由降级。
+- 请求触发的余额刷新现在按 provider/endpoint 去重和延迟刷新；手动刷新也能命中自动探测到的 sub2api provider id。
+
+#### TUI/GUI 可见变化
+
+- TUI 的 `Stats` 改为 `Usage`，集中看 provider 用量、余额/配额、刷新结果、endpoint 最近样本和费用估算。
+- `Usage` 页面可以按 `g` 刷新余额，按 `a` 只看需要处理的 provider；provider 很多时详情页支持 `PgUp` / `PgDn` 滚动 endpoint。
+- 窄终端下 Routing/Usage 的余额显示更稳，不再容易出现 `$0/$` 这类半截金额。Routing 页保留紧凑余额，详细分析放在 Usage/Balance。
+- GUI 的余额状态和 core 语义对齐，`unknown`、`stale`、`exhausted`、`error`、`unlimited` 不再由不同 UI 各算一套。
+
+#### 升级时关注
+
+- 常用 patch mode 放在 `[codex.client_patch] mode = "..."`，也可以用 `codex-helper switch on --mode ...` 显式切换。改完后需要完整重启 Codex App、TUI 或 `codex exec`。
+- relay 要求模型名前缀时，用 `provider add --model-map FROM=TO` 或 provider 级 `model_mapping`，例如 `gpt-5.5` -> `openai/gpt-5.5`。
+- 不确定 relay 是否支持 compact/imagegen 时，先跑 `codex-helper codex relay-capabilities`；只有要真实验证上游链路时再跑 live smoke。
+- 手机远程控制仍走 `codex-helper switch remote-control ...`，它和 `chatgpt-bridge` 是两条路径。
+
+### English summary
+
+#### Codex relays and native ChatGPT behavior
+
+- Added Codex bridge modes for setups where Codex should keep an official or ChatGPT-like client shape while model traffic goes through codex-helper relays.
+- `chatgpt-bridge` is for users already signed in to ChatGPT in official Codex. Codex keeps seeing ChatGPT account state, while model requests are routed through codex-helper.
+- `imagegen-bridge` exposes hosted `image_generation` for relays that do not support official provider identity. It writes the empty `{}` auth facade; real upstream credentials still come from helper config.
+- `official-relay-bridge` is for relays that forward OpenAI Responses semantics, especially `/responses/compact`. It lets Codex try remote compaction v1.
+- `official-imagegen-bridge` is for official-subscription-backed relays that support both `/responses/compact` and hosted image generation.
+- Bridge modes do not forward Codex ChatGPT tokens to third-party relays without helper-side credentials. Configure upstream secrets with `auth_token_env`, `auth_token`, `api_key_env`, or `api_key`.
+
+#### Relay diagnostics
+
+- Added Codex relay capability diagnostics in TUI Settings, admin API, and CLI. Common CLI: `codex-helper codex relay-capabilities --mode official-imagegen-bridge --model gpt-5.5`.
+- Diagnostics check `/models`, `/responses`, and `/responses/compact`, then recommend a patch mode. They do not switch modes automatically.
+- OpenAI-style `/models` responses (`data: [...]`) are translated into the Codex `models: [...]` catalog so Codex can see model metadata such as image/search/apply_patch support.
+- Added explicit live smoke: `codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5`. It checks compact by default; add `--image` to test hosted image generation. This sends real upstream requests and may spend quota or create an image.
+- Diagnostics and live smoke append sanitized records to `~/.codex-helper/logs/codex_relay_evidence.jsonl`. That file is local diagnostic evidence only; it does not affect routing, affinity, health, balance, retry, or patch-mode automation.
+
+#### Multi-relay routing and balance
+
+- Codex multi-relay routing now favors keeping a viable selected upstream stable. For official relay and remote compaction setups, use `[codex.routing].affinity_policy = "fallback-sticky"` when upstream-account continuity matters.
+- When every candidate is blocked by trusted balance exhaustion or cooldown, Codex streaming gets a retryable `response.failed` and helper queues a throttled balance refresh instead of hammering the same exhausted upstream.
+- If a relay balance API reports false zero balance, set that usage provider's `trust_exhaustion_for_routing` to `false` so balance stays informational and no longer demotes routing.
+- Request-triggered balance refreshes are deduplicated by provider/endpoint and delayed; manual refresh can also target auto-discovered sub2api provider ids.
+
+#### TUI and GUI
+
+- TUI `Stats` is now `Usage`, focused on provider usage, balance/quota state, refresh results, recent endpoint samples, and cost estimates.
+- On `Usage`, press `g` to refresh balances and `a` to show only providers that need attention. Large endpoint lists can be scrolled with `PgUp` / `PgDn`.
+- Narrow Routing/Usage views keep balance amounts readable instead of showing partial values like `$0/$`. Routing keeps compact balance context; detailed inspection lives in Usage/Balance.
+- GUI balance state now uses the same core semantics as TUI, keeping `unknown`, `stale`, `exhausted`, `error`, and `unlimited` distinct.
+
+#### Upgrade notes
+
+- Set the usual patch mode with `[codex.client_patch] mode = "..."` or `codex-helper switch on --mode ...`. Restart Codex App, TUI, or `codex exec` after changing it.
+- If a relay requires provider-prefixed model names, use `provider add --model-map FROM=TO` or provider-level `model_mapping`, for example `gpt-5.5` -> `openai/gpt-5.5`.
+- If you are unsure whether a relay supports compact or imagegen, run `codex-helper codex relay-capabilities` first. Use live smoke only when you want a real upstream test.
+- Mobile remote control still uses `codex-helper switch remote-control ...`; it is separate from `chatgpt-bridge`.
 
 ## [0.15.0] - 2026-05-14
 
