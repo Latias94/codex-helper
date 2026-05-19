@@ -743,6 +743,20 @@ Common provider fields:
 | `supported_models` | Optional model allowlist | Advanced |
 | `model_mapping` | Optional model alias map | Advanced |
 
+For authentication, first decide which HTTP header the provider expects:
+
+- **OpenAI and most OpenAI-compatible relays** use bearer auth: `Authorization: Bearer <key>`.
+  Configure `auth_token_env` for normal use, or `auth_token` only for local scratch configs.
+  This is true even when the provider's dashboard calls the secret an "API key".
+- Use `api_key_env` / `api_key` only when the provider explicitly documents an
+  `X-API-Key` header.
+- Prefer the `*_env` fields so secrets stay out of `~/.codex-helper/config.toml`.
+  The value in config is the environment variable name, not the secret itself; the variable must
+  be set in the process that runs codex-helper.
+- If an inline value and an env reference are both configured for the same header family, the
+  inline value wins. If both bearer and `X-API-Key` credentials are configured, codex-helper sends
+  both headers; avoid that unless the relay explicitly requires it.
+
 Use `model_mapping` when the model requested by Codex differs from the model name expected by a specific relay. The mapping is provider-scoped: codex-helper rewrites the request body `model` only after that provider is selected, so other providers are not affected.
 
 ```toml
@@ -751,6 +765,21 @@ base_url = "https://relay.example/v1"
 auth_token_env = "RELAY_API_KEY"
 supported_models = { "gpt-5.5" = true }
 model_mapping = { "gpt-5.5" = "openai/gpt-5.5" }
+```
+
+For OpenAI itself, use the same bearer form:
+
+```toml
+[codex.providers.openai]
+base_url = "https://api.openai.com/v1"
+auth_token_env = "OPENAI_API_KEY"
+```
+
+PowerShell example:
+
+```powershell
+$env:OPENAI_API_KEY = "sk-..."
+codex-helper
 ```
 
 A single `*` wildcard is supported, which is useful when a relay wants a provider prefix for a whole model family:

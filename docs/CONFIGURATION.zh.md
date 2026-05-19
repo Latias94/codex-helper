@@ -701,6 +701,17 @@ tags = { billing = "monthly" }
 | `supported_models` | 可选 model allowlist | 高级 |
 | `model_mapping` | 可选 model alias map | 高级 |
 
+认证字段先按 provider 要求的 HTTP header 来选：
+
+- **OpenAI 和大多数 OpenAI-compatible 中转** 使用 bearer auth：`Authorization: Bearer <key>`。
+  日常使用配置 `auth_token_env`，只在本地临时测试时才用 `auth_token`。
+  即使中转后台把密钥叫做 “API key”，这里通常也应该填 `auth_token_env`，不是 `api_key_env`。
+- 只有 provider 文档明确要求 `X-API-Key` header 时，才使用 `api_key_env` / `api_key`。
+- 优先使用 `*_env` 字段，避免 secret 写入 `~/.codex-helper/config.toml`。
+  config 里的值是环境变量名，不是密钥本身；运行 codex-helper 的进程里必须真的设置了这个环境变量。
+- 同一 header 类型里，如果同时配置 inline 值和 env 引用，inline 值优先。
+  如果同时配置 bearer 和 `X-API-Key` 两类凭据，codex-helper 会同时发送两个 header；除非中转明确要求，否则不要这样配。
+
 `model_mapping` 用于“Codex 请求的模型名”和“某个 relay 实际要求的模型名”不一致的场景。它是 provider 级别配置，路由选中该 provider 后才会改写请求体里的 `model` 字段；没有选中该 provider 时不会影响其它 provider。
 
 ```toml
@@ -709,6 +720,21 @@ base_url = "https://relay.example/v1"
 auth_token_env = "RELAY_API_KEY"
 supported_models = { "gpt-5.5" = true }
 model_mapping = { "gpt-5.5" = "openai/gpt-5.5" }
+```
+
+OpenAI 官方同样用 bearer 形式：
+
+```toml
+[codex.providers.openai]
+base_url = "https://api.openai.com/v1"
+auth_token_env = "OPENAI_API_KEY"
+```
+
+PowerShell 示例：
+
+```powershell
+$env:OPENAI_API_KEY = "sk-..."
+codex-helper
 ```
 
 也支持一个 `*` 通配符，适合一整类模型都要加 provider 前缀：
