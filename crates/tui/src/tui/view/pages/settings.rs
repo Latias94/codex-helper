@@ -77,6 +77,7 @@ fn live_smoke_case_label(case: CodexRelayLiveSmokeCase) -> &'static str {
     match case {
         CodexRelayLiveSmokeCase::ResponsesCompact => "responses_compact",
         CodexRelayLiveSmokeCase::HostedImageGeneration => "hosted_image_generation",
+        CodexRelayLiveSmokeCase::ResponsesWebSocket => "responses_websocket",
     }
 }
 
@@ -1335,6 +1336,9 @@ mod tests {
             service_name: "codex".to_string(),
             station_name: "input".to_string(),
             upstream_index: 0,
+            provider_id: None,
+            endpoint_id: None,
+            provider_endpoint_key: None,
             upstream_base_url: "https://relay.example/v1".to_string(),
             patch_mode: crate::codex_integration::CodexPatchMode::OfficialImagegenBridge,
             responses_websocket: false,
@@ -1357,6 +1361,9 @@ mod tests {
             service_name: "codex".to_string(),
             station_name: "input".to_string(),
             upstream_index: 0,
+            provider_id: None,
+            endpoint_id: None,
+            provider_endpoint_key: None,
             upstream_base_url: "https://relay.example/v1".to_string(),
             requested_model: "gpt-5.5".to_string(),
             upstream_model: "openai/gpt-5.5".to_string(),

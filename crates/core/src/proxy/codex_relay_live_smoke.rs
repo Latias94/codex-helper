@@ -1,8 +1,13 @@
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http as tungstenite_http;
 
 use crate::config::UpstreamConfig;
 use crate::model_routing;
@@ -16,6 +21,7 @@ pub const CODEX_RELAY_LIVE_SMOKE_ACK: &str = "run-live-codex-relay-smoke";
 const LIVE_SMOKE_API_VERSION: u32 = 1;
 const MAX_LIVE_SMOKE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const ERROR_SNIPPET_LIMIT: usize = 512;
+const RESPONSES_WS_BETA_HEADER: &str = "responses_websockets=2026-02-06";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodexRelayLiveSmokeRequest {
@@ -23,6 +29,10 @@ pub struct CodexRelayLiveSmokeRequest {
     pub acknowledgement: Option<String>,
     #[serde(default)]
     pub station_name: Option<String>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
     #[serde(default)]
     pub upstream_index: Option<usize>,
     #[serde(default)]
@@ -38,6 +48,8 @@ pub struct CodexRelayLiveSmokeRequest {
 pub enum CodexRelayLiveSmokeCase {
     ResponsesCompact,
     HostedImageGeneration,
+    #[serde(rename = "responses_websocket", alias = "responses_web_socket")]
+    ResponsesWebSocket,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +98,12 @@ pub struct CodexRelayLiveSmokeResponse {
     pub service_name: String,
     pub station_name: String,
     pub upstream_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_endpoint_key: Option<String>,
     pub upstream_base_url: String,
     pub requested_model: String,
     pub upstream_model: String,
@@ -111,6 +129,10 @@ impl CodexRelayLiveSmokeClient {
         service_tier: Option<&str>,
         case: CodexRelayLiveSmokeCase,
     ) -> CodexRelayLiveSmokeResult {
+        if matches!(case, CodexRelayLiveSmokeCase::ResponsesWebSocket) {
+            return self.run_websocket_case(upstream, model, service_tier).await;
+        }
+
         let spec = LiveSmokeSpec::for_case(case, model, service_tier);
         let url = match build_live_smoke_url(&upstream.base_url, spec.path) {
             Ok(url) => url,
@@ -161,6 +183,54 @@ impl CodexRelayLiveSmokeClient {
             Err(error) => return transport_result(case, Some(status), error),
         };
         classify_live_smoke_response(case, status, &headers, body.as_ref())
+    }
+
+    async fn run_websocket_case(
+        &self,
+        upstream: &UpstreamConfig,
+        model: &str,
+        service_tier: Option<&str>,
+    ) -> CodexRelayLiveSmokeResult {
+        let case = CodexRelayLiveSmokeCase::ResponsesWebSocket;
+        let url = match build_live_smoke_url(&upstream.base_url, "/responses")
+            .and_then(http_url_to_ws_url)
+        {
+            Ok(url) => url,
+            Err(error) => return transport_result(case, None, error),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "openai-beta",
+            HeaderValue::from_static(RESPONSES_WS_BETA_HEADER),
+        );
+        apply_upstream_auth_headers(upstream, &mut headers);
+        let request = match websocket_live_smoke_request(&url, &headers) {
+            Ok(request) => request,
+            Err(error) => return transport_result(case, None, error),
+        };
+
+        let connect_result =
+            tokio::time::timeout(std::time::Duration::from_secs(30), connect_async(request)).await;
+        let (mut socket, _) = match connect_result {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => return websocket_transport_error_result(error),
+            Err(_) => {
+                return transport_result(case, None, "websocket live smoke handshake timed out");
+            }
+        };
+
+        let body = responses_websocket_live_smoke_body(model, service_tier);
+        let message = TungsteniteMessage::Text(body.to_string().into());
+        if let Err(error) = socket.send(message).await {
+            return transport_result(
+                case,
+                Some(StatusCode::SWITCHING_PROTOCOLS),
+                format!("websocket live smoke send failed: {error}"),
+            );
+        }
+
+        read_websocket_live_smoke_result(socket, std::time::Duration::from_secs(60)).await
     }
 }
 
@@ -215,6 +285,8 @@ pub(super) async fn codex_relay_live_smoke_for_proxy(
         CodexRelayTargetSelection {
             station_name: payload.station_name.as_deref(),
             upstream_index: payload.upstream_index,
+            provider_id: payload.provider_id.as_deref(),
+            endpoint_id: payload.endpoint_id.as_deref(),
         },
     )?;
     let upstream_model =
@@ -246,12 +318,21 @@ pub(super) async fn codex_relay_live_smoke_for_proxy(
                 .to_string(),
         );
     }
+    if !cases.contains(&CodexRelayLiveSmokeCase::ResponsesWebSocket) {
+        warnings.push(
+            "Responses WebSocket was not tested because websocket smoke is explicit-only"
+                .to_string(),
+        );
+    }
 
     let response = CodexRelayLiveSmokeResponse {
         api_version: LIVE_SMOKE_API_VERSION,
         service_name: proxy.service_name.to_string(),
         station_name: target.station_name,
         upstream_index: target.upstream_index,
+        provider_id: target.provider_id,
+        endpoint_id: target.endpoint_id,
+        provider_endpoint_key: target.provider_endpoint_key,
         upstream_base_url: target.upstream.base_url,
         requested_model,
         upstream_model,
@@ -307,6 +388,9 @@ impl LiveSmokeSpec {
                 stream: true,
                 timeout: std::time::Duration::from_secs(60),
             },
+            CodexRelayLiveSmokeCase::ResponsesWebSocket => unreachable!(
+                "Responses WebSocket live smoke is handled before HTTP live smoke spec creation"
+            ),
         }
     }
 }
@@ -382,6 +466,193 @@ fn image_generation_live_smoke_body(model: &str, service_tier: Option<&str>) -> 
     body
 }
 
+fn responses_websocket_live_smoke_body(model: &str, service_tier: Option<&str>) -> Value {
+    let mut body = json!({
+        "type": "response.create",
+        "model": model,
+        "instructions": "You are running a Codex relay Responses WebSocket live smoke diagnostic. Reply with exactly OK.",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Codex relay Responses WebSocket live smoke. Reply OK."
+                    }
+                ]
+            }
+        ],
+        "tools": [],
+        "parallel_tool_calls": false,
+        "store": false,
+        "stream": true,
+        "prompt_cache_key": "codex-helper-live-smoke"
+    });
+    if let Some(service_tier) = service_tier {
+        body["service_tier"] = Value::String(service_tier.to_string());
+    }
+    body
+}
+
+async fn read_websocket_live_smoke_result(
+    mut socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    timeout: std::time::Duration,
+) -> CodexRelayLiveSmokeResult {
+    let case = CodexRelayLiveSmokeCase::ResponsesWebSocket;
+    let read_result = tokio::time::timeout(timeout, async {
+        loop {
+            let Some(message) = socket.next().await else {
+                return base_result(
+                    case,
+                    CodexRelayLiveSmokeOutcome::Unknown,
+                    CodexRelayLiveSmokeConfidence::Transport,
+                    Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+                    "websocket live smoke closed before any response event",
+                );
+            };
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    return transport_result(
+                        case,
+                        Some(StatusCode::SWITCHING_PROTOCOLS),
+                        format!("websocket live smoke read failed: {error}"),
+                    );
+                }
+            };
+            match message {
+                TungsteniteMessage::Text(text) => {
+                    return classify_websocket_live_smoke_message(text.as_bytes());
+                }
+                TungsteniteMessage::Binary(bytes) => {
+                    return classify_websocket_live_smoke_message(bytes.as_ref());
+                }
+                TungsteniteMessage::Ping(payload) => {
+                    let _ = socket.send(TungsteniteMessage::Pong(payload)).await;
+                }
+                TungsteniteMessage::Pong(_) => {}
+                TungsteniteMessage::Close(frame) => {
+                    let reason = frame
+                        .map(|frame| {
+                            if frame.reason.is_empty() {
+                                format!("websocket live smoke closed with code {}", frame.code)
+                            } else {
+                                format!(
+                                    "websocket live smoke closed with code {}: {}",
+                                    frame.code, frame.reason
+                                )
+                            }
+                        })
+                        .unwrap_or_else(|| "websocket live smoke closed".to_string());
+                    return base_result(
+                        case,
+                        CodexRelayLiveSmokeOutcome::Unknown,
+                        CodexRelayLiveSmokeConfidence::Transport,
+                        Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+                        reason,
+                    );
+                }
+                TungsteniteMessage::Frame(_) => {}
+            }
+        }
+    })
+    .await;
+
+    match read_result {
+        Ok(result) => result,
+        Err(_) => transport_result(
+            case,
+            Some(StatusCode::SWITCHING_PROTOCOLS),
+            "websocket live smoke timed out waiting for a response event",
+        ),
+    }
+}
+
+fn classify_websocket_live_smoke_message(body: &[u8]) -> CodexRelayLiveSmokeResult {
+    let case = CodexRelayLiveSmokeCase::ResponsesWebSocket;
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return base_result(
+            case,
+            CodexRelayLiveSmokeOutcome::Unknown,
+            CodexRelayLiveSmokeConfidence::Malformed,
+            Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+            "websocket live smoke returned a non-JSON data frame",
+        );
+    };
+
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing type>");
+    let event_message = websocket_error_event_message(&value);
+    let mut result = if matches!(
+        event_type,
+        "error" | "response.failed" | "response.incomplete"
+    ) {
+        let mut result = base_result(
+            case,
+            CodexRelayLiveSmokeOutcome::Failed,
+            CodexRelayLiveSmokeConfidence::LiveError,
+            Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+            match event_message {
+                Some(message) => format!("responses websocket returned {event_type}: {message}"),
+                None => format!("responses websocket returned {event_type}"),
+            },
+        );
+        result.error_class = Some("websocket_error_event".to_string());
+        result
+    } else if event_type.starts_with("response.") || event_type == "codex.rate_limits" {
+        base_result(
+            case,
+            CodexRelayLiveSmokeOutcome::Passed,
+            CodexRelayLiveSmokeConfidence::LiveAccepted,
+            Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+            format!("responses websocket accepted response.create and returned {event_type}"),
+        )
+    } else {
+        base_result(
+            case,
+            CodexRelayLiveSmokeOutcome::Unknown,
+            CodexRelayLiveSmokeConfidence::Malformed,
+            Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+            format!("websocket live smoke returned unexpected event type {event_type}"),
+        )
+    };
+    result.response_shape = Some(event_type.to_string());
+    result.output_items_seen = count_output_items(&value);
+    result.accepted_by_responses =
+        event_type.starts_with("response.") || event_type == "codex.rate_limits";
+    result
+}
+
+fn websocket_error_event_message(value: &Value) -> Option<String> {
+    [
+        "message",
+        "error.message",
+        "error.code",
+        "response.status",
+        "response.status_details.error.message",
+    ]
+    .iter()
+    .find_map(|path| json_string_path(value, path))
+    .map(|message| sanitized_error_snippet(message.as_bytes()))
+    .filter(|message| !message.is_empty())
+}
+
+fn json_string_path(value: &Value, path: &str) -> Option<String> {
+    let mut current = value;
+    for part in path.split('.') {
+        current = current.get(part)?;
+    }
+    current
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| (!current.is_null()).then(|| current.to_string()))
+}
+
 fn classify_live_smoke_response(
     case: CodexRelayLiveSmokeCase,
     status: StatusCode,
@@ -394,6 +665,9 @@ fn classify_live_smoke_response(
         }
         CodexRelayLiveSmokeCase::HostedImageGeneration => {
             classify_image_live_smoke_response(status, headers, body)
+        }
+        CodexRelayLiveSmokeCase::ResponsesWebSocket => {
+            unreachable!("Responses WebSocket live smoke is classified from WebSocket frames")
         }
     }
 }
@@ -544,6 +818,7 @@ fn live_smoke_error_reason(
     let prefix = match case {
         CodexRelayLiveSmokeCase::ResponsesCompact => "compact live smoke failed",
         CodexRelayLiveSmokeCase::HostedImageGeneration => "image live smoke failed",
+        CodexRelayLiveSmokeCase::ResponsesWebSocket => "responses websocket live smoke failed",
     };
     let snippet = sanitized_error_snippet(body);
     if snippet.is_empty() {
@@ -560,6 +835,9 @@ fn body_mentions_unsupported(case: CodexRelayLiveSmokeCase, body: &[u8]) -> bool
         }
         CodexRelayLiveSmokeCase::HostedImageGeneration => {
             text.contains("image_generation") || text.contains("image generation")
+        }
+        CodexRelayLiveSmokeCase::ResponsesWebSocket => {
+            text.contains("websocket") || text.contains("responses_websockets")
         }
     };
     capability_terms
@@ -745,6 +1023,38 @@ fn apply_upstream_auth_headers(upstream: &UpstreamConfig, headers: &mut HeaderMa
     }
 }
 
+fn websocket_transport_error_result(error: tungstenite::Error) -> CodexRelayLiveSmokeResult {
+    let case = CodexRelayLiveSmokeCase::ResponsesWebSocket;
+    match error {
+        tungstenite::Error::Http(response) => {
+            let status = StatusCode::from_u16(response.status().as_u16()).ok();
+            let body = response
+                .body()
+                .as_deref()
+                .map(|body| format!(": {}", sanitized_error_snippet(body)))
+                .unwrap_or_default();
+            let mut result = classify_live_smoke_error(
+                case,
+                status.unwrap_or(StatusCode::BAD_GATEWAY),
+                &HeaderMap::new(),
+                body.as_bytes(),
+            );
+            result.status_code = status.map(|status| status.as_u16());
+            result.reason = format!(
+                "websocket live smoke handshake failed with HTTP {}{}",
+                response.status().as_u16(),
+                body
+            );
+            result
+        }
+        other => transport_result(
+            case,
+            None,
+            format!("websocket live smoke transport error: {other}"),
+        ),
+    }
+}
+
 fn build_live_smoke_url(base_url: &str, path: &str) -> Result<reqwest::Url, String> {
     let base = base_url.trim_end_matches('/');
     let base_url =
@@ -767,6 +1077,39 @@ fn build_live_smoke_url(base_url: &str, path: &str) -> Result<reqwest::Url, Stri
     }
     let full = format!("{base}{path}");
     reqwest::Url::parse(&full).map_err(|error| format!("invalid live smoke url: {error}"))
+}
+
+fn http_url_to_ws_url(mut url: reqwest::Url) -> Result<reqwest::Url, String> {
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        other => {
+            return Err(format!(
+                "unsupported websocket live smoke base_url scheme '{other}'"
+            ));
+        }
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| format!("failed to convert live smoke url to {scheme}"))?;
+    Ok(url)
+}
+
+fn websocket_live_smoke_request(
+    url: &reqwest::Url,
+    headers: &HeaderMap,
+) -> Result<tungstenite_http::Request<()>, String> {
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|error| format!("invalid websocket live smoke request: {error}"))?;
+    for (name, value) in headers {
+        let name = tungstenite_http::HeaderName::from_bytes(name.as_str().as_bytes())
+            .map_err(|error| format!("invalid websocket live smoke header name: {error}"))?;
+        let value = tungstenite_http::HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|error| format!("invalid websocket live smoke header value: {error}"))?;
+        request.headers_mut().insert(name, value);
+    }
+    Ok(request)
 }
 
 async fn read_limited_body(response: reqwest::Response, max_bytes: usize) -> Result<Bytes, String> {
@@ -794,11 +1137,16 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::post;
+    use futures_util::{SinkExt, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        Request as WsRequest, Response as WsResponse,
+    };
 
     use super::*;
     use crate::config::{
-        ProxyConfig, RetryConfig, ServiceConfig, ServiceConfigManager, UiConfig, UpstreamAuth,
-        UpstreamConfig,
+        ProviderConfigV4, ProxyConfig, ProxyConfigV4, RetryConfig, RoutingConfigV4, ServiceConfig,
+        ServiceConfigManager, ServiceViewV4, UiConfig, UpstreamAuth, UpstreamConfig,
     };
     use crate::lb::LbState;
 
@@ -811,6 +1159,102 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve live smoke test");
+        });
+        (addr, handle)
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturedWebSocketSmoke {
+        path: Option<String>,
+        beta: Option<String>,
+        authorization: Option<String>,
+        api_key: Option<String>,
+        first_message: Option<Value>,
+    }
+
+    fn spawn_websocket_server(
+        captured: Arc<Mutex<CapturedWebSocketSmoke>>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ws");
+        let addr = listener.local_addr().expect("local_addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("to tokio listener");
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept ws");
+            let captured_for_callback = captured.clone();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |request: &WsRequest, response: WsResponse| {
+                    let mut captured = captured_for_callback.lock().expect("lock captured");
+                    captured.path = Some(request.uri().path().to_string());
+                    captured.beta = request
+                        .headers()
+                        .get("openai-beta")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    captured.authorization = request
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    captured.api_key = request
+                        .headers()
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("accept websocket handshake");
+
+            if let Some(Ok(message)) = socket.next().await {
+                let value = match message {
+                    TungsteniteMessage::Text(text) => {
+                        serde_json::from_str::<Value>(&text).expect("json ws text")
+                    }
+                    TungsteniteMessage::Binary(bytes) => {
+                        serde_json::from_slice::<Value>(&bytes).expect("json ws binary")
+                    }
+                    other => panic!("unexpected first ws message: {other:?}"),
+                };
+                captured.lock().expect("lock captured").first_message = Some(value);
+            }
+
+            socket
+                .send(TungsteniteMessage::Text(
+                    json!({
+                        "type": "response.created",
+                        "response": { "id": "resp_ws_smoke" }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send response.created");
+            socket
+                .send(TungsteniteMessage::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_ws_smoke",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [
+                                        { "type": "output_text", "text": "OK" }
+                                    ]
+                                }
+                            ]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send response.completed");
+            let _ = socket.close(None).await;
         });
         (addr, handle)
     }
@@ -852,6 +1296,42 @@ mod tests {
         ProxyService::new(
             reqwest::Client::new(),
             Arc::new(cfg),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        )
+    }
+
+    fn proxy_for_v4_providers(providers: Vec<(&str, String)>) -> ProxyService {
+        let v4 = ProxyConfigV4 {
+            codex: ServiceViewV4 {
+                providers: providers
+                    .iter()
+                    .map(|(provider_id, base_url)| {
+                        (
+                            (*provider_id).to_string(),
+                            ProviderConfigV4 {
+                                base_url: Some(base_url.clone()),
+                                inline_auth: UpstreamAuth::default(),
+                                ..ProviderConfigV4::default()
+                            },
+                        )
+                    })
+                    .collect(),
+                routing: Some(RoutingConfigV4::ordered_failover(
+                    providers
+                        .iter()
+                        .map(|(provider_id, _)| (*provider_id).to_string())
+                        .collect(),
+                )),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
+        ProxyService::new_with_v4_source(
+            reqwest::Client::new(),
+            Arc::new(runtime),
+            Some(Arc::new(v4)),
             "codex",
             Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
         )
@@ -923,6 +1403,32 @@ mod tests {
             result.response_shape.as_deref(),
             Some("image_generation_call")
         );
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_websocket_error_includes_message() {
+        let result = classify_websocket_live_smoke_message(
+            br#"{"type":"error","error":{"code":"quota_exceeded","message":"daily limit exceeded"}}"#,
+        );
+
+        assert_eq!(result.outcome, CodexRelayLiveSmokeOutcome::Failed);
+        assert_eq!(result.error_class.as_deref(), Some("websocket_error_event"));
+        assert!(result.reason.contains("daily limit exceeded"));
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_websocket_rate_limits_prove_accepted_stream() {
+        let result = classify_websocket_live_smoke_message(
+            br#"{"type":"codex.rate_limits","rate_limits":{"allowed":true}}"#,
+        );
+
+        assert_eq!(result.outcome, CodexRelayLiveSmokeOutcome::Passed);
+        assert_eq!(
+            result.confidence,
+            CodexRelayLiveSmokeConfidence::LiveAccepted
+        );
+        assert!(result.accepted_by_responses);
+        assert_eq!(result.response_shape.as_deref(), Some("codex.rate_limits"));
     }
 
     #[tokio::test]
@@ -1161,5 +1667,139 @@ mod tests {
         assert_eq!(response.upstream_model, "openai/gpt-5.5");
 
         upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_relay_live_smoke_websocket_sends_response_create_with_beta_and_auth() {
+        let captured = Arc::new(Mutex::new(CapturedWebSocketSmoke::default()));
+        let (upstream_addr, upstream_handle) = spawn_websocket_server(captured.clone());
+        let mut upstream = upstream(format!("http://{upstream_addr}/v1"));
+        upstream.auth.auth_token = Some("live-token".to_string());
+        upstream.auth.api_key = Some("live-api-key".to_string());
+        upstream
+            .model_mapping
+            .insert("gpt-5.5".to_string(), "openai/gpt-5.5".to_string());
+        let proxy = proxy_for_upstreams(vec![upstream]);
+
+        let response = codex_relay_live_smoke_for_proxy(
+            &proxy,
+            request("gpt-5.5", vec![CodexRelayLiveSmokeCase::ResponsesWebSocket]),
+        )
+        .await
+        .expect("websocket live smoke");
+
+        let captured = captured.lock().expect("lock captured");
+        assert_eq!(captured.path.as_deref(), Some("/v1/responses"));
+        assert_eq!(
+            captured.beta.as_deref(),
+            Some("responses_websockets=2026-02-06")
+        );
+        assert_eq!(captured.authorization.as_deref(), Some("Bearer live-token"));
+        assert_eq!(captured.api_key.as_deref(), Some("live-api-key"));
+        let first_message = captured.first_message.as_ref().expect("first message");
+        assert_eq!(first_message["type"].as_str(), Some("response.create"));
+        assert_eq!(first_message["model"].as_str(), Some("openai/gpt-5.5"));
+        assert_eq!(first_message["stream"].as_bool(), Some(true));
+        assert_eq!(first_message["store"].as_bool(), Some(false));
+        assert_eq!(first_message["tools"], json!([]));
+        drop(captured);
+
+        assert_eq!(response.requested_model, "gpt-5.5");
+        assert_eq!(response.upstream_model, "openai/gpt-5.5");
+        assert_eq!(
+            response.cases,
+            vec![CodexRelayLiveSmokeCase::ResponsesWebSocket]
+        );
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0].case,
+            CodexRelayLiveSmokeCase::ResponsesWebSocket
+        );
+        assert_eq!(
+            response.results[0].outcome,
+            CodexRelayLiveSmokeOutcome::Passed
+        );
+        assert!(response.results[0].accepted_by_responses);
+        assert_eq!(response.results[0].status_code, Some(101));
+
+        upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_relay_live_smoke_targets_route_graph_provider_id() {
+        let ciii_hits = Arc::new(AtomicUsize::new(0));
+        let ciii_hits_for_route = ciii_hits.clone();
+        let ciii_app = axum::Router::new().route(
+            "/v1/responses/compact",
+            post(move || {
+                let ciii_hits = ciii_hits_for_route.clone();
+                async move {
+                    ciii_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "output": [
+                            { "type": "compaction", "encrypted_content": "summary" }
+                        ]
+                    }))
+                }
+            }),
+        );
+        let input8_hits = Arc::new(AtomicUsize::new(0));
+        let input8_hits_for_route = input8_hits.clone();
+        let input8_app = axum::Router::new().route(
+            "/v1/responses/compact",
+            post(move || {
+                let input8_hits = input8_hits_for_route.clone();
+                async move {
+                    input8_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "output": [
+                            { "type": "compaction", "encrypted_content": "wrong target" }
+                        ]
+                    }))
+                }
+            }),
+        );
+        let (input8_addr, input8_handle) = spawn_axum_server(input8_app);
+        let (ciii_addr, ciii_handle) = spawn_axum_server(ciii_app);
+        let proxy = proxy_for_v4_providers(vec![
+            ("input8", format!("http://{input8_addr}/v1")),
+            ("ciii", format!("http://{ciii_addr}/v1")),
+        ]);
+
+        let mut payload = request("gpt-5.5", vec![CodexRelayLiveSmokeCase::ResponsesCompact]);
+        payload.provider_id = Some("ciii".to_string());
+        let response = codex_relay_live_smoke_for_proxy(&proxy, payload)
+            .await
+            .expect("live smoke");
+
+        assert_eq!(input8_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(ciii_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(response.station_name, "routing");
+        assert_eq!(response.upstream_index, 1);
+        assert_eq!(response.provider_id.as_deref(), Some("ciii"));
+        assert_eq!(response.endpoint_id.as_deref(), Some("default"));
+        assert_eq!(
+            response.provider_endpoint_key.as_deref(),
+            Some("codex/ciii/default")
+        );
+        assert_eq!(
+            response.results[0].outcome,
+            CodexRelayLiveSmokeOutcome::Passed
+        );
+
+        input8_handle.abort();
+        ciii_handle.abort();
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_websocket_case_uses_public_wire_name() {
+        let value =
+            serde_json::to_value(CodexRelayLiveSmokeCase::ResponsesWebSocket).expect("serialize");
+        assert_eq!(value, json!("responses_websocket"));
+
+        let legacy_value =
+            serde_json::from_value::<CodexRelayLiveSmokeCase>(json!("responses_web_socket"))
+                .expect("deserialize legacy spelling");
+        assert_eq!(legacy_value, CodexRelayLiveSmokeCase::ResponsesWebSocket);
     }
 }

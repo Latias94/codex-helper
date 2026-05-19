@@ -141,6 +141,12 @@ pub(crate) enum CodexCommand {
         /// Target station/provider name; defaults to the current Codex routing target
         #[arg(long)]
         station: Option<String>,
+        /// Target route-graph provider id; mutually exclusive with --station
+        #[arg(long)]
+        provider: Option<String>,
+        /// Target route-graph endpoint id; requires --provider
+        #[arg(long)]
+        endpoint: Option<String>,
         /// Target upstream index inside a legacy station/provider
         #[arg(long = "upstream-index")]
         upstream_index: Option<usize>,
@@ -163,15 +169,24 @@ pub(crate) enum CodexCommand {
         /// Target station/provider name; defaults to the current Codex routing target
         #[arg(long)]
         station: Option<String>,
+        /// Target route-graph provider id; mutually exclusive with --station
+        #[arg(long)]
+        provider: Option<String>,
+        /// Target route-graph endpoint id; requires --provider
+        #[arg(long)]
+        endpoint: Option<String>,
         /// Target upstream index inside a legacy station/provider
         #[arg(long = "upstream-index")]
         upstream_index: Option<usize>,
         /// Requested model; required for live smoke
         #[arg(long)]
         model: String,
-        /// Include hosted image_generation smoke in addition to compact smoke
+        /// Run hosted image_generation smoke instead of the default compact smoke
         #[arg(long)]
         image: bool,
+        /// Run Responses WebSocket smoke instead of the default compact smoke
+        #[arg(long)]
+        websocket: bool,
         /// Optional service tier forwarded to the live-smoke request body
         #[arg(long = "service-tier")]
         service_tier: Option<String>,
@@ -929,6 +944,10 @@ mod tests {
             "gpt-5.5",
             "--preset",
             "official-imagegen",
+            "--provider",
+            "ciii",
+            "--endpoint",
+            "default",
             "--json",
         ])
         .expect("parse codex relay capabilities");
@@ -938,6 +957,8 @@ mod tests {
                 CodexCommand::Capabilities {
                     model,
                     preset,
+                    provider,
+                    endpoint,
                     json,
                     ..
                 },
@@ -950,6 +971,8 @@ mod tests {
             preset,
             Some(CodexClientPatchPresetArg::OfficialImagegenBridge)
         );
+        assert_eq!(provider.as_deref(), Some("ciii"));
+        assert_eq!(endpoint.as_deref(), Some("default"));
         assert!(json);
     }
 
@@ -1010,6 +1033,7 @@ mod tests {
                     acknowledgement,
                     model,
                     image,
+                    websocket,
                     ..
                 },
         }) = cli.command
@@ -1019,6 +1043,40 @@ mod tests {
         assert_eq!(acknowledgement, "run-live-codex-relay-smoke");
         assert_eq!(model, "gpt-5.5");
         assert!(image);
+        assert!(!websocket);
+    }
+
+    #[test]
+    fn codex_relay_cli_parses_live_smoke_websocket_flag() {
+        let cli = Cli::try_parse_from([
+            "codex-helper",
+            "codex",
+            "relay-live-smoke",
+            "--acknowledgement",
+            "run-live-codex-relay-smoke",
+            "--model",
+            "gpt-5.5",
+            "--provider",
+            "input8",
+            "--websocket",
+        ])
+        .expect("parse codex relay live smoke websocket flag");
+
+        let Some(Command::Codex {
+            cmd:
+                CodexCommand::LiveSmoke {
+                    model,
+                    provider,
+                    websocket,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected codex relay live smoke command");
+        };
+        assert_eq!(model, "gpt-5.5");
+        assert_eq!(provider.as_deref(), Some("input8"));
+        assert!(websocket);
     }
 
     #[test]

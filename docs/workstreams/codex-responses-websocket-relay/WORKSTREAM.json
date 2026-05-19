@@ -25,6 +25,10 @@
     "cargo check -p codex-helper-core",
     "cargo check -p codex-helper",
     "cargo nextest run -p codex-helper-core responses_websocket",
+    "cargo nextest run -p codex-helper-core codex_relay_live_smoke",
+    "cargo nextest run -p codex-helper-core codex_relay_target",
+    "cargo nextest run -p codex-helper codex_relay_cli",
+    "cargo nextest run -p codex-helper live_smoke_cases",
     "cargo nextest run -p codex-helper-core forecast",
     "cargo nextest run -p codex-helper-tui spend_forecast",
     "cargo nextest run -p codex-helper-tui stats_kpis_show_spend_projection_only_when_sample_is_confident",
@@ -36,7 +40,7 @@
   "adr_refs": [],
   "continue_policy": {
     "default_action": "continue",
-    "notes": "Keep follow-ons separate: usage parsing from WS events, real relay smoke, and permessage-deflate/TLS parity if a target relay requires them."
+    "notes": "Keep follow-ons separate: usage parsing from WS events, real relay smoke on a non-exhausted target, and permessage-deflate/TLS parity if a target relay requires them."
   }
 }
 

@@ -148,8 +148,8 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
 ```
 
 With no `cases` field, live smoke only checks remote compaction v1 through `/responses/compact`.
-Hosted image generation is never part of the default case set. To explicitly test the hosted tool
-request path:
+Hosted image generation and Responses WebSocket are never part of the default case set. To
+explicitly test the hosted tool request path:
 
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
@@ -158,6 +158,24 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
     "acknowledgement": "run-live-codex-relay-smoke",
     "model": "gpt-5.5",
     "cases": ["responses_compact", "hosted_image_generation"]
+  }'
+```
+
+To explicitly test the selected upstream's Responses WebSocket v2 path, include
+`responses_websocket`. The smoke opens `GET /responses` as a WebSocket, injects
+`OpenAI-Beta: responses_websockets=2026-02-06`, sends one minimal `response.create` frame, and
+passes when the relay returns a `response.*` event or a Codex WebSocket protocol event such as
+`codex.rate_limits`:
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
+  -H 'content-type: application/json' \
+  -d '{
+    "acknowledgement": "run-live-codex-relay-smoke",
+    "model": "gpt-5.5",
+    "provider_id": "ciii",
+    "endpoint_id": "default",
+    "cases": ["responses_websocket"]
   }'
 ```
 
@@ -171,7 +189,9 @@ The same diagnostics are available without starting the TUI or admin listener:
 ```bash
 codex-helper codex relay-capabilities \
   --preset official-imagegen \
-  --model gpt-5.5
+  --model gpt-5.5 \
+  --provider ciii \
+  --endpoint default
 
 codex-helper codex relay-live-smoke \
   --acknowledgement run-live-codex-relay-smoke \
@@ -182,14 +202,29 @@ codex-helper codex relay-live-smoke \
   --model gpt-5.5 \
   --image
 
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5 \
+  --provider ciii \
+  --websocket
+
 codex-helper codex relay-evidence --limit 20
 ```
 
+For the CLI, omitting optional case flags runs the default compact smoke. Supplying `--image`,
+`--websocket`, or both runs only those explicit optional cases, so an optional smoke does not
+accidentally spend an additional compact request.
+
+Targeting uses the normal selected runtime target by default. For route-graph configs, diagnostics
+can target a provider endpoint directly with `provider_id` / `endpoint_id` in the API body or
+`--provider` / `--endpoint` in the CLI. Legacy `--station` / `--upstream-index` is still available
+for station-shaped configs, but provider targeting cannot be combined with station targeting.
+
 Live smoke is intentionally isolated from normal routing behavior. It selects one upstream, sends at
-most one request per selected case, bypasses route retry/failover, and does not write request ledger
-entries, route affinity, passive health, runtime health, balance state, or patch-preset changes. Image
-responses are summarized only: codex-helper reports whether an `image_generation_call` appeared, but
-does not store raw image bytes or base64 payloads.
+most one request/connection per selected case, bypasses route retry/failover, and does not write
+request ledger entries, route affinity, passive health, runtime health, balance state, or
+patch-preset changes. Image responses are summarized only: codex-helper reports whether an
+`image_generation_call` appeared, but does not store raw image bytes or base64 payloads.
 
 Capability diagnostics and live smoke append sanitized summaries to
 `~/.codex-helper/logs/codex_relay_evidence.jsonl`. This evidence store is local operator memory,

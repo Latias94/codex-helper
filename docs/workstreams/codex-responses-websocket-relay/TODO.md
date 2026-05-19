@@ -38,3 +38,17 @@ Last updated: 2026-05-19
   Validation: formatting and core tests pass; broader workspace gate if feasible.
   Evidence: `cargo fmt --check`, targeted nextest, `cargo nextest run -p codex-helper-core`, optional workspace gate.
 
+## M5 — Real Relay Smoke Surface
+
+- [x] CRW-060 [owner=main] [deps=CRW-030,CRW-040] [scope=crates/core/src/proxy/codex_relay_live_smoke.rs,src/cli_types.rs,src/commands/codex.rs,docs/CONFIGURATION*.md]
+  Goal: Add an explicit Responses WebSocket live smoke case so operators can verify real relay WebSocket support without enabling it implicitly.
+  Validation: local WebSocket upstream test proves `OpenAI-Beta` injection, upstream auth, model mapping, and `response.create` first-frame shape; CLI parses `--websocket`.
+  Evidence: record targeted test commands in `EVIDENCE_AND_GATES.md`.
+
+## M6 — Route-Graph Diagnostic Targeting
+
+- [x] CRW-070 [owner=main] [deps=CRW-060] [scope=crates/core/src/proxy/codex_relay_target.rs,src/cli_types.rs,src/commands/codex.rs,docs/CONFIGURATION*.md]
+  Goal: Let capability diagnostics and live smoke target route-graph provider ids/endpoints directly, not only legacy station names and upstream indexes.
+  Validation: `--provider ciii` (and optional `--endpoint`) resolves the route-graph provider endpoint without changing normal routing; targeted unit tests cover provider, endpoint, and station fallback selection.
+  Evidence: record commands in `EVIDENCE_AND_GATES.md`.
+

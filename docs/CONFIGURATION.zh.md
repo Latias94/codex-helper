@@ -130,7 +130,7 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
   }'
 ```
 
-不传 `cases` 时，live smoke 只会通过 `/responses/compact` 检查 remote compaction v1。Hosted image generation 永远不属于默认 case。要显式测试 hosted tool 请求链路，可以传：
+不传 `cases` 时，live smoke 只会通过 `/responses/compact` 检查 remote compaction v1。Hosted image generation 和 Responses WebSocket 永远不属于默认 case。要显式测试 hosted tool 请求链路，可以传：
 
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
@@ -142,6 +142,20 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
   }'
 ```
 
+要显式测试选中上游的 Responses WebSocket v2 链路，可传 `responses_websocket`。这个 smoke 会用 WebSocket 打开 `GET /responses`，注入 `OpenAI-Beta: responses_websockets=2026-02-06`，发送一个最小 `response.create` frame；只要中转返回 `response.*` 事件，或 `codex.rate_limits` 这类 Codex WebSocket 协议事件，就说明握手和首帧协议可用：
+
+```bash
+curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-live-smoke \
+  -H 'content-type: application/json' \
+  -d '{
+    "acknowledgement": "run-live-codex-relay-smoke",
+    "model": "gpt-5.5",
+    "provider_id": "ciii",
+    "endpoint_id": "default",
+    "cases": ["responses_websocket"]
+  }'
+```
+
 TUI Settings 页也提供同一能力：在确认窗口内按两次 `X` 会跑 compact-only live smoke，按两次 `Y` 会跑 compact + hosted image-generation live smoke。TUI 默认使用当前 Codex runtime target 和推断出来的模型；如果走 API，则可以在请求体里显式传目标字段。
 
 不启动 TUI 或 admin listener 时，也可以直接用 CLI 跑同一套诊断：
@@ -149,7 +163,9 @@ TUI Settings 页也提供同一能力：在确认窗口内按两次 `X` 会跑 c
 ```bash
 codex-helper codex relay-capabilities \
   --preset official-imagegen \
-  --model gpt-5.5
+  --model gpt-5.5 \
+  --provider ciii \
+  --endpoint default
 
 codex-helper codex relay-live-smoke \
   --acknowledgement run-live-codex-relay-smoke \
@@ -160,10 +176,20 @@ codex-helper codex relay-live-smoke \
   --model gpt-5.5 \
   --image
 
+codex-helper codex relay-live-smoke \
+  --acknowledgement run-live-codex-relay-smoke \
+  --model gpt-5.5 \
+  --provider ciii \
+  --websocket
+
 codex-helper codex relay-evidence --limit 20
 ```
 
-Live smoke 刻意和正常路由隔离。它只选择一个上游，每个选中的 case 最多发一次请求，不走 route retry/failover，也不会写 request ledger、route affinity、passive health、runtime health、余额状态或自动修改 patch 预设。图片响应只做摘要：codex-helper 会报告是否出现 `image_generation_call`，但不会保存原始图片字节或 base64 payload。
+CLI 里不带可选 case 参数时会跑默认 compact smoke；传 `--image`、`--websocket` 或两者同时传时，只跑这些显式可选 case，避免为了测某个可选能力而额外消耗一次 compact 请求。
+
+默认目标仍是当前 runtime 选中的上游。Route graph 配置下，也可以通过 API 请求体里的 `provider_id` / `endpoint_id`，或 CLI 的 `--provider` / `--endpoint` 直接指定 provider endpoint。旧的 `--station` / `--upstream-index` 仍用于 station 形态配置，但不能和 provider 目标混用。
+
+Live smoke 刻意和正常路由隔离。它只选择一个上游，每个选中的 case 最多发一次请求/连接，不走 route retry/failover，也不会写 request ledger、route affinity、passive health、runtime health、余额状态或自动修改 patch 预设。图片响应只做摘要：codex-helper 会报告是否出现 `image_generation_call`，但不会保存原始图片字节或 base64 payload。
 
 Capability diagnostics 和 live smoke 会把已脱敏的摘要追加写入 `~/.codex-helper/logs/codex_relay_evidence.jsonl`。这个 evidence store 是本地人工诊断记忆，不是 routing truth；它不会进入 request ledger 汇总，也不会驱动 load balancing、session affinity、passive health、余额耗尽、retry policy 或自动 patch 预设切换。需要给中转站对比或 bug report 附机器可读结果时，可以用 `codex-helper codex relay-evidence --json`。
 

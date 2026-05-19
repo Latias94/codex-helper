@@ -212,3 +212,105 @@ cargo nextest run -p codex-helper-tui startup --no-fail-fast
 # pass: 4 tests run, 4 passed
 ```
 
+### 2026-05-19 18:40 +08:00 бк Responses WebSocket Live Smoke
+
+Claim: operators can explicitly test a selected upstream relay's Responses WebSocket v2 path before
+turning on `responses_websocket` for normal Codex traffic.
+
+Implemented:
+
+- Added `CodexRelayLiveSmokeCase::ResponsesWebSocket`.
+- Added CLI `codex-helper codex relay-live-smoke --websocket`.
+- The WebSocket live smoke:
+  - connects to the selected upstream's `/responses` WebSocket URL,
+  - injects `OpenAI-Beta: responses_websockets=2026-02-06`,
+  - injects helper-side upstream auth,
+  - applies selected-upstream model mapping,
+  - sends one minimal `response.create` frame,
+  - reports pass when a `response.*` frame is received.
+- Kept WebSocket smoke explicit-only; default live smoke remains compact-only.
+
+Command evidence:
+
+```powershell
+cargo fmt --check
+# pass
+
+cargo check -p codex-helper
+# pass
+
+cargo nextest run -p codex-helper-core codex_relay_live_smoke_websocket_sends_response_create_with_beta_and_auth --no-fail-fast
+# pass: 1 test run, 1 passed
+
+cargo nextest run -p codex-helper-core codex_relay_live_smoke --no-fail-fast
+# pass: 9 tests run, 9 passed
+
+cargo nextest run -p codex-helper codex_relay_cli --no-fail-fast
+# pass: 6 tests run, 6 passed
+
+cargo nextest run -p codex-helper live_smoke_cases --no-fail-fast
+# pass: 4 tests run, 4 passed
+
+cargo nextest run -p codex-helper-tui codex_relay --no-fail-fast
+# pass: 7 tests run, 7 passed
+
+cargo run -p codex-helper --bin codex-helper -- codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5 --websocket --json
+# ran websocket-only; selected routing[0] https://input.9z1.me/v1; upstream rejected handshake with HTTP 429 DAILY_LIMIT_EXCEEDED
+
+cargo run -p codex-helper --bin codex-helper -- routing explain --model gpt-5.5 --json
+# selected provider_id=input; fallback candidates include provider_id=ciii base_url=https://codex.ciii.club/v1
+
+cargo run -p codex-helper --bin codex-helper -- codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --station ciii --model gpt-5.5 --websocket --json
+# fails before network IO: station 'ciii' not found, because live-smoke targeting still accepts legacy station names, not route-graph provider ids
+```
+
+### 2026-05-19 19:40 +08:00 бк CRW-070 Route-Graph Diagnostic Targeting
+
+Claim: Codex relay capability diagnostics and live smoke can target route-graph provider endpoints
+directly, so operators can run `--provider ciii` / `--provider input8` without changing normal
+routing.
+
+Implemented:
+
+- Added API request fields `provider_id` and `endpoint_id` for both capability diagnostics and live
+  smoke.
+- Added CLI flags `--provider` and `--endpoint` for both `relay-capabilities` and
+  `relay-live-smoke`.
+- Extended target selection to resolve provider ids from compiled route-graph upstream tags, prefer
+  `endpoint_id = default` when no endpoint is specified, and reject mixed provider/station
+  targeting.
+- Responses and evidence now include `provider_id`, `endpoint_id`, and `provider_endpoint_key` when
+  available.
+
+Command evidence:
+
+```powershell
+cargo nextest run -p codex-helper-core codex_relay_target --no-fail-fast
+# pass: 2 tests run, 2 passed
+
+cargo nextest run -p codex-helper-core codex_relay_live_smoke_targets_route_graph_provider_id --no-fail-fast
+# pass: 1 test run, 1 passed
+
+cargo nextest run -p codex-helper-core codex_relay_capabilities_targets_route_graph_provider_id --no-fail-fast
+# pass: 1 test run, 1 passed
+
+cargo nextest run -p codex-helper codex_relay_cli --no-fail-fast
+# pass: 6 tests run, 6 passed
+```
+
+Additional live-provider evidence:
+
+```powershell
+cargo run -p codex-helper --bin codex-helper -- codex relay-capabilities --model gpt-5.5 --provider input8 --json
+# pass: target codex/input8/default; /models, /responses, /responses/compact supported by validation-only probes
+
+cargo run -p codex-helper --bin codex-helper -- codex relay-capabilities --model gpt-5.5 --provider ciii --json
+# pass: target codex/ciii/default; /models, /responses, /responses/compact supported by validation-only probes
+
+cargo run -p codex-helper --bin codex-helper -- codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5 --provider input8 --websocket --json
+# pass: target codex/input8/default; WebSocket handshake HTTP 101; accepted response.create and returned codex.rate_limits
+
+cargo run -p codex-helper --bin codex-helper -- codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5 --provider ciii --websocket --json
+# unknown: target codex/ciii/default; WebSocket handshake HTTP 101 then close code 1011 "upstream websocket proxy failed"
+```
+

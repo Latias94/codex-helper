@@ -18,6 +18,8 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
     match cmd {
         CodexCommand::Capabilities {
             station,
+            provider,
+            endpoint,
             upstream_index,
             model,
             preset,
@@ -27,6 +29,8 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
             let response = proxy
                 .codex_relay_capabilities(CodexRelayCapabilitiesRequest {
                     station_name: station,
+                    provider_id: provider,
+                    endpoint_id: endpoint,
                     upstream_index,
                     model,
                     patch_mode: preset.map(Into::into),
@@ -43,21 +47,23 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
         CodexCommand::LiveSmoke {
             acknowledgement,
             station,
+            provider,
+            endpoint,
             upstream_index,
             model,
             image,
+            websocket,
             service_tier,
             json,
         } => {
             let proxy = build_codex_proxy_for_cli().await?;
-            let mut cases = vec![CodexRelayLiveSmokeCase::ResponsesCompact];
-            if image {
-                cases.push(CodexRelayLiveSmokeCase::HostedImageGeneration);
-            }
+            let cases = live_smoke_cases(image, websocket);
             let response = proxy
                 .codex_relay_live_smoke(CodexRelayLiveSmokeRequest {
                     acknowledgement: Some(acknowledgement),
                     station_name: station,
+                    provider_id: provider,
+                    endpoint_id: endpoint,
                     upstream_index,
                     model: Some(model),
                     cases,
@@ -95,6 +101,20 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
     Ok(())
 }
 
+fn live_smoke_cases(image: bool, websocket: bool) -> Vec<CodexRelayLiveSmokeCase> {
+    let mut cases = Vec::new();
+    if image {
+        cases.push(CodexRelayLiveSmokeCase::HostedImageGeneration);
+    }
+    if websocket {
+        cases.push(CodexRelayLiveSmokeCase::ResponsesWebSocket);
+    }
+    if cases.is_empty() {
+        cases.push(CodexRelayLiveSmokeCase::ResponsesCompact);
+    }
+    cases
+}
+
 async fn build_codex_proxy_for_cli() -> CliResult<ProxyService> {
     let loaded = load_or_bootstrap_for_service_with_v4_source(ServiceKind::Codex)
         .await
@@ -130,8 +150,13 @@ fn print_json<T: serde::Serialize>(value: &T) -> CliResult<()> {
 fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
     println!("{}", "Codex relay capability diagnostics".bold());
     println!(
-        "Target: {}[{}] {}",
-        response.station_name, response.upstream_index, response.upstream_base_url
+        "Target: {} {}",
+        format_target_identity(
+            &response.station_name,
+            response.upstream_index,
+            response.provider_endpoint_key.as_deref()
+        ),
+        response.upstream_base_url
     );
     println!(
         "Patch preset: {}; Responses WebSocket: {}; model: {}",
@@ -172,8 +197,13 @@ fn print_capabilities_text(response: &CodexRelayCapabilitiesResponse) {
 fn print_live_smoke_text(response: &CodexRelayLiveSmokeResponse) {
     println!("{}", "Codex relay live smoke".bold());
     println!(
-        "Target: {}[{}] {}",
-        response.station_name, response.upstream_index, response.upstream_base_url
+        "Target: {} {}",
+        format_target_identity(
+            &response.station_name,
+            response.upstream_index,
+            response.provider_endpoint_key.as_deref()
+        ),
+        response.upstream_base_url
     );
     println!(
         "Model: requested={}, upstream={}",
@@ -202,6 +232,19 @@ fn print_live_smoke_text(response: &CodexRelayLiveSmokeResponse) {
     );
 }
 
+fn format_target_identity(
+    station_name: &str,
+    upstream_index: usize,
+    provider_endpoint_key: Option<&str>,
+) -> String {
+    match provider_endpoint_key {
+        Some(provider_endpoint_key) => {
+            format!("{provider_endpoint_key} via {station_name}[{upstream_index}]")
+        }
+        None => format!("{station_name}[{upstream_index}]"),
+    }
+}
+
 fn print_evidence_text(entries: &[crate::proxy::CodexRelayEvidenceEntry]) {
     let path = codex_relay_evidence_path();
     println!("{}", format!("Codex relay evidence from {:?}", path).bold());
@@ -215,7 +258,10 @@ fn print_evidence_text(entries: &[crate::proxy::CodexRelayEvidenceEntry]) {
             entry.timestamp_ms,
             entry.evidence_id,
             entry.kind,
-            entry.station_name,
+            entry
+                .provider_endpoint_key
+                .as_deref()
+                .unwrap_or(entry.station_name.as_str()),
             entry.upstream_index,
             entry.model.as_deref().unwrap_or("-"),
             entry.source
@@ -252,5 +298,54 @@ fn print_evidence_text(entries: &[crate::proxy::CodexRelayEvidenceEntry]) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_smoke_cases_defaults_to_compact() {
+        assert_eq!(
+            live_smoke_cases(false, false),
+            vec![CodexRelayLiveSmokeCase::ResponsesCompact]
+        );
+    }
+
+    #[test]
+    fn live_smoke_cases_websocket_flag_runs_websocket_only() {
+        assert_eq!(
+            live_smoke_cases(false, true),
+            vec![CodexRelayLiveSmokeCase::ResponsesWebSocket]
+        );
+    }
+
+    #[test]
+    fn live_smoke_cases_image_flag_runs_image_only() {
+        assert_eq!(
+            live_smoke_cases(true, false),
+            vec![CodexRelayLiveSmokeCase::HostedImageGeneration]
+        );
+    }
+
+    #[test]
+    fn live_smoke_cases_combines_explicit_optional_smokes_without_compact() {
+        assert_eq!(
+            live_smoke_cases(true, true),
+            vec![
+                CodexRelayLiveSmokeCase::HostedImageGeneration,
+                CodexRelayLiveSmokeCase::ResponsesWebSocket,
+            ]
+        );
+    }
+
+    #[test]
+    fn format_target_identity_includes_provider_endpoint_when_available() {
+        assert_eq!(
+            format_target_identity("routing", 9, Some("codex/ciii/default")),
+            "codex/ciii/default via routing[9]"
+        );
+        assert_eq!(format_target_identity("input", 0, None), "input[0]");
     }
 }

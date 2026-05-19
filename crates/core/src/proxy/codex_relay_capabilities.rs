@@ -23,6 +23,10 @@ pub struct CodexRelayCapabilitiesRequest {
     #[serde(default)]
     pub station_name: Option<String>,
     #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+    #[serde(default)]
     pub upstream_index: Option<usize>,
     #[serde(default)]
     pub model: Option<String>,
@@ -38,6 +42,12 @@ pub struct CodexRelayCapabilitiesResponse {
     pub service_name: String,
     pub station_name: String,
     pub upstream_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_endpoint_key: Option<String>,
     pub upstream_base_url: String,
     pub patch_mode: CodexPatchMode,
     pub responses_websocket: bool,
@@ -81,6 +91,8 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         CodexRelayTargetSelection {
             station_name: payload.station_name.as_deref(),
             upstream_index: payload.upstream_index,
+            provider_id: payload.provider_id.as_deref(),
+            endpoint_id: payload.endpoint_id.as_deref(),
         },
     )?;
     let patch_mode = payload
@@ -147,6 +159,9 @@ pub(super) async fn codex_relay_capabilities_for_proxy(
         service_name: proxy.service_name.to_string(),
         station_name: target.station_name,
         upstream_index: target.upstream_index,
+        provider_id: target.provider_id,
+        endpoint_id: target.endpoint_id,
+        provider_endpoint_key: target.provider_endpoint_key,
         upstream_base_url: target.upstream.base_url,
         patch_mode,
         responses_websocket,
@@ -313,5 +328,80 @@ fn probe_confidence_label(confidence: super::CodexRelayProbeConfidence) -> &'sta
         super::CodexRelayProbeConfidence::ErrorClassification => "error_classification",
         super::CodexRelayProbeConfidence::Transport => "transport",
         super::CodexRelayProbeConfidence::Malformed => "malformed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
+
+    use reqwest::Client;
+
+    use super::*;
+    use crate::config::{
+        ProviderConfigV4, ProxyConfigV4, RoutingConfigV4, ServiceViewV4, UpstreamAuth,
+    };
+    use crate::lb::LbState;
+
+    #[tokio::test]
+    async fn codex_relay_capabilities_targets_route_graph_provider_id() {
+        let v4 = ProxyConfigV4 {
+            codex: ServiceViewV4 {
+                providers: BTreeMap::from([
+                    (
+                        "input8".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                    (
+                        "ciii".to_string(),
+                        ProviderConfigV4 {
+                            base_url: Some("http://127.0.0.1:10/v1".to_string()),
+                            inline_auth: UpstreamAuth::default(),
+                            ..ProviderConfigV4::default()
+                        },
+                    ),
+                ]),
+                routing: Some(RoutingConfigV4::ordered_failover(vec![
+                    "input8".to_string(),
+                    "ciii".to_string(),
+                ])),
+                ..ServiceViewV4::default()
+            },
+            ..ProxyConfigV4::default()
+        };
+        let runtime = crate::config::compile_v4_to_runtime(&v4).expect("compile v4 runtime");
+        let proxy = ProxyService::new_with_v4_source(
+            Client::new(),
+            Arc::new(runtime),
+            Some(Arc::new(v4)),
+            "codex",
+            Arc::new(Mutex::new(HashMap::<String, LbState>::new())),
+        );
+
+        let response = codex_relay_capabilities_for_proxy(
+            &proxy,
+            CodexRelayCapabilitiesRequest {
+                provider_id: Some("ciii".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("capabilities response");
+
+        assert_eq!(response.station_name, "routing");
+        assert_eq!(response.upstream_index, 1);
+        assert_eq!(response.provider_id.as_deref(), Some("ciii"));
+        assert_eq!(response.endpoint_id.as_deref(), Some("default"));
+        assert_eq!(
+            response.provider_endpoint_key.as_deref(),
+            Some("codex/ciii/default")
+        );
+        assert_eq!(response.upstream_base_url, "http://127.0.0.1:10/v1");
     }
 }

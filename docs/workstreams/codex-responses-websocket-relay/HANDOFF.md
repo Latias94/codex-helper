@@ -22,11 +22,18 @@ The first shippable slice is in place:
 2. `responses_websocket` is an orthogonal switch in config and CLI.
 3. Helper owns the Responses WebSocket relay for the three expected GET upgrade routes.
 4. Docs and diagnostics explain the new switch and default HTTP-only posture.
+5. `relay-live-smoke --websocket` can validate a selected real upstream's Responses WebSocket v2
+   handshake, auth, model mapping, beta header, and first `response.create` frame.
+6. Relay diagnostics can target route-graph providers directly with `--provider` / `--endpoint`;
+   responses report `provider_endpoint_key` when available.
+7. Real smoke results: `input8` accepts Responses WebSocket v2 (`codex.rate_limits` after HTTP
+   101), while `ciii` upgrades but closes with code 1011 `upstream websocket proxy failed`.
 
 ## Follow-on work
 
 1. Add usage extraction from Responses WebSocket events if upstream metadata makes it reliable.
-2. Add a live smoke test against a real relay target after explicit acknowledgement.
-3. Review whether the upstream websocket path should mirror Codex's permessage-deflate/TLS connector
+2. Review whether the upstream websocket path should mirror Codex's permessage-deflate/TLS connector
    behavior more closely for certain relays.
+3. If needed, report the ciii WebSocket close code 1011 to the relay operator; its HTTP endpoints
+   pass validation probes, so the failure is specific to WebSocket upstream proxying.
 
