@@ -487,17 +487,17 @@ async fn select_responses_websocket_target(
                         };
 
                     let target = AttemptTarget::from_candidate(proxy.service_name, candidate);
-                    return build_selected(
+                    return build_selected(BuildSelectedParams {
                         proxy,
                         prepared,
                         target,
-                        None,
-                        Some(route_graph_key),
-                        selection.avoided_candidate_indices,
-                        selection.avoided_total,
-                        selection.total_upstreams,
+                        legacy_lb: None,
+                        route_graph_key: Some(route_graph_key),
+                        avoided_indices: selection.avoided_candidate_indices,
+                        avoided_total: selection.avoided_total,
+                        total_upstreams: selection.total_upstreams,
                         concurrency_permit,
-                    )
+                    })
                     .await;
                 }
 
@@ -574,17 +574,17 @@ async fn select_responses_websocket_target(
                         route_state.route_avoid_candidate_indices(&legacy_template);
                     let selected_upstream = selected.selected_upstream;
                     let selected_index = selected_upstream.index;
-                    match build_selected(
+                    match build_selected(BuildSelectedParams {
                         proxy,
                         prepared,
-                        AttemptTarget::legacy(selected_upstream.clone()),
-                        Some(lb.clone()),
-                        None,
+                        target: AttemptTarget::legacy(selected_upstream.clone()),
+                        legacy_lb: Some(lb.clone()),
+                        route_graph_key: None,
                         avoided_indices,
-                        selection.avoided_total,
+                        avoided_total: selection.avoided_total,
                         total_upstreams,
-                        None,
-                    )
+                        concurrency_permit: None,
+                    })
                     .await
                     {
                         Ok(selected) => return Ok(selected),
@@ -606,9 +606,9 @@ async fn select_responses_websocket_target(
     }
 }
 
-async fn build_selected(
-    proxy: &ProxyService,
-    prepared: &ResponsesWebSocketPrepared,
+struct BuildSelectedParams<'a> {
+    proxy: &'a ProxyService,
+    prepared: &'a ResponsesWebSocketPrepared,
     target: AttemptTarget,
     legacy_lb: Option<LoadBalancer>,
     route_graph_key: Option<String>,
@@ -616,7 +616,22 @@ async fn build_selected(
     avoided_total: usize,
     total_upstreams: usize,
     concurrency_permit: Option<ConcurrencyPermit>,
+}
+
+async fn build_selected(
+    params: BuildSelectedParams<'_>,
 ) -> Result<ResponsesWebSocketSelected, (StatusCode, String)> {
+    let BuildSelectedParams {
+        proxy,
+        prepared,
+        target,
+        legacy_lb,
+        route_graph_key,
+        avoided_indices,
+        avoided_total,
+        total_upstreams,
+        concurrency_permit,
+    } = params;
     let (model_note, mapped_body) = apply_selected_model_mapping(
         &target,
         &prepared.body_for_upstream,

@@ -177,9 +177,7 @@ fn target_provider_id(upstream: &UpstreamConfig) -> Option<String> {
 }
 
 fn target_endpoint_id(upstream: &UpstreamConfig, upstream_index: usize) -> Option<String> {
-    if target_provider_id(upstream).is_none() {
-        return None;
-    }
+    target_provider_id(upstream)?;
     Some(
         upstream
             .tags

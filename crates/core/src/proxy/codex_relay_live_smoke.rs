@@ -1172,6 +1172,7 @@ mod tests {
         first_message: Option<Value>,
     }
 
+    #[allow(clippy::result_large_err)]
     fn spawn_websocket_server(
         captured: Arc<Mutex<CapturedWebSocketSmoke>>,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {

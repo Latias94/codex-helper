@@ -3,7 +3,7 @@ All notable changes to this project will be documented in this file.
 
 > Recent entries use **Chinese first, then an English summary**. Older entries keep the previous inline bilingual style.
 
-## [未发布 / Unreleased]
+## [0.16.0] - 2026-05-19
 
 ### 中文
 

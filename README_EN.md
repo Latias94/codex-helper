@@ -6,7 +6,7 @@ Some Codex features do not appear just because `/responses` can be forwarded. Ch
 
 codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, client presets, capability diagnostics, balance visibility, and fallback policy.
 
-Current release: `v0.15.0`
+Current release: `v0.16.0`
 
 中文说明: [README.md](README.md)
 
