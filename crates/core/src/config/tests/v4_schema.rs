@@ -1052,6 +1052,61 @@ responses_websocket = true
 }
 
 #[test]
+fn load_config_auto_normalizes_legacy_codex_client_patch_mode() {
+    let _env = setup_temp_codex_home();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async move {
+        let dir = super::proxy_home_dir();
+        let toml_path = dir.join("config.toml");
+        write_file(
+            &toml_path,
+            r#"
+version = 5
+
+[codex.client_patch]
+# mode = "imagegen-bridge"
+# mode = "official-relay-bridge"
+mode = "official-imagegen-bridge"
+
+[codex.providers.main]
+base_url = "https://api.example.com/v1"
+auth_token_env = "MAIN_API_KEY"
+
+[codex.routing]
+entry = "main_route"
+
+[codex.routing.routes.main_route]
+strategy = "manual-sticky"
+target = "main"
+"#,
+        );
+
+        let loaded = super::load_config_with_v4_source()
+            .await
+            .expect("load v5 config");
+        assert_eq!(
+            loaded.runtime.version,
+            Some(CURRENT_ROUTE_GRAPH_CONFIG_VERSION)
+        );
+
+        let saved = std::fs::read_to_string(&toml_path).expect("read normalized config");
+        assert!(saved.contains("[codex.client_patch]"));
+        assert!(saved.contains("preset = \"official-imagegen\""));
+        assert!(!saved.contains("mode = \"official-imagegen-bridge\""));
+
+        let backup_path = dir.join("config.toml.bak");
+        let backup = std::fs::read_to_string(backup_path).expect("read normalization backup");
+        assert!(backup.contains("# mode = \"imagegen-bridge\""));
+        assert!(backup.contains("# mode = \"official-relay-bridge\""));
+        assert!(backup.contains("mode = \"official-imagegen-bridge\""));
+    });
+}
+
+#[test]
 fn codex_client_patch_preset_parses_imagegen_bridge() {
     let _env = setup_temp_codex_home();
     let dir = super::proxy_home_dir();

@@ -203,6 +203,59 @@ fn preserve_existing_codex_client_patch(text: String) -> String {
     doc.to_string()
 }
 
+fn codex_client_patch_item_needs_normalization(item: &EditableTomlItem) -> bool {
+    let Some(table) = item.as_table() else {
+        return false;
+    };
+    let active_mode = table
+        .get("mode")
+        .and_then(EditableTomlItem::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if active_mode.is_some() {
+        return true;
+    }
+
+    let active_preset = table
+        .get("preset")
+        .and_then(EditableTomlItem::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    active_preset
+        .and_then(|value| {
+            parse_codex_client_patch_preset("preset", value)
+                .ok()
+                .map(|preset| (value, preset))
+        })
+        .is_some_and(|(value, preset)| value != preset.as_preset_str())
+}
+
+fn normalize_codex_client_patch_text(text: &str) -> Result<Option<String>> {
+    let mut doc = text.parse::<EditableTomlDocument>()?;
+    let Some(codex) = doc
+        .as_table_mut()
+        .get_mut("codex")
+        .and_then(EditableTomlItem::as_table_mut)
+    else {
+        return Ok(None);
+    };
+    let Some(existing) = codex.get("client_patch").cloned() else {
+        return Ok(None);
+    };
+    if !codex_client_patch_item_needs_normalization(&existing) {
+        return Ok(None);
+    }
+
+    let normalized = normalize_existing_codex_client_patch_item(existing);
+    codex.insert("client_patch", normalized);
+    let normalized_text = doc.to_string();
+    if normalized_text == text {
+        Ok(None)
+    } else {
+        Ok(Some(normalized_text))
+    }
+}
+
 fn config_backup_source_and_path() -> (PathBuf, PathBuf) {
     let toml_path = config_toml_path();
     if toml_path.exists() {
@@ -636,6 +689,7 @@ pub async fn load_config_with_v4_source() -> Result<LoadedProxyConfig> {
         } else if let Some(cfg_v4) = loaded_v4.as_ref() {
             auto_compact_loaded_v4_config(cfg_v4, "config.toml").await;
         }
+        auto_normalize_loaded_codex_client_patch("config.toml").await;
         return Ok(LoadedProxyConfig {
             runtime: cfg,
             v4: loaded_v4,
@@ -748,6 +802,53 @@ async fn auto_compact_loaded_v4_config(cfg: &ProxyConfigV4, source: &str) {
         Err(err) => {
             warn!(
                 "failed to auto-compact {} v4 provider config metadata: {}",
+                source, err
+            );
+        }
+    }
+}
+
+async fn auto_normalize_loaded_codex_client_patch(source: &str) {
+    let path = config_toml_path();
+    let text = match fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(err) => {
+            warn!(
+                "failed to read {} while normalizing codex.client_patch legacy mode: {}",
+                source, err
+            );
+            return;
+        }
+    };
+    let normalized = match normalize_codex_client_patch_text(&text) {
+        Ok(Some(normalized)) => normalized,
+        Ok(None) => return,
+        Err(err) => {
+            warn!(
+                "failed to normalize {} codex.client_patch legacy mode: {}",
+                source, err
+            );
+            return;
+        }
+    };
+
+    let backup_path = config_toml_backup_path();
+    if path.exists()
+        && let Err(err) = fs::copy(&path, &backup_path).await
+    {
+        warn!("failed to backup {:?} to {:?}: {}", path, backup_path, err);
+    }
+
+    match write_bytes_file_async(&path, normalized.as_bytes()).await {
+        Ok(()) => {
+            info!(
+                "auto-normalized {} codex.client_patch legacy mode to preset",
+                source
+            );
+        }
+        Err(err) => {
+            warn!(
+                "failed to auto-normalize {} codex.client_patch legacy mode: {}",
                 source, err
             );
         }
