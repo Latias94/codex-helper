@@ -13,11 +13,9 @@ use crate::proxy::ProxyService;
 use crate::sessions::find_codex_session_file_by_id;
 use crate::state::ProxyState;
 use crate::tui::Language;
-use crate::tui::codex_relay_diagnostics::{
-    CodexRelayDiagnosticsSender, request_codex_relay_diagnostics,
-};
+use crate::tui::codex_relay_diagnostics::request_codex_relay_diagnostics;
 use crate::tui::codex_relay_live_smoke::{
-    CodexRelayLiveSmokeMode, CodexRelayLiveSmokeSender, confirm_or_request_codex_relay_live_smoke,
+    CodexRelayLiveSmokeMode, confirm_or_request_codex_relay_live_smoke,
 };
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
@@ -29,7 +27,8 @@ use crate::tui::report::build_stats_report;
 use crate::tui::state::{CodexHistoryExternalFocusOrigin, UiState, adjust_table_selection};
 use crate::tui::types::{Focus, Overlay, Page, StatsFocus};
 
-use super::balance::{BalanceRefreshMode, BalanceRefreshSender, request_provider_balance_refresh};
+use super::KeyEventContext;
+use super::balance::{BalanceRefreshMode, request_provider_balance_refresh};
 use super::health::{
     begin_station_health_check, load_upstreams_for_station, spawn_all_station_health_checks,
     spawn_station_health_check,
@@ -273,17 +272,18 @@ pub(super) fn try_copy_to_clipboard(report: &str) -> anyhow::Result<()> {
     }
 }
 
-pub(super) async fn handle_key_normal(
-    state: &Arc<ProxyState>,
-    providers: &mut Vec<ProviderOption>,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    proxy: &ProxyService,
-    balance_refresh_tx: &BalanceRefreshSender,
-    codex_relay_diagnostics_tx: &CodexRelayDiagnosticsSender,
-    codex_relay_live_smoke_tx: &CodexRelayLiveSmokeSender,
-    key: KeyEvent,
-) -> bool {
+pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -> bool {
+    let KeyEventContext {
+        state,
+        providers,
+        ui,
+        snapshot,
+        proxy,
+        balance_refresh_tx,
+        codex_relay_diagnostics_tx,
+        codex_relay_live_smoke_tx,
+    } = ctx;
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         ui.should_exit = true;
         return true;

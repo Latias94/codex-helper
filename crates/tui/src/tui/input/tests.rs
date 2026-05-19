@@ -1,6 +1,6 @@
 use super::{
-    BalanceRefreshMode, default_profile_menu_idx, request_provider_balance_refresh,
-    routing_entry_children, routing_entry_is_flat_provider_list,
+    BalanceRefreshMode, KeyEventContext, default_profile_menu_idx,
+    request_provider_balance_refresh, routing_entry_children, routing_entry_is_flat_provider_list,
     routing_spec_after_provider_enabled_change, routing_spec_with_order,
     should_request_provider_balance_refresh,
 };
@@ -406,15 +406,19 @@ async fn routing_page_g_refreshes_balances() {
     let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
     let (live_smoke_tx, _live_smoke_rx) = mpsc::unbounded_channel();
 
+    let state = proxy.state_handle();
     let handled = super::handle_key_event(
-        proxy.state_handle(),
-        &mut providers,
-        &mut ui,
-        &snapshot,
-        &proxy,
-        tx,
-        diagnostics_tx,
-        live_smoke_tx,
+        TestKeyEventContext {
+            state: &state,
+            providers: &mut providers,
+            ui: &mut ui,
+            snapshot: &snapshot,
+            proxy: &proxy,
+            balance_refresh_tx: &tx,
+            codex_relay_diagnostics_tx: &diagnostics_tx,
+            codex_relay_live_smoke_tx: &live_smoke_tx,
+        }
+        .into(),
         KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
     )
     .await;
@@ -487,14 +491,17 @@ async fn route_graph_global_route_target_key_uses_routing_order_and_invalidates_
     let (live_smoke_tx, _live_smoke_rx) = mpsc::unbounded_channel();
 
     let handled = super::handle_key_event(
-        state.clone(),
-        &mut providers,
-        &mut ui,
-        &snapshot,
-        &proxy,
-        tx,
-        diagnostics_tx,
-        live_smoke_tx,
+        TestKeyEventContext {
+            state: &state,
+            providers: &mut providers,
+            ui: &mut ui,
+            snapshot: &snapshot,
+            proxy: &proxy,
+            balance_refresh_tx: &tx,
+            codex_relay_diagnostics_tx: &diagnostics_tx,
+            codex_relay_live_smoke_tx: &live_smoke_tx,
+        }
+        .into(),
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await;
@@ -525,14 +532,17 @@ async fn startup_alert_enter_dismisses_report() {
     let (live_smoke_tx, _live_smoke_rx) = mpsc::unbounded_channel();
 
     let handled = super::handle_key_event(
-        state,
-        &mut providers,
-        &mut ui,
-        &snapshot,
-        &proxy,
-        tx,
-        diagnostics_tx,
-        live_smoke_tx,
+        TestKeyEventContext {
+            state: &state,
+            providers: &mut providers,
+            ui: &mut ui,
+            snapshot: &snapshot,
+            proxy: &proxy,
+            balance_refresh_tx: &tx,
+            codex_relay_diagnostics_tx: &diagnostics_tx,
+            codex_relay_live_smoke_tx: &live_smoke_tx,
+        }
+        .into(),
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await;
@@ -540,6 +550,33 @@ async fn startup_alert_enter_dismisses_report() {
     assert!(handled);
     assert_eq!(ui.overlay, Overlay::None);
     assert!(ui.startup_readiness.is_none());
+}
+
+struct TestKeyEventContext<'a> {
+    state: &'a Arc<ProxyState>,
+    providers: &'a mut Vec<ProviderOption>,
+    ui: &'a mut UiState,
+    snapshot: &'a Snapshot,
+    proxy: &'a ProxyService,
+    balance_refresh_tx: &'a super::BalanceRefreshSender,
+    codex_relay_diagnostics_tx:
+        &'a crate::tui::codex_relay_diagnostics::CodexRelayDiagnosticsSender,
+    codex_relay_live_smoke_tx: &'a crate::tui::codex_relay_live_smoke::CodexRelayLiveSmokeSender,
+}
+
+impl<'a> From<TestKeyEventContext<'a>> for KeyEventContext<'a> {
+    fn from(ctx: TestKeyEventContext<'a>) -> Self {
+        Self {
+            state: ctx.state,
+            providers: ctx.providers,
+            ui: ctx.ui,
+            snapshot: ctx.snapshot,
+            proxy: ctx.proxy,
+            balance_refresh_tx: ctx.balance_refresh_tx,
+            codex_relay_diagnostics_tx: ctx.codex_relay_diagnostics_tx,
+            codex_relay_live_smoke_tx: ctx.codex_relay_live_smoke_tx,
+        }
+    }
 }
 
 #[tokio::test]
@@ -558,14 +595,17 @@ async fn codex_relay_live_smoke_x_requires_confirmation_before_request() {
     let _live_smoke_tx_keepalive = live_smoke_tx.clone();
 
     let handled = super::handle_key_event(
-        state,
-        &mut providers,
-        &mut ui,
-        &snapshot,
-        &proxy,
-        tx,
-        diagnostics_tx,
-        live_smoke_tx,
+        TestKeyEventContext {
+            state: &state,
+            providers: &mut providers,
+            ui: &mut ui,
+            snapshot: &snapshot,
+            proxy: &proxy,
+            balance_refresh_tx: &tx,
+            codex_relay_diagnostics_tx: &diagnostics_tx,
+            codex_relay_live_smoke_tx: &live_smoke_tx,
+        }
+        .into(),
         KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
     )
     .await;

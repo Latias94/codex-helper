@@ -383,14 +383,16 @@ pub async fn run_dashboard(
                     Event::Key(key) if input::should_accept_key_event(&key) => {
                         let before_surface = RenderSurfaceKey::capture(&ui);
                         if input::handle_key_event(
-                            state.clone(),
-                            &mut providers,
-                            &mut ui,
-                            &snapshot,
-                            &proxy,
-                            balance_refresh_tx.clone(),
-                            codex_relay_diagnostics_tx.clone(),
-                            codex_relay_live_smoke_tx.clone(),
+                            input::KeyEventContext {
+                                state: &state,
+                                providers: &mut providers,
+                                ui: &mut ui,
+                                snapshot: &snapshot,
+                                proxy: &proxy,
+                                balance_refresh_tx: &balance_refresh_tx,
+                                codex_relay_diagnostics_tx: &codex_relay_diagnostics_tx,
+                                codex_relay_live_smoke_tx: &codex_relay_live_smoke_tx,
+                            },
                             key,
                         )
                         .await

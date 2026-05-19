@@ -48,114 +48,124 @@ pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
     matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-pub(in crate::tui) async fn handle_key_event(
-    state: Arc<ProxyState>,
-    providers: &mut Vec<ProviderOption>,
-    ui: &mut UiState,
-    snapshot: &Snapshot,
-    proxy: &ProxyService,
-    balance_refresh_tx: BalanceRefreshSender,
-    codex_relay_diagnostics_tx: crate::tui::codex_relay_diagnostics::CodexRelayDiagnosticsSender,
-    codex_relay_live_smoke_tx: crate::tui::codex_relay_live_smoke::CodexRelayLiveSmokeSender,
-    key: KeyEvent,
-) -> bool {
-    if ui.overlay == Overlay::None && apply_page_shortcuts(ui, key.code) {
+pub(in crate::tui) struct KeyEventContext<'a> {
+    pub(in crate::tui) state: &'a Arc<ProxyState>,
+    pub(in crate::tui) providers: &'a mut Vec<ProviderOption>,
+    pub(in crate::tui) ui: &'a mut UiState,
+    pub(in crate::tui) snapshot: &'a Snapshot,
+    pub(in crate::tui) proxy: &'a ProxyService,
+    pub(in crate::tui) balance_refresh_tx: &'a BalanceRefreshSender,
+    pub(in crate::tui) codex_relay_diagnostics_tx:
+        &'a crate::tui::codex_relay_diagnostics::CodexRelayDiagnosticsSender,
+    pub(in crate::tui) codex_relay_live_smoke_tx:
+        &'a crate::tui::codex_relay_live_smoke::CodexRelayLiveSmokeSender,
+}
+
+pub(in crate::tui) async fn handle_key_event(ctx: KeyEventContext<'_>, key: KeyEvent) -> bool {
+    if ctx.ui.overlay == Overlay::None && apply_page_shortcuts(ctx.ui, key.code) {
         return true;
     }
 
-    match ui.overlay {
-        Overlay::None => {
-            handle_key_normal(
-                &state,
-                providers,
-                ui,
-                snapshot,
-                proxy,
-                &balance_refresh_tx,
-                &codex_relay_diagnostics_tx,
-                &codex_relay_live_smoke_tx,
-                key,
-            )
-            .await
-        }
+    match ctx.ui.overlay {
+        Overlay::None => handle_key_normal(ctx, key).await,
         Overlay::Help => match key.code {
             KeyCode::Esc | KeyCode::Char('?') => {
-                ui.overlay = Overlay::None;
+                ctx.ui.overlay = Overlay::None;
                 true
             }
             KeyCode::Char('L') => {
-                toggle_language(ui).await;
+                toggle_language(ctx.ui).await;
                 true
             }
             _ => false,
         },
-        Overlay::SessionTranscript => handle_key_session_transcript(ui, key).await,
+        Overlay::SessionTranscript => handle_key_session_transcript(ctx.ui, key).await,
         Overlay::StartupAlert => match key.code {
             KeyCode::Esc | KeyCode::Enter => {
-                ui.startup_readiness = None;
-                ui.overlay = Overlay::None;
+                ctx.ui.startup_readiness = None;
+                ctx.ui.overlay = Overlay::None;
                 true
             }
             KeyCode::Char('L') => {
-                toggle_language(ui).await;
+                toggle_language(ctx.ui).await;
                 true
             }
             _ => false,
         },
         Overlay::StationInfo => match key.code {
             KeyCode::Esc | KeyCode::Char('i') => {
-                ui.overlay = Overlay::None;
+                ctx.ui.overlay = Overlay::None;
                 true
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                ui.station_info_scroll = ui.station_info_scroll.saturating_sub(1);
+                ctx.ui.station_info_scroll = ctx.ui.station_info_scroll.saturating_sub(1);
                 true
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                ui.station_info_scroll = ui.station_info_scroll.saturating_add(1);
+                ctx.ui.station_info_scroll = ctx.ui.station_info_scroll.saturating_add(1);
                 true
             }
             KeyCode::PageUp => {
-                ui.station_info_scroll = ui.station_info_scroll.saturating_sub(10);
+                ctx.ui.station_info_scroll = ctx.ui.station_info_scroll.saturating_sub(10);
                 true
             }
             KeyCode::PageDown => {
-                ui.station_info_scroll = ui.station_info_scroll.saturating_add(10);
+                ctx.ui.station_info_scroll = ctx.ui.station_info_scroll.saturating_add(10);
                 true
             }
             KeyCode::Home | KeyCode::Char('g') => {
-                ui.station_info_scroll = 0;
+                ctx.ui.station_info_scroll = 0;
                 true
             }
             KeyCode::End | KeyCode::Char('G') => {
-                ui.station_info_scroll = u16::MAX;
+                ctx.ui.station_info_scroll = u16::MAX;
                 true
             }
             KeyCode::Char('L') => {
-                toggle_language(ui).await;
+                toggle_language(ctx.ui).await;
                 true
             }
             _ => false,
         },
-        Overlay::EffortMenu => handle_key_effort_menu(&state, ui, snapshot, key).await,
-        Overlay::ModelMenuSession => handle_key_model_menu(&state, ui, snapshot, key).await,
-        Overlay::ModelInputSession => handle_key_model_input(&state, ui, snapshot, key).await,
+        Overlay::EffortMenu => handle_key_effort_menu(ctx.state, ctx.ui, ctx.snapshot, key).await,
+        Overlay::ModelMenuSession => {
+            handle_key_model_menu(ctx.state, ctx.ui, ctx.snapshot, key).await
+        }
+        Overlay::ModelInputSession => {
+            handle_key_model_input(ctx.state, ctx.ui, ctx.snapshot, key).await
+        }
         Overlay::ServiceTierMenuSession => {
-            handle_key_service_tier_menu(&state, ui, snapshot, key).await
+            handle_key_service_tier_menu(ctx.state, ctx.ui, ctx.snapshot, key).await
         }
         Overlay::ServiceTierInputSession => {
-            handle_key_service_tier_input(&state, ui, snapshot, key).await
+            handle_key_service_tier_input(ctx.state, ctx.ui, ctx.snapshot, key).await
         }
         Overlay::ProfileMenuSession
         | Overlay::ProfileMenuDefaultRuntime
         | Overlay::ProfileMenuDefaultPersisted => {
-            handle_key_profile_menu(&state, ui, snapshot, proxy, key).await
+            handle_key_profile_menu(ctx.state, ctx.ui, ctx.snapshot, ctx.proxy, key).await
         }
         Overlay::ProviderMenuSession | Overlay::ProviderMenuGlobal => {
-            handle_key_provider_menu(&state, providers, ui, snapshot, proxy, key).await
+            handle_key_provider_menu(
+                ctx.state,
+                ctx.providers,
+                ctx.ui,
+                ctx.snapshot,
+                ctx.proxy,
+                key,
+            )
+            .await
         }
         Overlay::RoutingMenu => {
-            handle_key_routing_menu(providers, ui, snapshot, proxy, &balance_refresh_tx, key).await
+            handle_key_routing_menu(
+                ctx.providers,
+                ctx.ui,
+                ctx.snapshot,
+                ctx.proxy,
+                ctx.balance_refresh_tx,
+                key,
+            )
+            .await
         }
     }
 }
