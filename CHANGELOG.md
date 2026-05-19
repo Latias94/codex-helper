@@ -9,20 +9,23 @@ All notable changes to this project will be documented in this file.
 
 #### Codex 中转和 ChatGPT 原生体验
 
-- 新增一组 Codex bridge 模式，用来处理“Codex 客户端想要官方/ChatGPT 形态，但模型流量要走中转”的场景。
+- 新增 Codex client patch preset 体系，用来处理“Codex 客户端想要官方/ChatGPT 形态，但模型流量要走中转”的场景。用户侧推荐使用 `[codex.client_patch].preset = "..."` 和 `codex-helper switch on --preset ...`；旧配置 `mode = "..."` 和 CLI `--mode ...` 仍兼容读取，但 helper 保存/生成配置时统一写 `preset`。
 - `chatgpt-bridge` 适合已经在官方 Codex 登录 ChatGPT 的用户。Codex 仍看到 ChatGPT 登录态，桌面端和手机端账号能力可以继续按官方路径判断；模型请求由 codex-helper 路由到你的 relay。
 - `imagegen-bridge` 适合 relay 不支持 official provider 身份，但你想让 Codex 暴露 hosted `image_generation` 的场景。它会写入 `{}` auth facade，真实上游密钥仍来自 codex-helper 配置。
-- `official-relay-bridge` 适合能转发 OpenAI Responses 语义的中转，尤其是支持 `/responses/compact` 的 sub2api 或类似服务。它让 Codex 尝试 remote compaction v1。
-- `official-imagegen-bridge` 适合背后确实是官方订阅账号、同时支持 `/responses/compact` 和 hosted image generation 的 relay。它同时给 Codex official provider 身份和 imagegen facade。
+- `official-relay` 适合能转发 OpenAI Responses 语义的中转，尤其是支持 `/responses/compact` 的 sub2api 或类似服务。它让 Codex 尝试 remote compaction v1。
+- `official-imagegen` 适合背后确实是官方订阅账号、同时支持 `/responses/compact` 和 hosted image generation 的 relay。它同时给 Codex official provider 身份和 imagegen facade。
+- 旧 preset 名称 `official-relay-bridge` / `official-imagegen-bridge` 仍作为 alias 接受，但不再作为推荐写法；未发布过的旧 `official-ws-*` 组合已删除。
+- 新增独立传输开关 `responses_websocket = true` / `--responses-websocket`。它不是新的 preset，只允许搭配 `official-relay` 或 `official-imagegen`，启用后 helper 会写入 `supports_websockets = true` 并代理 Responses WebSocket v2。
 - bridge 模式不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。上游应配置自己的 `auth_token_env`、`auth_token`、`api_key_env` 或 `api_key`。
 
 #### 中转能力诊断
 
-- 新增 Codex relay 能力诊断，可从 TUI Settings、admin API 或 CLI 运行。常用 CLI：`codex-helper codex relay-capabilities --mode official-imagegen-bridge --model gpt-5.5`。
-- 诊断会检查 relay 的 `/models`、`/responses`、`/responses/compact`，然后给出更适合的 patch mode。它不会自动切换配置。
+- 新增 Codex relay 能力诊断，可从 TUI Settings、admin API 或 CLI 运行。常用 CLI：`codex-helper codex relay-capabilities --preset official-imagegen --model gpt-5.5`。
+- 诊断会检查 relay 的 `/models`、`/responses`、`/responses/compact`，然后给出更适合的 patch preset。它不会自动切换配置。
+- 诊断和 live smoke 支持 provider/endpoint 定向：CLI 可用 `--provider <ID>`、`--endpoint <ID>`，便于直接验证某个中转，而不是只测当前路由首选项。
 - 如果 relay 返回 OpenAI 风格的 `/models`（`data: [...]`），codex-helper 会翻译成 Codex 需要的 `models: [...]` catalog，避免 Codex 因模型 metadata 形态不对而看不到 image/search/apply_patch 等能力。
-- 新增需要明确确认的 live smoke：`codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5`。默认只测 `/responses/compact`；加 `--image` 才会测试 hosted image generation。这个命令会打真实上游，可能消耗额度或生成图片。
-- 诊断和 live smoke 会写入 `~/.codex-helper/logs/codex_relay_evidence.jsonl`。这是给人看的本地证据，不参与 routing、affinity、health、余额、retry 或自动 patch mode。
+- 新增需要明确确认的 live smoke：`codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5`。默认只测 `/responses/compact`；加 `--image` 只测 hosted image generation，加 `--websocket` 只测 Responses WebSocket v2，同时传多个可选 case 时只跑显式指定的 case。这个命令会打真实上游，可能消耗额度、生成图片或建立 WebSocket 会话。
+- 诊断和 live smoke 会写入 `~/.codex-helper/logs/codex_relay_evidence.jsonl`。这是给人看的本地证据，不参与 routing、affinity、health、余额、retry 或自动 patch preset。
 
 #### 多中转路由和余额
 
@@ -37,10 +40,12 @@ All notable changes to this project will be documented in this file.
 - `Usage` 页面可以按 `g` 刷新余额，按 `a` 只看需要处理的 provider；provider 很多时详情页支持 `PgUp` / `PgDn` 滚动 endpoint。
 - 窄终端下 Routing/Usage 的余额显示更稳，不再容易出现 `$0/$` 这类半截金额。Routing 页保留紧凑余额，详细分析放在 Usage/Balance。
 - GUI 的余额状态和 core 语义对齐，`unknown`、`stale`、`exhausted`、`error`、`unlimited` 不再由不同 UI 各算一套。
+- Usage 的 burn forecast 现在会合并请求 ledger tail 和 recent samples，并在请求日志里补充 model / route decision 信息，避免高频请求场景下 burn rate 和到 0 点预估明显偏低。
 
 #### 升级时关注
 
-- 常用 patch mode 放在 `[codex.client_patch] mode = "..."`，也可以用 `codex-helper switch on --mode ...` 显式切换。改完后需要完整重启 Codex App、TUI 或 `codex exec`。
+- 常用 client patch preset 放在 `[codex.client_patch] preset = "..."`，也可以用 `codex-helper switch on --preset ...` 显式切换。旧的 `mode` / `--mode` 仍可读，但建议迁移到 `preset`。改完后需要完整重启 Codex App、TUI 或 `codex exec`。
+- 如果想启用 Responses WebSocket，请额外设置 `responses_websocket = true` 或传 `--responses-websocket`；它不是 preset，只建议在已验证支持 WebSocket 的上游上开启。例如实测 `input8` 支持，`ciii` 的 HTTP endpoints 可用但 WebSocket upstream/proxy 失败，应保持关闭。
 - relay 要求模型名前缀时，用 `provider add --model-map FROM=TO` 或 provider 级 `model_mapping`，例如 `gpt-5.5` -> `openai/gpt-5.5`。
 - 不确定 relay 是否支持 compact/imagegen 时，先跑 `codex-helper codex relay-capabilities`；只有要真实验证上游链路时再跑 live smoke。
 - 手机远程控制仍走 `codex-helper switch remote-control ...`，它和 `chatgpt-bridge` 是两条路径。
@@ -49,20 +54,23 @@ All notable changes to this project will be documented in this file.
 
 #### Codex relays and native ChatGPT behavior
 
-- Added Codex bridge modes for setups where Codex should keep an official or ChatGPT-like client shape while model traffic goes through codex-helper relays.
+- Added Codex client patch presets for setups where Codex should keep an official or ChatGPT-like client shape while model traffic goes through codex-helper relays. Use `[codex.client_patch].preset = "..."` and `codex-helper switch on --preset ...`; legacy `mode = "..."` and CLI `--mode ...` are still accepted, but helper writes saved/generated config as `preset`.
 - `chatgpt-bridge` is for users already signed in to ChatGPT in official Codex. Codex keeps seeing ChatGPT account state, while model requests are routed through codex-helper.
 - `imagegen-bridge` exposes hosted `image_generation` for relays that do not support official provider identity. It writes the empty `{}` auth facade; real upstream credentials still come from helper config.
-- `official-relay-bridge` is for relays that forward OpenAI Responses semantics, especially `/responses/compact`. It lets Codex try remote compaction v1.
-- `official-imagegen-bridge` is for official-subscription-backed relays that support both `/responses/compact` and hosted image generation.
+- `official-relay` is for relays that forward OpenAI Responses semantics, especially `/responses/compact`. It lets Codex try remote compaction v1.
+- `official-imagegen` is for official-subscription-backed relays that support both `/responses/compact` and hosted image generation.
+- Legacy preset names `official-relay-bridge` / `official-imagegen-bridge` remain accepted as aliases, but are no longer the recommended spelling; unpublished `official-ws-*` combinations were removed.
+- Added the separate transport switch `responses_websocket = true` / `--responses-websocket`. It is not a new preset, is only valid with `official-relay` or `official-imagegen`, and makes helper advertise `supports_websockets = true` while proxying Responses WebSocket v2.
 - Bridge modes do not forward Codex ChatGPT tokens to third-party relays without helper-side credentials. Configure upstream secrets with `auth_token_env`, `auth_token`, `api_key_env`, or `api_key`.
 
 #### Relay diagnostics
 
-- Added Codex relay capability diagnostics in TUI Settings, admin API, and CLI. Common CLI: `codex-helper codex relay-capabilities --mode official-imagegen-bridge --model gpt-5.5`.
-- Diagnostics check `/models`, `/responses`, and `/responses/compact`, then recommend a patch mode. They do not switch modes automatically.
+- Added Codex relay capability diagnostics in TUI Settings, admin API, and CLI. Common CLI: `codex-helper codex relay-capabilities --preset official-imagegen --model gpt-5.5`.
+- Diagnostics check `/models`, `/responses`, and `/responses/compact`, then recommend a patch preset. They do not switch modes automatically.
+- Diagnostics and live smoke can target a specific provider/endpoint with `--provider <ID>` and `--endpoint <ID>`, making it possible to verify one relay directly instead of only the current routing preference.
 - OpenAI-style `/models` responses (`data: [...]`) are translated into the Codex `models: [...]` catalog so Codex can see model metadata such as image/search/apply_patch support.
-- Added explicit live smoke: `codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5`. It checks compact by default; add `--image` to test hosted image generation. This sends real upstream requests and may spend quota or create an image.
-- Diagnostics and live smoke append sanitized records to `~/.codex-helper/logs/codex_relay_evidence.jsonl`. That file is local diagnostic evidence only; it does not affect routing, affinity, health, balance, retry, or patch-mode automation.
+- Added explicit live smoke: `codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5`. It checks compact by default; `--image` tests only hosted image generation, `--websocket` tests only Responses WebSocket v2, and multiple optional cases run only the explicitly requested cases. This sends real upstream requests and may spend quota, create an image, or open a WebSocket session.
+- Diagnostics and live smoke append sanitized records to `~/.codex-helper/logs/codex_relay_evidence.jsonl`. That file is local diagnostic evidence only; it does not affect routing, affinity, health, balance, retry, or patch-preset automation.
 
 #### Multi-relay routing and balance
 
@@ -77,10 +85,12 @@ All notable changes to this project will be documented in this file.
 - On `Usage`, press `g` to refresh balances and `a` to show only providers that need attention. Large endpoint lists can be scrolled with `PgUp` / `PgDn`.
 - Narrow Routing/Usage views keep balance amounts readable instead of showing partial values like `$0/$`. Routing keeps compact balance context; detailed inspection lives in Usage/Balance.
 - GUI balance state now uses the same core semantics as TUI, keeping `unknown`, `stale`, `exhausted`, `error`, and `unlimited` distinct.
+- Usage burn forecasts now merge request ledger tail data with recent samples and include model / route-decision context in request logs, avoiding undercounted burn rate and midnight projections during high-volume Codex sessions.
 
 #### Upgrade notes
 
-- Set the usual patch mode with `[codex.client_patch] mode = "..."` or `codex-helper switch on --mode ...`. Restart Codex App, TUI, or `codex exec` after changing it.
+- Set the usual client patch preset with `[codex.client_patch] preset = "..."` or `codex-helper switch on --preset ...`. Legacy `mode` / `--mode` are still accepted, but `preset` is the recommended spelling. Restart Codex App, TUI, or `codex exec` after changing it.
+- To enable Responses WebSocket, set `responses_websocket = true` or pass `--responses-websocket`; it is not a preset and should only be enabled for upstream relays verified to support WebSocket. For example, `input8` was verified to support it, while `ciii` supports the HTTP endpoints but fails the WebSocket upstream/proxy path and should keep it disabled.
 - If a relay requires provider-prefixed model names, use `provider add --model-map FROM=TO` or provider-level `model_mapping`, for example `gpt-5.5` -> `openai/gpt-5.5`.
 - If you are unsure whether a relay supports compact or imagegen, run `codex-helper codex relay-capabilities` first. Use live smoke only when you want a real upstream test.
 - Mobile remote control still uses `codex-helper switch remote-control ...`; it is separate from `chatgpt-bridge`.
