@@ -38,6 +38,7 @@ All notable changes to this project will be documented in this file.
 - TUI `Usage` 页面的 provider 表格、详情面板和报告导出现在共用同一套筛选后的行模型，降低关注项筛选后详情或导出目标错位的风险。
 - GUI 统计页和余额概览迁移到同一套 core `UsageBalanceView` 语义，`unknown`、`stale`、`exhausted`、`error` 和 `unlimited` 不再由各 UI 自行混算。
 - 路由页继续只保留紧凑余额上下文，详细用量、余额和 endpoint 分析统一到 `Usage / Balance`。
+- Codex streaming 请求在所有 route candidates 都被可信余额耗尽或 cooldown 阻断时，会返回带延迟的可重试 `response.failed` SSE，并排队受节流的 provider/endpoint 余额刷新；已确认 `usage_exhausted` 的上游不再作为兜底目标被反复请求。
 
 ### English Summary
 
@@ -72,6 +73,7 @@ All notable changes to this project will be documented in this file.
 - The TUI `Usage` provider table, detail pane, and report export now share the same filtered row model, reducing the risk of detail/export target drift after attention filtering.
 - The GUI stats and balance views now consume the shared core `UsageBalanceView`, so `unknown`, `stale`, `exhausted`, `error`, and `unlimited` stay distinct across UI surfaces.
 - Routing pages keep compact balance context; detailed usage, balance, and endpoint inspection lives in `Usage / Balance`.
+- Codex streaming requests now return a delayed retryable `response.failed` SSE when every route candidate is blocked by trusted balance exhaustion or cooldown, while queueing a throttled provider/endpoint balance refresh; confirmed `usage_exhausted` upstreams are no longer hammered as fallback targets.
 
 ## [0.15.0] - 2026-05-14
 
