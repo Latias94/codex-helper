@@ -4,7 +4,7 @@ A local relay proxy and operator console for Codex CLI, focused on two jobs: man
 
 Some Codex features do not appear just because `/responses` can be forwarded. ChatGPT auth shape, OpenAI provider identity, `/models` metadata, `/responses/compact`, and hosted `image_generation` all affect what Codex decides to expose. Some sub2api-style and other relays also return shapes that work for normal chat but are not quite what Codex expects.
 
-codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, bridge patching, capability diagnostics, balance visibility, and fallback policy.
+codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, client patch presets, capability diagnostics, balance visibility, and fallback policy.
 
 Current release: `v0.15.0`
 
@@ -30,8 +30,8 @@ It is probably unnecessary if you only use one official account and do not need 
 
 - **Local proxy**: listens on `127.0.0.1:3211` by default.
 - **Safe Codex patching**: only touches the local proxy fields in `~/.codex/config.toml`; unrelated Codex edits are preserved.
-- **Native Codex bridge modes**: `chatgpt-bridge` keeps ChatGPT login shape, `imagegen-bridge` exposes hosted image generation, and `official-relay-bridge` / `official-imagegen-bridge` let relays that forward official Responses semantics try remote compaction v1.
-- **Relay capability diagnostics**: TUI, CLI, and admin API checks for `/models`, `/responses`, and `/responses/compact`, then recommends the patch mode that matches the selected relay.
+- **Native Codex presets**: `chatgpt-bridge` keeps ChatGPT login shape, `imagegen-bridge` exposes hosted image generation, and `official-relay` / `official-imagegen` let relays that forward official Responses semantics try remote compaction v1; `responses_websocket` is a separate transport switch for Responses WebSocket v2.
+- **Relay capability diagnostics**: TUI, CLI, and admin API checks for `/models`, `/responses`, and `/responses/compact`, then recommends the preset that matches the selected relay.
 - **Provider / routing config**: `version = 5` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
 - **Session affinity and failover**: each Codex session tries to keep using the selected provider, then falls through to other route candidates when requests fail, upstreams are unavailable, or trusted balance snapshots are exhausted.
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
@@ -82,33 +82,36 @@ Manage the Codex proxy patch explicitly:
 
 ```bash
 codex-helper switch on
-codex-helper switch on --mode chatgpt-bridge
-codex-helper switch on --mode official-relay-bridge
-codex-helper switch on --mode official-imagegen-bridge
+codex-helper switch on --preset chatgpt-bridge
+codex-helper switch on --preset official-relay
+codex-helper switch on --preset official-relay --responses-websocket
+codex-helper switch on --preset official-imagegen
 codex-helper switch status
 codex-helper switch off
 ```
 
-Patch mode choices:
+Preset choices:
 
-| Mode | Use it when | Effect |
+| Preset | Use it when | Effect |
 | --- | --- | --- |
 | `default` | You only need the local proxy, multiple providers, and fallback | Codex sends model requests to the local helper; helper picks the upstream |
 | `chatgpt-bridge` | You are already signed in to ChatGPT in official Codex and want app/mobile account behavior, but model traffic should use a relay | Keeps the ChatGPT auth shape while upstream credentials still come from helper config |
 | `imagegen-bridge` | The relay does not support official provider identity, but you want Codex to expose hosted `image_generation` | Writes the empty `{}` auth facade and does not require official login |
-| `official-relay-bridge` | The relay forwards official OpenAI Responses semantics, especially `/responses/compact` | Makes Codex treat the local helper as an OpenAI provider so it can try remote compaction v1 |
-| `official-imagegen-bridge` | The relay is backed by an official subscription account and supports both `/responses/compact` and hosted image generation | Combines OpenAI provider identity with the imagegen auth facade |
+| `official-relay` | The relay forwards official OpenAI Responses semantics, especially `/responses/compact` | Makes Codex treat the local helper as an OpenAI provider so it can try remote compaction v1 |
+| `official-imagegen` | The relay is backed by an official subscription account and supports both `/responses/compact` and hosted image generation | Combines OpenAI provider identity with the imagegen auth facade |
 
 `chatgpt-bridge` requires a completed ChatGPT login in official Codex first. If `~/.codex/auth.json` lacks the full token, email, and account metadata, codex-helper refuses the patch instead of leaving Codex in a half-login state.
 
-`official-relay-bridge` and `official-imagegen-bridge` are experimental. They only change how Codex chooses client-side capabilities; the relay still has to support the underlying endpoints. Real request credentials come from `~/.codex-helper/config.toml`, and bridge mode does not forward Codex ChatGPT tokens to third-party relays that do not have helper-side credentials.
+`official-relay` and `official-imagegen` are experimental. They only change how Codex chooses client-side capabilities; the relay still has to support the underlying endpoints. Real request credentials come from `~/.codex-helper/config.toml`, and the bridge presets do not forward Codex ChatGPT tokens to third-party relays that do not have helper-side credentials. Legacy names `official-relay-bridge` / `official-imagegen-bridge` are still accepted as aliases, but are no longer the recommended spelling.
+
+If the upstream is known to support Responses WebSocket v2, enable `responses_websocket = true` or `--responses-websocket` separately; it is a transport switch, not a preset.
 
 Note: any change to `~/.codex/config.toml` is only picked up by newly started Codex sessions. After changing it, fully restart the Codex App, TUI, or `codex exec` session.
 
 If you want Codex to stay logged into ChatGPT while the actual conversation/model traffic goes through a relay, split the setup into two layers:
 
 1. Use `chatgpt-bridge` to keep the Codex App on the ChatGPT auth path.
-2. `codex-helper switch on --mode chatgpt-bridge` points Codex's own `~/.codex/config.toml` at the local `codex_proxy`.
+2. `codex-helper switch on --preset chatgpt-bridge` points Codex's own `~/.codex/config.toml` at the local `codex_proxy`.
 3. Configure `codex.providers.*` and `codex.routing` in `~/.codex-helper/config.toml` so codex-helper selects your relay.
 4. If the relay expects prefixed model names, add `model_mapping` on the provider.
 
@@ -135,7 +138,8 @@ The codex-helper side only owns upstreams and routing:
 version = 5
 
 [codex.client_patch]
-mode = "chatgpt-bridge"
+preset = "chatgpt-bridge"
+responses_websocket = false
 
 [codex.providers.relay]
 base_url = "https://relay.example/v1"
@@ -273,7 +277,7 @@ codex-helper pricing sync-basellm --model gpt-5 --dry-run
 # diagnostics
 codex-helper status
 codex-helper doctor
-codex-helper codex relay-capabilities --mode official-imagegen-bridge --model gpt-5.5
+codex-helper codex relay-capabilities --preset official-imagegen --model gpt-5.5
 codex-helper codex relay-live-smoke --acknowledgement run-live-codex-relay-smoke --model gpt-5.5
 codex-helper codex relay-evidence --limit 20
 codex-helper --version
