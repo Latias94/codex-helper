@@ -32,12 +32,12 @@ Last updated: 2026-05-19
 
 ## M3 — TUI Operator Flow
 
-- [ ] RLS-040 [owner=codex] [deps=RLS-030] [scope=crates/tui/src/tui]
+- [x] RLS-040 [owner=codex] [deps=RLS-030] [scope=crates/tui/src/tui]
   Goal: Add a TUI Settings live-smoke trigger with a deliberate confirmation flow and result rendering.
   Validation: `cargo nextest run -p codex-helper-tui codex_relay_live_smoke`
   Review: Confirm no single accidental key starts live smoke and loading/stale results are handled.
   Evidence: TUI tests.
-  Handoff: TUI should reuse model inference from capability diagnostics where possible.
+  Handoff: DONE 2026-05-19; `X` double-confirms compact-only smoke, `Y` double-confirms compact+image smoke, and model inference is shared with capability diagnostics.
 
 ## M4 — Docs, Evidence, Closeout
 

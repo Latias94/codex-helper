@@ -5,7 +5,7 @@ Last updated: 2026-05-19
 
 ## Current State
 
-The workstream is open. Core live smoke and the admin API surface are implemented and validated. Capability diagnostics remain validation-only and should not be changed into live checks.
+The workstream is open. Core live smoke, the admin API surface, and the TUI Settings operator flow are implemented and validated. Capability diagnostics remain validation-only and should not be changed into live checks.
 
 ## Completed Tasks
 
@@ -25,15 +25,23 @@ The workstream is open. Core live smoke and the admin API surface are implemente
 - Review: admin route must stay protected, manifest/operator-summary should advertise the endpoint, and missing acknowledgement must fail before upstream IO.
 - Evidence: admin API tests plus `EVIDENCE_AND_GATES.md`
 
-## Active Task
-
 - Task ID: RLS-040
 - Owner: codex
 - Files: `crates/tui/src/tui`
 - Validation: `cargo nextest run -p codex-helper-tui codex_relay_live_smoke`
-- Status: READY
+- Status: DONE
 - Review: no single accidental key starts live smoke; compact-only and image-explicit flows should be distinguishable.
 - Evidence: TUI tests plus `EVIDENCE_AND_GATES.md`
+
+## Active Task
+
+- Task ID: RLS-050
+- Owner: codex
+- Files: `docs`, `CHANGELOG.md`
+- Validation: `cargo fmt --check`; targeted nextest gates from `EVIDENCE_AND_GATES.md`
+- Status: READY
+- Review: docs must describe live smoke as manual/cost-bearing, not a free health check.
+- Evidence: docs/changelog plus closeout gates.
 
 ## Decisions Since Last Update
 
@@ -43,6 +51,7 @@ The workstream is open. Core live smoke and the admin API surface are implemente
 - Real image artifacts are not stored by helper; returned image-generation items are classified and summarized only.
 - Codex relay target selection is shared between capability diagnostics and live smoke.
 - Admin API endpoint is `POST /__codex_helper/api/v1/codex/relay-live-smoke`.
+- TUI Settings uses `X` double-confirm for compact-only smoke and `Y` double-confirm for compact+image smoke.
 
 ## Blockers
 
@@ -55,4 +64,4 @@ The workstream is open. Core live smoke and the admin API surface are implemente
 
 ## Next Recommended Action
 
-- Implement RLS-040 TUI Settings trigger and rendering using `CodexRelayLiveSmokeRequest` / `CodexRelayLiveSmokeResponse`.
+- Implement RLS-050 docs, changelog, evidence refresh, and closeout decision.

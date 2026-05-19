@@ -16,6 +16,37 @@ pub(in crate::tui) struct CodexRelayDiagnosticsResult {
 pub(in crate::tui) type CodexRelayDiagnosticsSender =
     mpsc::UnboundedSender<CodexRelayDiagnosticsResult>;
 
+pub(in crate::tui) fn infer_codex_relay_diagnostics_model(
+    ui: &UiState,
+    snapshot: &Snapshot,
+) -> Option<String> {
+    let selected = snapshot.rows.get(ui.selected_session_idx);
+    selected
+        .and_then(|row| {
+            row.effective_model
+                .as_ref()
+                .map(|value| value.value.as_str())
+        })
+        .or_else(|| selected.and_then(|row| row.override_model.as_deref()))
+        .or_else(|| selected.and_then(|row| row.last_model.as_deref()))
+        .or_else(|| {
+            snapshot
+                .recent
+                .iter()
+                .find_map(|request| request.model.as_deref())
+        })
+        .or_else(|| {
+            let default_profile = ui.effective_default_profile.as_deref()?;
+            ui.profile_options
+                .iter()
+                .find(|profile| profile.name == default_profile)
+                .and_then(|profile| profile.model.as_deref())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 pub(in crate::tui) fn request_codex_relay_diagnostics(
     ui: &mut UiState,
     snapshot: &Snapshot,
@@ -108,34 +139,6 @@ pub(in crate::tui) fn apply_codex_relay_diagnostics_result(
     }
 
     true
-}
-
-fn infer_codex_relay_diagnostics_model(ui: &UiState, snapshot: &Snapshot) -> Option<String> {
-    let selected = snapshot.rows.get(ui.selected_session_idx);
-    selected
-        .and_then(|row| {
-            row.effective_model
-                .as_ref()
-                .map(|value| value.value.as_str())
-        })
-        .or_else(|| selected.and_then(|row| row.override_model.as_deref()))
-        .or_else(|| selected.and_then(|row| row.last_model.as_deref()))
-        .or_else(|| {
-            snapshot
-                .recent
-                .iter()
-                .find_map(|request| request.model.as_deref())
-        })
-        .or_else(|| {
-            let default_profile = ui.effective_default_profile.as_deref()?;
-            ui.profile_options
-                .iter()
-                .find(|profile| profile.name == default_profile)
-                .and_then(|profile| profile.model.as_deref())
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]

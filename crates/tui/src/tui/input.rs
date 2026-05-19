@@ -56,6 +56,7 @@ pub(in crate::tui) async fn handle_key_event(
     proxy: &ProxyService,
     balance_refresh_tx: BalanceRefreshSender,
     codex_relay_diagnostics_tx: crate::tui::codex_relay_diagnostics::CodexRelayDiagnosticsSender,
+    codex_relay_live_smoke_tx: crate::tui::codex_relay_live_smoke::CodexRelayLiveSmokeSender,
     key: KeyEvent,
 ) -> bool {
     if ui.overlay == Overlay::None && apply_page_shortcuts(ui, key.code) {
@@ -72,6 +73,7 @@ pub(in crate::tui) async fn handle_key_event(
                 proxy,
                 &balance_refresh_tx,
                 &codex_relay_diagnostics_tx,
+                &codex_relay_live_smoke_tx,
                 key,
             )
             .await

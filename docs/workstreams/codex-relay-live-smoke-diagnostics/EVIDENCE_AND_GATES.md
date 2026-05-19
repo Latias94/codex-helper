@@ -120,6 +120,41 @@ cargo fmt --check
 
 Result: PASS; core live-smoke tests passed again (7 passed, 531 skipped) and formatting check passed.
 
+### 2026-05-19 — RLS-040 TUI Operator Flow
+
+Command:
+
+```bash
+cargo nextest run -p codex-helper-tui codex_relay_live_smoke
+```
+
+Result: PASS; 3 tests passed, 117 skipped.
+
+Proves:
+
+- live smoke confirmation expires after 3 seconds and is mode-specific,
+- one `X` key press on Settings only arms compact-only confirmation and does not start a live request,
+- Settings renders live smoke confirmation, compact result, hosted image-generation result, and warnings.
+
+Files:
+
+- `crates/tui/src/tui/codex_relay_live_smoke.rs`
+- `crates/tui/src/tui/input/normal.rs`
+- `crates/tui/src/tui/view/pages/settings.rs`
+- `crates/tui/src/tui/state.rs`
+
+### 2026-05-19 — RLS-040 Regression Gates
+
+Commands:
+
+```bash
+cargo nextest run -p codex-helper-core codex_live_smoke_api
+cargo nextest run -p codex-helper-core codex_relay_live_smoke
+cargo fmt --check
+```
+
+Result: PASS; admin API tests passed (3 passed, 535 skipped), core live-smoke tests passed (7 passed, 531 skipped), and formatting check passed.
+
 ## Notes
 
 Live relay smoke against a real paid upstream is optional evidence unless the user explicitly requests it. Automated tests must use local fake upstreams.

@@ -13,10 +13,12 @@ use crate::healthcheck::{
     HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
 };
 use crate::proxy::{
-    CodexRelayCapabilitiesResponse, CodexRelayProbeConfidence, CodexRelayProbeResult,
-    CodexRelayProbeSupport,
+    CodexRelayCapabilitiesResponse, CodexRelayLiveSmokeCase, CodexRelayLiveSmokeConfidence,
+    CodexRelayLiveSmokeOutcome, CodexRelayLiveSmokeResponse, CodexRelayLiveSmokeResult,
+    CodexRelayProbeConfidence, CodexRelayProbeResult, CodexRelayProbeSupport,
 };
 use crate::tui::Language;
+use crate::tui::codex_relay_live_smoke::CodexRelayLiveSmokeMode;
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     Palette, Snapshot, balance_amount_brief_lang, balance_snapshot_status_label_lang, now_ms,
@@ -71,6 +73,31 @@ fn probe_confidence_label(confidence: CodexRelayProbeConfidence) -> &'static str
     }
 }
 
+fn live_smoke_case_label(case: CodexRelayLiveSmokeCase) -> &'static str {
+    match case {
+        CodexRelayLiveSmokeCase::ResponsesCompact => "responses_compact",
+        CodexRelayLiveSmokeCase::HostedImageGeneration => "hosted_image_generation",
+    }
+}
+
+fn live_smoke_outcome_label(outcome: CodexRelayLiveSmokeOutcome) -> &'static str {
+    match outcome {
+        CodexRelayLiveSmokeOutcome::Passed => "passed",
+        CodexRelayLiveSmokeOutcome::Failed => "failed",
+        CodexRelayLiveSmokeOutcome::Unknown => "unknown",
+    }
+}
+
+fn live_smoke_confidence_label(confidence: CodexRelayLiveSmokeConfidence) -> &'static str {
+    match confidence {
+        CodexRelayLiveSmokeConfidence::LiveOutputShape => "live_output_shape",
+        CodexRelayLiveSmokeConfidence::LiveAccepted => "live_accepted",
+        CodexRelayLiveSmokeConfidence::LiveError => "live_error",
+        CodexRelayLiveSmokeConfidence::Transport => "transport",
+        CodexRelayLiveSmokeConfidence::Malformed => "malformed",
+    }
+}
+
 fn recommendation_confidence_label(
     confidence: CodexPatchModeRecommendationConfidence,
 ) -> &'static str {
@@ -79,6 +106,33 @@ fn recommendation_confidence_label(
         CodexPatchModeRecommendationConfidence::Medium => "medium",
         CodexPatchModeRecommendationConfidence::Low => "low",
     }
+}
+
+fn live_smoke_result_brief(result: &CodexRelayLiveSmokeResult) -> String {
+    let mut parts = vec![
+        live_smoke_outcome_label(result.outcome).to_string(),
+        format!("via {}", live_smoke_confidence_label(result.confidence)),
+    ];
+    if let Some(status_code) = result.status_code {
+        parts.push(format!("status={status_code}"));
+    }
+    if let Some(shape) = result.response_shape.as_deref() {
+        parts.push(format!("shape={shape}"));
+    }
+    if result.output_items_seen > 0 {
+        parts.push(format!("items={}", result.output_items_seen));
+    }
+    if result.image_generation_call_seen {
+        parts.push("image_call=true".to_string());
+    }
+    if result.image_result_present {
+        parts.push("image_result=true".to_string());
+    }
+    if let Some(error_class) = result.error_class.as_deref() {
+        parts.push(format!("class={error_class}"));
+    }
+    parts.push(shorten(&result.reason, 72));
+    parts.join("  ")
 }
 
 fn decision_brief(decision: &CodexCapabilityDecision) -> String {
@@ -158,6 +212,127 @@ fn codex_relay_diagnostics_lines(p: Palette, ui: &UiState) -> Vec<Line<'static>>
         )]));
     }
     lines
+}
+
+fn codex_relay_live_smoke_lines(p: Palette, ui: &UiState) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        match ui.language {
+            Language::Zh => "Codex Relay Live Smoke",
+            Language::En => "Codex Relay Live Smoke",
+        },
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        match ui.language {
+            Language::Zh => {
+                "  X 二次确认后真实请求 /responses/compact；Y 二次确认后真实请求 compact+hosted image_generation。会消耗上游 tokens/余额，不会更新路由健康状态。"
+            }
+            Language::En => {
+                "  X double-confirms a real /responses/compact request; Y double-confirms compact+hosted image_generation. This may consume upstream tokens/credits and does not update routing health."
+            }
+        },
+        Style::default().fg(p.warn),
+    )]));
+
+    let state = &ui.codex_relay_live_smoke;
+    if let Some(mode) = state.pending_confirm {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  confirm: press {} again within 3s",
+                match mode {
+                    CodexRelayLiveSmokeMode::CompactOnly => "X",
+                    CodexRelayLiveSmokeMode::CompactAndImage => "Y",
+                }
+            ),
+            Style::default().fg(p.warn),
+        )]));
+    }
+    if state.loading {
+        lines.push(Line::from(vec![Span::styled(
+            match (ui.language, state.mode) {
+                (Language::Zh, Some(CodexRelayLiveSmokeMode::CompactOnly)) => {
+                    "  status: remote compaction live smoke 运行中..."
+                }
+                (Language::Zh, Some(CodexRelayLiveSmokeMode::CompactAndImage)) => {
+                    "  status: compact+image live smoke 运行中..."
+                }
+                (Language::Zh, None) => "  status: live smoke 运行中...",
+                (Language::En, Some(CodexRelayLiveSmokeMode::CompactOnly)) => {
+                    "  status: remote compaction live smoke running..."
+                }
+                (Language::En, Some(CodexRelayLiveSmokeMode::CompactAndImage)) => {
+                    "  status: compact+image live smoke running..."
+                }
+                (Language::En, None) => "  status: live smoke running...",
+            },
+            Style::default().fg(p.accent),
+        )]));
+    }
+    if let Some(error) = state.last_error.as_deref() {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  error: {}", shorten(error, 110)),
+            Style::default().fg(p.warn),
+        )]));
+    }
+
+    if let Some(response) = state.last_result.as_ref() {
+        push_codex_relay_live_smoke_result_lines(&mut lines, p, response);
+    } else if !state.loading && state.last_error.is_none() {
+        lines.push(Line::from(vec![Span::styled(
+            match ui.language {
+                Language::Zh => "  status: 尚未运行",
+                Language::En => "  status: not run",
+            },
+            Style::default().fg(p.muted),
+        )]));
+    }
+    lines
+}
+
+fn push_codex_relay_live_smoke_result_lines(
+    lines: &mut Vec<Line<'static>>,
+    p: Palette,
+    response: &CodexRelayLiveSmokeResponse,
+) {
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  target: {} #{}  {}",
+            response.station_name,
+            response.upstream_index,
+            shorten_middle(&response.upstream_base_url, 70)
+        ),
+        Style::default().fg(p.text),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  model: requested={}  upstream={}",
+            response.requested_model, response.upstream_model
+        ),
+        Style::default().fg(p.muted),
+    )]));
+    for result in &response.results {
+        let color = match result.outcome {
+            CodexRelayLiveSmokeOutcome::Passed => p.good,
+            CodexRelayLiveSmokeOutcome::Failed => p.bad,
+            CodexRelayLiveSmokeOutcome::Unknown => p.warn,
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  live {}: {}",
+                live_smoke_case_label(result.case),
+                live_smoke_result_brief(result)
+            ),
+            Style::default().fg(color),
+        )]));
+    }
+    for warning in response.warnings.iter().take(3) {
+        lines.push(Line::from(vec![Span::styled(
+            format!("    warning: {}", shorten(warning, 96)),
+            Style::default().fg(p.warn),
+        )]));
+    }
 }
 
 fn push_codex_relay_diagnostics_result_lines(
@@ -910,15 +1085,16 @@ pub(super) fn render_settings_page(
                 lines.push(Line::from(vec![Span::styled(
                     match ui.language {
                         Language::Zh => {
-                            "  B/I/F/V/D 启用 ChatGPT / Imagegen / Official relay / Official imagegen / 默认 patch；C 诊断 relay 能力。修改 ~/.codex/config.toml 后已有 Codex app 需要重启。"
+                            "  B/I/F/V/D 启用 ChatGPT / Imagegen / Official relay / Official imagegen / 默认 patch；C 诊断 relay 能力；X/Y 确认后运行 live smoke。修改 ~/.codex/config.toml 后已有 Codex app 需要重启。"
                         }
                         Language::En => {
-                            "  B/I/F/V/D enable ChatGPT / Imagegen / Official relay / Official imagegen / default patch; C diagnoses relay capabilities. Restart existing Codex apps after ~/.codex/config.toml changes."
+                            "  B/I/F/V/D enable ChatGPT / Imagegen / Official relay / Official imagegen / default patch; C diagnoses relay capabilities; X/Y run live smoke after confirmation. Restart existing Codex apps after ~/.codex/config.toml changes."
                         }
                     },
                     Style::default().fg(p.muted),
                 )]));
                 lines.extend(codex_relay_diagnostics_lines(p, ui));
+                lines.extend(codex_relay_live_smoke_lines(p, ui));
             }
             Err(err) => {
                 lines.push(Line::from(vec![Span::styled(
@@ -929,6 +1105,7 @@ pub(super) fn render_settings_page(
                     Style::default().fg(p.warn),
                 )]));
                 lines.extend(codex_relay_diagnostics_lines(p, ui));
+                lines.extend(codex_relay_live_smoke_lines(p, ui));
             }
         }
     }
@@ -1173,6 +1350,57 @@ mod tests {
         }
     }
 
+    fn live_smoke_response() -> CodexRelayLiveSmokeResponse {
+        CodexRelayLiveSmokeResponse {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            station_name: "input".to_string(),
+            upstream_index: 0,
+            upstream_base_url: "https://relay.example/v1".to_string(),
+            requested_model: "gpt-5.5".to_string(),
+            upstream_model: "openai/gpt-5.5".to_string(),
+            cases: vec![
+                CodexRelayLiveSmokeCase::ResponsesCompact,
+                CodexRelayLiveSmokeCase::HostedImageGeneration,
+            ],
+            results: vec![
+                CodexRelayLiveSmokeResult {
+                    case: CodexRelayLiveSmokeCase::ResponsesCompact,
+                    outcome: CodexRelayLiveSmokeOutcome::Passed,
+                    confidence: CodexRelayLiveSmokeConfidence::LiveOutputShape,
+                    side_effect: crate::proxy::CodexRelayLiveSmokeSideEffect::LiveRequest,
+                    status_code: Some(200),
+                    response_shape: Some("compact_output_compaction_item".to_string()),
+                    output_items_seen: 1,
+                    image_generation_call_seen: false,
+                    image_result_present: false,
+                    accepted_by_responses: false,
+                    error_class: None,
+                    reason: "compact endpoint returned a live output array".to_string(),
+                },
+                CodexRelayLiveSmokeResult {
+                    case: CodexRelayLiveSmokeCase::HostedImageGeneration,
+                    outcome: CodexRelayLiveSmokeOutcome::Passed,
+                    confidence: CodexRelayLiveSmokeConfidence::LiveOutputShape,
+                    side_effect: crate::proxy::CodexRelayLiveSmokeSideEffect::LiveRequest,
+                    status_code: Some(200),
+                    response_shape: Some("image_generation_call".to_string()),
+                    output_items_seen: 1,
+                    image_generation_call_seen: true,
+                    image_result_present: true,
+                    accepted_by_responses: true,
+                    error_class: None,
+                    reason: "responses endpoint returned a hosted image_generation_call"
+                        .to_string(),
+                },
+            ],
+            warnings: vec![
+                "live smoke sends real upstream requests and may consume tokens or credits"
+                    .to_string(),
+            ],
+        }
+    }
+
     fn retry_layer(strategy: RetryStrategy, attempts: u32) -> ResolvedRetryLayerConfig {
         ResolvedRetryLayerConfig {
             max_attempts: attempts,
@@ -1247,5 +1475,34 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("warning:"), "{text}");
+    }
+
+    #[test]
+    fn codex_relay_live_smoke_lines_show_confirmation_and_results() {
+        let mut ui = UiState {
+            codex_relay_live_smoke: crate::tui::state::CodexRelayLiveSmokeState {
+                pending_confirm: Some(CodexRelayLiveSmokeMode::CompactAndImage),
+                pending_confirm_at: Some(std::time::Instant::now()),
+                last_result: Some(live_smoke_response()),
+                ..Default::default()
+            },
+            ..UiState::default()
+        };
+
+        let text = lines_text(&codex_relay_live_smoke_lines(Palette::default(), &ui));
+
+        assert!(text.contains("Codex Relay Live Smoke"), "{text}");
+        assert!(text.contains("press Y again within 3s"), "{text}");
+        assert!(text.contains("live responses_compact: passed"), "{text}");
+        assert!(
+            text.contains("live hosted_image_generation: passed"),
+            "{text}"
+        );
+        assert!(text.contains("image_result=true"), "{text}");
+        assert!(text.contains("warning:"), "{text}");
+
+        ui.codex_relay_live_smoke.pending_confirm = Some(CodexRelayLiveSmokeMode::CompactOnly);
+        let text = lines_text(&codex_relay_live_smoke_lines(Palette::default(), &ui));
+        assert!(text.contains("press X again within 3s"), "{text}");
     }
 }

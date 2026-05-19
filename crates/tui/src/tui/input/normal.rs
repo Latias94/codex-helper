@@ -16,6 +16,9 @@ use crate::tui::Language;
 use crate::tui::codex_relay_diagnostics::{
     CodexRelayDiagnosticsSender, request_codex_relay_diagnostics,
 };
+use crate::tui::codex_relay_live_smoke::{
+    CodexRelayLiveSmokeMode, CodexRelayLiveSmokeSender, confirm_or_request_codex_relay_live_smoke,
+};
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     CODEX_RECENT_WINDOWS, ProviderOption, Snapshot, codex_recent_window_label,
@@ -278,6 +281,7 @@ pub(super) async fn handle_key_normal(
     proxy: &ProxyService,
     balance_refresh_tx: &BalanceRefreshSender,
     codex_relay_diagnostics_tx: &CodexRelayDiagnosticsSender,
+    codex_relay_live_smoke_tx: &CodexRelayLiveSmokeSender,
     key: KeyEvent,
 ) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
@@ -537,6 +541,24 @@ pub(super) async fn handle_key_normal(
         }
         KeyCode::Char('C') if ui.page == Page::Settings && ui.service_name == "codex" => {
             request_codex_relay_diagnostics(ui, snapshot, proxy, codex_relay_diagnostics_tx)
+        }
+        KeyCode::Char('X') if ui.page == Page::Settings && ui.service_name == "codex" => {
+            confirm_or_request_codex_relay_live_smoke(
+                ui,
+                snapshot,
+                proxy,
+                codex_relay_live_smoke_tx,
+                CodexRelayLiveSmokeMode::CompactOnly,
+            )
+        }
+        KeyCode::Char('Y') if ui.page == Page::Settings && ui.service_name == "codex" => {
+            confirm_or_request_codex_relay_live_smoke(
+                ui,
+                snapshot,
+                proxy,
+                codex_relay_live_smoke_tx,
+                CodexRelayLiveSmokeMode::CompactAndImage,
+            )
         }
         KeyCode::Char('R') if ui.page == Page::Settings => {
             let now = Instant::now();

@@ -404,6 +404,7 @@ async fn routing_page_g_refreshes_balances() {
     .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
+    let (live_smoke_tx, _live_smoke_rx) = mpsc::unbounded_channel();
 
     let handled = super::handle_key_event(
         proxy.state_handle(),
@@ -413,6 +414,7 @@ async fn routing_page_g_refreshes_balances() {
         &proxy,
         tx,
         diagnostics_tx,
+        live_smoke_tx,
         KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
     )
     .await;
@@ -482,6 +484,7 @@ async fn route_graph_global_route_target_key_uses_routing_order_and_invalidates_
     };
     let (tx, _rx) = mpsc::unbounded_channel();
     let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
+    let (live_smoke_tx, _live_smoke_rx) = mpsc::unbounded_channel();
 
     let handled = super::handle_key_event(
         state.clone(),
@@ -491,6 +494,7 @@ async fn route_graph_global_route_target_key_uses_routing_order_and_invalidates_
         &proxy,
         tx,
         diagnostics_tx,
+        live_smoke_tx,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await;
@@ -518,6 +522,7 @@ async fn startup_alert_enter_dismisses_report() {
     };
     let (tx, _rx) = mpsc::unbounded_channel();
     let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
+    let (live_smoke_tx, _live_smoke_rx) = mpsc::unbounded_channel();
 
     let handled = super::handle_key_event(
         state,
@@ -527,6 +532,7 @@ async fn startup_alert_enter_dismisses_report() {
         &proxy,
         tx,
         diagnostics_tx,
+        live_smoke_tx,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await;
@@ -534,6 +540,46 @@ async fn startup_alert_enter_dismisses_report() {
     assert!(handled);
     assert_eq!(ui.overlay, Overlay::None);
     assert!(ui.startup_readiness.is_none());
+}
+
+#[tokio::test]
+async fn codex_relay_live_smoke_x_requires_confirmation_before_request() {
+    let (proxy, cfg) = proxy_with_single_station_without_upstreams();
+    let state = proxy.state_handle();
+    let snapshot = empty_snapshot(state.as_ref(), cfg).await;
+    let mut providers = Vec::new();
+    let mut ui = UiState {
+        page: Page::Settings,
+        ..UiState::default()
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
+    let (live_smoke_tx, mut live_smoke_rx) = mpsc::unbounded_channel();
+    let _live_smoke_tx_keepalive = live_smoke_tx.clone();
+
+    let handled = super::handle_key_event(
+        state,
+        &mut providers,
+        &mut ui,
+        &snapshot,
+        &proxy,
+        tx,
+        diagnostics_tx,
+        live_smoke_tx,
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+    )
+    .await;
+
+    assert!(handled);
+    assert_eq!(
+        ui.codex_relay_live_smoke.pending_confirm,
+        Some(crate::tui::codex_relay_live_smoke::CodexRelayLiveSmokeMode::CompactOnly)
+    );
+    assert!(!ui.codex_relay_live_smoke.loading);
+    assert!(matches!(
+        live_smoke_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[test]

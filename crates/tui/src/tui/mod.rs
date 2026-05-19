@@ -1,4 +1,5 @@
 mod codex_relay_diagnostics;
+mod codex_relay_live_smoke;
 mod i18n;
 mod input;
 mod model;
@@ -35,6 +36,9 @@ use crate::state::ProxyState;
 
 use self::codex_relay_diagnostics::{
     CodexRelayDiagnosticsResult, apply_codex_relay_diagnostics_result,
+};
+use self::codex_relay_live_smoke::{
+    CodexRelayLiveSmokeResult, apply_codex_relay_live_smoke_result,
 };
 use self::model::{Palette, Snapshot, refresh_snapshot};
 use self::runtime_refresh::{
@@ -249,6 +253,8 @@ pub async fn run_dashboard(
         mpsc::unbounded_channel::<CodexRecentRefreshResult>();
     let (codex_relay_diagnostics_tx, mut codex_relay_diagnostics_rx) =
         mpsc::unbounded_channel::<CodexRelayDiagnosticsResult>();
+    let (codex_relay_live_smoke_tx, mut codex_relay_live_smoke_rx) =
+        mpsc::unbounded_channel::<CodexRelayLiveSmokeResult>();
     let mut snapshot_refresh = SnapshotRefreshController::new(snapshot_refresh_tx);
 
     let mut render_invalidation = RenderInvalidation::FullClear;
@@ -353,6 +359,13 @@ pub async fn run_dashboard(
                     request_redraw(&mut render_invalidation);
                 }
             }
+            maybe_codex_relay_live_smoke = codex_relay_live_smoke_rx.recv() => {
+                if let Some(result) = maybe_codex_relay_live_smoke
+                    && apply_codex_relay_live_smoke_result(&mut ui, result)
+                {
+                    request_redraw(&mut render_invalidation);
+                }
+            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 ui.should_exit = true;
@@ -377,6 +390,7 @@ pub async fn run_dashboard(
                             &proxy,
                             balance_refresh_tx.clone(),
                             codex_relay_diagnostics_tx.clone(),
+                            codex_relay_live_smoke_tx.clone(),
                             key,
                         )
                         .await
