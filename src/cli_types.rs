@@ -136,7 +136,8 @@ pub(crate) enum Command {
 #[derive(Subcommand, Debug)]
 pub(crate) enum CodexCommand {
     /// Run validation-only Codex relay capability diagnostics
-    RelayCapabilities {
+    #[command(name = "relay-capabilities")]
+    Capabilities {
         /// Target station/provider name; defaults to the current Codex routing target
         #[arg(long)]
         station: Option<String>,
@@ -154,7 +155,8 @@ pub(crate) enum CodexCommand {
         json: bool,
     },
     /// Run strongly opt-in Codex relay live smoke against one selected upstream
-    RelayLiveSmoke {
+    #[command(name = "relay-live-smoke")]
+    LiveSmoke {
         /// Required exact acknowledgement before any upstream live-smoke request is sent
         #[arg(long = "acknowledgement", value_name = "ACK")]
         acknowledgement: String,
@@ -178,7 +180,8 @@ pub(crate) enum CodexCommand {
         json: bool,
     },
     /// List local Codex relay diagnostic evidence records
-    RelayEvidence {
+    #[command(name = "relay-evidence")]
+    Evidence {
         /// Maximum number of records to show, newest first
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -926,10 +929,9 @@ mod tests {
         .expect("parse codex relay capabilities");
 
         let Some(Command::Codex {
-            cmd:
-                CodexCommand::RelayCapabilities {
-                    model, mode, json, ..
-                },
+            cmd: CodexCommand::Capabilities {
+                model, mode, json, ..
+            },
         }) = cli.command
         else {
             panic!("expected codex relay capabilities command");
@@ -969,7 +971,7 @@ mod tests {
 
         let Some(Command::Codex {
             cmd:
-                CodexCommand::RelayLiveSmoke {
+                CodexCommand::LiveSmoke {
                     acknowledgement,
                     model,
                     image,
@@ -1001,7 +1003,7 @@ mod tests {
 
         let Some(Command::Codex {
             cmd:
-                CodexCommand::RelayEvidence {
+                CodexCommand::Evidence {
                     kind,
                     station,
                     limit,

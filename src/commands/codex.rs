@@ -16,7 +16,7 @@ use crate::{CliError, CliResult};
 
 pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
     match cmd {
-        CodexCommand::RelayCapabilities {
+        CodexCommand::Capabilities {
             station,
             upstream_index,
             model,
@@ -39,7 +39,7 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
                 print_capabilities_text(&response);
             }
         }
-        CodexCommand::RelayLiveSmoke {
+        CodexCommand::LiveSmoke {
             acknowledgement,
             station,
             upstream_index,
@@ -70,7 +70,7 @@ pub(crate) async fn handle_codex_cmd(cmd: CodexCommand) -> CliResult<()> {
                 print_live_smoke_text(&response);
             }
         }
-        CodexCommand::RelayEvidence {
+        CodexCommand::Evidence {
             limit,
             kind,
             station,

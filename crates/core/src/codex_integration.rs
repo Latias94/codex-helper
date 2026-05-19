@@ -1259,8 +1259,6 @@ pub fn codex_bridge_diagnostics() -> CodexBridgeDiagnostics {
             let auth_ready = snapshot.authed_upstreams > 0;
             let status = if auth_ready {
                 CodexBridgeDiagnosticStatus::Ok
-            } else if snapshot.routable_upstreams == 0 {
-                CodexBridgeDiagnosticStatus::Fail
             } else {
                 CodexBridgeDiagnosticStatus::Fail
             };
