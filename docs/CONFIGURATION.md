@@ -79,6 +79,18 @@ The legacy CLI spelling `--mode ...` is also accepted as an alias. On startup, `
 
 `responses_websocket = true` is a transport switch, not a separate preset. It is only valid with `official-relay` and `official-imagegen`. When enabled, codex-helper writes `supports_websockets = true` into Codex's provider config and handles the WebSocket upgrade itself on `/responses`, `/v1/responses`, and `/backend-api/codex/responses`. The relay path reads the first `response.create` frame, applies the same model override, model mapping, request filter, routing selection, session affinity, concurrency snapshot, and auth injection as normal helper traffic, injects `OpenAI-Beta: responses_websockets=2026-02-06`, then bridges frames bidirectionally to the selected upstream. Keep it disabled unless your upstream relay also supports Responses WebSocket v2.
 
+Assuming the relay supports the required endpoints, the capability ladder is:
+
+```text
+default
+< chatgpt-bridge / imagegen-bridge
+< official-relay
+< official-imagegen
+< official-imagegen + responses_websocket
+```
+
+`official-imagegen` is the most complete preset, but it is also the most demanding: the relay must support `/responses`, `/responses/compact`, and hosted `image_generation`. Only enable `responses_websocket` after a WebSocket live smoke passes for the selected upstream.
+
 You can actively inspect a relay's Codex capability profile through the local admin API:
 
 In the built-in TUI, open Settings (`6`) and press `C` to run the same bounded relay diagnostic

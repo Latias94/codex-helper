@@ -79,6 +79,18 @@ codex-helper switch on --preset default
 
 `responses_websocket = true` 是传输开关，不是新的 preset。它只允许搭配 `official-relay` 和 `official-imagegen`。启用后，codex-helper 会在 Codex provider 配置里写入 `supports_websockets = true`，并由 helper 自己处理 `/responses`、`/v1/responses`、`/backend-api/codex/responses` 的 WebSocket upgrade。relay 会读取第一个 `response.create` frame，复用普通 helper 请求的 model override、model mapping、request filter、routing selection、session affinity、concurrency snapshot 和 auth injection，注入 `OpenAI-Beta: responses_websockets=2026-02-06`，然后和选中的上游做双向 frame 转发。除非你的上游中转也支持 Responses WebSocket v2，否则保持关闭。
 
+在 relay 支持对应接口的前提下，能力阶梯是：
+
+```text
+default
+< chatgpt-bridge / imagegen-bridge
+< official-relay
+< official-imagegen
+< official-imagegen + responses_websocket
+```
+
+`official-imagegen` 是当前最完整 preset，但也是对中转要求最高的 preset：中转必须支持 `/responses`、`/responses/compact` 和 hosted `image_generation`。只有选中的上游通过 WebSocket live smoke 后，才建议额外开启 `responses_websocket`。
+
 可以通过本地 admin API 主动检查某个中转的 Codex 能力画像：
 
 内置 TUI 也能直接跑同一个诊断：进入 Settings（`6`）后按 `C`，它会针对当前 Codex runtime

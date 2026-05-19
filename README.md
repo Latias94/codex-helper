@@ -116,6 +116,18 @@ codex-helper switch off
 
 `official-relay` 和 `official-imagegen` 都是实验预设。它们只负责让 Codex 使用更接近官方的客户端能力选择；中转站本身仍必须真正支持对应接口。真实请求密钥来自 `~/.codex-helper/config.toml` 的 provider 配置，bridge 预设不会把 Codex 的 ChatGPT token 透传给没有 helper 侧密钥的第三方 relay。旧的 `official-relay-bridge` / `official-imagegen-bridge` 仍作为 alias 接受，但不再作为推荐写法。
 
+在上游能力满足的前提下，能力最完整的是 `official-imagegen`；如果再确认上游支持 Responses WebSocket v2，可以额外开启 `responses_websocket`，这就是当前最接近官方体验的组合：
+
+```text
+default
+< chatgpt-bridge / imagegen-bridge
+< official-relay
+< official-imagegen
+< official-imagegen + responses_websocket
+```
+
+不要无脑开最强组合：`official-imagegen` 要求中转同时支持 `/responses`、`/responses/compact` 和 hosted `image_generation`；`responses_websocket` 还要求 WebSocket live smoke 通过。
+
 如果上游已确认支持 Responses WebSocket v2，再额外启用 `responses_websocket = true` 或 `--responses-websocket`；它是独立传输开关，不是新的 preset。
 
 注意：任何对 `~/.codex/config.toml` 的修改都只会被新启动的 Codex 会话读取；修改后请完整重启 Codex App、TUI 或 `codex exec` 会话。

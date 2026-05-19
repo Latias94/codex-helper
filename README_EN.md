@@ -104,6 +104,18 @@ Preset choices:
 
 `official-relay` and `official-imagegen` are experimental. They only change how Codex chooses client-side capabilities; the relay still has to support the underlying endpoints. Real request credentials come from `~/.codex-helper/config.toml`, and the bridge presets do not forward Codex ChatGPT tokens to third-party relays that do not have helper-side credentials. Legacy names `official-relay-bridge` / `official-imagegen-bridge` are still accepted as aliases, but are no longer the recommended spelling.
 
+Assuming the upstream supports the required endpoints, `official-imagegen` is the most complete preset. If the upstream also passes Responses WebSocket v2 smoke, adding `responses_websocket` is the closest current setup to the official experience:
+
+```text
+default
+< chatgpt-bridge / imagegen-bridge
+< official-relay
+< official-imagegen
+< official-imagegen + responses_websocket
+```
+
+Do not enable the strongest combination blindly: `official-imagegen` requires the relay to support `/responses`, `/responses/compact`, and hosted `image_generation`; `responses_websocket` additionally requires a passing WebSocket live smoke.
+
 If the upstream is known to support Responses WebSocket v2, enable `responses_websocket = true` or `--responses-websocket` separately; it is a transport switch, not a preset.
 
 Note: any change to `~/.codex/config.toml` is only picked up by newly started Codex sessions. After changing it, fully restart the Codex App, TUI, or `codex exec` session.
