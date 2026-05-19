@@ -13,6 +13,9 @@ use crate::proxy::ProxyService;
 use crate::sessions::find_codex_session_file_by_id;
 use crate::state::ProxyState;
 use crate::tui::Language;
+use crate::tui::codex_relay_diagnostics::{
+    CodexRelayDiagnosticsSender, request_codex_relay_diagnostics,
+};
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{
     CODEX_RECENT_WINDOWS, ProviderOption, Snapshot, codex_recent_window_label,
@@ -274,6 +277,7 @@ pub(super) async fn handle_key_normal(
     snapshot: &Snapshot,
     proxy: &ProxyService,
     balance_refresh_tx: &BalanceRefreshSender,
+    codex_relay_diagnostics_tx: &CodexRelayDiagnosticsSender,
     key: KeyEvent,
 ) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
@@ -530,6 +534,9 @@ pub(super) async fn handle_key_normal(
                 }
             }
             true
+        }
+        KeyCode::Char('C') if ui.page == Page::Settings && ui.service_name == "codex" => {
+            request_codex_relay_diagnostics(ui, snapshot, proxy, codex_relay_diagnostics_tx)
         }
         KeyCode::Char('R') if ui.page == Page::Settings => {
             let now = Instant::now();

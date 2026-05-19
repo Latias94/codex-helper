@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "slug": "codex-relay-diagnostics-operator-surface",
+  "title": "Codex Relay Diagnostics Operator Surface",
+  "status": "implemented",
+  "updated": "2026-05-19",
+  "scope_kind": "execution",
+  "problem": "Codex relay capability diagnostics exist behind an admin API but are not available in the normal operator UI path.",
+  "authoritative_docs": [
+    {
+      "role": "design",
+      "path": "docs/workstreams/codex-relay-diagnostics-operator-surface/DESIGN.md"
+    },
+    {
+      "role": "execution",
+      "path": "docs/workstreams/codex-relay-diagnostics-operator-surface/TODO.md"
+    },
+    {
+      "role": "gates",
+      "path": "docs/workstreams/codex-relay-diagnostics-operator-surface/EVIDENCE_AND_GATES.md"
+    }
+  ],
+  "gates": [
+    "cargo nextest run -p codex-helper-core codex_capabilities_api",
+    "cargo nextest run -p codex-helper-tui codex_relay_diagnostics",
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core",
+    "cargo nextest run -p codex-helper-tui"
+  ],
+  "evidence": [
+    "docs/workstreams/codex-relay-diagnostics-operator-surface/DESIGN.md",
+    "docs/workstreams/codex-relay-diagnostics-operator-surface/TODO.md",
+    "cargo nextest run -p codex-helper-core codex_capabilities_api",
+    "cargo nextest run -p codex-helper-tui codex_relay_diagnostics",
+    "cargo fmt --check",
+    "cargo nextest run -p codex-helper-core",
+    "cargo nextest run -p codex-helper-tui"
+  ],
+  "adr_refs": [],
+  "continue_policy": {
+    "default_action": "split_follow_on",
+    "notes": "The TUI-first operator diagnostic target is implemented. Split GUI, CLI, or live relay smoke automation into follow-on workstreams."
+  }
+}

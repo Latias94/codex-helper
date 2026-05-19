@@ -73,6 +73,12 @@ On startup, `codex-helper serve` uses `[codex.client_patch]` when Codex is not a
 
 You can actively inspect a relay's Codex capability profile through the local admin API:
 
+In the built-in TUI, open Settings (`6`) and press `C` to run the same bounded relay diagnostic
+against the current Codex runtime. The Settings page shows the selected target, expected
+capabilities, observed `/models` / `/responses` / `/responses/compact` support, mismatches,
+warnings, and the recommended patch mode. The TUI action is diagnostic-only; it never changes the
+patch mode automatically.
+
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
   -H 'content-type: application/json' \

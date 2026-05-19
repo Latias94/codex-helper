@@ -403,6 +403,7 @@ async fn routing_page_g_refreshes_balances() {
     )
     .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
 
     let handled = super::handle_key_event(
         proxy.state_handle(),
@@ -411,6 +412,7 @@ async fn routing_page_g_refreshes_balances() {
         &snapshot,
         &proxy,
         tx,
+        diagnostics_tx,
         KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
     )
     .await;
@@ -479,6 +481,7 @@ async fn route_graph_global_route_target_key_uses_routing_order_and_invalidates_
         ..UiState::default()
     };
     let (tx, _rx) = mpsc::unbounded_channel();
+    let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
 
     let handled = super::handle_key_event(
         state.clone(),
@@ -487,6 +490,7 @@ async fn route_graph_global_route_target_key_uses_routing_order_and_invalidates_
         &snapshot,
         &proxy,
         tx,
+        diagnostics_tx,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await;
@@ -513,6 +517,7 @@ async fn startup_alert_enter_dismisses_report() {
         ..UiState::default()
     };
     let (tx, _rx) = mpsc::unbounded_channel();
+    let (diagnostics_tx, _diagnostics_rx) = mpsc::unbounded_channel();
 
     let handled = super::handle_key_event(
         state,
@@ -521,6 +526,7 @@ async fn startup_alert_enter_dismisses_report() {
         &snapshot,
         &proxy,
         tx,
+        diagnostics_tx,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await;

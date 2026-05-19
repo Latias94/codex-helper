@@ -1,3 +1,4 @@
+mod codex_relay_diagnostics;
 mod i18n;
 mod input;
 mod model;
@@ -32,6 +33,9 @@ use crate::config::ProxyConfig;
 use crate::proxy::ProxyService;
 use crate::state::ProxyState;
 
+use self::codex_relay_diagnostics::{
+    CodexRelayDiagnosticsResult, apply_codex_relay_diagnostics_result,
+};
 use self::model::{Palette, Snapshot, refresh_snapshot};
 use self::runtime_refresh::{
     DashboardTiming, apply_pending_refresh_requests, handle_balance_refresh_result,
@@ -243,6 +247,8 @@ pub async fn run_dashboard(
         mpsc::unbounded_channel::<CodexHistoryRefreshResult>();
     let (recent_refresh_tx, mut recent_refresh_rx) =
         mpsc::unbounded_channel::<CodexRecentRefreshResult>();
+    let (codex_relay_diagnostics_tx, mut codex_relay_diagnostics_rx) =
+        mpsc::unbounded_channel::<CodexRelayDiagnosticsResult>();
     let mut snapshot_refresh = SnapshotRefreshController::new(snapshot_refresh_tx);
 
     let mut render_invalidation = RenderInvalidation::FullClear;
@@ -340,6 +346,13 @@ pub async fn run_dashboard(
                     request_redraw(&mut render_invalidation);
                 }
             }
+            maybe_codex_relay_diagnostics = codex_relay_diagnostics_rx.recv() => {
+                if let Some(result) = maybe_codex_relay_diagnostics
+                    && apply_codex_relay_diagnostics_result(&mut ui, result)
+                {
+                    request_redraw(&mut render_invalidation);
+                }
+            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 ui.should_exit = true;
@@ -363,6 +376,7 @@ pub async fn run_dashboard(
                             &snapshot,
                             &proxy,
                             balance_refresh_tx.clone(),
+                            codex_relay_diagnostics_tx.clone(),
                             key,
                         )
                         .await

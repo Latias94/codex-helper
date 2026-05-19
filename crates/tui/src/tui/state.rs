@@ -61,6 +61,16 @@ pub(in crate::tui) struct CodexHistoryExternalFocus {
     pub(in crate::tui) origin: CodexHistoryExternalFocusOrigin,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(in crate::tui) struct CodexRelayDiagnosticsState {
+    pub(in crate::tui) loading: bool,
+    pub(in crate::tui) generation: u64,
+    pub(in crate::tui) last_started_at: Option<std::time::Instant>,
+    pub(in crate::tui) last_finished_at: Option<std::time::Instant>,
+    pub(in crate::tui) last_result: Option<crate::proxy::CodexRelayCapabilitiesResponse>,
+    pub(in crate::tui) last_error: Option<String>,
+}
+
 #[derive(Debug)]
 pub(in crate::tui) struct UiState {
     pub(in crate::tui) service_name: &'static str,
@@ -151,6 +161,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) last_balance_refresh_message: Option<String>,
     pub(in crate::tui) last_balance_refresh_error: Option<String>,
     pub(in crate::tui) last_balance_refresh_summary: Option<UsageProviderRefreshSummary>,
+    pub(in crate::tui) codex_relay_diagnostics: CodexRelayDiagnosticsState,
     pub(in crate::tui) should_exit: bool,
     pub(in crate::tui) stations_table: TableState,
     pub(in crate::tui) sessions_table: TableState,
@@ -256,6 +267,7 @@ impl Default for UiState {
             last_balance_refresh_message: None,
             last_balance_refresh_error: None,
             last_balance_refresh_summary: None,
+            codex_relay_diagnostics: CodexRelayDiagnosticsState::default(),
             should_exit: false,
             stations_table: TableState::default(),
             sessions_table: TableState::default(),

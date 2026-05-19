@@ -17,6 +17,7 @@ mod attempt_transport;
 mod auth_resolution;
 mod classify;
 mod client_identity;
+mod codex_relay_capabilities;
 mod codex_relay_probe;
 mod concurrency_limits;
 mod control_plane;
@@ -72,6 +73,10 @@ pub use self::admin::{
     admin_port_for_proxy_port, local_admin_base_url_for_proxy_port, local_proxy_base_url,
 };
 pub use self::api_responses::{ProfilesResponse, ReloadResult, RuntimeStatusResponse};
+pub use self::codex_relay_capabilities::{
+    CodexRelayCapabilitiesObserved, CodexRelayCapabilitiesRequest, CodexRelayCapabilitiesResponse,
+    CodexRelayCapabilityMismatch,
+};
 pub use self::codex_relay_probe::{
     CodexRelayProbeClient, CodexRelayProbeConfidence, CodexRelayProbeKind, CodexRelayProbeResult,
     CodexRelayProbeSideEffect, CodexRelayProbeSpec, CodexRelayProbeSupport,

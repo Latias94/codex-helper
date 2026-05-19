@@ -73,6 +73,11 @@ codex-helper switch on --mode default
 
 可以通过本地 admin API 主动检查某个中转的 Codex 能力画像：
 
+内置 TUI 也能直接跑同一个诊断：进入 Settings（`6`）后按 `C`，它会针对当前 Codex runtime
+执行一次有界 relay 诊断。Settings 页会显示选中的目标上游、expected 能力、实际观测到的
+`/models` / `/responses` / `/responses/compact` 支持情况、mismatch、warning 和推荐 patch mode。
+这个 TUI 动作只诊断，不会自动修改 patch mode。
+
 ```bash
 curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
   -H 'content-type: application/json' \

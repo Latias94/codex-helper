@@ -102,7 +102,7 @@ define_messages! {
     FOOTER_REQUESTS => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ 选择  e 错误  s scope  o/h 跳转  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ select  e errors  s scope  o/h navigate  ? help" },
     FOOTER_SESSIONS => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ 选择  b/M/f 覆盖  a/e/v 筛选  t 记录  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ select  b/M/f overrides  a/e/v filters  t transcript  ? help" },
     FOOTER_STATS => { zh: "1-8 页面  q 退出  L 语言  Tab 站点/提供商  ↑/↓ 选择  a 关注  g 刷新余额  PgUp/PgDn 详情  ? 帮助", en: "1-8 pages  q quit  L language  Tab station/provider  ↑/↓ select  a attention  g refresh balances  PgUp/PgDn detail  ? help" },
-    FOOTER_SETTINGS_CODEX => { zh: "1-8 页面  q 退出  L 语言  p/P profile  R 重载  O 导入  B/I/F/D patch  ? 帮助", en: "1-8 pages  q quit  L language  p/P profile  R reload  O import  B/I/F/D patch  ? help" },
+    FOOTER_SETTINGS_CODEX => { zh: "1-8 页面  q 退出  L 语言  p/P profile  R 重载  O 导入  B/I/F/V/D patch  C 诊断  ? 帮助", en: "1-8 pages  q quit  L language  p/P profile  R reload  O import  B/I/F/V/D patch  C diagnose  ? help" },
     FOOTER_SETTINGS_OTHER => { zh: "1-8 页面  q 退出  L 语言  p/P profile  R 重载  ? 帮助", en: "1-8 pages  q quit  L language  p/P profile  R reload  ? help" },
     FOOTER_HISTORY => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ 选择  r 刷新  t/Enter 记录  s/f 跳转  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ select  r refresh  t/Enter transcript  s/f navigate  ? help" },
     FOOTER_RECENT => { zh: "1-8 页面  q 退出  L 语言  ↑/↓ 选择  [] 时间  Enter/y 复制  t 记录  ? 帮助", en: "1-8 pages  q quit  L language  ↑/↓ select  [] window  Enter/y copy  t transcript  ? help" },
@@ -194,7 +194,7 @@ define_messages! {
     RUNTIME_CONFIG_TITLE => { zh: "运行态配置", en: "Runtime config" },
     PRESS_R_RELOAD => { zh: "  (按 R 立即重载)", en: "  (press R to reload)" },
     COMMON_KEYS_TITLE => { zh: "常用快捷键", en: "Common keys" },
-    COMMON_KEYS_CODEX => { zh: "  1-8 切页  ? 帮助  q 退出  L 语言  (Stations: i 详情  Stats: y 导出/复制  Settings: R 重载  O 覆盖导入  B Bridge  D 默认)", en: "  1-8 pages  ? help  q quit  L language  (Stations: i details  Stats: y export/copy  Settings: R reload  O overwrite  B bridge  D default)" },
+    COMMON_KEYS_CODEX => { zh: "  1-8 切页  ? 帮助  q 退出  L 语言  (Stations: i 详情  Stats: y 导出/复制  Settings: R 重载  O 覆盖导入  C 诊断  B/I/F/V/D patch)", en: "  1-8 pages  ? help  q quit  L language  (Stations: i details  Stats: y export/copy  Settings: R reload  O overwrite  C diagnose  B/I/F/V/D patch)" },
     COMMON_KEYS_OTHER => { zh: "  1-8 切页  ? 帮助  q 退出  L 语言  (Stations: i 详情  Stats: y 导出/复制)", en: "  1-8 pages  ? help  q quit  L language  (Stations: i details  Stats: y export/copy)" },
 
     CONFIRM_OVERWRITE => { zh: "再次按 O 确认覆盖导入（3s 内）", en: "Press O again to confirm overwrite (within 3s)" },

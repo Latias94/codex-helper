@@ -5,9 +5,16 @@ use ratatui::layout::Rect;
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use crate::codex_capability_profile::{
+    CodexCapabilityDecision, CodexCapabilitySupport, CodexPatchModeRecommendationConfidence,
+};
 use crate::config::{ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryStrategy};
 use crate::healthcheck::{
     HEALTHCHECK_MAX_INFLIGHT_ENV, HEALTHCHECK_TIMEOUT_MS_ENV, HEALTHCHECK_UPSTREAM_CONCURRENCY_ENV,
+};
+use crate::proxy::{
+    CodexRelayCapabilitiesResponse, CodexRelayProbeConfidence, CodexRelayProbeResult,
+    CodexRelayProbeSupport,
 };
 use crate::tui::Language;
 use crate::tui::i18n::{self, msg};
@@ -36,6 +43,234 @@ fn retry_trigger_summary(layer: &ResolvedRetryLayerConfig) -> String {
         layer.on_class.join(",")
     };
     format!("status=[{statuses}] class=[{classes}]")
+}
+
+fn capability_support_label(support: CodexCapabilitySupport) -> &'static str {
+    match support {
+        CodexCapabilitySupport::Unknown => "unknown",
+        CodexCapabilitySupport::Supported => "supported",
+        CodexCapabilitySupport::Unsupported => "unsupported",
+    }
+}
+
+fn probe_support_label(support: CodexRelayProbeSupport) -> &'static str {
+    match support {
+        CodexRelayProbeSupport::Supported => "supported",
+        CodexRelayProbeSupport::Unsupported => "unsupported",
+        CodexRelayProbeSupport::Unknown => "unknown",
+    }
+}
+
+fn probe_confidence_label(confidence: CodexRelayProbeConfidence) -> &'static str {
+    match confidence {
+        CodexRelayProbeConfidence::SuccessStatus => "success_status",
+        CodexRelayProbeConfidence::EndpointValidation => "endpoint_validation",
+        CodexRelayProbeConfidence::ErrorClassification => "error_classification",
+        CodexRelayProbeConfidence::Transport => "transport",
+        CodexRelayProbeConfidence::Malformed => "malformed",
+    }
+}
+
+fn recommendation_confidence_label(
+    confidence: CodexPatchModeRecommendationConfidence,
+) -> &'static str {
+    match confidence {
+        CodexPatchModeRecommendationConfidence::High => "high",
+        CodexPatchModeRecommendationConfidence::Medium => "medium",
+        CodexPatchModeRecommendationConfidence::Low => "low",
+    }
+}
+
+fn decision_brief(decision: &CodexCapabilityDecision) -> String {
+    format!(
+        "{} ({})",
+        capability_support_label(decision.support),
+        shorten(&decision.reason, 72)
+    )
+}
+
+fn probe_brief(result: &CodexRelayProbeResult) -> String {
+    let mut parts = vec![
+        probe_support_label(result.support).to_string(),
+        format!("via {}", probe_confidence_label(result.confidence)),
+    ];
+    if let Some(status_code) = result.status_code {
+        parts.push(format!("status={status_code}"));
+    }
+    if let Some(shape) = result.response_shape.as_deref() {
+        parts.push(format!("shape={shape}"));
+    }
+    if result.translation_required {
+        parts.push("translation_required=true".to_string());
+    }
+    parts.push(shorten(&result.reason, 72));
+    parts.join("  ")
+}
+
+fn codex_relay_diagnostics_lines(p: Palette, ui: &UiState) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        match ui.language {
+            Language::Zh => "Codex Relay 能力诊断",
+            Language::En => "Codex Relay Diagnostics",
+        },
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        match ui.language {
+            Language::Zh => {
+                "  C 运行一次有界诊断：/models 只读，/responses 与 /responses/compact 只发 {} 校验请求；不会自动切换 patch。"
+            }
+            Language::En => {
+                "  C runs one bounded diagnostic: /models read-only, /responses and /responses/compact send {} validation probes; patch mode is not changed automatically."
+            }
+        },
+        Style::default().fg(p.muted),
+    )]));
+
+    let state = &ui.codex_relay_diagnostics;
+    if state.loading {
+        lines.push(Line::from(vec![Span::styled(
+            match ui.language {
+                Language::Zh => "  status: 诊断中...",
+                Language::En => "  status: running...",
+            },
+            Style::default().fg(p.accent),
+        )]));
+    }
+    if let Some(error) = state.last_error.as_deref() {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  error: {}", shorten(error, 110)),
+            Style::default().fg(p.warn),
+        )]));
+    }
+
+    if let Some(response) = state.last_result.as_ref() {
+        push_codex_relay_diagnostics_result_lines(&mut lines, p, response);
+    } else if !state.loading && state.last_error.is_none() {
+        lines.push(Line::from(vec![Span::styled(
+            match ui.language {
+                Language::Zh => "  status: 尚未运行",
+                Language::En => "  status: not run",
+            },
+            Style::default().fg(p.muted),
+        )]));
+    }
+    lines
+}
+
+fn push_codex_relay_diagnostics_result_lines(
+    lines: &mut Vec<Line<'static>>,
+    p: Palette,
+    response: &CodexRelayCapabilitiesResponse,
+) {
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  target: {} #{}  {}",
+            response.station_name,
+            response.upstream_index,
+            shorten_middle(&response.upstream_base_url, 70)
+        ),
+        Style::default().fg(p.text),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  patch={}  model={}  catalog_shape={:?}  selected={:?}",
+            response.patch_mode,
+            response.model.as_deref().unwrap_or("-"),
+            response.expected.model_catalog.shape,
+            response.expected.model_catalog.selection
+        ),
+        Style::default().fg(p.muted),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  expected: compact={}  image_generation={}  web_search={}  apply_patch={}",
+            decision_brief(&response.expected.remote_compaction_v1),
+            decision_brief(&response.expected.hosted_image_generation),
+            decision_brief(&response.expected.web_search),
+            decision_brief(&response.expected.apply_patch)
+        ),
+        Style::default().fg(p.muted),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  observed /models: {}",
+            probe_brief(&response.observed.models)
+        ),
+        Style::default().fg(p.muted),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  observed /responses: {}",
+            probe_brief(&response.observed.responses)
+        ),
+        Style::default().fg(p.muted),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  observed /responses/compact: {}",
+            probe_brief(&response.observed.responses_compact)
+        ),
+        Style::default().fg(p.muted),
+    )]));
+
+    if response.mismatches.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  mismatches: none",
+            Style::default().fg(p.good),
+        )]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  mismatches: {}", response.mismatches.len()),
+            Style::default().fg(p.warn),
+        )]));
+        for mismatch in response.mismatches.iter().take(4) {
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "    - {} expected={} observed={}  {}",
+                    mismatch.capability,
+                    mismatch.expected,
+                    mismatch.observed,
+                    shorten(&mismatch.reason, 86)
+                ),
+                Style::default().fg(p.warn),
+            )]));
+        }
+    }
+
+    let recommendation = &response.recommendation;
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  recommendation: {} -> {}  confidence={}{}",
+            recommendation.current_patch_mode,
+            recommendation.recommended_patch_mode,
+            recommendation_confidence_label(recommendation.confidence),
+            if recommendation.changes_current_mode {
+                "  change"
+            } else {
+                ""
+            }
+        ),
+        Style::default().fg(if recommendation.changes_current_mode {
+            p.accent
+        } else {
+            p.good
+        }),
+    )]));
+    for reason in recommendation.reasons.iter().take(3) {
+        lines.push(Line::from(vec![Span::styled(
+            format!("    reason: {}", shorten(reason, 96)),
+            Style::default().fg(p.muted),
+        )]));
+    }
+    for warning in recommendation.warnings.iter().take(3) {
+        lines.push(Line::from(vec![Span::styled(
+            format!("    warning: {}", shorten(warning, 96)),
+            Style::default().fg(p.warn),
+        )]));
+    }
 }
 
 fn retry_layer_preview_lang(
@@ -675,14 +910,15 @@ pub(super) fn render_settings_page(
                 lines.push(Line::from(vec![Span::styled(
                     match ui.language {
                         Language::Zh => {
-                            "  B/I/F/V/D 启用 ChatGPT / Imagegen / Official relay / Official imagegen / 默认 patch。修改 ~/.codex/config.toml 后已有 Codex app 需要重启。"
+                            "  B/I/F/V/D 启用 ChatGPT / Imagegen / Official relay / Official imagegen / 默认 patch；C 诊断 relay 能力。修改 ~/.codex/config.toml 后已有 Codex app 需要重启。"
                         }
                         Language::En => {
-                            "  B/I/F/V/D enable ChatGPT / Imagegen / Official relay / Official imagegen / default patch. Restart existing Codex apps after ~/.codex/config.toml changes."
+                            "  B/I/F/V/D enable ChatGPT / Imagegen / Official relay / Official imagegen / default patch; C diagnoses relay capabilities. Restart existing Codex apps after ~/.codex/config.toml changes."
                         }
                     },
                     Style::default().fg(p.muted),
                 )]));
+                lines.extend(codex_relay_diagnostics_lines(p, ui));
             }
             Err(err) => {
                 lines.push(Line::from(vec![Span::styled(
@@ -692,6 +928,7 @@ pub(super) fn render_settings_page(
                     },
                     Style::default().fg(p.warn),
                 )]));
+                lines.extend(codex_relay_diagnostics_lines(p, ui));
             }
         }
     }
@@ -830,7 +1067,111 @@ pub(super) fn render_settings_page(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn lines_text(lines: &[Line<'_>]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    fn probe_result(
+        kind: crate::proxy::CodexRelayProbeKind,
+        support: CodexRelayProbeSupport,
+        confidence: CodexRelayProbeConfidence,
+        status_code: Option<u16>,
+        reason: &str,
+    ) -> CodexRelayProbeResult {
+        CodexRelayProbeResult {
+            kind,
+            support,
+            confidence,
+            status_code,
+            response_shape: None,
+            translation_required: false,
+            error_class: None,
+            reason: reason.to_string(),
+        }
+    }
+
+    fn diagnostic_response() -> CodexRelayCapabilitiesResponse {
+        let expected =
+            crate::codex_capability_profile::CodexCapabilityProfile::for_models_response_json(
+                crate::codex_integration::CodexPatchMode::OfficialImagegenBridge,
+                &json!({
+                    "models": [{
+                        "slug": "gpt-5.5",
+                        "input_modalities": ["text", "image"],
+                        "supports_search_tool": true,
+                        "apply_patch_tool_type": "freeform",
+                        "supports_reasoning_summaries": true
+                    }]
+                }),
+                Some("gpt-5.5"),
+            );
+        let observed = crate::proxy::CodexRelayCapabilitiesObserved {
+            models: {
+                let mut result = probe_result(
+                    crate::proxy::CodexRelayProbeKind::Models,
+                    CodexRelayProbeSupport::Supported,
+                    CodexRelayProbeConfidence::SuccessStatus,
+                    Some(200),
+                    "relay returned a Codex models catalog",
+                );
+                result.response_shape = Some("codex_models".to_string());
+                result
+            },
+            responses: probe_result(
+                crate::proxy::CodexRelayProbeKind::Responses,
+                CodexRelayProbeSupport::Supported,
+                CodexRelayProbeConfidence::EndpointValidation,
+                Some(400),
+                "endpoint exists",
+            ),
+            responses_compact: probe_result(
+                crate::proxy::CodexRelayProbeKind::ResponsesCompact,
+                CodexRelayProbeSupport::Unsupported,
+                CodexRelayProbeConfidence::ErrorClassification,
+                Some(404),
+                "endpoint is missing",
+            ),
+        };
+        let recommendation =
+            crate::codex_capability_profile::CodexPatchModeRecommendation::for_input(
+                crate::codex_capability_profile::CodexPatchModeRecommendationInput {
+                    current_patch_mode:
+                        crate::codex_integration::CodexPatchMode::OfficialImagegenBridge,
+                    model_catalog: expected.model_catalog.clone(),
+                    responses: CodexCapabilitySupport::Supported,
+                    responses_compact: CodexCapabilitySupport::Unsupported,
+                },
+            );
+        CodexRelayCapabilitiesResponse {
+            api_version: 1,
+            service_name: "codex".to_string(),
+            station_name: "input".to_string(),
+            upstream_index: 0,
+            upstream_base_url: "https://relay.example/v1".to_string(),
+            patch_mode: crate::codex_integration::CodexPatchMode::OfficialImagegenBridge,
+            model: Some("gpt-5.5".to_string()),
+            expected,
+            observed,
+            recommendation,
+            mismatches: vec![crate::proxy::CodexRelayCapabilityMismatch {
+                capability: "remote_compaction_v1".to_string(),
+                expected: "supported".to_string(),
+                observed: "unsupported via error_classification".to_string(),
+                reason: "endpoint is missing".to_string(),
+            }],
+        }
+    }
 
     fn retry_layer(strategy: RetryStrategy, attempts: u32) -> ResolvedRetryLayerConfig {
         ResolvedRetryLayerConfig {
@@ -884,5 +1225,27 @@ mod tests {
         let provider_pos = line.find("input").expect(&line);
 
         assert!(amount_pos < provider_pos, "{line}");
+    }
+
+    #[test]
+    fn codex_relay_diagnostics_lines_show_observed_mismatch_and_recommendation() {
+        let ui = UiState {
+            codex_relay_diagnostics: crate::tui::state::CodexRelayDiagnosticsState {
+                last_result: Some(diagnostic_response()),
+                ..Default::default()
+            },
+            ..UiState::default()
+        };
+
+        let text = lines_text(&codex_relay_diagnostics_lines(Palette::default(), &ui));
+
+        assert!(text.contains("Codex Relay Diagnostics"), "{text}");
+        assert!(text.contains("observed /responses/compact"), "{text}");
+        assert!(text.contains("mismatches: 1"), "{text}");
+        assert!(
+            text.contains("official-imagegen-bridge -> imagegen-bridge"),
+            "{text}"
+        );
+        assert!(text.contains("warning:"), "{text}");
     }
 }
